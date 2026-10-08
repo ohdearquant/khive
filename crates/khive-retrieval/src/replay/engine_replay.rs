@@ -127,16 +127,7 @@ pub async fn weights_as_of(
         let mut result = HashMap::new();
 
         let mut stmt = conn
-            .prepare(
-                "SELECT atom_id, weight_after
-                 FROM (
-                     SELECT atom_id, weight_after,
-                            ROW_NUMBER() OVER (PARTITION BY atom_id ORDER BY ts DESC) as rn
-                     FROM weight_events
-                     WHERE namespace = ?1 AND ts <= ?2
-                 )
-                 WHERE rn = 1",
-            )
+            .prepare(include_str!("../../sql/weight_events_latest_as_of.sql"))
             .map_err(|e| EngineError::Internal(format!("weights_as_of prepare: {e}")))?;
 
         let mut rows = stmt
@@ -401,12 +392,7 @@ pub async fn rank_history(
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT ts, weight_after, delta, channel, context_id, event_id
-                 FROM weight_events
-                 WHERE namespace = ?1 AND atom_id = ?2
-                 ORDER BY ts ASC",
-            )
+            .prepare(include_str!("../../sql/weight_events_history_by_atom.sql"))
             .map_err(|e| EngineError::Internal(format!("rank_history prepare: {e}")))?;
 
         let rows = stmt
@@ -543,8 +529,7 @@ async fn load_brain_event(
         // column added in migration v27.
         let result = guard
             .query_row(
-                "SELECT query_text, payload, actor_id, created_at, embedding_model
-                 FROM brain_events WHERE id = ?1",
+                "SELECT query_text, payload, actor_id, created_at, embedding_model FROM brain_events WHERE id = ?1",
                 params![event_id_str.clone()],
                 |row| {
                     let query_text: Option<String> = row.get(0)?;
@@ -642,13 +627,7 @@ pub mod metrics {
                 let c = conn.lock();
                 let cutoff_us = (Utc::now() - chrono::Duration::days(7)).timestamp_micros();
                 let mut stmt = c
-                    .prepare(
-                        "SELECT id FROM brain_events
-                         WHERE kind = 'ComposeEvent'
-                           AND created_at >= ?1
-                           AND json_extract(payload, '$.lambda_id') = ?2
-                         ORDER BY created_at DESC",
-                    )
+                    .prepare("SELECT id FROM brain_events WHERE kind = 'ComposeEvent' AND created_at >= ?1 AND json_extract(payload, '$.lambda_id') = ?2 ORDER BY created_at DESC")
                     .map_err(|e| {
                         EngineError::Internal(format!("jaccard_stability_7d prepare: {e}"))
                     })?;
@@ -722,11 +701,7 @@ pub mod metrics {
         tokio::task::spawn_blocking(move || {
             let c = conn.lock();
             let mut stmt = c
-                .prepare(
-                    "SELECT payload FROM brain_events
-                     WHERE kind = 'ComposeEvent'
-                       AND json_extract(payload, '$.lambda_id') = ?1",
-                )
+                .prepare("SELECT payload FROM brain_events WHERE kind = 'ComposeEvent' AND json_extract(payload, '$.lambda_id') = ?1")
                 .map_err(|e| EngineError::Internal(format!("atom_rank_variance prepare: {e}")))?;
 
             let rows = stmt
@@ -780,11 +755,7 @@ pub mod metrics {
             let mut stmt = c
                 .prepare(
                     // SQLite: integer division gives day bucket (micros / 86_400_000_000).
-                    "SELECT ts / 86400000000 AS day_bucket, COUNT(*) as cnt
-                     FROM weight_events
-                     WHERE namespace = ?1 AND ts >= ?2
-                     GROUP BY day_bucket
-                     ORDER BY day_bucket ASC",
+                    include_str!("../../sql/weight_events_count_by_day.sql"),
                 )
                 .map_err(|e| {
                     EngineError::Internal(format!("adjustment_rate_per_day prepare: {e}"))
@@ -830,22 +801,7 @@ mod tests {
 
     fn make_conn() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE weight_events (
-                namespace TEXT NOT NULL,
-                atom_id TEXT NOT NULL,
-                delta REAL NOT NULL,
-                weight_after REAL NOT NULL,
-                channel TEXT NOT NULL,
-                eta REAL NOT NULL,
-                event_id TEXT,
-                context_id TEXT,
-                ts INTEGER NOT NULL
-            );
-            "#,
-        )
-        .expect("init replay test schema");
+        crate::weights::init_weight_schema(&conn).expect("init replay test schema");
         Arc::new(Mutex::new(conn))
     }
 

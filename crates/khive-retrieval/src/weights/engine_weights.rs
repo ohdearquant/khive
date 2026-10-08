@@ -21,6 +21,19 @@ pub const WEIGHT_FLOOR: f32 = 0.1;
 pub const WEIGHT_CEIL: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+/// Create the `atom_weights` and `weight_events` tables if they do not exist.
+///
+/// The weight store owns these two tables; the replay module reads
+/// `weight_events`. Callers run this once per connection before any write.
+pub fn init_weight_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(include_str!("../../sql/atom_weights_create.sql"))?;
+    conn.execute_batch(include_str!("../../sql/weight_events_create.sql"))
+}
+
+// ---------------------------------------------------------------------------
 // WeightChannel
 // ---------------------------------------------------------------------------
 
@@ -138,7 +151,7 @@ pub async fn apply_weight_delta_with_eta(
         // Read current weight (default 1.0 if row absent).
         let old_weight: f32 = tx
             .query_row(
-                "SELECT weight FROM atom_weights WHERE namespace = ?1 AND atom_id = ?2",
+                include_str!("../../sql/atom_weights_select_weight.sql"),
                 params![namespace_str, atom_id_str],
                 |row| row.get::<_, f64>(0),
             )
@@ -151,20 +164,13 @@ pub async fn apply_weight_delta_with_eta(
 
         // Upsert atom_weights — increment version on each write.
         tx.execute(
-            "INSERT INTO atom_weights (namespace, atom_id, weight, updated_at, version)
-             VALUES (?1, ?2, ?3, ?4, 1)
-             ON CONFLICT(namespace, atom_id) DO UPDATE SET
-               weight     = excluded.weight,
-               updated_at = excluded.updated_at,
-               version    = version + 1",
+            include_str!("../../sql/atom_weights_upsert.sql"),
             params![namespace_str, atom_id_str, new_weight as f64, now_us],
         )?;
 
         // Append weight_events audit row.
         tx.execute(
-            "INSERT INTO weight_events
-               (namespace, atom_id, delta, weight_after, channel, eta, event_id, context_id, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            include_str!("../../sql/weight_events_insert.sql"),
             params![
                 namespace_str,
                 atom_id_str,
@@ -272,30 +278,7 @@ mod tests {
 
     fn make_conn() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE atom_weights (
-                namespace TEXT NOT NULL,
-                atom_id TEXT NOT NULL,
-                weight REAL NOT NULL,
-                updated_at INTEGER NOT NULL,
-                version INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY(namespace, atom_id)
-            );
-            CREATE TABLE weight_events (
-                namespace TEXT NOT NULL,
-                atom_id TEXT NOT NULL,
-                delta REAL NOT NULL,
-                weight_after REAL NOT NULL,
-                channel TEXT NOT NULL,
-                eta REAL NOT NULL,
-                event_id TEXT,
-                context_id TEXT,
-                ts INTEGER NOT NULL
-            );
-            "#,
-        )
-        .expect("init weight test schema");
+        init_weight_schema(&conn).expect("init weight test schema");
         Arc::new(Mutex::new(conn))
     }
 

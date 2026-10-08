@@ -83,20 +83,7 @@ impl RetrievalPersistence {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS retrieval_snapshots (
-                    namespace   TEXT NOT NULL,
-                    index_type  TEXT NOT NULL,
-                    snapshot    BLOB NOT NULL,
-                    created_at  INTEGER NOT NULL,
-                    PRIMARY KEY (namespace, index_type)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_retrieval_snapshots_namespace
-                    ON retrieval_snapshots(namespace);
-                "#,
-            )?;
+            conn.execute_batch(include_str!("../../sql/retrieval_snapshots_create.sql"))?;
             Ok(())
         })
         .await
@@ -119,12 +106,7 @@ impl RetrievalPersistence {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                r#"
-                INSERT OR REPLACE INTO retrieval_snapshots
-                    (namespace, index_type, snapshot, created_at)
-                VALUES
-                    (?1, ?2, ?3, ?4)
-                "#,
+                include_str!("../../sql/retrieval_snapshots_upsert.sql"),
                 rusqlite::params![
                     &*namespace,
                     index_type,
@@ -149,12 +131,9 @@ impl RetrievalPersistence {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT snapshot FROM retrieval_snapshots
-                WHERE namespace = ?1 AND index_type = ?2
-                "#,
-            )?;
+            let mut stmt = conn.prepare(include_str!(
+                "../../sql/retrieval_snapshots_select_snapshot.sql"
+            ))?;
 
             let result: Option<Vec<u8>> = match stmt
                 .query_row(rusqlite::params![&*namespace, index_type], |row| row.get(0))
@@ -185,7 +164,7 @@ impl RetrievalPersistence {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "DELETE FROM retrieval_snapshots WHERE namespace = ?1",
+                include_str!("../../sql/retrieval_snapshots_delete_namespace.sql"),
                 rusqlite::params![&*namespace],
             )?;
             Ok(())
@@ -201,13 +180,9 @@ impl RetrievalPersistence {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT index_type, length(snapshot), created_at
-                FROM retrieval_snapshots
-                WHERE namespace = ?1
-                "#,
-            )?;
+            let mut stmt = conn.prepare(include_str!(
+                "../../sql/retrieval_snapshots_list_namespace.sql"
+            ))?;
 
             let mut stats = PersistenceStats::default();
             let mut rows = stmt.query(rusqlite::params![&*namespace])?;
