@@ -2,15 +2,8 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
-use crate::validate::{validate_with_warnings, MAX_DEPTH};
-
-/// Closed observation projections handled outside canonical graph edges.
-const SYNTHETIC_RELATIONS: &[&str] = &[
-    "observed_as_candidate",
-    "observed_as_selected",
-    "observed_as_target",
-    "observed_as_signal",
-];
+use crate::language::read_only_error;
+use crate::validate::{validate_with_warnings, MAX_DEPTH, SYNTHETIC_RELATIONS};
 
 fn is_synthetic(rel: &str) -> bool {
     SYNTHETIC_RELATIONS.contains(&rel)
@@ -198,11 +191,15 @@ fn assert_select_only(sql: &str) -> Result<(), QueryError> {
     if first == "SELECT" || first == "WITH" {
         return Ok(());
     }
-    Err(QueryError::Compile(
-        "the query verb is read-only; \
-         to mutate the graph use: create, update, link, merge, delete"
-            .into(),
-    ))
+    Err(read_only_error(QueryError::Compile))
+}
+
+fn in_placeholders(indices: impl IntoIterator<Item = usize>) -> String {
+    indices
+        .into_iter()
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryValue>) -> String {
@@ -212,15 +209,11 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
         params.push(QueryValue::Text(opts.scopes[0].clone()));
         format!(" AND {alias}.namespace = ?{}", params.len())
     } else {
-        let placeholders: Vec<String> = opts
-            .scopes
-            .iter()
-            .map(|s| {
-                params.push(QueryValue::Text(s.clone()));
-                format!("?{}", params.len())
-            })
-            .collect();
-        format!(" AND {alias}.namespace IN ({})", placeholders.join(", "))
+        let placeholders = in_placeholders(opts.scopes.iter().map(|s| {
+            params.push(QueryValue::Text(s.clone()));
+            params.len()
+        }));
+        format!(" AND {alias}.namespace IN ({})", placeholders)
     }
 }
 
@@ -525,15 +518,11 @@ fn compile_fixed_length(
                         params.push(QueryValue::Text(roles[0].to_string()));
                         where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
                     } else if roles.len() > 1 {
-                        let placeholders: Vec<String> = roles
-                            .iter()
-                            .map(|r| {
-                                params.push(QueryValue::Text(r.to_string()));
-                                format!("?{}", params.len())
-                            })
-                            .collect();
-                        where_parts
-                            .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
+                        let placeholders = in_placeholders(roles.iter().map(|r| {
+                            params.push(QueryValue::Text(r.to_string()));
+                            params.len()
+                        }));
+                        where_parts.push(format!("{e_alias}.role IN ({})", placeholders));
                     }
                     // `referent_kind` prevents equal IDs on different substrates from colliding.
                     join_parts.push(format!(
@@ -593,18 +582,11 @@ fn compile_fixed_length(
                             params.push(QueryValue::Text(ep.relations[0].clone()));
                             where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
                         } else {
-                            let placeholders: Vec<String> = ep
-                                .relations
-                                .iter()
-                                .map(|r| {
-                                    params.push(QueryValue::Text(r.clone()));
-                                    format!("?{}", params.len())
-                                })
-                                .collect();
-                            where_parts.push(format!(
-                                "{e_alias}.relation IN ({})",
-                                placeholders.join(", ")
-                            ));
+                            let placeholders = in_placeholders(ep.relations.iter().map(|r| {
+                                params.push(QueryValue::Text(r.clone()));
+                                params.len()
+                            }));
+                            where_parts.push(format!("{e_alias}.relation IN ({})", placeholders));
                         }
                     }
                 }
@@ -832,12 +814,12 @@ fn compile_condition_predicate(
                 .any(|value| matches!(value, ConditionValue::String(_)));
             let placeholders = values
                 .iter()
-                .map(|value| bind_condition_value(value, params).map(|index| format!("?{index}")))
+                .map(|value| bind_condition_value(value, params))
                 .collect::<Result<Vec<_>, _>>()?;
             let collate = if has_string { " COLLATE NOCASE" } else { "" };
             Ok(format!(
                 "{col_expr}{collate} IN ({})",
-                placeholders.join(", ")
+                in_placeholders(placeholders)
             ))
         }
         CompareOp::IsNotNull => {
@@ -1144,15 +1126,11 @@ fn compile_variable_length(
             params.push(QueryValue::Text(edge.relations[0].clone()));
             relation_condition = format!(" AND e.relation = ?{}", params.len());
         } else {
-            let placeholders: Vec<String> = edge
-                .relations
-                .iter()
-                .map(|r| {
-                    params.push(QueryValue::Text(r.clone()));
-                    format!("?{}", params.len())
-                })
-                .collect();
-            relation_condition = format!(" AND e.relation IN ({})", placeholders.join(", "));
+            let placeholders = in_placeholders(edge.relations.iter().map(|r| {
+                params.push(QueryValue::Text(r.clone()));
+                params.len()
+            }));
+            relation_condition = format!(" AND e.relation IN ({})", placeholders);
         }
     }
 

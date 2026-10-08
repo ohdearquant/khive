@@ -9,7 +9,7 @@ use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement,
 use crate::error::QueryError;
 
 /// Closed synthetic relation set handled outside the canonical edge enum.
-const SYNTHETIC_RELATIONS: &[&str] = &[
+pub(crate) const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_candidate",
     "observed_as_selected",
     "observed_as_target",

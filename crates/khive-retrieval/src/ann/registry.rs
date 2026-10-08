@@ -80,6 +80,26 @@ fn stmt(sql: impl Into<String>, params: Vec<SqlValue>, label: &str) -> SqlStatem
     }
 }
 
+fn consumer_stmt(
+    sql: impl Into<String>,
+    label: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+    watermark: i64,
+) -> SqlStatement {
+    stmt(
+        sql,
+        vec![
+            SqlValue::Text(consumer.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+            SqlValue::Integer(watermark),
+        ],
+        label,
+    )
+}
+
 fn integer_range_error(value: u64) -> StorageError {
     StorageError::Internal(format!(
         "ANN watermark {value} exceeds SQLite INTEGER range"
@@ -123,15 +143,13 @@ pub fn pathless_register_pending(
     namespace: &str,
     model: &str,
 ) -> SqlStatement {
-    stmt(
+    consumer_stmt(
         REGISTER_PENDING_SQL,
-        vec![
-            SqlValue::Text(consumer.to_owned()),
-            SqlValue::Text(namespace.to_owned()),
-            SqlValue::Text(model.to_owned()),
-            SqlValue::Integer(PENDING_WATERMARK),
-        ],
         &format!("{label_prefix}ann_register_pathless_consumer"),
+        consumer,
+        namespace,
+        model,
+        PENDING_WATERMARK,
     )
 }
 
@@ -144,15 +162,13 @@ pub fn pathless_mark_recovering(
     namespace: &str,
     model: &str,
 ) -> SqlStatement {
-    stmt(
+    consumer_stmt(
         MARK_RECOVERING_SQL,
-        vec![
-            SqlValue::Text(consumer.to_owned()),
-            SqlValue::Text(namespace.to_owned()),
-            SqlValue::Text(model.to_owned()),
-            SqlValue::Integer(RECOVERING_WATERMARK),
-        ],
         &format!("{label_prefix}ann_mark_pathless_recovering"),
+        consumer,
+        namespace,
+        model,
+        RECOVERING_WATERMARK,
     )
 }
 
@@ -169,15 +185,13 @@ pub fn pathless_raise_watermark(
     watermark: i64,
     authority: WatermarkAuthority,
 ) -> SqlStatement {
-    stmt(
+    consumer_stmt(
         raise_sql(authority),
-        vec![
-            SqlValue::Text(consumer.to_owned()),
-            SqlValue::Text(namespace.to_owned()),
-            SqlValue::Text(model.to_owned()),
-            SqlValue::Integer(watermark),
-        ],
         &format!("{label_prefix}ann_raise_pathless_watermark"),
+        consumer,
+        namespace,
+        model,
+        watermark,
     )
 }
 
@@ -202,6 +216,88 @@ pub fn pathless_compact_log(
             vec![SqlValue::Text(model)],
             &label,
         ),
+    }
+}
+
+/// Register with one statement when pathless, otherwise retain the durable
+/// pending-registration transaction and timestamp.
+#[doc(hidden)]
+pub async fn register_pending_dispatch(
+    sql: &dyn SqlAccess,
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+    pathless: bool,
+) -> StorageResult<()> {
+    if pathless {
+        let mut writer = sql.writer().await?;
+        writer
+            .execute(pathless_register_pending(
+                label_prefix,
+                consumer,
+                namespace,
+                model,
+            ))
+            .await?;
+        Ok(())
+    } else {
+        register_pending(sql, consumer, namespace, model).await
+    }
+}
+
+/// Publish through the pathless statement or the durable activation transaction.
+/// Callers retain any pack-specific range diagnostic before entering this helper.
+#[doc(hidden)]
+// The existing registry identity and statement label stay explicit at both consumers.
+#[allow(clippy::too_many_arguments)]
+pub async fn raise_watermark_dispatch(
+    sql: &dyn SqlAccess,
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+    watermark: u64,
+    authority: WatermarkAuthority,
+    pathless: bool,
+) -> StorageResult<bool> {
+    if pathless {
+        let watermark = i64::try_from(watermark).map_err(|_| integer_range_error(watermark))?;
+        let mut writer = sql.writer().await?;
+        Ok(writer
+            .execute(pathless_raise_watermark(
+                label_prefix,
+                consumer,
+                namespace,
+                model,
+                watermark,
+                authority,
+            ))
+            .await?
+            == 1)
+    } else {
+        raise_watermark(sql, consumer, namespace, model, watermark, authority).await
+    }
+}
+
+/// Compact with one statement when pathless, otherwise retain atomic pending
+/// retirement, metadata cleanup and warning publication.
+#[doc(hidden)]
+pub async fn compact_dispatch(
+    sql: &dyn SqlAccess,
+    label_prefix: &str,
+    scope: CompactionScope,
+    model: &str,
+    pathless: bool,
+) -> StorageResult<()> {
+    if pathless {
+        let mut writer = sql.writer().await?;
+        writer
+            .execute(pathless_compact_log(label_prefix, scope, model))
+            .await?;
+        Ok(())
+    } else {
+        compact_write_log(sql, scope, model).await.map(|_| ())
     }
 }
 
@@ -275,15 +371,13 @@ async fn register_pending_at(
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
             let inserted = writer
-                .execute(stmt(
+                .execute(consumer_stmt(
                     REGISTER_PENDING_SQL,
-                    vec![
-                        SqlValue::Text(consumer.clone()),
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(model.clone()),
-                        SqlValue::Integer(PENDING_WATERMARK),
-                    ],
                     "ann_registry_register_pending",
+                    &consumer,
+                    &namespace,
+                    &model,
+                    PENDING_WATERMARK,
                 ))
                 .await?;
             let pending_insert = if inserted == 1 {
@@ -336,15 +430,13 @@ pub async fn mark_recovering(
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
             writer
-                .execute(stmt(
+                .execute(consumer_stmt(
                     MARK_RECOVERING_SQL,
-                    vec![
-                        SqlValue::Text(consumer.clone()),
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(model.clone()),
-                        SqlValue::Integer(RECOVERING_WATERMARK),
-                    ],
                     "ann_registry_mark_recovering",
+                    &consumer,
+                    &namespace,
+                    &model,
+                    RECOVERING_WATERMARK,
                 ))
                 .await?;
             writer
@@ -393,15 +485,13 @@ pub async fn raise_watermark(
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
             let affected = writer
-                .execute(stmt(
+                .execute(consumer_stmt(
                     raise_sql(authority),
-                    vec![
-                        SqlValue::Text(consumer.clone()),
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(model.clone()),
-                        SqlValue::Integer(watermark),
-                    ],
                     "ann_registry_raise_watermark",
+                    &consumer,
+                    &namespace,
+                    &model,
+                    watermark,
                 ))
                 .await?;
             if affected == 1 {

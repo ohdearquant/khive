@@ -104,73 +104,13 @@ pub struct GreedySearchResult {
     pub expanded: Vec<(u32, f32)>,
 }
 
-/// Generation-based visited-node tracker for greedy search.
-///
-/// Avoids clearing a `Vec<bool>` on every query by incrementing a generation counter.
-#[derive(Debug, Clone)]
-pub struct VisitedSet {
-    marks: Vec<u64>,
-    generation: u64,
-}
+pub use khive_types::vector::VisitedSet;
 
-impl VisitedSet {
-    /// Create a new `VisitedSet` with pre-allocated capacity for `capacity` nodes.
-    pub fn new(capacity: usize) -> Self {
-        #[cfg(test)]
-        VISITED_SET_ALLOCATIONS.with(|count| count.set(count.get().wrapping_add(1)));
-        Self {
-            marks: vec![0; capacity],
-            generation: 1,
-        }
-    }
-
-    /// Reset the visited state for all nodes in O(1) by advancing the generation.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.marks.fill(0);
-            self.generation = 1;
-        }
-    }
-
-    /// Grow the internal buffer if `node` would be out of range.
-    #[inline]
-    pub fn ensure_capacity(&mut self, node: usize) {
-        if node >= self.marks.len() {
-            self.marks.resize(node + 1, 0);
-        }
-    }
-
-    /// Mark `node` as visited if it has not been visited in this generation.
-    ///
-    /// Returns `true` on first visit, `false` on subsequent calls for the same node.
-    #[inline]
-    pub fn mark_if_new(&mut self, node: usize) -> bool {
-        if node >= self.marks.len() {
-            self.marks.resize(node + 1, 0);
-        }
-        if self.marks[node] == self.generation {
-            false
-        } else {
-            self.marks[node] = self.generation;
-            true
-        }
-    }
-
-    /// Return `true` if `node` has been marked in the current generation.
-    #[inline]
-    pub fn is_marked(&self, node: usize) -> bool {
-        node < self.marks.len() && self.marks[node] == self.generation
-    }
-
+/// Construct scratch while retaining Vamana's test-only construction accounting.
+pub(crate) fn new_visited_set(capacity: usize) -> VisitedSet {
     #[cfg(test)]
-    pub(crate) fn with_generation(capacity: usize, generation: u64) -> Self {
-        Self {
-            marks: vec![0; capacity],
-            generation,
-        }
-    }
+    VISITED_SET_ALLOCATIONS.with(|count| count.set(count.get().wrapping_add(1)));
+    VisitedSet::new(capacity)
 }
 
 /// Pass-local scratch indexed by the current Rayon pool's real workers.
@@ -197,7 +137,7 @@ impl BuildScratch {
             #[cfg(feature = "parallel")]
             capacity,
             #[cfg(not(feature = "parallel"))]
-            visited: VisitedSet::new(capacity),
+            visited: new_visited_set(capacity),
         }
     }
 
@@ -220,7 +160,7 @@ impl BuildScratch {
                 let mut slot = self.slots[index]
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let visited = slot.get_or_insert_with(|| VisitedSet::new(self.capacity));
+                let visited = slot.get_or_insert_with(|| new_visited_set(self.capacity));
                 let proposals = (start..end)
                     .map(|position| propose(batch[position], &prior[position], visited))
                     .collect::<Vec<_>>();
@@ -1316,15 +1256,6 @@ mod tests {
         let mut vs = VisitedSet::new(4);
         assert!(vs.mark_if_new(100));
         assert!(!vs.mark_if_new(100));
-    }
-
-    #[test]
-    fn visited_set_wraparound_resets_marks() {
-        let mut vs = VisitedSet::with_generation(4, u64::MAX);
-        vs.mark_if_new(0);
-        vs.clear();
-        assert!(vs.mark_if_new(0));
-        assert!(!vs.mark_if_new(0));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The path behind an open file, and an open that is checked against a root.
+//! The path behind an open file, a contained open, and a Unix final-component no-follow open.
 //!
 //! A path checked before it is opened can be swapped for a symlink in between. The helpers here
 //! judge the file that was actually opened: [`opened_file_path`] asks the kernel which path an
@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Why [`open_regular_file_within`] refused a path.
+/// Why a regular-file open refused a path.
 #[derive(Debug)]
 pub enum ContainedOpenError {
     /// The open itself failed.
@@ -28,6 +28,28 @@ pub enum ContainedOpenError {
         /// The resolved path of the opened file.
         opened: PathBuf,
     },
+}
+
+/// Open a regular file read-only without following a final-component symlink on Unix.
+///
+/// Earlier symlinks resolve normally; this does not enforce containment or ancestor trust.
+/// Trailing separators or `/.` can make the preceding component an ancestor. Non-blocking
+/// open prevents a FIFO waiting for a writer before the opened-file type check refuses it.
+/// The returned file is close-on-exec. Open and metadata failures retain their raw errors.
+#[cfg(unix)]
+pub fn open_regular_file_nofollow(path: &Path) -> Result<File, ContainedOpenError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(ContainedOpenError::Open)?;
+    let metadata = file.metadata().map_err(ContainedOpenError::Metadata)?;
+    if !metadata.is_file() {
+        return Err(ContainedOpenError::NotRegular);
+    }
+    Ok(file)
 }
 
 /// Open `path` read-only and return the file only if it is a regular file inside `canonical_root`.

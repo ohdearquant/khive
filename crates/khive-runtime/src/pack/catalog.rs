@@ -17,8 +17,8 @@ use super::request_identity::extract_table_names;
 use super::VerbPresentationPolicy;
 use super::{
     EdgeEndpointRule, EntityTypeDef, HandlerDef, KindHook, NoteEmbeddingPolicySpec, NoteKindSpec,
-    PackByIdResolver, PackColumnAddition, SchemaPlan, VerbCategory, VerbRegistry, Visibility,
-    GENERIC_CRUD_PACK,
+    PackByIdResolver, PackColumnAddition, PackRuntime, SchemaPlan, VerbCategory, VerbRegistry,
+    Visibility, GENERIC_CRUD_PACK,
 };
 
 impl VerbRegistry {
@@ -397,16 +397,24 @@ impl VerbRegistry {
             .map(|p| p.handlers())
     }
 
+    /// Collect pack items in registration order without filtering or deduplication.
+    fn collect_pack_items<T, I>(&self, select: impl Fn(&dyn PackRuntime) -> I) -> Vec<T>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.packs
+            .iter()
+            .flat_map(|pack| select(pack.as_ref()))
+            .collect()
+    }
+
     /// All pack-declared edge endpoint rules across registered packs.
     ///
     /// Order follows topological pack registration; duplicates are *not* deduplicated —
     /// validation only checks membership, and an exact-duplicate rule is a
     /// harmless restatement.
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.edge_rules().iter().copied())
-            .collect()
+        self.collect_pack_items(|pack| pack.edge_rules().iter().copied())
     }
 
     /// All pack-declared entity-type subtypes across registered packs.
@@ -416,28 +424,19 @@ impl VerbRegistry {
     /// Consumers compose this with `EntityTypeRegistry::builtin()` via
     /// `EntityTypeRegistry::with_extra` to get the boot-time composed registry.
     pub fn all_entity_types(&self) -> Vec<EntityTypeDef> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.entity_types().iter().cloned())
-            .collect()
+        self.collect_pack_items(|pack| pack.entity_types().iter().cloned())
     }
 
     /// Collect all `NoteKindSpec` declarations from every loaded pack.
     ///
     /// Used by the runtime for lifecycle introspection and future enforcement.
     pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.note_kind_specs().iter())
-            .collect()
+        self.collect_pack_items(|pack| pack.note_kind_specs().iter())
     }
 
     /// Collect pack-declared embedding policies for registered note kinds.
     pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
-        self.packs
-            .iter()
-            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
-            .collect()
+        self.collect_pack_items(|pack| pack.note_embedding_policies().iter().copied())
     }
 
     /// All pack-contributed validation rules across registered packs.
@@ -446,10 +445,7 @@ impl VerbRegistry {
     /// beyond the outer `Vec`. Rule IDs are namespaced by pack; callers can
     /// group by `rule.id.split_once('/')` to attribute rules to their packs.
     pub fn all_validation_rules(&self) -> Vec<&'static ValidationRule> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.validation_rules().iter())
-            .collect()
+        self.collect_pack_items(|pack| pack.validation_rules().iter())
     }
 
     /// Pack-auxiliary schema plans for all registered packs.

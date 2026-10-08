@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
+use crate::language::{read_only_error, DEFAULT_HOP_CAP, GQL_WRITE_KEYWORDS};
 use std::collections::HashMap;
 
 struct Parser {
@@ -349,7 +350,7 @@ impl Parser {
                 }
             } else {
                 min_hops = 1;
-                max_hops = 5; // default unbounded cap
+                max_hops = DEFAULT_HOP_CAP; // default unbounded cap
             }
         }
 
@@ -632,15 +633,10 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// Deliberately rejects GQL/Cypher writes before the read grammar runs.
 fn reject_gql_write(input: &str) -> Result<(), QueryError> {
     let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
-    match first.as_str() {
-        "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE" => {
-            Err(QueryError::Unsupported(
-                "the query verb is read-only; \
-                 to mutate the graph use: create, update, link, merge, delete"
-                    .into(),
-            ))
-        }
-        _ => Ok(()),
+    if GQL_WRITE_KEYWORDS.contains(&first.as_str()) {
+        Err(read_only_error(QueryError::Unsupported))
+    } else {
+        Ok(())
     }
 }
 
