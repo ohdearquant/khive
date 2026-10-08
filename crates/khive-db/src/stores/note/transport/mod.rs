@@ -73,10 +73,7 @@ impl SenderEnvelope {
             return Err(invalid("invalid transport identity"));
         }
         if self.recipient_key_fingerprint.len() != 64
-            || !self
-                .recipient_key_fingerprint
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !khive_types::is_lowercase_hex(&self.recipient_key_fingerprint)
         {
             return Err(invalid("fingerprint must be 32 lowercase hex bytes"));
         }

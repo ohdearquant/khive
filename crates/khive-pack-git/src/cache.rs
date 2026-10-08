@@ -1992,10 +1992,7 @@ fn dir_size_with(
 mod dir_size_tests;
 
 fn is_cache_key_name(name: &str) -> bool {
-    name.len() == 16
-        && name
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    name.len() == 16 && khive_types::is_lowercase_hex(name)
 }
 
 /// Whether `path` is a directory `ensure_clone` could plausibly have

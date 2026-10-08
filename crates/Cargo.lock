@@ -2761,6 +2761,7 @@ dependencies = [
  "chrono",
  "hex",
  "jsonschema",
+ "khive-types",
  "rusqlite",
  "schemars",
  "serde",

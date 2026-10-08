@@ -107,11 +107,7 @@ pub(crate) fn oid(value: &str) -> Result<(), Failure> {
 }
 
 fn lowercase_oid(value: &str) -> Result<(), Failure> {
-    if value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if value.len() == 40 && khive_types::is_lowercase_hex(value) {
         Ok(())
     } else {
         Err(Failure::invalid(

@@ -57,7 +57,7 @@ pub use event::{
 };
 pub use hash::Hash32;
 pub use header::Header;
-pub use id::{Id128, ParseIdError};
+pub use id::{is_lowercase_hex, Id128, ParseIdError};
 #[cfg(feature = "serde")]
 pub use json_type::json_type_name;
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};

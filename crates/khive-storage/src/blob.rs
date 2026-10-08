@@ -60,11 +60,7 @@ impl UploadId {
     /// Parse exactly 32 lowercase hex characters, never a backend pathname.
     pub fn from_hex(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        if value.len() != 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if value.len() != 32 || !khive_types::is_lowercase_hex(&value) {
             return Err("upload_id must be 32 lowercase hex characters".into());
         }
         Ok(Self(value))
@@ -112,10 +108,7 @@ impl ContentRef {
                 hex.len()
             ));
         }
-        if !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
-        {
+        if !khive_types::is_lowercase_hex(&hex) {
             return Err(format!(
                 "content_ref must be lowercase hex (0-9, a-f), got {hex:?}"
             ));
