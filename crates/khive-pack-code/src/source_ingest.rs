@@ -2544,9 +2544,10 @@ pub async fn run_code_ingest(
 
 /// The `source_project` for a file with no governing manifest anywhere above
 /// it: the basename of the ingested folder (ADR-085 Amendment 2 B4).
-fn basename_project_name(ingest_root: &Path) -> String {
+fn basename_project_name(ingest_root: &Path, canonical_ingest_root: &Path) -> String {
     ingest_root
         .file_name()
+        .or_else(|| canonical_ingest_root.file_name())
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| ingest_root.display().to_string())
 }
@@ -2623,7 +2624,7 @@ async fn run_import_scan(
         let (proj_root, proj_name) = governing.unwrap_or_else(|| {
             (
                 canonical_ingest_root.clone(),
-                basename_project_name(ingest_root),
+                basename_project_name(ingest_root, &canonical_ingest_root),
             )
         });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
@@ -4010,7 +4011,7 @@ async fn run_l2_sweep(
             let (proj_root, proj_name) = governing.unwrap_or_else(|| {
                 (
                     canonical_ingest_root.clone(),
-                    basename_project_name(ingest_root),
+                    basename_project_name(ingest_root, &canonical_ingest_root),
                 )
             });
             let owner = L2OwnerKey {
@@ -4428,6 +4429,32 @@ mod tests {
     use khive_db::StorageBackend;
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
+
+    #[test]
+    fn basename_fallback_uses_canonical_name_only_when_lexical_name_is_missing() {
+        assert_eq!(
+            basename_project_name(Path::new("project/child/.."), Path::new("project")),
+            "project"
+        );
+        assert_eq!(
+            basename_project_name(Path::new("caller_alias"), Path::new("physical_project")),
+            "caller_alias"
+        );
+        assert_eq!(
+            basename_project_name(Path::new("project/."), Path::new("physical_project")),
+            "project"
+        );
+    }
+
+    #[test]
+    fn basename_fallback_preserves_the_last_resort_without_filesystem_access() {
+        let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(
+            basename_project_name(root, root),
+            root.display().to_string()
+        );
+        assert_eq!(basename_project_name(Path::new("."), Path::new(".")), ".");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_worker_yields_the_async_executor() {
