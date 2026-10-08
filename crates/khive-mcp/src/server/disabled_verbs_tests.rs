@@ -35,7 +35,7 @@ async fn disabled_verbs_hide_capabilities_refuse_dispatch_and_keep_operator_meta
     let built = crate::serve::build_registry_for_multi_backend(
         disabled_verbs_runtime_config(),
         &config,
-        None,
+        Some(":memory:"),
     )
     .await
     .unwrap();
@@ -166,7 +166,7 @@ async fn disabled_verbs_hide_capabilities_refuse_dispatch_and_keep_operator_meta
     let enabled = crate::serve::build_registry_for_multi_backend(
         disabled_verbs_runtime_config(),
         &disabled_verbs_config(""),
-        None,
+        Some(":memory:"),
     )
     .await
     .unwrap();
@@ -207,7 +207,7 @@ async fn disabled_verbs_reject_unloaded_foreign_and_unknown_handlers_at_boot() {
         let result = crate::serve::build_registry_for_multi_backend(
             disabled_verbs_runtime_config(),
             &disabled_verbs_config(policy),
-            None,
+            Some(":memory:"),
         )
         .await;
         let error = result
