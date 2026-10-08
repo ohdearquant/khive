@@ -918,22 +918,18 @@ fn finish(report: &ReindexReport, best_effort: bool) -> Result<()> {
 }
 
 async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyhow::Result<()> {
-    use khive_storage::types::{SqlStatement, SqlValue};
-
-    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut writer = sql
         .writer()
         .await
         .context("open SQL writer for Vamana snapshot invalidation")?;
 
-    match writer
-        .execute(SqlStatement {
-            sql: sql!("retrieval_snapshots_delete_namespace").into(),
-            params: vec![SqlValue::Text(pattern)],
-            label: Some("invalidate_vamana_snapshots".into()),
-        })
-        .await
+    match khive_pack_knowledge::invalidate_legacy_vamana_snapshots(
+        writer.as_mut(),
+        namespace,
+        "invalidate_vamana_snapshots",
+    )
+    .await
     {
         Ok(deleted) => {
             tracing::info!(

@@ -38,9 +38,7 @@ async fn append_usage_mark_distinguishes_typed_writer_outcomes() {
         WriterTaskRequestState::SideEffectsUnknown,
     ] {
         for error in [
-            StorageError::WriterTaskTerminated {
-                request_state: state,
-            },
+            StorageError::writer_task_terminated(state),
             StorageError::WriterTaskRequestFailed {
                 request_state: state,
                 source: Box::new(StorageError::Pool {
@@ -71,9 +69,9 @@ async fn append_usage_mark_distinguishes_typed_writer_outcomes() {
     })
     .await;
     assert_eq!(ctx.shipping_snapshot(), Some(json!({})));
-    mark_unknown_append_usage(&StorageError::WriterTaskTerminated {
-        request_state: WriterTaskRequestState::SideEffectsUnknown,
-    });
+    mark_unknown_append_usage(&StorageError::writer_task_terminated(
+        WriterTaskRequestState::SideEffectsUnknown,
+    ));
 }
 
 async fn observations_for(store: &SqlEventStore, event_id: Uuid) -> Vec<EventObservation> {

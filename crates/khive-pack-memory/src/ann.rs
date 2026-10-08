@@ -1349,29 +1349,19 @@ fn start_rotation_watcher_with_shutdown(
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let ann_root = rt.backend_ann_root()?;
-    if ann
-        .rotation_watch_started
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return None;
-    }
-
-    let ann = Arc::downgrade(ann);
-    let tick = move || {
-        let ann = ann.upgrade();
-        let ann_root = ann_root.clone();
-        async move {
-            let Some(ann) = ann else {
-                return std::ops::ControlFlow::Break(());
-            };
+    let watch = khive_retrieval::ann::rotation_watch_future(
+        ann,
+        &ann.rotation_watch_started,
+        ann_root,
+        ROTATION_WATCH_INTERVAL,
+        shutdown,
+        |ann, ann_root| async move {
             refresh_rotated_segments_in_root(&ann_root, &ann).await;
-            std::ops::ControlFlow::Continue(())
-        }
-    };
+        },
+    )?;
     Some(khive_runtime::spawn_named_tracked_task(
         "memory_ann_rotation_watch",
-        khive_retrieval::ann::rotation_watch_loop(ROTATION_WATCH_INTERVAL, shutdown, tick),
+        watch,
     ))
 }
 

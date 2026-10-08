@@ -61,6 +61,50 @@ pub async fn acquire_checkpoint_lock_async(
         .map_err(|error| format!("{prefix} lock task failed: {error}"))?
 }
 
+/// Claim a one-shot watcher synchronously and return its unpolled future.
+///
+/// The caller keeps backend selection and task spawning. The watcher retains only
+/// a weak ANN reference between ticks; `refresh` receives an owned handle for one
+/// tick and must not capture another strong handle to the ANN. Dropping the future
+/// does not reset `started`. Timing and cancellation follow [`rotation_watch_loop`].
+#[doc(hidden)]
+pub fn rotation_watch_future<T, F, Fut>(
+    ann: &std::sync::Arc<T>,
+    started: &std::sync::atomic::AtomicBool,
+    ann_root: PathBuf,
+    interval: Duration,
+    shutdown: CancellationToken,
+    mut refresh: F,
+) -> Option<impl Future<Output = ()> + Send + 'static>
+where
+    T: Send + Sync + 'static,
+    F: FnMut(std::sync::Arc<T>, PathBuf) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    if started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let ann = std::sync::Arc::downgrade(ann);
+    let tick = move || {
+        let ann = ann.upgrade();
+        let ann_root = ann_root.clone();
+        let refresh = ann.map(|ann| refresh(ann, ann_root));
+        async move {
+            let Some(refresh) = refresh else {
+                return ControlFlow::Break(());
+            };
+            refresh.await;
+            ControlFlow::Continue(())
+        }
+    };
+    Some(rotation_watch_loop(interval, shutdown, tick))
+}
+
 /// Call `tick` every `interval` until `shutdown` is cancelled or `tick` returns
 /// [`ControlFlow::Break`].
 ///

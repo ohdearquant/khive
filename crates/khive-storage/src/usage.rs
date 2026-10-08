@@ -202,6 +202,7 @@ pub fn account_event_write(outcome: Result<u64, &crate::StorageError>) {
             }
             | crate::StorageError::WriterTaskTerminated {
                 request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+                ..
             },
         ) => {
             if let Some(context) = current() {

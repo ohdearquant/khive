@@ -410,10 +410,13 @@ pub(crate) async fn apply_plan(
     let note_version = if let AtomicOpPlan::AddNote(plan) = plan {
         if capture_note_versions {
             let current = writer
-                .query_scalar(crate::note_write::statement(
-                    "SELECT version FROM notes WHERE id=?1",
-                    vec![khive_storage::SqlValue::Text(plan.note_id.to_string())],
-                ))
+                .query_scalar(
+                    SqlStatement::new(
+                        "SELECT version FROM notes WHERE id=?1",
+                        vec![khive_storage::SqlValue::Text(plan.note_id.to_string())],
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await
                 .map_err(|error| AtomicOpFailure::SqlError {
                     statement_label: Some("note-version-receipt".into()),
@@ -1392,7 +1395,7 @@ mod tests {
                         )),
                     },
                     Self::Terminated(request_state) => {
-                        StorageError::WriterTaskTerminated { request_state }
+                        StorageError::writer_task_terminated(request_state)
                     }
                 }
             }
@@ -1412,7 +1415,7 @@ mod tests {
                     }
                     (
                         Self::Terminated(expected),
-                        StorageError::WriterTaskTerminated { request_state },
+                        StorageError::WriterTaskTerminated { request_state, .. },
                     ) => assert_eq!(request_state, expected),
                     (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
                 }

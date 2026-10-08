@@ -637,7 +637,8 @@ async fn unknown_atomic_write_outcome_omits_usage_from_the_real_envelope() {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
                 ..
             }) | Err(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "{:?}",

@@ -174,14 +174,17 @@ async fn expiry_arm8_timestamp_survives_later_writer_before_reply() {
                 .writer()
                 .await
                 .unwrap()
-                .execute(statement(
-                    "UPDATE notes SET content=?1, updated_at=?2 WHERE id=?3",
-                    vec![
-                        SqlValue::Text("{\"later\":true}".into()),
-                        SqlValue::Integer(prior.updated_at + 100),
-                        SqlValue::Text(id.to_string()),
-                    ],
-                ))
+                .execute(
+                    SqlStatement::new(
+                        "UPDATE notes SET content=?1, updated_at=?2 WHERE id=?3",
+                        vec![
+                            SqlValue::Text("{\"later\":true}".into()),
+                            SqlValue::Integer(prior.updated_at + 100),
+                            SqlValue::Text(id.to_string()),
+                        ],
+                    )
+                    .labelled("stream"),
+                )
                 .await
                 .unwrap();
             captured.lock().unwrap().push(prior);

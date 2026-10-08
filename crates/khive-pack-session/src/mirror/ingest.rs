@@ -140,9 +140,8 @@ pub struct MirrorStats {
 pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = file.metadata()?;
-        Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+        let identity = khive_fs::fd_relative::FileIdentity::of(file)?;
+        Ok(format!("unix:{}:{}", identity.dev, identity.ino))
     }
     #[cfg(windows)]
     {

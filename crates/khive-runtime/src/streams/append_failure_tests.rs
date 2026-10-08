@@ -67,24 +67,16 @@ fn append_proof_uses_typed_finality_and_never_retryability_or_error_text() {
             NotCommitted,
         ),
         (
-            StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::NotStarted,
-            }
-            .into(),
+            StorageError::writer_task_terminated(WriterTaskRequestState::NotStarted).into(),
             NotCommitted,
         ),
         (
-            StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::TransactionRolledBack,
-            }
-            .into(),
+            StorageError::writer_task_terminated(WriterTaskRequestState::TransactionRolledBack)
+                .into(),
             NotCommitted,
         ),
         (
-            StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown,
-            }
-            .into(),
+            StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown).into(),
             Unknown,
         ),
         (
@@ -139,10 +131,7 @@ fn append_proof_uses_typed_finality_and_never_retryability_or_error_text() {
     assert_eq!(preparation.disposition(), NotCommitted);
     assert_eq!(submitted.disposition(), Unknown);
     let unknown = StreamAppendFailure::after_submission(
-        StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        }
-        .into(),
+        StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown).into(),
         true,
     );
     assert_eq!(
