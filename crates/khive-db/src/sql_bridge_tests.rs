@@ -4650,7 +4650,7 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
             }))
             .await;
         assert!(
-            matches!(result, Err(StorageError::WriterTaskTerminated { request_state })
+            matches!(result, Err(StorageError::WriterTaskTerminated { request_state, .. })
                 if request_state == expected),
             "{mode}: {result:?}"
         );

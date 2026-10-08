@@ -85,9 +85,9 @@ impl SqlEventStore {
                 .lose_next_fallback_reply
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown,
-            });
+            return Err(StorageError::writer_task_terminated(
+                WriterTaskRequestState::SideEffectsUnknown,
+            ));
         }
         result
     }
