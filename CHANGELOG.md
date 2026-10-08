@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Entity updates now distinguish an omitted `description` from an explicit `null`: omission
+  keeps the stored value, `null` clears it, and an empty string stays a concrete value. Before,
+  `description: null` was a no-op. Canonical and atomic updates also refuse a present `salience`
+  or `decay_factor`, `null` included, on an entity or edge target, where it used to be ignored;
+  the record is left unchanged and the refusal comes before any sibling field is applied.
+
 ### Removed
 
 - `KhiveRuntime::rerank` is removed. No workspace code called it; its implementation
