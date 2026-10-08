@@ -1,7 +1,7 @@
 //! Additive, caller-attributed traces for refused atom batches. Atom rows are never written here.
 
 use super::schema::{Atom, AtomWrite};
-use super::util::{atom_from_row, validate_atom_content};
+use super::util::{atom_from_row, has_domain_mirror_tag, validate_atom_content};
 use khive_runtime::{
     secret_gate, KhiveRuntime, NamespaceToken, RefusalEventRecording, RefusalRecordingErrorClass,
     RuntimeError,
@@ -118,7 +118,7 @@ pub(super) async fn refuse_batch(
             params, label: Some("knowledge.upsert_atoms.refusal_target".into()),
         }).await;
         let target = match row {
-            Ok(Some(row)) => atom_from_row(&row).filter(|old| !old.tags.contains("type:domain")),
+            Ok(Some(row)) => atom_from_row(&row).filter(|old| !has_domain_mirror_tag(&old.tags)),
             Ok(None) => None,
             Err(_) => {
                 tracing::warn!(

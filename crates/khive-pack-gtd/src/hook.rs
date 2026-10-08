@@ -213,6 +213,7 @@ fn resolve_due_zone(
     // "Asia/Tokyo"}` would discard the spelling that parses and fall through to the stored or
     // configured zone, storing an anchor nobody asked for. A zone the caller wrote is either used
     // or refused.
+    let mut supplied_zone = None;
     for key in ["due_timezone", "timezone"] {
         let Some(value) = properties.get(key).filter(|value| !value.is_null()) else {
             continue;
@@ -222,11 +223,15 @@ fn resolve_due_zone(
                 "{key} must be an IANA zone name string (e.g. \"America/New_York\"); got {value}"
             ))
         })?;
-        return name.parse::<chrono_tz::Tz>().map_err(|_| {
+        let zone = name.parse::<chrono_tz::Tz>().map_err(|_| {
             RuntimeError::InvalidInput(format!(
                 "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
             ))
-        });
+        })?;
+        supplied_zone.get_or_insert(zone);
+    }
+    if let Some(zone) = supplied_zone {
+        return Ok(zone);
     }
     let stored = note
         .properties
