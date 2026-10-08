@@ -11,7 +11,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::AsyncRead;
@@ -1954,10 +1953,7 @@ async fn read_page_checkpoint(
         .await?;
     let floor = match row.as_ref().and_then(|r| r.get("floor")) {
         Some(SqlValue::Text(raw)) => match chrono::DateTime::parse_from_rfc3339(raw) {
-            Ok(dt) => Some(
-                dt.with_timezone(&Utc)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            ),
+            Ok(dt) => Some(khive_runtime::presentation::format_utc_rfc3339_seconds(&dt)),
             Err(_) => {
                 warnings.push(format!(
                     "{kind}: invalid stored timestamp cursor; restarting the window"
@@ -3513,10 +3509,7 @@ fn canonical_issue_timestamp(
 ) -> Option<String> {
     let raw = raw?;
     match chrono::DateTime::parse_from_rfc3339(&raw) {
-        Ok(dt) => Some(
-            dt.with_timezone(&Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        Ok(dt) => Some(khive_runtime::presentation::format_utc_rfc3339_seconds(&dt)),
         Err(_) => {
             warnings.push(format!(
                 "issue #{number}: {field} is not a valid RFC3339 timestamp, field dropped"
@@ -3749,10 +3742,7 @@ fn canonical_pr_updated_at(
 ) -> Option<String> {
     let raw = raw?;
     match chrono::DateTime::parse_from_rfc3339(&raw) {
-        Ok(dt) => Some(
-            dt.with_timezone(&Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        Ok(dt) => Some(khive_runtime::presentation::format_utc_rfc3339_seconds(&dt)),
         Err(_) => {
             warnings.push(format!(
                 "pull request #{number}: updatedAt is not a valid RFC3339 timestamp, field dropped"
