@@ -7,6 +7,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 
 use crate::types::{PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
+use crate::StorageError;
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -96,6 +97,20 @@ pub trait SqlReader: Send + 'static {
     }
     /// Execute `statement` and return the first column of the first row as a scalar.
     async fn query_scalar(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlValue>>;
+    /// Execute a count statement and return its nonnegative integer scalar as `u64`.
+    ///
+    /// The default passes `statement` unchanged to [`Self::query_scalar`] exactly
+    /// once. It does not parse SQL or verify that the statement uses `COUNT`.
+    /// A negative integer, missing row, NULL, or non-integer scalar returns
+    /// [`StorageError::Internal`]; backend errors pass through unchanged.
+    async fn count(&mut self, statement: SqlStatement) -> StorageResult<u64> {
+        match self.query_scalar(statement).await? {
+            Some(SqlValue::Integer(value)) if value >= 0 => Ok(value as u64),
+            _ => Err(StorageError::Internal(
+                "SQL count expected a nonnegative integer scalar".into(),
+            )),
+        }
+    }
     /// Run `EXPLAIN QUERY PLAN` for `statement` and return the plan rows.
     async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>>;
 }
