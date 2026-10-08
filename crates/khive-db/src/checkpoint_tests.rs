@@ -2727,6 +2727,7 @@ fn checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held() {
 fn all_checkpoint_metrics_callers_are_serial_tagged() {
     let sources = [
         include_str!("checkpoint.rs"),
+        include_str!("checkpoint/run_state.rs"),
         include_str!("checkpoint_tests.rs"),
         include_str!("checkpoint/churn_tests.rs"),
         include_str!("checkpoint_owner_interval_tests.rs"),

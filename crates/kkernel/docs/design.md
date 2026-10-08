@@ -136,7 +136,7 @@
 
 ### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
 
-`exec.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
+`exec/ops_file_apply.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
 whose reader or model resources cannot safely serve multiple handlers at once.
 The complete source is first validated into the same byte-bounded stable
 snapshot, including a whole-snapshot typed-JSON structural preflight, before

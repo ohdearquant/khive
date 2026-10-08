@@ -2817,6 +2817,7 @@ async fn hydrate_atoms_statement_still_scopes_by_namespace() {
 fn knowledge_ann_query_paths_use_query_intent_embed() {
     let src = [
         include_str!("search.rs"),
+        include_str!("search/ann_search.rs"),
         include_str!("search/compose_packing.rs"),
     ]
     .join("\n");
