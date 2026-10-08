@@ -18,8 +18,8 @@ use super::search::HYDRATION_ID_CHUNK;
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
-    domain_to_json, new_id, now_us, row_i64, row_str, sql_err, status_sql_clause, status_values,
-    tags_to_json, validate_atom_content,
+    domain_to_json, has_domain_mirror_tag, new_id, now_us, row_i64, row_str, sql_err,
+    status_sql_clause, status_values, tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
 
@@ -1305,7 +1305,7 @@ impl KnowledgeHandlers {
                     .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
                 for row in &rows {
                     let tags = row_str(row, "tags").unwrap_or_default();
-                    if tags.contains("type:domain") {
+                    if has_domain_mirror_tag(&tags) {
                         mirrors.extend(row_str(row, "id"));
                         mirrors.extend(row_str(row, "slug"));
                     }
