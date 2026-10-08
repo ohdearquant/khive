@@ -149,13 +149,16 @@ impl KhiveRuntime {
                 note.id,
             ));
         }
-        statements.push(crate::note_write::statement(
-            "DELETE FROM notes WHERE namespace=?1 AND id=?2",
-            vec![
-                SqlValue::Text(note.namespace.clone()),
-                SqlValue::Text(note.id.to_string()),
-            ],
-        ));
+        statements.push(
+            SqlStatement::new(
+                "DELETE FROM notes WHERE namespace=?1 AND id=?2",
+                vec![
+                    SqlValue::Text(note.namespace.clone()),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        );
         statements.push(
             khive_db::stores::attachment::delete_record_attachments_statement(
                 note.id,
@@ -181,10 +184,10 @@ impl KhiveRuntime {
         let purge = crate::note_write::NoteVectors::new(namespace.clone(), note.id);
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
-                let current = writer.query_scalar(crate::note_write::statement(
+                let current = writer.query_scalar(SqlStatement::new(
                 "SELECT version FROM notes WHERE namespace=?1 AND id=?2 AND deleted_at IS NULL",
                 vec![SqlValue::Text(namespace), SqlValue::Text(id)],
-            )).await?;
+            ).labelled("note-write-guard")).await?;
                 if !matches!(current, Some(SqlValue::Integer(current)) if current == version) {
                     return Ok(Box::new(NoteIndexRevision {
                         applied: false,
@@ -199,10 +202,10 @@ impl KhiveRuntime {
                 }
                 let ann_write_log_seq = if capture_ann_seq {
                     match writer
-                        .query_scalar(crate::note_write::statement(
-                            "SELECT last_insert_rowid()",
-                            Vec::new(),
-                        ))
+                        .query_scalar(
+                            SqlStatement::new("SELECT last_insert_rowid()", Vec::new())
+                                .labelled("note-write-guard"),
+                        )
                         .await?
                     {
                         Some(SqlValue::Integer(seq)) => Some(seq),

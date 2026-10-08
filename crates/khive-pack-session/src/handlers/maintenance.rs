@@ -36,14 +36,6 @@ const TABLE_BYTES_SQL: &str = "SELECT d.name AS name, s.tbl_name AS owner, d.pgs
        OR s.tbl_name GLOB 'session_messages_fts_*' \
        OR d.name = 'session_messages_fts')";
 
-fn statement(sql: &str, label: &str) -> SqlStatement {
-    SqlStatement {
-        sql: sql.to_owned(),
-        params: vec![],
-        label: Some(label.to_owned()),
-    }
-}
-
 fn nonnegative(value: i64, field: &str) -> Result<u64, RuntimeError> {
     u64::try_from(value)
         .map_err(|_| RuntimeError::Internal(format!("session maintenance: negative {field}")))
@@ -72,7 +64,10 @@ async fn scalar_u64<R: SqlReader + ?Sized>(
     sql: &str,
     field: &str,
 ) -> Result<u64, RuntimeError> {
-    match reader.query_scalar(statement(sql, field)).await? {
+    match reader
+        .query_scalar(SqlStatement::new(sql, vec![]).labelled(field))
+        .await?
+    {
         Some(SqlValue::Integer(value)) => nonnegative(value, field),
         _ => Err(RuntimeError::Internal(format!(
             "session maintenance: missing integer {field}"
@@ -146,7 +141,7 @@ pub(crate) async fn handle_stats(
 
     let mut table_bytes = [0u64; 4];
     let objects = reader
-        .query_all(statement(TABLE_BYTES_SQL, "session_table_bytes"))
+        .query_all(SqlStatement::new(TABLE_BYTES_SQL, vec![]).labelled("session_table_bytes"))
         .await
         .map_err(|error| {
             RuntimeError::Internal(format!(

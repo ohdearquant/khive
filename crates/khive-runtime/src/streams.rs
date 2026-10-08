@@ -37,14 +37,6 @@ use crate::{
 #[cfg(test)]
 mod append_failure_tests;
 
-fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
-    SqlStatement {
-        sql: sql.into(),
-        params,
-        label: Some("stream".into()),
-    }
-}
-
 fn validate_stream(stream: &str) -> RuntimeResult<()> {
     if stream.len() > 512 || stream.contains('\0') {
         return Err(RuntimeError::InvalidInput(
@@ -612,15 +604,18 @@ async fn insert_stream_entry(
     note_id: String,
 ) -> Result<(), StorageError> {
     writer
-        .execute(statement(
-            "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
-            vec![
-                SqlValue::Text(namespace.into()),
-                SqlValue::Text(stream),
-                SqlValue::Integer(seq),
-                SqlValue::Text(note_id),
-            ],
-        ))
+        .execute(
+            SqlStatement::new(
+                "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
+                vec![
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(stream),
+                    SqlValue::Integer(seq),
+                    SqlValue::Text(note_id),
+                ],
+            )
+            .labelled("stream"),
+        )
         .await?;
     Ok(())
 }
@@ -643,10 +638,10 @@ async fn apply_stream_member(
             let head = match heads.entry(stream.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let head = writer.query_scalar(statement(
+                    let head = writer.query_scalar(SqlStatement::new(
                         "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
                         vec![SqlValue::Text(namespace.into()), SqlValue::Text(stream.clone())],
-                    )).await?;
+                    ).labelled("stream")).await?;
                     let Some(SqlValue::Integer(head)) = head else {
                         return Err(RuntimeError::Internal("invalid stream head".into()));
                     };
@@ -703,10 +698,10 @@ async fn apply_stream_member(
             }
             Err(AtomicOpFailure::NoteConflict(conflict)) => Err(conflict.into_error().into()),
             Err(AtomicOpFailure::GuardFailed { .. }) => {
-                let holder = writer.query_row(statement(
+                let holder = writer.query_row(SqlStatement::new(
                         "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
                         vec![SqlValue::Text(namespace.into()), SqlValue::Text(kind), SqlValue::Text(key.clone())],
-                    )).await?;
+                    ).labelled("stream")).await?;
                 let Some(holder) = holder else {
                     return Err(missing_write(&key).into());
                 };
@@ -879,10 +874,10 @@ impl KhiveRuntime {
                         continue;
                     }
                     let head = writer
-                        .query_scalar(statement(
+                        .query_scalar(SqlStatement::new(
                             "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
                             vec![SqlValue::Text(ns.clone()), SqlValue::Text(stream.clone())],
-                        ))
+                        ).labelled("stream"))
                         .await?;
                     let Some(SqlValue::Integer(head)) = head else {
                         return Err(write_failure("invalid stream head"));
@@ -1447,13 +1442,13 @@ impl KhiveRuntime {
             ));
         }
         let mut reader = self.sql().reader().await?;
-        let rows = reader.query_all(statement(
+        let rows = reader.query_all(SqlStatement::new(
             "WITH head AS (SELECT COALESCE(MAX(seq),0) AS head_seq FROM note_streams WHERE namespace=?1 AND stream=?2), \
              page AS (SELECT s.seq,n.id,n.content,n.created_at FROM note_streams s JOIN notes n ON n.id=s.note_id \
                       WHERE s.namespace=?1 AND s.stream=?2 AND s.seq>?3 ORDER BY s.seq LIMIT ?4) \
              SELECT head.head_seq,page.seq,page.id,page.content,page.created_at FROM head LEFT JOIN page ON 1=1 ORDER BY page.seq",
             vec![SqlValue::Text(token.namespace().as_str().into()), SqlValue::Text(stream.into()), SqlValue::Integer(after), SqlValue::Integer(limit)],
-        )).await?;
+        ).labelled("stream")).await?;
         let head = rows
             .first()
             .map(|row| {
@@ -1487,10 +1482,10 @@ impl KhiveRuntime {
     /// Independently count entries and read the head in the same statement.
     pub async fn stream_stat(&self, token: &NamespaceToken, stream: &str) -> RuntimeResult<Value> {
         validate_stream(stream)?;
-        let row = self.sql().reader().await?.query_row(statement(
+        let row = self.sql().reader().await?.query_row(SqlStatement::new(
             "SELECT COUNT(*) AS count, COALESCE(MAX(seq),0) AS head_seq FROM note_streams WHERE namespace=?1 AND stream=?2",
             vec![SqlValue::Text(token.namespace().as_str().into()), SqlValue::Text(stream.into())],
-        )).await?.ok_or_else(|| RuntimeError::Internal("stream.stat returned no aggregate row".into()))?;
+        ).labelled("stream")).await?.ok_or_else(|| RuntimeError::Internal("stream.stat returned no aggregate row".into()))?;
         Ok(
             json!({"head_seq": row.i64("head_seq").map_err(|_| RuntimeError::Internal("stream query missing integer head_seq".to_owned()))?, "count": row.i64("count").map_err(|_| RuntimeError::Internal("stream query missing integer count".to_owned()))?}),
         )
@@ -1506,13 +1501,16 @@ impl KhiveRuntime {
             .sql()
             .reader()
             .await?
-            .query_row(statement(
-                "SELECT stream,seq FROM note_streams WHERE namespace=?1 AND note_id=?2",
-                vec![
-                    SqlValue::Text(note.namespace.clone()),
-                    SqlValue::Text(note.id.to_string()),
-                ],
-            ))
+            .query_row(
+                SqlStatement::new(
+                    "SELECT stream,seq FROM note_streams WHERE namespace=?1 AND note_id=?2",
+                    vec![
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(note.id.to_string()),
+                    ],
+                )
+                .labelled("stream"),
+            )
             .await?;
         row.map(|row| {
             Ok(KhiveError::conflict("stream entries are immutable")

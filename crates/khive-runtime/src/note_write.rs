@@ -294,11 +294,14 @@ impl NoteVectors {
         // vec_* is the backend's reserved vector-table namespace. Catalog
         // types exclude sqlite-vec shadow tables without guessing suffixes.
         let tables = writer
-            .query_all(statement(
-                "SELECT name FROM pragma_table_list \
+            .query_all(
+                SqlStatement::new(
+                    "SELECT name FROM pragma_table_list \
              WHERE schema='main' AND type='virtual' AND name GLOB 'vec_*' ORDER BY name",
-                vec![],
-            ))
+                    vec![],
+                )
+                .labelled("note-write-guard"),
+            )
             .await?;
         let mut names = Vec::with_capacity(tables.len());
         for row in tables {
@@ -322,15 +325,18 @@ impl NoteVectors {
     pub(crate) async fn has_rows(&self, writer: &mut dyn SqlWriter) -> Result<bool, StorageError> {
         for table in Self::tables(writer).await? {
             if writer
-                .query_scalar(statement(
-                    format!(
+                .query_scalar(
+                    SqlStatement::new(
+                        format!(
                         "SELECT 1 FROM main.{table} WHERE namespace=?1 AND subject_id=?2 LIMIT 1"
                     ),
-                    vec![
-                        SqlValue::Text(self.namespace.clone()),
-                        SqlValue::Text(self.subject_id.to_string()),
-                    ],
-                ))
+                        vec![
+                            SqlValue::Text(self.namespace.clone()),
+                            SqlValue::Text(self.subject_id.to_string()),
+                        ],
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?
                 .is_some()
             {
@@ -347,33 +353,42 @@ impl NoteVectors {
                 SqlValue::Text(self.subject_id.to_string()),
             ];
             writer
-                .execute(statement(
-                    format!(
+                .execute(
+                    SqlStatement::new(
+                        format!(
                 "INSERT INTO ann_write_log (namespace,embedding_model,kind,field,subject_id,op) \
                  SELECT namespace,embedding_model,kind,field,subject_id,'delete' \
                  FROM main.{table} WHERE namespace=?1 AND subject_id=?2"),
-                    scope.clone(),
-                ))
+                        scope.clone(),
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?;
             writer
-                .execute(statement(
-                    format!("DELETE FROM main.{table} WHERE namespace=?1 AND subject_id=?2"),
-                    scope,
-                ))
+                .execute(
+                    SqlStatement::new(
+                        format!("DELETE FROM main.{table} WHERE namespace=?1 AND subject_id=?2"),
+                        scope,
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?;
             let model_key = table.strip_prefix("vec_").ok_or_else(|| {
                 StorageError::Internal("invalid persisted vector table name".into())
             })?;
             writer
-                .execute(statement(
-                    "DELETE FROM vector_provenance \
+                .execute(
+                    SqlStatement::new(
+                        "DELETE FROM vector_provenance \
                      WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
-                    vec![
-                        SqlValue::Text(model_key.to_string()),
-                        SqlValue::Text(self.namespace.clone()),
-                        SqlValue::Text(self.subject_id.to_string()),
-                    ],
-                ))
+                        vec![
+                            SqlValue::Text(model_key.to_string()),
+                            SqlValue::Text(self.namespace.clone()),
+                            SqlValue::Text(self.subject_id.to_string()),
+                        ],
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?;
         }
         Ok(())
@@ -550,14 +565,6 @@ impl NoteWriteConflict {
     }
 }
 
-pub(crate) fn statement(sql: impl Into<String>, params: Vec<SqlValue>) -> SqlStatement {
-    SqlStatement {
-        sql: sql.into(),
-        params,
-        label: Some("note-write-guard".into()),
-    }
-}
-
 impl NoteWriteGuard {
     pub(crate) async fn check_fence(
         &self,
@@ -659,15 +666,18 @@ impl NoteWriteGuard {
             // guarded INSERT just contended on. Never a later, separate
             // lookup after the transaction has settled.
             let holder = writer
-                .query_row(statement(
-                    "SELECT id, content, properties FROM notes \
+                .query_row(
+                    SqlStatement::new(
+                        "SELECT id, content, properties FROM notes \
                      WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
-                    vec![
-                        SqlValue::Text(self.namespace.clone()),
-                        SqlValue::Text(claim.kind.clone()),
-                        SqlValue::Text(claim.key.clone()),
-                    ],
-                ))
+                        vec![
+                            SqlValue::Text(self.namespace.clone()),
+                            SqlValue::Text(claim.kind.clone()),
+                            SqlValue::Text(claim.key.clone()),
+                        ],
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?;
             if let Some(row) = holder {
                 let existing_id = match row.get("id") {
@@ -724,10 +734,13 @@ impl NoteWriteGuard {
         }
         if let Some(expected) = self.expected_version {
             let current = writer
-                .query_scalar(statement(
-                    "SELECT version FROM notes WHERE id=?1 AND deleted_at IS NULL",
-                    vec![SqlValue::Text(self.target_id.to_string())],
-                ))
+                .query_scalar(
+                    SqlStatement::new(
+                        "SELECT version FROM notes WHERE id=?1 AND deleted_at IS NULL",
+                        vec![SqlValue::Text(self.target_id.to_string())],
+                    )
+                    .labelled("note-write-guard"),
+                )
                 .await?;
             if let Some(SqlValue::Integer(current)) = current {
                 if current != expected {

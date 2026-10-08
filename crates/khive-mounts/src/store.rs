@@ -5,14 +5,6 @@ use khive_storage::{AtomicUnitOp, Event, SqlAccess, SqlStatement, SqlValue};
 
 use crate::error::Failure;
 
-fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
-    SqlStatement {
-        sql: sql.into(),
-        params,
-        label: Some("tool_source_mount".into()),
-    }
-}
-
 pub(crate) async fn load(
     sql: &Arc<dyn SqlAccess>,
     name: &str,
@@ -20,10 +12,13 @@ pub(crate) async fn load(
     let row = sql
         .reader()
         .await?
-        .query_row(statement(
-            "SELECT generation, tools FROM tool_source_mounts WHERE name = ?1",
-            vec![SqlValue::Text(name.into())],
-        ))
+        .query_row(
+            SqlStatement::new(
+                "SELECT generation, tools FROM tool_source_mounts WHERE name = ?1",
+                vec![SqlValue::Text(name.into())],
+            )
+            .labelled("tool_source_mount"),
+        )
         .await?;
     let Some(row) = row else { return Ok(None) };
     let (Some(SqlValue::Integer(generation)), Some(SqlValue::Text(tools))) =
@@ -46,10 +41,10 @@ pub(crate) async fn initialize(
 ) -> Result<(), RuntimeError> {
     let tools = serde_json::to_string(tools)
         .map_err(|_| Failure::error("catalog_unavailable").wire(name))?;
-    sql.writer().await?.execute(statement(
+    sql.writer().await?.execute(SqlStatement::new(
         "INSERT INTO tool_source_mounts(name, generation, tools) VALUES (?1, 1, ?2) ON CONFLICT(name) DO NOTHING",
         vec![SqlValue::Text(name.into()), SqlValue::Text(tools)],
-    )).await?;
+    ).labelled("tool_source_mount")).await?;
     Ok(())
 }
 
@@ -62,10 +57,10 @@ pub(crate) async fn replace(
 ) -> Result<(), RuntimeError> {
     let tools = serde_json::to_string(tools)
         .map_err(|_| Failure::error("catalog_unavailable").wire(name))?;
-    let update = statement(
+    let update = SqlStatement::new(
         "UPDATE tool_source_mounts SET tools = ?1, generation = generation + 1 WHERE name = ?2 AND generation = ?3 AND generation < 9223372036854775807",
         vec![SqlValue::Text(tools), SqlValue::Text(name.into()), SqlValue::Integer(generation)],
-    );
+    ).labelled("tool_source_mount");
     let audit = khive_db::stores::event::event_insert_statements(audit)
         .map_err(|_| Failure::error("audit_unavailable").wire(name))?;
     // Serialization, catalog discovery and audit preparation precede the writer.
