@@ -412,7 +412,10 @@ where
                         RollbackDisposition::SideEffectsUnknown => {
                             let request_state = WriterTaskRequestState::SideEffectsUnknown;
                             ProfiledWrappedTransaction {
-                                result: Err(writer_task_terminated(request_state)),
+                                result: Err(writer_task_terminated_with_cause(
+                                    request_state,
+                                    &commit_error,
+                                )),
                                 terminal_state: Some(request_state),
                                 body,
                                 commit,
@@ -435,14 +438,17 @@ where
                 },
                 RollbackDisposition::SideEffectsUnknown => {
                     // SQLite may have already rolled back a failed transaction,
-                    // leaving no cause on the terminal error returned to callers.
-                    // Escalate SQLITE_FULL while the original error is still here.
+                    // leaving no transaction for the explicit ROLLBACK.
+                    // Escalate the original cause once; retain native FULL evidence below.
                     if let Some(db) = db {
                         crate::timeout_sink::maybe_emit_sqlite_full(db, &operation_error);
                     }
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
                     ProfiledWrappedTransaction {
-                        result: Err(writer_task_terminated(request_state)),
+                        result: Err(writer_task_terminated_with_cause(
+                            request_state,
+                            &operation_error,
+                        )),
                         terminal_state: Some(request_state),
                         body,
                         commit: Duration::ZERO,
@@ -616,7 +622,32 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
 }
 
 fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError {
-    StorageError::WriterTaskTerminated { request_state }
+    StorageError::writer_task_terminated(request_state)
+}
+
+fn writer_task_terminated_with_cause(
+    request_state: WriterTaskRequestState,
+    error: &(dyn std::error::Error + 'static),
+) -> StorageError {
+    let mut source = Some(error);
+    let mut sqlite_full_codes = None;
+    while let Some(current) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            current.downcast_ref::<rusqlite::Error>()
+        {
+            if code.code == rusqlite::ErrorCode::DiskFull {
+                sqlite_full_codes = Some((code.extended_code & 0xff, code.extended_code));
+                break;
+            }
+        }
+        source = current.source();
+    }
+    // The original error was already escalated at the failing boundary.
+    // A source-free pair preserves caller evidence without duplicating that sink event.
+    StorageError::WriterTaskTerminated {
+        request_state,
+        sqlite_full_codes,
+    }
 }
 
 fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> StorageError {
@@ -1425,11 +1456,57 @@ mod tests {
         expected: WriterTaskRequestState,
     ) {
         match result {
-            Err(StorageError::WriterTaskTerminated { request_state }) => {
+            Err(StorageError::WriterTaskTerminated { request_state, .. }) => {
                 assert_eq!(request_state, expected)
             }
             other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn terminal_native_full_evidence_uses_the_original_error_chain() {
+        let extended = rusqlite::ffi::SQLITE_FULL | (3 << 8);
+        let native = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended),
+            Some("synthetic classifier control".into()),
+        );
+        let wrapped = StorageError::driver(khive_storage::StorageCapability::Sql, "nested", native);
+        let error =
+            writer_task_terminated_with_cause(WriterTaskRequestState::SideEffectsUnknown, &wrapped);
+        assert!(matches!(error, StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+            sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, code)),
+        } if code == extended));
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "evidence must not replay the original sink cause"
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(error.capability(), None);
+
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_IOERR] {
+            let native = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database or disk is full".into()),
+            );
+            assert!(matches!(
+                writer_task_terminated_with_cause(
+                    WriterTaskRequestState::SideEffectsUnknown,
+                    &native
+                ),
+                StorageError::WriterTaskTerminated {
+                    sqlite_full_codes: None,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            writer_task_terminated(WriterTaskRequestState::NotStarted),
+            StorageError::WriterTaskTerminated {
+                sqlite_full_codes: None,
+                ..
+            }
+        ));
     }
 
     struct ParkedWake {

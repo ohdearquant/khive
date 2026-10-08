@@ -1509,9 +1509,9 @@ fn read_response_err_preserves_stored_null_properties() {
 fn read_response_side_effects_unknown_reports_unknown_not_failed() {
     let original = json!({ "direction": "inbound", "read": false });
     let patched = json!({ "direction": "inbound", "read": true });
-    let err = StorageError::WriterTaskTerminated {
-        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-    };
+    let err = StorageError::writer_task_terminated(
+        khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+    );
     let err_text = err.to_string();
     let resp = read_response(
         "abc123".to_string(),
@@ -1541,9 +1541,9 @@ fn read_response_side_effects_unknown_reports_unknown_not_failed() {
 fn read_response_writer_task_terminated_rolled_back_still_reports_failed() {
     let original = json!({ "direction": "inbound", "read": false });
     let patched = json!({ "direction": "inbound", "read": true });
-    let err = StorageError::WriterTaskTerminated {
-        request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
-    };
+    let err = StorageError::writer_task_terminated(
+        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+    );
     let resp = read_response(
         "abc123".to_string(),
         "full-uuid".to_string(),

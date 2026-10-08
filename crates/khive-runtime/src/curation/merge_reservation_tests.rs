@@ -324,7 +324,7 @@ fn merge_reservation_error_mapping_preserves_other_sources_and_request_states() 
                 assert_eq!(format!("{after:?}"), before, "{record:?}/{request_state:?}");
             }
 
-            let error = StorageError::WriterTaskTerminated { request_state };
+            let error = StorageError::writer_task_terminated(request_state);
             let before = format!("{error:?}");
             let RuntimeError::Storage(after) = record.map_error(error) else {
                 panic!("terminal writer outcomes must not become semantic refusals");

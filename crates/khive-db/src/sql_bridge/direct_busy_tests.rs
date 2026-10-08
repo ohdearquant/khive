@@ -150,10 +150,9 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                         match mode {
                             0 => Ok(Box::new(()) as Box<dyn Any + Send>),
                             1 => Err(error),
-                            _ => Err(StorageError::WriterTaskTerminated {
-                                request_state:
-                                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                            }),
+                            _ => Err(StorageError::writer_task_terminated(
+                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                            )),
                         }
                     })
                 }))
@@ -191,6 +190,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                         StorageError::WriterTaskTerminated {
                             request_state:
                                 khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                            ..
                         }
                     ));
                     assert_eq!(

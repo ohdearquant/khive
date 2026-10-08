@@ -2617,6 +2617,7 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "a failed rollback cannot claim that the attempted write did not land"
@@ -2658,6 +2659,7 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "a panic whose rollback cannot be verified must report unknown side effects"
@@ -2691,6 +2693,7 @@ async fn pooled_transaction_refuses_preexisting_non_autocommit_connection() {
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "an inherited transaction has an unknown prior outcome and must fail closed"

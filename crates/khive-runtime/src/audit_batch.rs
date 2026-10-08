@@ -546,7 +546,7 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
             }
             WriterTaskRequestState::SideEffectsUnknown => RetryDecision::Retry,
         },
-        StorageError::WriterTaskTerminated { request_state } => match request_state {
+        StorageError::WriterTaskTerminated { request_state, .. } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }

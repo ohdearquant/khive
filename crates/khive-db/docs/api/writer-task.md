@@ -85,6 +85,15 @@ projected as `NotStarted`). The task preserves its terminal reply and closes and
 fails the queued requests without restarting. A cleanup failure does not turn an
 unknown outcome into an ordinary capacity refusal.
 
+When native `SQLITE_FULL` automatically ends an admitted transaction, the
+shared finalizer retains its primary and extended codes on the terminal outcome.
+The request remains `SideEffectsUnknown`, the writer still retires, and caller
+projection reports `sqlite_disk_full` rather than a capacity refusal. The
+original operation or COMMIT error is escalated once before it is discarded;
+the retained code pair is not an error source, so the outer sink hook does not
+emit it again. Ordinary terminal failures carry no pair. COMMIT failures whose
+rollback succeeds keep their existing request-failed pool-error representation.
+
 The two migration bootstrap writes happen before a migration transaction exists:
 `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
 `bootstrap_migration_ledger` executes `MIGRATION_TRACKING_TABLE`. Their admitted

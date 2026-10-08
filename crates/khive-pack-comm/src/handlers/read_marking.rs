@@ -402,6 +402,7 @@ fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFail
     match error {
         khive_storage::StorageError::WriterTaskTerminated {
             request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            ..
         } => MarkReadFailure::Unknown,
         _ => MarkReadFailure::Failed,
     }

@@ -2047,9 +2047,9 @@ impl PackRuntime for ErrorInjectPack {
         }
         if verb == "writer_task_side_effects_unknown" {
             return Err(RuntimeError::Storage(
-                khive_storage::StorageError::WriterTaskTerminated {
-                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                },
+                khive_storage::StorageError::writer_task_terminated(
+                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                ),
             ));
         }
         if verb == "storage_admission_timeout" {

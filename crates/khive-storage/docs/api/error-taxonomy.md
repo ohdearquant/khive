@@ -14,16 +14,16 @@ when `PoolConfig::write_queue_enabled` is set.
 
 ## Writer-request finality
 
-`WriterTaskTerminated { request_state }` is the public error returned when a
+`WriterTaskTerminated { request_state, sqlite_full_codes }` is the public error returned when a
 single-writer request cannot complete because its writer-task instance has terminated or the
 legacy pool-mutex writer has been retired after a terminal transaction fault. The state reports
 what the execution seam can prove about the individual request:
 
-| State                   | Meaning                                                                                                                 |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure            |
-| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed       |
-| `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                    |
+| State                   | Meaning                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure        |
+| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed |
+| `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                |
 
 A top-level operation has no enclosing transaction, so a panic is always
 `SideEffectsUnknown`. An unexpected loss of the typed reply for an accepted
@@ -64,13 +64,33 @@ whether the writer seam terminated. MCP serializes that context with stable
 `request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
 request-failed versus task-terminated disposition and reconstructs the matching storage variant.
 
+A terminal operation or COMMIT failure caused by native SQLite FULL retains its
+primary and extended codes in `sqlite_full_codes`. Other terminal outcomes carry
+`None`; `StorageError::writer_task_terminated(request_state)` constructs that
+evidence-free form. The pair is not an error source and does not repeat the
+original cause's FULL escalation. It changes neither request finality nor retry
+policy. A native FULL that automatically ended SQLite's transaction still
+reports `SideEffectsUnknown` and retires the writer.
+
+Runtime projection recognizes only a nonnegative extended code whose low byte
+equals the supplied `SQLITE_FULL` primary code. It reports `sqlite_disk_full`
+with both codes, `capability: sql`, and the same terminal-state fields; the
+storage variant's `capability()` remains `None`. The events socket carries the
+optional pair, while frames without it keep the historical terminal projection.
+A COMMIT failure followed by a proven rollback still uses the existing
+`WriterTaskRequestFailed` / pool-error representation; this terminal repair
+does not change that path or domain-specific ambiguous-outcome adapters.
+
 The rendered forms remain stable:
 
 - `writer task request failed (request_state=<state>): <source>`
 - `writer task terminated (request_state=<state>)`
 
 `StorageError` is a public enum without `#[non_exhaustive]`, so
-`WriterTaskRequestFailed` is a Rust source-compatibility change for downstream exhaustive matches.
+`WriterTaskRequestFailed` and the added terminal evidence field are Rust
+source-compatibility changes for downstream exhaustive patterns or literal
+constructors. Use the terminal factory for outcomes without native evidence and
+`..` in patterns that inspect only request state.
 
 ## Bounded blob read failures
 
@@ -160,7 +180,7 @@ budgets are capability-neutral and no separate backoff policy is defined.
 `pool_identity: Option<String>` identifies the database of the refusing pool when
 known. MCP includes a `pool_identity` string only for `Some`; `None` leaves the
 existing wire fields and message unchanged. When present, Display appends
-` (pool: {identity})` without changing `operation`. A `ConnectionPool` supplies
+`(pool: {identity})` preceded by a space, without changing `operation`. A `ConnectionPool` supplies
 only the canonical file name (lossy for non-UTF-8 names), or `:memory:` for an
 in-memory database. No directory is reported, including on local stdio servers.
 When distinct canonical paths with the same rendered file name are open in the

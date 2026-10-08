@@ -1395,7 +1395,7 @@ mod tests {
                         )),
                     },
                     Self::Terminated(request_state) => {
-                        StorageError::WriterTaskTerminated { request_state }
+                        StorageError::writer_task_terminated(request_state)
                     }
                 }
             }
@@ -1415,7 +1415,7 @@ mod tests {
                     }
                     (
                         Self::Terminated(expected),
-                        StorageError::WriterTaskTerminated { request_state },
+                        StorageError::WriterTaskTerminated { request_state, .. },
                     ) => assert_eq!(request_state, expected),
                     (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
                 }

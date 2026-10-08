@@ -681,8 +681,14 @@ pub enum EventsResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireWriterTaskFailure {
-    RequestFailed { request_state: WireWriterTaskState },
-    TaskTerminated { request_state: WireWriterTaskState },
+    RequestFailed {
+        request_state: WireWriterTaskState,
+    },
+    TaskTerminated {
+        request_state: WireWriterTaskState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sqlite_full_codes: Option<(i32, i32)>,
+    },
 }
 
 /// Wire mirror of [`khive_storage::WriterTaskRequestState`]. A separate type
@@ -1707,10 +1713,14 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
                 request_state: (*request_state).into(),
             }),
         ),
-        StorageError::WriterTaskTerminated { request_state } => (
+        StorageError::WriterTaskTerminated {
+            request_state,
+            sqlite_full_codes,
+        } => (
             error.to_string(),
             Some(WireWriterTaskFailure::TaskTerminated {
                 request_state: (*request_state).into(),
+                sqlite_full_codes: *sqlite_full_codes,
             }),
         ),
         _ => (error.to_string(), None),
@@ -2329,11 +2339,13 @@ impl ForwardingEventStore {
                                 source: Box::new(source),
                             }
                         }
-                        WireWriterTaskFailure::TaskTerminated { request_state } => {
-                            StorageError::WriterTaskTerminated {
-                                request_state: request_state.into(),
-                            }
-                        }
+                        WireWriterTaskFailure::TaskTerminated {
+                            request_state,
+                            sqlite_full_codes,
+                        } => StorageError::WriterTaskTerminated {
+                            request_state: request_state.into(),
+                            sqlite_full_codes,
+                        },
                     }
                 } else if retryable {
                     StorageError::Pool {
@@ -2698,6 +2710,10 @@ impl EventStore for SplitEventStore {
 }
 
 #[cfg(test)]
+#[path = "events_split_sqlite_full_tests.rs"]
+mod sqlite_full_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2938,15 +2954,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn side_effects_unknown_state_crosses_the_wire_as_terminal_failure() {
-        let response = storage_error_response(&StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let response = storage_error_response(&StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
         assert!(
             matches!(
                 response,
                 EventsResponse::Error {
                     writer_task_failure: Some(WireWriterTaskFailure::TaskTerminated {
                         request_state: WireWriterTaskState::SideEffectsUnknown,
+                        sqlite_full_codes: None,
                     }),
                     ..
                 }
@@ -3171,9 +3188,7 @@ mod tests {
             S::TransactionRolledBack,
             S::SideEffectsUnknown,
         ] {
-            let response = storage_error_response(&StorageError::WriterTaskTerminated {
-                request_state: state,
-            });
+            let response = storage_error_response(&StorageError::writer_task_terminated(state));
             // Round-trip through serde like the socket does.
             let bytes = serde_json::to_vec(&response).unwrap();
             let parsed: EventsResponse = serde_json::from_slice(&bytes).unwrap();
@@ -3181,7 +3196,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    StorageError::WriterTaskTerminated { request_state } if request_state == state
+                    StorageError::WriterTaskTerminated { request_state, .. } if request_state == state
                 ),
                 "state {state:?} did not survive the socket: got {err:?}"
             );
@@ -3440,9 +3455,9 @@ mod tests {
         );
         // A terminated writer task is not retryable per the storage layer's
         // own classifier; the wire response must agree rather than widen it.
-        let terminated = storage_error_response(&StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let terminated = storage_error_response(&StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
         assert!(
             matches!(
                 terminated,

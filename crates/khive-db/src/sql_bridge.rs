@@ -3404,18 +3404,16 @@ impl khive_storage::SqlAccess for SqlBridge {
                     let conn = guard.conn();
                     if !conn.is_autocommit() {
                         pool.retire_pooled_writer(conn);
-                        return Err(StorageError::WriterTaskTerminated {
-                            request_state:
-                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                        });
+                        return Err(StorageError::writer_task_terminated(
+                            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                        ));
                     }
                     if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
                         if !conn.is_autocommit() {
                             pool.retire_pooled_writer(conn);
-                            return Err(StorageError::WriterTaskTerminated {
-                                request_state:
-                                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                            });
+                            return Err(StorageError::writer_task_terminated(
+                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                            ));
                         }
                         return Err(map_rusqlite_err(error, "atomic_unit.begin"))
                             .inspect_err(|error| pool.record_direct_writer_error(error));

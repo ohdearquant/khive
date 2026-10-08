@@ -886,14 +886,14 @@ impl From<khive_db::SqliteError> for RuntimeError {
             khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
             khive_db::SqliteError::InheritedWriterTransaction
             | khive_db::SqliteError::WriterSettlementUnknown => {
-                Self::Storage(khive_storage::StorageError::WriterTaskTerminated {
-                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                })
+                Self::Storage(khive_storage::StorageError::writer_task_terminated(
+                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                ))
             }
             khive_db::SqliteError::WriterPoisoned => {
-                Self::Storage(khive_storage::StorageError::WriterTaskTerminated {
-                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
-                })
+                Self::Storage(khive_storage::StorageError::writer_task_terminated(
+                    khive_storage::WriterTaskRequestState::NotStarted,
+                ))
             }
             error => Self::Sqlite(error),
         }
@@ -1134,7 +1134,7 @@ impl RuntimeError {
                 task_terminated: false,
                 retryable: source.is_retryable(),
             }),
-            khive_storage::StorageError::WriterTaskTerminated { request_state } => {
+            khive_storage::StorageError::WriterTaskTerminated { request_state, .. } => {
                 Some(WriterTaskFailureContext {
                     stage: WRITER_TASK_TERMINATED_STAGE,
                     request_state: *request_state,
@@ -1348,9 +1348,9 @@ mod refusal_event_context_tests {
             WRITER_TASK_BEGIN_BUSY_STAGE
         );
 
-        let stopped = RuntimeError::Storage(khive_storage::StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        })
+        let stopped = RuntimeError::Storage(khive_storage::StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ))
         .with_refusal_events(failed());
         let context = stopped.writer_task_failure_context().unwrap();
         assert_eq!(
@@ -1626,9 +1626,9 @@ mod channel_ingest_failure_class_tests {
         assert!(!rolled_back_context.task_terminated);
         assert!(rolled_back_context.retryable);
 
-        let unknown = RuntimeError::Storage(StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let unknown = RuntimeError::Storage(StorageError::writer_task_terminated(
+            WriterTaskRequestState::SideEffectsUnknown,
+        ));
         let unknown_context = unknown
             .writer_task_failure_context()
             .expect("ambiguous finality must remain typed through RuntimeError");

@@ -13,18 +13,18 @@ where
         if pooled {
             pool.retire_pooled_writer(conn);
         }
-        return Err(StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        return Err(StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
     }
     if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
         if !conn.is_autocommit() {
             if pooled {
                 pool.retire_pooled_writer(conn);
             }
-            return Err(StorageError::WriterTaskTerminated {
-                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            });
+            return Err(StorageError::writer_task_terminated(
+                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            ));
         }
         crate::timeout_sink::maybe_emit_busy(
             &crate::timeout_sink::db_label(pool),
@@ -39,9 +39,9 @@ where
             if pooled {
                 pool.retire_pooled_writer(conn);
             }
-            return Err(StorageError::WriterTaskTerminated {
-                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            });
+            return Err(StorageError::writer_task_terminated(
+                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            ));
         }
         return Err(map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP));
     }

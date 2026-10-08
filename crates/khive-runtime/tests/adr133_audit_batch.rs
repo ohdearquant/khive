@@ -156,9 +156,9 @@ impl EventStore for FakeStore {
             // ADR-133 acceptance criterion 7 requires: a commit that
             // succeeds in the store while the driver observes ambiguity and
             // must retry rather than duplicate.
-            return Err(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown,
-            });
+            return Err(StorageError::writer_task_terminated(
+                WriterTaskRequestState::SideEffectsUnknown,
+            ));
         }
         Ok(IdempotentEventBatchResult { rows: dispositions })
     }

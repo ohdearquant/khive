@@ -264,6 +264,9 @@ pub enum StorageError {
     #[error("writer task terminated (request_state={request_state})")]
     WriterTaskTerminated {
         request_state: WriterTaskRequestState,
+        /// Original SQLITE_FULL primary/extended codes, when the terminal cause supplied them.
+        /// Evidence only: it does not change finality, retryability or the error source chain.
+        sqlite_full_codes: Option<(i32, i32)>,
     },
 
     /// An internal storage failure not attributable to a specific storage
@@ -306,6 +309,16 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Construct a terminal writer outcome without native SQLite evidence.
+    ///
+    /// The request state and existing retry policy are unchanged.
+    pub fn writer_task_terminated(request_state: WriterTaskRequestState) -> Self {
+        Self::WriterTaskTerminated {
+            request_state,
+            sqlite_full_codes: None,
+        }
+    }
+
     /// Construct a `Driver` error wrapping a backend-specific error source.
     pub fn driver(
         capability: StorageCapability,
@@ -542,7 +555,7 @@ mod tests {
             WriterTaskRequestState::TransactionRolledBack,
             WriterTaskRequestState::SideEffectsUnknown,
         ] {
-            let error = StorageError::WriterTaskTerminated { request_state };
+            let error = StorageError::writer_task_terminated(request_state);
             assert_eq!(error.capability(), None);
             assert!(!error.is_retryable());
             assert_eq!(
