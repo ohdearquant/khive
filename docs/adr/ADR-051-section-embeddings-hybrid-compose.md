@@ -437,7 +437,14 @@ note and memory retrieval are governed by ADR-031 directly.
    ANN warming per engine index, fresh-tail handling per engine, exact rerank where it is used,
    and per-engine index identity for atom and section vectors. There is no per-surface activation;
    a write path that fans out while any read path is still single-engine is the dead-embedding
-   state Amendment 1 refused.
+   state Amendment 1 refused. Section vectors are the one place this record's accepted Storage
+   section conflicts with per-engine identity: it stores one vector per section in the single
+   `knowledge_sections.embedding` column and calls section embeddings single-model. At activation
+   that single-column section store is superseded by per-engine section vector storage, designed
+   in the activation change and covered by the Knowledge/lifecycle verification matrix of ADR-031
+   Amendment 5. Until then sections stay single-engine on the first configured peer, compose's
+   section cosine runs on that engine only, and the envelope discloses it as the one-engine
+   applicable set of item 3.
 5. **Backfill and coverage.** Existing default-model vectors remain valid for that engine and are
    never deleted because a later write policy excludes their engine. Other engines are backfilled,
    and an engine is reported ready only on coverage evidence (indexed rows against live atoms and
