@@ -8,7 +8,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
+use khive_storage::entity::{Entity, EntityFilter, EntityTombstones, EntityTypeCounts};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -420,6 +420,11 @@ impl SqlEntityStore {
         mode: EntityPageMode,
     ) -> Result<Page<Entity>, StorageError> {
         let operation = mode.operation();
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            operation,
+        )?;
         let namespace = namespace.to_string();
         let skip_total = mode == EntityPageMode::CountFree || is_complete_id_lookup(&filter, &page);
         let limit_i64 = i64::from(page.limit);
@@ -744,7 +749,12 @@ fn build_entity_where_with_mode(
             )
         };
 
-    let mut conditions: Vec<String> = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut conditions: Vec<String> = vec![ns_condition];
+    match filter.tombstones {
+        EntityTombstones::Live => conditions.push("deleted_at IS NULL".into()),
+        EntityTombstones::All => {}
+        EntityTombstones::Only => conditions.push("deleted_at IS NOT NULL".into()),
+    }
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if !filter.ids.is_empty() {
@@ -888,6 +898,12 @@ fn build_entity_where_with_mode(
         ));
     }
 
+    super::append_json_equalities(
+        &mut conditions,
+        &mut params,
+        "properties",
+        &filter.property_equalities,
+    );
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -951,7 +967,9 @@ fn build_entity_page_query_from_source(
 /// Keep selective names/kinds/tags and legacy JSON paths free to choose their
 /// own access paths. Explicit IDs always keep the bounded primary-key plan.
 fn entity_list_source(filter: &EntityFilter) -> &'static str {
-    if !filter.ids.is_empty()
+    if filter.tombstones != EntityTombstones::Live
+        || !filter.property_equalities.is_empty()
+        || !filter.ids.is_empty()
         || !filter.kinds.is_empty()
         || !filter.entity_types_by_kind.is_empty()
         || filter.legacy_entity_type_fallback
@@ -995,6 +1013,9 @@ fn has_one_distinct_value(values: &[String]) -> bool {
 /// Other predicates remain row-local residual filters, so the page can stop
 /// after its limit without materializing the complete matching ID set.
 fn entity_count_free_source(filter: &EntityFilter) -> &'static str {
+    if filter.tombstones != EntityTombstones::Live {
+        return entity_read_source(filter);
+    }
     if !is_entity_streaming_page(filter) {
         return entity_list_source(filter);
     }
@@ -1136,6 +1157,7 @@ fn build_entity_cursor_query(
 
 fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
+        && filter.property_equalities.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
         && filter.entity_types_by_kind.is_empty()
@@ -1368,6 +1390,11 @@ impl EntityStore for SqlEntityStore {
         after: Option<SeekCursor>,
         limit: u32,
     ) -> Result<SeekPage<Entity>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "query_entities_after",
+        )?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -1470,6 +1497,11 @@ impl EntityStore for SqlEntityStore {
         namespace: &str,
         filter: EntityFilter,
     ) -> Result<u64, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "count_entities",
+        )?;
         let namespace = namespace.to_string();
 
         let index = entity_list_index(&filter);

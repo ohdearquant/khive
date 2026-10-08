@@ -9,7 +9,7 @@ use khive_types::{EventKind, EventOutcome, RefResolution, SubstrateKind};
 
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
-use crate::types::{BatchWriteSummary, Page, PageRequest, StorageResult};
+use crate::types::{BatchWriteSummary, Page, PageRequest, SqlValue, StorageResult};
 
 /// Storage-level event record. Every verb execution produces one.
 /// Immutable once appended; projection rows are written beside it at append time.
@@ -184,6 +184,9 @@ pub struct EventView {
 }
 
 /// Filter for querying events. Namespace is implicit in the scoped EventStore.
+///
+/// New fields deserialize to defaults for older serialized filters. Complete
+/// external Rust struct literals must specify them or use `..Default::default()`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventFilter {
     pub ids: Vec<Uuid>,
@@ -200,6 +203,32 @@ pub struct EventFilter {
     pub observed: Vec<Uuid>,
     pub selected: Vec<Uuid>,
     pub payload_proposal_id: Option<Uuid>,
+    /// Exact outcome; no restriction when absent.
+    #[serde(default)]
+    pub outcome: Option<EventOutcome>,
+    /// ANDed SQL JSON equalities; see [`EventFilter::payload_eq`].
+    #[serde(default)]
+    pub payload_equalities: Vec<(String, SqlValue)>,
+}
+
+impl EventFilter {
+    /// Match one outcome, replacing any previous outcome selection.
+    pub fn outcome(mut self, outcome: EventOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// Require SQL `json_extract(payload, path) = value` equality.
+    ///
+    /// Paths must be `$.field[.subfield]` with nonempty ASCII alphanumeric or
+    /// underscore segments; queries reject other paths. Calls are ANDed.
+    /// SQL NULL matches neither a missing field nor explicit JSON null.
+    /// JSON booleans compare as 0/1, including numeric coercion. JSON objects
+    /// and arrays compare their serialized SQL text, not structural JSON equality.
+    pub fn payload_eq(mut self, path: impl Into<String>, value: SqlValue) -> Self {
+        self.payload_equalities.push((path.into(), value));
+        self
+    }
 }
 
 /// Persisted ordering key; the physical UUID spelling is not normalized.
