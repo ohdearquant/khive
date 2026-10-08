@@ -27,6 +27,24 @@ pub enum WatermarkCapture<'a> {
     LogHighWater,
 }
 
+/// Registry protection and result framing for a coalesced write-log tail.
+#[derive(Clone, Copy, Debug)]
+pub enum TailFloor<'a> {
+    /// Caller already holds its registry guard. Return each final operation's
+    /// latest sequence, ordered by its subject's first selected appearance.
+    CallerGuarded,
+    /// Read registry and own watermarks in this same statement, floor the tail
+    /// by MAX(watermark, COALESCE(registry minimum, watermark)). Return
+    /// first-appearance sequences plus own-watermark and live-count metadata.
+    /// An empty tail still returns one metadata row.
+    RegistryMinimum {
+        /// Exact registry namespace, also bounded by wildcard consumers.
+        registry_namespace: &'a str,
+        /// Consumer whose current watermark is returned with the snapshot.
+        consumer: &'a str,
+    },
+}
+
 /// Corpus predicates and capture rule shared by an ANN consumer's statements.
 #[derive(Clone, Copy, Debug)]
 pub struct CorpusScope<'a> {
@@ -160,6 +178,132 @@ impl CorpusScope<'_> {
         match self.namespace {
             Some(namespace) => CompactionScope::Namespace(namespace.to_owned()),
             None => CompactionScope::Model,
+        }
+    }
+
+    /// Coalesce the selected raw log suffix before joining each final vector.
+    ///
+    /// The optional newest-raw cap precedes coalescing. Namespace/kind vector
+    /// annotations follow the scope, and a live-note join adds `live_note_id`.
+    /// `table_name` must be a trusted, sanitized vector table identifier.
+    /// Callers retain watermark conversion, readers, parsing and guard errors.
+    pub fn final_tail(
+        &self,
+        table_name: &str,
+        model: &str,
+        watermark: i64,
+        live_threshold: Option<f64>,
+        floor: TailFloor<'_>,
+        label: &str,
+    ) -> SqlStatement {
+        let mut params = self.model_params(model);
+        let model_param = params.len();
+        params.push(SqlValue::Integer(watermark));
+        let seq_param = params.len();
+        let (registry_cte, tail_floor, seq_column, registry_frame) = match floor {
+            TailFloor::CallerGuarded => {
+                (String::new(), format!("?{seq_param}"), "finals.seq", false)
+            }
+            TailFloor::RegistryMinimum {
+                registry_namespace,
+                consumer,
+            } => {
+                params.push(SqlValue::Text(consumer.to_owned()));
+                let consumer_param = params.len();
+                let namespace_param = if self.namespace == Some(registry_namespace) {
+                    1
+                } else {
+                    params.push(SqlValue::Text(registry_namespace.to_owned()));
+                    params.len()
+                };
+                (
+                    format!(
+                        "registry AS (\
+                           SELECT MIN(watermark) AS registry_min FROM ann_consumer_watermark \
+                           WHERE (namespace = ?{namespace_param} OR namespace = '*') \
+                             AND embedding_model = ?{model_param}\
+                         ), own AS (\
+                           SELECT (SELECT watermark FROM ann_consumer_watermark \
+                                   WHERE consumer = ?{consumer_param} \
+                                     AND namespace = ?{namespace_param} \
+                                     AND embedding_model = ?{model_param}) AS own_watermark\
+                         ), "
+                    ),
+                    format!("MAX(?{seq_param}, COALESCE((SELECT registry_min FROM registry), ?{seq_param}))"),
+                    "finals.first_seq AS seq",
+                    true,
+                )
+            }
+        };
+        let (live_cte, selected_order, live_join, live_column) = match live_threshold {
+            Some(threshold) => {
+                params.push(SqlValue::Float(threshold));
+                let cap_param = params.len();
+                let (corpus, live) = self.corpus(table_name);
+                (
+                    format!("live AS (SELECT COUNT(*) AS live_count FROM {corpus} WHERE {live}), "),
+                    format!(
+                        "ORDER BY seq DESC LIMIT (\
+                           SELECT CAST(live_count * ?{cap_param} AS INTEGER) + \
+                             CASE WHEN CAST(live_count * ?{cap_param} AS INTEGER) < live_count * ?{cap_param} \
+                                  THEN 1 ELSE 0 END FROM live)"
+                    ),
+                    "CROSS JOIN live",
+                    "live.live_count",
+                )
+            }
+            None => (String::new(), "ORDER BY seq".to_owned(), "", "NULL"),
+        };
+        let mut columns = vec![seq_column, "finals.subject_id", "finals.op"];
+        if self.namespace.is_some() {
+            columns.push("vectors.namespace AS vector_namespace");
+        }
+        columns.push("vectors.embedding_model AS vector_model");
+        if self.record_kind.is_some() {
+            columns.push("vectors.kind AS vector_kind");
+        }
+        columns.extend(["vectors.field AS vector_field", "vectors.embedding"]);
+        let note_join = match self.live_join {
+            Some(LiveRowJoin::Notes) => {
+                columns.push("live_note.id AS live_note_id");
+                "LEFT JOIN notes AS live_note ON live_note.id = finals.subject_id \
+                 AND live_note.deleted_at IS NULL"
+            }
+            None => "",
+        };
+        let metadata_column = format!("{live_column} AS live_count");
+        let from = if registry_frame {
+            columns.extend([
+                "registry.registry_min",
+                "own.own_watermark",
+                &metadata_column,
+            ]);
+            format!("registry CROSS JOIN own {live_join} LEFT JOIN finals ON 1 = 1")
+        } else {
+            "finals".to_owned()
+        };
+        let columns = columns.join(", ");
+        let predicate = self.predicate("");
+        SqlStatement {
+            sql: format!(
+                "WITH {registry_cte}{live_cte}selected AS (\
+                   SELECT seq, subject_id, op FROM ann_write_log \
+                   WHERE {predicate} AND seq > {tail_floor} {selected_order}\
+                 ), finals AS (\
+                   SELECT seq, subject_id, op, first_seq FROM (\
+                     SELECT seq, subject_id, op, \
+                            MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, \
+                            ROW_NUMBER() OVER (\
+                              PARTITION BY subject_id ORDER BY seq DESC\
+                            ) AS final_rank FROM selected\
+                   ) WHERE final_rank = 1\
+                 ) \
+                 SELECT {columns} FROM {from} \
+                 LEFT JOIN {table_name} AS vectors ON vectors.subject_id = finals.subject_id \
+                 {note_join} ORDER BY finals.first_seq"
+            ),
+            params,
+            label: Some(label.to_owned()),
         }
     }
 
