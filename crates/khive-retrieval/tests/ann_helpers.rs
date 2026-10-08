@@ -107,6 +107,53 @@ fn second_acquisition_waits_for_the_first_to_release() {
     waiter.join().expect("waiter thread");
 }
 
+#[test]
+fn watcher_claims_before_poll_without_retaining_the_ann() {
+    use khive_retrieval::ann::rotation_watch_future;
+    use std::sync::atomic::AtomicBool;
+
+    let ann = Arc::new(());
+    let weak = Arc::downgrade(&ann);
+    let started = AtomicBool::new(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    // An ordinary test has no Tokio runtime. Construction must not start a timer.
+    let watch = rotation_watch_future(
+        &ann,
+        &started,
+        PathBuf::from("unpolled-root"),
+        Duration::from_secs(5),
+        CancellationToken::new(),
+        move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        },
+    )
+    .expect("first call claims the watcher");
+    assert!(started.load(Ordering::Acquire));
+    assert_eq!(Arc::strong_count(&ann), 1);
+    assert!(rotation_watch_future(
+        &ann,
+        &started,
+        PathBuf::from("duplicate-root"),
+        Duration::from_secs(5),
+        CancellationToken::new(),
+        |_, _| std::future::ready(()),
+    )
+    .is_none());
+    drop(ann);
+    assert!(
+        weak.upgrade().is_none(),
+        "the unpolled future must not retain the ANN"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(watch);
+    assert!(
+        started.load(Ordering::Acquire),
+        "dropping the future does not reset the one-shot guard"
+    );
+}
+
 #[tokio::test]
 async fn loop_returns_promptly_after_shutdown() {
     let shutdown = CancellationToken::new();
