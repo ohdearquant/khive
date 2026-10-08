@@ -2681,32 +2681,9 @@ pub(crate) fn merge_fresh_tail_for_route(
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
     route: AnnScoreRoute,
 ) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
-    if ops.is_empty() {
-        return Ok(best_raw);
-    }
-    let mut deletes: HashSet<Uuid> = HashSet::new();
-    let mut upserts: HashMap<Uuid, f64> = HashMap::new();
-    for (uuid, op) in ops {
-        match op {
-            None => {
-                deletes.insert(uuid);
-            }
-            Some(embedding) => {
-                upserts.insert(uuid, route.tail_score(query, &embedding)?);
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f64)> = best_raw
-        .into_iter()
-        .filter(|(uuid, _)| !deletes.contains(uuid) && !upserts.contains_key(uuid))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    Ok(merged)
+    khive_retrieval::ann::merge_fresh_tail(best_raw, ops, |embedding| {
+        route.tail_score(query, embedding)
+    })
 }
 
 /// Keep the cheap wait probe and candidate-producing snapshot on the same
@@ -2920,32 +2897,10 @@ pub(crate) fn merge_fresh_tail(
     query: &[f32],
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 ) -> Vec<(Uuid, f32)> {
-    if ops.is_empty() {
-        return best_raw;
-    }
-    let mut deletes: HashSet<Uuid> = HashSet::new();
-    let mut upserts: HashMap<Uuid, f32> = HashMap::new();
-    for (uuid, op) in ops {
-        match op {
-            None => {
-                deletes.insert(uuid);
-            }
-            Some(embedding) => {
-                upserts.insert(uuid, exact_cosine(query, &embedding));
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f32)> = best_raw
-        .into_iter()
-        .filter(|(u, _)| !deletes.contains(u) && !upserts.contains_key(u))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    merged
+    khive_retrieval::ann::merge_fresh_tail(best_raw, ops, |embedding| {
+        Ok::<_, std::convert::Infallible>(exact_cosine(query, embedding))
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
 /// Fold a [`FreshTailOutcome`] into the candidates a recall handler serves

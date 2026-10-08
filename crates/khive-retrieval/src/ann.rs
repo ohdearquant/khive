@@ -11,6 +11,7 @@
 pub mod corpus;
 pub mod registry;
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -18,6 +19,51 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+/// Merge tail operations into candidates using the caller's score type and policy.
+///
+/// Empty operations leave the input unchanged. Each upsert is scored in input order;
+/// the first scoring error is returned. Upserts replace prior candidates and the last
+/// upsert for an id wins; a delete removes prior candidates but does not erase an upsert.
+/// Nonempty operations sort descending by partial score, breaking equal or incomparable
+/// scores by ascending id. Untouched duplicate candidates are retained.
+#[doc(hidden)]
+pub fn merge_fresh_tail<S, E>(
+    candidates: Vec<(Uuid, S)>,
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    mut score: impl FnMut(&[f32]) -> Result<S, E>,
+) -> Result<Vec<(Uuid, S)>, E>
+where
+    S: PartialOrd,
+{
+    if ops.is_empty() {
+        return Ok(candidates);
+    }
+    let mut deletes: HashSet<Uuid> = HashSet::new();
+    let mut upserts: HashMap<Uuid, S> = HashMap::new();
+    for (uuid, op) in ops {
+        match op {
+            None => {
+                deletes.insert(uuid);
+            }
+            Some(embedding) => {
+                upserts.insert(uuid, score(&embedding)?);
+            }
+        }
+    }
+    let mut merged: Vec<(Uuid, S)> = candidates
+        .into_iter()
+        .filter(|(uuid, _)| !deletes.contains(uuid) && !upserts.contains_key(uuid))
+        .collect();
+    merged.extend(upserts);
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(merged)
+}
 
 /// Name of the lock file taken inside a checkpoint directory.
 const CHECKPOINT_LOCK_FILE: &str = ".bridge-checkpoint.lock";
