@@ -213,11 +213,7 @@ impl KhiveRuntime {
                         merge_guard,
                     )
                     .map_err(|e| {
-                        khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Notes,
-                            "merge_note",
-                            e,
-                        )
+                        e.into_storage_error(khive_storage::StorageCapability::Notes, "merge_note")
                     })
                 })
                 .await

@@ -1505,6 +1505,7 @@ impl KhiveRuntime {
                 if matches!(
                     &error,
                     khive_db::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    | khive_db::SqliteError::Write { source: rusqlite::Error::SqliteFailure(code, _), .. }
                         if code.code == rusqlite::ErrorCode::ConstraintViolation
                 ) {
                     RuntimeError::InvalidInput(format!(
