@@ -673,6 +673,9 @@ pub enum EventsResponse {
         retryable: bool,
         #[serde(default)]
         writer_task_failure: Option<WireWriterTaskFailure>,
+        /// Optional native write evidence; older frames retain their legacy mapping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sqlite_write_failure: Option<khive_storage::error::SqliteWriteFailure>,
     },
 }
 
@@ -1569,6 +1572,7 @@ async fn serve_events_conn(
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
                 writer_task_failure: None,
+                sqlite_write_failure: None,
             },
         };
         let bytes = match serde_json::to_vec(&response) {
@@ -1590,6 +1594,7 @@ async fn serve_events_conn(
                 ),
                 retryable: false,
                 writer_task_failure: None,
+                sqlite_write_failure: None,
             };
             match serde_json::to_vec(&refusal) {
                 Ok(bytes) => bytes,
@@ -1629,6 +1634,7 @@ async fn dispatch_events_request(
             ),
             retryable: false,
             writer_task_failure: None,
+            sqlite_write_failure: None,
         };
     }
     // The wire namespace is an unrestricted client-supplied String until this
@@ -1641,6 +1647,7 @@ async fn dispatch_events_request(
             message: format!("events request namespace rejected: {error}"),
             retryable: false,
             writer_task_failure: None,
+            sqlite_write_failure: None,
         };
     }
     let store = match namespace_store(backend, stores, request.namespace()) {
@@ -1650,6 +1657,7 @@ async fn dispatch_events_request(
                 message: format!("events store unavailable: {error}"),
                 retryable: true,
                 writer_task_failure: None,
+                sqlite_write_failure: None,
             };
         }
     };
@@ -1678,6 +1686,7 @@ async fn dispatch_events_request(
                     ),
                     retryable: false,
                     writer_task_failure: None,
+                    sqlite_write_failure: None,
                 };
             }
             match store.query_events(filter, page).await {
@@ -1703,7 +1712,7 @@ async fn dispatch_events_request(
 
 #[cfg(unix)]
 fn storage_error_response(error: &StorageError) -> EventsResponse {
-    let (message, writer_task_failure) = match error {
+    let (message, writer_task_failure) = match error.without_sqlite_write_stage() {
         StorageError::WriterTaskRequestFailed {
             request_state,
             source,
@@ -1733,6 +1742,7 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
         // a terminal error on the client side of the socket.
         retryable: error.is_retryable(),
         writer_task_failure,
+        sqlite_write_failure: error.sqlite_write_failure(),
     }
 }
 
@@ -2318,36 +2328,11 @@ impl ForwardingEventStore {
                 message,
                 retryable,
                 writer_task_failure,
+                sqlite_write_failure,
             } => {
-                if let Some(failure) = writer_task_failure {
-                    match failure {
-                        WireWriterTaskFailure::RequestFailed { request_state } => {
-                            let source = if retryable {
-                                StorageError::Pool {
-                                    operation: op.into(),
-                                    message,
-                                }
-                            } else {
-                                StorageError::InvalidInput {
-                                    capability: khive_storage::StorageCapability::Events,
-                                    operation: op.into(),
-                                    message,
-                                }
-                            };
-                            StorageError::WriterTaskRequestFailed {
-                                request_state: request_state.into(),
-                                source: Box::new(source),
-                            }
-                        }
-                        WireWriterTaskFailure::TaskTerminated {
-                            request_state,
-                            sqlite_full_codes,
-                        } => StorageError::WriterTaskTerminated {
-                            request_state: request_state.into(),
-                            sqlite_full_codes,
-                        },
-                    }
-                } else if retryable {
+                // Reconstruct the same legacy policy first; evidence must not
+                // widen retries or turn a known rollback into task termination.
+                let source = if retryable {
                     StorageError::Pool {
                         operation: op.into(),
                         message,
@@ -2358,6 +2343,32 @@ impl ForwardingEventStore {
                         operation: op.into(),
                         message,
                     }
+                };
+                let source = match sqlite_write_failure {
+                    Some(failure) => source.with_sqlite_write_failure(failure),
+                    None => source,
+                };
+                match writer_task_failure {
+                    Some(WireWriterTaskFailure::RequestFailed { request_state }) => {
+                        StorageError::WriterTaskRequestFailed {
+                            request_state: request_state.into(),
+                            source: Box::new(source),
+                        }
+                    }
+                    Some(WireWriterTaskFailure::TaskTerminated {
+                        request_state,
+                        sqlite_full_codes,
+                    }) => {
+                        let terminal = StorageError::WriterTaskTerminated {
+                            request_state: request_state.into(),
+                            sqlite_full_codes,
+                        };
+                        match sqlite_write_failure {
+                            Some(failure) => terminal.with_sqlite_write_failure(failure),
+                            None => terminal,
+                        }
+                    }
+                    None => source,
                 }
             }
             other => StorageError::Serialization {
@@ -2931,6 +2942,7 @@ mod tests {
                 message,
                 retryable,
                 writer_task_failure,
+                ..
             } => {
                 assert!(
                     message.contains(&MAX_QUERY_EVENTS_PAGE_ROWS.to_string()),
@@ -2976,6 +2988,7 @@ mod tests {
             busy,
             EventsResponse::Error {
                 writer_task_failure: None,
+                sqlite_write_failure: None,
                 ..
             }
         ));
@@ -3014,6 +3027,7 @@ mod tests {
             EventsResponse::Error {
                 retryable: true,
                 writer_task_failure: None,
+                sqlite_write_failure: None,
                 ..
             }
         ));
@@ -3207,9 +3221,183 @@ mod tests {
             busy,
             EventsResponse::Error {
                 writer_task_failure: None,
+                sqlite_write_failure: None,
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_write_stages_survive_direct_and_request_error_frames() {
+        use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+        use khive_storage::WriterTaskRequestState;
+        let dir = tempfile::tempdir().unwrap();
+        let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
+        let store = ForwardingEventStore::new("test", client);
+        for (stage, extended) in [
+            (SqliteWriteStage::Begin, rusqlite::ffi::SQLITE_BUSY_RECOVERY),
+            (
+                SqliteWriteStage::Statement,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            ),
+            (SqliteWriteStage::Commit, rusqlite::ffi::SQLITE_IOERR_FSYNC),
+            (SqliteWriteStage::Statement, rusqlite::ffi::SQLITE_FULL),
+        ] {
+            for request in [false, true] {
+                for retryable in [false, true] {
+                    let failure = SqliteWriteFailure {
+                        stage,
+                        primary_code: extended & 0xff,
+                        extended_code: extended,
+                        settlement_unknown: false,
+                    };
+                    let source = if retryable {
+                        StorageError::Pool {
+                            operation: "append".into(),
+                            message: "no code in this message".into(),
+                        }
+                    } else {
+                        StorageError::InvalidInput {
+                            capability: khive_storage::StorageCapability::Events,
+                            operation: "append".into(),
+                            message: "no code in this message".into(),
+                        }
+                    }
+                    .with_sqlite_write_failure(failure);
+                    let source = if request {
+                        StorageError::WriterTaskRequestFailed {
+                            request_state: WriterTaskRequestState::TransactionRolledBack,
+                            source: Box::new(source),
+                        }
+                    } else {
+                        source
+                    };
+                    let bytes = serde_json::to_vec(&storage_error_response(&source)).unwrap();
+                    let error = store.unexpected("append", serde_json::from_slice(&bytes).unwrap());
+                    assert_eq!(error.sqlite_write_failure(), Some(failure));
+                    assert_eq!(error.is_retryable(), retryable);
+                    assert_eq!(
+                        matches!(
+                            &error,
+                            StorageError::WriterTaskRequestFailed {
+                                request_state: WriterTaskRequestState::TransactionRolledBack,
+                                ..
+                            }
+                        ),
+                        request
+                    );
+                    let wire =
+                        crate::runtime_error_value(error.into(), crate::DomainDisposition::Unknown);
+                    let expected = if extended == rusqlite::ffi::SQLITE_FULL {
+                        "sqlite_disk_full"
+                    } else {
+                        stage.as_str()
+                    };
+                    assert_eq!(wire["stage"], expected);
+                    assert_eq!(wire["sqlite_primary_code"], failure.primary_code);
+                    assert_eq!(wire["sqlite_extended_code"], extended);
+                    if request {
+                        assert_eq!(wire["task_terminated"], false);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_native_evidence_keeps_unknown_outcome_precedence() {
+        use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+        use khive_storage::WriterTaskRequestState;
+        let dir = tempfile::tempdir().unwrap();
+        let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
+        let store = ForwardingEventStore::new("test", client);
+        for terminal in [false, true] {
+            for extended in [
+                rusqlite::ffi::SQLITE_IOERR_FSYNC,
+                rusqlite::ffi::SQLITE_FULL,
+            ] {
+                let failure = SqliteWriteFailure {
+                    stage: SqliteWriteStage::Commit,
+                    primary_code: extended & 0xff,
+                    extended_code: extended,
+                    settlement_unknown: false,
+                };
+                // Even serialized false evidence cannot override an existing unknown outcome.
+                let source = if terminal {
+                    StorageError::WriterTaskTerminated {
+                        request_state: WriterTaskRequestState::SideEffectsUnknown,
+                        sqlite_full_codes: (extended == rusqlite::ffi::SQLITE_FULL)
+                            .then_some((extended, extended)),
+                    }
+                } else {
+                    StorageError::WriterTaskRequestFailed {
+                        request_state: WriterTaskRequestState::SideEffectsUnknown,
+                        source: Box::new(StorageError::Internal("original cause".into())),
+                    }
+                }
+                .with_sqlite_write_failure(failure);
+                let bytes = serde_json::to_vec(&storage_error_response(&source)).unwrap();
+                let error = store.unexpected("append", serde_json::from_slice(&bytes).unwrap());
+                assert_eq!(error.sqlite_write_failure(), Some(failure));
+                if terminal {
+                    assert!(
+                        std::error::Error::source(error.without_sqlite_write_stage()).is_none()
+                    );
+                }
+                let wire =
+                    crate::runtime_error_value(error.into(), crate::DomainDisposition::Unknown);
+                let expected = if extended == rusqlite::ffi::SQLITE_FULL {
+                    "sqlite_disk_full"
+                } else if terminal {
+                    "writer_task_terminated"
+                } else {
+                    "writer_task_request_failed"
+                };
+                assert_eq!(wire["code"], expected);
+                assert_eq!(wire["stage"], expected);
+                assert_eq!(wire["sqlite_write_stage"], "sqlite_commit_failure");
+                assert_eq!(wire["sqlite_extended_code"], extended);
+                assert_eq!(wire["request_state"], "side_effects_unknown");
+                assert_eq!(wire["task_terminated"], terminal);
+                assert_eq!(wire["retryable"], false);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poisoned_commit_evidence_does_not_claim_definite_failure() {
+        use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+        let dir = tempfile::tempdir().unwrap();
+        let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
+        let store = ForwardingEventStore::new("test", client);
+        let failure = SqliteWriteFailure {
+            stage: SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_AUTH,
+            extended_code: rusqlite::ffi::SQLITE_AUTH,
+            settlement_unknown: true,
+        };
+        let original = StorageError::driver(
+            khive_storage::StorageCapability::Sql,
+            "execute_batch",
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_AUTH),
+                None,
+            ),
+        );
+        let source = original.with_sqlite_write_failure(failure);
+        let bytes = serde_json::to_vec(&storage_error_response(&source)).unwrap();
+        let error = store.unexpected("append", serde_json::from_slice(&bytes).unwrap());
+        assert_eq!(error.sqlite_write_failure(), Some(failure));
+        assert!(!error.is_retryable());
+        let wire = crate::runtime_error_value(error.into(), crate::DomainDisposition::Unknown);
+        assert!(wire.get("code").is_none());
+        assert!(wire.get("stage").is_none());
+        assert_eq!(wire["sqlite_write_stage"], "sqlite_commit_failure");
+        assert_eq!(wire["sqlite_primary_code"], rusqlite::ffi::SQLITE_AUTH);
+        assert_eq!(wire["domain_disposition"], "unknown");
     }
 
     #[cfg(unix)]
@@ -3364,6 +3552,7 @@ mod tests {
                 EventsResponse::Error {
                     retryable: false,
                     writer_task_failure: None,
+                    sqlite_write_failure: None,
                     ..
                 }
             ),
