@@ -153,23 +153,14 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<bool, RuntimeError> {
-        let now = chrono::Utc::now().timestamp_micros();
-        let ns = token.namespace().as_str().to_owned();
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let rows = writer
-            .execute(SqlStatement {
-                sql: sql!("proposals_mark_applying").to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("projection_worker.proposals_open.pre_apply_cas".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
-        Ok(rows == 1)
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_mark_applying"),
+            "projection_worker.proposals_open.pre_apply_cas",
+            |rows| rows == 1,
+        )
+        .await
     }
 
     /// Called after a `ProposalWithdrawn` event is emitted.
@@ -178,23 +169,14 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<bool, RuntimeError> {
-        let now = chrono::Utc::now().timestamp_micros();
-        let ns = token.namespace().as_str().to_owned();
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let rows = writer
-            .execute(SqlStatement {
-                sql: sql!("proposals_mark_withdrawn").to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("projection_worker.proposals_open.withdrawn".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
-        Ok(rows == 1)
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_mark_withdrawn"),
+            "projection_worker.proposals_open.withdrawn",
+            |rows| rows == 1,
+        )
+        .await
     }
 
     /// Revert status from `applying` back to `approved` on KG failure.
@@ -203,23 +185,43 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<(), RuntimeError> {
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_revert_to_approved"),
+            "projection_worker.proposals_open.revert_applying",
+            |_| (),
+        )
+        .await
+    }
+
+    /// Execute one existing status transition, preserving its caller-owned SQL guard.
+    /// Decode the affected count before releasing the writer, as the wrappers did.
+    async fn execute_status_transition<T>(
+        &self,
+        token: &NamespaceToken,
+        proposal_id: Uuid,
+        sql_text: &str,
+        label: &str,
+        finish: fn(u64) -> T,
+    ) -> Result<T, RuntimeError> {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        writer
+        let rows = writer
             .execute(SqlStatement {
-                sql: sql!("proposals_revert_to_approved").to_string(),
+                sql: sql_text.to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(proposal_id.to_string()),
                     SqlValue::Text(ns),
                 ],
-                label: Some("projection_worker.proposals_open.revert_applying".into()),
+                label: Some(label.into()),
             })
             .await
             .map_err(RuntimeError::Storage)?;
-        Ok(())
+        Ok(finish(rows))
     }
 
     /// Atomically run the reviewed CAS UPDATE and `ProposalReviewed` event INSERT.
