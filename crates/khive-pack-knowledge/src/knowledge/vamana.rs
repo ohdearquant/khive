@@ -2535,13 +2535,30 @@ pub(crate) async fn load_and_build_from_vector_store(
         .map_err(RuntimeError::Internal)
 }
 
+/// Execute legacy Vamana snapshot invalidation through an already-open writer.
+/// Returns the affected-row count or the original storage error. The caller owns
+/// writer acquisition, statement labeling, missing-table tolerance and logging.
+pub async fn invalidate_legacy_vamana_snapshots(
+    writer: &mut dyn khive_storage::SqlWriter,
+    namespace: &str,
+    label: &'static str,
+) -> khive_storage::StorageResult<u64> {
+    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
+    writer
+        .execute(SqlStatement {
+            sql: khive_runtime::sql!("knowledge_legacy_snapshots_invalidate").into(),
+            params: vec![SqlValue::Text(pattern)],
+            label: Some(label.into()),
+        })
+        .await
+}
+
 /// Delete all Vamana snapshots for `namespace` from `retrieval_snapshots`.
 ///
 /// Called after any vector-corpus mutation to guarantee `ensure_ann_for_model` cannot
 /// load a snapshot that no longer matches the live corpus.  Best-effort: if
 /// the `retrieval_snapshots` table doesn't exist yet, the call is a no-op.
 pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
-    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut w = match sql.writer().await {
         Ok(w) => w,
@@ -2550,12 +2567,7 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
             return;
         }
     };
-    match w
-        .execute(SqlStatement {
-            sql: khive_runtime::sql!("knowledge_legacy_snapshots_invalidate").into(),
-            params: vec![SqlValue::Text(pattern)],
-            label: Some("invalidate_vamana_snapshot".into()),
-        })
+    match invalidate_legacy_vamana_snapshots(w.as_mut(), namespace, "invalidate_vamana_snapshot")
         .await
     {
         Ok(_) => {}

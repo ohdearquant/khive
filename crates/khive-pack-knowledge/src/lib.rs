@@ -6,6 +6,7 @@ pub(crate) mod knowledge;
 mod pack;
 mod vocab;
 
+pub use knowledge::vamana::invalidate_legacy_vamana_snapshots;
 pub use pack::KnowledgePack;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
