@@ -17,6 +17,9 @@
 
 ---
 
+The generation-wrap regression lives in `khive-types/src/vector.rs`; the remaining
+visited-set behavior and graph-search tests stay in `src/graph.rs`.
+
 ## Adversarial invariants tested
 
 - **NaN / Infinity in build vectors** — `NonFiniteFloat` error returned

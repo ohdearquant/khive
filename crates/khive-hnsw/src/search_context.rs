@@ -4,65 +4,7 @@ use std::collections::BinaryHeap;
 
 use crate::distance::OrderedF32;
 
-/// O(1) visited set: generation counter + dense array; increment to clear.
-pub(crate) struct VisitedSet {
-    /// Current generation number. Incremented on each `clear()`.
-    generation: u64,
-    /// Dense array indexed by internal node ID.
-    /// `markers[id] == generation` means node `id` has been visited.
-    markers: Vec<u64>,
-}
-
-impl VisitedSet {
-    /// Create a new visited set with the given capacity hint.
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            generation: 1, // Start at 1 so default 0 values are "not visited"
-            markers: vec![0u64; capacity],
-        }
-    }
-
-    /// Clear in O(1) by incrementing the generation counter.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            // Wrapped around -- reset markers to avoid false positives
-            self.markers.fill(0);
-            self.generation = 1;
-        }
-    }
-
-    /// Ensure the set can accommodate node IDs up to `max_id` (inclusive).
-    #[inline]
-    pub fn ensure_capacity(&mut self, max_id: usize) {
-        if max_id >= self.markers.len() {
-            self.markers.resize(max_id + 1, 0);
-        }
-    }
-
-    /// Mark a node as visited; returns `true` if this is the first visit.
-    #[inline]
-    pub fn visit(&mut self, id: usize) -> bool {
-        if id >= self.markers.len() {
-            self.markers.resize(id + 1, 0);
-        }
-        if self.markers[id] == self.generation {
-            false // already visited
-        } else {
-            self.markers[id] = self.generation;
-            true // newly visited
-        }
-    }
-
-    /// Mark multiple nodes as visited.
-    #[inline]
-    pub fn visit_all(&mut self, ids: impl Iterator<Item = usize>) {
-        for id in ids {
-            self.visit(id);
-        }
-    }
-}
+use khive_types::vector::VisitedSet;
 
 /// Pre-allocated search context; reuse across calls to amortize allocation cost.
 pub struct HnswSearchContext {
