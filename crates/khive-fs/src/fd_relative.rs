@@ -12,6 +12,7 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
@@ -90,6 +91,67 @@ pub fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File>
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` was just returned by a successful `openat` and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Creation policy for a descriptor-relative writable open.
+#[derive(Debug, Clone, Copy)]
+pub enum Create {
+    /// Open an existing entry; do not create one.
+    No,
+    /// Create the entry if it is missing, preserving existing contents otherwise.
+    IfMissing,
+    /// Create a new entry, refusing any existing entry.
+    Exclusive,
+}
+
+/// Options for [`open_file_at`]. Opens never truncate existing contents.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFileOptions {
+    /// Open read-write when true, or write-only when false.
+    pub read_write: bool,
+    pub create: Create,
+    /// Add `O_NONBLOCK` to the open.
+    pub nonblock: bool,
+    /// Creation permissions, filtered by the process umask; ignored for existing entries.
+    pub mode: u32,
+}
+
+/// Open one writable entry relative to a borrowed directory descriptor.
+///
+/// Always uses `O_NOFOLLOW | O_CLOEXEC`. The name passes through [`c_name`], with
+/// an additional refusal of `.` and `..`; the older read/directory helpers keep
+/// their existing dot-component policy. This does not require a regular file.
+pub fn open_file_at(parent: BorrowedFd<'_>, name: &str, opts: OpenFileOptions) -> io::Result<File> {
+    let name = c_name(OsStr::new(name))?;
+    if matches!(name.to_bytes(), b"." | b"..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dot components are not writable names",
+        ));
+    }
+    let access = if opts.read_write {
+        libc::O_RDWR
+    } else {
+        libc::O_WRONLY
+    };
+    let create = match opts.create {
+        Create::No => 0,
+        Create::IfMissing => libc::O_CREAT,
+        Create::Exclusive => libc::O_CREAT | libc::O_EXCL,
+    };
+    let flags = access
+        | create
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if opts.nonblock { libc::O_NONBLOCK } else { 0 };
+    // SAFETY: parent is borrowed and live, the validated name is NUL-terminated,
+    // and mode is passed as the promoted unsigned integer required by openat's varargs.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, opts.mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful openat returned a new descriptor owned by this File.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
