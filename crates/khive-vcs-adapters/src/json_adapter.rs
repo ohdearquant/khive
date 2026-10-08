@@ -230,7 +230,7 @@ fn extract_weight(
     }
 }
 
-fn parse_entity(
+pub(super) fn parse_entity(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
@@ -338,7 +338,7 @@ fn parse_entity(
     })
 }
 
-fn parse_edge(
+pub(super) fn parse_edge(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
