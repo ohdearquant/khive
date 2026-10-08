@@ -74,6 +74,41 @@ pub fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
+/// Device and inode identity in the unsigned representation used by Unix `MetadataExt`.
+///
+/// Equality compares the object observed by each call, not its contents. It does not
+/// prevent later replacement, inode reuse, or changes to the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    /// Read identity from the open handle using the standard library's metadata path.
+    pub fn of(file: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Read identity relative to `parent`, identifying a final symlink itself.
+    ///
+    /// Name validation and errors are those of [`stat_at`], including its native
+    /// `fstatat` representation limits. No path containment policy is added.
+    #[allow(clippy::unnecessary_cast)] // The native field widths and signedness vary by Unix target.
+    pub fn at(parent: &File, name: &OsStr) -> io::Result<Self> {
+        let stat = stat_at(parent, name)?;
+        Ok(Self {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        })
+    }
+}
+
 /// Open `name` read-only relative to `parent`, refusing a symlink at the final component.
 ///
 /// The open is close-on-exec and non-blocking. With `directory` set it also requires the

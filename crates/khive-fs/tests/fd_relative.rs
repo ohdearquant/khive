@@ -66,6 +66,93 @@ fn stat_at_reports_a_symlink_as_a_symlink() {
 }
 
 #[test]
+fn file_identity_matches_open_handles_and_hard_links_but_not_copies() {
+    use khive_fs::fd_relative::FileIdentity;
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = Scratch::new("identity-handles");
+    let original = scratch.path().join("original");
+    std::fs::write(&original, b"same contents").unwrap();
+    std::fs::hard_link(&original, scratch.path().join("hard-link")).unwrap();
+    std::fs::copy(&original, scratch.path().join("copy")).unwrap();
+    let first = File::open(&original).unwrap();
+    let second = File::open(&original).unwrap();
+    let hard_link = File::open(scratch.path().join("hard-link")).unwrap();
+    let copy = File::open(scratch.path().join("copy")).unwrap();
+    let identity = FileIdentity::of(&first).unwrap();
+    let metadata = first.metadata().unwrap();
+    assert_eq!(
+        identity,
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino()
+        }
+    );
+    assert_eq!(identity, FileIdentity::of(&second).unwrap());
+    assert_eq!(identity, FileIdentity::of(&hard_link).unwrap());
+    assert_ne!(identity, FileIdentity::of(&copy).unwrap());
+    let dir = scratch.open();
+    assert_eq!(
+        identity,
+        FileIdentity::at(&dir, OsStr::new("original")).unwrap()
+    );
+    assert_eq!(
+        FileIdentity::of(&dir).unwrap(),
+        FileIdentity::at(&dir, OsStr::new(".")).unwrap()
+    );
+}
+
+#[test]
+fn file_identity_at_keeps_byte_names_and_identifies_the_symlink_itself() {
+    use khive_fs::fd_relative::FileIdentity;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = Scratch::new("identity-at");
+    // A byte that is not valid UTF-8 exercises the raw-name path on Linux; APFS refuses
+    // such names at creation, so other targets use a non-ASCII but valid name instead.
+    #[cfg(target_os = "linux")]
+    let name = OsStr::from_bytes(b"target-\xff");
+    #[cfg(not(target_os = "linux"))]
+    let name = OsStr::from_bytes("target-\u{e9}".as_bytes());
+    std::fs::write(scratch.path().join(name), b"data").unwrap();
+    symlink(name, scratch.path().join("link")).unwrap();
+    let dir = scratch.open();
+    let target = File::open(scratch.path().join(name)).unwrap();
+    let target_identity = FileIdentity::of(&target).unwrap();
+    assert_eq!(FileIdentity::at(&dir, name).unwrap(), target_identity);
+    let link_identity = FileIdentity::at(&dir, OsStr::new("link")).unwrap();
+    let link_metadata = std::fs::symlink_metadata(scratch.path().join("link")).unwrap();
+    assert_eq!(
+        link_identity,
+        FileIdentity {
+            dev: link_metadata.dev(),
+            ino: link_metadata.ino()
+        }
+    );
+    assert_ne!(link_identity, target_identity);
+}
+
+#[test]
+fn file_identity_at_preserves_name_refusals_and_os_errors() {
+    use khive_fs::fd_relative::FileIdentity;
+
+    let scratch = Scratch::new("identity-errors");
+    let dir = scratch.open();
+    for name in ["", "sub/file", "/absolute", "nul\0suffix"] {
+        let error = FileIdentity::at(&dir, OsStr::new(name)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{name:?}");
+        assert_eq!(error.raw_os_error(), None, "{name:?}");
+    }
+    let missing = FileIdentity::at(&dir, OsStr::new("missing")).unwrap_err();
+    assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    std::fs::write(scratch.path().join("file"), b"data").unwrap();
+    let file = File::open(scratch.path().join("file")).unwrap();
+    let not_directory = FileIdentity::at(&file, OsStr::new("child")).unwrap_err();
+    assert_eq!(not_directory.raw_os_error(), Some(libc::ENOTDIR));
+}
+
+#[test]
 fn open_at_refuses_a_final_symlink() {
     let scratch = Scratch::new("open-at");
     std::fs::write(scratch.path().join("target.txt"), b"data").unwrap();
