@@ -6087,30 +6087,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        let ns = token.namespace().as_str();
-
-        // Entity: primary-only check (exclude entities in visible-only namespaces).
-        if let Some(entity) = self.entities(token)?.get_entity(id).await? {
-            if Self::ensure_namespace(&entity.namespace, ns).is_ok() {
-                return Ok(Some(Resolved::Entity(entity)));
-            }
-        }
-
-        // Note: primary-only check.
-        if let Some(note) = self.notes(token)?.get_note(id).await? {
-            if Self::ensure_namespace(&note.namespace, ns).is_ok() {
-                return Ok(Some(Resolved::Note(note)));
-            }
-        }
-
-        // Event: primary-only check.
-        if let Some(event) = self.events(token)?.get_event(id).await? {
-            if Self::ensure_namespace(&event.namespace, ns).is_ok() {
-                return Ok(Some(Resolved::Event(event)));
-            }
-        }
-
-        Ok(None)
+        self.resolve_primary_inner(token, id, false).await
     }
 
     /// Resolve a UUID to its substrate kind, including soft-deleted rows.
@@ -6122,19 +6099,37 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
+        self.resolve_primary_inner(token, id, true).await
+    }
+
+    // Tombstone selection applies only to entities and notes; events keep their live lookup.
+    async fn resolve_primary_inner(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Resolved>> {
         let ns = token.namespace().as_str();
 
-        if let Some(entity) = self
-            .entities(token)?
-            .get_entity_including_deleted(id)
-            .await?
-        {
+        let entity = if include_deleted {
+            self.entities(token)?
+                .get_entity_including_deleted(id)
+                .await?
+        } else {
+            self.entities(token)?.get_entity(id).await?
+        };
+        if let Some(entity) = entity {
             if Self::ensure_namespace(&entity.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Entity(entity)));
             }
         }
 
-        if let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? {
+        let note = if include_deleted {
+            self.notes(token)?.get_note_including_deleted(id).await?
+        } else {
+            self.notes(token)?.get_note(id).await?
+        };
+        if let Some(note) = note {
             if Self::ensure_namespace(&note.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Note(note)));
             }
