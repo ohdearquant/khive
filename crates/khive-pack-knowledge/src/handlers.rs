@@ -25,20 +25,7 @@ pub(crate) async fn resolve_uuid(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = s.parse::<Uuid>() {
-        return Ok(uuid);
-    }
-    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return match runtime.resolve_prefix(token, s).await? {
-            Some(uuid) => Ok(uuid),
-            None => Err(RuntimeError::InvalidInput(format!(
-                "no record matches prefix: {s:?}"
-            ))),
-        };
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
-    )))
+    runtime.resolve_uuid_or_prefix(token, s).await
 }
 
 // ── param structs ─────────────────────────────────────────────────────────────
