@@ -93,7 +93,7 @@ CRATES=(
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
     khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
-    khive-mounts         # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-mounts         # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-web       # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-mcp
     khive-repo-showcase    # needs khive-types (above); normal dep of kkernel, so publish first

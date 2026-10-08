@@ -61,7 +61,7 @@ pub(crate) async fn replace(
         "UPDATE tool_source_mounts SET tools = ?1, generation = generation + 1 WHERE name = ?2 AND generation = ?3 AND generation < 9223372036854775807",
         vec![SqlValue::Text(tools), SqlValue::Text(name.into()), SqlValue::Integer(generation)],
     ).labelled("tool_source_mount");
-    let audit = khive_db::stores::event::event_insert_statements(audit)
+    let audit = khive_runtime::event_insert_statements(audit)
         .map_err(|_| Failure::error("audit_unavailable").wire(name))?;
     // Serialization, catalog discovery and audit preparation precede the writer.
     // The closure performs only bounded SQL; a lost CAS writes no audit row.

@@ -75,15 +75,7 @@ impl KgPack {
 
             let ids: Vec<String> = rows
                 .into_iter()
-                .filter_map(|row| {
-                    row.get("proposal_id").and_then(|v| {
-                        if let SqlValue::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
+                .filter_map(|row| row.text_or_none("proposal_id").map(str::to_owned))
                 .collect();
 
             return match ids.len() {
@@ -305,26 +297,11 @@ impl KgPack {
             .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
-            .get("proposer")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .text_or_none("proposer")
+            .map(str::to_owned)
             .unwrap_or_default();
 
-        let current_status = row
-            .get("status")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("open");
+        let current_status = row.text_or_none("status").unwrap_or("open");
 
         if matches!(
             current_status,
@@ -435,14 +412,8 @@ impl KgPack {
             .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
-            .get("proposer")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .text_or_none("proposer")
+            .map(str::to_owned)
             .unwrap_or_default();
 
         if actor != proposer {
@@ -451,16 +422,7 @@ impl KgPack {
             )));
         }
 
-        let current_status = row
-            .get("status")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("open");
+        let current_status = row.text_or_none("status").unwrap_or("open");
 
         if matches!(current_status, "applied" | "withdrawn" | "applying") {
             return Err(RuntimeError::InvalidInput(format!(
@@ -573,25 +535,11 @@ impl KgPack {
             .into_iter()
             .map(|row| {
                 let get_text = |name: &str| -> String {
-                    row.get(name)
-                        .and_then(|v| {
-                            if let SqlValue::Text(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
+                    row.text_or_none(name)
+                        .map(str::to_owned)
                         .unwrap_or_default()
                 };
-                let get_int = |name: &str| -> Option<i64> {
-                    row.get(name).and_then(|v| {
-                        if let SqlValue::Integer(i) = v {
-                            Some(*i)
-                        } else {
-                            None
-                        }
-                    })
-                };
+                let get_int = |name: &str| -> Option<i64> { row.i64_or_none(name) };
                 let ts_or_null = |name: &str| -> Value {
                     match get_int(name) {
                         Some(micros) => Value::String(micros_to_iso(micros)),

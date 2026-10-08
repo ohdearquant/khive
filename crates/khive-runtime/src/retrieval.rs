@@ -131,15 +131,20 @@ fn prepared_document_fingerprint(text: &str, model: EmbeddingModel) -> ContentRe
 }
 
 impl KhiveRuntime {
+    fn require_default_embedder(&self) -> RuntimeResult<&str> {
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        Ok(model_name)
+    }
+
     /// Generate an embedding vector for `text` using the configured default model.
     ///
     /// First call lazily loads model weights (cold start cost). Subsequent calls reuse them.
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
     pub async fn embed(&self, text: &str) -> RuntimeResult<Vec<f32>> {
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_with_model(model_name, text).await
     }
 
@@ -329,10 +334,7 @@ impl KhiveRuntime {
         &self,
         text: &str,
     ) -> RuntimeResult<DocumentEmbeddingOutcome> {
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_document_with_model_outcome(model_name, text)
             .await
     }
@@ -344,10 +346,7 @@ impl KhiveRuntime {
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
     pub async fn embed_query(&self, text: &str) -> RuntimeResult<Vec<f32>> {
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_query_with_model(model_name, text).await
     }
 
@@ -356,10 +355,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         text: &str,
     ) -> RuntimeResult<Vec<f32>> {
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_query_with_model_for_token(token, model_name, text)
             .await
     }
@@ -375,10 +371,7 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_batch_with_model(model_name, texts).await
     }
 
@@ -527,10 +520,7 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_document_batch_with_model(model_name, texts)
             .await
     }
@@ -543,10 +533,7 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let model_name = self.default_embedder_name();
-        if model_name.is_empty() {
-            return Err(RuntimeError::Unconfigured("embedding_model".into()));
-        }
+        let model_name = self.require_default_embedder()?;
         self.embed_document_batch_with_model_outcomes(model_name, texts)
             .await
     }

@@ -10,7 +10,6 @@ description = "Pinned stdio MCP tool sources for the khive verb registry"
 
 [dependencies]
 khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
-khive-db = { version = "0.10.0", path = "../khive-db" }
 khive-storage = { version = "0.10.0", path = "../khive-storage" }
 khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
 async-trait.workspace = true

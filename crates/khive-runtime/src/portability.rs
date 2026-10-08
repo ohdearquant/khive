@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -14,6 +15,22 @@ use khive_storage::{EdgeRelation, EntityFilter};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+/// Parse an optional archive timestamp, using `fallback` only when absent.
+///
+/// Present values must be RFC3339 and are converted to UTC. Invalid values keep
+/// their parser error with the original timestamp as context.
+pub fn parse_archive_timestamp(
+    value: Option<&str>,
+    fallback: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let Some(raw) = value else {
+        return Ok(fallback);
+    };
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+}
 
 // ── Archive types ─────────────────────────────────────────────────────────────
 
@@ -584,6 +601,29 @@ mod tests {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         runtime.register_embedder(ImportEmbeddingProvider);
         runtime
+    }
+
+    #[test]
+    fn archive_timestamp_falls_back_only_when_absent_and_converts_offsets_to_utc() {
+        let fallback = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(parse_archive_timestamp(None, fallback).unwrap(), fallback);
+
+        let utc = parse_archive_timestamp(Some("2024-05-06T07:08:09Z"), fallback).unwrap();
+        assert_eq!(utc.to_rfc3339(), "2024-05-06T07:08:09+00:00");
+
+        let offset = parse_archive_timestamp(Some("2024-05-06T09:08:09+02:00"), fallback).unwrap();
+        assert_eq!(offset, utc);
+
+        let err = parse_archive_timestamp(Some("2024-05-06 07:08:09"), fallback).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("\"2024-05-06 07:08:09\""), "{text}");
+        assert!(text.contains("must be RFC3339"), "{text}");
+        assert!(
+            err.chain().count() > 1,
+            "parser source error is kept: {text}"
+        );
     }
 
     #[tokio::test]

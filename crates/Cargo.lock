@@ -2225,7 +2225,6 @@ dependencies = [
  "async-trait",
  "blake3",
  "jsonschema",
- "khive-db",
  "khive-gate",
  "khive-pack-kg",
  "khive-runtime",
