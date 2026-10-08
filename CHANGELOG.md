@@ -40,11 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   point. This is a source-breaking change for an out-of-tree Rust consumer. `hybrid_search` takes
   no fusion strategy, and its text leg covers every namespace visible to the caller, where the
   removed method searched the caller's primary namespace only.
-- `khive_retrieval::DualIndexRouter`, `DualIndexConfig` and `DualIndexStrategy` are removed, with
-  the `hybrid::dual_index` module. Nothing in the workspace constructed the router outside its own
-  tests. This is a source-breaking change for an out-of-tree Rust consumer; a caller that merged a
-  primary and a legacy index through it now fuses the two result lists with
-  `fuse_search_results_checked` and its own source order.
 
 ### Changed
 
