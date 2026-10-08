@@ -1,5 +1,7 @@
 //! Event storage capability — append-only operation log.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -183,6 +185,29 @@ pub struct EventView {
     pub observations: Vec<EventObservation>,
 }
 
+/// Closed grouping keys for storage-level event counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGroupBy {
+    /// Exact stored verb name.
+    Verb,
+    /// Canonical stored event kind.
+    Kind,
+    /// Exact stored actor attribution.
+    Actor,
+}
+
+impl EventGroupBy {
+    /// Return the fixed stored column name; never caller-supplied SQL.
+    pub const fn column(self) -> &'static str {
+        match self {
+            Self::Verb => "verb",
+            Self::Kind => "kind",
+            Self::Actor => "actor",
+        }
+    }
+}
+
 /// Filter for querying events. Namespace is implicit in the scoped EventStore.
 ///
 /// New fields deserialize to defaults for older serialized filters. Complete
@@ -322,6 +347,22 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
+
+    /// Count matching rows per stored verb, kind, or actor in this store's namespace.
+    /// Empty groups are omitted. Backends must aggregate in storage rather than
+    /// substitute a bounded row query that could silently undercount.
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        let _ = (filter, group_by);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "count_events_grouped".into(),
+            message: "this EventStore backend does not implement grouped counts".into(),
+        })
+    }
 
     /// Validate `event` against the exact insert/observation shape the
     /// backend would build at append time, performing no I/O. Rejects a
