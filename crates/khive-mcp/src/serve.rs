@@ -721,10 +721,7 @@ fn spawn_email_channel_loops(
 /// loop is spawned.
 #[cfg(feature = "channel-email")]
 fn ingest_namespace_from_env() -> String {
-    std::env::var("KHIVE_EMAIL_INGEST_NAMESPACE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    nonblank_env_or("KHIVE_EMAIL_INGEST_NAMESPACE", "local")
 }
 
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
@@ -740,7 +737,12 @@ fn email_default_inbound_actor_from_env() -> String {
 /// from the anonymous `local` mailbox.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
-    std::env::var(actor_variable)
+    nonblank_env_or(actor_variable, fallback)
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn nonblank_env_or(variable: &str, fallback: &str) -> String {
+    std::env::var(variable)
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| fallback.to_string())
@@ -2182,10 +2184,7 @@ fn spawn_telegram_channel_loops(
 /// loop is spawned.
 #[cfg(feature = "channel-telegram")]
 fn telegram_ingest_namespace_from_env() -> String {
-    std::env::var("KHIVE_TELEGRAM_INGEST_NAMESPACE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    nonblank_env_or("KHIVE_TELEGRAM_INGEST_NAMESPACE", "local")
 }
 
 // Keep the offset acknowledgement coupled to the polled channel. This
