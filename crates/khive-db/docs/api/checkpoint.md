@@ -153,6 +153,34 @@ after the attempt, win or lose. No transaction is ever killed or aborted
 here — the tx_registry is only read for diagnostics; Plank 1 owns the
 registry's own bound.
 
+### Outstanding pooled reader checkouts
+
+`ConnectionPool::oldest_checkout_age()` reports the age of the oldest outstanding
+reader lease, or `None` after the last lease returns. It includes ordinary pooled
+readers and degraded shared-reader leases, through reset/replacement or retirement.
+Failed/cancelled acquisitions never register a checkout. Standalone transactions
+remain covered by the separate transaction-registry age sweep.
+
+The existing daemon checkpoint and file-backed session sweeps also emit a WARN when
+this age exceeds `PoolConfig::reader_checkout_warn_after`. The default is 10 seconds,
+captured from `KHIVE_READER_CHECKOUT_WARN_SECS` when the pool configuration is built.
+Unsigned integer seconds are accepted, including zero; unset, non-Unicode or invalid
+values use the default. Zero warns on any strictly positive observed age. The observation never cancels a reader or changes sweep
+intervals. The daemon still observes ages on skipped checkpoint ticks.
+
+A warning episode remains latched while any checkout exceeds the threshold. Releasing
+the oldest lease does not emit another warning if an already-aged successor remains.
+A sweep observing no outstanding lease, or an oldest age at/below the threshold,
+rearms the warning. Each backend has its own episode state. The session sweep retains
+its existing file-backed backend selection; the age API also works for in-memory
+pools. Amendment 13 of ADR-091 made pooled readers the ordinary file-backed route,
+extending the original watchdog's in-memory/test usefulness to that production route.
+
+Tests hold actual reader guards and pass explicit observation instants through the
+same sweep path, so the one-second threshold and repeated observations require no
+wall-time sleep. Lifecycle controls cover query errors, unwinding, cancellation,
+discard/replacement failure, and owned shared-reader rollback/poisoning.
+
 ### Plank 1: age-based background sweep, not per-statement rejection
 
 The ADR's original text describes a "cooperative stale-op guard" that
