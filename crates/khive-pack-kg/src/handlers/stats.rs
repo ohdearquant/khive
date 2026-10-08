@@ -1,5 +1,10 @@
-//! `stats` verb handler.
+//! `stats` and grouped event `count` verb handlers.
 
+use std::collections::BTreeMap;
+
+use khive_storage::event::EventGroupBy;
+use khive_storage::EventFilter;
+use serde::Deserialize;
 use serde_json::Value;
 
 use khive_runtime::operations::EntityStatsCounts;
@@ -7,10 +12,90 @@ use khive_runtime::{NamespaceToken, RuntimeError};
 
 use khive_runtime::EdgeListFilter;
 
-use super::common::{deser, StatsParams};
+use super::common::{
+    deser, parse_event_kind, parse_event_outcome, parse_event_substrate, StatsParams,
+};
 use crate::KgPack;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventCountParams {
+    kind: String,
+    group_by: EventGroupBy,
+    #[serde(default)]
+    verb: Option<String>,
+    #[serde(default)]
+    verbs: Vec<String>,
+    #[serde(default)]
+    event_kind: Option<String>,
+    #[serde(default)]
+    event_kinds: Vec<String>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    substrate: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    since: Option<i64>,
+    #[serde(default)]
+    until: Option<i64>,
+}
+
 impl KgPack {
+    /// Aggregate stored event counts over only the caller's visible namespaces.
+    pub(crate) async fn handle_count(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: EventCountParams = deser(params)?;
+        if p.kind.trim().to_ascii_lowercase() != "event" {
+            return Err(RuntimeError::InvalidInput(
+                "count: kind must be event".into(),
+            ));
+        }
+        let filter = EventFilter {
+            verbs: p.verb.into_iter().chain(p.verbs).collect(),
+            kinds: p
+                .event_kind
+                .iter()
+                .chain(p.event_kinds.iter())
+                .map(|kind| parse_event_kind(kind))
+                .collect::<Result<_, _>>()?,
+            actors: p.actor.into_iter().collect(),
+            substrates: p
+                .substrate
+                .as_deref()
+                .map(parse_event_substrate)
+                .transpose()?
+                .into_iter()
+                .collect(),
+            outcome: p.outcome.as_deref().map(parse_event_outcome).transpose()?,
+            after: p.since,
+            before: p.until,
+            ..EventFilter::default()
+        };
+        let mut counts = BTreeMap::<String, u64>::new();
+        for namespace in token.visible_namespaces() {
+            // Narrow only to an already-authorized read namespace. The event
+            // accessor retains the attributed/split store routing.
+            let scoped = token.with_namespace(namespace.clone());
+            for (key, count) in self
+                .runtime
+                .events(&scoped)?
+                .count_events_grouped(filter.clone(), p.group_by)
+                .await?
+            {
+                let total = counts.entry(key).or_default();
+                *total = total
+                    .checked_add(count)
+                    .ok_or_else(|| RuntimeError::Internal("grouped event count overflow".into()))?;
+            }
+        }
+        super::common::to_json(&counts)
+    }
+
     /// Aggregate KG substrate counts (entities, edges, notes).
     ///
     /// Scope contract: every total here is summed across the caller's

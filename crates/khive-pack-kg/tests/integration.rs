@@ -93,12 +93,12 @@ fn list_items(response: &Value) -> &[Value] {
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
 // db_diagnostics (ADR-091 operator surface), then restore, then scan.
 #[test]
-fn pack_verbs_returns_twenty_six() {
+fn pack_verbs_returns_twenty_seven() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        26,
-        "KgPack must expose exactly 26 verbs including ordered streams, restore, and scan"
+        27,
+        "KgPack must expose exactly 27 verbs including grouped event count"
     );
 }
 
@@ -111,6 +111,7 @@ fn pack_verbs_names_are_correct() {
         "get",
         "list",
         "stats",
+        "count",
         "update",
         "delete",
         "merge",
@@ -17513,4 +17514,268 @@ async fn create_bulk_best_effort_commit_fault_fails_only_its_item() {
     assert_eq!(results[2]["ok"], true);
     assert_eq!(count_in(&pack, &namespace, "concept").await, 2);
     assert_eq!(count_in(&pack, &namespace, "observation").await, 0);
+}
+
+// Grouped counts exercise the public registry and real SQLite aggregation.
+fn event_count_fixture() -> (KhiveRuntime, VerbRegistry) {
+    use khive_runtime::{RuntimeConfig, WalCeilingSource};
+    let config = RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: Vec::new(),
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_env_raw: None,
+        wal_ceiling_source: WalCeilingSource::Default,
+        disk_guard_config: None,
+        disk_guard_environment: Default::default(),
+        volume_lock_dir: None,
+        visibility_receipts: None,
+        credentials: Vec::new(),
+        actor_id: None,
+        visible_namespaces: Vec::new(),
+        allowed_outbound_namespaces: Vec::new(),
+        brain_profile: None,
+        brain: Default::default(),
+        events_split: None,
+        mounts: Vec::new(),
+        blob: Default::default(),
+        packs: vec!["kg".into()],
+        ..RuntimeConfig::no_embeddings()
+    };
+    let runtime = KhiveRuntime::new(config).expect("isolated memory runtime");
+    assert!(!runtime.backend().is_file_backed());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    assert!(registry.admission_degrade_safe_probe("count"));
+    (runtime, registry)
+}
+
+async fn seed_count_event(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    verb: &str,
+    kind: khive_types::EventKind,
+    actor: &str,
+    at: i64,
+    outcome: khive_types::EventOutcome,
+) {
+    let mut event = khive_storage::Event::new(
+        namespace,
+        verb,
+        kind,
+        khive_types::SubstrateKind::Note,
+        actor,
+    )
+    .with_outcome(outcome);
+    event.created_at = at;
+    // Seed historical attribution directly; public reads still use the sealed
+    // identity and its attributed EventStore wrapper.
+    runtime
+        .backend()
+        .events_for_namespace(namespace)
+        .unwrap()
+        .append_event(event)
+        .await
+        .unwrap();
+}
+
+async fn grouped_count(registry: &VerbRegistry, visible: &[&str], args: Value) -> Value {
+    registry
+        .dispatch_with_identity(
+            "count",
+            args,
+            Some(khive_runtime::RequestIdentity {
+                namespace: "local".into(),
+                visible_namespaces: visible.iter().map(|ns| (*ns).to_owned()).collect(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("public grouped count")
+}
+
+#[tokio::test]
+async fn event_count_groups_only_visible_rows_inside_exclusive_time_bounds() {
+    use khive_types::{EventKind, EventOutcome};
+    let (runtime, registry) = event_count_fixture();
+    for (namespace, verb, kind, actor, at, outcome) in [
+        (
+            "local",
+            "verb_a",
+            EventKind::Audit,
+            "actor:a",
+            101,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_a",
+            EventKind::Audit,
+            "actor:a",
+            102,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_a",
+            EventKind::Refusal,
+            "actor:b",
+            103,
+            EventOutcome::Denied,
+        ),
+        (
+            "local",
+            "verb_b",
+            EventKind::Audit,
+            "actor:b",
+            104,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_b",
+            EventKind::Refusal,
+            "actor:a",
+            105,
+            EventOutcome::Error,
+        ),
+        (
+            "local",
+            "at_lower_bound",
+            EventKind::Audit,
+            "actor:a",
+            100,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "at_upper_bound",
+            EventKind::Audit,
+            "actor:a",
+            200,
+            EventOutcome::Success,
+        ),
+        (
+            "visible",
+            "verb_a",
+            EventKind::Audit,
+            "actor:c",
+            106,
+            EventOutcome::Success,
+        ),
+        (
+            "hidden",
+            "secret",
+            EventKind::Audit,
+            "actor:hidden",
+            107,
+            EventOutcome::Success,
+        ),
+    ] {
+        seed_count_event(&runtime, namespace, verb, kind, actor, at, outcome).await;
+    }
+    let args = json!({"kind":"event", "group_by":"verb", "since":100, "until":200});
+    assert_eq!(
+        grouped_count(&registry, &[], args.clone()).await,
+        json!({"verb_a":3, "verb_b":2})
+    );
+    assert_eq!(
+        grouped_count(&registry, &["visible", "visible"], args.clone()).await,
+        json!({"verb_a":4, "verb_b":2})
+    );
+    let mut by_kind = args.clone();
+    by_kind["group_by"] = json!("kind");
+    assert_eq!(
+        grouped_count(&registry, &[], by_kind).await,
+        json!({"audit":3, "refusal":2})
+    );
+    let mut by_actor = args.clone();
+    by_actor["group_by"] = json!("actor");
+    assert_eq!(
+        grouped_count(&registry, &["visible"], by_actor).await,
+        json!({"actor:a":3, "actor:b":2, "actor:c":1})
+    );
+    let mut filtered = args.clone();
+    filtered["verb"] = json!("verb_a");
+    filtered["verbs"] = json!(["verb_b"]);
+    filtered["event_kind"] = json!("refusal");
+    filtered["event_kinds"] = json!(["audit"]);
+    filtered["actor"] = json!("actor:b");
+    filtered["outcome"] = json!("denied");
+    filtered["substrate"] = json!("note");
+    assert_eq!(
+        grouped_count(&registry, &[], filtered.clone()).await,
+        json!({"verb_a":1})
+    );
+    filtered["actor"] = json!("actor:b' OR 1=1 --");
+    assert_eq!(grouped_count(&registry, &[], filtered).await, json!({}));
+    let mut empty = args;
+    empty["since"] = json!(201);
+    assert_eq!(
+        grouped_count(&registry, &["visible"], empty).await,
+        json!({})
+    );
+}
+
+#[tokio::test]
+async fn event_count_is_not_truncated_to_the_event_list_page_limit() {
+    use khive_types::{EventKind, EventOutcome};
+    let (runtime, registry) = event_count_fixture();
+    let events = (0..1101)
+        .map(|_| {
+            let mut event = khive_storage::Event::new(
+                "local",
+                "many",
+                EventKind::Audit,
+                khive_types::SubstrateKind::Note,
+                "actor:a",
+            )
+            .with_outcome(EventOutcome::Success);
+            event.created_at = 150;
+            event
+        })
+        .collect();
+    runtime
+        .backend()
+        .events_for_namespace("local")
+        .unwrap()
+        .append_events(events)
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped_count(
+            &registry,
+            &[],
+            json!({"kind":"event", "group_by":"verb", "since":100, "until":200})
+        )
+        .await,
+        json!({"many":1101})
+    );
+}
+
+#[tokio::test]
+async fn event_count_rejects_unknown_groups_kinds_and_filter_values() {
+    let (_, registry) = event_count_fixture();
+    for args in [
+        json!({"kind":"note", "group_by":"verb"}),
+        json!({"kind":"event", "group_by":"verb; DROP TABLE events"}),
+        json!({"kind":"event", "group_by":"verb", "event_kind":"not_registered"}),
+        json!({"kind":"event", "group_by":"verb", "event_kinds":["audit", "not_registered"]}),
+        json!({"kind":"event", "group_by":"verb", "substrate":"edge"}),
+        json!({"kind":"event", "group_by":"verb", "outcome":"maybe"}),
+        json!({"kind":"event", "group_by":"verb", "since":"100"}),
+        json!({"kind":"event", "group_by":"verb", "limit":1}),
+    ] {
+        let error = registry.dispatch("count", args.clone()).await.unwrap_err();
+        assert!(is_invalid_input(&error), "{args}: {error:?}");
+    }
+    assert_eq!(
+        registry
+            .dispatch("count", json!({"kind":"event", "group_by":"verb"}))
+            .await
+            .unwrap(),
+        json!({})
+    );
 }
