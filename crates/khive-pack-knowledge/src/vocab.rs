@@ -1,4 +1,4 @@
-//! Static handler descriptor table for the knowledge pack (19 verbs + 1 subhandler).
+//! Static handler descriptor table for the knowledge pack (20 verbs + 1 subhandler).
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
@@ -12,7 +12,7 @@ pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
     khive_runtime::sql!("knowledge_eval_runs_ns_run_at_index"),
 ];
 
-pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 21] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -77,6 +77,19 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
+    },
+    HandlerDef {
+        name: "knowledge.export",
+        description: "Export the selected namespace's live corpus rows as deterministic JSONL data with atom/domain/section counts. Includes domain mirror atoms, every lifecycle status and retired sections; excludes vectors and sections of deleted atoms. Does not write a file or export the KG graph.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "format",
+            param_type: "string",
+            required: false,
+            description: "Output format: jsonl (the default and only supported value)",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
     },
     HandlerDef {
         name: "knowledge.list",
@@ -803,6 +816,7 @@ mod tests {
             ),
             ("knowledge.upsert_domains", &["domains"]),
             ("knowledge.get", &["id", "include_sections"]),
+            ("knowledge.export", &["format"]),
             (
                 "knowledge.list",
                 &[
