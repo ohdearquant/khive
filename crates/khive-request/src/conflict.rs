@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use khive_types::EdgeRelation;
@@ -8,6 +8,67 @@ use crate::types::{ArgValue, ParsedOp};
 
 #[cfg(test)]
 use crate::types::{DslError, ExecutionMode, ParsedRequest};
+
+/// Direct conflict participants for each flat-batch operation, including itself.
+///
+/// Lists are sorted and unique. Repeated key occurrences within one operation
+/// retain the existing flat-batch refusal and produce a self-only list. This
+/// reports static write keys; it does not resolve IDs or change admission.
+pub fn write_key_conflict_ops(ops: &[ParsedOp]) -> Vec<Vec<usize>> {
+    participants_for_keys(
+        ops.len(),
+        key_claims(ops)
+            .into_values()
+            .filter(|claims| claims.len() > 1),
+    )
+}
+
+/// Direct conflict participants for each global leaf of a parallel batch of chains.
+///
+/// Only keys shared across different units count. For such a key, every claiming
+/// leaf is included, even repeated claims within a unit. An innocent leaf in a
+/// refused unit has an empty list. Lists never expand through transitive conflicts.
+/// `ranges` must partition `ops`, as guaranteed by the request parser.
+pub fn unit_write_key_conflict_ops(ops: &[ParsedOp], ranges: &[Range<usize>]) -> Vec<Vec<usize>> {
+    let mut unit_of = vec![0; ops.len()];
+    for (unit, range) in ranges.iter().enumerate() {
+        for leaf in range.clone() {
+            unit_of[leaf] = unit;
+        }
+    }
+    participants_for_keys(
+        ops.len(),
+        key_claims(ops).into_values().filter(|claims| {
+            claims
+                .iter()
+                .any(|&leaf| unit_of[leaf] != unit_of[claims[0]])
+        }),
+    )
+}
+
+fn key_claims(ops: &[ParsedOp]) -> HashMap<String, Vec<usize>> {
+    let mut claims: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        for key in write_keys_for_op_pub(op) {
+            claims.entry(key).or_default().push(index);
+        }
+    }
+    claims
+}
+
+fn participants_for_keys(count: usize, keys: impl Iterator<Item = Vec<usize>>) -> Vec<Vec<usize>> {
+    let mut participants = vec![BTreeSet::new(); count];
+    for claims in keys {
+        let claims: BTreeSet<_> = claims.into_iter().collect();
+        for &index in &claims {
+            participants[index].extend(claims.iter().copied());
+        }
+    }
+    participants
+        .into_iter()
+        .map(|indices| indices.into_iter().collect())
+        .collect()
+}
 
 /// One cross-unit static write-key conflict: `leaf` (inside the unit this
 /// entry is filed under) claims the same statically knowable write key as
@@ -187,6 +248,12 @@ pub(crate) fn check_write_key_conflicts(req: &ParsedRequest) -> Result<(), DslEr
         for key in keys {
             if let Some(first) = seen.get(&key) {
                 return Err(DslError::WriteKeyConflict {
+                    conflict_ops: key_claims(&req.ops)[&key]
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                     id: key,
                     first_op: first.clone(),
                     second_op: op.tool.clone(),
@@ -216,7 +283,7 @@ mod tests {
             parse_request(r#"[update(id="abc-123", name="new"), delete(id="abc-123")]"#).unwrap();
         let err = check_write_key_conflicts(&r).unwrap_err();
         assert!(
-            matches!(&err, DslError::WriteKeyConflict { id, first_op, second_op }
+            matches!(&err, DslError::WriteKeyConflict { id, first_op, second_op, .. }
                 if id == "entity:abc-123" && first_op == "update" && second_op == "delete"),
             "expected WriteKeyConflict with entity-prefixed key, got {err:?}"
         );
@@ -349,7 +416,7 @@ mod tests {
             let r = parse_request(ops).unwrap();
             let err = check_write_key_conflicts(&r).unwrap_err();
             assert!(
-                matches!(&err, DslError::WriteKeyConflict { id, first_op, second_op }
+                matches!(&err, DslError::WriteKeyConflict { id, first_op, second_op, .. }
                     if id == "edge-natural:a:b:extends"
                         && first_op == "link"
                         && second_op == "link"),
@@ -520,5 +587,73 @@ mod tests {
         .unwrap();
         let conflicts = unit_write_key_conflicts(&r.ops, &r.ranges);
         assert_eq!(conflicts.len(), 3, "{conflicts:?}");
+    }
+
+    #[test]
+    fn conflict_participants_are_direct_complete_and_sorted() {
+        let req = parse_request(r#"[update(id="a"), merge(from_id="a", into_id="b"), delete(id="b"), update(id="c"), delete(id="c"), list(kind="entity")]"#).unwrap();
+        assert_eq!(
+            write_key_conflict_ops(&req.ops),
+            vec![
+                vec![0, 1],
+                vec![0, 1, 2],
+                vec![1, 2],
+                vec![3, 4],
+                vec![3, 4],
+                vec![],
+            ]
+        );
+        let req = parse_request(
+            r#"[update(id="a"), list(kind="entity"), delete(id="a"), update(id="a")]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            write_key_conflict_ops(&req.ops),
+            vec![vec![0, 2, 3], vec![], vec![0, 2, 3], vec![0, 2, 3]]
+        );
+        let error = check_write_key_conflicts(&req).unwrap_err();
+        assert!(
+            matches!(&error, DslError::WriteKeyConflict { conflict_ops, .. } if conflict_ops == &[0, 2, 3])
+        );
+        assert_eq!(error.to_string(), "write-key conflict: id \"entity:a\" is targeted by both \"update\" and \"delete\" in the same batch; split into separate requests");
+    }
+
+    #[test]
+    fn unit_participants_include_repeated_claims_but_not_collateral_leaves() {
+        let req = parse_request(r#"[list(kind="entity") | update(id="a") | delete(id="a"), update(id="a"), delete(id="a"), list(kind="entity")]"#).unwrap();
+        assert_eq!(
+            unit_write_key_conflict_ops(&req.ops, &req.ranges),
+            vec![
+                vec![],
+                vec![1, 2, 3, 4],
+                vec![1, 2, 3, 4],
+                vec![1, 2, 3, 4],
+                vec![1, 2, 3, 4],
+                vec![],
+            ]
+        );
+        let req =
+            parse_request(r#"[update(id="a") | update(id="b"), delete(id="a"), delete(id="b")]"#)
+                .unwrap();
+        assert_eq!(
+            unit_write_key_conflict_ops(&req.ops, &req.ranges),
+            vec![vec![0, 2], vec![1, 3], vec![0, 2], vec![1, 3]]
+        );
+        let req = parse_request(r#"[update(id="a") | delete(id="a"), update(id="b")]"#).unwrap();
+        assert_eq!(
+            unit_write_key_conflict_ops(&req.ops, &req.ranges),
+            vec![Vec::<usize>::new(); 3]
+        );
+    }
+
+    #[test]
+    fn conflict_diagnostics_preserve_flat_self_refusal_and_key_policy() {
+        let req = parse_request(r#"merge(from_id="same", into_id="same")"#).unwrap();
+        assert_eq!(write_key_conflict_ops(&req.ops), vec![vec![0]]);
+        let req = parse_request(r#"[merge(from_id="a", into_id="b", dry_run=true), update(id="a"), link(links=[{"source_id":"x","target_id":"y","relation":"competes_with"},{"source_id":"x","target_id":"y","relation":"competes_with"}]), link(source="y",target="x",kind="competes-with")]"#).unwrap();
+        assert_eq!(
+            write_key_conflict_ops(&req.ops),
+            vec![vec![], vec![], vec![2, 3], vec![2, 3]]
+        );
     }
 }

@@ -479,6 +479,8 @@ pub enum DslError {
         first_op: String,
         /// Name of the second op that conflicts.
         second_op: String,
+        /// Sorted, unique global operation indexes claiming this key, including self.
+        conflict_ops: Vec<usize>,
     },
     /// An envelope-only field appears inside a verb argument list.
     ReservedEnvelopeArg {
@@ -576,6 +578,7 @@ impl fmt::Display for DslError {
                 id,
                 first_op,
                 second_op,
+                ..
             } => {
                 write!(
                     f,
