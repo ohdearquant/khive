@@ -27,6 +27,29 @@ pub(super) struct EdgeRow {
     pub(super) metadata: Option<String>,
 }
 
+impl EdgeRow {
+    /// Decode the shared incident-edge projection after the caller has parsed its ID.
+    /// Keeping ID handling separate lets cascade collection skip planned deletions
+    /// before decoding the remaining columns.
+    pub(super) fn from_row_with_id(row: &rusqlite::Row<'_>, id: Uuid) -> Result<Self, SqliteError> {
+        let parse_id =
+            |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
+        Ok(Self {
+            id,
+            namespace: row.get(1)?,
+            source_id: parse_id(row.get(2)?)?,
+            target_id: parse_id(row.get(3)?)?,
+            relation: row.get(4)?,
+            weight: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            deleted_at: row.get(8)?,
+            target_backend: row.get(9)?,
+            metadata: row.get(10)?,
+        })
+    }
+}
+
 pub(super) fn edge_row_preimage(edge: &EdgeRow) -> Result<MergeEdgePreimage, SqliteError> {
     let metadata = edge
         .metadata
@@ -82,19 +105,7 @@ pub(super) fn collect_merge_drop_incident_edge_preimages(
             if planned_deleted_edge_ids.contains(&id) {
                 continue;
             }
-            let edge = EdgeRow {
-                id,
-                namespace: row.get(1)?,
-                source_id: parse_id(row.get(2)?)?,
-                target_id: parse_id(row.get(3)?)?,
-                relation: row.get(4)?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                deleted_at: row.get(8)?,
-                target_backend: row.get(9)?,
-                metadata: row.get(10)?,
-            };
+            let edge = EdgeRow::from_row_with_id(row, id)?;
             budget.charge(1, edge_row_budget_bytes(&edge), budget_context)?;
             if !seen.insert(edge.id) {
                 continue;
