@@ -13,6 +13,12 @@
 > decision while the shipped runtime still exposes and uses the ADR-012
 > composition path.
 
+> Current-surface update (#4493): the unused `KhiveRuntime::rerank` method has
+> been removed. References to that method below describe the original v1 surface,
+> not an available runtime API. Its implementation filtered a namespace-wide top-N
+> result rather than scoring the complete candidate set. No replacement runtime
+> method is introduced; the composition decisions in this ADR remain unchanged.
+
 ## Context
 
 khive retrieves entities, notes, and graph subsets from typed, multi-substrate storage.

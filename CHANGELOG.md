@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `KhiveRuntime::rerank` is removed. No workspace code called it; its implementation
+  filtered a namespace-wide top-N instead of scoring every requested candidate.
+  This is a source-breaking change for an out-of-tree Rust consumer. There is no
+  replacement runtime method with the same candidate-set contract.
+
 ## [0.10.0] - 2026-10-07
 
 ### Removed
