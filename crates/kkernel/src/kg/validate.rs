@@ -455,11 +455,11 @@ fn record_prefix(entity_id: Option<&str>, entity_name: Option<&str>) -> String {
     }
 }
 
-/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op entity
-/// kinds against the same pack-declared taxonomy `kg validate` enforces.
-pub(super) fn check_valid_entity_kinds(
-    entities_path: &Path,
+fn check_valid_kinds(
+    records_path: &Path,
     valid_kinds: &HashSet<String>,
+    rule_id: &str,
+    kind_label: &str,
 ) -> RuleResult {
     let valid_list = {
         let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
@@ -468,7 +468,7 @@ pub(super) fn check_valid_entity_kinds(
     };
     let mut violations = Vec::new();
 
-    if let Ok(content) = std::fs::read_to_string(entities_path) {
+    if let Ok(content) = std::fs::read_to_string(records_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(kind_str) = v.get("kind").and_then(|k| k.as_str()) {
@@ -487,10 +487,10 @@ pub(super) fn check_valid_entity_kinds(
                             entity_id: if id.is_empty() { None } else { Some(id) },
                             entity_name: name,
                             entity_kind: Some(kind_str.to_string()),
-                            rule_id: "valid-entity-kinds".into(),
+                            rule_id: rule_id.into(),
                             severity: "error",
                             message: format!(
-                                "{prefix}unknown entity_kind: {kind_str:?}. \
+                                "{prefix}unknown {kind_label}: {kind_str:?}. \
                                  Valid: {valid_list}"
                             ),
                             fixable: false,
@@ -502,11 +502,25 @@ pub(super) fn check_valid_entity_kinds(
     }
 
     RuleResult {
-        id: "valid-entity-kinds".into(),
+        id: rule_id.into(),
         severity: "error",
         passed: violations.is_empty(),
         violations,
     }
+}
+
+/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op entity
+/// kinds against the same pack-declared taxonomy `kg validate` enforces.
+pub(super) fn check_valid_entity_kinds(
+    entities_path: &Path,
+    valid_kinds: &HashSet<String>,
+) -> RuleResult {
+    check_valid_kinds(
+        entities_path,
+        valid_kinds,
+        "valid-entity-kinds",
+        "entity_kind",
+    )
 }
 
 /// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op note
@@ -517,52 +531,7 @@ pub(super) fn check_valid_note_kinds(
     notes_path: &Path,
     valid_kinds: &HashSet<String>,
 ) -> RuleResult {
-    let valid_list = {
-        let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
-        v.sort_unstable();
-        v.join(" | ")
-    };
-    let mut violations = Vec::new();
-
-    if let Ok(content) = std::fs::read_to_string(notes_path) {
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(kind_str) = v.get("kind").and_then(|k| k.as_str()) {
-                    if !valid_kinds.contains(kind_str) {
-                        let id = v
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
-                        let prefix = record_prefix(
-                            if id.is_empty() { None } else { Some(&id) },
-                            name.as_deref(),
-                        );
-                        violations.push(Violation {
-                            entity_id: if id.is_empty() { None } else { Some(id) },
-                            entity_name: name,
-                            entity_kind: Some(kind_str.to_string()),
-                            rule_id: "valid-note-kinds".into(),
-                            severity: "error",
-                            message: format!(
-                                "{prefix}unknown note_kind: {kind_str:?}. \
-                                 Valid: {valid_list}"
-                            ),
-                            fixable: false,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    RuleResult {
-        id: "valid-note-kinds".into(),
-        severity: "error",
-        passed: violations.is_empty(),
-        violations,
-    }
+    check_valid_kinds(notes_path, valid_kinds, "valid-note-kinds", "note_kind")
 }
 
 fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
