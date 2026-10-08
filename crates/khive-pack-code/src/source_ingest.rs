@@ -1973,11 +1973,7 @@ async fn derive_source_path_on_worker(
 fn content_hash(content: &str) -> String {
     // FNV-1a: fast, dependency-free, sufficient for change-detection (not a
     // security boundary).
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in content.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let hash = khive_types::fnv1a_64(content.as_bytes());
     format!("{hash:016x}")
 }
 
