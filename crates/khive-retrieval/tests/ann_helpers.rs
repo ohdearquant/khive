@@ -12,6 +12,191 @@ use khive_retrieval::ann::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn empty_tail_preserves_candidate_order_duplicates_and_score_bits() {
+    use khive_retrieval::ann::merge_fresh_tail;
+    use uuid::Uuid;
+
+    let high_id = Uuid::from_u128(9);
+    let low_id = Uuid::from_u128(1);
+    let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+    let candidates = vec![(high_id, 0.25_f64), (high_id, nan), (low_id, 0.75)];
+    let expected: Vec<_> = candidates
+        .iter()
+        .map(|(id, score)| (*id, score.to_bits()))
+        .collect();
+    let merged = merge_fresh_tail(candidates, Vec::new(), |_| -> Result<f64, &'static str> {
+        panic!("empty tail must not score")
+    })
+    .expect("empty tail");
+    let actual: Vec<_> = merged
+        .iter()
+        .map(|(id, score)| (*id, score.to_bits()))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn tail_merge_preserves_f64_precision_and_descending_order() {
+    use khive_retrieval::ann::merge_fresh_tail;
+    use uuid::Uuid;
+
+    let low = 0.5_f64;
+    let high = f64::from_bits(low.to_bits() + 1);
+    let carried_high = f64::from_bits(low.to_bits() + 2);
+    assert_eq!(
+        (low as f32).to_bits(),
+        (high as f32).to_bits(),
+        "fixture detects narrowing"
+    );
+    assert_eq!((low as f32).to_bits(), (carried_high as f32).to_bits());
+    let low_id = Uuid::from_u128(1);
+    let high_id = Uuid::from_u128(9);
+    let carried_id = Uuid::from_u128(7);
+    let mut calls = 0;
+    let merged = merge_fresh_tail(
+        vec![(low_id, low), (carried_id, carried_high)],
+        vec![(high_id, Some(vec![1.0]))],
+        |embedding| {
+            assert_eq!(embedding, &[1.0]);
+            calls += 1;
+            Ok::<_, &'static str>(high)
+        },
+    )
+    .expect("score tail");
+    assert_eq!(calls, 1);
+    let actual: Vec<_> = merged
+        .iter()
+        .map(|(id, score)| (*id, score.to_bits()))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            (carried_id, carried_high.to_bits()),
+            (high_id, high.to_bits()),
+            (low_id, low.to_bits())
+        ]
+    );
+}
+
+#[test]
+fn tail_merge_scores_repeated_upserts_in_order_and_stops_at_first_error() {
+    use khive_retrieval::ann::merge_fresh_tail;
+    use uuid::Uuid;
+
+    let repeated = Uuid::from_u128(1);
+    let deleted = Uuid::from_u128(2);
+    let last = Uuid::from_u128(3);
+    let ops = vec![
+        (repeated, Some(vec![1.0])),
+        (deleted, None),
+        (repeated, Some(vec![2.0])),
+        (last, Some(vec![3.0])),
+    ];
+    let mut calls = Vec::new();
+    let merged = merge_fresh_tail(Vec::new(), ops.clone(), |embedding| {
+        calls.push(embedding[0]);
+        Ok::<_, (&'static str, u32)>(f64::from(embedding[0]))
+    })
+    .expect("successful callback");
+    assert_eq!(calls, vec![1.0, 2.0, 3.0]);
+    assert_eq!(merged, vec![(last, 3.0), (repeated, 2.0)]);
+
+    calls.clear();
+    let error = merge_fresh_tail(vec![(deleted, 9.0)], ops, |embedding| {
+        calls.push(embedding[0]);
+        if embedding[0] == 2.0 {
+            Err(("score rejected", 42_u32))
+        } else {
+            Ok(f64::from(embedding[0]))
+        }
+    })
+    .expect_err("first failure must propagate");
+    assert_eq!(error, ("score rejected", 42));
+    assert_eq!(calls, vec![1.0, 2.0]);
+}
+
+#[test]
+fn tail_merge_preserves_replacement_delete_and_uncoalesced_upsert_semantics() {
+    use khive_retrieval::ann::merge_fresh_tail;
+    use uuid::Uuid;
+
+    let updated = Uuid::from_u128(1);
+    let deleted = Uuid::from_u128(2);
+    let untouched = Uuid::from_u128(3);
+    let upsert_then_delete = Uuid::from_u128(4);
+    let delete_then_upsert = Uuid::from_u128(5);
+    let candidates = vec![
+        (updated, 0.1),
+        (updated, 0.2),
+        (deleted, 0.9),
+        (untouched, 0.75),
+        (untouched, 0.5),
+        (upsert_then_delete, 0.1),
+        (delete_then_upsert, 0.1),
+    ];
+    let ops = vec![
+        (upsert_then_delete, Some(vec![4.0])),
+        (upsert_then_delete, None),
+        (delete_then_upsert, None),
+        (delete_then_upsert, Some(vec![5.0])),
+        (updated, Some(vec![6.0])),
+        (updated, Some(vec![7.0])),
+        (deleted, None),
+    ];
+    let mut calls = Vec::new();
+    let merged = merge_fresh_tail(candidates, ops, |embedding| {
+        calls.push(embedding[0]);
+        Ok::<_, &'static str>(f64::from(embedding[0]))
+    })
+    .expect("score upserts");
+    assert_eq!(calls, vec![4.0, 5.0, 6.0, 7.0]);
+    assert_eq!(
+        merged,
+        vec![
+            (updated, 7.0),
+            (delete_then_upsert, 5.0),
+            (upsert_then_delete, 4.0),
+            (untouched, 0.75),
+            (untouched, 0.5),
+        ]
+    );
+}
+
+#[test]
+fn tail_merge_orders_equal_scores_and_incomparable_scores_by_uuid() {
+    use khive_retrieval::ann::merge_fresh_tail;
+    use uuid::Uuid;
+
+    let low = Uuid::from_u128(1);
+    let middle = Uuid::from_u128(2);
+    let high = Uuid::from_u128(3);
+    let merged = merge_fresh_tail(
+        vec![(middle, 1.0_f32)],
+        vec![(high, Some(vec![1.0])), (low, Some(vec![1.0]))],
+        |embedding| Ok::<_, &'static str>(embedding[0]),
+    )
+    .expect("equal scores");
+    assert_eq!(merged, vec![(low, 1.0), (middle, 1.0), (high, 1.0)]);
+
+    let low_nan = f64::from_bits(0x7ff8_0000_0000_0011);
+    let high_nan = f64::from_bits(0x7ff8_0000_0000_0022);
+    let merged = merge_fresh_tail(
+        vec![(high, high_nan), (low, low_nan)],
+        vec![(middle, None)],
+        |_| -> Result<f64, &'static str> { panic!("deletes must not score") },
+    )
+    .expect("incomparable scores");
+    let actual: Vec<_> = merged
+        .iter()
+        .map(|(id, score)| (*id, score.to_bits()))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![(low, low_nan.to_bits()), (high, high_nan.to_bits())]
+    );
+}
+
 /// A scratch directory under the system temp dir, removed on drop.
 struct ScratchDir(PathBuf);
 

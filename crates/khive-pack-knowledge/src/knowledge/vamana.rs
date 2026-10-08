@@ -1792,34 +1792,10 @@ pub(crate) fn merge_fresh_tail(
     query: &[f32],
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 ) -> Vec<(Uuid, f32)> {
-    if ops.is_empty() {
-        return candidates;
-    }
-    let mut deletes = HashSet::new();
-    let mut upserts = HashMap::new();
-    for (subject, op) in ops {
-        match op {
-            Some(embedding) => {
-                upserts.insert(subject, exact_cosine(query, &embedding));
-            }
-            None => {
-                deletes.insert(subject);
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f32)> = candidates
-        .into_iter()
-        .filter(|(subject, _)| !deletes.contains(subject) && !upserts.contains_key(subject))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    merged
+    khive_retrieval::ann::merge_fresh_tail(candidates, ops, |embedding| {
+        Ok::<_, std::convert::Infallible>(exact_cosine(query, embedding))
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
 pub(crate) async fn merge_fresh_tail_off_thread(
