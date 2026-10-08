@@ -586,6 +586,17 @@ fn cell_text(key: &str, value: &Value, truncate: bool) -> String {
     }
 }
 
+/// Format an instant in UTC using RFC3339 whole seconds and a `Z` suffix.
+///
+/// Fractional seconds are omitted. Chrono's supported years and signed
+/// expanded-year rendering are inherited; no additional range validation is done.
+/// Parsing and error policy remain with callers.
+pub fn format_utc_rfc3339_seconds<Tz: chrono::TimeZone>(value: &chrono::DateTime<Tz>) -> String {
+    value
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// Convert a microsecond epoch `i64` to an exact UTC ISO-8601 string.
 ///
 /// Output always carries six fractional digits and a `Z` suffix. Years
@@ -1330,6 +1341,20 @@ mod tests {
 
     /// A fixed "now" for deterministic tests: 2025-05-23T16:08:00Z.
     const NOW: i64 = 1_748_016_480;
+
+    #[test]
+    fn utc_rfc3339_seconds_normalizes_offsets_and_omits_fractions() {
+        for (raw, expected) in [
+            (
+                "2026-01-01T00:15:30.987654321+01:00",
+                "2025-12-31T23:15:30Z",
+            ),
+            ("1969-12-31T23:59:59.999999999Z", "1969-12-31T23:59:59Z"),
+        ] {
+            let instant = chrono::DateTime::parse_from_rfc3339(raw).unwrap();
+            assert_eq!(format_utc_rfc3339_seconds(&instant), expected, "{raw}");
+        }
+    }
 
     #[test]
     fn micros_to_iso_preserves_chrono_range_spelling() {

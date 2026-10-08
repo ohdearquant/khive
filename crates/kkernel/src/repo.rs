@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::DateTime;
 use clap::{Args, Subcommand, ValueEnum};
 use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
@@ -1121,9 +1121,9 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
 fn canonical_timestamp(raw: &str) -> Result<String> {
     let parsed = DateTime::parse_from_rfc3339(raw)
         .with_context(|| format!("--generated-at {raw:?} is not RFC3339"))?;
-    Ok(parsed
-        .with_timezone(&Utc)
-        .to_rfc3339_opts(SecondsFormat::Secs, true))
+    Ok(khive_runtime::presentation::format_utc_rfc3339_seconds(
+        &parsed,
+    ))
 }
 
 fn ensure_generated_at_not_before_head(repo: &Path, generated_at: &str) -> Result<()> {
@@ -1135,8 +1135,7 @@ fn ensure_generated_at_not_before_head(repo: &Path, generated_at: &str) -> Resul
     if generated < head {
         bail!(
             "--generated-at {generated_at} predates HEAD commit time {}; repository bundle provenance cannot precede its snapshot",
-            head.with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::Secs, true)
+            khive_runtime::presentation::format_utc_rfc3339_seconds(&head)
         );
     }
     Ok(())
