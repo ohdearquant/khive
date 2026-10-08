@@ -9,7 +9,9 @@ use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::EdgeRelation;
-use khive_vcs_adapters::{EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter};
+use khive_vcs_adapters::{
+    CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter,
+};
 use uuid::Uuid;
 
 use super::types::{ExportArgs, ImportArgs, ImportFormat};
@@ -90,29 +92,47 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     // source failures must not create or migrate `--db` as a side effect.
     let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
     let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
-    let archive = match args.format {
+    let format = args.format.unwrap_or_else(|| {
+        match args
+            .source
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some(extension) if extension.eq_ignore_ascii_case("csv") => ImportFormat::Csv,
+            Some(extension) if extension.eq_ignore_ascii_case("tsv") => ImportFormat::Tsv,
+            _ => ImportFormat::Archive,
+        }
+    });
+    if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
+        bail!("--default-kind is only supported for CSV/TSV input");
+    }
+    let archive = match format {
         ImportFormat::Archive => serde_json::from_str(&source)
             .with_context(|| format!("parse archive {}", args.source.display()))?,
         ImportFormat::Json | ImportFormat::Ndjson => {
-            let input = match args.format {
-                ImportFormat::Json => source,
-                ImportFormat::Ndjson => ndjson_to_json_array(&source)?,
-                ImportFormat::Archive => unreachable!(),
+            let input = if format == ImportFormat::Ndjson {
+                ndjson_to_json_array(&source)?
+            } else {
+                source
             };
-            let mut adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
+            let adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
                 .with_context(|| format!("parse adapter input {}", args.source.display()))?;
-            if args.verbose {
-                for warning in adapter.warnings() {
-                    eprintln!("warning: {warning}");
-                }
-            }
-            let entities: Vec<EntityRecord> = adapter
-                .entities()
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let edges: Vec<EdgeRecord> = adapter
-                .edges()
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            adapter_records_to_archive(&args.namespace, entities, edges)?
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+        }
+        ImportFormat::Csv | ImportFormat::Tsv => {
+            let delimiter = if format == ImportFormat::Csv {
+                DelimitedFormat::Csv
+            } else {
+                DelimitedFormat::Tsv
+            };
+            let adapter = CsvFormatAdapter::new(
+                &source,
+                delimiter,
+                args.default_kind.as_deref(),
+                &valid_entity_kinds,
+            )
+            .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
         }
     };
     validate_archive_deterministic(&archive, &valid_entity_kinds)?;
@@ -136,6 +156,25 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let json = serde_json::to_string(&summary).expect("serialize ImportSummary");
     println!("{json}");
     Ok(())
+}
+
+fn archive_from_adapter(
+    namespace: &str,
+    mut adapter: impl FormatAdapter,
+    verbose: bool,
+) -> Result<KgArchive> {
+    if verbose {
+        for warning in adapter.warnings() {
+            eprintln!("warning: {warning}");
+        }
+    }
+    let entities = adapter
+        .entities()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let edges = adapter
+        .edges()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    adapter_records_to_archive(namespace, entities, edges)
 }
 
 fn ndjson_to_json_array(source: &str) -> Result<String> {
@@ -647,7 +686,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -682,7 +722,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -729,7 +770,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -766,7 +808,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Ndjson,
+            format: Some(ImportFormat::Ndjson),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -803,7 +846,8 @@ mod tests {
             source: source_path,
             db: db_path,
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         assert!(
@@ -829,7 +873,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -863,7 +908,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Ndjson,
+            format: Some(ImportFormat::Ndjson),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1012,7 +1058,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1059,7 +1106,8 @@ mod tests {
             source: baseline_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1080,7 +1128,8 @@ mod tests {
             source: bad_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1133,7 +1182,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1187,7 +1237,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         })
         .await
