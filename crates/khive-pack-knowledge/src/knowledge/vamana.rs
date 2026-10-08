@@ -1004,7 +1004,8 @@ impl AnnBridge {
     /// is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
-        let _publication_lock = acquire_bridge_checkpoint_lock(dir)?;
+        let _publication_lock =
+            khive_retrieval::ann::acquire_checkpoint_lock(dir, BRIDGE_LOCK_MESSAGE_PREFIX)?;
         self.save_atomic_locked(dir)
     }
 
@@ -1039,28 +1040,13 @@ impl AnnBridge {
 
 const BRIDGE_LOCK_MESSAGE_PREFIX: &str = "ANN bridge";
 
-fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock(dir, BRIDGE_LOCK_MESSAGE_PREFIX)
-}
-
-async fn acquire_bridge_checkpoint_lock_async(
-    dir: std::path::PathBuf,
-) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, BRIDGE_LOCK_MESSAGE_PREFIX).await
-}
-
 // ── persistence helpers ───────────────────────────────────────────────────────
 
 mod segment_key;
 pub(crate) use segment_key::snapshot_key;
 use segment_key::{ann_segment_dir, ann_segment_dir_from_root, decode_ann_dir_name};
 
-/// Model-key sanitization — must match `khive_runtime::sanitize_key`.
-pub(crate) fn sanitize_model_key(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
+pub(crate) use khive_runtime::config::sanitize_key as sanitize_model_key;
 
 /// Persist `bridge` as v2 Vamana segments under `<db-file>.ann/<hex>/`.
 ///
@@ -1151,7 +1137,10 @@ async fn write_force_rebuild_sentinel(rt: &KhiveRuntime, key: &AnnKey) -> Result
     // therefore either finishes before `-1` is published or observes `-1`
     // under this same lock and aborts without publishing.
     let _publication_lock = match ann_segment_dir(rt, &key.namespace, &key.model) {
-        Some(dir) => Some(acquire_bridge_checkpoint_lock_async(dir).await?),
+        Some(dir) => Some(
+            khive_retrieval::ann::acquire_checkpoint_lock_async(dir, BRIDGE_LOCK_MESSAGE_PREFIX)
+                .await?,
+        ),
         None => None,
     };
     // The detector may have waited behind a successful authoritative
@@ -2241,7 +2230,12 @@ pub(crate) async fn checkpoint_raise_compact_readopt(
     // transition.  The sentinel writer takes the same lock, so an ordinary
     // replay checkpoint that predates registry loss cannot publish after -1.
     let publication_lock = match ann_segment_dir(rt, ns, model) {
-        Some(dir) => match acquire_bridge_checkpoint_lock_async(dir).await {
+        Some(dir) => match khive_retrieval::ann::acquire_checkpoint_lock_async(
+            dir,
+            BRIDGE_LOCK_MESSAGE_PREFIX,
+        )
+        .await
+        {
             Ok(lock) => Some(lock),
             Err(error) => {
                 tracing::warn!(error = %error, "failed to acquire ANN checkpoint lock");
@@ -2826,7 +2820,12 @@ async fn refresh_rotated_segment(
         return;
     }
 
-    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+    let _publication_guard = match khive_retrieval::ann::acquire_checkpoint_lock_async(
+        dir.clone(),
+        BRIDGE_LOCK_MESSAGE_PREFIX,
+    )
+    .await
+    {
         Ok(lock) => lock,
         Err(error) => {
             tracing::warn!(
