@@ -148,6 +148,7 @@ pub struct UpdateParams {
     pub(crate) id: String,
     pub(crate) kind: Option<String>,
     pub(crate) name: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub(crate) description: Option<Value>,
     pub(crate) content: Option<String>,
     #[serde(default, deserialize_with = "tri_f64")]
@@ -405,6 +406,10 @@ pub(crate) struct ResolveParams {
     pub(crate) refs: Vec<String>,
     pub(crate) kind: Option<String>,
     pub(crate) limit: Option<u32>,
+}
+
+fn deserialize_present_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {

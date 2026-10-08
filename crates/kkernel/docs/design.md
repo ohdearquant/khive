@@ -394,17 +394,15 @@ operations known to be idempotent.
   operator could start a no-actor daemon, then run strict-mode `kkernel exec`, which would
   forward through it and exit 0 — bypassing the gate. The fix moves the check before the
   daemon block.
-- `atomic_update_null_and_type_semantics_match_canonical_no_op_behavior`: atomic `update`
-  null/type semantics must match canonical's actually-reachable behavior. Empirically
-  verified against live `handle_update` that `name=null`/`description=null` are canonical
-  no-ops, not rejections — canonical's field type is `Option<Value>`, and serde's derived
-  `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the outer `Option`
-  boundary and maps it straight to `None` regardless of the inner type, so canonical's own
-  literal-null branches in `string_value`/`description_patch` are unreachable through normal
-  struct deserialization. This test deliberately does NOT implement the naive expectation
-  ("`update(name=null)` REJECTED") since that doesn't match the live system. What canonical
-  DOES still reject is a non-null, non-string `name` (e.g. `name: 123`) — pre-fix, atomic
-  silently treated that as absent too, reporting success for an invalid update.
+- `atomic_update_null_and_type_semantics_match_canonical_behavior`: canonical MCP dispatch
+  and atomic execution preserve the same description patch states. An explicit
+  `description: null` clears the entity description, omission leaves it unchanged, and
+  an empty string remains a concrete value. Null `name`, `properties`, and `tags` retain
+  their existing no-op behavior. Non-string description values are refused with the
+  record unchanged, as is any present description on a note or edge, including null.
+  Present nullable note-only fields (`salience` and `decay_factor`) are also refused on
+  entity and edge targets, including null, before any sibling patch field changes.
+  Valid note-content and edge-weight updates remain available after those refusals.
 
 ### `reindex` memory Vamana epoch protocol (#812, ADR-107 §4)
 

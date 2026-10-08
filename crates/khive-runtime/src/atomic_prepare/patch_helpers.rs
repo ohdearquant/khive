@@ -63,10 +63,10 @@ pub(super) fn optional_create_string(args: &Value, key: &str) -> RuntimeResult<O
     }
 }
 
-/// ADR-014 tri-state patch for entity `entity_type`, read from raw JSON to
-/// mirror `UpdateParams.entity_type`'s `tri_string` deserializer (the
-/// kkernel `--atomic` seam deserializes through that struct first, so the
-/// two surfaces cannot diverge): key absent -> `None` (unchanged), key
+/// ADR-014 tri-state patch for entity `entity_type` and `description`.
+/// Both canonical fields preserve explicit null before building the patch.
+/// Read the same distinction from raw atomic arguments: absent -> `None`
+/// (unchanged), key
 /// present as `null` -> `Some(None)` (explicit clear), key present as a
 /// string -> `Some(Some(s))` (set); any other JSON type -> a hard error.
 pub(super) fn optional_entity_type_patch(
@@ -83,18 +83,9 @@ pub(super) fn optional_entity_type_patch(
     }
 }
 
-/// Nullable-string patch semantics shared by note updates and mirroring the
-/// actually-reachable entity description behavior of
-/// `khive-pack-kg::handlers::common::description_patch`. Canonical's field
-/// type is `Option<Value>` (`UpdateParams.name`/`.description`); serde_json's
-/// derived `Deserialize` for `Option<T>` intercepts a literal JSON `null` at
-/// the outer `Option` boundary and maps it straight to Rust `None`
-/// regardless of the inner type, so canonical's own "clear" arm is
-/// unreachable through normal struct deserialization: `update(name=null)` /
-/// `update(description=null)` are no-ops, not clears. This module reads raw,
-/// un-deserialized JSON, so it must replicate that collapse explicitly: key
-/// absent OR JSON `null` -> `None` (leave unchanged, no-op); key present as a
-/// string -> `Some(Some(s))` (set); any other JSON type -> a hard error.
+/// Nullable note-name patch semantics: absent or JSON `null` leaves the name
+/// unchanged; a string sets it; every other JSON type is an error.
+/// Entity descriptions use the tri-state helper above so null clears them.
 pub(super) fn optional_string_patch(
     args: &Value,
     key: &str,

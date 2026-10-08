@@ -7109,99 +7109,259 @@ async fn atomic_delete_rejects_kind_mismatch_and_accepts_matching_or_omitted_kin
     );
 }
 
-/// Atomic `update` null/type semantics must match canonical's actually-reachable
-/// behavior. See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
+/// Canonical and atomic updates preserve nullable-field presence and applicability.
+/// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
 #[tokio::test]
-async fn atomic_update_null_and_type_semantics_match_canonical_no_op_behavior() {
+async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
     if crate::test_process::run_in_child() {
         return;
     }
 
-    let db_file = NamedTempFile::new().expect("temp db");
-    let db_path = db_file.path().to_str().expect("utf8").to_string();
-    let khive_cfg = KhiveConfig::default();
+    async fn call(db_path: &str, ops: &str) -> serde_json::Value {
+        let server = isolated_server(db_path);
+        let envelope = dispatch_json(&server, ops).await;
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+        envelope["results"][0]["result"].clone()
+    }
 
-    let entity_id = {
-        let server = isolated_server(&db_path);
-        let resp = dispatch_json(
-            &server,
-            r#"create(kind="concept", name="NullSemantics", description="orig-desc", properties={"k": "v"}, tags=["a", "b"])"#,
+    async fn get(db_path: &str, id: &str) -> serde_json::Value {
+        call(db_path, &format!(r#"get(id="{id}")"#)).await
+    }
+
+    async fn update(db_path: &str, atomic: bool, args: serde_json::Value) -> Result<(), String> {
+        let envelope = if atomic {
+            crate::atomic_apply::execute_atomic_ops_file(
+                vec![atomic_op("update", args)],
+                atomic_cfg(db_path),
+                &KhiveConfig::default(),
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?
+        } else {
+            let fields = args
+                .as_object()
+                .expect("update argument object")
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let server = isolated_server(db_path);
+            dispatch_json(&server, &format!("update({fields})")).await
+        };
+        let accepted = if atomic {
+            envelope["atomic"]["committed"] == true
+        } else {
+            envelope["results"][0]["ok"] == true
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(envelope.to_string())
+        }
+    }
+
+    for atomic in [false, true] {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8");
+        let created = call(
+            db_path,
+            r#"create(kind="concept", name="NullSemantics", description="orig-desc", properties={"k":"v"}, tags=["a","b"], skip_dedup_check=true)"#,
+        ).await;
+        let id = created["id"].as_str().expect("full entity id");
+        let initial = get(db_path, id).await;
+        assert_eq!(initial["description"], "orig-desc");
+
+        let error = update(db_path, atomic, serde_json::json!({"id":id,"name":123}))
+            .await
+            .expect_err("non-string name stays invalid");
+        assert!(error.contains("name must be a string"), "{error}");
+        assert_eq!(get(db_path, id).await, initial);
+
+        for field in ["salience", "decay_factor"] {
+            let mut args = serde_json::json!({"id":id,"name":"must-not-land"});
+            args[field] = serde_json::Value::Null;
+            let error = update(db_path, atomic, args)
+                .await
+                .expect_err("nullable note fields are inapplicable to entities");
+            assert!(
+                error.contains(&format!("field '{field}' is not valid for an entity")),
+                "{error}"
+            );
+            assert_eq!(get(db_path, id).await, initial);
+        }
+
+        for malformed in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let error = update(
+                db_path,
+                atomic,
+                serde_json::json!({
+                    "id":id,"description":malformed,"name":"must-not-land"
+                }),
+            )
+            .await
+            .expect_err("non-string description stays invalid");
+            let expected = if atomic {
+                "description must be a string or null"
+            } else {
+                "description must be null or a string"
+            };
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(get(db_path, id).await, initial);
+        }
+
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":id,"properties":{"added":true}}),
+        )
+        .await
+        .expect("omitted description preserves its value");
+        let omitted = get(db_path, id).await;
+        assert_eq!(omitted["description"], "orig-desc");
+        assert_eq!(omitted["properties"]["added"], true);
+
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({
+                "id":id,"name":null,"description":null,"properties":null,"tags":null
+            }),
+        )
+        .await
+        .expect("description null clears; other null fields keep their behavior");
+        let cleared = get(db_path, id).await;
+        assert_eq!(cleared.get("description"), Some(&serde_json::Value::Null));
+        assert_eq!(cleared["name"], "NullSemantics");
+        assert_eq!(cleared["properties"], omitted["properties"]);
+        assert_eq!(cleared["tags"], omitted["tags"]);
+
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":id,"name":"after-clear"}),
+        )
+        .await
+        .expect("an unrelated update preserves a cleared description");
+        let after_clear = get(db_path, id).await;
+        assert_eq!(
+            after_clear.get("description"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(after_clear["name"], "after-clear");
+
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":id,"description":"reset"}),
+        )
+        .await
+        .expect("description may be set again");
+        assert_eq!(get(db_path, id).await["description"], "reset");
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":id,"name":"after-reset"}),
+        )
+        .await
+        .expect("omission preserves a newly set description");
+        assert_eq!(get(db_path, id).await["description"], "reset");
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":id,"description":""}),
+        )
+        .await
+        .expect("empty string remains a concrete description");
+        assert_eq!(
+            get(db_path, id).await.get("description"),
+            Some(&serde_json::json!(""))
+        );
+
+        let note = call(
+            db_path,
+            r#"create(kind="observation", name="kept-note", content="before")"#,
         )
         .await;
-        resp["results"][0]["result"]["id"]
-            .as_str()
-            .expect("id")
-            .to_string()
-    };
+        let note_id = note["id"].as_str().expect("full note id");
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":note_id,"salience":0.6,"decay_factor":0.03}),
+        )
+        .await
+        .expect("nullable fields remain valid on notes");
+        let note_before = get(db_path, note_id).await;
+        assert_eq!(note_before["salience"], 0.6);
+        assert_eq!(note_before["decay_factor"], 0.03);
+        let error = update(
+            db_path,
+            atomic,
+            serde_json::json!({
+                "id":note_id,"description":null,"content":"must-not-land"
+            }),
+        )
+        .await
+        .expect_err("a present description is inapplicable to notes");
+        assert!(
+            error.contains("field 'description' is not valid for a note"),
+            "{error}"
+        );
+        assert_eq!(get(db_path, note_id).await, note_before);
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({
+                "id":note_id,"content":"after","name":null,"salience":null,"decay_factor":null
+            }),
+        )
+        .await
+        .expect("valid note clears still accept null name as unchanged");
+        let note_after = get(db_path, note_id).await;
+        assert_eq!(note_after["content"], "after");
+        assert_eq!(note_after["name"], note_before["name"]);
+        assert_eq!(note_after.get("salience"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            note_after.get("decay_factor"),
+            Some(&serde_json::Value::Null)
+        );
 
-    // (a) name: a non-null, non-string value must be REJECTED — the
-    // actual violation (pre-fix: silently treated as
-    // absent, reporting success).
-    let ops = vec![atomic_op(
-        "update",
-        serde_json::json!({"id": entity_id, "name": 123}),
-    )];
-    let err = crate::atomic_apply::execute_atomic_ops_file(
-        ops,
-        atomic_cfg(&db_path),
-        &khive_cfg,
-        khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-    )
-    .await
-    .expect_err("name: 123 (non-null, non-string) must be rejected");
-    assert!(
-        format!("{err:#}").contains("name must be a string"),
-        "error: {err:#}"
-    );
-
-    // (b) name=null, description=null, properties=null, tags=null in one
-    // update: all four are canonical no-ops — the update must succeed
-    // and every field must be UNCHANGED afterward.
-    let ops = vec![atomic_op(
-        "update",
-        serde_json::json!({
-            "id": entity_id,
-            "name": null,
-            "description": null,
-            "properties": null,
-            "tags": null,
-        }),
-    )];
-    let envelope = crate::atomic_apply::execute_atomic_ops_file(
-        ops,
-        atomic_cfg(&db_path),
-        &khive_cfg,
-        khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-    )
-    .await
-    .expect("an all-null update must be a no-op success, not a rejection");
-    assert_eq!(
-        envelope["atomic"]["committed"], true,
-        "envelope: {envelope}"
-    );
-
-    let server = isolated_server(&db_path);
-    let resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
-    let row = &resp["results"][0]["result"];
-    assert_eq!(
-        row["name"], "NullSemantics",
-        "name must be unchanged: {row}"
-    );
-    assert_eq!(
-        row["description"], "orig-desc",
-        "description must be unchanged: {row}"
-    );
-    assert_eq!(
-        row["properties"]["k"], "v",
-        "properties must be unchanged: {row}"
-    );
-    assert_eq!(
-        row["tags"],
-        serde_json::json!(["a", "b"]),
-        "tags must be unchanged: {row}"
-    );
+        let target = call(
+            db_path,
+            r#"create(kind="concept", name="DescriptionTarget", skip_dedup_check=true)"#,
+        )
+        .await;
+        let target_id = target["id"].as_str().expect("full target id");
+        let edge = call(db_path, &format!(r#"link(source_id="{id}", target_id="{target_id}", relation="supports", weight=0.4)"#)).await;
+        let edge_id = edge["id"].as_str().expect("full edge id");
+        let edge_before = get(db_path, edge_id).await;
+        for field in ["description", "salience", "decay_factor"] {
+            let mut args = serde_json::json!({"id":edge_id,"weight":0.8});
+            args[field] = serde_json::Value::Null;
+            let error = update(db_path, atomic, args)
+                .await
+                .expect_err("nullable entity/note fields are inapplicable to edges");
+            assert!(
+                error.contains(&format!("field '{field}' is not valid for an edge")),
+                "{error}"
+            );
+            assert_eq!(get(db_path, edge_id).await, edge_before);
+        }
+        update(
+            db_path,
+            atomic,
+            serde_json::json!({"id":edge_id,"weight":0.8,"name":null}),
+        )
+        .await
+        .expect("valid edge update preserves null name behavior");
+        assert_eq!(get(db_path, edge_id).await["weight"], 0.8);
+    }
 }
-
 /// An atomic ops-file using an 8-hex-prefix id for
 /// `update` AND `gtd.transition` must succeed identically to canonical
 /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix

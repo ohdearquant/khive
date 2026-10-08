@@ -216,9 +216,9 @@ pub async fn prepare_add_note(
 /// back to `khive-runtime`, so its exact field-applicability check list and
 /// error message shape are reimplemented here rather than imported: same
 /// pattern as `optional_string_patch` above. Presence is checked directly on
-/// the raw args object (this module has no `UpdateParams` struct); a JSON
-/// `null` value is treated as absent, matching `Option<T>` deserialization
-/// semantics.
+/// the raw args object (this module has no `UpdateParams` struct). Nullable
+/// description, salience, decay_factor, and entity_type preserve key presence;
+/// the remaining field checks retain their existing rules.
 pub(super) fn reject_inapplicable_update_fields(
     args: &Value,
     substrate: &str,
@@ -243,9 +243,9 @@ pub(super) fn reject_inapplicable_update_fields(
         "entity" => {
             let bad = if present("content") {
                 Some("content")
-            } else if present("salience") {
+            } else if o.contains_key("salience") {
                 Some("salience")
-            } else if present("decay_factor") {
+            } else if o.contains_key("decay_factor") {
                 Some("decay_factor")
             } else if present("relation") {
                 Some("relation")
@@ -257,7 +257,7 @@ pub(super) fn reject_inapplicable_update_fields(
             (bad, "name, description, tags, properties, entity_type")
         }
         "note" => {
-            let bad = if present("description") {
+            let bad = if o.contains_key("description") {
                 Some("description")
             } else if present("relation") {
                 Some("relation")
@@ -283,15 +283,15 @@ pub(super) fn reject_inapplicable_update_fields(
         "edge" => {
             let bad = if present("name") {
                 Some("name")
-            } else if present("description") {
+            } else if o.contains_key("description") {
                 Some("description")
             } else if present("content") {
                 Some("content")
             } else if present("tags") {
                 Some("tags")
-            } else if present("salience") {
+            } else if o.contains_key("salience") {
                 Some("salience")
-            } else if present("decay_factor") {
+            } else if o.contains_key("decay_factor") {
                 Some("decay_factor")
             } else if o.contains_key("entity_type") {
                 // ADR-014 tri-state: a PRESENT key (including JSON `null`,
@@ -673,7 +673,7 @@ pub async fn prepare_update(
             // marker, under an exactly-one affected-row guard.
             reject_inapplicable_update_fields(args, "entity")?;
             let name = entity_name_patch(args)?;
-            let description = optional_string_patch(args, "description")?;
+            let description = optional_entity_type_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
             if let Some(ref tags) = tags {
@@ -752,8 +752,8 @@ pub async fn prepare_update(
 }
 
 /// Build an entity update plan from a typed patch. Proposal changesets use
-/// this entry point so their explicit `description: null` clear operation is
-/// preserved instead of being collapsed by raw verb deserialization.
+/// this entry point to preserve the typed patch directly, without translating
+/// it through raw verb parameters.
 pub async fn prepare_update_entity_plan(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
