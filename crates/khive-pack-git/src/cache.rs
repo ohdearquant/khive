@@ -336,26 +336,16 @@ fn scratch_root() -> PathBuf {
         .join("git-digest")
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 fn max_repos() -> usize {
-    std::env::var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_REPOS)
+    khive_runtime::env_parse_or("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", DEFAULT_MAX_REPOS)
 }
 
 fn max_total_bytes() -> u64 {
-    env_u64("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", DEFAULT_MAX_TOTAL_BYTES)
+    khive_runtime::env_parse_or("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", DEFAULT_MAX_TOTAL_BYTES)
 }
 
 fn clone_max_bytes() -> u64 {
-    env_u64("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", DEFAULT_CLONE_MAX_BYTES)
+    khive_runtime::env_parse_or("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", DEFAULT_CLONE_MAX_BYTES)
 }
 
 /// Per-cache-slot advisory locks, keyed by `cache_key` (issue #805): each of
