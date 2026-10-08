@@ -15,14 +15,14 @@ description = "Git-lifecycle pack — commit/issue/pull_request provenance notes
 contract-faults = ["khive-runtime/contract-faults"]
 
 [dependencies]
-khive-pack-exec = { version = "0.9.0", path = "../khive-pack-exec" }
-khive-pack-tool = { version = "0.9.0", path = "../khive-pack-tool" }
+khive-pack-exec = { version = "0.10.0", path = "../khive-pack-exec" }
+khive-pack-tool = { version = "0.10.0", path = "../khive-pack-tool" }
 tempfile = { workspace = true }
 zeroize = "1"
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
+khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
 inventory = { workspace = true }
-khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-storage = { version = "0.10.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }
@@ -37,7 +37,7 @@ clap = { workspace = true }
 blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-khive-fs = { version = "0.9.0", path = "../khive-fs" }
+khive-fs = { version = "0.10.0", path = "../khive-fs" }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -52,11 +52,11 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-khive-db = { version = "0.9.0", path = "../khive-db" }
-khive-pack-blob = { version = "0.9.0", path = "../khive-pack-blob" }
+khive-db = { version = "0.10.0", path = "../khive-db" }
+khive-pack-blob = { version = "0.10.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.10.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["fault-injection"] }
+khive-runtime = { version = "0.10.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }
 serial_test = { workspace = true }

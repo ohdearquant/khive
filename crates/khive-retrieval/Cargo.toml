@@ -15,14 +15,14 @@ description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-e
 bench = false
 
 [dependencies]
-khive-hnsw    = { version = "0.9.0", path = "../khive-hnsw", optional = true }
-khive-bm25    = { version = "0.9.0", path = "../khive-bm25", optional = true }
-khive-fusion  = { version = "0.9.0", path = "../khive-fusion" }
-khive-score   = { version = "0.9.0", path = "../khive-score" }
-khive-types   = { version = "0.9.0", path = "../khive-types" }
-khive-fold    = { version = "0.9.0", path = "../khive-fold", optional = true }
-khive-storage = { version = "0.9.0", path = "../khive-storage", optional = true }
-khive-gate    = { version = "0.9.0", path = "../khive-gate", optional = true }
+khive-hnsw    = { version = "0.10.0", path = "../khive-hnsw", optional = true }
+khive-bm25    = { version = "0.10.0", path = "../khive-bm25", optional = true }
+khive-fusion  = { version = "0.10.0", path = "../khive-fusion" }
+khive-score   = { version = "0.10.0", path = "../khive-score" }
+khive-types   = { version = "0.10.0", path = "../khive-types" }
+khive-fold    = { version = "0.10.0", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.10.0", path = "../khive-storage", optional = true }
+khive-gate    = { version = "0.10.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
 
 serde = { workspace = true }
@@ -62,10 +62,10 @@ ann = ["khive-storage", "tracing"]
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-score = { version = "0.9.0", path = "../khive-score" }
-khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+khive-score = { version = "0.10.0", path = "../khive-score" }
+khive-fusion = { version = "0.10.0", path = "../khive-fusion" }
 # Only the storage-adapters and ann registry tests use khive-db; `vectors` loads sqlite-vec.
-khive-db = { version = "0.9.0", path = "../khive-db", features = ["vectors"] }
+khive-db = { version = "0.10.0", path = "../khive-db", features = ["vectors"] }
 
 [[bench]]
 name = "fusion_bench"

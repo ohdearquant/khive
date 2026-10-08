@@ -12,11 +12,11 @@ categories.workspace = true
 description = "Exec pack - materialize a blob tree into a sandbox, run one registered tool under policy, capture outputs and changed files back to blobs with a receipt"
 
 [dependencies]
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
-khive-storage = { version = "0.9.0", path = "../khive-storage" }
-khive-pack-tool = { version = "0.9.0", path = "../khive-pack-tool" }
-khive-fs = { version = "0.9.0", path = "../khive-fs" }
+khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
+khive-storage = { version = "0.10.0", path = "../khive-storage" }
+khive-pack-tool = { version = "0.10.0", path = "../khive-pack-tool" }
+khive-fs = { version = "0.10.0", path = "../khive-fs" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -30,8 +30,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-khive-db = { version = "0.9.0", path = "../khive-db" }
-khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
-khive-pack-blob = { version = "0.9.0", path = "../khive-pack-blob" }
+khive-db = { version = "0.10.0", path = "../khive-db" }
+khive-pack-kg = { version = "0.10.0", path = "../khive-pack-kg" }
+khive-pack-blob = { version = "0.10.0", path = "../khive-pack-blob" }
 tempfile = { workspace = true }
 base64 = { workspace = true }
