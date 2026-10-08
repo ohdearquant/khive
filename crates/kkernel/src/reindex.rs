@@ -582,10 +582,10 @@ async fn run_reindex_with_setup(
         let entity_bar = ProgressBar::new("entities");
         entity_bar.update(0, entity_total);
 
-        let mut entity_offset: u32 = 0;
+        let mut entity_after = None;
         loop {
-            let batch = rt
-                .list_entities(&token, None, None, batch_size, entity_offset)
+            let (batch, next_after) = rt
+                .list_entities_after(&token, None, None, &[], entity_after, batch_size)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let n = batch.len();
@@ -631,10 +631,10 @@ async fn run_reindex_with_setup(
 
             entity_bar.update(entities_processed, entity_total);
 
-            if n < batch_size as usize {
+            entity_after = next_after;
+            if entity_after.is_none() {
                 break;
             }
-            entity_offset += n as u32;
         }
         entity_bar.finish();
 
@@ -643,10 +643,10 @@ async fn run_reindex_with_setup(
         let note_bar = ProgressBar::new("notes");
         note_bar.update(0, note_total);
 
-        let mut note_offset: u32 = 0;
+        let mut note_after = None;
         loop {
-            let batch = rt
-                .list_notes(&token, None, batch_size, note_offset)
+            let (batch, next_after) = rt
+                .list_notes_after(&token, None, note_after, batch_size)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let n = batch.len();
@@ -701,10 +701,10 @@ async fn run_reindex_with_setup(
 
             note_bar.update(notes_processed, note_total);
 
-            if n < batch_size as usize {
+            note_after = next_after;
+            if note_after.is_none() {
                 break;
             }
-            note_offset += n as u32;
         }
         note_bar.finish();
 
@@ -1253,6 +1253,7 @@ mod tests {
     use serial_test::serial;
 
     mod cross_process_epoch_tests;
+    mod cursor_interleaving_tests;
     use cross_process_epoch_tests::FixedReindexEmbedder;
 
     // Empty TOML retains the normal default engine. FTS-only fixtures must

@@ -895,11 +895,11 @@ async fn resolve_kg_ids_in_args(
     Ok(out)
 }
 
-/// Resolves a caller-supplied `delete(kind=...)` into `AtomicDeleteKind`. See
-/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`.
-fn delete_expected_kind(
+/// Resolve the common kind expectation before adapting it to update or delete.
+fn expected_kind(
     args: &Value,
     registry: &VerbRegistry,
+    verb: &str,
 ) -> anyhow::Result<Option<khive_runtime::atomic_prepare::AtomicDeleteKind>> {
     let raw = match args
         .as_object()
@@ -929,11 +929,20 @@ fn delete_expected_kind(
         }
         khive_pack_kg::handlers::KindSpec::Event | khive_pack_kg::handlers::KindSpec::Proposal => {
             Err(anyhow::anyhow!(
-                "kind {raw:?} not supported under --atomic delete; only entity/note/edge \
+                "kind {raw:?} not supported under --atomic {verb}; only entity/note/edge \
                  substrates are v1-admissible"
             ))
         }
     }
+}
+
+/// Resolves a caller-supplied `delete(kind=...)` into `AtomicDeleteKind`. See
+/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`.
+fn delete_expected_kind(
+    args: &Value,
+    registry: &VerbRegistry,
+) -> anyhow::Result<Option<khive_runtime::atomic_prepare::AtomicDeleteKind>> {
+    expected_kind(args, registry, "delete")
 }
 
 /// Resolves a caller-supplied `update(kind=...)` into `AtomicUpdateKind`;
@@ -943,39 +952,23 @@ fn update_expected_kind(
     args: &Value,
     registry: &VerbRegistry,
 ) -> anyhow::Result<Option<khive_runtime::atomic_prepare::AtomicUpdateKind>> {
-    let raw = match args
-        .as_object()
-        .and_then(|o| o.get("kind"))
-        .and_then(|v| v.as_str())
-    {
-        Some(k) => k,
-        None => return Ok(None),
-    };
-    let spec = khive_pack_kg::handlers::resolve_kind_spec(raw, registry)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    match spec {
-        khive_pack_kg::handlers::KindSpec::Entity {
-            specific,
-            entity_type,
-        } => Ok(Some(
-            khive_runtime::atomic_prepare::AtomicUpdateKind::Entity {
+    Ok(
+        expected_kind(args, registry, "update")?.map(|kind| match kind {
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Entity {
+                specific,
+                entity_type,
+            } => khive_runtime::atomic_prepare::AtomicUpdateKind::Entity {
                 specific,
                 entity_type,
             },
-        )),
-        khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
-            khive_runtime::atomic_prepare::AtomicUpdateKind::Note { specific },
-        )),
-        khive_pack_kg::handlers::KindSpec::Edge => {
-            Ok(Some(khive_runtime::atomic_prepare::AtomicUpdateKind::Edge))
-        }
-        khive_pack_kg::handlers::KindSpec::Event | khive_pack_kg::handlers::KindSpec::Proposal => {
-            Err(anyhow::anyhow!(
-                "kind {raw:?} not supported under --atomic update; only entity/note/edge \
-                 substrates are v1-admissible"
-            ))
-        }
-    }
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Note { specific } => {
+                khive_runtime::atomic_prepare::AtomicUpdateKind::Note { specific }
+            }
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Edge => {
+                khive_runtime::atomic_prepare::AtomicUpdateKind::Edge
+            }
+        }),
+    )
 }
 
 /// Extract `(from_status, to_status)` from a gtd lifecycle post-commit

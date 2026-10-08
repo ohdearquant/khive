@@ -17,7 +17,9 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = REPO_ROOT / ".gitleaks.toml"
-CACHE_PATH = "crates/khive-pack-git/src/cache.rs"
+CACHE_HISTORY_PATH = "crates/khive-pack-git/src/cache.rs"
+CACHE_PATH = "crates/khive-pack-git/src/cache_tests.rs"
+CACHE_PATHS = (CACHE_HISTORY_PATH, CACHE_PATH)
 CACHE_VALUES = ("abcdef0123456789", "fedcba9876543210")
 GATE_HISTORY_PATH = "crates/khive-runtime/src/secret_gate.rs"
 GATE_PATH = "crates/khive-runtime/src/secret_gate_tests.rs"
@@ -92,8 +94,8 @@ class GitleaksConfigTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def commit_fixture(self, message):
-        self.git("add", "--", CACHE_PATH)
+    def commit_fixture(self, message, path=CACHE_PATH):
+        self.git("add", "--", path)
         self.git("commit", "--quiet", "-m", message)
         return self.git("rev-parse", "HEAD")
 
@@ -106,58 +108,76 @@ class GitleaksConfigTests(unittest.TestCase):
             {("generic-api-key", CACHE_PATH, 1), ("generic-api-key", CACHE_PATH, 2)},
         )
 
-    def test_ci_autodiscovery_accepts_exact_values_at_the_exact_path(self):
+    def test_ci_autodiscovery_accepts_exact_values_at_both_exact_paths(self):
         (self.source / ".gitleaks.toml").write_text(CONFIG.read_text())
-        self.write_values()
+        for path in CACHE_PATHS:
+            self.write_values(path)
         self.assertEqual(self.scan(expected_exit=0, autodiscover=True), [])
 
-    def test_exemption_survives_line_moves_and_new_commits_without_fingerprints(self):
+    def test_exemption_survives_file_moves_and_new_commits_without_fingerprints(self):
         self.git("init", "--quiet")
         self.assertEqual(self.git("remote"), "")
         hooks = self.root / "empty-hooks"
         hooks.mkdir()
         self.git("config", "core.hooksPath", str(hooks))
         self.git("config", "commit.gpgsign", "false")
-        self.write_values()
-        first = self.commit_fixture("original fixtures")
-        self.write_values(values=())
-        removed = self.commit_fixture("remove fixtures before reintroduction")
+        self.write_values(CACHE_HISTORY_PATH)
+        first = self.commit_fixture("original fixtures", CACHE_HISTORY_PATH)
+        self.write_values(CACHE_HISTORY_PATH, values=())
+        removed = self.commit_fixture("remove fixtures before extraction", CACHE_HISTORY_PATH)
         self.write_values(padding=17)
-        moved = self.commit_fixture("reintroduce the same values at new lines")
+        moved = self.commit_fixture("extract the same values to the test module")
         self.assertNotEqual(first, moved)
 
-        # Positive control: the same values really are re-attributed to both
-        # commits by the scanner, rather than ignored because no added lines ran.
+        # Positive control: both paths and commits really contain reportable
+        # values, so a passing history scan cannot be an empty scan.
         self.config.write_text("[extend]\nuseDefault = true\n")
         findings = self.scan(expected_exit=1, history="--all")
         self.assertEqual({row["Commit"] for row in findings}, {first, moved})
+        self.assertEqual({row["File"] for row in findings}, set(CACHE_PATHS))
         moved_findings = self.scan(expected_exit=1, history=f"{removed}..{moved}")
         self.assertEqual({row["StartLine"] for row in moved_findings}, {18, 19})
         self.assertEqual({row["Commit"] for row in moved_findings}, {moved})
+        self.assertEqual({row["File"] for row in moved_findings}, {CACHE_PATH})
 
         self.config.write_text(CONFIG.read_text())
         self.assertEqual(self.scan(expected_exit=0, history="--all"), [])
         self.assertEqual(self.scan(expected_exit=0, history=f"{removed}..{moved}"), [])
         self.assertEqual(self.scan(expected_exit=0), [])
 
+        # Each exact path is necessary: removing it exposes only that history.
+        for path, commit in [(CACHE_HISTORY_PATH, first), (CACHE_PATH, moved)]:
+            entry = "  '''^" + path.replace(".", r"\.") + "$''',\n"
+            config = CONFIG.read_text()
+            self.assertEqual(config.count(entry), 1)
+            self.config.write_text(config.replace(entry, "", 1))
+            findings = self.scan(expected_exit=1, history="--all")
+            self.assertEqual({row["File"] for row in findings}, {path})
+            self.assertEqual({row["Commit"] for row in findings}, {commit})
+
     def test_other_paths_and_path_prefixes_or_suffixes_are_not_exempt(self):
         paths = (
             "crates/khive-pack-git/src/other.rs",
-            "prefix/" + CACHE_PATH,
-            CACHE_PATH + ".bak",
+            *("prefix/" + path for path in CACHE_PATHS),
+            *(path + ".bak" for path in CACHE_PATHS),
         )
         for path in paths:
             self.write_values(path)
-        self.write_values()  # the exempt site coexists with the positive controls
+        for path in CACHE_PATHS:
+            self.write_values(path)  # both exempt sites coexist with the controls
         findings = self.scan(expected_exit=1)
         self.assertEqual({row["File"] for row in findings}, set(paths))
         self.assertEqual(len(findings), 2 * len(paths))
 
-    def test_unrelated_values_and_superstrings_at_the_same_site_are_not_exempt(self):
+    def test_unrelated_values_and_superstrings_at_both_sites_are_not_exempt(self):
         other = "".join(reversed("72qQ93wW64eE85rR"))
-        self.write_values(values=(other, "q7" + CACHE_VALUES[0], CACHE_VALUES[1] + "R8"))
+        for path in CACHE_PATHS:
+            self.write_values(path, values=(other, "q7" + CACHE_VALUES[0], CACHE_VALUES[1] + "R8"))
         findings = self.scan(expected_exit=1)
-        self.assertEqual({row["StartLine"] for row in findings}, {1, 2, 3})
+        self.assertEqual(
+            {(row["File"], row["StartLine"]) for row in findings},
+            {(path, line) for path in CACHE_PATHS for line in (1, 2, 3)},
+        )
         self.assertEqual({row["RuleID"] for row in findings}, {"generic-api-key"})
 
     def test_same_values_at_same_site_still_match_a_different_rule(self):
@@ -167,10 +187,20 @@ class GitleaksConfigTests(unittest.TestCase):
             "[[rules]]", 'id = "fixture-other-rule"',
             "regex = '''(" + "|".join(CACHE_VALUES) + ")'''",
         ]) + "\n")
-        self.write_values()
+        for path in CACHE_PATHS:
+            self.write_values(path)
         findings = self.scan(expected_exit=1)
-        self.assertEqual(len(findings), 2)
+        self.assertEqual(len(findings), 2 * len(CACHE_PATHS))
+        self.assertEqual({row["File"] for row in findings}, set(CACHE_PATHS))
         self.assertEqual({row["RuleID"] for row in findings}, {"fixture-other-rule"})
+
+    def test_every_exempt_cache_constant_still_appears_in_the_current_fixture(self):
+        source = (REPO_ROOT / CACHE_PATH).read_text()
+        for value in CACHE_VALUES:
+            self.assertIn(
+                value, source,
+                f"exempt constant no longer present in {CACHE_PATH}; remove the exemption",
+            )
 
     def test_other_default_rules_remain_enabled(self):
         # Synthetic provider-shaped data, assembled only in the disposable input.

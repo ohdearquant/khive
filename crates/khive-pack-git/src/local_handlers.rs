@@ -831,7 +831,7 @@ impl GitPack {
                         .unwrap_or(false)
                         {
                             prior.disposition = Disposition::Committed;
-                            prior.finished_at = Some(chrono::Utc::now().timestamp_micros());
+                            prior.finished_at = Some(khive_storage::now_micros());
                             prior.reason = None;
                             receipts::persist(self.runtime(), &prior).await?;
                         }
@@ -869,7 +869,7 @@ impl GitPack {
                 Err(())
             }
         };
-        receipt.finished_at = Some(chrono::Utc::now().timestamp_micros());
+        receipt.finished_at = Some(khive_storage::now_micros());
         let settled = receipts::persist(self.runtime(), &receipt).await.is_ok();
         if matches!(
             receipt.verb.as_str(),

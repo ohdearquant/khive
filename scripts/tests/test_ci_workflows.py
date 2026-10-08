@@ -1582,7 +1582,7 @@ class HarnessEnvironmentTests(unittest.TestCase):
             "scripts/tests/test_ci_workflows.py",
             # An enumerated contract test whose FIRST assertion is equality with
             # the declaration, so the enumeration below it cannot drift silently.
-            "crates/khive-runtime/src/runtime.rs",
+            "crates/khive-runtime/src/runtime_tests.rs",
             # Same shape: the description scan pairs each pack name with the
             # handler table it publishes, and its first assertion is that the
             # names cover built_in_packs() with a declared, checked remainder.
