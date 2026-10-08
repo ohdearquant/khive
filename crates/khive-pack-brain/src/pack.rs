@@ -440,10 +440,10 @@ impl khive_runtime::PackFactory for BrainPackFactory {
 /// Forwards the full `PackRuntime` surface to the shared inner `BrainPack`
 /// instance so the pack registry's runtime and the registered dispatch hook
 /// (see `create_install`) observe the same state and persistence tracker.
-struct BrainPackRuntime(std::sync::Arc<BrainPack>);
+struct BrainPackRuntime<P = BrainPack>(std::sync::Arc<P>);
 
 #[async_trait::async_trait]
-impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
+impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for BrainPackRuntime<P> {
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -529,6 +529,69 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.warm().await
     }
 
+    fn host_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.0.host_state()
+    }
+
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        self.0.validate_config()
+    }
+
+    fn input_schema(&self, verb: &str) -> Option<serde_json::Value> {
+        self.0.input_schema(verb)
+    }
+
+    fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
+        self.0.accept_channel_ingest_capability(capability)
+    }
+
+    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
+        self.0.register_entity_type_validator(runtime)
+    }
+
+    fn register_note_mutation_hook(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_mutation_hook(runtime)
+    }
+
+    fn register_note_search_ann_provider(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_search_ann_provider(runtime)
+    }
+
+    fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_write_validator(runtime)
+    }
+
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.0.registered_embedding_model_names()
+    }
+
+    fn mounted_namespace(&self) -> Option<&str> {
+        self.0.mounted_namespace()
+    }
+
+    fn mounted_catalog_snapshot(&self) -> Vec<khive_runtime::mounted_verb::MountedVerb> {
+        self.0.mounted_catalog_snapshot()
+    }
+
+    async fn mounted_catalog(
+        &self,
+    ) -> Result<Vec<khive_runtime::mounted_verb::MountedVerb>, RuntimeError> {
+        self.0.mounted_catalog().await
+    }
+
+    async fn dispatch_mounted(
+        &self,
+        definition: &khive_runtime::mounted_verb::MountedVerb,
+        verb: &str,
+        params: serde_json::Value,
+        registry: &khive_runtime::VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.0
+            .dispatch_mounted(definition, verb, params, registry, token)
+            .await
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
@@ -541,3 +604,7 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
 }
 
 inventory::submit! { khive_runtime::PackRegistration(&BrainPackFactory) }
+
+#[cfg(test)]
+#[path = "pack_runtime_tests.rs"]
+mod pack_runtime_tests;
