@@ -676,9 +676,7 @@ impl SqlAccess for OutcomeAccess {
             assert_eq!(outcome.is_ok(), self.expect_success);
         }
         if self.terminate {
-            Err(StorageError::WriterTaskTerminated {
-                request_state: self.state,
-            })
+            Err(StorageError::writer_task_terminated(self.state))
         } else {
             Err(StorageError::WriterTaskRequestFailed {
                 request_state: self.state,
@@ -744,7 +742,9 @@ async fn stream_batch_recovers_failure_slot_only_after_confirmed_rollback() {
             assert_eq!(error["details"]["next_seq"], "1");
         } else {
             match outcome.expect_err("preserve the outer storage failure") {
-                RuntimeError::Storage(StorageError::WriterTaskTerminated { request_state }) => {
+                RuntimeError::Storage(StorageError::WriterTaskTerminated {
+                    request_state, ..
+                }) => {
                     assert!(terminate);
                     assert_eq!(request_state, state);
                 }
@@ -806,6 +806,7 @@ async fn stream_batch_commit_ack_failure_returns_no_executable_effects() {
         outcome,
         Err(RuntimeError::Storage(StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
+            ..
         }))
     ));
     assert_eq!(*callback.lock().unwrap(), Some(true));

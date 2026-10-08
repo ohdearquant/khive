@@ -1707,7 +1707,7 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
                 request_state: (*request_state).into(),
             }),
         ),
-        StorageError::WriterTaskTerminated { request_state } => (
+        StorageError::WriterTaskTerminated { request_state, .. } => (
             error.to_string(),
             Some(WireWriterTaskFailure::TaskTerminated {
                 request_state: (*request_state).into(),
@@ -2330,9 +2330,7 @@ impl ForwardingEventStore {
                             }
                         }
                         WireWriterTaskFailure::TaskTerminated { request_state } => {
-                            StorageError::WriterTaskTerminated {
-                                request_state: request_state.into(),
-                            }
+                            StorageError::writer_task_terminated(request_state.into())
                         }
                     }
                 } else if retryable {
@@ -2938,9 +2936,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn side_effects_unknown_state_crosses_the_wire_as_terminal_failure() {
-        let response = storage_error_response(&StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let response = storage_error_response(&StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
         assert!(
             matches!(
                 response,
@@ -3171,9 +3169,7 @@ mod tests {
             S::TransactionRolledBack,
             S::SideEffectsUnknown,
         ] {
-            let response = storage_error_response(&StorageError::WriterTaskTerminated {
-                request_state: state,
-            });
+            let response = storage_error_response(&StorageError::writer_task_terminated(state));
             // Round-trip through serde like the socket does.
             let bytes = serde_json::to_vec(&response).unwrap();
             let parsed: EventsResponse = serde_json::from_slice(&bytes).unwrap();
@@ -3181,7 +3177,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    StorageError::WriterTaskTerminated { request_state } if request_state == state
+                    StorageError::WriterTaskTerminated { request_state, .. } if request_state == state
                 ),
                 "state {state:?} did not survive the socket: got {err:?}"
             );
@@ -3440,9 +3436,9 @@ mod tests {
         );
         // A terminated writer task is not retryable per the storage layer's
         // own classifier; the wire response must agree rather than widen it.
-        let terminated = storage_error_response(&StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let terminated = storage_error_response(&StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
         assert!(
             matches!(
                 terminated,

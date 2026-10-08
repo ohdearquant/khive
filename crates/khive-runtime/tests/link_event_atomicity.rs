@@ -877,6 +877,7 @@ async fn unknown_link_usage() {
             error,
             RuntimeError::Storage(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "real transaction finality must be unknown: {error:?}"
