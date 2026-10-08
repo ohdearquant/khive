@@ -2031,12 +2031,9 @@ async fn load_and_build_from_vector_store(
         if bytes.len() != dims * 4 {
             continue;
         }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
+            continue;
+        };
         if let Some(SqlValue::Text(ns)) = row.get("namespace") {
             namespace_set.insert(ns.clone());
         }
@@ -2539,12 +2536,9 @@ fn parse_final_tail_rows(
         let Some(bytes) = embedding else {
             return Err(format!("tail upsert {subject}: embedding is not a blob"));
         };
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // Preserve this adapter's existing complete-chunk policy.
+        let vector =
+            khive_storage::decode_f32_native(&bytes[..bytes.len() / 4 * 4]).unwrap_or_default();
         if is_live {
             ops.push((subject, Some(vector)));
         } else {
@@ -2786,7 +2780,7 @@ pub(crate) async fn session_exact_candidates(
     }
 
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    let query_blob = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let query_blob = khive_storage::encode_f32_native(query);
     let mut params = vec![
         SqlValue::Blob(query_blob),
         SqlValue::Integer(i64::try_from(k).unwrap_or(i64::MAX)),

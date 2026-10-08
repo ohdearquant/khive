@@ -13,7 +13,7 @@ use khive_storage::types::{
     BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, SparseRecord, SparseSearchHit,
     SparseSearchRequest, SparseVector,
 };
-use khive_storage::{SparseStore, StorageCapability};
+use khive_storage::{decode_f32_le, encode_f32_le, SparseStore, StorageCapability};
 use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
@@ -78,12 +78,6 @@ fn validate_sparse_vector(vector: &SparseVector, op: &'static str) -> Result<(),
     Ok(())
 }
 
-/// Serialize f32 slice to little-endian bytes (same pattern as vectors.rs).
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    // SAFETY: same safety argument as vectors.rs — valid &[f32], alignment = 1, lifetime tied to input.
-    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
-}
-
 /// DML-only batch insert loop shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `insert_sparse_batch` paths (ADR-067
 /// Component A).
@@ -145,7 +139,7 @@ fn batch_insert_sparse_dml(
                 continue;
             }
         };
-        let values_blob = f32_slice_as_bytes(&record.vector.values);
+        let values_blob = encode_f32_le(&record.vector.values);
         let now = record.updated_at.timestamp();
         let id_str = record.subject_id.to_string();
         let kind_str = record.kind.to_string();
@@ -309,7 +303,7 @@ impl SqliteSparseStore {
                     Box::new(e),
                 )
             })?;
-            let values_blob = f32_slice_as_bytes(&vector.values);
+            let values_blob = encode_f32_le(&vector.values);
             let now = chrono::Utc::now().timestamp();
             let sql = format!(
                 "INSERT INTO {table} \
@@ -485,24 +479,16 @@ impl SqliteSparseStore {
                         )
                     })?;
 
-                if values_blob.len() % 4 != 0 {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                let stored_values = decode_f32_le(&values_blob).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Blob,
                         Box::<dyn std::error::Error + Send + Sync>::from(format!(
                             "corrupt sparse row {id_str}: values blob length {} not a multiple of 4",
                             values_blob.len()
                         )),
-                    ));
-                }
-
-                // `as_chunks` is unstable on stable; keep `chunks_exact`
-                // until it lands.
-                #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-                let stored_values: Vec<f32> = values_blob
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                    )
+                })?;
 
                 validate_persisted_sparse(&id_str, &stored_indices, &stored_values)?;
 
@@ -712,6 +698,75 @@ mod tests {
 
     fn sv(indices: Vec<u32>, values: Vec<f32>) -> SparseVector {
         SparseVector { indices, values }
+    }
+
+    #[tokio::test]
+    async fn single_and_batch_sparse_writes_store_fixed_little_endian_bytes() {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                write_routing_strict: false,
+                write_admission_deadline_ms: 2000,
+                disk_guard_config: Some(crate::EffectiveDiskGuardConfig::default()),
+                ..PoolConfig::for_test()
+            })
+            .expect("private memory pool"),
+        );
+        {
+            let writer = pool.try_writer().expect("writer");
+            ensure_sparse_schema(writer.conn(), "codec_bytes").expect("schema");
+        }
+        let store =
+            SqliteSparseStore::new(pool, false, "codec_bytes".into(), "ns:codec".into()).unwrap();
+        let values = || sv(vec![0, 1], vec![1.0, -2.5]);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        store
+            .insert_sparse(first, SubstrateKind::Entity, "ns:codec", "body", values())
+            .await
+            .unwrap();
+        let summary = store
+            .insert_batch(vec![SparseRecord {
+                subject_id: second,
+                kind: SubstrateKind::Entity,
+                namespace: "ns:codec".into(),
+                field: "body".into(),
+                vector: values(),
+                updated_at: chrono::Utc::now(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            (summary.attempted, summary.affected, summary.failed),
+            (1, 1, 0)
+        );
+        let blobs = store
+            .with_reader("sparse_codec_bytes", |conn| {
+                let mut statement =
+                    conn.prepare("SELECT values_blob FROM sparse_codec_bytes ORDER BY subject_id")?;
+                let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2);
+        for blob in blobs {
+            assert_eq!(blob, [0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0]);
+        }
+        let hits = store
+            .search_sparse(SparseSearchRequest {
+                query: values(),
+                top_k: 2,
+                namespace: Some("ns:codec".into()),
+                kind: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
     }
 
     #[tokio::test]

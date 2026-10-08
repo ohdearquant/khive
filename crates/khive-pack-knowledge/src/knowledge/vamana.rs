@@ -1660,18 +1660,12 @@ async fn fetch_fresh_tail_snapshot(
                 "fresh-tail upsert {subject}: embedding is not a blob"
             ));
         };
-        if bytes.len() % std::mem::size_of::<f32>() != 0 {
-            return Err(format!(
+        let embedding = khive_storage::decode_f32_native(&bytes).map_err(|_| {
+            format!(
                 "fresh-tail upsert {subject}: malformed embedding byte length {}",
                 bytes.len()
-            ));
-        }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let embedding = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+            )
+        })?;
         ops.push((subject, Some(embedding)));
     }
     Ok(FreshTailSnapshot {
@@ -2390,12 +2384,9 @@ async fn scan_corpus_raw(
         if bytes.len() != dims * 4 {
             continue;
         }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
+            continue;
+        };
         id_map.push(uuid);
         flat.extend_from_slice(&vec);
     }

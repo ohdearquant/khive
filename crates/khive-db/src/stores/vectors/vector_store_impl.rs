@@ -3,14 +3,15 @@
 use super::{
     async_trait, batch_insert_vectors_dml, bind_params, current_failpoint,
     delete_vector_provenance, delete_vector_statement, delete_vector_subjects_dml,
-    f32_slice_as_bytes, log_vector_deletes, map_err, non_finite_index, non_finite_vector_error,
-    orphan_sweep_dml, provenance_read_sql, provenance_sidecar_exists, replace_vector_row_dml,
-    sqlite_cosine_score, vec_upsert_atomic_dml, BatchWriteSummary, ContentRef, DateTime, HashSet,
-    IndexRebuildScope, OnceLock, OptionalExtension, OrphanSweepConfig, OrphanSweepResult,
-    SqliteVecStore, StorageCapability, StorageError, StorageResult, SubstrateKind, Utc, Uuid,
-    VectorIndexKind, VectorProvenance, VectorRecord, VectorRowRef, VectorSearchHit,
-    VectorSearchRequest, VectorStore, VectorStoreCapabilities, VectorStoreInfo,
+    log_vector_deletes, map_err, non_finite_index, non_finite_vector_error, orphan_sweep_dml,
+    provenance_read_sql, provenance_sidecar_exists, replace_vector_row_dml, sqlite_cosine_score,
+    vec_upsert_atomic_dml, BatchWriteSummary, ContentRef, DateTime, HashSet, IndexRebuildScope,
+    OnceLock, OptionalExtension, OrphanSweepConfig, OrphanSweepResult, SqliteVecStore,
+    StorageCapability, StorageError, StorageResult, SubstrateKind, Utc, Uuid, VectorIndexKind,
+    VectorProvenance, VectorRecord, VectorRowRef, VectorSearchHit, VectorSearchRequest,
+    VectorStore, VectorStoreCapabilities, VectorStoreInfo,
 };
+use khive_storage::{decode_f32_native, encode_f32_native};
 
 #[async_trait]
 impl VectorStore for SqliteVecStore {
@@ -396,7 +397,7 @@ impl VectorStore for SqliteVecStore {
                 kind_clause = kind_clause
             );
 
-            let query_blob = f32_slice_as_bytes(&query_embedding);
+            let query_blob = encode_f32_native(&query_embedding);
             let mut stmt = conn.prepare(&sql)?;
 
             // Collect rows into a Vec to avoid holding MappedRows (which is
@@ -597,12 +598,14 @@ impl VectorStore for SqliteVecStore {
                             )),
                         ));
                     }
-                    let vector = blob
-                        .chunks_exact(std::mem::size_of::<f32>())
-                        // Inserts bind f32_slice_as_bytes, which writes native-endian
-                        // f32 bytes. Decode with the same layout on every target.
-                        .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                        .collect();
+                    // vec0 exposes its native f32 ABI; keep the dimension check above.
+                    let vector = decode_f32_native(&blob).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
                     found.insert(id, vector);
                 }
             }
