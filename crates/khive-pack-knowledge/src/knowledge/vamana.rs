@@ -25,6 +25,8 @@ use khive_retrieval::ann::registry::{self as ann_registry, WatermarkAuthority};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+
+use super::snapshot_invalidation::invalidate_legacy_vamana_snapshots;
 use khive_vamana::bridge::AnnBridgeCore;
 use khive_vamana::distance::l2_normalize;
 use khive_vamana::{
@@ -2526,7 +2528,6 @@ pub(crate) async fn load_and_build_from_vector_store(
 /// load a snapshot that no longer matches the live corpus.  Best-effort: if
 /// the `retrieval_snapshots` table doesn't exist yet, the call is a no-op.
 pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
-    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut w = match sql.writer().await {
         Ok(w) => w,
@@ -2535,12 +2536,7 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
             return;
         }
     };
-    match w
-        .execute(SqlStatement {
-            sql: khive_runtime::sql!("knowledge_legacy_snapshots_invalidate").into(),
-            params: vec![SqlValue::Text(pattern)],
-            label: Some("invalidate_vamana_snapshot".into()),
-        })
+    match invalidate_legacy_vamana_snapshots(w.as_mut(), namespace, "invalidate_vamana_snapshot")
         .await
     {
         Ok(_) => {}
