@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_retrieval::hybrid::{combine_best_ranked_evidence, fuse_labelled, HitLabel};
+use khive_retrieval::DEFAULT_RRF_K;
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
     RuntimeError, SearchHit, SearchSource,
@@ -653,7 +654,7 @@ impl SubstrateCoordinator {
 
     /// Broadcast a validated KG search request to all registered backends in
     /// parallel. One selected backend passes its ranking evidence through;
-    /// multiple selected backends use outer RRF (k=60). Every filter in the
+    /// multiple selected backends use outer RRF (shared default k). Every filter in the
     /// request reaches the matching runtime search method on every backend.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
@@ -1327,7 +1328,7 @@ fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
 
 // ---- RRF merge ----
 
-/// Fuse ranked lists with reciprocal rank fusion (k=60), keep the hits whose fused source passes
+/// Fuse ranked lists with RRF (shared default k), keep hits whose fused source passes
 /// `source_filter`, then cut the filtered order to `limit`.
 ///
 /// Each list is one arm and each hit carries its position in its own list. Later copies of an id
@@ -1338,15 +1339,13 @@ fn merge_labelled(
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<(Uuid, DeterministicScore, HitLabel)> {
-    const K: usize = 60;
-
-    let mut fused = fuse_labelled(arms, K, combine_best_ranked_evidence);
+    let mut fused = fuse_labelled(arms, DEFAULT_RRF_K, combine_best_ranked_evidence);
     fused.retain(|(_, _, label)| source_filter.is_none_or(|want| label.source == want));
     fused.truncate(limit);
     fused
 }
 
-/// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked entity hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     rrf_merge_entity_hits_filtered(lists, limit, None)
@@ -1389,7 +1388,7 @@ pub(super) fn rrf_merge_entity_hits_filtered(
     merged
 }
 
-/// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked note hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_note_hits(
     lists: Vec<Vec<NoteSearchHit>>,
