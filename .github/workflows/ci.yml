@@ -648,6 +648,8 @@ jobs:
         run: bash scripts/tests/check-json-data-test.sh
       - name: Cargo hook fixture tests
         run: python3 scripts/tests/test_hook_cargo.py
+      - name: Coverage profile forwarder tests
+        run: python3 scripts/tests/test_coverage_profile_diagnostics.py
 
   secret-scan:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
