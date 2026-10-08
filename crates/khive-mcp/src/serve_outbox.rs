@@ -132,21 +132,19 @@ struct Prepared {
 }
 
 impl OutboxPolicy<'_> {
-    fn kind(&self) -> &'static str {
+    fn kind_and_prefix(&self) -> (&'static str, &'static str) {
         match self {
             #[cfg(feature = "channel-email")]
-            Self::Email { .. } => "email",
+            Self::Email { .. } => ("email", "email:"),
             #[cfg(feature = "channel-telegram")]
-            Self::Telegram(_) => "telegram",
+            Self::Telegram(_) => ("telegram", "telegram:"),
         }
     }
+    fn kind(&self) -> &'static str {
+        self.kind_and_prefix().0
+    }
     fn prefix(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "channel-email")]
-            Self::Email { .. } => "email:",
-            #[cfg(feature = "channel-telegram")]
-            Self::Telegram(_) => "telegram:",
-        }
+        self.kind_and_prefix().1
     }
     async fn prepare(
         &self,
