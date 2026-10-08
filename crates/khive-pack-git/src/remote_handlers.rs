@@ -1027,7 +1027,7 @@ impl GitPack {
         };
         if committed {
             prior.disposition = Disposition::Committed;
-            prior.finished_at = Some(chrono::Utc::now().timestamp_micros());
+            prior.finished_at = Some(khive_storage::now_micros());
             prior.reason = None;
             receipts::persist(self.runtime(), prior).await?;
         }
