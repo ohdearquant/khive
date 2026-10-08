@@ -221,10 +221,7 @@ async fn resolve_message_thread_filter(
     let mut case_variant_label: Option<String> = None;
     let mut resolved: Option<uuid::Uuid> = None;
     for row in &rows {
-        let Some(stored) = row.get("thread_id").and_then(|value| match value {
-            SqlValue::Text(value) => Some(value.as_str()),
-            _ => None,
-        }) else {
+        let Some(stored) = row.text_or_none("thread_id") else {
             continue;
         };
         if stored == raw {

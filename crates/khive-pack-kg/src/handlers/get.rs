@@ -547,14 +547,8 @@ impl KgPack {
         }
 
         let full_uuid_str = rows[0]
-            .get("proposal_id")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .text_or_none("proposal_id")
+            .map(str::to_owned)
             .ok_or_else(|| {
                 RuntimeError::Internal("proposal_id column missing from proposals_open row".into())
             })?;
