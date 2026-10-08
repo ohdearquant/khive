@@ -282,21 +282,18 @@ impl KhiveRuntime {
             let entities: Vec<khive_storage::entity::Entity> = page
                 .iter()
                 .map(|ee| khive_storage::entity::Entity {
-                    id: ee.id,
-                    namespace: ns.clone(),
-                    kind: ee.kind.clone(),
                     entity_type: ee.entity_type.clone(),
-                    name: ee.name.clone(),
                     description: ee.description.clone(),
                     properties: ee.properties.clone(),
                     tags: ee.tags.clone(),
-                    created_at: ee.created_at.timestamp_micros(),
-                    updated_at: ee.updated_at.timestamp_micros(),
-                    deleted_at: None,
-                    merged_into: None,
-                    merge_event_id: None,
-                    version: 1,
-                    content_ref: None,
+                    ..khive_storage::entity::Entity::minimal(
+                        ee.id,
+                        ns.clone(),
+                        ee.kind.clone(),
+                        ee.name.clone(),
+                        ee.created_at.timestamp_micros(),
+                        ee.updated_at.timestamp_micros(),
+                    )
                 })
                 .collect();
             let texts: Vec<String> = entities

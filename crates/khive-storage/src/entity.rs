@@ -54,8 +54,21 @@ impl Entity {
         name: impl Into<String>,
     ) -> Self {
         let now = chrono::Utc::now().timestamp_micros();
+        Self::minimal(Uuid::new_v4(), namespace, kind, name, now, now)
+    }
+
+    /// Create an entity with supplied identity and microsecond timestamps.
+    /// Optional payload, revision, and tombstone fields use the same defaults as `new`.
+    pub fn minimal(
+        id: Uuid,
+        namespace: impl Into<String>,
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id,
             namespace: namespace.into(),
             kind: kind.into(),
             entity_type: None,
@@ -63,8 +76,8 @@ impl Entity {
             description: None,
             properties: None,
             tags: Vec::new(),
-            created_at: now,
-            updated_at: now,
+            created_at,
+            updated_at,
             version: 1,
             deleted_at: None,
             merged_into: None,
