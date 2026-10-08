@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -14,6 +15,22 @@ use khive_storage::{EdgeRelation, EntityFilter};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+/// Parse an optional archive timestamp, using `fallback` only when absent.
+///
+/// Present values must be RFC3339 and are converted to UTC. Invalid values keep
+/// their parser error with the original timestamp as context.
+pub fn parse_archive_timestamp(
+    value: Option<&str>,
+    fallback: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let Some(raw) = value else {
+        return Ok(fallback);
+    };
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+}
 
 // ── Archive types ─────────────────────────────────────────────────────────────
 

@@ -79,12 +79,7 @@ fn parse_timestamp(
     s: Option<&str>,
     fallback: chrono::DateTime<Utc>,
 ) -> Result<chrono::DateTime<Utc>> {
-    let Some(raw) = s else {
-        return Ok(fallback);
-    };
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+    khive_runtime::portability::parse_archive_timestamp(s, fallback)
 }
 
 fn parse_ts_micros(s: Option<&str>, fallback: chrono::DateTime<Utc>) -> Result<i64> {
