@@ -1011,12 +1011,7 @@ impl AnnBridge {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Replace non-alphanumeric chars with `_` to produce a valid table-name suffix.
-pub(crate) fn sanitize_model_key(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
+pub(crate) use khive_runtime::config::sanitize_key as sanitize_model_key;
 
 /// Identity key for the global memory Vamana index for a model; hex-encoded to
 /// name its v2 segment directory. Distinct from knowledge's
@@ -1440,7 +1435,12 @@ async fn refresh_rotated_segment(
         return;
     }
 
-    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+    let _publication_guard = match khive_retrieval::ann::acquire_checkpoint_lock_async(
+        dir.clone(),
+        "memory ANN",
+    )
+    .await
+    {
         Ok(lock) => lock,
         Err(error) => {
             tracing::warn!(
@@ -2077,12 +2077,6 @@ fn ann_segment_dir_from_root(ann_root: &std::path::Path, model: &str) -> std::pa
     let key = snapshot_key("global", model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
     ann_root.join(hex)
-}
-
-async fn acquire_bridge_checkpoint_lock_async(
-    dir: std::path::PathBuf,
-) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, "memory ANN").await
 }
 
 /// Install `candidate`, replacing an equal-or-newer-generation incumbent but
@@ -3761,13 +3755,16 @@ async fn persist_file_checkpoint(
     // lock. Revalidate the durable row only after acquiring it: otherwise a
     // stale publisher could overwrite a newer segment, lose its conditional
     // raise, and leave the registry ahead of the files that restart adopts.
-    let _publication_lock = match acquire_bridge_checkpoint_lock_async(dir.to_path_buf()).await {
-        Ok(lock) => lock,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
-            return Err(false);
-        }
-    };
+    let _publication_lock =
+        match khive_retrieval::ann::acquire_checkpoint_lock_async(dir.to_path_buf(), "memory ANN")
+            .await
+        {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
+                return Err(false);
+            }
+        };
     let current_watermark = match read_own_watermark(rt, model).await {
         Ok(value) => value,
         Err(e) => {
