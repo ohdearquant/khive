@@ -12,6 +12,10 @@ pathname from the filesystem root:
 - `open_file_at`: write-only or read-write opens through a borrowed directory descriptor, with
   explicit create/no-create/exclusive policy, non-blocking flag and umask-filtered creation mode.
   It always refuses final symlinks and sets close-on-exec; existing contents are not truncated.
+- `unlink_at`: `unlinkat` of a file or symlink entry without following it; directories are
+  refused and the entry's target is never touched.
+- `rename_at`: `renameat` between two independently held directory descriptors, with the
+  kernel's ordinary replacement and error semantics.
 - `list_names`: the sorted entry names of a directory, without `.` and `..`, with a read error
   reported as an error rather than a short listing.
 - `errno_location`, `clear_errno`, `current_errno`: the thread `errno` cell on every supported Unix
