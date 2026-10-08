@@ -473,12 +473,7 @@ where
 }
 
 fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> Result<chrono::DateTime<Utc>> {
-    let Some(raw) = value else {
-        return Ok(fallback);
-    };
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+    khive_runtime::portability::parse_archive_timestamp(value, fallback)
 }
 
 #[cfg(test)]
