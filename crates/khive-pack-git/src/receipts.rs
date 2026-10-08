@@ -76,7 +76,7 @@ impl Receipt {
             policy,
             fork_policy: Value::Null,
             credential: Value::Null,
-            started_at: chrono::Utc::now().timestamp_micros(),
+            started_at: khive_storage::now_micros(),
             finished_at: None,
             disposition: Disposition::Unknown,
             result: Value::Null,
@@ -447,7 +447,7 @@ mod tests {
             .expect("load candidate");
         assert_eq!(settled.result, pending.result);
         settled.disposition = Disposition::Committed;
-        settled.finished_at = Some(chrono::Utc::now().timestamp_micros());
+        settled.finished_at = Some(khive_storage::now_micros());
         persist(&rt, &settled).await.expect("settle committed");
 
         assert!(persist(&rt, &pending).await.is_err());
