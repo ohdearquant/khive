@@ -24,6 +24,12 @@ use uuid::Uuid;
 
 use crate::persist::PersistError as EngineError;
 use crate::weights::WEIGHT_FLOOR;
+
+/// Per-day weight-event counts; loaded here, outside the `metrics` module, because
+/// static SQL loaders are resolved at a scope without glob imports.
+/// SQLite: integer division gives the day bucket (micros / 86_400_000_000).
+const WEIGHT_EVENTS_COUNT_BY_DAY_SQL: &str =
+    include_str!("../../sql/weight_events_count_by_day.sql");
 // TODO(port-engine): EmbeddedEngine not yet in khive-retrieval scope; stub for compilation.
 // Tracked: port blocked on khive-inference crate landing.
 // REASON: type alias is referenced by `#[cfg(feature = "engine")]` items that are not compiled by default
@@ -752,14 +758,9 @@ pub mod metrics {
             let c = conn.lock();
             let cutoff_us = (Utc::now() - chrono::Duration::days(days_i64)).timestamp_micros();
 
-            let mut stmt = c
-                .prepare(
-                    // SQLite: integer division gives day bucket (micros / 86_400_000_000).
-                    include_str!("../../sql/weight_events_count_by_day.sql"),
-                )
-                .map_err(|e| {
-                    EngineError::Internal(format!("adjustment_rate_per_day prepare: {e}"))
-                })?;
+            let mut stmt = c.prepare(WEIGHT_EVENTS_COUNT_BY_DAY_SQL).map_err(|e| {
+                EngineError::Internal(format!("adjustment_rate_per_day prepare: {e}"))
+            })?;
 
             let rows = stmt
                 .query_map(params![namespace_str, cutoff_us], |row| {
