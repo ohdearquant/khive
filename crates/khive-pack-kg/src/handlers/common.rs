@@ -802,7 +802,7 @@ pub(crate) fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
 
 pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> {
     let w = weight.unwrap_or(1.0);
-    if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+    if !khive_types::validate_edge_weight(w) {
         return Err(RuntimeError::InvalidInput(format!(
             "edge weight must be a finite number in [0.0, 1.0], got {w}"
         )));

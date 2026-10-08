@@ -587,7 +587,7 @@ impl TraversalOptions {
             }
         }
         if let Some(weight) = self.min_weight {
-            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+            if !khive_types::validate_edge_weight(weight) {
                 return Err(format!(
                     "TraversalOptions: min_weight must be finite and in [0.0, 1.0], got {weight}"
                 ));
