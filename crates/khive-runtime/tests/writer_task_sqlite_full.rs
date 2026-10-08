@@ -48,6 +48,8 @@ fn automatic_rollback_full_reaches_runtime_projection() {
                 #[cfg(any(unix, windows))]
                 expected_file_identity: None,
                 max_readers: 1,
+                reader_max_age: Duration::from_secs(300),
+                reader_max_ops: 5000,
                 wal_mode: true,
                 busy_timeout: Duration::from_secs(1),
                 checkout_timeout: Duration::from_secs(1),

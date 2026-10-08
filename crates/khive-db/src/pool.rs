@@ -195,6 +195,14 @@ pub struct PoolConfig {
     pub expected_file_identity: Option<DatabaseFileIdentity>,
     /// Number of reader connections (default: min(num_cpus, 8)).
     pub max_readers: usize,
+    /// Retire a dedicated reader on return when its connection age exceeds
+    /// this duration. `KHIVE_READER_MAX_AGE_SECS`, default 300 seconds.
+    /// Does not expire an outstanding lease or recycle the shared writer.
+    pub reader_max_age: Duration,
+    /// Retire a dedicated reader on return after more than this many
+    /// successful checkouts. `KHIVE_READER_MAX_OPS`, default 5000.
+    /// Counts leases, not SQL statements; zero retires every returned lease.
+    pub reader_max_ops: u64,
     /// WAL mode (must be true for pooling to work; default: true).
     pub wal_mode: bool,
     /// Busy timeout per connection (default: 30s).
@@ -322,6 +330,11 @@ impl Default for PoolConfig {
                 .map(|n| n.get())
                 .unwrap_or(1)
                 .clamp(1, DEFAULT_READER_CAP),
+            reader_max_age: Duration::from_secs(crate::env::env_parse_or(
+                "KHIVE_READER_MAX_AGE_SECS",
+                300,
+            )),
+            reader_max_ops: crate::env::env_parse_or("KHIVE_READER_MAX_OPS", 5000),
             wal_mode: true,
             busy_timeout: Duration::from_secs(crate::env::env_parse_or(
                 "KHIVE_BUSY_TIMEOUT_SECS",
@@ -558,7 +571,7 @@ pub struct ConnectionPool {
     /// backend. Backend IDs remain separate even when aliases share a pool.
     search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
     note_candidate_hydration_rows: AtomicU64,
-    readers: ArrayQueue<Connection>,
+    readers: ArrayQueue<PooledReader>,
     max_readers: usize,
     config: PoolConfig,
     /// Canonical physical target used by every connection in a file-backed
@@ -635,8 +648,22 @@ impl Drop for ConnectionPool {
     }
 }
 
+#[derive(Debug)]
+struct PooledReader {
+    conn: Connection,
+    opened_at: Instant,
+    checkouts: u64,
+}
+
+impl PooledReader {
+    fn past_limit(&self, config: &PoolConfig, now: Instant) -> bool {
+        now.saturating_duration_since(self.opened_at) > config.reader_max_age
+            || self.checkouts > config.reader_max_ops
+    }
+}
+
 enum ReaderLease<'pool> {
-    Pooled(Connection),
+    Pooled(PooledReader),
     Shared(parking_lot::MutexGuard<'pool, Connection>),
 }
 
@@ -733,7 +760,7 @@ impl<'pool> ReaderGuard<'pool> {
             .as_ref()
             .expect("reader guard missing connection")
         {
-            ReaderLease::Pooled(conn) => conn,
+            ReaderLease::Pooled(reader) => &reader.conn,
             ReaderLease::Shared(guard) => guard,
         }
     }
@@ -850,7 +877,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
                 self.pool.return_reader(conn, self.dirty.get())
             }
             ReaderLease::Pooled(conn) => {
-                close_connection_quietly(conn);
+                close_connection_quietly(conn.conn);
                 self.pool.replace_discarded_reader_slot();
             }
             ReaderLease::Shared(guard) if !self.reusable.get() => {
@@ -1105,7 +1132,11 @@ pub struct ReaderAcquisitionSnapshot {
     /// that carries no operation name, which is itself the answer rather
     /// than a missing reading (#2793).
     pub max_completed_hold_operation: Option<&'static str>,
-    /// A disqualified pooled-reader return (reset/pristine-check failure)
+    /// Dedicated reader connections discarded on return for age, checkout
+    /// count, failed cleanup/health checks, or an explicitly non-reusable lease.
+    /// Counts replacement attempts, including opens that fail; not pool shutdown.
+    pub reader_discards: u64,
+    /// A discarded pooled-reader return (expiry or reset/pristine-check failure)
     /// whose replacement connection then also failed to open, permanently
     /// shrinking the physical pool by one slot below `max_readers`. Logged at
     /// `warn` when it happens; this counter makes the shrink observable in a
@@ -1133,6 +1164,7 @@ struct ReaderAcquisitionCounters {
     peak_active_pooled_checkouts: AtomicU64,
     completed_pooled_checkouts: AtomicU64,
     longest_completed_hold: parking_lot::Mutex<LongestCompletedHold>,
+    reader_discards: AtomicU64,
     reader_replacement_open_failures: AtomicU64,
 }
 
@@ -1209,6 +1241,7 @@ impl ReaderAcquisitionCounters {
             completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
             max_completed_hold_micros: longest_completed_hold.micros,
             max_completed_hold_operation: longest_completed_hold.operation,
+            reader_discards: self.reader_discards.load(Ordering::Relaxed),
             reader_replacement_open_failures: self
                 .reader_replacement_open_failures
                 .load(Ordering::Relaxed),
@@ -1472,7 +1505,7 @@ impl ConnectionPool {
         };
 
         for _ in 0..pool.max_readers {
-            let conn = pool.open_reader_connection()?;
+            let conn = pool.open_pooled_reader()?;
             pool.readers
                 .push(conn)
                 .expect("reader queue must have capacity during pool initialization");
@@ -1681,7 +1714,8 @@ impl ConnectionPool {
             if should_stop() {
                 return Ok(None);
             }
-            if let Some(conn) = self.readers.pop() {
+            if let Some(mut conn) = self.readers.pop() {
+                conn.checkouts = conn.checkouts.saturating_add(1);
                 self.reader_acquisition_counters.record_pooled_checkout();
                 return Ok(Some(ReaderGuard {
                     lease: Some(ReaderLease::Pooled(conn)),
@@ -2532,6 +2566,15 @@ impl ConnectionPool {
         self.writer_task_join.lock().take()
     }
 
+    fn open_pooled_reader(&self) -> Result<PooledReader, SqliteError> {
+        let opened_at = Instant::now();
+        Ok(PooledReader {
+            conn: self.open_reader_connection()?,
+            opened_at,
+            checkouts: 0,
+        })
+    }
+
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
         #[cfg(any(unix, windows))]
@@ -2819,29 +2862,30 @@ impl ConnectionPool {
         Ok(conn)
     }
 
-    fn return_reader(&self, conn: Connection, dirty: bool) {
+    fn return_reader(&self, conn: PooledReader, dirty: bool) {
         if self.max_readers == 0 {
             return;
         }
 
-        if reset_reader_connection(&conn, dirty, &self.config)
-            && reader_connection_is_healthy(&conn)
+        if !conn.past_limit(&self.config, Instant::now())
+            && reset_reader_connection(&conn.conn, dirty, &self.config)
+            && reader_connection_is_healthy(&conn.conn)
         {
             self.enqueue_reader_slot(conn);
             return;
         }
 
-        close_connection_quietly(conn);
+        close_connection_quietly(conn.conn);
         self.replace_discarded_reader_slot();
     }
 
     /// Push a connection back onto the physical reader queue, discarding it
     /// (rather than growing the queue past its configured capacity) if the
     /// queue is already full.
-    fn enqueue_reader_slot(&self, conn: Connection) {
+    fn enqueue_reader_slot(&self, conn: PooledReader) {
         if let Err(conn) = self.readers.push(conn) {
             eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
-            close_connection_quietly(conn);
+            close_connection_quietly(conn.conn);
         }
     }
 
@@ -2852,7 +2896,10 @@ impl ConnectionPool {
     /// share this so a failed replacement is recorded and logged identically
     /// either way, instead of one path silently shrinking the pool.
     fn replace_discarded_reader_slot(&self) {
-        match self.open_reader_connection() {
+        self.reader_acquisition_counters
+            .reader_discards
+            .fetch_add(1, Ordering::Relaxed);
+        match self.open_pooled_reader() {
             Ok(conn) => self.enqueue_reader_slot(conn),
             Err(error) => {
                 self.reader_acquisition_counters
@@ -3762,6 +3809,10 @@ mod database_owner_identity_pool_tests;
 #[cfg(test)]
 #[path = "pool_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pool/recycling_tests.rs"]
+mod recycling_tests;
 
 #[cfg(all(test, any(unix, windows)))]
 #[path = "pool_identity_admission_tests.rs"]
