@@ -19,14 +19,6 @@ fn unit_normalize(v: &mut [f32]) {
     }
 }
 
-fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out
-}
-
 struct SectionEmbeddingInput {
     id: String,
     atom_name: String,
@@ -232,7 +224,7 @@ pub(crate) async fn embed_sections(
                                 sql: khive_runtime::sql!("knowledge_section_embedding_update")
                                     .into(),
                                 params: vec![
-                                    SqlValue::Blob(f32_to_le_bytes(&emb)),
+                                    SqlValue::Blob(khive_storage::encode_f32_le(&emb)),
                                     SqlValue::Integer(now),
                                     SqlValue::Text(input.id.clone()),
                                     SqlValue::Text(input.heading.clone()),
