@@ -571,7 +571,7 @@ pub struct ConnectionPool {
     /// backend. Backend IDs remain separate even when aliases share a pool.
     search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
     note_candidate_hydration_rows: AtomicU64,
-    readers: ArrayQueue<PooledReader>,
+    readers: ArrayQueue<Box<PooledReader>>,
     max_readers: usize,
     config: PoolConfig,
     /// Canonical physical target used by every connection in a file-backed
@@ -663,7 +663,7 @@ impl PooledReader {
 }
 
 enum ReaderLease<'pool> {
-    Pooled(PooledReader),
+    Pooled(Box<PooledReader>),
     Shared(parking_lot::MutexGuard<'pool, Connection>),
 }
 
@@ -2566,13 +2566,15 @@ impl ConnectionPool {
         self.writer_task_join.lock().take()
     }
 
-    fn open_pooled_reader(&self) -> Result<PooledReader, SqliteError> {
+    fn open_pooled_reader(&self) -> Result<Box<PooledReader>, SqliteError> {
         let opened_at = Instant::now();
-        Ok(PooledReader {
+        // Allocate once per physical reader; checkouts move the same box between
+        // the queue and lease without allocating on every borrow/return.
+        Ok(Box::new(PooledReader {
             conn: self.open_reader_connection()?,
             opened_at,
             checkouts: 0,
-        })
+        }))
     }
 
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
@@ -2862,7 +2864,7 @@ impl ConnectionPool {
         Ok(conn)
     }
 
-    fn return_reader(&self, conn: PooledReader, dirty: bool) {
+    fn return_reader(&self, conn: Box<PooledReader>, dirty: bool) {
         if self.max_readers == 0 {
             return;
         }
@@ -2882,7 +2884,7 @@ impl ConnectionPool {
     /// Push a connection back onto the physical reader queue, discarding it
     /// (rather than growing the queue past its configured capacity) if the
     /// queue is already full.
-    fn enqueue_reader_slot(&self, conn: PooledReader) {
+    fn enqueue_reader_slot(&self, conn: Box<PooledReader>) {
         if let Err(conn) = self.readers.push(conn) {
             eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
             close_connection_quietly(conn.conn);
