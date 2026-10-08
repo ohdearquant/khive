@@ -143,6 +143,65 @@ impl SqlRow {
             _ => self.opt_i64(name),
         }
     }
+
+    /// Read a native UUID or parse UUID text, refusing NULL, absence, invalid
+    /// UUID text, and other SQL variants.
+    pub fn uuid(&self, name: &str) -> Result<Uuid, SqlColumnError> {
+        let found = self.get(name);
+        match found {
+            Some(SqlValue::Uuid(value)) => Ok(*value),
+            Some(SqlValue::Text(value)) => {
+                Uuid::parse_str(value).map_err(|_| column_error(name, found))
+            }
+            _ => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read a nullable UUID with the same accepted representations as [`Self::uuid`].
+    /// An absent column, invalid UUID text, or another SQL variant is refused.
+    pub fn opt_uuid(&self, name: &str) -> Result<Option<Uuid>, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Null) => Ok(None),
+            _ => self.uuid(name).map(Some),
+        }
+    }
+
+    /// Read a Float unchanged or convert an Integer using Rust's `as f64`
+    /// rounding. Non-finite Floats are preserved; NULL, absence, and other
+    /// SQL variants (including numeric text) are refused.
+    pub fn f64(&self, name: &str) -> Result<f64, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Float(value)) => Ok(*value),
+            Some(SqlValue::Integer(value)) => Ok(*value as f64),
+            found => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read a nullable number using [`Self::f64`], refusing an absent column
+    /// or another SQL variant.
+    pub fn opt_f64(&self, name: &str) -> Result<Option<f64>, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Null) => Ok(None),
+            _ => self.f64(name).map(Some),
+        }
+    }
+
+    /// Read text, treating absence, NULL, and every other SQL variant as `None`.
+    pub fn text_or_none(&self, name: &str) -> Option<&str> {
+        match self.get(name) {
+            Some(SqlValue::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Read an integer, treating absence, NULL, and every other SQL variant
+    /// (including Float) as `None`.
+    pub fn i64_or_none(&self, name: &str) -> Option<i64> {
+        match self.get(name) {
+            Some(SqlValue::Integer(value)) => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 fn column_error(name: &str, found: Option<&SqlValue>) -> SqlColumnError {
