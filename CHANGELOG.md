@@ -15,12 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `decay_factor`, `null` included, on an entity or edge target, where it used to be ignored;
   the record is left unchanged and the refusal comes before any sibling field is applied.
 
-### Removed
+### Restored
 
-- `KhiveRuntime::rerank` is removed. No workspace code called it; its implementation
-  filtered a namespace-wide top-N instead of scoring every requested candidate.
-  This is a source-breaking change for an out-of-tree Rust consumer. There is no
-  replacement runtime method with the same candidate-set contract.
+- The retrieval surfaces removed in 0.10.0 are back, unchanged from 0.9.x, as the base for
+  their integration work: `KhiveRuntime::hybrid_search_with_strategy` and `KhiveRuntime::rerank`;
+  `khive_retrieval::hybrid::dual_index` (`DualIndexRouter`, `DualIndexConfig`,
+  `DualIndexStrategy`); `khive_retrieval::query_ir` (`QueryNode`, `FuseStrategy`,
+  `FilterPredicate`, `RerankMethod`); `khive_retrieval::metrics` (`MetricEvent`,
+  `MetricValue`, `MetricsSink`, `NoopSink`, `RecordingSink`); and the `persist` feature with
+  the `persist`, `replay` and `weights` modules (`RetrievalPersistence`, `PersistenceStats`,
+  `PersistError`, `ShadowValidationConfig`, `ShadowValidationResult`, `ShadowMetrics`). A
+  0.10.0 consumer that migrated away from any of these keeps working; the removal entries
+  below describe 0.10.0 only.
 
 ## [0.10.0] - 2026-10-07
 
