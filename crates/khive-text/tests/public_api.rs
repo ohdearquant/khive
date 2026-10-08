@@ -66,6 +66,58 @@ fn kg_name_preset_splits_identifiers() {
     assert!(tokens.contains(&"case".to_string()));
 }
 
+#[test]
+fn acronym_boundaries_reach_the_public_identifier_tokenizer() {
+    use khive_text::identifier::is_identifier;
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    let tokenizer = IdentifierTokenizer::default();
+    for (input, expected) in [
+        ("XMLParser", vec!["xmlparser", "xml", "parser"]),
+        ("HTTPServer", vec!["httpserver", "http", "server"]),
+        ("IDValue", vec!["idvalue", "id", "value"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(tokenizer.tokenize(input), expected, "{input}");
+        assert_eq!(preset::kg_name().analyze(input), expected, "{input}");
+    }
+    assert_eq!(
+        tokenizer.tokenize("(XMLParser), HTTPServer!"),
+        vec!["xmlparser", "xml", "parser", "httpserver", "http", "server"]
+    );
+}
+
+#[test]
+fn acronym_parts_obey_the_configured_minimum_without_dropping_the_original() {
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    assert_eq!(
+        IdentifierTokenizer { min_part_len: 4 }.tokenize("XMLParser"),
+        vec!["xmlparser", "parser"]
+    );
+    assert_eq!(
+        IdentifierTokenizer { min_part_len: 7 }.tokenize("XMLParser"),
+        vec!["xmlparser"]
+    );
+}
+
+#[test]
+fn acronym_detection_preserves_plain_word_and_whitespace_rules() {
+    use khive_text::identifier::is_identifier;
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    let tokenizer = IdentifierTokenizer::default();
+    for word in ["", "X", "XML", "Parser", "plain", "\u{C9}Parser", "123"] {
+        assert!(!is_identifier(word), "{word}");
+        if !word.is_empty() {
+            assert_eq!(tokenizer.tokenize(word), vec![word], "{word}");
+        }
+    }
+    assert!(!is_identifier("XMLParser HTTPServer"));
+    assert!(!is_identifier("XMLParser\u{2003}HTTPServer"));
+    assert_eq!(tokenizer.tokenize("XML Parser"), vec!["XML", "Parser"]);
+}
+
 // ---------------------------------------------------------------------------
 // Re-exported items are accessible
 // ---------------------------------------------------------------------------
