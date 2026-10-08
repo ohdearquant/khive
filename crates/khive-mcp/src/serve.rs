@@ -3129,18 +3129,16 @@ pub async fn migrate_configured_storage_topology(
 }
 
 async fn read_applied_schema_version(sql: &dyn khive_storage::SqlAccess) -> anyhow::Result<u32> {
-    use khive_storage::types::{SqlStatement, SqlValue};
+    use khive_storage::types::SqlValue;
 
     let mut reader = sql
         .reader()
         .await
         .map_err(|error| anyhow::anyhow!("open schema-version reader: {error}"))?;
     let value = reader
-        .query_scalar(SqlStatement {
-            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
-            params: vec![],
-            label: Some("read_applied_schema_version".into()),
-        })
+        .query_scalar(
+            khive_db::migrations::schema_version_probe().labelled("read_applied_schema_version"),
+        )
         .await
         .map_err(|error| anyhow::anyhow!("read applied schema version: {error}"))?;
     match value {

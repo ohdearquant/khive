@@ -1477,17 +1477,20 @@ fn validate_applied_migration_ledger(
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
+const SCHEMA_VERSION_PROBE_SQL: &str = "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations";
+
+/// Build the schema-ledger version query without opening a reader or decoding its result.
+pub fn schema_version_probe() -> khive_storage::types::SqlStatement {
+    khive_storage::types::SqlStatement::new(SCHEMA_VERSION_PROBE_SQL, Vec::new())
+}
+
 /// Read the applied schema version from an open connection **without** running
 /// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
 /// un-migrated or empty database); any other failure (BUSY, IO) propagates —
 /// collapsing it to 0 would misreport a live database as un-migrated. Never
 /// writes.
 pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
-    match conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-        [],
-        |row| row.get(0),
-    ) {
+    match conn.query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0)) {
         Ok(version) => Ok(version),
         Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
             if msg.contains("no such table: _schema_migrations") =>
@@ -1898,11 +1901,7 @@ fn apply_versioned_migration(
     // this migration (and possibly later ones) while we waited. Running
     // its DDL again would fail; fast-forward past everything it applied.
     let sibling_version: u32 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0))
         .map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),
