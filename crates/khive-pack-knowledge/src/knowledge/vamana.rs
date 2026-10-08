@@ -1549,82 +1549,17 @@ fn fresh_tail_snapshot_statement(
     live_threshold: Option<f64>,
 ) -> SqlStatement {
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    let (live_cte, selected_order, live_join, live_column) = match live_threshold {
-        Some(_) => (
-            format!(
-                "live AS (\
-                   SELECT COUNT(*) AS live_count FROM {table_name} \
-                   WHERE namespace = ?1 AND embedding_model = ?2 \
-                     AND field = 'knowledge.atom'\
-                 ),"
-            ),
-            "ORDER BY seq DESC \
-             LIMIT (SELECT CAST(live_count * ?5 AS INTEGER) + \
-                       CASE WHEN CAST(live_count * ?5 AS INTEGER) < live_count * ?5 \
-                            THEN 1 ELSE 0 END FROM live)",
-            "CROSS JOIN live",
-            "live.live_count",
-        ),
-        None => (String::new(), "ORDER BY seq", "", "NULL"),
-    };
-    let mut params = vec![
-        SqlValue::Text(ns.to_owned()),
-        SqlValue::Text(model.to_owned()),
-        SqlValue::Integer(watermark),
-        SqlValue::Text(ANN_CONSUMER.into()),
-    ];
-    if let Some(threshold) = live_threshold {
-        params.push(SqlValue::Float(threshold));
-    }
-    SqlStatement {
-        sql: format!(
-            "WITH \
-             registry AS (\
-               SELECT MIN(watermark) AS registry_min \
-               FROM ann_consumer_watermark \
-               WHERE (namespace = ?1 OR namespace = '*') \
-                 AND embedding_model = ?2\
-             ), \
-             own AS (\
-               SELECT (SELECT watermark FROM ann_consumer_watermark \
-                       WHERE consumer = ?4 AND namespace = ?1 \
-                         AND embedding_model = ?2) AS own_watermark\
-             ), \
-             {live_cte} \
-             selected AS (\
-               SELECT seq, subject_id, op FROM ann_write_log \
-               WHERE namespace = ?1 AND embedding_model = ?2 \
-                 AND field = 'knowledge.atom' \
-                 AND seq > MAX(\
-                   ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
-                 ) \
-               {selected_order}\
-             ), \
-             finals AS (\
-               SELECT first_seq AS seq, subject_id, op FROM (\
-                 SELECT MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, \
-                        subject_id, op, \
-                        ROW_NUMBER() OVER (\
-                          PARTITION BY subject_id ORDER BY seq DESC\
-                        ) AS final_rank \
-                 FROM selected\
-               ) WHERE final_rank = 1\
-             ) \
-             SELECT finals.seq, finals.subject_id, finals.op, \
-                    vectors.namespace AS vector_namespace, \
-                    vectors.embedding_model AS vector_model, \
-                    vectors.field AS vector_field, \
-                    vectors.embedding, registry.registry_min, \
-                    own.own_watermark, {live_column} AS live_count \
-             FROM registry CROSS JOIN own {live_join} \
-             LEFT JOIN finals ON 1 = 1 \
-             LEFT JOIN {table_name} AS vectors \
-               ON vectors.subject_id = finals.subject_id \
-             ORDER BY finals.seq"
-        ),
-        params,
-        label: Some("knowledge_ann_fresh_tail_snapshot".into()),
-    }
+    knowledge_corpus(ns).final_tail(
+        &table_name,
+        model,
+        watermark,
+        live_threshold,
+        khive_retrieval::ann::corpus::TailFloor::RegistryMinimum {
+            registry_namespace: ns,
+            consumer: ANN_CONSUMER,
+        },
+        "knowledge_ann_fresh_tail_snapshot",
+    )
 }
 
 /// Read the registry guard, optional live-count cap, selected log suffix, and
