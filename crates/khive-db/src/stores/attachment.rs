@@ -152,6 +152,7 @@ impl SqlAttachmentStore {
                 .map_err(|error| map_sqlite_err(error, operation))?;
             f(guard.conn())
                 .map_err(|error| map_err(error, operation))
+                .map_err(crate::error::statement_failure)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await

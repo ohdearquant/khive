@@ -580,10 +580,9 @@ impl KhiveRuntime {
                         Some(event_context),
                     )
                     .map_err(|e| {
-                        khive_storage::StorageError::driver(
+                        e.into_storage_error(
                             khive_storage::StorageCapability::Entities,
                             "merge_entity",
-                            e,
                         )
                     })
                 })
