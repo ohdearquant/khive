@@ -414,7 +414,23 @@ impl VerbRegistry {
     /// validation only checks membership, and an exact-duplicate rule is a
     /// harmless restatement.
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
-        self.collect_pack_items(|pack| pack.edge_rules().iter().copied())
+        self.attributed_edge_rules
+            .iter()
+            .map(|(_, rule)| *rule)
+            .collect()
+    }
+
+    /// Pack-declared endpoint rules paired with their owning pack names.
+    ///
+    /// Ownership is captured when the registry is built. Order and duplicate
+    /// declarations match [`Self::all_edge_rules`] exactly; built-in substrate
+    /// rules are excluded from both accessors. Names borrow the immutable
+    /// registry snapshot, so registry clones retain the same attribution.
+    pub fn all_edge_rules_with_packs(&self) -> Vec<(&str, EdgeEndpointRule)> {
+        self.attributed_edge_rules
+            .iter()
+            .map(|(pack, rule)| (pack.as_str(), *rule))
+            .collect()
     }
 
     /// All pack-declared entity-type subtypes across registered packs.

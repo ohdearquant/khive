@@ -551,8 +551,21 @@ impl VerbRegistryBuilder {
             )
         });
 
+        // Snapshot ownership before flattening rules for runtime installation.
+        // Keep declaration order and duplicate rules, including identical rules
+        // contributed by different packs.
+        let attributed_edge_rules = ordered_packs
+            .iter()
+            .flat_map(|pack| {
+                pack.edge_rules()
+                    .iter()
+                    .map(move |rule| (pack.name().to_owned(), *rule))
+            })
+            .collect();
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
+            attributed_edge_rules: Arc::new(attributed_edge_rules),
             resolvers: Arc::new(self.resolvers),
             kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
@@ -819,5 +832,10 @@ impl PackMetadataRegistry {
 
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
         self.registry.all_edge_rules()
+    }
+
+    /// Pack ownership for every declared endpoint rule, in installation order.
+    pub fn all_edge_rules_with_packs(&self) -> Vec<(&str, EdgeEndpointRule)> {
+        self.registry.all_edge_rules_with_packs()
     }
 }
