@@ -751,9 +751,9 @@ mod tests {
 
     #[test]
     fn projection_keeps_typed_writer_state_and_capability_spelling() {
-        let error = RuntimeError::Storage(khive_storage::StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let error = RuntimeError::Storage(khive_storage::StorageError::writer_task_terminated(
+            khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        ));
         let value = runtime_error_value(error, DomainDisposition::Unknown);
         assert_eq!(value["request_state"], "side_effects_unknown");
         assert_eq!(value["task_terminated"], true);
