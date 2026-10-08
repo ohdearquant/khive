@@ -3646,19 +3646,22 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-async fn fetch_pr_page(
+async fn fetch_page<T: serde::de::DeserializeOwned>(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
     limit: usize,
-) -> Result<Vec<GhPr>> {
+    kind: &str,
+    fields: &str,
+    parse_context: &'static str,
+) -> Result<Vec<T>> {
     let search = search_query(floor);
     let limit = limit.to_string();
     let raw = gh_json(
         repo,
         gh_repo,
         &[
-            "pr",
+            kind,
             "list",
             "--state",
             "all",
@@ -3667,11 +3670,29 @@ async fn fetch_pr_page(
             "--limit",
             &limit,
             "--json",
-            PR_FIELDS,
+            fields,
         ],
     )
     .await?;
-    serde_json::from_str(&raw).context("parsing gh pr list --json")
+    serde_json::from_str(&raw).context(parse_context)
+}
+
+async fn fetch_pr_page(
+    repo: &Path,
+    gh_repo: &str,
+    floor: Option<&str>,
+    limit: usize,
+) -> Result<Vec<GhPr>> {
+    fetch_page::<GhPr>(
+        repo,
+        gh_repo,
+        floor,
+        limit,
+        "pr",
+        PR_FIELDS,
+        "parsing gh pr list --json",
+    )
+    .await
 }
 
 async fn fetch_issue_page(
@@ -3680,26 +3701,16 @@ async fn fetch_issue_page(
     floor: Option<&str>,
     limit: usize,
 ) -> Result<Vec<GhIssue>> {
-    let search = search_query(floor);
-    let limit = limit.to_string();
-    let raw = gh_json(
+    fetch_page::<GhIssue>(
         repo,
         gh_repo,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--search",
-            search.as_str(),
-            "--limit",
-            &limit,
-            "--json",
-            ISSUE_FIELDS,
-        ],
+        floor,
+        limit,
+        "issue",
+        ISSUE_FIELDS,
+        "parsing gh issue list --json",
     )
-    .await?;
-    serde_json::from_str(&raw).context("parsing gh issue list --json")
+    .await
 }
 
 /// Every `GhPr` field funnels through this constructor before it can reach
