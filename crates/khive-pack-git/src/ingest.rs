@@ -2724,11 +2724,10 @@ fn squash_merge_pr_number(subject: &str) -> Option<u64> {
 /// `"<short_sha> <subject>"`).
 const NAME_MAX_CHARS: usize = 120;
 
-/// Cap for the text a commit note sends to the vector embedder (issue #764).
-/// Matches the repository's existing `MAX_EMBED_BYTES` precedent
-/// (`khive-pack-knowledge`, `kkernel::reindex`, ADR-048) — bytes, not chars,
-/// UTF-8-boundary-safe. The full, untruncated commit content is always
-/// stored and FTS-indexed; only the candidate vector input is capped.
+/// Byte cap for a commit note's candidate `embedding_content` (issue #764).
+/// This UTF-8-safe pre-cut drives the truncation summary; the runtime bounds
+/// each model's provider input to its own budget. Full commit content stays
+/// untruncated in storage and FTS.
 const MAX_COMMIT_EMBED_BYTES: usize = 32_768;
 
 /// Sentinel reason seeded into the commit source slot when a walk begins.
@@ -4554,6 +4553,11 @@ mod recovery_classifier_tests {
 #[cfg(test)]
 mod truncation_tests {
     use super::*;
+
+    #[test]
+    fn commit_embedding_cap_matches_embedding_service_limit() {
+        assert_eq!(MAX_COMMIT_EMBED_BYTES, lattice_embed::MAX_TEXT_BYTES);
+    }
 
     #[test]
     fn under_cap_content_is_not_truncated() {
