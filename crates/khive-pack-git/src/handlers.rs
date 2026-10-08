@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use khive_runtime::error::ResolutionFacts;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
 use crate::cache::{self, CacheError};
 use crate::ingest::{
@@ -573,6 +573,30 @@ fn append_unique_ids(target: &mut Vec<Uuid>, candidates: impl IntoIterator<Item 
     }
 }
 
+async fn query_projects<T>(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    value: &str,
+    statement: &'static str,
+    label: &'static str,
+    decode: fn(&SqlRow) -> Option<T>,
+) -> anyhow::Result<Vec<T>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: statement.into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(value.to_string()),
+            ],
+            label: Some(label.into()),
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
+    Ok(rows.iter().filter_map(decode).collect())
+}
+
 // Multiple live anchors can carry one slug when two legacy anchors holding
 // different URL spellings of the same repository were each exact-matched and
 // backfilled on separate ingests. Selection must be deterministic (oldest
@@ -583,27 +607,15 @@ async fn find_projects_by_slug(
     token: &NamespaceToken,
     identity: &str,
 ) -> anyhow::Result<Vec<Uuid>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_by_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_projects_by_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| match r.get("id") {
-            Some(SqlValue::Uuid(u)) => Some(*u),
-            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-            _ => None,
-        })
-        .collect())
+    query_projects(
+        runtime,
+        token,
+        identity,
+        sql!("projects_by_slug_select"),
+        "git_digest_find_projects_by_slug",
+        |row| row.uuid("id").ok(),
+    )
+    .await
 }
 
 /// Exact step-2 legacy match (ADR-088 Amendment 2): every live pre-slug
@@ -620,27 +632,15 @@ async fn find_projects_by_legacy_repo_url(
     token: &NamespaceToken,
     repo_url: &str,
 ) -> anyhow::Result<Vec<Uuid>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_by_legacy_repo_url_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(repo_url.to_string()),
-            ],
-            label: Some("git_digest_find_projects_by_legacy_repo_url".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| match r.get("id") {
-            Some(SqlValue::Uuid(u)) => Some(*u),
-            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-            _ => None,
-        })
-        .collect())
+    query_projects(
+        runtime,
+        token,
+        repo_url,
+        sql!("projects_by_legacy_repo_url_select"),
+        "git_digest_find_projects_by_legacy_repo_url",
+        |row| row.uuid("id").ok(),
+    )
+    .await
 }
 
 /// Fetch every live `project` anchor whose slug is absent or differs from
@@ -653,34 +653,19 @@ async fn find_projects_without_canonical_slug(
     token: &NamespaceToken,
     identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String)>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_without_canonical_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_projects_without_canonical_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            let id = match r.get("id") {
-                Some(SqlValue::Uuid(u)) => Some(*u),
-                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-                _ => None,
-            }?;
-            let url = match r.get("repo_url") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            }?;
+    query_projects(
+        runtime,
+        token,
+        identity,
+        sql!("projects_without_canonical_slug_select"),
+        "git_digest_find_projects_without_canonical_slug",
+        |row| {
+            let id = row.uuid("id").ok()?;
+            let url = row.text_or_none("repo_url")?.to_owned();
             Some((id, url))
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Fetch every soft-deleted anchor outside the canonical slug tier and carry
@@ -693,38 +678,20 @@ async fn find_soft_deleted_projects_without_canonical_slug(
     token: &NamespaceToken,
     identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("soft_deleted_projects_without_canonical_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_soft_deleted_projects_without_canonical_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            let id = match r.get("id") {
-                Some(SqlValue::Uuid(u)) => Some(*u),
-                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-                _ => None,
-            }?;
-            let deleted_at = match r.get("deleted_at") {
-                Some(SqlValue::Integer(n)) => *n,
-                _ => 0,
-            };
-            let url = match r.get("repo_url") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            }?;
+    query_projects(
+        runtime,
+        token,
+        identity,
+        sql!("soft_deleted_projects_without_canonical_slug_select"),
+        "git_digest_find_soft_deleted_projects_without_canonical_slug",
+        |row| {
+            let id = row.uuid("id").ok()?;
+            let deleted_at = row.i64_or_none("deleted_at").unwrap_or(0);
+            let url = row.text_or_none("repo_url")?.to_owned();
             Some((id, url, deleted_at))
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Return live anchors outside the canonical slug tier whose own stored
