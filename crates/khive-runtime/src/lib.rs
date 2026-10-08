@@ -164,8 +164,8 @@ pub use graph_traversal::PathNode;
 pub use kg_read::KgNeighborRead;
 pub use khive_db::env::env_parse_or;
 pub use khive_db::{
-    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
-    CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
+    checkpoint_once, run_checkpoint_task, run_migrations, stores::event::event_insert_statements,
+    CheckpointConfig, CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
     classify_operation, is_valid_mailbox_actor_label, split_stamped_label, ActorRef, AllowAllGate,
