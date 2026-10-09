@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::{StorageCapability, StorageError};
 
 use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
@@ -1396,46 +1397,65 @@ impl KnowledgeHandlers {
         )
         .await?;
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("challenge writer", e))?;
+        let atom_id_for_update = atom_id.clone();
+        let target_hash_for_update = target_hash.clone();
+        let affected = sql
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    let affected = writer
+                        .execute(SqlStatement {
+                            sql: khive_runtime::sql!("knowledge_section_dispute").into(),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update.clone()),
+                                SqlValue::Text(stype.as_str().to_string()),
+                                SqlValue::Text(target_hash_for_update),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "challenge section status", e))?;
 
-        let affected = writer
-            .execute(SqlStatement {
-                sql: khive_runtime::sql!("knowledge_section_dispute").into(),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(stype.as_str().to_string()),
-                    SqlValue::Text(target_hash.clone()),
-                ],
-                label: None,
-            })
+                    if affected == 0 {
+                        return Ok(Box::new(0_u64) as Box<dyn std::any::Any + Send>);
+                    }
+                    // json_set targets the fixed nested path `$.dispute_count` only; no caller
+                    // input reaches this statement, so it cannot create or replace the
+                    // top-level reserved property key.
+                    let updated_atoms = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update),
+                                SqlValue::Text(ns.clone()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "challenge dispute_count increment", e))?;
+                    if updated_atoms != 1 {
+                        return Err(StorageError::Conflict {
+                            capability: StorageCapability::Sql,
+                            operation: "challenge dispute_count".into(),
+                            message: format!("expected one parent atom, updated {updated_atoms}"),
+                        });
+                    }
+
+                    Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+                })
+            }))
             .await
-            .map_err(|e| sql_err("challenge section status", e))?;
+            .map_err(|e| sql_err("challenge transaction", e))?
+            .downcast::<u64>()
+            .map_err(|_| RuntimeError::Internal("invalid challenge transaction outcome".into()))?;
+        let affected = *affected;
 
         if affected == 0 {
             return Err(RuntimeError::InvalidInput(
                 "section not found, already disputed, or deprecated".into(),
             ));
         }
-
-        // json_set targets the fixed nested path `$.dispute_count` only; no caller
-        // input reaches this statement, so it cannot create or replace the
-        // top-level reserved property key.
-        writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(ns.clone()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("challenge dispute_count increment", e))?;
 
         Ok(json!({
             "atom_id": atom_id,
@@ -1543,49 +1563,68 @@ impl KnowledgeHandlers {
         )
         .await?;
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("adjudicate writer", e))?;
+        let atom_id_for_update = atom_id.clone();
+        let target_hash_for_update = target_hash.clone();
+        let affected = sql
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    let affected = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_sections SET status='{new_status}' \
+                                 WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update.clone()),
+                                SqlValue::Text(stype.as_str().to_string()),
+                                SqlValue::Text(target_hash_for_update),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "adjudicate section status", e))?;
 
-        let affected = writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_sections SET status='{new_status}' \
-                     WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(stype.as_str().to_string()),
-                    SqlValue::Text(target_hash.clone()),
-                ],
-                label: None,
-            })
+                    if affected == 0 {
+                        return Ok(Box::new(0_u64) as Box<dyn std::any::Any + Send>);
+                    }
+                    // json_set targets the fixed nested path `$.dispute_count` only; no caller
+                    // input reaches this statement, so it cannot create or replace the
+                    // top-level reserved property key.
+                    let updated_atoms = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update),
+                                SqlValue::Text(ns.clone()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "adjudicate dispute_count decrement", e))?;
+                    if updated_atoms != 1 {
+                        return Err(StorageError::Conflict {
+                            capability: StorageCapability::Sql,
+                            operation: "adjudicate dispute_count".into(),
+                            message: format!("expected one parent atom, updated {updated_atoms}"),
+                        });
+                    }
+
+                    Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+                })
+            }))
             .await
-            .map_err(|e| sql_err("adjudicate section status", e))?;
+            .map_err(|e| sql_err("adjudicate transaction", e))?
+            .downcast::<u64>()
+            .map_err(|_| RuntimeError::Internal("invalid adjudicate transaction outcome".into()))?;
+        let affected = *affected;
 
         if affected == 0 {
             return Err(RuntimeError::InvalidInput(
                 "section not found or not in disputed state".into(),
             ));
         }
-
-        // json_set targets the fixed nested path `$.dispute_count` only; no caller
-        // input reaches this statement, so it cannot create or replace the
-        // top-level reserved property key.
-        writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(ns.clone()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("adjudicate dispute_count decrement", e))?;
 
         Ok(json!({
             "atom_id": atom_id,
