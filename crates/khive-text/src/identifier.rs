@@ -26,11 +26,14 @@ pub fn is_identifier(text: &str) -> bool {
         }
     }
 
-    // Check for camelCase (lowercase followed by uppercase) or digit-letter boundaries
+    // Match the camelCase, acronym-to-word, and digit-letter boundaries used by the splitter.
     for i in 0..n - 1 {
         let a = chars[i];
         let b = chars[i + 1];
         if (a.is_ascii_lowercase() && b.is_ascii_uppercase())
+            || (a.is_ascii_uppercase()
+                && b.is_ascii_uppercase()
+                && chars.get(i + 2).is_some_and(char::is_ascii_lowercase))
             || (a.is_ascii_alphabetic() && b.is_ascii_digit())
             || (a.is_ascii_digit() && b.is_ascii_alphabetic())
         {

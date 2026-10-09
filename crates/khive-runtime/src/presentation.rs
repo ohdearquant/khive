@@ -1303,6 +1303,9 @@ fn parse_tz_offset_secs(tail: &str) -> Option<i64> {
 }
 
 fn parse_digits(b: &[u8]) -> Option<i64> {
+    if !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
     let s = std::str::from_utf8(b).ok()?;
     s.parse().ok()
 }
@@ -1328,10 +1331,21 @@ fn truncate_to_3_sig_figs(f: f64) -> Value {
     let magnitude = f.abs().log10().floor() as i32;
     let factor = 10f64.powi(2 - magnitude);
     let rounded = (f * factor).round() / factor;
+    let rounded = if rounded.is_finite() {
+        rounded
+    } else {
+        // Decimal formatting handles subnormals without an overflowing scale.
+        // If rounding would exceed f64's range, retain the finite input.
+        format!("{f:.2e}")
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .unwrap_or(f)
+    };
     // Re-serialize through serde_json to avoid floating-point noise.
     serde_json::Number::from_f64(rounded)
         .map(Value::Number)
-        .unwrap_or(Value::from(rounded))
+        .unwrap_or(Value::from(f))
 }
 
 #[cfg(test)]
