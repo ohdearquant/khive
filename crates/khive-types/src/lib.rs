@@ -41,7 +41,7 @@ pub use agent::{AgentRecord, AgentState, TerminalReason};
 #[cfg(feature = "serde")]
 pub use canonical_json::canonical_json_bytes;
 pub use edge::{EdgeCategory, EdgeRelation};
-pub use entity::{Entity, EntityKind, Link, PropertyValue};
+pub use entity::{validate_edge_weight, Entity, EntityKind, Link, PropertyValue};
 pub use entity_type::{
     to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
 };
@@ -55,7 +55,7 @@ pub use event::{
 pub use event::{
     EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch,
 };
-pub use hash::Hash32;
+pub use hash::{fnv1a_64, Hash32};
 pub use header::Header;
 pub use id::{is_lowercase_hex, Id128, ParseIdError};
 #[cfg(feature = "serde")]

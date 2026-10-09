@@ -403,6 +403,7 @@ impl VerbRegistry {
         ("kg", "get"),
         ("kg", "list"),
         ("kg", "stats"),
+        ("kg", "count"),
         ("kg", "search"),
         ("kg", "neighbors"),
         ("kg", "traverse"),

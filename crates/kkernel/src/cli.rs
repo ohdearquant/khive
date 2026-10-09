@@ -2335,6 +2335,7 @@ no_embed = true
             "comm".to_string(),
             khive_runtime::PackConfig {
                 backend: "main".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: true,
             },
         );
@@ -2732,6 +2733,7 @@ no_embed = true
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        verbs_disabled: Vec::new(),
                         no_embed: false,
                     },
                 );

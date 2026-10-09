@@ -556,6 +556,16 @@ impl RecallParams {
 pub(super) fn normalize_relevance(raw: f64, strategy: &FusionStrategy) -> f64 {
     match strategy {
         FusionStrategy::Rrf { k } => (raw * (*k as f64 + 1.0)).min(1.0),
+        // Weighted RRF scores are weight / (k + rank) sums: a rank-one hit in the
+        // heaviest source normalizes to 1.0, so unit weights reproduce the RRF arm.
+        FusionStrategy::WeightedRrf { k, weights } => {
+            let heaviest = weights.iter().copied().fold(0.0_f64, f64::max);
+            if heaviest > 0.0 {
+                (raw * (*k as f64 + 1.0) / heaviest).min(1.0)
+            } else {
+                raw
+            }
+        }
         _ => raw,
     }
 }
@@ -977,7 +987,9 @@ pub(super) fn fuse_candidates(
                 entity_id: id,
                 score,
                 rank_score_kind: match &cfg.fuse_strategy {
-                    FusionStrategy::Rrf { .. } => khive_runtime::RankScoreKind::Rrf,
+                    FusionStrategy::Rrf { .. } | FusionStrategy::WeightedRrf { .. } => {
+                        khive_runtime::RankScoreKind::Rrf
+                    }
                     FusionStrategy::VectorOnly => khive_runtime::RankScoreKind::Vector,
                     FusionStrategy::KeywordOnly => khive_runtime::RankScoreKind::Keyword,
                     FusionStrategy::Weighted { .. } => khive_runtime::RankScoreKind::Weighted,

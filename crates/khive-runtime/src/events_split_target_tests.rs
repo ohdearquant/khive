@@ -107,3 +107,114 @@ async fn exact_target_filter_crosses_socket_and_merges_both_event_stores() {
         "atom subjects do not create graph observations"
     );
 }
+
+#[tokio::test]
+async fn grouped_counts_cross_socket_and_merge_without_row_paging() {
+    let dir = tempfile::tempdir().unwrap();
+    let _registry_guard = TestRegistryGuard::new(dir.path());
+    let (_db, socket) = boot_daemon(&dir).await;
+    let client = EventsSplitClient::new(socket).unwrap();
+    let lane: Arc<dyn EventStore> =
+        Arc::new(ForwardingEventStore::new("local", Arc::clone(&client)));
+    let foreign = ForwardingEventStore::new("foreign", client);
+    let backend = direct_backend_for(&dir.path().join("legacy.db")).unwrap();
+    let legacy = backend.events_for_namespace("local").unwrap();
+    let split = SplitEventStore::new(Arc::clone(&legacy), Arc::clone(&lane));
+    let make = |namespace: &str, verb: &str, actor: &str, at| {
+        let mut event = Event::new(
+            namespace,
+            verb,
+            EventKind::Audit,
+            SubstrateKind::Note,
+            actor,
+        );
+        event.created_at = at;
+        event
+    };
+    split
+        .append_events(vec![
+            make("local", "shared", "a", 101),
+            make("local", "main", "b", 102),
+        ])
+        .await
+        .unwrap();
+    lane.append_events_idempotent(vec![
+        make("local", "shared", "a", 103),
+        make("local", "lane", "c", 104),
+        make("local", "excluded", "a", 200),
+    ])
+    .await
+    .unwrap();
+    foreign
+        .append_events_idempotent(vec![make("foreign", "hidden", "a", 105)])
+        .await
+        .unwrap();
+    let filter = EventFilter {
+        after: Some(100),
+        before: Some(200),
+        ..Default::default()
+    };
+    assert_eq!(
+        split
+            .count_events_grouped(filter.clone(), EventGroupBy::Verb)
+            .await
+            .unwrap(),
+        BTreeMap::from([("shared".into(), 2), ("main".into(), 1), ("lane".into(), 1)])
+    );
+    assert_eq!(
+        split
+            .count_events_grouped(filter.clone(), EventGroupBy::Kind)
+            .await
+            .unwrap(),
+        BTreeMap::from([("audit".into(), 4)])
+    );
+    assert_eq!(
+        split
+            .count_events_grouped(filter.clone(), EventGroupBy::Actor)
+            .await
+            .unwrap(),
+        BTreeMap::from([("a".into(), 2), ("b".into(), 1), ("c".into(), 1)])
+    );
+    assert!(split
+        .count_events_grouped(
+            EventFilter {
+                verbs: vec!["absent".into()],
+                ..filter
+            },
+            EventGroupBy::Verb
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grouped_count_protocol_rejects_old_version_before_opening_store() {
+    let backend = StorageBackend::memory().unwrap();
+    let stores: NamespaceStores = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    for request in [
+        EventsRequest::CountEvents {
+            protocol_version: 4,
+            namespace: "local".into(),
+            filter: EventFilter::default(),
+        },
+        EventsRequest::CountEventsGrouped {
+            protocol_version: 4,
+            namespace: "local".into(),
+            filter: EventFilter::default(),
+            group_by: EventGroupBy::Verb,
+        },
+    ] {
+        let request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        match dispatch_events_request(request, &backend, &stores).await {
+            EventsResponse::Error {
+                message, retryable, ..
+            } => {
+                assert!(message.contains("protocol version mismatch"));
+                assert!(!retryable);
+            }
+            other => panic!("old count protocol must refuse: {other:?}"),
+        }
+    }
+    assert!(stores.lock().unwrap().is_empty());
+}

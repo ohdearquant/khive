@@ -192,7 +192,19 @@ impl VerbRegistry {
     /// guaranteed-failed `dispatch` (and its audit write) when an optional
     /// pack is absent can probe first and skip the call entirely.
     pub fn has_verb(&self, verb: &str) -> bool {
-        self.handler_by_name.contains_key(verb)
+        self.handler_by_name.contains_key(verb) && !self.is_verb_disabled(verb)
+    }
+
+    /// Whether operator policy disables this registered public handler.
+    pub fn is_verb_disabled(&self, verb: &str) -> bool {
+        self.disabled_verbs.contains(verb)
+    }
+
+    pub(crate) fn unknown_verb_error(&self, verb: &str) -> RuntimeError {
+        RuntimeError::UnknownVerb(format!(
+            "unknown verb {verb:?}; available: {}",
+            self.available_verbs.join(", ")
+        ))
     }
 
     /// Advisory metadata for synchronous planning and MCP initialization.
@@ -243,14 +255,14 @@ impl VerbRegistry {
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
-    /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
+    /// Disabled verbs and subhandlers (`Visibility::Subhandler`) are excluded — subhandlers are internal
     /// pipeline steps not surfaced on the MCP wire. Returned with `'static`
     /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .filter(|h| matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name))
             .collect()
     }
 
@@ -264,11 +276,13 @@ impl VerbRegistry {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
-            .filter(|(_, h)| matches!(h.visibility, Visibility::Verb))
+            .filter(|(_, h)| {
+                matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name)
+            })
             .collect()
     }
 
-    /// All handler definitions across all registered packs, including subhandlers.
+    /// All handler definitions across all registered packs, including disabled verbs and subhandlers.
     ///
     /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
     /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
@@ -280,15 +294,23 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// Merged set of note kinds across all registered packs (deduplicated,
-    /// first-seen order preserved).
-    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+    /// Collect declared kinds once, retaining their first-seen registration order.
+    fn collect_pack_kinds(
+        &self,
+        select: impl Fn(&dyn PackRuntime) -> &'static [&'static str],
+    ) -> Vec<&'static str> {
         let mut seen = std::collections::HashSet::new();
         self.packs
             .iter()
-            .flat_map(|p| p.note_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
+            .flat_map(|pack| select(pack.as_ref()).iter().copied())
+            .filter(|kind| seen.insert(*kind))
             .collect()
+    }
+
+    /// Merged set of note kinds across all registered packs (deduplicated,
+    /// first-seen order preserved).
+    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+        self.collect_pack_kinds(|pack| pack.note_kinds())
     }
 
     /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
@@ -321,23 +343,13 @@ impl VerbRegistry {
     /// Merged set of entity kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_entity_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.entity_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.entity_kinds())
     }
 
     /// Merged set of brain profile consumer kinds requested by registered
     /// packs (deduplicated, first-seen order preserved).
     pub fn all_brain_consumer_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.brain_consumer_kinds().iter().copied())
-            .filter(|kind| seen.insert(*kind))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.brain_consumer_kinds())
     }
 
     /// Names of packs in topological load order.

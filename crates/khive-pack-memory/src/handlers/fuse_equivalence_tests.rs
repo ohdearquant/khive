@@ -114,7 +114,9 @@ fn reference_fuse_candidates(
                 entity_id: id,
                 score,
                 rank_score_kind: match &cfg.fuse_strategy {
-                    FusionStrategy::Rrf { .. } => RankScoreKind::Rrf,
+                    FusionStrategy::Rrf { .. } | FusionStrategy::WeightedRrf { .. } => {
+                        RankScoreKind::Rrf
+                    }
                     FusionStrategy::VectorOnly => RankScoreKind::Vector,
                     FusionStrategy::KeywordOnly => RankScoreKind::Keyword,
                     FusionStrategy::Weighted { .. } => RankScoreKind::Weighted,
@@ -218,6 +220,8 @@ fn strategies() -> Vec<FusionStrategy> {
             weights: vec![0.5, 0.5],
         },
         FusionStrategy::Union,
+        FusionStrategy::weighted_rrf(60, vec![1.0, 1.0]),
+        FusionStrategy::weighted_rrf(1, vec![2.0, 0.5]),
         custom,
     ]
 }

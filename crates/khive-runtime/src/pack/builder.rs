@@ -39,6 +39,7 @@ pub struct VerbRegistryBuilder {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc for why
     /// `pack.name()` alone cannot be trusted for this decision.
     pack_trusted: Vec<bool>,
+    disabled_verbs: HashMap<String, Vec<String>>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     pub(super) kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
@@ -84,6 +85,7 @@ impl VerbRegistryBuilder {
         Self {
             packs: Vec::new(),
             pack_trusted: Vec::new(),
+            disabled_verbs: HashMap::new(),
             resolvers: Vec::new(),
             kg_read_resolver: None,
             gate: std::sync::Arc::new(AllowAllGate),
@@ -96,6 +98,12 @@ impl VerbRegistryBuilder {
             dispatch_hook: None,
             audit_batch_config: None,
         }
+    }
+
+    /// Disable public handlers owned by a loaded pack; validated when the registry builds.
+    pub fn with_disabled_verbs(&mut self, pack: &str, verbs: &[String]) -> &mut Self {
+        self.disabled_verbs.insert(pack.to_owned(), verbs.to_vec());
+        self
     }
 
     /// Set the operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -448,6 +456,37 @@ impl VerbRegistryBuilder {
         validate_unique_entity_types(&ordered_packs)?;
         validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        let mut disabled_verbs = HashSet::new();
+        let mut policies: Vec<_> = self.disabled_verbs.iter().collect();
+        policies.sort_by_key(|(pack, _)| *pack);
+        for (name, verbs) in policies {
+            if verbs.is_empty() {
+                continue;
+            }
+            let pack = ordered_packs
+                .iter()
+                .find(|pack| pack.name() == name.as_str())
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!(
+                        "packs.{name}.verbs_disabled: pack is not loaded"
+                    ))
+                })?;
+            for verb in verbs {
+                let handler = pack
+                    .handlers()
+                    .iter()
+                    .find(|handler| {
+                        handler.name == verb.as_str()
+                            && matches!(handler.visibility, Visibility::Verb)
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                    "packs.{name}.verbs_disabled: {verb:?} is not a public verb owned by this pack"
+                ))
+                    })?;
+                disabled_verbs.insert(handler.name);
+            }
+        }
         if activate {
             for pack in &ordered_packs {
                 pack.validate_config()?;
@@ -457,7 +496,9 @@ impl VerbRegistryBuilder {
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
             .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .filter(|h| {
+                matches!(h.visibility, Visibility::Verb) && !disabled_verbs.contains(h.name)
+            })
             .map(|h| h.name)
             .collect();
 
@@ -563,6 +604,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            disabled_verbs: Arc::new(disabled_verbs),
             handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),

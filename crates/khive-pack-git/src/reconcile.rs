@@ -19,6 +19,7 @@ const CURSOR_MAX_BYTES: i64 = 8 * 1024;
 const MAX_ACKNOWLEDGED_SHAS: usize = 250_000;
 const DIAGNOSTIC_CAP: usize = 16;
 const WRITE_BATCH: usize = 64;
+const READ_BATCH: usize = 900;
 
 #[derive(Clone, Debug)]
 pub struct ReconcileOptions {
@@ -309,6 +310,128 @@ fn diagnostic(report: &mut ReconcileReport, message: impl Into<String>) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AcknowledgedNote {
+    Missing,
+    Ambiguous,
+    Deleted,
+    Live(Uuid),
+}
+
+// Bound returned note rows to three per SHA and retain acknowledged order when
+// hashing/classifying. The reader and per-link apply guards remain caller-owned.
+async fn inspect_acknowledged(
+    reader: &mut dyn khive_storage::SqlReader,
+    namespace: &str,
+    project_id: Uuid,
+    shas: &[String],
+    report: &mut ReconcileReport,
+    hasher: &mut blake3::Hasher,
+) -> Result<Vec<(String, Uuid)>> {
+    let mut candidates = Vec::new();
+    for chunk in shas.chunks(READ_BATCH) {
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: crate::sql::sql!("annotation_repair_commit_notes_select").into(),
+                params: vec![
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(serde_json::to_string(chunk)?),
+                ],
+                label: Some("git_annotation_repair_note".into()),
+            })
+            .await?;
+        let mut by_sha = std::collections::HashMap::<String, Vec<_>>::new();
+        for row in rows {
+            by_sha
+                .entry(row.text("sha")?.to_owned())
+                .or_default()
+                .push(row);
+        }
+        let mut notes = Vec::with_capacity(chunk.len());
+        let mut ids = Vec::new();
+        for sha in chunk {
+            let rows = by_sha.get(sha).map(Vec::as_slice).unwrap_or(&[]);
+            notes.push(if rows.is_empty() {
+                AcknowledgedNote::Missing
+            } else if rows.len() != 1 {
+                AcknowledgedNote::Ambiguous
+            } else if !matches!(rows[0].get("deleted_at"), Some(SqlValue::Null)) {
+                AcknowledgedNote::Deleted
+            } else {
+                let id = match rows[0].get("id") {
+                    Some(SqlValue::Uuid(id)) => *id,
+                    Some(SqlValue::Text(id)) => {
+                        Uuid::parse_str(id).context("stored commit note has an invalid id")?
+                    }
+                    _ => bail!("stored commit note has an invalid id"),
+                };
+                ids.push(id.to_string());
+                AcknowledgedNote::Live(id)
+            });
+        }
+        let mut edges = std::collections::HashMap::new();
+        if !ids.is_empty() {
+            for row in reader
+                .query_all(SqlStatement {
+                    sql: crate::sql::sql!("annotation_repair_project_edge_select").into(),
+                    params: vec![
+                        SqlValue::Text(namespace.into()),
+                        SqlValue::Text(serde_json::to_string(&ids)?),
+                        SqlValue::Text(project_id.to_string()),
+                    ],
+                    label: Some("git_annotation_repair_edge".into()),
+                })
+                .await?
+            {
+                // SQL compares canonical lookup IDs to stored source_id exactly.
+                // Do not parse/normalize stored edge IDs and widen that match.
+                edges.insert(
+                    row.text("source_id")?.to_owned(),
+                    matches!(row.get("deleted_at"), Some(SqlValue::Null)),
+                );
+            }
+        }
+        for (sha, note) in chunk.iter().zip(notes) {
+            report.counts.acknowledged_shas_examined += 1;
+            let class = match note {
+                AcknowledgedNote::Missing => {
+                    report.counts.missing_notes += 1;
+                    "missing_note"
+                }
+                AcknowledgedNote::Ambiguous => {
+                    report.counts.ambiguous_notes += 1;
+                    "ambiguous_note"
+                }
+                AcknowledgedNote::Deleted => {
+                    report.counts.deleted_notes += 1;
+                    "deleted_note"
+                }
+                AcknowledgedNote::Live(note_id) => {
+                    hasher.update(note_id.as_bytes());
+                    report.counts.live_note_hits += 1;
+                    match edges.get(&note_id.to_string()) {
+                        Some(true) => {
+                            report.counts.live_project_edges += 1;
+                            "live_edge"
+                        }
+                        Some(false) => {
+                            report.counts.tombstones_skipped += 1;
+                            "tombstone"
+                        }
+                        None => {
+                            report.counts.repairable_missing_links += 1;
+                            candidates.push((sha.clone(), note_id));
+                            "missing_link"
+                        }
+                    }
+                }
+            };
+            hasher.update(&serde_json::to_vec(&(sha, class))?);
+        }
+    }
+    Ok(candidates)
+}
+
 async fn preview(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -394,66 +517,15 @@ async fn preview(
         Ok(shas) => {
             report.complete_coverage = true;
             let mut reader = runtime.sql().reader().await?;
-            for sha in shas {
-                report.counts.acknowledged_shas_examined += 1;
-                let notes = reader
-                    .query_all(SqlStatement {
-                        sql: crate::sql::sql!("annotation_repair_commit_notes_select").into(),
-                        params: vec![
-                            SqlValue::Text(namespace.into()),
-                            SqlValue::Text(sha.clone()),
-                        ],
-                        label: Some("git_annotation_repair_note".into()),
-                    })
-                    .await?;
-                let class = if notes.is_empty() {
-                    report.counts.missing_notes += 1;
-                    "missing_note"
-                } else if notes.len() != 1 {
-                    report.counts.ambiguous_notes += 1;
-                    "ambiguous_note"
-                } else if !matches!(notes[0].get("deleted_at"), Some(SqlValue::Null)) {
-                    report.counts.deleted_notes += 1;
-                    "deleted_note"
-                } else {
-                    let note_id = match notes[0].get("id") {
-                        Some(SqlValue::Uuid(id)) => *id,
-                        Some(SqlValue::Text(id)) => {
-                            Uuid::parse_str(id).context("stored commit note has an invalid id")?
-                        }
-                        _ => bail!("stored commit note has an invalid id"),
-                    };
-                    hasher.update(note_id.as_bytes());
-                    report.counts.live_note_hits += 1;
-                    let edge = reader
-                        .query_row(SqlStatement {
-                            sql: crate::sql::sql!("annotation_repair_project_edge_select").into(),
-                            params: vec![
-                                SqlValue::Text(namespace.into()),
-                                SqlValue::Text(note_id.to_string()),
-                                SqlValue::Text(project_id.to_string()),
-                            ],
-                            label: Some("git_annotation_repair_edge".into()),
-                        })
-                        .await?;
-                    match edge {
-                        Some(edge) if matches!(edge.get("deleted_at"), Some(SqlValue::Null)) => {
-                            report.counts.live_project_edges += 1;
-                            "live_edge"
-                        }
-                        Some(_) => {
-                            report.counts.tombstones_skipped += 1;
-                            "tombstone"
-                        }
-                        None => {
-                            report.counts.repairable_missing_links += 1;
-                            candidates.push((sha.clone(), note_id));
-                            "missing_link"
-                        }
-                    }
-                };
-                hasher.update(&serde_json::to_vec(&(&sha, class))?);
-            }
+            candidates = inspect_acknowledged(
+                reader.as_mut(),
+                namespace,
+                project_id,
+                &shas,
+                &mut report,
+                &mut hasher,
+            )
+            .await?;
         }
     }
     let after = cursor_snapshot(runtime, project_id).await?;
@@ -718,6 +790,10 @@ mod test_hooks {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "reconcile/batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {

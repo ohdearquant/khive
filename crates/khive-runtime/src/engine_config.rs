@@ -515,7 +515,11 @@ pub struct BackendConfig {
 pub struct PackConfig {
     /// Backend name this pack is assigned to. Must match a `[[backends]].name`,
     /// or `main` when no backends are declared.
+    #[serde(default = "default_pack_backend")]
     pub backend: String,
+    /// Public handlers disabled by the operator. Names must belong to this loaded pack.
+    #[serde(default)]
+    pub verbs_disabled: Vec<String>,
     /// Disable vector embedding for this pack's runtime: rows it writes get
     /// FTS and metadata only, no `vec_*` rows and no ANN participation. The
     /// opt-out covers pack-owned writes on the pack's own backend; it does
@@ -527,6 +531,10 @@ pub struct PackConfig {
     /// each pack gets its own runtime. Defaults to `false`.
     #[serde(default)]
     pub no_embed: bool,
+}
+
+fn default_pack_backend() -> String {
+    BackendId::MAIN.to_owned()
 }
 
 // ---- Blob store config (ADR-111 Amendment 2) ----

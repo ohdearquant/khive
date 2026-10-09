@@ -597,8 +597,9 @@ async fn pathless_checkpoint_writer_wait_leaves_index_available_to_snapshot_read
     begin_read_snapshot(reader.as_mut())
         .await
         .expect("pin pathless read snapshot");
-    registry_min_watermark_on(reader.as_mut(), MODEL)
+    ann_registry::min_watermark_on(reader.as_mut(), "memory_", ANN_WILDCARD_NS, MODEL)
         .await
+        .map_err(|e| e.to_string())
         .expect("read pinned registry floor");
     ann.pathless_checkpoint_release.notify_one();
     tokio::time::timeout(

@@ -2367,6 +2367,7 @@ async fn fetch_protected_tail_on(
     max_delta: u64,
 ) -> Result<(Option<(Vec<(Uuid, Option<Vec<f32>>)>, u64, u64)>, u64), String> {
     let table_name = format!("vec_{}", sanitize_model_key(model));
+    let minimum = ann_registry::min_watermark_subquery(3, 1);
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
@@ -2377,9 +2378,7 @@ async fn fetch_protected_tail_on(
                    ORDER BY seq LIMIT ?5\
                  ), summary AS MATERIALIZED (\
                    SELECT COUNT(*) AS raw_count, \
-                          (SELECT MIN(watermark) FROM ann_consumer_watermark \
-                           WHERE (namespace = ?3 OR namespace = '*') \
-                             AND embedding_model = ?1) AS min_watermark \
+                          ({minimum}) AS min_watermark \
                    FROM tail\
                  ), selected AS MATERIALIZED (\
                    SELECT seq, subject_id, op FROM tail \
@@ -2563,59 +2562,6 @@ pub(crate) async fn bridge_applied_seq(ann: &SharedAnn, key: &AnnKey) -> Option<
     guard
         .get(key)
         .map(|b| b.index.last_applied_seq().unwrap_or(0))
-}
-
-/// The wildcard-inclusive registry minimum (ADR-118 §1 "Compaction
-/// linearization"; see `docs/ann.md`): the same bound `compact_log` uses. If
-/// this exceeds a bridge's watermark, completeness above it is unprovable.
-async fn registry_min_watermark_on(
-    reader: &mut dyn khive_storage::SqlReader,
-    model: &str,
-) -> Result<Option<i64>, String> {
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: ::khive_runtime::sql!("memory_ann_registry_min_select").into(),
-            params: vec![
-                SqlValue::Text(ANN_WILDCARD_NS.into()),
-                SqlValue::Text(model.to_owned()),
-            ],
-            label: Some("memory_ann_registry_min".into()),
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(rows.into_iter().next().and_then(|row| match row.get("m") {
-        Some(SqlValue::Integer(n)) => Some(*n),
-        _ => None,
-    }))
-}
-
-/// Read the named consumer inside the same snapshot as the registry minimum
-/// and fresh-tail rows. An outside-the-snapshot precheck cannot protect a
-/// graph from concurrent consumer retirement and compaction.
-async fn consumer_watermark_on(
-    reader: &mut dyn khive_storage::SqlReader,
-    model: &str,
-    consumer: &str,
-) -> Result<Option<i64>, String> {
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: ::khive_runtime::sql!("memory_ann_consumer_watermark_select").into(),
-            params: vec![
-                SqlValue::Text(consumer.into()),
-                SqlValue::Text(ANN_WILDCARD_NS.into()),
-                SqlValue::Text(model.to_owned()),
-            ],
-            label: Some("note_search_ann_consumer_snapshot".into()),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| match row.get("watermark") {
-            Some(SqlValue::Integer(value)) => Some(*value),
-            _ => None,
-        }))
 }
 
 /// Open an explicit read transaction so a reader keeps one connection across
@@ -3169,7 +3115,15 @@ pub(crate) async fn fresh_tail_serving(
         ));
     }
     if let Some(consumer) = consumer {
-        let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+        let own = ann_registry::read_watermark_on(
+            reader.as_mut(),
+            "note_search_ann_consumer_snapshot",
+            consumer,
+            ANN_WILDCARD_NS,
+            model,
+        )
+        .await
+        .map_err(|error| error.to_string());
         if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
             end_read_snapshot(reader.as_mut()).await;
             return FreshTailOutcome::Skipped(SkipReason::bare(
@@ -3178,7 +3132,15 @@ pub(crate) async fn fresh_tail_serving(
         }
     }
 
-    let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
+    let registry_min = match ann_registry::min_watermark_on(
+        reader.as_mut(),
+        "memory_",
+        ANN_WILDCARD_NS,
+        model,
+    )
+    .await
+    .map_err(|e| e.to_string())
+    {
         Ok(v) => v,
         Err(e) => {
             end_read_snapshot(reader.as_mut()).await;
@@ -3325,7 +3287,15 @@ async fn fresh_tail_pathless_reresolve(
         );
     }
     if let Some(consumer) = consumer {
-        let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+        let own = ann_registry::read_watermark_on(
+            reader.as_mut(),
+            "note_search_ann_consumer_snapshot",
+            consumer,
+            ANN_WILDCARD_NS,
+            model,
+        )
+        .await
+        .map_err(|error| error.to_string());
         if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
             end_read_snapshot(reader.as_mut()).await;
             return FreshTailOutcome::Skipped(SkipReason::bare(
@@ -3333,7 +3303,9 @@ async fn fresh_tail_pathless_reresolve(
             ));
         }
     }
-    let floor = registry_min_watermark_on(reader.as_mut(), model).await;
+    let floor = ann_registry::min_watermark_on(reader.as_mut(), "memory_", ANN_WILDCARD_NS, model)
+        .await
+        .map_err(|e| e.to_string());
     let outcome = match floor {
         Ok(floor)
             if floor
@@ -3476,7 +3448,15 @@ async fn fresh_tail_reresolve(
             );
         }
         if let Some(consumer) = consumer {
-            let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+            let own = ann_registry::read_watermark_on(
+                reader.as_mut(),
+                "note_search_ann_consumer_snapshot",
+                consumer,
+                ANN_WILDCARD_NS,
+                model,
+            )
+            .await
+            .map_err(|error| error.to_string());
             if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
                 end_read_snapshot(reader.as_mut()).await;
                 return FreshTailOutcome::Skipped(SkipReason::bare(
@@ -3485,7 +3465,15 @@ async fn fresh_tail_reresolve(
             }
         }
 
-        let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
+        let registry_min = match ann_registry::min_watermark_on(
+            reader.as_mut(),
+            "memory_",
+            ANN_WILDCARD_NS,
+            model,
+        )
+        .await
+        .map_err(|e| e.to_string())
+        {
             Ok(v) => v.and_then(|value| u64::try_from(value).ok()),
             Err(e) => {
                 end_read_snapshot(reader.as_mut()).await;

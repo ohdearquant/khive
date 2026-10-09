@@ -3129,18 +3129,16 @@ pub async fn migrate_configured_storage_topology(
 }
 
 async fn read_applied_schema_version(sql: &dyn khive_storage::SqlAccess) -> anyhow::Result<u32> {
-    use khive_storage::types::{SqlStatement, SqlValue};
+    use khive_storage::types::SqlValue;
 
     let mut reader = sql
         .reader()
         .await
         .map_err(|error| anyhow::anyhow!("open schema-version reader: {error}"))?;
     let value = reader
-        .query_scalar(SqlStatement {
-            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
-            params: vec![],
-            label: Some("read_applied_schema_version".into()),
-        })
+        .query_scalar(
+            khive_db::migrations::schema_version_probe().labelled("read_applied_schema_version"),
+        )
         .await
         .map_err(|error| anyhow::anyhow!("read applied schema version: {error}"))?;
     match value {
@@ -3938,6 +3936,9 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
 
+    for (pack, policy) in &khive_cfg.packs {
+        builder.with_disabled_verbs(pack, &policy.verbs_disabled);
+    }
     khive_mounts::register_mounts(&default_runtime, &mut builder).await?;
 
     let registry = builder
@@ -4346,7 +4347,7 @@ async fn build_server_from_prepared(
                 .then(|| runtime.clone()),
         );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        let server = KhiveMcpServer::new_with_mounts(runtime)
+        let server = KhiveMcpServer::new_with_mounts_and_config(runtime, Some(&khive_cfg))
             .await
             .map(|s| s.with_default_output_format(fmt))
             .map_err(|e| anyhow::anyhow!("{e}"))?;

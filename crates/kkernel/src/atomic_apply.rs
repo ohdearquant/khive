@@ -258,7 +258,10 @@ fn atomic_preparation_pack_names(cfg: &RuntimeConfig) -> Vec<String> {
 /// set. Atomic admissibility must run before the target database is opened,
 /// but classifying `verb-refused` requires the same loaded-vs-known distinction
 /// normal dispatch gets from `VerbRegistry::has_verb`.
-fn build_atomic_preflight_registry(cfg: &RuntimeConfig) -> Result<(VerbRegistry, KhiveRuntime)> {
+fn build_atomic_preflight_registry(
+    cfg: &RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+) -> Result<(VerbRegistry, KhiveRuntime)> {
     // Pack-registry metadata has no file-backed writer; ADR-194 allows this explicit opt-out.
     let mut metadata_cfg = cfg.clone().for_metadata_registry();
     metadata_cfg.default_namespace =
@@ -269,6 +272,9 @@ fn build_atomic_preflight_registry(cfg: &RuntimeConfig) -> Result<(VerbRegistry,
     let mut builder = VerbRegistryBuilder::new();
     PackRegistry::register_packs(&pack_names, runtime.clone(), &mut builder)
         .map_err(|error| anyhow::anyhow!("build --atomic preflight registry: {error}"))?;
+    for (pack, policy) in &khive_cfg.packs {
+        builder.with_disabled_verbs(pack, &policy.verbs_disabled);
+    }
     let registry = builder
         .build()
         .context("building --atomic preflight VerbRegistry")?;
@@ -278,6 +284,7 @@ fn build_atomic_preflight_registry(cfg: &RuntimeConfig) -> Result<(VerbRegistry,
 fn classify_atomic_preflight(
     ops: &[OpsFileEntry],
     cfg: &RuntimeConfig,
+    khive_cfg: &KhiveConfig,
 ) -> Result<Vec<AtomicFailureDetail>> {
     let parsed: Vec<khive_request::ParsedOp> = ops
         .iter()
@@ -291,10 +298,24 @@ fn classify_atomic_preflight(
             .into_iter()
             .map(|rejection| (rejection.op_index, rejection))
             .collect();
-    let (registry, _runtime) = build_atomic_preflight_registry(cfg)?;
+    let (registry, _runtime) = build_atomic_preflight_registry(cfg, khive_cfg)?;
 
     let mut failures = Vec::new();
     for (op_index, op) in ops.iter().enumerate() {
+        // Deployment policy applies even to statically atomic-admissible verbs.
+        // Refuse the entire unit before opening the target or preparing writes.
+        if registry.is_verb_disabled(&op.tool) {
+            failures.push(AtomicFailureDetail {
+                op_index,
+                tool: op.tool.clone(),
+                error: format!(
+                    "op {op_index} (`{}`) cannot run under --atomic: verb is unknown or disabled",
+                    op.tool
+                ),
+                reason: Some(RefusalReason::VerbRefused),
+            });
+            continue;
+        }
         let Some(rejection) = rejections.get(&op_index) else {
             continue;
         };
@@ -350,7 +371,7 @@ pub(crate) fn preflight_atomic_ops_file(
         );
     }
 
-    let preflight_failures = classify_atomic_preflight(ops, cfg)?;
+    let preflight_failures = classify_atomic_preflight(ops, cfg, khive_cfg)?;
     if !preflight_failures.is_empty() {
         let messages: Vec<&str> = preflight_failures
             .iter()
@@ -1442,8 +1463,8 @@ mod tests {
             wal_ceiling_source: khive_runtime::WalCeilingSource::BackendField,
             ..RuntimeConfig::no_embeddings()
         };
-        let (registry, runtime) =
-            build_atomic_preflight_registry(&cfg).expect("ATOMIC_METADATA_CEILING_EXEMPTION");
+        let (registry, runtime) = build_atomic_preflight_registry(&cfg, &KhiveConfig::default())
+            .expect("ATOMIC_METADATA_CEILING_EXEMPTION");
         assert!(registry.has_verb("create"));
         assert!(!runtime.backend().is_file_backed());
         assert_eq!(
@@ -1518,8 +1539,9 @@ mod tests {
         assert!(registry.all_note_kinds().contains(&"memory"));
         assert!(!registry.has_verb("telemetry.emit"));
         assert!(registry.has_verb("gtd.transition"));
-        let (preflight, _runtime) = build_atomic_preflight_registry(runtime.config())
-            .expect("unrequested telemetry needs no declaration");
+        let (preflight, _runtime) =
+            build_atomic_preflight_registry(runtime.config(), &KhiveConfig::default())
+                .expect("unrequested telemetry needs no declaration");
         assert!(preflight.has_verb("create"));
 
         let mut configured = runtime.config().clone();
@@ -1527,13 +1549,14 @@ mod tests {
         assert!(atomic_preparation_pack_names(&configured)
             .iter()
             .any(|name| name == "telemetry"));
-        let error = build_atomic_preflight_registry(&configured)
+        let error = build_atomic_preflight_registry(&configured, &KhiveConfig::default())
             .err()
             .expect("requested telemetry requires its declared default");
         assert!(format!("{error:#}").contains("telemetry.default_carrier"));
         configured.telemetry.default_carrier = Some(khive_runtime::TelemetryCarrier::Ephemeral);
-        let (preflight, _runtime) = build_atomic_preflight_registry(&configured)
-            .expect("requested telemetry has its declared default");
+        let (preflight, _runtime) =
+            build_atomic_preflight_registry(&configured, &KhiveConfig::default())
+                .expect("requested telemetry has its declared default");
         assert!(preflight.has_verb("telemetry.emit"));
     }
 
@@ -1587,7 +1610,11 @@ mod tests {
                 tool: handler.name.into(),
                 args: json!({}),
             }];
-            assert!(!classify_atomic_preflight(&ops, &cfg).unwrap().is_empty());
+            assert!(
+                !classify_atomic_preflight(&ops, &cfg, &KhiveConfig::default())
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

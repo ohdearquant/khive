@@ -204,5 +204,9 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         ""
     };
     let disk_guard = disk_guard_policy_fingerprint(config, khive_cfg, storage_read_only);
-    format!("{base}{topology}{blob_file_transfers}{disk_guard}")
+    // Operator policy applies with implicit main as well as declared backends.
+    let disabled_verbs = khive_cfg
+        .map(disabled_verb_policy_suffix)
+        .unwrap_or_default();
+    format!("{base}{topology}{blob_file_transfers}{disk_guard}{disabled_verbs}")
 }
