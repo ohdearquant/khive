@@ -91,6 +91,7 @@ arguments!(Push {
     branch,
     expected_local,
     expected_remote,
+    force,
     session_id
 });
 arguments!(PrOpen {

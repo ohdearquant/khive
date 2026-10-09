@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `git.push` accepts the optional boolean `force` validation field and refuses
+  `true` with `force_denied` before transport. False and omission retain ordinary
+  push behavior; null and non-boolean values return `invalid_params`.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
