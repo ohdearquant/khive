@@ -42,6 +42,7 @@ members = [
     "khive-pack-exec",
     "khive-pack-git",
     "khive-pack-workspace",
+    "khive-pack-charter",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",

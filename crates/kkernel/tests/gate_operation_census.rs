@@ -22,6 +22,7 @@ fn every_production_handler_has_an_explicit_reviewed_access_class() {
         .collect();
     let mut expected_packs: BTreeSet<String> =
         RuntimeConfig::built_in_packs().into_iter().collect();
+    expected_packs.insert("charter".into());
     // These packs are linked by the executable but are not enabled by default;
     // the access census must cover their handlers as well as the shipping set.
     // Each is an optional feature, so it is expected only in a build that links it.

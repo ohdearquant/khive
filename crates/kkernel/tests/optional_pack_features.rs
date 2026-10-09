@@ -45,9 +45,13 @@ fn feature(manifest: &toml::Table, name: &str) -> Vec<String> {
 }
 
 #[test]
-fn discovered_packs_are_the_core_set_plus_the_enabled_optional_packs() {
-    // The packs every build links are the default selection, read from its declaration.
+fn discovered_packs_include_the_default_and_explicitly_selected_packs() {
     let mut expected: BTreeSet<String> = RuntimeConfig::built_in_packs().into_iter().collect();
+    assert!(
+        !expected.contains("charter"),
+        "the schema-only pack is opt-in"
+    );
+    expected.insert("charter".to_string());
     for (name, linked) in OPTIONAL_PACKS {
         if linked {
             expected.insert(name.to_string());
@@ -62,7 +66,7 @@ fn discovered_packs_are_the_core_set_plus_the_enabled_optional_packs() {
     assert_eq!(
         discovered(),
         expected,
-        "the linked packs must be the core set plus the packs whose feature is on"
+        "the linked packs must include charter and the packs whose feature is on"
     );
 }
 

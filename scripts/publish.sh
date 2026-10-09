@@ -89,6 +89,7 @@ CRATES=(
     khive-pack-knowledge
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
+    khive-pack-charter   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-template
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp

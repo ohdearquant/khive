@@ -38,6 +38,7 @@ khive-pack-telemetry = { version = "0.11.0", path = "../khive-pack-telemetry", o
 khive-pack-blob = { version = "0.11.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.11.0", path = "../khive-pack-moodboard", optional = true }
 khive-pack-workspace = { version = "0.11.0", path = "../khive-pack-workspace" }
+khive-pack-charter = { version = "0.11.0", path = "../khive-pack-charter" }
 uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }
