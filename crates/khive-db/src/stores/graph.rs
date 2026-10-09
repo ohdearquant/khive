@@ -4,6 +4,15 @@
 mod write_transaction;
 use write_transaction::run_graph_mutation_transaction;
 
+#[path = "graph/symmetric_update.rs"]
+mod symmetric_update;
+pub use symmetric_update::{
+    edge_symmetric_conflict_probe_statement, edge_symmetric_delete_noncanonical_statement,
+    edge_symmetric_update_inplace_statement, EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
+    EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL, EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+    EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -13,7 +22,10 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
-use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
+use khive_storage::graph::{
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    SymmetricEdgeUpdateRequest,
+};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
@@ -552,137 +564,6 @@ pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
         sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1".to_string(),
         params: vec![SqlValue::Text(node_id.to_string())],
         label: Some("edge-purge-incident".to_string()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Symmetric-relation update DML (ADR-099 B3 r6 second pass) — the SQL text
-// `khive-runtime::operations::KhiveRuntime::update_edge_symmetric_dml` (the
-// synchronous raw-connection commit-time path, run inside the writer-task/
-// pool-mutex transaction) and ADR-099's atomic `prepare_update_edge` symmetric
-// branch (the async plan-time path) both bind. `upsert_edge` cannot be used
-// here: it resolves `ON CONFLICT(namespace, id)` first and cannot detect a
-// natural-key collision at (namespace, source_id, target_id, relation) with a
-// *different* id, which is exactly the case a symmetric-relation endpoint
-// canonicalization can produce.
-//
-// The two call sites bind these against different parameter-passing
-// mechanisms — `conn.execute`/`conn.query_row` with `rusqlite::params!` in the
-// synchronous path (it must run inside an existing transaction on a borrowed
-// `&rusqlite::Connection`, so it cannot go through the `SqlStatement`/
-// `SqlValue` plan-shape khive-storage abstracts elsewhere) vs. `SqlValue`
-// plan params for the async `PlanStatement` path — but the SQL TEXT itself
-// (the `EDGE_SYMMETRIC_*_SQL` constants below) is the single source of truth
-// for both, closing the class of drift that produced a hand-copied SQL
-// literal silently diverging from canonical (ADR-099 §B3).
-pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges \
-     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-     AND relation = ?4 AND id != ?5";
-
-pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
-    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
-
-/// Canonical `update_edge`'s guarded variant of
-/// [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`]: `?3`/`?4` pin the fetched
-/// snapshot's `updated_at`/`deleted_at` so a writer whose edge changed
-/// concurrently after it read that snapshot cannot delete the row out from
-/// under the concurrent write, even though a canonical survivor genuinely
-/// exists at the natural key. Zero affected rows means stale, not
-/// "no conflict" — the caller has already confirmed a conflicting canonical
-/// row exists before running this statement. Deliberately a DIFFERENT
-/// constant from the unguarded one above: merge's predicate-based rewrites
-/// (`khive-runtime::curation`) intentionally keep running the unguarded form
-/// inside their own single writer transaction and must not be changed to
-/// bind this one.
-pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL: &str =
-    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2 \
-     AND updated_at = ?3 AND deleted_at IS ?4";
-
-/// Case (a) update, guarded on the fetched snapshot's revision and deletion
-/// marker: `?9`/`?10` pin `updated_at`/`deleted_at` as read, and `?5 >
-/// updated_at` requires the replacement revision to strictly advance —
-/// mirroring `edge_replace_if_unchanged_statement`'s guard so the symmetric
-/// path cannot silently overwrite a concurrent writer's change between the
-/// snapshot read and this write.
-pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
-     source_id = ?1, target_id = ?2, relation = ?3, \
-     weight = ?4, updated_at = ?5, metadata = ?6 \
-     WHERE namespace = ?7 AND id = ?8 \
-       AND updated_at = ?9 AND deleted_at IS ?10 \
-       AND ?5 > updated_at";
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] — the
-/// async prepare-time conflict probe.
-pub fn edge_symmetric_conflict_probe_statement(
-    namespace: &str,
-    canon_src: Uuid,
-    canon_tgt: Uuid,
-    relation: EdgeRelation,
-    exclude_id: Uuid,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_CONFLICT_PROBE_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(canon_src.to_string()),
-            SqlValue::Text(canon_tgt.to_string()),
-            SqlValue::Text(relation.to_string()),
-            SqlValue::Text(exclude_id.to_string()),
-        ],
-        label: Some("edge-symmetric-conflict-probe".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`] —
-/// case (b): a canonical row already exists, delete the requested row.
-pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(id.to_string()),
-        ],
-        label: Some("edge-symmetric-delete-noncanonical".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`] —
-/// case (a): no conflict, update the requested row in place, guarded on the
-/// fetched snapshot's revision and deletion marker.
-#[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_update_inplace_statement(
-    namespace: &str,
-    id: Uuid,
-    canon_src: Uuid,
-    canon_tgt: Uuid,
-    relation: EdgeRelation,
-    weight: f64,
-    updated_at_micros: i64,
-    metadata: Option<&str>,
-    expected_updated_at_micros: i64,
-    expected_deleted_at_micros: Option<i64>,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_UPDATE_INPLACE_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(canon_src.to_string()),
-            SqlValue::Text(canon_tgt.to_string()),
-            SqlValue::Text(relation.to_string()),
-            SqlValue::Float(weight),
-            SqlValue::Integer(updated_at_micros),
-            match metadata {
-                Some(m) => SqlValue::Text(m.to_string()),
-                None => SqlValue::Null,
-            },
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(id.to_string()),
-            SqlValue::Integer(expected_updated_at_micros),
-            match expected_deleted_at_micros {
-                Some(value) => SqlValue::Integer(value),
-                None => SqlValue::Null,
-            },
-        ],
-        label: Some("edge-symmetric-update-inplace".to_string()),
     }
 }
 
@@ -2471,6 +2352,13 @@ impl SqlGraphStore {
 
 #[async_trait]
 impl GraphStore for SqlGraphStore {
+    async fn update_symmetric_edge_if_unchanged(
+        &self,
+        request: SymmetricEdgeUpdateRequest,
+    ) -> StorageResult<SymmetricEdgeUpdateOutcome> {
+        self.update_symmetric_edge(request).await
+    }
+
     async fn latest_annotating_note(
         &self,
         node_id: Uuid,
