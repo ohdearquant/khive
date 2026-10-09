@@ -1223,7 +1223,7 @@ lifecycle diagnostics.
 The mode travels on the daemon's command line. `mcp --daemon` gains `--lifetime <demand|persistent>`;
 when the flag is absent the mode is persistent, so an explicit invocation and every supervisor
 configuration written before this amendment keep today's behavior. Automatic spawn has a single
-construction point, the argument builder in `crates/khive-mcp/src/daemon.rs` that both CLI and MCP
+construction point, the argument builder in `crates/khive-mcp/src/daemon/launch.rs` that both CLI and MCP
 forwarding reach, and that builder passes `--lifetime demand`; the bounded-takeover replacement
 spawns through the same builder when it is implemented. The mode is not read from the environment:
 a spawned daemon inherits its caller's environment, so a variable set for one client would silently
