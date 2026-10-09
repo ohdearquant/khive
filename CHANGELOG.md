@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Propose the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
+  reports and statistics, and guarded fix receipts. The amendment awaits maintainer
+  acceptance; the verb remains unimplemented.
+
 ### Fixed
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
