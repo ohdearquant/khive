@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
+  `RuntimeError::Storage`, retaining typed driver sources and the existing capacity,
+  retry, and writer-settlement wire codes. Callers matching the removed variant
+  should inspect `StorageError` instead. Typed policy reasons now report `Storage`,
+  rendered backend messages use the storage envelope, and direct writer-checkout
+  failures carry `sql`/`runtime` capability/operation context instead of nulls.
+
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
