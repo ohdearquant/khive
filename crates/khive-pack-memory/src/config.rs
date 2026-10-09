@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use khive_fusion::FusionStrategy;
 use khive_runtime::RuntimeError;
-use khive_storage::types::{TextGatherMode, TextSearchOptions};
+use khive_storage::types::TextSearchOptions;
 
 /// Error returned when `min_score` is outside the accepted dual-scale range.
 #[derive(Debug, Clone)]
@@ -141,25 +141,8 @@ pub enum RecallFtsSelectionRule {
     HighestIdf,
 }
 
-/// Pack-level alias for the DB gather mode enum, serializable identically.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RecallFtsGatherMode {
-    #[default]
-    Ranked,
-    Unranked,
-    RankWithinCap,
-}
-
-impl From<RecallFtsGatherMode> for TextGatherMode {
-    fn from(m: RecallFtsGatherMode) -> Self {
-        match m {
-            RecallFtsGatherMode::Ranked => TextGatherMode::Ranked,
-            RecallFtsGatherMode::Unranked => TextGatherMode::Unranked,
-            RecallFtsGatherMode::RankWithinCap => TextGatherMode::RankWithinCap,
-        }
-    }
-}
+/// Public recall path for the canonical storage gather mode, including variant imports.
+pub use khive_storage::types::TextGatherMode as RecallFtsGatherMode;
 
 /// Configuration for the FTS candidate-gather optimization (default: disabled, existing behavior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,7 +341,7 @@ impl RecallFtsGatherConfig {
     ) -> Result<TextSearchOptions, RuntimeError> {
         let gather_limit = self.effective_gather_limit(candidate_limit)?;
         Ok(TextSearchOptions {
-            gather_mode: self.gather_mode.into(),
+            gather_mode: self.gather_mode,
             gather_limit: Some(gather_limit),
         })
     }
@@ -1053,19 +1036,76 @@ mod tests {
     }
 
     #[test]
-    fn fts_gather_from_into_gather_mode() {
+    fn fts_gather_config_wire_modes_preserve_search_options() {
+        use khive_storage::types::TextGatherMode;
+        use RecallFtsGatherMode::*;
+
+        for (wire, mode) in [
+            ("ranked", Ranked),
+            ("unranked", Unranked),
+            ("rank_within_cap", RankWithinCap),
+        ] {
+            let mut cfg: RecallFtsGatherConfig = serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "gather_mode": wire,
+            }))
+            .unwrap();
+            cfg.validate().unwrap();
+            let canonical: TextGatherMode = cfg.gather_mode;
+            assert_eq!(canonical, mode);
+            assert_eq!(
+                cfg.to_search_options(150).unwrap(),
+                TextSearchOptions {
+                    gather_mode: canonical,
+                    gather_limit: Some(600),
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(&cfg).unwrap(),
+                serde_json::json!({
+                    "enabled": true,
+                    "term_k": 10,
+                    "selection_rule": "original",
+                    "gather_mode": wire,
+                    "gather_limit": null,
+                    "gather_cap_multiplier": 4,
+                    "cjk_bypass_ranked": true,
+                })
+            );
+
+            cfg.gather_limit = Some(300);
+            assert_eq!(cfg.to_search_options(150).unwrap().gather_limit, Some(300));
+            assert!(matches!(
+                cfg.to_search_options(301),
+                Err(RuntimeError::InvalidInput(message))
+                    if message == "fts_gather.gather_limit (300) must be >= candidate_limit (301)"
+            ));
+        }
+
+        let defaults: RecallFtsGatherConfig = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.enabled);
         assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::Ranked),
-            TextGatherMode::Ranked
+            defaults.to_search_options(150).unwrap(),
+            TextSearchOptions {
+                gather_mode: Ranked,
+                gather_limit: Some(600),
+            }
         );
-        assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::Unranked),
-            TextGatherMode::Unranked
-        );
-        assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::RankWithinCap),
-            TextGatherMode::RankWithinCap
-        );
+        for invalid in [
+            serde_json::json!("Ranked"),
+            serde_json::json!("rank_subset"),
+            serde_json::json!("unknown"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<RecallFtsGatherConfig>(serde_json::json!({
+                    "gather_mode": invalid,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
