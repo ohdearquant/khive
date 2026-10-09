@@ -161,10 +161,9 @@ fleet_readers = []
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 #
-# The [[engines]] array registers the embedding models available at runtime.
-# When [[engines]] entries are present they are authoritative: each engine's
-# `model` sets the embedding model used for entity indexing and retrieval. When
-# no [[engines]] block is configured — whether or not a config file is loaded —
+# The [[engines]] array declares peers in participation order. Built-in aliases
+# resolve to their canonical provider and existing index names. When
+# no engine list is configured — whether or not a config file is loaded —
 # khive falls back to the legacy two-tier env pair (KHIVE_EMBEDDING_MODEL +
 # KHIVE_ADDITIONAL_EMBEDDING_MODELS; see the env reference at the end), and to
 # the built-in default models when those env vars are unset.
@@ -174,42 +173,35 @@ fleet_readers = []
 # block is configured, no warning is logged — the env vars (or built-in
 # defaults) simply apply, as described above.
 
-# Exactly one [[engines]] entry must set `default = true`.
-# That engine becomes the primary embedding model used for entity indexing
-# and single-model retrieval paths.
+# The first peer is used by single-engine compatibility APIs. An explicit
+# top-level engines = [] disables vector participation; omission keeps fallback.
+# Custom names parse, but startup binding to host providers is not available yet.
 
 [[engines]]
-name = "default"
-model = "all-minilm-l6-v2"
-default = true
-# fusion_weight is reserved for future per-engine fusion. Setting it currently
-# fails config load because retrieval would otherwise ignore the value.
-# dims is optional — for documentation only. The actual dimension is derived
-# from the model via EmbeddingModel::dimensions(). A mismatch produces a
-# warning, not an error.
-# dims = 384
+name = "all-minilm-l6-v2"
+weight = 1.0
+# Optional positive dimensionality assertion; mismatch fails startup.
+dims = 384
 
 [[engines]]
-name = "paraphrase"
-model = "paraphrase-multilingual-minilm-l12-v2"
+name = "paraphrase-multilingual-minilm-l12-v2"
 # dims = 384
 
 # Additional examples (uncomment to activate):
 
 # [[engines]]
-# name = "bge-small"
-# model = "bge-small-en-v1.5"
+# name = "bge-small-en-v1.5"
 
 # [[engines]]
-# name = "bge-base"
-# model = "bge-base-en-v1.5"
+# name = "bge-base-en-v1.5"
 
-# ── Notes on fusion_weight ─────────────────────────────────────────────────────
+# ── Weights and legacy input ───────────────────────────────────────────────────
 #
-# ADR-031 specifies per-engine weighted RRF as a future integration target.
-# Current RuntimeConfig retains only engine models, and retrieval does not read
-# EngineConfig.fusion_weight. KhiveConfig::load rejects any explicit value so
-# an operator cannot mistake a validated but ignored setting for active tuning.
+# Weight defaults to 1.0 and must be finite and strictly positive. Values other
+# than 1.0 remain refused until every activated retrieval path applies them.
+# Legacy model/default/fusion_weight lists migrate as a whole: the single old
+# default moves first, canonical model identities replace decorative names,
+# and remaining order is retained. Mixed legacy/canonical entries are errors.
 
 # ── [[backends]] — named storage backends (ADR-028) ──────────────────────────────
 #

@@ -936,8 +936,7 @@ fn resolve_db_command_context(
     // Schema administration never needs to instantiate an embedding model or
     // register packs. Blob hydration remains configured because verified V20
     // moodboard evidence may be part of the cutover.
-    base_config.embedding_model = None;
-    base_config.additional_embedding_models.clear();
+    base_config.disable_embedding_models();
     base_config.packs.clear();
 
     Ok(DbCommandContext {

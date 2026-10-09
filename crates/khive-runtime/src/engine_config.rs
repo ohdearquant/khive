@@ -11,13 +11,15 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
-    config::{parse_embedding_model_alias, BackendId},
-    presentation::OutputFormat,
-};
+use crate::{config::BackendId, presentation::OutputFormat};
 
 #[path = "engine_config_backend_disk_guard.rs"]
 mod backend_disk_guard;
+
+#[path = "engine_config_peers.rs"]
+mod peers;
+pub use peers::EngineConfig;
+pub(crate) use peers::{canonical_engine_name, validate_peer_engines};
 
 // ---- Error type ----
 
@@ -59,6 +61,40 @@ pub enum ConfigError {
          remove it until weighted multi-engine fusion is wired"
     )]
     UnsupportedFusionWeight { name: String },
+
+    #[error("engine name must not be empty: {name:?}")]
+    InvalidEngineName { name: String },
+
+    #[error("engine {name:?} collides with another engine after alias canonicalization to {canonical:?}; remove the duplicate declaration")]
+    AliasCollision { name: String, canonical: String },
+
+    #[error("engine {name:?}: weight must be finite and strictly positive, got {value}")]
+    InvalidEngineWeight { name: String, value: f64 },
+
+    #[error("engine {name:?}: non-unit weight is refused until configured weights reach every activated retrieval path")]
+    UnsupportedEngineWeight { name: String },
+
+    #[error("engine {name:?}: dims must be positive and at most 4294967295, got {value}")]
+    InvalidEngineDimensions { name: String, value: i64 },
+
+    #[error(
+        "engine {name:?}: configured dims {expected} do not match provider dimensions {actual}"
+    )]
+    EngineDimensionMismatch {
+        name: String,
+        expected: i64,
+        actual: usize,
+    },
+
+    #[error("engine {name:?}: cannot mix legacy model/default/fusion_weight entries with canonical name/weight entries")]
+    EngineKeyConflict { name: String },
+
+    #[error("engines {name:?} and {other:?} share the storage key {key:?}; distinct engine identities require distinct bindings")]
+    EngineKeyCollision {
+        name: String,
+        other: String,
+        key: String,
+    },
 
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
@@ -221,40 +257,6 @@ impl ConfigError {
 }
 
 // ---- Config structs ----
-
-/// Configuration for a single embedding engine.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EngineConfig {
-    /// Logical name used to reference this engine in logs and fusion.
-    pub name: String,
-
-    /// Lattice-embed model name (e.g. `"all-minilm-l6-v2"`).
-    ///
-    /// Must be parseable via `lattice_embed::EmbeddingModel::from_str` (or a
-    /// recognised short alias handled by `parse_embedding_model_alias`).
-    pub model: String,
-
-    /// When `true`, this engine's model becomes the primary (`RuntimeConfig::embedding_model`).
-    /// Exactly one engine in the list must set this. If absent, defaults to `false`.
-    #[serde(default)]
-    pub default: bool,
-
-    /// Reserved RRF fusion weight for future weighted multi-engine fusion.
-    ///
-    /// Current retrieval does not consume this field. Config loading rejects
-    /// any explicit value rather than silently treating it as applied. Leave
-    /// it unset until per-engine weighted fusion is implemented. The loader
-    /// still distinguishes invalid (non-finite or non-positive) values from
-    /// valid but unsupported ones.
-    pub fusion_weight: Option<f64>,
-
-    /// Expected output dimensionality (optional sanity check).
-    ///
-    /// Not used at runtime — dimensions are authoritative from
-    /// `EmbeddingModel::dimensions()`. Present so operators can document the
-    /// expected shape alongside the model name.
-    pub dims: Option<u32>,
-}
 
 /// Actor configuration — the default namespace / identity for this khive instance.
 ///
@@ -1331,6 +1333,12 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
 
+    /// Distinguishes a file's explicit `engines = []` from an omitted engine list.
+    /// Use [`Self::load`] for file input; direct deserialization does not track
+    /// presence or perform legacy engine conversion.
+    #[serde(skip)]
+    pub engines_declared: bool,
+
     /// Default actor identity for this khive instance.
     ///
     /// When present, `actor.id` feeds configuration identity and gate/attribution
@@ -1498,14 +1506,25 @@ impl KhiveConfig {
         let diagnostic_path = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         let raw = std::fs::read_to_string(&resolved)
             .map_err(|source| ConfigError::from(source).in_file(&diagnostic_path))?;
-        let mut cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let mut document: toml::Value =
+            toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+                path: diagnostic_path.clone(),
+                source,
+            })?;
+        let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
+            .map_err(|error| error.in_file(&diagnostic_path))?;
+        let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
+        cfg.engines_declared = engines_declared;
         crate::credentials::read_tables(&raw, &mut cfg)
             .map_err(|error| ConfigError::from(error).in_file(&diagnostic_path))?;
         cfg.validate()
             .map_err(|error| error.in_file(&diagnostic_path))?;
+        for engine in &mut cfg.engines {
+            engine.name = canonical_engine_name(&engine.name);
+        }
         Ok(Some(cfg))
     }
 
@@ -1682,11 +1701,8 @@ impl KhiveConfig {
     /// Validate the parsed config for logical consistency.
     ///
     /// Checks:
-    /// - Exactly one engine has `default = true` (when the list is non-empty).
-    /// - Engine names are unique.
-    /// - Every engine model is recognized by the runtime's alias parser.
-    /// - `fusion_weight`, when present, is finite and `> 0`, then rejected as
-    ///   unsupported until the retrieval path actually consumes it.
+    /// Engine names and storage keys are unique; dimensions and weights are
+    /// positive. Non-unit weights remain refused until retrieval applies them.
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
@@ -1997,60 +2013,12 @@ impl KhiveConfig {
             }
         }
 
-        if self.engines.is_empty() {
-            return Ok(());
-        }
-
-        let mut seen_names = std::collections::HashSet::new();
-        for engine in &self.engines {
-            if !seen_names.insert(engine.name.clone()) {
-                return Err(ConfigError::DuplicateName {
-                    name: engine.name.clone(),
-                });
-            }
-            if parse_embedding_model_alias(&engine.model).is_none() {
-                return Err(ConfigError::UnknownModel {
-                    name: engine.name.clone(),
-                    model: engine.model.clone(),
-                });
-            }
-        }
-
-        let default_count = self.engines.iter().filter(|e| e.default).count();
-        if default_count != 1 {
-            return Err(ConfigError::DefaultCount {
-                found: default_count,
-            });
-        }
-
-        // Reject non-finite fusion_weight explicitly: NaN doesn't satisfy `w <= 0.0`
-        // and +inf is unbounded, so neither is caught by the range check alone.
-        for engine in &self.engines {
-            if let Some(w) = engine.fusion_weight {
-                if !w.is_finite() || w <= 0.0 {
-                    return Err(ConfigError::InvalidFusionWeight {
-                        name: engine.name.clone(),
-                        value: w,
-                    });
-                }
-            }
-        }
-        if let Some(engine) = self
-            .engines
-            .iter()
-            .find(|engine| engine.fusion_weight.is_some())
-        {
-            return Err(ConfigError::UnsupportedFusionWeight {
-                name: engine.name.clone(),
-            });
-        }
-
-        Ok(())
+        validate_peer_engines(&self.engines)
     }
 
-    /// Return the engine flagged `default = true`, or `None` if the list is empty.
+    /// First peer used by single-engine compatibility APIs, if any.
     pub fn default_engine(&self) -> Option<&EngineConfig> {
-        self.engines.iter().find(|e| e.default)
+        self.engines.first()
     }
 }
 
@@ -2061,8 +2029,8 @@ impl KhiveConfig {
 /// Used when no config file is present. Emits `tracing::info!` directing
 /// operators to migrate to `~/.khive/config.toml`.
 ///
-/// The primary model (`KHIVE_EMBEDDING_MODEL`) becomes the `default = true`
-/// engine; additional models become non-default secondary engines. When only
+/// The primary model (`KHIVE_EMBEDDING_MODEL`) becomes the first peer;
+/// additional models follow in their existing order. When only
 /// `KHIVE_ADDITIONAL_EMBEDDING_MODELS` is set, the built-in default model is
 /// synthesized as the primary — the additional list is additive, never a
 /// replacement for the primary (khive#1221; matches `RuntimeConfig::default()`,
@@ -2097,24 +2065,17 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
 
     let primary =
         primary_model.unwrap_or_else(|| lattice_embed::EmbeddingModel::AllMiniLmL6V2.to_string());
-    engines.push(EngineConfig {
-        name: "default".to_string(),
-        model: primary.clone(),
-        default: true,
-        fusion_weight: None,
-        dims: None,
-    });
-
-    for (i, model) in additional.into_iter().enumerate() {
-        // The additional list restating the primary is a no-op, not a second engine.
-        if model.eq_ignore_ascii_case(&primary) {
+    for model in std::iter::once(primary).chain(additional) {
+        let name = canonical_engine_name(&model);
+        if engines
+            .iter()
+            .any(|engine: &EngineConfig| engine.name == name)
+        {
             continue;
         }
         engines.push(EngineConfig {
-            name: format!("engine-{}", i + 1),
-            model,
-            default: false,
-            fusion_weight: None,
+            name,
+            weight: 1.0,
             dims: None,
         });
     }

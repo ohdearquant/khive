@@ -21,8 +21,7 @@ async fn fixture() -> VerbRegistry {
     config.disk_guard_environment = Default::default();
     config.disk_guard_config = None;
     config.volume_lock_dir = None;
-    config.embedding_model = None;
-    config.additional_embedding_models.clear();
+    config.disable_embedding_models();
     config.credentials.clear();
     config.visibility_receipts = None;
     config.mounts.clear();
