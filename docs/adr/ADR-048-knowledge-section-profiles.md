@@ -6,9 +6,9 @@
 
 ## Amendment (2026-10-09): graph lint contract (#4813)
 
-**Status: Proposed (2026-10-09).** The parent ADR remains accepted; this new
-amendment awaits maintainer acceptance and does not claim implementation
-acceptance. The proposed public contract is specified in the revised
+**Status: Accepted (2026-10-09).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates. The public
+contract is specified in the revised
 [section 9](#9-kg-lint--configurable-graph-hygiene-rules-deferred).
 
 This amendment specifies all thirteen built-in `knowledge.lint` rules, the
@@ -17,9 +17,8 @@ families with honest partial outcomes. It corrects `missing-entity-type` to use
 the canonical entity column. Custom `knowledge.lint_config` rules and the broader
 graph export remain deferred; shipped namespace corpus export is unchanged.
 
-Publish and review this amendment before dependent code PRs. Source preparation
-is allowed now; code PRs follow maintainer acceptance of this amendment, and
-dependent code cannot merge before that acceptance. Register the verb only after its complete implementation is integrated.
+Dependent code PRs follow this accepted text. Register the verb only after its
+complete implementation is integrated.
 
 ## Amendment (2026-10-04): eight section types
 
@@ -947,7 +946,7 @@ The graph needs a linting system analogous to `clippy` for Rust or `eslint` for
 JavaScript. Static rules catch structural problems; configurable rules encode
 project-specific conventions. The output is machine-readable and actionable.
 
-The [proposed 2026-10-09 amendment](#amendment-2026-10-09-graph-lint-contract-4813)
+The [2026-10-09 amendment](#amendment-2026-10-09-graph-lint-contract-4813)
 specifies the thirteen built-in rules, statistics, and three guarded fix families
 for #4813 below. `knowledge.lint` is still unimplemented. Custom rules and
 `knowledge.lint_config` remain a separate deferred scope.
@@ -1243,9 +1242,7 @@ transports must preserve the typed detail through the canonical projector.
 
 #### Implementation and acceptance sequence
 
-The amendment docs PR precedes dependent code PRs and references #4813. Source
-preparation may proceed while this text is Proposed; code PRs follow maintainer
-acceptance, and no dependent implementation merges before that acceptance. Registration
+Dependent code PRs reference #4813 and follow this accepted text. Registration
 is the last implementation step, after the full inspection, thirteen-rule report,
 statistics, guarded fixes, and error projection are integrated. No read-only
 subset or helper alone completes #4813.

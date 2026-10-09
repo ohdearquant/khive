@@ -9,9 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- Propose the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
-  reports and statistics, and guarded fix receipts. The amendment awaits maintainer
-  acceptance; the verb remains unimplemented.
+- Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
+  reports and statistics, and guarded fix receipts. The verb remains unimplemented.
 
 ### Fixed
 
