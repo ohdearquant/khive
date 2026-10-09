@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
+  caller filters, explicit depth and entry caps, and optional within-root symlink following.
+  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
