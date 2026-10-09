@@ -91,6 +91,7 @@ impl KhiveRuntime {
                     .await
             }
             FusionStrategy::Rrf { .. }
+            | FusionStrategy::WeightedRrf { .. }
             | FusionStrategy::Weighted { .. }
             | FusionStrategy::Union
             | FusionStrategy::Custom { .. } => {
@@ -190,7 +191,7 @@ impl KhiveRuntime {
         limit: usize,
     ) -> RuntimeResult<(RankScoreKind, Vec<RankedHit>)> {
         let rank_score_kind = match strategy {
-            FusionStrategy::Rrf { .. } => RankScoreKind::Rrf,
+            FusionStrategy::Rrf { .. } | FusionStrategy::WeightedRrf { .. } => RankScoreKind::Rrf,
             FusionStrategy::VectorOnly => RankScoreKind::Vector,
             FusionStrategy::KeywordOnly => RankScoreKind::Keyword,
             FusionStrategy::Weighted { .. } => RankScoreKind::Weighted,
@@ -223,8 +224,8 @@ fn merge_metadata(
         Entry::Occupied(mut entry) => {
             let existing = entry.get_mut();
             existing.source = merge_sources(existing.source, hit.source);
-            // RRF and pass-through retain the first occurrence; weighted and
-            // union use the maximum contribution from each retrieval leg.
+            // Rank fusion and pass-through retain the first occurrence; linear
+            // weighted fusion and union use the maximum signal from each leg.
             existing.signals.vector_similarity = if prefer_maximum_signal {
                 existing
                     .signals
@@ -782,6 +783,19 @@ mod tests {
             );
             assert_eq!(hits[0].title.as_deref(), Some("first"));
         }
+    }
+
+    #[tokio::test]
+    async fn weighted_rrf_fusion_reports_the_rrf_kind() {
+        let rt = evidence_runtime();
+        let id = Uuid::from_u128(1);
+        let strategy = FusionStrategy::weighted_rrf(60, vec![1.0, 1.0]);
+        let hits = rt
+            .fuse_with_strategy(vec![text_hit(id, 0.75, "candidate")], vec![], &strategy, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rank_score_kind, RankScoreKind::Rrf);
     }
 
     #[tokio::test]

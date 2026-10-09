@@ -80,6 +80,10 @@ pub trait Reranker<Id: Send + Sync + 'static>: Send + Sync {
 /// arm is represented by an empty slot; any other source count falls back to
 /// RRF to prevent silent positional rebinding. Use
 /// [`fuse_search_results_checked`] if you need an explicit error instead.
+///
+/// `WeightedRrf` never degrades to another strategy here: when its parameters,
+/// weight count, or score range are invalid, this helper returns no results.
+/// Use [`fuse_search_results_checked`] to receive the error.
 pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     config: &HybridConfig,
@@ -103,9 +107,13 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
         other => other.clone(),
     };
 
-    // Fuse results — strategy is guaranteed non-Custom after the match above.
-    let mut fused =
-        fuse(sources, &strategy, config.top_k).expect("non-Custom strategies are infallible");
+    // Fuse results — only WeightedRrf can fail after the match above, and it fails closed with
+    // no results rather than substituting different weights or another strategy.
+    let mut fused = if matches!(&strategy, FusionStrategy::WeightedRrf { .. }) {
+        fuse(sources, &strategy, config.top_k).unwrap_or_default()
+    } else {
+        fuse(sources, &strategy, config.top_k).expect("non-Custom strategies are infallible")
+    };
 
     // Apply minimum score filter
     if let Some(min_score) = config.min_score {
@@ -115,8 +123,8 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     fused
 }
 
-/// Like [`fuse_search_results`] but returns `Err` when `Weighted` fusion is
-/// configured without exactly two vector/text source slots.
+/// Like [`fuse_search_results`] but returns `Err` for invalid weighted source
+/// shapes, weighted-RRF parameters, or weighted-RRF score overflow.
 ///
 /// Use this in code paths that should not silently fall back to RRF.
 pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
@@ -134,6 +142,14 @@ pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
                 "Weighted fusion requires exactly 2 sources, got {}",
                 sources.len()
             )));
+        }
+        FusionStrategy::WeightedRrf { .. } => {
+            let mut fused = fuse(sources, &config.fusion_strategy, config.top_k)
+                .map_err(|error| crate::error::RetrievalError::Fusion(error.to_string()))?;
+            if let Some(min_score) = config.min_score {
+                fused.retain(|(_, score)| *score >= min_score);
+            }
+            return Ok(fused);
         }
         _ => {}
     }
@@ -297,5 +313,69 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "keyword");
         assert!((result[0].1.to_f64() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_rrf_rejects_wrong_count_for_empty_arms() {
+        let strategy = FusionStrategy::try_weighted_rrf(10, vec![1.0]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(strategy);
+
+        let result = fuse_search_results_checked(
+            vec![Vec::<(String, DeterministicScore)>::new(), Vec::new()],
+            &config,
+        );
+        assert!(
+            result.is_err(),
+            "checked fusion must reject a weight/source mismatch"
+        );
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_rrf_reports_score_overflow() {
+        let strategy = FusionStrategy::try_weighted_rrf(1, vec![f64::MAX]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(strategy);
+        let source = vec![("a".to_string(), DeterministicScore::from_f64(1.0))];
+
+        let result = fuse_search_results_checked(vec![source], &config);
+        assert!(
+            result.is_err(),
+            "checked fusion must surface deterministic-score overflow"
+        );
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_rrf_applies_weights_by_slot() {
+        let first = vec![
+            ("a".to_string(), DeterministicScore::from_f64(1.0)),
+            ("b".to_string(), DeterministicScore::from_f64(0.5)),
+        ];
+        let second = vec![
+            ("b".to_string(), DeterministicScore::from_f64(1.0)),
+            ("a".to_string(), DeterministicScore::from_f64(0.5)),
+        ];
+        let sources = vec![first, second];
+
+        let weighted = FusionStrategy::try_weighted_rrf(10, vec![1.0, 3.0]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(weighted);
+        let result = fuse_search_results_checked(sources.clone(), &config).unwrap();
+        assert_eq!(result[0].0, "b");
+
+        let swapped = FusionStrategy::try_weighted_rrf(10, vec![3.0, 1.0]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(swapped);
+        let result = fuse_search_results_checked(sources, &config).unwrap();
+        assert_eq!(result[0].0, "a");
+    }
+
+    #[test]
+    fn test_fuse_search_results_weighted_rrf_never_falls_back_to_rrf() {
+        let source = vec![("a".to_string(), DeterministicScore::from_f64(1.0))];
+
+        let overflow = FusionStrategy::try_weighted_rrf(1, vec![f64::MAX]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(overflow);
+        assert!(fuse_search_results(vec![source.clone()], &config).is_empty());
+
+        let mismatch = FusionStrategy::try_weighted_rrf(1, vec![1.0, 1.0]).unwrap();
+        let config = HybridConfig::new(10).with_fusion_strategy(mismatch);
+        assert!(fuse_search_results(vec![source], &config).is_empty());
     }
 }

@@ -173,7 +173,13 @@ where
                     FusionStrategy::Custom { .. } => &FusionStrategy::default(),
                     s => s,
                 };
-                fuse(sources, safe, top_k).expect("non-Custom strategies are infallible")
+                match (fuse(sources, safe, top_k), safe) {
+                    (Ok(fused), _) => fused,
+                    // WeightedRrf fails closed (no results) when its weights do not match
+                    // [primary, legacy] or a score overflows; it never degrades to another strategy.
+                    (Err(_), FusionStrategy::WeightedRrf { .. }) => Vec::new(),
+                    (Err(error), _) => panic!("non-Custom strategies are infallible: {error}"),
+                }
             }
             DualIndexStrategy::Weighted { primary_weight } => {
                 let w = if primary_weight.is_nan() {
@@ -356,6 +362,31 @@ mod tests {
         assert_eq!(merged[0].0, "b");
         // All three unique IDs should be present
         assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_both_weighted_rrf_uses_primary_then_legacy_order() {
+        let fusion = FusionStrategy::try_weighted_rrf(10, vec![1.0, 3.0]).unwrap();
+        let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Both { fusion });
+        let router = DualIndexRouter::<String>::new(config);
+
+        let primary = make_results(vec![("a", 0.9), ("b", 0.8)]);
+        let legacy = make_results(vec![("b", 0.9), ("a", 0.8)]);
+
+        let merged = router.merge_results(primary, legacy, 10);
+        assert_eq!(merged[0].0, "b");
+    }
+
+    #[test]
+    fn test_merge_both_weighted_rrf_with_wrong_weight_count_returns_no_results() {
+        let fusion = FusionStrategy::try_weighted_rrf(10, vec![1.0]).unwrap();
+        let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Both { fusion });
+        let router = DualIndexRouter::<String>::new(config);
+
+        let primary = make_results(vec![("a", 0.9)]);
+        let legacy = make_results(vec![("b", 0.9)]);
+
+        assert!(router.merge_results(primary, legacy, 10).is_empty());
     }
 
     #[test]
