@@ -6,8 +6,10 @@ and reject low-information retrieval queries.
 ## `is_identifier`
 
 Returns true only for text with no whitespace, at least one ASCII letter, and a structural boundary:
-an explicit separator, a lowercase-to-uppercase transition, or a letter/digit transition. A single
-plain letter and an all-lowercase word are not identifiers.
+an explicit separator, a lowercase-to-uppercase transition, an acronym-to-word boundary such as
+`XMLParser`, or a letter/digit transition. An acronym boundary is an uppercase letter followed by
+another uppercase letter and then a lowercase letter. Plain lowercase, titlecase, and all-uppercase
+words without a boundary are not identifiers.
 
 ## `split_identifier`
 
