@@ -50,6 +50,29 @@ store. Namespace-scoped variants
 non-empty; the store itself remains namespace-agnostic — callers pass namespace on
 each query.
 
+## Guarded note property patches
+
+`NoteStore::try_patch_note_properties` updates one live note only while its ID,
+namespace, kind and property preconditions still match. The supplied namespace is
+an explicit match predicate, not an authorization boundary. The operation merges
+up to 32 top-level property writes into the stored object and accepts up to 32
+preconditions. It preserves JSON types, unrelated properties and row identity.
+Missing properties remain distinct from explicit JSON null in absent-or-equal
+conditions. A non-object properties document does not match; SQL-NULL properties
+start from an empty object.
+
+The same statement installs or extends an optional expiry and takes the maximum
+of the existing and supplied update timestamps. Writing `next_attempt_at` also
+maintains its derived retry-deadline columns. A false result means no row matched;
+storage failures remain errors. Backends without the operation return
+`Unsupported` instead of replacing a fetched note.
+
+The SQLite implementation executes through the existing `SqlBridge` writer over
+the same pool, retaining queued admission, standalone file fallback and settlement
+behavior. Runtime's public note accessor enforces its property protections on this
+operation. Comm's duplicate-quarantine repair reaches it through a capability-gated
+runtime method that constructs only the channel-slug and original-reference patch.
+
 ## Migrations
 
 Two migration systems coexist, both defined in `migrations.rs`:

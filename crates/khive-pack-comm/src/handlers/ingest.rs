@@ -7,8 +7,8 @@ use super::{
     outbound_email_message, short_id, thread_id_query_spellings,
     verified_outbound_email_external_id, Attachment, AttachmentSubstrate, ContentRef,
     EmailMessageIdDomains, FilterOp, InboxSignal, IngestParams, KhiveRuntime, NamespaceToken,
-    NewAttachment, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlStatement,
-    SqlValue, Utc, Uuid, Value, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    NewAttachment, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlValue, Utc,
+    Uuid, Value, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
 };
 
 /// Reuse the stored thread identity for either form of duplicate detection.
@@ -49,7 +49,8 @@ fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
 #[allow(clippy::too_many_arguments)]
 async fn repair_duplicate_quarantine(
     runtime: &KhiveRuntime,
-    ns: &str,
+    capability: &khive_runtime::ChannelIngestCapability,
+    token: &NamespaceToken,
     duplicate: &Note,
     attachment: Option<&NewAttachment>,
     channel_kind: Option<&str>,
@@ -189,25 +190,19 @@ async fn repair_duplicate_quarantine(
             // acknowledging it, and install or extend retention for a
             // current-key replay or a row with no deadline. A concurrent
             // identity change cannot redirect cleanup.
-            let sql = runtime.sql();
-            let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-            let repaired = writer
-                .execute(SqlStatement {
-                    sql: khive_runtime::sql!("quarantine_duplicate_retention_repair").into(),
-                    params: vec![
-                        SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
-                        SqlValue::Text(ns.to_string()),
-                        SqlValue::Text(attachment.content_ref.to_string()),
-                        SqlValue::Text(channel_kind.to_string()),
-                        SqlValue::Text(channel_slug.to_string()),
-                        replay_deadline.map_or(SqlValue::Null, SqlValue::Integer),
-                        SqlValue::Integer(Utc::now().timestamp_micros()),
-                    ],
-                    label: Some("comm_quarantine_duplicate_retention_repair".into()),
-                })
-                .await
-                .map_err(RuntimeError::Storage)?;
-            if repaired != 1 {
+            let repaired = runtime
+                .try_repair_quarantined_note_retention(
+                    capability,
+                    token,
+                    duplicate.id,
+                    channel_kind,
+                    channel_slug,
+                    &attachment.content_ref,
+                    replay_deadline,
+                    Utc::now().timestamp_micros(),
+                )
+                .await?;
+            if !repaired {
                 return Err(RuntimeError::InvalidInput(
                     "ingest: duplicate quarantine changed during retention repair".to_string(),
                 ));
@@ -415,7 +410,8 @@ pub(crate) async fn handle_ingest(
         if let Some(duplicate) = new_page.items.first() {
             repair_duplicate_quarantine(
                 runtime,
-                ns,
+                capability,
+                token,
                 duplicate,
                 quarantine_attachment.as_ref(),
                 p.channel_kind.as_deref(),
@@ -465,7 +461,8 @@ pub(crate) async fn handle_ingest(
         if let Some(duplicate) = old_page.items.first() {
             repair_duplicate_quarantine(
                 runtime,
-                ns,
+                capability,
+                token,
                 duplicate,
                 quarantine_attachment.as_ref(),
                 p.channel_kind.as_deref(),
@@ -759,7 +756,8 @@ pub(crate) async fn handle_ingest(
             })?;
             repair_duplicate_quarantine(
                 runtime,
-                ns,
+                capability,
+                token,
                 duplicate,
                 quarantine_attachment.as_ref(),
                 p.channel_kind.as_deref(),
