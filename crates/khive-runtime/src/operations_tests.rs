@@ -1105,28 +1105,24 @@ async fn update_edge_symmetric_absorption_refuses_stale_snapshot_when_survivor_e
         "fixture premise: the survivor and the stale writer's edge must be distinct rows"
     );
 
-    // Reproduce the exact DML `update_edge` runs for the stale writer,
-    // using the snapshot it captured BEFORE the concurrent write above.
-    let pool = rt.backend().pool_arc();
-    let guard = pool.writer().expect("writer guard");
+    // Exercise the same storage capability as the runtime with its stale snapshot.
     let (canon_src, canon_tgt) = canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
-    let outcome = guard
-        .transaction(|conn| {
-            KhiveRuntime::update_edge_symmetric_dml(
-                conn,
-                "local",
-                &e_id.to_string(),
-                &canon_src.to_string(),
-                &canon_tgt.to_string(),
-                "competes_with",
-                0.9,
-                None,
-                stale_updated_at_micros,
-                stale_deleted_at_micros,
-            )
+    let outcome = rt
+        .graph(&tok)
+        .unwrap()
+        .update_symmetric_edge_if_unchanged(SymmetricEdgeUpdateRequest {
+            namespace: "local".into(),
+            id: e.id,
+            source_id: canon_src,
+            target_id: canon_tgt,
+            relation: EdgeRelation::CompetesWith,
+            weight: 0.9,
+            metadata: None,
+            expected_updated_at_micros: stale_updated_at_micros,
+            expected_deleted_at_micros: stale_deleted_at_micros,
         })
-        .expect("dml call must not error");
-    drop(guard);
+        .await
+        .expect("guarded update must not error");
     assert!(
         matches!(outcome, SymmetricEdgeUpdateOutcome::Stale),
         "a stale writer must be refused, not silently absorbed into the survivor: {outcome:?}"
