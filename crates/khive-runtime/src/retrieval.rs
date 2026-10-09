@@ -1703,7 +1703,7 @@ mod rrf_fuse_label_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
@@ -1712,64 +1712,10 @@ mod tests {
     use khive_types::namespace::Namespace;
     use lattice_embed::{EmbedError, EmbeddingModel};
 
-    /// An `EmbeddingService` that always fails — used to drive a real
-    /// vector-arm failure (as opposed to an `Unconfigured` short-circuit)
-    /// through `embed_query_for_token` without loading actual model weights.
-    struct FailingEmbeddingService;
-
-    #[async_trait::async_trait]
-    impl EmbeddingService for FailingEmbeddingService {
-        async fn embed(
-            &self,
-            _texts: &[String],
-            _model: EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, EmbedError> {
-            Err(EmbedError::ModelInitialization(
-                "injected vector-arm failure".to_string(),
-            ))
-        }
-
-        fn supports_model(&self, _model: EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "hybrid-search-test-failing-embedding"
-        }
-    }
-
-    struct FailingEmbedderProvider {
-        name: String,
-        dimensions: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl EmbedderProvider for FailingEmbedderProvider {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dimensions
-        }
-
-        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-            Ok(Arc::new(FailingEmbeddingService))
-        }
-    }
-
-    /// Swap the runtime's registered embedder for the always-failing one,
-    /// re-keyed under the same model name so `hybrid_search`'s vector leg
-    /// (which resolves the embedder by the runtime's configured model name)
-    /// picks it up. `EmbedderRegistry::register` overwrites by name and
-    /// resets the provider's build cache, so this takes effect on the next
-    /// embed call without needing a fresh runtime.
-    fn break_vector_arm(runtime: &KhiveRuntime) {
-        let model = EmbeddingModel::AllMiniLmL6V2;
-        runtime.register_embedder(FailingEmbedderProvider {
-            name: model.to_string(),
-            dimensions: model.dimensions(),
-        });
+    /// Arm a provider that changes from healthy to failing after setup so a
+    /// test can exercise an error on a provider already serving requests.
+    fn break_vector_arm(fail: &AtomicBool) {
+        fail.store(true, Ordering::SeqCst);
     }
 
     /// An `EmbeddingService` that always succeeds with a fixed vector — used
@@ -1777,6 +1723,7 @@ mod tests {
     /// weights.
     struct ConstantEmbeddingService {
         dimensions: usize,
+        fail: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -1786,6 +1733,11 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(EmbedError::ModelInitialization(
+                    "injected vector-arm failure".to_string(),
+                ));
+            }
             Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
         }
 
@@ -1801,6 +1753,7 @@ mod tests {
     struct ConstantEmbedderProvider {
         name: String,
         dimensions: usize,
+        fail: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -1816,6 +1769,7 @@ mod tests {
         async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
             Ok(Arc::new(ConstantEmbeddingService {
                 dimensions: self.dimensions,
+                fail: Arc::clone(&self.fail),
             }))
         }
     }
@@ -1823,6 +1777,10 @@ mod tests {
     /// A runtime configured with a healthy (constant, non-failing) embedder —
     /// the vector leg genuinely runs and succeeds.
     fn runtime_with_constant_embeddings() -> KhiveRuntime {
+        runtime_with_toggleable_embeddings().0
+    }
+
+    fn runtime_with_toggleable_embeddings() -> (KhiveRuntime, Arc<AtomicBool>) {
         let model = EmbeddingModel::AllMiniLmL6V2;
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -1831,11 +1789,13 @@ mod tests {
             ..RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
+        let fail = Arc::new(AtomicBool::new(false));
         runtime.register_embedder(ConstantEmbedderProvider {
             name: model.to_string(),
             dimensions: model.dimensions(),
+            fail: Arc::clone(&fail),
         });
-        runtime
+        (runtime, fail)
     }
 
     #[test]
@@ -2258,7 +2218,7 @@ mod tests {
     /// tolerance below is a real behavioral difference, not a no-op.
     #[tokio::test]
     async fn hybrid_search_still_fails_loud_on_vector_arm_error() {
-        let rt = runtime_with_constant_embeddings();
+        let (rt, fail) = runtime_with_toggleable_embeddings();
         let tok = NamespaceToken::local();
         rt.create_entity(
             &tok,
@@ -2271,7 +2231,7 @@ mod tests {
         )
         .await
         .unwrap();
-        break_vector_arm(&rt);
+        break_vector_arm(&fail);
 
         let result = rt
             .hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None)
@@ -2288,7 +2248,7 @@ mod tests {
     /// call.
     #[tokio::test]
     async fn hybrid_search_outcome_preserves_text_hits_on_vector_arm_error() {
-        let rt = runtime_with_constant_embeddings();
+        let (rt, fail) = runtime_with_toggleable_embeddings();
         let tok = NamespaceToken::local();
         rt.create_entity(
             &tok,
@@ -2301,7 +2261,7 @@ mod tests {
         )
         .await
         .unwrap();
-        break_vector_arm(&rt);
+        break_vector_arm(&fail);
 
         let outcome = rt
             .hybrid_search_outcome(&tok, "FlashAttention", 10, None, None, &[], None)
@@ -3414,10 +3374,12 @@ mod tests {
         rt.register_embedder(ConstantEmbedderProvider {
             name: primary_name.clone(),
             dimensions: primary.dimensions(),
+            fail: Arc::new(AtomicBool::new(false)),
         });
         rt.register_embedder(ConstantEmbedderProvider {
             name: secondary_name.into(),
             dimensions: 4,
+            fail: Arc::new(AtomicBool::new(false)),
         });
         rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
             kind: "message",
