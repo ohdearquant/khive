@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Session mirror enable flags now use the shared boolean parser: `on` and surrounding
+  whitespace on recognized true values enable the configured source. All four flags still
+  default to disabled; the separately default-enabled backfill flag keeps its existing parser.
+  Session maintenance uses shared typed SQL row accessors while preserving its error messages
+  and rejection of negative counts.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
