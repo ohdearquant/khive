@@ -12,9 +12,8 @@ use crate::MemoryPack;
 
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
-    recall_candidate_count, search_source_label, to_json, validate_memory_type,
-    RecallCandidateParams, RecallParams, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
-    RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
+    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
 };
 
 impl MemoryPack {
@@ -279,7 +278,7 @@ impl MemoryPack {
                 Some(json!({
                     "id": hit.entity_id.to_string(),
                     "fused_score": hit.score.to_f64(),
-                    "source": search_source_label(hit.source),
+                    "source": hit.source.as_str(),
                     "title": hit.title,
                     "snippet": hit.snippet,
                 }))

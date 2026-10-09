@@ -802,14 +802,6 @@ pub(super) fn recall_candidate_count(cfg: &RecallConfig, limit: u32) -> u32 {
         .unwrap_or_else(|| limit.saturating_mul(cfg.candidate_multiplier).max(40))
 }
 
-pub(super) fn search_source_label(source: SearchSource) -> &'static str {
-    match source {
-        SearchSource::Vector => "vector",
-        SearchSource::Text => "text",
-        SearchSource::Both => "both",
-    }
-}
-
 /// Controls whether the FTS5 `snippet(...)` function is called during text search.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
@@ -986,17 +978,9 @@ pub(super) fn fuse_candidates(
             SearchHit {
                 entity_id: id,
                 score,
-                rank_score_kind: match &cfg.fuse_strategy {
-                    FusionStrategy::Rrf { .. } | FusionStrategy::WeightedRrf { .. } => {
-                        khive_runtime::RankScoreKind::Rrf
-                    }
-                    FusionStrategy::VectorOnly => khive_runtime::RankScoreKind::Vector,
-                    FusionStrategy::KeywordOnly => khive_runtime::RankScoreKind::Keyword,
-                    FusionStrategy::Weighted { .. } => khive_runtime::RankScoreKind::Weighted,
-                    FusionStrategy::Union => khive_runtime::RankScoreKind::Union,
-                    // The retrieval helper resolves custom strategies to its RRF fallback.
-                    FusionStrategy::Custom { .. } => khive_runtime::RankScoreKind::Rrf,
-                },
+                // The retrieval helper resolves custom strategies to its RRF fallback.
+                rank_score_kind: khive_runtime::RankScoreKind::of(&cfg.fuse_strategy)
+                    .unwrap_or(khive_runtime::RankScoreKind::Rrf),
                 signals: khive_runtime::SearchSignals::default(),
                 source,
                 title,
