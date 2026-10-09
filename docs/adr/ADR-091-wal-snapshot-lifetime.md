@@ -371,6 +371,14 @@ future reader of this ADR does not re-inherit the false production claim.
 `KHIVE_READER_MAX_AGE_SECS` (default 300s) and `KHIVE_READER_MAX_OPS` (default 5000)
 config keys are retained under this narrowed scope.
 
+> **Amendment (2026-10-08): recycling now covers every pooled reader.** The narrowed
+> claim above described the pool as it stood when the correction was written. Since the
+> reader-recycling change, `return_reader` closes and replaces any pooled reader connection,
+> file-backed included, once it passes the age limit or the checkout count, and the pool
+> counts each replacement in `reader_discards`. The in-memory pool keeps its shared
+> connection and is never recycled. The two config keys keep their defaults and now govern
+> production traffic; the Config summary rows below reflect that.
+
 **Checkout-age watchdog: retained, same narrowed scope.** `oldest_checkout_age()`
 (as originally specified) is still useful for the in-memory/test pool path and for any
 future production caller of `pool.reader()`, so it is kept, but is not claimed to cover
@@ -482,8 +490,8 @@ expressed in the former, page-count, unit.
 | -------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
 | `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Background sweep: `tracing::warn!` once the shared registry's oldest entry's age exceeds this cap (any `khive_storage::tx_registry`-registered span, logging only)             | Implemented, adapted — see 2026-07-12 amendment |
 | `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Background sweep: `tracing::error!` once the same entry's age exceeds this cap (logging only — no per-statement reject or `commit()` rollback ships; see 2026-07-12 amendment) | Implemented, adapted — see 2026-07-12 amendment |
-| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)                                                                                          | Carried over, scope narrowed                    |
-| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)                                                                                     | Carried over, scope narrowed                    |
+| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (every file-backed pool; see the 2026-10-08 amendment)                                                              | Implemented, 2026-10-08 amendment               |
+| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this checkout count on return (every file-backed pool; see the 2026-10-08 amendment)                                                   | Implemented, 2026-10-08 amendment               |
 | `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only)                                                                                   | Carried over, scope narrowed                    |
 | `KHIVE_WAL_WARN_SUSTAINED_CYCLES`      | 3       | 0     | Consecutive observed ticks at/above `warn_pages` before the one-shot per-episode WARN; invalid or zero values fall back silently                                               | Implemented                                     |
 | `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                                                                                                    | Carried over                                    |

@@ -3936,6 +3936,9 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     )
     .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
 
+    for (pack, policy) in &khive_cfg.packs {
+        builder.with_disabled_verbs(pack, &policy.verbs_disabled);
+    }
     khive_mounts::register_mounts(&default_runtime, &mut builder).await?;
 
     let registry = builder
@@ -4344,7 +4347,7 @@ async fn build_server_from_prepared(
                 .then(|| runtime.clone()),
         );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        let server = KhiveMcpServer::new_with_mounts(runtime)
+        let server = KhiveMcpServer::new_with_mounts_and_config(runtime, Some(&khive_cfg))
             .await
             .map(|s| s.with_default_output_format(fmt))
             .map_err(|e| anyhow::anyhow!("{e}"))?;

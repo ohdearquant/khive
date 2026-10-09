@@ -6,10 +6,13 @@
 //! either persisted field: this decorator replaces them from the sealed
 //! [`crate::NamespaceToken`] on every append path.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use khive_storage::event::{EventPageQuery, EventPageWindow, IdempotentEventBatchResult};
+use khive_storage::event::{
+    EventGroupBy, EventPageQuery, EventPageWindow, IdempotentEventBatchResult,
+};
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageResult,
 };
@@ -107,6 +110,14 @@ impl EventStore for AttributedEventStore {
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
         self.inner.count_events(filter).await
+    }
+
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        self.inner.count_events_grouped(filter, group_by).await
     }
 
     async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {

@@ -64,6 +64,7 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
     "create",
     "get",
     "list",
+    "count",
     "stats",
     "update",
     "delete",

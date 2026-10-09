@@ -1337,6 +1337,7 @@ fn exec_config_id_matches_serve_config_id_for_multi_backend_topology() {
                 "session".to_string(),
                 PackConfig {
                     backend: "sessions".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -1466,6 +1467,7 @@ async fn build_local_fallback_server_routes_through_multi_backend_when_backends_
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -7451,3 +7453,105 @@ async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
 
 include!("exec_atomic_result_shape_tests.rs");
 include!("exec_atomic_kind_tests.rs");
+
+#[tokio::test]
+async fn disabled_atomic_mutation_refuses_whole_unit_before_prepare_or_write() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let db_file = NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_str().unwrap();
+    let server = isolated_server(db_path);
+    let created = dispatch_json(
+        &server,
+        r#"create(kind="concept", name="unchanged", skip_dedup_check=true)"#,
+    )
+    .await;
+    assert_eq!(created["results"][0]["ok"], true, "{created}");
+    let id = created["results"][0]["result"]["id"].as_str().unwrap();
+    let get = format!("get(id=\"{id}\")");
+    let before = dispatch_json(&server, &get).await["results"][0]["result"].clone();
+    let policy: KhiveConfig = toml::from_str("[packs.kg]\nverbs_disabled = ['delete']\n").unwrap();
+    let ops = vec![
+        atomic_op(
+            "update",
+            serde_json::json!({"id": id, "name": "would have changed"}),
+        ),
+        atomic_op("delete", serde_json::json!({"id": id})),
+    ];
+    let cfg = atomic_cfg(db_path);
+    let preview =
+        crate::atomic_apply::preflight_atomic_ops_file(&ops, &cfg, &policy, 10).unwrap_err();
+    assert!(
+        preview.to_string().contains("unknown or disabled"),
+        "{preview:#}"
+    );
+    let error = crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &policy, 10)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown or disabled"),
+        "{error:#}"
+    );
+    let after = dispatch_json(&server, &get).await;
+    assert_eq!(after["results"][0]["result"], before);
+    let enabled = crate::atomic_apply::execute_atomic_ops_file(
+        vec![atomic_op(
+            "update",
+            serde_json::json!({"id": id, "name": "enabled update"}),
+        )],
+        atomic_cfg(db_path),
+        &policy,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(enabled["results"][0]["ok"], true, "{enabled}");
+    let after = dispatch_json(&server, &get).await;
+    assert_eq!(after["results"][0]["result"]["name"], "enabled update");
+    // The ordinary exec fallback must use the same policy as the daemon and
+    // atomic runner, including a config with only an implicit main backend.
+    let local = build_local_fallback_server(atomic_cfg(db_path), &policy, None, None)
+        .await
+        .unwrap();
+    let refused = dispatch_json(&local, &format!("delete(id=\"{id}\")")).await;
+    assert_eq!(refused["results"][0]["ok"], false, "{refused}");
+    assert_eq!(refused["results"][0]["reason"], "verb-refused", "{refused}");
+    assert_eq!(
+        dispatch_json(&server, &get).await["results"][0]["result"],
+        after["results"][0]["result"]
+    );
+}
+
+#[tokio::test]
+async fn disabled_atomic_admissible_verbs_never_open_the_target_database() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for (pack, verb) in [
+        ("kg", "update"),
+        ("kg", "delete"),
+        ("kg", "link"),
+        ("gtd", "gtd.transition"),
+    ] {
+        let path = root.path().join(format!("{verb}.db"));
+        let mut cfg = atomic_cfg(path.to_str().unwrap());
+        cfg.packs.push("gtd".into());
+        let policy: KhiveConfig =
+            toml::from_str(&format!("[packs.{pack}]\nverbs_disabled = ['{verb}']\n")).unwrap();
+        let error = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(verb, serde_json::json!({}))],
+            cfg,
+            &policy,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown or disabled"),
+            "{error:#}"
+        );
+        assert!(!path.exists(), "disabled {verb} opened the target database");
+    }
+}

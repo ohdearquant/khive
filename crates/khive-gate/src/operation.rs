@@ -76,6 +76,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("comm.transport_status", OperationAccess::Read),
     ("comm.unread", OperationAccess::Read),
     ("context", OperationAccess::Read),
+    ("count", OperationAccess::Read),
     ("create", OperationAccess::Write),
     ("db_diagnostics", OperationAccess::Read),
     ("delete", OperationAccess::Write),

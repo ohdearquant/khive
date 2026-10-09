@@ -8404,26 +8404,40 @@ async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure(
     use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
 
+    // One provider registered once, before anything serves: it embeds like the
+    // merge test service until `fail` is set, then every call fails. Replacing a
+    // serving provider is refused by the registry, so the failure is switched on
+    // in place instead of registered over the top.
     struct FailingProvider {
         name: String,
         dimensions: usize,
         attempts: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
     }
 
-    struct FailingService(Arc<AtomicUsize>);
+    struct FailingService {
+        attempts: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+        dims: usize,
+    }
 
     #[async_trait::async_trait]
     impl EmbeddingService for FailingService {
         async fn embed(
             &self,
-            _texts: &[String],
-            _model: EmbeddingModel,
+            texts: &[String],
+            model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            if !self.fail.load(Ordering::SeqCst) {
+                return MergeTestVecService { dims: self.dims }
+                    .embed(texts, model)
+                    .await;
+            }
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(EmbedError::InferenceFailed(
                 "injected default embed failure".into(),
             ))
@@ -8449,7 +8463,11 @@ async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure(
         }
 
         async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
-            Ok(Arc::new(FailingService(Arc::clone(&self.attempts))))
+            Ok(Arc::new(FailingService {
+                attempts: Arc::clone(&self.attempts),
+                fail: Arc::clone(&self.fail),
+                dims: self.dimensions,
+            }))
         }
     }
 
@@ -8469,10 +8487,14 @@ async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure(
     })
     .unwrap();
     let tok = NamespaceToken::local();
-    rt.register_embedder(MergeTestVecProvider::new(
-        &primary_name,
-        primary.dimensions(),
-    ));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    rt.register_embedder(FailingProvider {
+        name: primary_name.clone(),
+        dimensions: primary.dimensions(),
+        attempts: Arc::clone(&attempts),
+        fail: Arc::clone(&fail),
+    });
     let note = Note::new("local", "message", "message before policy narrowing");
     rt.notes(&tok)
         .unwrap()
@@ -8514,12 +8536,7 @@ async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure(
         excluded_name,
         primary.dimensions(),
     ));
-    let attempts = Arc::new(AtomicUsize::new(0));
-    rt.register_embedder(FailingProvider {
-        name: primary_name.clone(),
-        dimensions: primary.dimensions(),
-        attempts: Arc::clone(&attempts),
-    });
+    fail.store(true, Ordering::SeqCst);
     rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
         kind: "message",
         policy: NoteEmbeddingPolicy::DefaultModel,

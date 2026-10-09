@@ -15,6 +15,8 @@ pub enum FusionStrategyError {
     WeightNaN,
     /// Weighted strategy weights contain infinity.
     WeightInfinite,
+    /// Weighted RRF requires every weight to be strictly positive.
+    WeightNotPositive,
     /// Custom strategy name must not be empty.
     CustomNameEmpty,
 }
@@ -25,6 +27,7 @@ impl fmt::Display for FusionStrategyError {
             Self::RrfKZero => write!(f, "Rrf k must be >= 1"),
             Self::WeightNaN => write!(f, "Weighted weights must not contain NaN"),
             Self::WeightInfinite => write!(f, "Weighted weights must not contain infinity"),
+            Self::WeightNotPositive => write!(f, "WeightedRrf weights must be strictly positive"),
             Self::CustomNameEmpty => write!(f, "Custom strategy name must not be empty"),
         }
     }
@@ -40,6 +43,8 @@ enum RawFusionStrategy {
     Rrf { k: usize },
     #[serde(alias = "Weighted")]
     Weighted { weights: Vec<f64> },
+    #[serde(alias = "WeightedRrf")]
+    WeightedRrf { k: usize, weights: Vec<f64> },
     #[serde(alias = "Union")]
     Union,
     #[serde(alias = "VectorOnly")]
@@ -60,6 +65,9 @@ impl TryFrom<RawFusionStrategy> for FusionStrategy {
         match raw {
             RawFusionStrategy::Rrf { k } => FusionStrategy::try_rrf(k),
             RawFusionStrategy::Weighted { weights } => FusionStrategy::try_weighted(weights),
+            RawFusionStrategy::WeightedRrf { k, weights } => {
+                FusionStrategy::try_weighted_rrf(k, weights)
+            }
             RawFusionStrategy::Union => Ok(FusionStrategy::Union),
             RawFusionStrategy::VectorOnly => Ok(FusionStrategy::VectorOnly),
             RawFusionStrategy::KeywordOnly => Ok(FusionStrategy::KeywordOnly),
@@ -84,6 +92,14 @@ pub enum FusionStrategy {
     /// Weighted linear combination of scores. Weights normalized to 1.0; must be finite.
     Weighted {
         /// Weights for each source (will be normalized). Must be finite.
+        weights: Vec<f64>,
+    },
+
+    /// Weighted Reciprocal Rank Fusion over ordered sources. Weights are not normalized.
+    WeightedRrf {
+        /// Smoothing constant (>= 1).
+        k: usize,
+        /// One finite, strictly positive weight for each ordered source.
         weights: Vec<f64>,
     },
 
@@ -164,6 +180,36 @@ impl FusionStrategy {
     #[inline]
     pub fn weighted(weights: Vec<f64>) -> Self {
         Self::try_weighted(weights).expect("weights must be finite")
+    }
+
+    /// Create weighted reciprocal rank fusion, rejecting zero `k` and weights that are
+    /// non-finite or not strictly positive. Source-count validation happens when the strategy is
+    /// fused because a strategy does not carry its source lists.
+    pub fn try_weighted_rrf(k: usize, weights: Vec<f64>) -> Result<Self, FusionStrategyError> {
+        if k == 0 {
+            return Err(FusionStrategyError::RrfKZero);
+        }
+        for weight in &weights {
+            if weight.is_nan() {
+                return Err(FusionStrategyError::WeightNaN);
+            }
+            if weight.is_infinite() {
+                return Err(FusionStrategyError::WeightInfinite);
+            }
+            if *weight <= 0.0 {
+                return Err(FusionStrategyError::WeightNotPositive);
+            }
+        }
+        Ok(Self::WeightedRrf { k, weights })
+    }
+
+    /// Create weighted reciprocal rank fusion. Panics on zero `k` or invalid weights.
+    ///
+    /// Prefer [`try_weighted_rrf`](Self::try_weighted_rrf) at public API boundaries.
+    #[inline]
+    pub fn weighted_rrf(k: usize, weights: Vec<f64>) -> Self {
+        Self::try_weighted_rrf(k, weights)
+            .expect("weighted RRF requires k >= 1 and positive finite weights")
     }
 
     /// Create a union strategy.
@@ -250,6 +296,41 @@ mod tests {
     }
 
     #[test]
+    fn test_try_weighted_rrf_rejects_invalid_parameters() {
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(0, vec![1.0]),
+            Err(FusionStrategyError::RrfKZero)
+        );
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(1, vec![f64::NAN]),
+            Err(FusionStrategyError::WeightNaN)
+        );
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(1, vec![f64::INFINITY]),
+            Err(FusionStrategyError::WeightInfinite)
+        );
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(1, vec![0.0]),
+            Err(FusionStrategyError::WeightNotPositive)
+        );
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(1, vec![-1.0]),
+            Err(FusionStrategyError::WeightNotPositive)
+        );
+    }
+
+    #[test]
+    fn test_try_weighted_rrf_accepts_positive_finite_weights() {
+        assert_eq!(
+            FusionStrategy::try_weighted_rrf(10, vec![1.0, 3.0]),
+            Ok(FusionStrategy::WeightedRrf {
+                k: 10,
+                weights: vec![1.0, 3.0]
+            })
+        );
+    }
+
+    #[test]
     fn test_try_custom_rejects_empty_name() {
         assert_eq!(
             FusionStrategy::try_custom(String::new(), serde_json::Value::Null),
@@ -285,6 +366,17 @@ mod tests {
     }
 
     #[test]
+    fn test_serde_roundtrip_weighted_rrf() {
+        let strategy = FusionStrategy::WeightedRrf {
+            k: 10,
+            weights: vec![1.0, 3.0],
+        };
+        let json = serde_json::to_string(&strategy).unwrap();
+        let deserialized: FusionStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(strategy, deserialized);
+    }
+
+    #[test]
     fn test_serde_roundtrip_custom() {
         let strategy = FusionStrategy::Custom {
             name: "decay_weighted".to_string(),
@@ -300,6 +392,17 @@ mod tests {
         let json = r#"{"rrf":{"k":0}}"#;
         let result: Result<FusionStrategy, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_serde_rejects_weighted_rrf_k_zero_and_nonpositive_weights() {
+        let k_zero: Result<FusionStrategy, _> =
+            serde_json::from_str(r#"{"weighted_rrf":{"k":0,"weights":[1.0]}}"#);
+        assert!(k_zero.is_err());
+
+        let zero_weight: Result<FusionStrategy, _> =
+            serde_json::from_str(r#"{"weighted_rrf":{"k":1,"weights":[0.0]}}"#);
+        assert!(zero_weight.is_err());
     }
 
     #[test]
