@@ -102,6 +102,50 @@ fn acronym_parts_obey_the_configured_minimum_without_dropping_the_original() {
 }
 
 #[test]
+fn plural_acronyms_stay_whole_through_public_tokenizers() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    let tokenizer = IdentifierTokenizer::default();
+    for input in ["APIs", "IDs", "URLs"] {
+        assert!(!is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+        assert_eq!(tokenizer.tokenize(input), vec![input]);
+        assert_eq!(preset::kg_name().analyze(input), vec![input.to_lowercase()]);
+    }
+    assert_eq!(preset::kg_name().analyze("REST APIs"), vec!["rest", "apis"]);
+    assert_eq!(preset::kg_name().analyze("IDs URLs"), vec!["ids", "urls"]);
+    assert_eq!(tokenizer.tokenize("(APIs), URLs!"), vec!["APIs", "URLs"]);
+    // A lowercase run that starts with `s` stays with the acronym too.
+    assert!(!is_identifier("URLsafe"));
+    assert_eq!(split_identifier("URLsafe", 1), vec!["urlsafe"]);
+}
+
+#[test]
+fn plural_suffixes_do_not_hide_adjacent_identifier_boundaries() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    for (input, parts) in [
+        ("APIsClient", vec!["apis", "client"]),
+        ("IDs_URLs", vec!["ids", "urls"]),
+        ("APIs2", vec!["apis", "2"]),
+        ("XMLParser", vec!["xml", "parser"]),
+        ("HTTPServer", vec!["http", "server"]),
+        ("XMLToJSON", vec!["xml", "to", "json"]),
+        ("PDFToText", vec!["pdf", "to", "text"]),
+        ("XMLTo", vec!["xml", "to"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), parts, "{input}");
+    }
+    assert_eq!(
+        IdentifierTokenizer { min_part_len: 4 }.tokenize("IDs_URLs"),
+        vec!["ids_urls", "urls"]
+    );
+}
+
+#[test]
 fn acronym_detection_preserves_plain_word_and_whitespace_rules() {
     use khive_text::identifier::is_identifier;
     use khive_text::tokenizer::IdentifierTokenizer;
