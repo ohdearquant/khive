@@ -639,7 +639,7 @@ async fn run_reindex_with_setup(
         entity_bar.finish();
 
         // ── notes ─────────────────────────────────────────────────────────────────
-        let note_total = count_notes(&rt, &ns_str).await;
+        let note_total = count_notes(&rt, &token).await;
         let note_bar = ProgressBar::new("notes");
         note_bar.update(0, note_total);
 
@@ -1117,26 +1117,14 @@ fn quote_sqlite_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
-    use khive_storage::types::{SqlStatement, SqlValue};
-    let sql = rt.sql();
-    let Ok(mut reader) = sql.reader().await else {
+async fn count_notes(rt: &KhiveRuntime, token: &khive_runtime::NamespaceToken) -> u64 {
+    let Ok(notes) = rt.notes(token) else {
         return 0;
     };
-    let row = reader
-        .query_row(SqlStatement {
-            sql: sql!("notes_count").into(),
-            params: vec![SqlValue::Text(ns.to_owned())],
-            label: None,
-        })
-        .await;
-    match row {
-        Ok(Some(r)) => match r.get("cnt") {
-            Some(SqlValue::Integer(n)) => *n as u64,
-            _ => 0,
-        },
-        _ => 0,
-    }
+    notes
+        .count_notes(token.namespace().as_str(), None)
+        .await
+        .unwrap_or(0)
 }
 
 fn render_human_report(report: &ReindexReport) -> String {
