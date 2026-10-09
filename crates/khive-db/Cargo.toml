@@ -17,7 +17,7 @@ bench = false
 [dependencies]
 khive-storage = { version = "0.10.0", path = "../khive-storage" }
 khive-score = { version = "0.10.0", path = "../khive-score" }
-khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde", "sha2"] }
 khive-fs = { version = "0.10.0", path = "../khive-fs" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
