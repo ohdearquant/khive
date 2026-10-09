@@ -14,6 +14,9 @@ pub use adapter::FormatAdapter;
 mod csv_adapter;
 pub use csv_adapter::{CsvFormatAdapter, DelimitedFormat};
 
+mod bibtex_adapter;
+pub use bibtex_adapter::{BibtexFormatAdapter, BibtexImportStats};
+
 mod json_adapter;
 pub use json_adapter::JsonFormatAdapter;
 
