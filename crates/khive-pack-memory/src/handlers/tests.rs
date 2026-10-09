@@ -630,6 +630,40 @@ fn compute_score_rrf_strategy_normalizes_to_comparable_range() {
 }
 
 #[test]
+fn compute_score_weighted_rrf_normalizes_by_the_heaviest_weight() {
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(60, vec![2.0, 0.5]),
+        ..RecallConfig::default()
+    };
+    let pipeline = make_pipeline(&cfg);
+    let raw_rank1_in_heaviest = 2.0 / 61.0;
+    let (_, bd) = compute_score(&cfg, &pipeline, raw_rank1_in_heaviest, 1.0, 0.0, 0.0);
+    assert!(
+        (bd.relevance - 1.0).abs() < 1e-10,
+        "rank-1 in the heaviest source should normalize to 1.0, got {}",
+        bd.relevance
+    );
+    let raw_rank1_in_lightest = 0.5 / 61.0;
+    let (_, bd) = compute_score(&cfg, &pipeline, raw_rank1_in_lightest, 1.0, 0.0, 0.0);
+    assert!(
+        (bd.relevance - 0.25).abs() < 1e-10,
+        "rank-1 in the lightest source should normalize to its weight share, got {}",
+        bd.relevance
+    );
+    let unit = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(60, vec![1.0, 1.0]),
+        ..RecallConfig::default()
+    };
+    let (_, unit_bd) = compute_score(&unit, &make_pipeline(&unit), 2.0 / 61.0, 1.0, 0.0, 0.0);
+    let rrf = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 60 },
+        ..RecallConfig::default()
+    };
+    let (_, rrf_bd) = compute_score(&rrf, &make_pipeline(&rrf), 2.0 / 61.0, 1.0, 0.0, 0.0);
+    assert!((unit_bd.relevance - rrf_bd.relevance).abs() < 1e-12);
+}
+
+#[test]
 fn compute_score_rrf_multi_source_clamped_to_one() {
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },

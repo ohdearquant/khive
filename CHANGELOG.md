@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking (Rust crates)
+
+- `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
+  fusion errors. This is source-breaking for consumers with exhaustive matches on
+  `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
+  rank-based strategy and its validation errors. Weighted RRF checks positive finite weights and
+  source-count alignment, preserves empty source slots, and errors when a fused score exceeds the
+  finite deterministic-score range.
+
 ## [0.11.0] - 2026-10-08
 
 ### Changed
