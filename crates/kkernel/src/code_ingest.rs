@@ -1522,6 +1522,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_creates_once_then_skips_on_rerun() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1551,6 +1555,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_never_reactivates_consumed_tombstone_ids() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("tombstones.db");
@@ -1629,6 +1637,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_writes_nothing() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1654,6 +1666,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_rejects_invalid_document_before_any_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let path = tmp.path().join("bad.json");
         std::fs::write(
@@ -1692,6 +1708,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_nonexistent_db_creates_no_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("does-not-exist.db");
@@ -1713,6 +1733,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_existing_db_does_not_mutate_it() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1811,6 +1835,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_existing_wal_db_leaves_sidecars_untouched() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("wal_scratch.db");
@@ -1894,6 +1922,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_rejects_secret_bearing_evidence_before_any_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let path = tmp.path().join("secret.json");
         std::fs::write(
@@ -1988,6 +2020,10 @@ mod tests {
 
     #[tokio::test]
     async fn direct_ingest_writers_reject_reserved_properties_before_storage() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let mut batch = mapped_batch(&findings);
@@ -2090,6 +2126,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_entity_vector_uses_canonical_body_field_label() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -2175,6 +2215,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_reports_actual_embedding_truncation_by_model() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
