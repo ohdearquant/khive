@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rank-based strategy and its validation errors. Weighted RRF checks positive finite weights and
   source-count alignment, preserves empty source slots, and errors when a fused score exceeds the
   finite deterministic-score range.
+- Breaking Rust API change: `khive_types::RerankExecutedPayload::model_id` is now
+  optional, and the payload adds `reranker`, `query_id`, `tiers`, `ignored_weights`
+  and `unidentified_candidates`. Direct constructors and exhaustive destructurings
+  must account for those fields. Stored events without a discriminator still decode
+  as native reranks; weighted memory reranking does not invent a model identity.
 
 ## [0.11.0] - 2026-10-08
 
