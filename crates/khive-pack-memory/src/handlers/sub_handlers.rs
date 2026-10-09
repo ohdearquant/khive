@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_types::{EventKind, Id128, RerankExecutedPayload, RerankerKind, SubstrateKind};
 
 use crate::config::RecallConfig;
 use crate::rerank::{weighted_rerank, RerankFeatures};
@@ -292,15 +293,59 @@ impl MemoryPack {
         }))
     }
 
-    pub(crate) async fn handle_recall_rerank(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_recall_rerank(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct RerankParams {
             candidates: Vec<serde_json::Value>,
             config: Option<RecallConfig>,
+            query_id: Option<String>,
         }
+        let started = std::time::Instant::now();
         let p: RerankParams = deser(params)?;
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
+
+        const FEATURE_NAMES: [&str; 5] = [
+            "relevance",
+            "salience",
+            "temporal",
+            "text_match",
+            "vector_match",
+        ];
+        let mut ignored_weights: Vec<String> = cfg
+            .reranker_weights
+            .keys()
+            .filter(|name| !FEATURE_NAMES.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        ignored_weights.sort_unstable();
+        let mut payload = RerankExecutedPayload {
+            reranker: RerankerKind::Weighted,
+            served_by_profile_id: None,
+            model_id: None,
+            query_id: p.query_id,
+            tiers: FEATURE_NAMES
+                .into_iter()
+                .filter(|name| {
+                    cfg.reranker_weights
+                        .get(*name)
+                        .is_some_and(|weight| *weight > 0.0)
+                })
+                .map(str::to_owned)
+                .collect(),
+            ignored_weights,
+            unidentified_candidates: 0,
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: Vec::new(),
+            latency_us: 0,
+            hook_applied: false,
+            hook_target_match: false,
+        };
 
         let active_rerankers: Vec<&String> = cfg
             .reranker_weights
@@ -316,14 +361,6 @@ impl MemoryPack {
                     .get("id")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-
-                if cfg.reranker_weights.is_empty() {
-                    return json!({
-                        "id": id,
-                        "rerank_scores": {},
-                        "rerank_score": 0.0_f64,
-                    });
-                }
 
                 let fused_score = candidate
                     .get("fused_score")
@@ -370,6 +407,38 @@ impl MemoryPack {
                 };
                 let rerank_score = weighted_rerank(&features, &cfg.reranker_weights);
 
+                if let Some(uuid) = id
+                    .as_str()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                {
+                    let event_id = Id128::from_bytes(*uuid.as_bytes());
+                    payload.candidates.push(event_id);
+                    let raw_features = [
+                        features.relevance as f32,
+                        features.salience as f32,
+                        features.temporal as f32,
+                        f32::from(features.text_match),
+                        f32::from(features.vector_match),
+                    ];
+                    let final_score = rerank_score as f32;
+                    // Keep identity even when score narrowing is not representable.
+                    // Omit both tuples, never clamp or change the f64 response.
+                    if final_score.is_finite() && raw_features.iter().all(|value| value.is_finite())
+                    {
+                        payload.reranked.push((
+                            event_id,
+                            FEATURE_NAMES
+                                .into_iter()
+                                .zip(raw_features)
+                                .map(|(name, value)| (name.to_owned(), value))
+                                .collect(),
+                        ));
+                        payload.final_scores.push((event_id, final_score));
+                    }
+                } else {
+                    payload.unidentified_candidates += 1;
+                }
+
                 let mut rerank_scores = serde_json::Map::new();
                 for (name, &weight) in &cfg.reranker_weights {
                     if weight == 0.0 {
@@ -394,10 +463,38 @@ impl MemoryPack {
             })
             .collect();
 
+        payload.latency_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.record_rerank_event(token, payload).await;
+
         to_json(&json!({
             "reranked": reranked,
             "active_rerankers": active_rerankers.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
         }))
+    }
+
+    async fn record_rerank_event(&self, token: &NamespaceToken, payload: RerankExecutedPayload) {
+        let result: Result<(), RuntimeError> = async {
+            let store = self.runtime.events(token)?;
+            let event = khive_storage::Event::new(
+                token.namespace().as_str(),
+                "memory.recall_rerank",
+                EventKind::RerankExecuted,
+                SubstrateKind::Event,
+                token.actor().id.clone(),
+            )
+            .with_duration_us(i64::try_from(payload.latency_us).unwrap_or(i64::MAX))
+            .with_payload(to_json(&payload)?);
+            store.append_event(event).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                %error,
+                namespace = token.namespace().as_str(),
+                "rerank_executed event append failed; rerank result is unaffected"
+            );
+        }
     }
 
     pub(crate) async fn handle_recall_score(&self, params: Value) -> Result<Value, RuntimeError> {

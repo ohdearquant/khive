@@ -578,7 +578,7 @@ impl PackRuntime for MemoryPack {
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
             "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
-            "memory.recall_rerank" => self.handle_recall_rerank(params).await,
+            "memory.recall_rerank" => self.handle_recall_rerank(token, params).await,
             "memory.recall_score" => self.handle_recall_score(params).await,
             "memory.prune" => self.handle_prune(token, params).await,
             "memory.vacuum" => self.handle_vacuum(params).await,
