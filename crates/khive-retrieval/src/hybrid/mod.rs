@@ -11,6 +11,7 @@ mod identity;
 mod labelled;
 mod labelled_scored;
 mod searcher;
+mod two_stage;
 
 // Re-export public types
 pub use config::{HybridConfig, Query, DEFAULT_POOL_MULTIPLIER};
@@ -26,3 +27,4 @@ pub use searcher::{
     fuse_search_results, fuse_search_results_checked, HybridSearcher, KeywordSearch, Reranker,
     VectorSearch,
 };
+pub use two_stage::fuse_two_stage;

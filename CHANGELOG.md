@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
