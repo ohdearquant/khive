@@ -270,6 +270,16 @@ sequential reads, and each operation-scoped checkout has its own bounded wait;
 the caller's total wall time can therefore exceed five seconds even though no
 single admission wait does. The timeout never triggers a fresh connection open.
 
+`KHIVE_READER_MAX_AGE_SECS` (default 300) and `KHIVE_READER_MAX_OPS` (default
+5000) configure `reader_max_age` and `reader_max_ops`. A pooled reader connection
+that has lived longer than the age limit, or has served more than the limit of
+successful checkouts, is closed on return and replaced by a fresh connection before
+the slot is reused; the replacement open happens inside the returning request's
+tail. Both comparisons are strict, so a zero value for either key recycles on every
+return. The in-memory pool shares one connection and is never recycled. Each replacement counts
+in `reader_discards` on the acquisition snapshot, and a replacement that fails to
+open counts in `reader_replacement_open_failures`.
+
 ### Synchronous `ReaderGuard::query_row`
 
 A held `ReaderGuard` exposes one public SQL method, synchronous

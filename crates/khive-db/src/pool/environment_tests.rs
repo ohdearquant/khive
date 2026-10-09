@@ -1,9 +1,11 @@
 // Environment fixtures share the parent tests module through include!.
 // Cases that open pools configure the child before any reader or writer starts.
 
-const POOL_ENV_VARS: [&str; 7] = [
+const POOL_ENV_VARS: [&str; 9] = [
     "KHIVE_BUSY_TIMEOUT_SECS",
     "KHIVE_CHECKOUT_TIMEOUT_SECS",
+    "KHIVE_READER_MAX_AGE_SECS",
+    "KHIVE_READER_MAX_OPS",
     "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
     "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
     "KHIVE_WRITE_QUEUE",
