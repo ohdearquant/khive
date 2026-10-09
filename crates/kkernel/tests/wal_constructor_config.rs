@@ -154,7 +154,7 @@ fn mcp_single_backend_wal_child() {
         "abc" => {
             let error = result.err().expect("SINGLE_HOST_INVALID_CAPTURED_ENV");
             assert!(
-                matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Sqlite(SqliteError::InvalidConfig(message))) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))
+                matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })) if matches!(source.downcast_ref(), Some(SqliteError::InvalidConfig(message)) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES")))
             );
             assert!(!home.join("before-open").exists());
         }

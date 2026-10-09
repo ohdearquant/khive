@@ -700,7 +700,7 @@ async fn resolve_get_prefix(
 /// Of what the resolvers produce today, `resolve_name_async` (in `common.rs`) itself constructs
 /// `Storage`/`NotFound`/`Ambiguous`, and also propagates whatever `runtime.entities(token)?`
 /// yields, so it is not the sole author of its own error type. The only `InvalidInput` the
-/// prefix-resolution path constructs is a prefix-miss. Everything else — `Storage`, `Sqlite`,
+/// prefix-resolution path constructs is a prefix-miss. Everything else — `Storage`,
 /// `Internal`, `Ambiguous`, `AmbiguousPrefix` — is a failure and reaches the caller as itself.
 ///
 /// Both ambiguity variants are failures, for the same reason: no later arm can resolve an
