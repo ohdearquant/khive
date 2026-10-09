@@ -1155,14 +1155,14 @@ with `SQLITE_BUSY` after the busy timeout (`KHIVE_BUSY_TIMEOUT_SECS`) elapsed; i
 `reader_checkout_timeouts` and excludes writer refusals.
 `active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
 `completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
-and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
-`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
-connection then also failed to open, permanently shrinking the physical pool by one slot below
-`max_readers`; non-zero here means the pool has fewer physical reader connections than
-configured, and each occurrence is also logged at `warn`. A pooled reader is disqualified on
-return once it is older than `KHIVE_READER_MAX_AGE_SECS` (default 300) or has served more than
-`KHIVE_READER_MAX_OPS` checkouts (default 5000); the replacement is opened before the slot is
-reused.
+and lifecycle evidence, including reset/replacement before reuse. `reader_discards` counts each
+dedicated reader discarded on return once, including failed replacements but excluding shutdown.
+Discard causes are age/use limits, reset/health failures, or an explicitly non-reusable lease;
+the shared in-memory connection is never recycled. `reader_replacement_open_failures` counts
+replacement opens that failed, permanently shrinking the physical pool below `max_readers`;
+each failure also logs at `warn`. Age/use expiry occurs on return after
+`KHIVE_READER_MAX_AGE_SECS` (default 300) or more than `KHIVE_READER_MAX_OPS` checkouts
+(default 5000). The replacement opens before the slot is reused.
 
 The timeout setting applies to each admission attempt. A verb that issues several sequential
 reads can spend more than one configured timeout in total wall time, but each attempt is bounded
