@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use khive_score::DeterministicScore;
 
-use khive_fusion::{fuse, FusionStrategy};
+use khive_fusion::{fuse, FuseError, FusionStrategy};
 
 /// Strategy for routing queries during dual-index operation.
 ///
@@ -150,22 +150,23 @@ where
     /// Positional strategies use `[primary, legacy]`. This migration-specific
     /// contract is independent of the `[vector, keyword]` order used by
     /// two-arm hybrid search APIs.
+    /// Weighted-RRF parameter, source-count and score errors are returned unchanged.
     pub fn merge_results(
         &self,
         primary_results: Vec<(Id, DeterministicScore)>,
         legacy_results: Vec<(Id, DeterministicScore)>,
         top_k: usize,
-    ) -> Vec<(Id, DeterministicScore)> {
+    ) -> Result<Vec<(Id, DeterministicScore)>, FuseError> {
         match &self.config.strategy {
             DualIndexStrategy::PrimaryOnly => {
                 let mut results = primary_results;
                 results.truncate(top_k);
-                results
+                Ok(results)
             }
             DualIndexStrategy::LegacyOnly => {
                 let mut results = legacy_results;
                 results.truncate(top_k);
-                results
+                Ok(results)
             }
             DualIndexStrategy::Both { fusion } => {
                 let sources = vec![primary_results, legacy_results];
@@ -173,13 +174,7 @@ where
                     FusionStrategy::Custom { .. } => &FusionStrategy::default(),
                     s => s,
                 };
-                match (fuse(sources, safe, top_k), safe) {
-                    (Ok(fused), _) => fused,
-                    // WeightedRrf fails closed (no results) when its weights do not match
-                    // [primary, legacy] or a score overflows; it never degrades to another strategy.
-                    (Err(_), FusionStrategy::WeightedRrf { .. }) => Vec::new(),
-                    (Err(error), _) => panic!("non-Custom strategies are infallible: {error}"),
-                }
+                fuse(sources, safe, top_k)
             }
             DualIndexStrategy::Weighted { primary_weight } => {
                 let w = if primary_weight.is_nan() {
@@ -190,7 +185,7 @@ where
                 let strategy = FusionStrategy::try_weighted(vec![w, 1.0 - w])
                     .unwrap_or_else(|_| FusionStrategy::weighted(vec![0.5, 0.5]));
                 let sources = vec![primary_results, legacy_results];
-                fuse(sources, &strategy, top_k).expect("Weighted is infallible")
+                fuse(sources, &strategy, top_k)
             }
         }
     }
@@ -328,7 +323,7 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.8)]);
         let legacy = make_results(vec![("c", 0.95), ("d", 0.85)]);
 
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].0, "a");
         assert_eq!(merged[1].0, "b");
@@ -342,7 +337,7 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.8)]);
         let legacy = make_results(vec![("c", 0.95), ("d", 0.85)]);
 
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].0, "c");
         assert_eq!(merged[1].0, "d");
@@ -356,7 +351,7 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.8)]);
         let legacy = make_results(vec![("b", 0.95), ("c", 0.7)]);
 
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
 
         // "b" appears in both sources, should get highest RRF score
         assert_eq!(merged[0].0, "b");
@@ -373,12 +368,12 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.8)]);
         let legacy = make_results(vec![("b", 0.9), ("a", 0.8)]);
 
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
         assert_eq!(merged[0].0, "b");
     }
 
     #[test]
-    fn test_merge_both_weighted_rrf_with_wrong_weight_count_returns_no_results() {
+    fn test_merge_both_weighted_rrf_with_wrong_weight_count_returns_error() {
         let fusion = FusionStrategy::try_weighted_rrf(10, vec![1.0]).unwrap();
         let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Both { fusion });
         let router = DualIndexRouter::<String>::new(config);
@@ -386,7 +381,47 @@ mod tests {
         let primary = make_results(vec![("a", 0.9)]);
         let legacy = make_results(vec![("b", 0.9)]);
 
-        assert!(router.merge_results(primary, legacy, 10).is_empty());
+        assert_eq!(
+            router.merge_results(primary, legacy, 10),
+            Err(FuseError::WeightedRrfWeightCountMismatch {
+                source_count: 2,
+                weight_count: 1,
+            })
+        );
+        assert_eq!(
+            router.merge_results(vec![], vec![], 10),
+            Err(FuseError::WeightedRrfWeightCountMismatch {
+                source_count: 2,
+                weight_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn test_merge_both_weighted_rrf_preserves_validation_and_score_errors() {
+        for (weights, expected) in [
+            (
+                vec![f64::NAN, 1.0],
+                FuseError::InvalidWeightedRrfStrategy(khive_fusion::FusionStrategyError::WeightNaN),
+            ),
+            (vec![f64::MAX, 1.0], FuseError::WeightedRrfScoreOverflow),
+        ] {
+            let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Both {
+                fusion: FusionStrategy::WeightedRrf { k: 1, weights },
+            });
+            let router = DualIndexRouter::<String>::new(config);
+            assert_eq!(
+                router.merge_results(make_results(vec![("a", 1.0)]), vec![], 10),
+                Err(expected)
+            );
+        }
+        let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Both {
+            fusion: FusionStrategy::weighted_rrf(1, vec![1.0, 1.0]),
+        });
+        assert!(DualIndexRouter::<String>::new(config)
+            .merge_results(vec![], vec![], 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -399,7 +434,7 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.5)]);
         let legacy = make_results(vec![("b", 0.9), ("c", 0.5)]);
 
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
 
         // All three unique IDs should appear
         let ids: Vec<&str> = merged.iter().map(|(id, _)| id.as_str()).collect();
@@ -417,7 +452,7 @@ mod tests {
 
         let primary = make_results(vec![("primary", 0.9)]);
         let legacy = make_results(vec![("legacy", 0.9)]);
-        let merged = router.merge_results(primary, legacy, 10);
+        let merged = router.merge_results(primary, legacy, 10).unwrap();
 
         assert_eq!(merged[0].0, "primary");
         assert!(merged[0].1 > merged[1].1);
@@ -449,7 +484,7 @@ mod tests {
                 "merge_results must not panic for primary_weight={primary_weight}"
             );
 
-            let merged = result.unwrap();
+            let merged = result.unwrap().unwrap();
             let ids: Vec<_> = merged.iter().map(|(id, _)| id.as_str()).collect();
             assert_eq!(ids, expected_ids);
         }
@@ -463,7 +498,7 @@ mod tests {
         let primary = make_results(vec![("a", 0.9), ("b", 0.8), ("c", 0.7)]);
         let legacy = make_results(vec![("d", 0.95), ("e", 0.85), ("f", 0.75)]);
 
-        let merged = router.merge_results(primary, legacy, 2);
+        let merged = router.merge_results(primary, legacy, 2).unwrap();
         assert_eq!(merged.len(), 2);
     }
 
@@ -472,7 +507,7 @@ mod tests {
         let config = DualIndexConfig::default();
         let router = DualIndexRouter::<String>::new(config);
 
-        let merged = router.merge_results(vec![], vec![], 10);
+        let merged = router.merge_results(vec![], vec![], 10).unwrap();
         assert!(merged.is_empty());
     }
 
