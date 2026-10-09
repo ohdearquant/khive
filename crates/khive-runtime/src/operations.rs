@@ -7940,7 +7940,7 @@ impl KhiveRuntime {
                 .map_err(|e| {
                     RuntimeError::Internal(format!("update_edge: spawn_blocking join: {e}"))
                 })?
-                .map_err(RuntimeError::Sqlite)?
+                .map_err(RuntimeError::from)?
             };
 
             match outcome {

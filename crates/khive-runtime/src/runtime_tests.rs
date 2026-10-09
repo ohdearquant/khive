@@ -416,7 +416,8 @@ fn direct_memory_runtime_rejects_nonzero_wal_ceiling() {
     };
     assert!(matches!(
         error,
-        RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(_))
+        RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })
+            if matches!(source.downcast_ref(), Some(khive_db::SqliteError::InvalidConfig(_)))
     ));
 }
 
