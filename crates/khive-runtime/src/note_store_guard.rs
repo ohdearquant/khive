@@ -46,6 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use khive_storage::note::NotePropertyPatch;
 use khive_storage::{
     BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, NoteVisibility, Page,
     PageRequest, SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
@@ -470,6 +471,30 @@ impl NoteStore for PolicyEnforcingNoteStore {
         reject_existing_secret_gate_property(existing.as_ref(), "try_patch_note_property")?;
         self.inner
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
+            .await
+    }
+
+    async fn try_patch_note_properties(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        kind: &str,
+        patch: &NotePropertyPatch,
+    ) -> StorageResult<bool> {
+        reject_reserved_note_properties(
+            Some(&serde_json::json!(&patch.set)),
+            "try_patch_note_properties",
+        )?;
+        for key in patch.set.keys() {
+            reject_reserved_patch_target(key, "try_patch_note_properties")?;
+        }
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("try_patch_note_properties"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "try_patch_note_properties")?;
+        self.inner
+            .try_patch_note_properties(id, namespace, kind, patch)
             .await
     }
 

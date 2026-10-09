@@ -12,6 +12,85 @@ fn assert_secret_gate_refusal(error: StorageError) {
 }
 
 #[tokio::test]
+async fn guarded_property_patch_enforces_public_note_policy() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = NamespaceToken::local();
+    let store = runtime.notes(&token).unwrap();
+    let raw = runtime.raw_notes(&token).unwrap();
+    let note = Note::new("local", "observation", "guarded patch")
+        .with_properties(json!({"safe": 1, "keep": {"nested": true}}));
+    raw.upsert_note(note.clone()).await.unwrap();
+    let before = raw.get_note(note.id).await.unwrap().unwrap();
+    let patch_for = |key: &str| NotePropertyPatch {
+        preconditions: vec![],
+        set: std::collections::BTreeMap::from([(key.to_string(), json!(2))]),
+        extend_expires_at: Some(before.updated_at + 100),
+        updated_at: before.updated_at + 1,
+    };
+    for key in kind_owned_properties("message").iter().copied().chain([
+        "khive:secret_gate",
+        "khive:web_receipt",
+        "$",
+        "$[\"channel_slug\"]",
+        r#"$."channel_slug""#,
+    ]) {
+        let error = store
+            .try_patch_note_properties(note.id, "local", "observation", &patch_for(key))
+            .await
+            .expect_err("public patches must refuse protected targets");
+        assert!(
+            matches!(error, StorageError::InvalidInput { .. }),
+            "{key}: {error}"
+        );
+        assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), before);
+    }
+
+    for provenance in [
+        json!({"khive:secret_gate": "legacy", "safe": 1}),
+        json!({"khive:web_receipt": "v1", "safe": 1}),
+        json!({"khive:web_receipt": "v1", "khive:secret_gate": "legacy", "safe": 1}),
+    ] {
+        let protected = Note::new("local", "observation", "protected").with_properties(provenance);
+        raw.upsert_note(protected.clone()).await.unwrap();
+        let protected_before = raw.get_note(protected.id).await.unwrap().unwrap();
+        let error = store
+            .try_patch_note_properties(protected.id, "local", "observation", &patch_for("safe"))
+            .await
+            .expect_err("protected existing records must not be changed");
+        if protected
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("khive:web_receipt")
+            .is_some()
+        {
+            assert!(
+                error.to_string().contains("web receipt provenance"),
+                "{error}"
+            );
+        } else {
+            assert_secret_gate_refusal(error);
+        }
+        assert_eq!(
+            raw.get_note(protected.id).await.unwrap().unwrap(),
+            protected_before
+        );
+    }
+
+    assert!(store
+        .try_patch_note_properties(note.id, "local", "observation", &patch_for("safe"))
+        .await
+        .unwrap());
+    let after = raw.get_note(note.id).await.unwrap().unwrap();
+    assert_eq!(after.properties.as_ref().unwrap()["safe"], 2);
+    assert_eq!(
+        after.properties.as_ref().unwrap()["keep"],
+        json!({"nested": true})
+    );
+    assert_eq!(after.expires_at, Some(before.updated_at + 100));
+}
+
+#[tokio::test]
 async fn atomic_property_patch_batches_real_policy_reads() {
     for count in [1_usize, 128, 129, 500] {
         let runtime = KhiveRuntime::memory().unwrap();
