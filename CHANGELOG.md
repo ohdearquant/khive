@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
+  decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
+  remain visible, and an additive migration rebuilds the cursor index without rewriting rows.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
