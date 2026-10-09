@@ -14,6 +14,10 @@ pins down each guarantee.
 
 See `crates/khive-db/src/checkpoint.rs` module doc.
 
+`crates/khive-db/src/checkpoint/config.rs` owns `CheckpointConfig`, its defaults,
+and the shared transaction-age environment thresholds. The public configuration
+and default constant remain available through `khive_db::checkpoint`.
+
 The periodic task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick,
 including when the WAL page count exceeds the high-water mark. Ordinary
 ticks stay PASSIVE-only and non-blocking; a rare, separately-gated escalation
