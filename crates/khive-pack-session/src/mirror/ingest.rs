@@ -158,19 +158,32 @@ pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<String> {
 }
 
 fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use khive_fs::opened_file::{open_regular_file_nofollow, ContainedOpenError};
+
+        open_regular_file_nofollow(path).map_err(|error| match error {
+            ContainedOpenError::Open(error)
+            | ContainedOpenError::Metadata(error)
+            | ContainedOpenError::Resolve(error) => error,
+            ContainedOpenError::NotRegular => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mirror source is not a regular file",
+            ),
+            ContainedOpenError::Escapes { .. } => std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source is outside its configured root",
+            ),
+        })
+    }
     #[cfg(windows)]
     {
-        return windows_source_open::open_file(path);
+        windows_source_open::open_file(path)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(unix, windows)))]
     {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
         options.open(path)
     }
 }
@@ -196,8 +209,6 @@ pub(crate) fn open_source_file_beneath(
     path: &Path,
     expected_directories: Option<&[String]>,
 ) -> std::io::Result<(std::fs::File, Vec<String>)> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Component;
 
@@ -241,27 +252,17 @@ pub(crate) fn open_source_file_beneath(
                 "mirror source contains a non-normal path component",
             ));
         };
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
+        if name.as_bytes().contains(&0) {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "mirror source contains a NUL byte",
-            )
-        })?;
+            ));
+        }
         let last = components.peek().is_none();
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        let flags = if last {
-            flags
-        } else {
-            flags | libc::O_DIRECTORY
-        };
         let directory = pinned_directories
             .last()
             .expect("source parent is retained");
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        let opened = khive_fs::fd_relative::open_at(directory, name, !last)?;
         if last {
             if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
                 return Err(std::io::Error::other(
