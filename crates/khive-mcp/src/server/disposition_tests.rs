@@ -1285,6 +1285,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "lifecycle",
         "khive-runtime/src/daemon/lifecycle.rs",
     ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "wire_frames",
+        "khive-runtime/src/daemon/wire_frames.rs",
+    ),
 ];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
@@ -1439,7 +1444,7 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
                     && self.impl_type.as_deref() == Some("DaemonDispatchError"))
         }) {
             self.constructors_seen += 1;
-            let normalizer = self.source == "khive-runtime/src/daemon.rs"
+            let normalizer = self.source == "khive-runtime/src/daemon/wire_frames.rs"
                 && self.modules.is_empty()
                 && self.impl_type.as_deref() == Some("DaemonDispatchError")
                 && self.function == "new"
