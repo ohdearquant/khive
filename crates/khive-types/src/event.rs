@@ -414,6 +414,17 @@ pub struct ToolCheckDecidedPayload {
     pub caller_verb: String,
 }
 
+/// Implementation that produced a rerank event (ADR-042 Amendment 1).
+/// Events written before the discriminator existed are native reranks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum RerankerKind {
+    #[default]
+    Native,
+    Weighted,
+}
+
 /// Payload for a rerank pass event, recording per-candidate scores.
 ///
 /// All score values (`reranked` section scores, `final_scores`) must be finite.
@@ -421,10 +432,22 @@ pub struct ToolCheckDecidedPayload {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RerankExecutedPayload {
+    /// Native model or weighted feature scoring; legacy events default to native.
+    pub reranker: RerankerKind,
     /// Brain profile that served this rerank, if any.
     pub served_by_profile_id: Option<String>,
-    /// Model used for reranking.
-    pub model_id: Id128,
+    /// Model used for reranking; absent for weighted feature scoring.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub model_id: Option<Id128>,
+    /// Opaque caller-supplied query correlation; never generated or parsed as a UUID.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub query_id: Option<String>,
+    /// Positive recognized feature weights, in scoring order.
+    pub tiers: Vec<String>,
+    /// Configured keys unknown to weighted scoring, in lexical order.
+    pub ignored_weights: Vec<String>,
+    /// Candidates without a parseable UUID, omitted from the three ID arrays.
+    pub unidentified_candidates: usize,
     /// Candidate IDs in input order.
     pub candidates: Vec<Id128>,
     /// Per-candidate named sub-scores from the reranker.
@@ -459,8 +482,17 @@ impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
     {
         #[derive(serde::Deserialize)]
         struct Raw {
+            #[serde(default)]
+            reranker: RerankerKind,
             served_by_profile_id: Option<String>,
-            model_id: Id128,
+            model_id: Option<Id128>,
+            query_id: Option<String>,
+            #[serde(default)]
+            tiers: Vec<String>,
+            #[serde(default)]
+            ignored_weights: Vec<String>,
+            #[serde(default)]
+            unidentified_candidates: usize,
             candidates: Vec<Id128>,
             reranked: Vec<(Id128, Vec<(String, f32)>)>,
             final_scores: Vec<(Id128, f32)>,
@@ -489,8 +521,13 @@ impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
         }
 
         Ok(RerankExecutedPayload {
+            reranker: raw.reranker,
             served_by_profile_id: raw.served_by_profile_id,
             model_id: raw.model_id,
+            query_id: raw.query_id,
+            tiers: raw.tiers,
+            ignored_weights: raw.ignored_weights,
+            unidentified_candidates: raw.unidentified_candidates,
             candidates: raw.candidates,
             reranked: raw.reranked,
             final_scores: raw.final_scores,
@@ -968,7 +1005,12 @@ mod tests {
     fn rerank_payload_records_served_profile() {
         let payload = EventPayload::RerankExecuted(RerankExecutedPayload {
             served_by_profile_id: Some("profile-a".into()),
-            model_id: Id128::from_u128(1),
+            reranker: RerankerKind::Native,
+            model_id: Some(Id128::from_u128(1)),
+            query_id: None,
+            tiers: Vec::new(),
+            ignored_weights: Vec::new(),
+            unidentified_candidates: 0,
             candidates: Vec::new(),
             reranked: Vec::new(),
             final_scores: Vec::new(),
@@ -1149,7 +1191,12 @@ mod tests {
     fn rerank_payload_is_valid_checks_finite() {
         let p = RerankExecutedPayload {
             served_by_profile_id: None,
-            model_id: Id128::from_u128(1),
+            reranker: RerankerKind::Native,
+            model_id: Some(Id128::from_u128(1)),
+            query_id: None,
+            tiers: Vec::new(),
+            ignored_weights: Vec::new(),
+            unidentified_candidates: 0,
             candidates: Vec::new(),
             reranked: Vec::new(),
             final_scores: alloc::vec![(Id128::from_u128(1), 0.5)],
@@ -1161,7 +1208,12 @@ mod tests {
 
         let p_inf = RerankExecutedPayload {
             served_by_profile_id: None,
-            model_id: Id128::from_u128(1),
+            reranker: RerankerKind::Native,
+            model_id: Some(Id128::from_u128(1)),
+            query_id: None,
+            tiers: Vec::new(),
+            ignored_weights: Vec::new(),
+            unidentified_candidates: 0,
             candidates: Vec::new(),
             reranked: Vec::new(),
             final_scores: alloc::vec![(Id128::from_u128(1), f32::INFINITY)],
@@ -1170,5 +1222,74 @@ mod tests {
             hook_target_match: false,
         };
         assert!(!p_inf.is_valid());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rerank_payload_reads_pre_amendment_events_as_native() {
+        let old = serde_json::json!({
+            "served_by_profile_id": "profile-a",
+            "model_id": "00000000-0000-0000-0000-000000000001",
+            "candidates": ["00000000-0000-0000-0000-000000000002"],
+            "reranked": [],
+            "final_scores": [["00000000-0000-0000-0000-000000000002", 0.25]],
+            "latency_us": 100, "hook_applied": true, "hook_target_match": true
+        });
+        let payload: RerankExecutedPayload = serde_json::from_value(old).unwrap();
+        assert_eq!(payload.reranker, RerankerKind::Native);
+        assert_eq!(payload.model_id, Some(Id128::from_u128(1)));
+        assert_eq!(payload.query_id, None);
+        assert!(payload.tiers.is_empty());
+        assert!(payload.ignored_weights.is_empty());
+        assert_eq!(payload.unidentified_candidates, 0);
+        assert!(payload.hook_applied && payload.hook_target_match);
+        assert_eq!(
+            payload.final_scores,
+            alloc::vec![(Id128::from_u128(2), 0.25)]
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn weighted_rerank_payload_has_no_fabricated_model_or_query() {
+        let raw = serde_json::json!({
+            "reranker": "weighted", "served_by_profile_id": null,
+            "tiers": ["relevance", "temporal"], "ignored_weights": ["typo"],
+            "unidentified_candidates": 2, "candidates": [], "reranked": [],
+            "final_scores": [], "latency_us": 0,
+            "hook_applied": false, "hook_target_match": false
+        });
+        let payload: RerankExecutedPayload = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(payload.reranker, RerankerKind::Weighted);
+        assert_eq!(payload.model_id, None);
+        assert_eq!(payload.query_id, None);
+        assert_eq!(serde_json::to_value(&payload).unwrap(), raw);
+        let mut invalid = raw.clone();
+        invalid["reranker"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<RerankExecutedPayload>(invalid).is_err());
+        let mut invalid = raw.clone();
+        invalid["model_id"] = serde_json::json!("not-a-uuid");
+        assert!(serde_json::from_value::<RerankExecutedPayload>(invalid).is_err());
+        let mut invalid = raw.clone();
+        invalid["query_id"] = serde_json::json!(42);
+        assert!(serde_json::from_value::<RerankExecutedPayload>(invalid).is_err());
+        let mut correlated = raw.clone();
+        correlated["query_id"] = serde_json::json!(" query/session-7 ");
+        let payload: RerankExecutedPayload = serde_json::from_value(correlated.clone()).unwrap();
+        assert_eq!(payload.query_id.as_deref(), Some(" query/session-7 "));
+        assert_eq!(serde_json::to_value(payload).unwrap(), correlated);
+        // A finite f64 can still overflow the existing finite-f32 event contract.
+        for field in ["final_scores", "reranked"] {
+            let mut invalid = raw.clone();
+            invalid[field] = if field == "final_scores" {
+                serde_json::json!([["00000000-0000-0000-0000-000000000001", f64::MAX]])
+            } else {
+                serde_json::json!([[
+                    "00000000-0000-0000-0000-000000000001",
+                    [["relevance", f64::MAX]]
+                ]])
+            };
+            assert!(serde_json::from_value::<RerankExecutedPayload>(invalid).is_err());
+        }
     }
 }
