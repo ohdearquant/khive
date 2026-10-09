@@ -34,7 +34,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
-use khive_fs::fd_relative::{open_dir_at, stat_at, stat_fd};
+use khive_fs::directory_walk::open_dir_nofollow;
+#[cfg(unix)]
+use khive_fs::fd_relative::{open_dir_at, rename_at, stat_at, stat_fd};
 use uuid::Uuid;
 
 use crate::source::{cache_key, redact_repo_url};
@@ -746,7 +748,8 @@ fn delete_verified_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), Cache
     let name = repo_dir
         .file_name()
         .ok_or_else(|| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
-    let root_fd = unix_fd::open_dir_nofollow(root)
+    let root_fd = open_dir_nofollow(root)
+        .map(std::fs::File::from)
         .map_err(|e| io_err("delete_verified_owned_entry: open root", root, e))?;
     let target_fd = open_dir_at(&root_fd, name)
         .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
@@ -758,16 +761,18 @@ fn delete_verified_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), Cache
 
     let namespace_root = ensure_staging_namespace(root)
         .map_err(|e| io_err("delete_verified_owned_entry: staging namespace", root, e))?;
-    let namespace_fd = unix_fd::open_dir_nofollow(&namespace_root).map_err(|e| {
-        io_err(
-            "delete_verified_owned_entry: open staging namespace",
-            &namespace_root,
-            e,
-        )
-    })?;
+    let namespace_fd = open_dir_nofollow(&namespace_root)
+        .map(std::fs::File::from)
+        .map_err(|e| {
+            io_err(
+                "delete_verified_owned_entry: open staging namespace",
+                &namespace_root,
+                e,
+            )
+        })?;
     let trash_name = format!("trash-{}", Uuid::new_v4());
     let trash_name_os = std::ffi::OsStr::new(&trash_name);
-    unix_fd::renameat(&root_fd, name, &namespace_fd, trash_name_os).map_err(|e| {
+    rename_at(&root_fd, name, &namespace_fd, trash_name_os).map_err(|e| {
         io_err(
             "delete_verified_owned_entry: renameat to private namespace",
             repo_dir,
@@ -829,7 +834,9 @@ impl ValidatedSlot {
     /// discovering upward into an ancestor.
     #[cfg(test)]
     fn for_test(dir: &Path) -> Self {
-        let parent = unix_fd::open_dir_nofollow(dir).expect("open test slot dir");
+        let parent = open_dir_nofollow(dir)
+            .map(std::fs::File::from)
+            .expect("open test slot dir");
         let git_dir = open_dir_at(&parent, std::ffi::OsStr::new(".git")).unwrap_or(parent);
         Self { git_dir }
     }
@@ -902,7 +909,8 @@ fn git_at_slot(repo: &Path, slot: &ValidatedSlot) -> Command {
 /// see `ValidatedSlot` and `git_at_slot`.
 #[cfg(unix)]
 fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
-    let fd = unix_fd::open_dir_nofollow(repo_dir)
+    let fd = open_dir_nofollow(repo_dir)
+        .map(std::fs::File::from)
         .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
     if !is_owned_entry_via_fd(&fd) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
@@ -949,75 +957,6 @@ fn is_owned_entry_via_fd(target_fd: &std::fs::File) -> bool {
     let marker_is_regular_file = stat_at(target_fd, std::ffi::OsStr::new(MARKER_FILE))
         .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
     git_is_directory && marker_is_regular_file
-}
-
-/// The two primitives `khive_fs::fd_relative` has no equivalent for: the
-/// path-based directory open and `renameat`. The descriptor-relative `openat`,
-/// `fstatat` and `fstat` the cache needs (`open_dir_at`, `stat_at`, `stat_fd`)
-/// come from that shared module: every operation after the initial
-/// `open`/`openat` is relative to a handle the kernel resolved once, immune
-/// to the original pathname being swapped out from under it afterward.
-#[cfg(unix)]
-mod unix_fd {
-    use std::ffi::{CString, OsStr};
-    use std::fs;
-    use std::io;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    use std::path::Path;
-
-    use khive_fs::fd_relative;
-
-    /// Open `path` as a directory, refusing to follow a symlink at the
-    /// final component. The returned handle is bound to that exact inode:
-    /// every later `*at()` call against it is immune to `path` being
-    /// replaced out from under it afterward.
-    pub(super) fn open_dir_nofollow(path: &Path) -> io::Result<fs::File> {
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-        // SAFETY: `c_path` is NUL-terminated and lives for the duration of
-        // the call; `O_NOFOLLOW` refuses a symlink at the final component
-        // and `O_DIRECTORY` refuses a non-directory.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` was just returned by a successful `open` and is
-        // owned here.
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
-    }
-
-    /// `renameat(from, name, to, to_name)` — move `name` out of `from` and
-    /// into `to` under `to_name`, both endpoints fd-relative so neither is
-    /// re-resolved by pathname at the moment of the move.
-    pub(super) fn renameat(
-        from: &fs::File,
-        name: &OsStr,
-        to: &fs::File,
-        to_name: &OsStr,
-    ) -> io::Result<()> {
-        let c_name = fd_relative::c_name(name)?;
-        let c_to_name = fd_relative::c_name(to_name)?;
-        // SAFETY: both fds are live directory descriptors; both C strings
-        // are NUL-terminated for the duration of the call.
-        let rc = unsafe {
-            libc::renameat(
-                from.as_raw_fd(),
-                c_name.as_ptr(),
-                to.as_raw_fd(),
-                c_to_name.as_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
 }
 
 /// A Win32 job object that kills every process it contains when the handle
