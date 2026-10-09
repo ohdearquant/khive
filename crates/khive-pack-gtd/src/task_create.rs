@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::mask_secrets;
 use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
@@ -281,8 +282,9 @@ pub(crate) async fn prepare_task_create(
     let status = normalize_status(status_in);
     if !is_valid_status(status) {
         return Err(RuntimeError::InvalidInput(format!(
-            "invalid status {status_in:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-             (aliases: in_progress, todo, blocked, later, finished)"
+            "invalid status {:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
+             (aliases: in_progress, todo, blocked, later, finished)",
+            mask_secrets(status_in)
         )));
     }
     if is_terminal(status) {
@@ -317,7 +319,8 @@ pub(crate) async fn prepare_task_create(
     if let Some(ref p) = priority {
         if !is_valid_priority(p) {
             return Err(RuntimeError::InvalidInput(format!(
-                "invalid priority {p:?} — valid: p0, p1, p2, p3"
+                "invalid priority {:?} — valid: p0, p1, p2, p3",
+                mask_secrets(p)
             )));
         }
     }

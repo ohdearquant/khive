@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- GTD status and priority refusals now mask credential-shaped values with the existing secret
+  masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
