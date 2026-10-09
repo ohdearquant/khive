@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::note_write::NoteWriteOptions;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, NoteTagMode, PropertyFilter};
@@ -263,7 +264,8 @@ fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeE
         None | Some("done") => Ok("done"),
         Some("cancelled") => Ok("cancelled"),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "complete: status must be \"done\" or \"cancelled\"; got {other:?}"
+            "complete: status must be \"done\" or \"cancelled\"; got {:?}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -1160,8 +1162,9 @@ pub async fn prepare_transition(
     let target = normalize_status(raw_status);
     if !is_valid_status(target) {
         return Err(RuntimeError::InvalidInput(format!(
-            "invalid status {raw_status:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-             (aliases: in_progress, todo, blocked, later, finished)"
+            "invalid status {:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
+             (aliases: in_progress, todo, blocked, later, finished)",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, raw_status)
         )));
     }
     if let Some(n) = note_arg {
@@ -1723,7 +1726,8 @@ impl GtdPack {
                 let normalized = normalize_status(s);
                 if !is_valid_status(normalized) {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "invalid status {s:?} — valid: {}",
+                        "invalid status {:?} — valid: {}",
+                        mask_for_redaction_surface(RedactionSurface::GateProbe, s),
                         crate::schema::TASK_STATUSES.join(", ")
                     )));
                 }
@@ -1733,7 +1737,8 @@ impl GtdPack {
         if let Some(ref pri) = p.priority {
             if !is_valid_priority(pri) {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "invalid priority {pri:?} — valid: p0, p1, p2, p3"
+                    "invalid priority {:?} — valid: p0, p1, p2, p3",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, pri)
                 )));
             }
         }

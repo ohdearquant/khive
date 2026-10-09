@@ -32,7 +32,7 @@ rerank, and composed into markdown briefings under a token budget.
 ## Usage
 
 This crate is not called directly as a Rust library — it registers `KnowledgePack`
-with the runtime's `inventory`-based pack registry and dispatches its 19 verbs
+with the runtime's `inventory`-based pack registry and dispatches its 20 verbs
 through the MCP `request` DSL (or `kkernel exec`). A caller issues:
 
 ```text
@@ -120,20 +120,21 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 
 ## Verbs
 
-| Verb                                                                              | What it does                                                     |
-| --------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                            |
-| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                                 |
-| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only)      |
-| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly              |
-| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget         |
-| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest               |
-| `knowledge.import`                                                                | Validate/import atlas markdown with frontmatter or path identity |
-| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                          |
-| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                          |
-| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights                   |
+| Verb                                                                              | What it does                                                                                       |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                                                              |
+| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                                                                   |
+| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only)                                        |
+| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly                                                |
+| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget                                           |
+| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest                                                 |
+| `knowledge.export`                                                                | [Deterministic namespace corpus JSONL](docs/api/export.md), returned as data plus table-row counts |
+| `knowledge.import`                                                                | Validate/import atlas markdown with frontmatter or path identity                                   |
+| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                                                            |
+| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                                                            |
+| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights                                                     |
 
-All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
+All 20 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
 
 For a cheap, stable inventory walk, call
 `knowledge.list(fields=["id","slug"], after="", limit=500)` and round-trip each

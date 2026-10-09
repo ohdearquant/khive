@@ -40,6 +40,9 @@ namespace-scoped sender records and receipts without changing transport metadata
 Revision `domain-effects-v11` classifies `brain.event_page` as `Read`: it pages stored
 event rows inside the caller's visible namespaces and writes nothing.
 
+Revision `domain-effects-v12` classifies `knowledge.export` as `Read`: it renders the
+selected namespace's live corpus rows as JSONL in the response and writes no file and no row.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -141,6 +144,7 @@ event rows inside the caller's visible namespaces and writes nothing.
 | `knowledge.delete_atoms`     | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L158)  |
 | `knowledge.edit`             | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L488)  |
 | `knowledge.eval_retrieval`   | Write  | Subhandler | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L187)  |
+| `knowledge.export`           | Read   | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L82)   |
 | `knowledge.feedback`         | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L714)  |
 | `knowledge.fold`             | Read   | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L236)  |
 | `knowledge.get`              | Read   | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L63)   |

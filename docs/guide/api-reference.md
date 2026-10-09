@@ -25,7 +25,7 @@ An always-machine-readable copy of this page is at
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
+| `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
@@ -2293,7 +2293,7 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ---
 
-## `knowledge` pack — 19 verbs
+## `knowledge` pack — 20 verbs
 
 The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
 section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
@@ -2575,6 +2575,18 @@ are rejected with or without a trailing separator. Entry, depth, and file-limit 
 exact failing path plus current and configured traversal counts. Successful responses add
 `entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
 and `sections_skipped` to the existing import counters.
+
+### `knowledge.export` — Assertive
+
+Deterministic snapshot of one namespace's corpus. `format` is optional; `jsonl` is its only value.
+The request `namespace` override selects the namespace; without it, the token's primary namespace
+is used. Returns `format`, `namespace`, `data` (one JSON object per line, typed `atom`, `domain` or
+`section`, sorted by `id` then `type`) and `counts` (`atoms`, `domains`, `sections`). No filesystem
+path, no corpus writes.
+
+```
+request(ops="knowledge.export(namespace=\"local\")")
+```
 
 ### `knowledge.challenge` — Commissive
 

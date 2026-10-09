@@ -420,6 +420,7 @@ impl VerbRegistry {
         // knowledge (ANN-maintaining search/suggest/compose are excluded)
         ("knowledge", "knowledge.get"),
         ("knowledge", "knowledge.list"),
+        ("knowledge", "knowledge.export"),
         ("knowledge", "knowledge.stats"),
         ("knowledge", "knowledge.fold"),
         ("knowledge", "knowledge.topic"),
