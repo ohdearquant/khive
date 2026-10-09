@@ -344,9 +344,8 @@ fn single_backend_opener_uses_effective_ceiling_when_configured_value_is_zero() 
     assert!(
         matches!(
             &runtime_error,
-            khive_runtime::RuntimeError::Sqlite(
-                khive_db::SqliteError::WalCapacityUnavailable { bytes, .. }
-            ) if *bytes == CEILING
+            khive_runtime::RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })
+                if matches!(source.downcast_ref(), Some(khive_db::SqliteError::WalCapacityUnavailable { bytes, .. }) if *bytes == CEILING)
         ),
         "runtime refusal must name the same ceiling; got {runtime_error:?}"
     );
