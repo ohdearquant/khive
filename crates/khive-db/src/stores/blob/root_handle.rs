@@ -68,7 +68,7 @@ pub(super) fn verify_blob_root_identity(
     root: &Path,
     root_handle: &std::fs::File,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    use khive_fs::fd_relative::FileIdentity;
 
     let current = open_dir_no_follow(root).map_err(|error| {
         std::io::Error::new(
@@ -79,9 +79,9 @@ pub(super) fn verify_blob_root_identity(
             ),
         )
     })?;
-    let expected = root_handle.metadata()?;
-    let current = current.metadata()?;
-    if expected.dev() != current.dev() || expected.ino() != current.ino() {
+    let expected = FileIdentity::of(root_handle)?;
+    let current = FileIdentity::of(&current)?;
+    if expected != current {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -671,22 +671,22 @@ pub(super) fn unlink_entry_at(
 
 #[cfg(unix)]
 pub(super) fn rename_entry_at(
-    source_fd: std::os::unix::io::RawFd,
+    source: &std::fs::File,
     from: &str,
-    destination_fd: std::os::unix::io::RawFd,
+    destination: &std::fs::File,
     to: &str,
 ) -> std::io::Result<()> {
-    let c_from = std::ffi::CString::new(from)
+    // Preserve the existing NUL diagnostics before shared component validation.
+    let _ = std::ffi::CString::new(from)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_to = std::ffi::CString::new(to)
+    let _ = std::ffi::CString::new(to)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: both names are NUL-terminated and relative to live directory
-    // handles retained from the same blob root.
-    let rc = unsafe { libc::renameat(source_fd, c_from.as_ptr(), destination_fd, c_to.as_ptr()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    khive_fs::fd_relative::rename_at(
+        source,
+        std::ffi::OsStr::new(from),
+        destination,
+        std::ffi::OsStr::new(to),
+    )
 }
 
 #[cfg(unix)]

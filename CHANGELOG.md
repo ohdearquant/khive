@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
   outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
   with the caller.
+### Changed
+
+- Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
+  verification uses the shared file identity type, preserving held handles and durability barriers.
 
 ### Breaking (Rust crates)
 
