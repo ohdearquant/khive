@@ -1196,3 +1196,76 @@ query observations, and explicit row/byte-budget refusals. The public live-windo
 semantics are specified in [ADR-022](ADR-022-events-query-surface.md)'s compound-page
 amendment; transport composition is specified in
 [ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md) Amendment 8.
+
+## Amendment: guarded partial note property updates (2026-10-09, #5069)
+
+**Status: Proposed.** This amendment accompanies its implementation for review;
+it does not establish acceptance before that review.
+
+`NoteStore` adds the provided method
+`try_patch_note_properties(&self, id: Uuid, namespace: &str, kind: &str, patch: &NotePropertyPatch) -> StorageResult<bool>`.
+The default returns `Unsupported(Notes, "try_patch_note_properties")` without
+reading or mutating storage. Existing implementations remain source-compatible.
+There is no read-and-replace or unguarded upsert fallback.
+
+`NotePropertyPatch` contains an AND-combined vector of
+`NotePropertyPrecondition`, a `BTreeMap<String, serde_json::Value>` named `set`,
+`extend_expires_at: Option<i64>` and `updated_at: i64`. Both timestamps are signed
+microseconds since the Unix epoch. The map must contain 1-32 writes; there may be
+0-32 preconditions. Keys denote literal top-level properties, not JSON paths;
+U+0000 is refused before writer acquisition.
+
+The preconditions have four explicit comparison contracts:
+
+| Variant                 | Fields                         | Match                                                                                                                           |
+| ----------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `ExtractEquals`         | `key: String, value: SqlValue` | Extracted value equals the bound scalar using the existing storage scalar comparison. SQL NULL does not equal a bound SQL NULL. |
+| `AbsentOrExtractEquals` | `key: String, value: SqlValue` | The property is absent, or the extracted equality matches.                                                                      |
+| `AbsentOrTextEquals`    | `key: String, value: String`   | The property is absent, or is JSON text equal to the supplied string.                                                           |
+| `TrueOrTextTrue`        | `key: String`                  | JSON boolean true or the exact JSON string `"true"`; numeric 1 is excluded.                                                     |
+
+In SQLite, extracted equality is `json_extract(properties, path) = value`, and
+absence is `json_type(properties, path) IS NULL`. Explicit JSON null is present
+and never gains the absent branch. Preconditions are combined with the supplied
+ID, exact namespace, exact kind and live-row predicate in the mutation itself.
+The namespace is a requested equality guard, not an authorization boundary; the
+namespace-agnostic contracts of other by-ID operations are unchanged.
+
+All writes apply together to the current stored object, preserving their JSON
+types, including explicit JSON null. SQL-NULL properties initialize as an empty
+object; other non-object documents do not match. Unmentioned properties and note
+columns remain unchanged. An absent expiry extension leaves `expires_at`
+unchanged. A supplied extension installs a missing expiry or advances an earlier
+one, never shortening a later deadline. `updated_at` becomes the maximum of its
+stored and supplied values. The ordinary matched-update version behavior remains
+in force. Missing, deleted or nonmatching rows return false without modification;
+storage errors do not become false.
+
+The SQLite implementation binds paths and values into one UPDATE. When the map
+contains `next_attempt_at`, that same statement maintains `strict_due_key` and
+`due_source` with the existing strict timestamp parser. Other patches omit those
+columns from the SET list. It executes through `SqlBridge::writer().execute()`
+over the note store's existing pool, preserving queued admission, standalone
+file fallback, in-memory settlement and storage error context. The method adds
+no private retry, alternate pool, queue or error taxonomy.
+
+Runtime's public note-store decorator applies its existing reserved-target and
+provenance protections before forwarding. A separate
+`KhiveRuntime::try_repair_quarantined_note_retention` entry point requires
+`ChannelIngestCapability` and constructs a fixed two-property patch for a live
+message in the token's namespace. It sets only `channel_slug` and
+`quarantine_content_ref`. The guards require an absent or equal content reference,
+the exact channel kind, an absent or text-equal slug, and a boolean-or-text true
+quarantine marker. It retains the original runtime backend and does not route a
+secondary note mutation to the main backend. The original attachment ownership
+checks and their ordering remain outside this single-note mutation.
+
+Acceptance covers missing/null/type distinctions, stale preconditions, unrelated
+concurrent property changes, expiry and timestamp boundaries, version behavior,
+typed writes, retry-deadline projection maintenance, invalid input before writer
+admission, default refusal, public policy refusal and capability routing. Writer
+route tests cover queue, standalone fallback and in-memory behavior with existing
+error/settlement fixtures. A duplicate replay whose quarantine precondition changes
+after lookup must retain the existing refusal and leave the current note untouched;
+matching replay remains a positive control. No schema, wire verb, general JSON
+path mutation or attachment-transaction contract is added.
