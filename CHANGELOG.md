@@ -11,18 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
   reports and statistics, and guarded fix receipts. The verb remains unimplemented.
-- Propose the `kg.proposal_cleanup` operator contract: hide old applied or rejected
 - Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
   proposals using an archive marker while retaining their identity and event history.
   Retention follows last projection activity. The handler remains unimplemented.
-
-### Fixed
-
-- GTD status and priority refusals now mask credential-shaped values with the existing secret
-  masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
-- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
-  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 
 ### Added
 
@@ -32,38 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
   Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
   writer while retaining their update and proposal guards.
-### Fixed
-
-- Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
-  decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
-  remain visible, and an additive migration rebuilds the cursor index without rewriting rows.
-### Added
-
 - `KhiveRuntime::resolve_prefix_in` resolves UUID prefixes in a named pack-owned table,
   reporting distinct-ID ambiguity and storage failures. A `PrefixScope` argument states which
   rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
   outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
   with the caller.
+
 ### Changed
 
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
-### Changed
-
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
   descriptor-relative atomic publication helpers. Checkpoints retain their separate metadata
   commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
-### Changed
-
 - Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
   their separate size limits, refusal messages and exact stored cursor bytes.
+
 ### Fixed
 
+- GTD status and priority refusals now mask credential-shaped values with the existing secret
+  masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
+- Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
+  decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
+  remain visible, and an additive migration rebuilds the cursor index without rewriting rows.
 - `git.push` accepts the optional boolean `force` validation field and refuses
   `true` with `force_denied` before transport. False and omission retain ordinary
   push behavior; null and non-boolean values return `invalid_params`.
-### Fixed
-
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
