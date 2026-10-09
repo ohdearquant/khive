@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- Symmetric-edge runtime updates now use the guarded `GraphStore` capability. Direct-fallback
+  backend failures return `RuntimeError::Storage` instead of `Sqlite`, and blocking-task join
+  failures use `Storage` instead of `Internal`; their reasons, rendered prefixes and `graph`/`update_edge`
+  operation context change. Concrete causes and writer-settlement distinctions are retained.
+  Backends without the new transaction method explicitly return `Unsupported`.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new

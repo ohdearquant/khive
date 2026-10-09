@@ -65,7 +65,7 @@ DML shape:
   read and write, and the caller must roll back rather than silently overwrite it.
 - symmetric relation (`competes_with`, `composed_with`): neither side uses the upsert builder here,
   because `upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot detect a natural-key
-  collision with a _different_ id. Canonical (`update_edge_symmetric_dml`) runs a conflict probe and
+  collision with a _different_ id. Canonical (`GraphStore::update_symmetric_edge_if_unchanged`) runs a conflict probe and
   branches in Rust inside a single uninterrupted transaction, which is safe there. This atomic path
   cannot do that (see the in-source invariant note on `prepare_update_edge`), so it always emits
   both `edge_symmetric_delete_if_conflict_statement` and

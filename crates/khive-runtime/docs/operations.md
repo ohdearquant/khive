@@ -75,12 +75,27 @@ seen-set from scratch per namespace (quadratic in namespace count). The merge ke
 which tied edge is "more correct"), reorders BFS-style (ascending depth), and re-applies `limit`
 to the merged non-root node count.
 
-### update_edge_symmetric_dml
+### Guarded symmetric-edge updates
 
-This function runs inside an existing transaction on a borrowed `&rusqlite::Connection`, so it
-binds SQL against `rusqlite::params!` rather than the `SqlStatement`/`SqlValue` plan shape used
-elsewhere — see the constants' doc comment in `khive-db` for why a single bridge type isn't used
-for both.
+`update_edge` calls `GraphStore::update_symmetric_edge_if_unchanged` with the record's stored
+namespace, canonical endpoints, patch fields and exact revision/deletion snapshot. The SQLite
+implementation in `khive-db/src/stores/graph/symmetric_update.rs` owns the conflict probe and
+one guarded mutation inside a single writer transaction. It retains the dedicated
+`UpdateSymmetricEdge` route and unbounded-wait `WriterTaskHandle::send` admission; the generic
+graph helper has a different bounded-admission policy. Compatibility fallback retains the
+pooled writer guard's transaction.
+
+The storage result distinguishes an in-place update, absorption into an unchanged live or
+tombstoned survivor, and a stale snapshot. The survivor identifier is returned as stored text
+and parsed by the runtime after commit. Refetch and the separate EdgeUpdated audit append also
+remain after commit; their failures do not undo the graph mutation. The in-place response keeps
+its existing runtime timestamp behavior, while the persisted revision strictly advances.
+
+Backend failures cross the storage capability boundary. On the direct fallback this changes
+`RuntimeError::Sqlite` (and a blocking-task join's `Internal`) to `RuntimeError::Storage`, including
+its reason and rendered prefix. The SQLite source is retained under the storage envelope;
+capacity and unknown writer settlement keep their typed classification. The queue's existing
+confirmed-rollback or unknown-settlement wrapper propagates unchanged.
 
 It binds `khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL` for the probe,
 `EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL` for the absorbed arm, and
