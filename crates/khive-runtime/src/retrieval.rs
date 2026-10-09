@@ -1116,6 +1116,9 @@ impl KhiveRuntime {
     /// Useful for reranking the top-N results from `hybrid_search` (or any other
     /// retrieval path) with exact cosine similarity against a query vector.
     /// Returns hits sorted by similarity (highest first), truncated to `top_k`.
+    /// Equal scores use ascending IDs; duplicate IDs yield one hit. Missing or
+    /// out-of-scope entity vectors are omitted. An unsupported backend returns
+    /// its capability error instead of falling back to namespace-wide search.
     pub async fn rerank(
         &self,
         token: &NamespaceToken,
@@ -1123,25 +1126,10 @@ impl KhiveRuntime {
         candidate_ids: &[Uuid],
         top_k: u32,
     ) -> RuntimeResult<Vec<VectorSearchHit>> {
-        let candidate_set: HashSet<Uuid> = candidate_ids.iter().copied().collect();
-        let ns = token.namespace().as_str().to_owned();
-        let all_hits = self
+        let mut hits = self
             .vectors(token)?
-            .search(VectorSearchRequest {
-                query_vectors: vec![query_vector.to_vec()],
-                top_k: candidate_ids.len() as u32,
-                namespace: Some(ns),
-                kind: Some(SubstrateKind::Entity),
-                embedding_model: None,
-                filter: None,
-                backend_hints: None,
-            })
+            .score_candidates(query_vector, candidate_ids, Some(SubstrateKind::Entity))
             .await?;
-        let mut hits: Vec<VectorSearchHit> = all_hits
-            .into_iter()
-            .filter(|h| candidate_set.contains(&h.subject_id))
-            .collect();
-        hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
         hits.truncate(top_k as usize);
         Ok(hits)
     }
