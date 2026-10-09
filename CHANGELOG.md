@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
+
 ### Breaking (Rust crates)
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use

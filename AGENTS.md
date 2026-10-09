@@ -224,6 +224,13 @@ object count once; matches across different objects are ambiguous and rejected. 
 object's non-null `full_id`, when supplied, must be a full UUID and determines canonical
 attribution; otherwise `id` is resolved. Default JSON recall results can be forwarded unchanged and judged
 using either alias. Rank position never supplies a judgment.
+`signal="unjudged"` records a separate `feedback_unjudged` event with available
+serve attribution, query, and candidate ids, without changing posterior state.
+It requires the same uniquely selected target and never fabricates a default
+serving profile. Optional `scorer_run_id` and `serve_ledger_id` must arrive together
+and match the serve. Unjudged preserves their grade/dedup budget: a later eligible
+`useful`, `not_useful`, or `wrong` auto-feedback judgment using that pair commits
+exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 
 ### Comm pack — 11 verbs (`comm.` prefix)
 
