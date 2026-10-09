@@ -23,9 +23,9 @@ use khive_runtime::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
     KhiveConfig, KhiveRuntime, Namespace,
 };
-use khive_storage::entity::Entity;
+use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::error::StorageError;
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteFilter};
 use khive_storage::types::VectorRecord;
 use khive_storage::VectorStore;
 use khive_types::{Pack, SubstrateKind};
@@ -584,10 +584,27 @@ async fn run_reindex_with_setup(
 
         let mut entity_after = None;
         loop {
-            let (batch, next_after) = rt
-                .list_entities_after(&token, None, None, &[], entity_after, batch_size)
+            let page = rt
+                .entities(&token)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .query_entities_after(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        legacy_entity_type_fallback: true,
+                        namespaces: token
+                            .visible_namespaces()
+                            .iter()
+                            .map(|ns| ns.as_str().to_owned())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    entity_after,
+                    batch_size,
+                )
                 .await
+                .map_err(khive_runtime::RuntimeError::from)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (batch, next_after) = (page.items, page.next_after);
             let n = batch.len();
             if n == 0 {
                 break;
@@ -645,10 +662,26 @@ async fn run_reindex_with_setup(
 
         let mut note_after = None;
         loop {
-            let (batch, next_after) = rt
-                .list_notes_after(&token, None, note_after, batch_size)
+            let page = rt
+                .notes(&token)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .query_notes_filtered_after(
+                    token.namespace().as_str(),
+                    &NoteFilter {
+                        namespaces: token
+                            .visible_namespaces()
+                            .iter()
+                            .map(|ns| ns.as_str().to_owned())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    note_after,
+                    batch_size,
+                )
                 .await
+                .map_err(khive_runtime::RuntimeError::from)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (batch, next_after) = (page.items, page.next_after);
             let n = batch.len();
             if n == 0 {
                 break;
