@@ -495,6 +495,13 @@ pub enum FilterOp {
     EqOrMissingIndexed,
     /// Matches rows where the JSON field is absent or SQL-NULL.
     JsonTypeMissing,
+    /// Matches a missing path, JSON null, or JSON text empty after SQLite's
+    /// ASCII-SPACE-only `trim`. Tabs and Unicode whitespace do not match.
+    /// `PropertyFilter.value` is unused.
+    MissingNullOrSpaceEmptyText,
+    /// Matches JSON boolean true or the exact JSON text "true", not numeric 1.
+    /// `PropertyFilter.value` is unused.
+    TrueOrTextTrue,
     /// Matches rows where the JSON field is absent or explicitly JSON `null`,
     /// while constraining its index key to the empty recipient key. This is
     /// the index-friendly legacy-recipient partition used with
@@ -631,6 +638,24 @@ impl From<&Note> for NoteKeyCursor {
     }
 }
 
+/// Inclusive expiry cutoff with a creation cutoff only for notes without an expiry.
+/// Both bounds use microseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteExpiryFallback {
+    pub expires_at_or_before: i64,
+    pub created_at_or_before: i64,
+}
+
+/// Ascending native timestamp order, with ascending note ID as the final tie-break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteTimeOrder {
+    /// `expires_at ASC, id ASC`; absent expiries sort first.
+    ExpiresAt,
+    /// `COALESCE(expires_at, created_at) ASC, id ASC`.
+    ExpiresAtOrCreatedAt,
+}
+
 /// Filter + sort options for [`NoteStore::query_notes_filtered`].
 ///
 /// Designed for general property-based filtering on any JSON field, not
@@ -659,6 +684,25 @@ pub struct NoteFilter {
     /// Restrict to notes where `created_at >= min_created_at` (microseconds epoch).
     /// `None` applies no lower-bound constraint.
     pub min_created_at: Option<i64>,
+    /// Inclusive creation-time upper bound in microseconds since the Unix epoch.
+    #[serde(default)]
+    pub max_created_at: Option<i64>,
+    /// Inclusive expiry-time upper bound in microseconds since the Unix epoch.
+    /// Rows with no expiry do not match a supplied bound.
+    #[serde(default)]
+    pub max_expires_at: Option<i64>,
+    /// Include soft-deleted rows in filtered reads. Property patches remain live-only.
+    #[serde(default)]
+    pub include_deleted: bool,
+    /// Select expired notes, falling back to creation time only when expiry is absent.
+    /// This predicate is ANDed with all other bounds and property filters.
+    #[serde(default)]
+    pub expiry_fallback: Option<NoteExpiryFallback>,
+    /// Native ascending timestamp order for counted/count-free/bounded pages.
+    /// Incompatible with property/instant/unordered ordering or any cursor.
+    /// Keyed/sequence reads and filtered mutations reject it; counts ignore ordering.
+    #[serde(default)]
+    pub time_order: Option<NoteTimeOrder>,
     #[serde(default)]
     pub min_updated_at: Option<i64>,
     #[serde(default)]
@@ -688,6 +732,27 @@ pub struct NoteFilter {
     /// only ever contains rows the reader is allowed to see.
     #[serde(default)]
     pub mailbox: Option<NoteMailboxScope>,
+}
+
+impl NoteFilter {
+    /// Select expiry timestamps at or before `micros` (inclusive, Unix microseconds).
+    /// A note without an expiry does not match this bound.
+    pub fn expires_before(mut self, micros: i64) -> Self {
+        self.max_expires_at = Some(micros);
+        self
+    }
+
+    /// Select creation timestamps at or before `micros` (inclusive, Unix microseconds).
+    pub fn created_before(mut self, micros: i64) -> Self {
+        self.max_created_at = Some(micros);
+        self
+    }
+
+    /// Include tombstones in filtered reads without permitting property patches on them.
+    pub fn include_deleted(mut self) -> Self {
+        self.include_deleted = true;
+        self
+    }
 }
 
 /// The actor partition a mailbox reader may see, as evaluated by the store.
