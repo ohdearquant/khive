@@ -2079,8 +2079,8 @@ async fn list_embedding_models_returns_row_after_insert() {
     assert_eq!(records[0].engine_name, "test_engine");
     assert_eq!(records[0].model_id, "test-model-v1");
     assert_eq!(records[0].key_version, "v1");
-    assert_eq!(records[0].dimensions, 384);
-    assert_eq!(records[0].status, "active");
+    assert_eq!(records[0].dim, 384);
+    assert_eq!(records[0].status, crate::EmbeddingModelStatus::Active);
 
     // engine filter — match
     let filtered = rt
@@ -2128,9 +2128,7 @@ async fn named_vector_store_rejects_dimension_or_model_key_rebinding() {
         .await
         .expect("list model registry");
     assert!(registered.iter().any(|record| {
-        record.model_id == "model-a"
-            && record.key_version == "visual_contract"
-            && record.dimensions == 4
+        record.model_id == "model-a" && record.key_version == "visual_contract" && record.dim == 4
     }));
     let wrong_dimensions = NamedVectorIdentity::new("visual_contract", "model-a", 5).unwrap();
     let Err(dimension_error) = rt
@@ -2230,9 +2228,7 @@ async fn rebound_core_named_vector_lookup_uses_new_backend() {
         .await
         .expect("second backend model registry");
     assert!(registered.iter().any(|record| {
-        record.model_id == "model-a"
-            && record.key_version == "rebound_visual"
-            && record.dimensions == 4
+        record.model_id == "model-a" && record.key_version == "rebound_visual" && record.dim == 4
     }));
 }
 
@@ -2324,12 +2320,12 @@ async fn named_vector_registry_keeps_immutable_revisions_active_together() {
         record.engine_name == "visual_revision_a"
             && record.model_id == "visual-model"
             && record.key_version == "visual_revision_a"
-            && record.status == "active"
+            && record.status == crate::EmbeddingModelStatus::Active
     }));
     assert!(registered.iter().any(|record| {
         record.engine_name == "visual_revision_b"
             && record.model_id == "visual-model"
             && record.key_version == "visual_revision_b"
-            && record.status == "active"
+            && record.status == crate::EmbeddingModelStatus::Active
     }));
 }
