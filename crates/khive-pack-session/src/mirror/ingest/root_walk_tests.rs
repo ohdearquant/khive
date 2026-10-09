@@ -9,6 +9,23 @@ use tempfile::TempDir;
 use super::*;
 use crate::mirror::ingest::file_identity;
 
+#[test]
+fn source_link_length_preserves_non_utf8_bytes_and_nonlink_errno() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().expect("fixture directory");
+    let target = OsString::from_vec(vec![b'a', 0xff, b'/', 0xc3, 0xa9]);
+    std::os::unix::fs::symlink(&target, temp.path().join("link")).expect("link");
+    let parent = File::open(temp.path()).expect("parent");
+    assert_eq!(read_link_length(&parent, OsStr::new("link")).unwrap(), 5);
+
+    std::fs::write(temp.path().join("ordinary"), b"file").expect("ordinary file");
+    let error =
+        read_link_length(&parent, OsStr::new("ordinary")).expect_err("ordinary file is not a link");
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+}
+
 fn shared_refusal(error: &std::io::Error) -> &AncestorLinkRefusal {
     error
         .get_ref()
