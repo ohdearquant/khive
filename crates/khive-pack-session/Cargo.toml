@@ -40,6 +40,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+khive-storage = { version = "0.11.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["full"] }
 lattice-embed = { workspace = true }
 rusqlite = { workspace = true }
