@@ -189,9 +189,13 @@ pub struct ImportArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Import format. Default is the `KgArchive` JSON envelope.
-    #[arg(long, value_enum, default_value_t = ImportFormat::Archive)]
-    pub format: ImportFormat,
+    /// Import format. Infer CSV or TSV by extension; otherwise use archive JSON.
+    #[arg(long, value_enum)]
+    pub format: Option<ImportFormat>,
+
+    /// Entity kind for CSV/TSV rows with a missing or blank kind.
+    #[arg(long)]
+    pub default_kind: Option<String>,
 
     /// Print adapter warnings to stderr.
     #[arg(long)]
@@ -204,6 +208,8 @@ pub enum ImportFormat {
     Archive,
     Json,
     Ndjson,
+    Csv,
+    Tsv,
 }
 
 /// CLI arguments for `kkernel kg status`.
