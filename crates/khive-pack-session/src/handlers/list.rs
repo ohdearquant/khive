@@ -36,15 +36,11 @@ pub(crate) async fn handle_list(
     require_non_empty_if_present(&p.provider, "provider", VERB)?;
     require_non_empty_if_present(&p.agent_id, "agent_id", VERB)?;
 
-    let limit = match p.limit {
-        None => DEFAULT_LIMIT,
-        Some(l) if (1..=MAX_LIMIT).contains(&l) => l,
-        Some(l) => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "{VERB}: limit must be in 1..={MAX_LIMIT}; valid values: integers 1 through {MAX_LIMIT}; got {l}"
-            )))
-        }
-    };
+    let limit = super::validate_limit(p.limit, DEFAULT_LIMIT, MAX_LIMIT).map_err(|l| {
+        RuntimeError::InvalidInput(format!(
+            "{VERB}: limit must be in 1..={MAX_LIMIT}; valid values: integers 1 through {MAX_LIMIT}; got {l}"
+        ))
+    })?;
     let offset = p.offset.unwrap_or(0) as u64;
 
     let mut property_filters = Vec::new();
