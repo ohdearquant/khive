@@ -465,8 +465,7 @@ async fn configured_file_transfer_opt_in_reaches_both_runtime_conversion_paths()
                 khive_runtime::RuntimeConfig::no_embeddings(),
             );
             resolved.db_path = None;
-            resolved.embedding_model = None;
-            resolved.additional_embedding_models.clear();
+            resolved.disable_embedding_models();
             let runtime = durable_runtime(&roots, resolved);
             let store = Arc::new(FsBlobStore::new(roots.path(&format!("cas-{index}")), 0).unwrap());
             runtime.install_blob_store(store).unwrap();
