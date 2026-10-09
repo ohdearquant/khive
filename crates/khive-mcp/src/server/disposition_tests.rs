@@ -1007,8 +1007,8 @@ impl ErrorConstructorCensus {
             && self.function_depth == 1
     }
     fn central_entry_builder(&self) -> bool {
-        self.root_function("khive-mcp/src/server.rs", "failure_entry")
-            || self.root_function("khive-mcp/src/server.rs", "aborted_entry")
+        self.root_function("khive-mcp/src/server/batch_types.rs", "failure_entry")
+            || self.root_function("khive-mcp/src/server/batch_types.rs", "aborted_entry")
     }
     fn inspect_json(&mut self, parsed: &JsonSyntax) {
         let summary = ["total", "succeeded", "failed", "aborted"]
@@ -1125,7 +1125,10 @@ impl ErrorConstructorCensus {
                 } else {
                     name.ident == "error_with_disposition"
                         && path.path.segments.len() == 1
-                        && self.source == "khive-mcp/src/server.rs"
+                        && matches!(
+                            self.source.as_str(),
+                            "khive-mcp/src/server.rs" | "khive-mcp/src/server/batch_types.rs"
+                        )
                         && self.modules.is_empty()
                 }
             }
@@ -1206,6 +1209,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server.rs",
         "search_diagnostics",
         "khive-mcp/src/server/search_diagnostics.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "batch_types",
+        "khive-mcp/src/server/batch_types.rs",
     ),
     (
         "khive-mcp/src/server.rs",
@@ -1618,15 +1626,20 @@ fn a3_constructor_census_rejects_new_raw_sites_and_unclassified_variants() {
         r#"fn added() { DaemonResponseFrame { ok: false, error: Some("lost"), error_detail: Some(json!({"message":"lost"})) }; }"#,
         r#"mod unscanned_envelope_builders;"#,
     ] {
-        let mut census = ErrorConstructorCensus {
-            source: "khive-mcp/src/server.rs".into(),
-            ..Default::default()
-        };
-        census.visit_file(&syn::parse_file(mutation).expect("valid mutation fixture"));
-        assert!(
-            !census.offenders.is_empty(),
-            "scanner accepted unclassified mutation: {mutation}"
-        );
+        for source in [
+            "khive-mcp/src/server.rs",
+            "khive-mcp/src/server/batch_types.rs",
+        ] {
+            let mut census = ErrorConstructorCensus {
+                source: source.into(),
+                ..Default::default()
+            };
+            census.visit_file(&syn::parse_file(mutation).expect("valid mutation fixture"));
+            assert!(
+                !census.offenders.is_empty(),
+                "scanner accepted unclassified mutation in {source}: {mutation}"
+            );
+        }
     }
     let mut census = ErrorConstructorCensus::default();
     census.visit_file(&syn::parse_file(r#"
