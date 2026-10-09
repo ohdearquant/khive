@@ -262,6 +262,7 @@ pub use crate::config::{
 struct CoreEmbedderState {
     registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
+    engines: Option<Vec<crate::engine_config::EngineConfig>>,
     embedding_model: Option<EmbeddingModel>,
     additional_embedding_models: Vec<EmbeddingModel>,
 }
@@ -475,10 +476,11 @@ impl KhiveRuntime {
     }
 
     pub(crate) fn new_with_file_backend(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
         #[cfg(all(test, target_os = "macos"))]
@@ -554,9 +556,10 @@ impl KhiveRuntime {
     }
 
     fn new_readonly_with_file_backend(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
         #[cfg(all(test, target_os = "macos"))]
@@ -592,16 +595,34 @@ impl KhiveRuntime {
     /// backend. Prefer [`Self::from_prepared_backend`] when constructing one
     /// fallible host runtime.
     ///
-    /// The returned runtime has `db_path = None` and `embedding_model = None`; all
-    /// storage access is through the provided `backend`. Set `backend_id` and
-    /// `default_namespace` via the config builder pattern if non-defaults are needed.
+    /// All storage access is through the provided `backend`; the config's
+    /// ordered embedding peers are prepared before assembly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine configuration is invalid. Use
+    /// [`Self::try_from_backend`] to handle configuration errors at startup.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        Self::try_from_backend(backend, config)
+            .expect("from_backend requires a valid embedding engine configuration")
+    }
+
+    /// Assemble an already-opened backend after validating its engine config.
+    ///
+    /// This retains [`Self::from_backend`]'s warning-only storage-model
+    /// registration policy; use [`Self::from_prepared_backend`] when those
+    /// registration failures must also abort startup.
+    pub fn try_from_backend(
+        backend: Arc<StorageBackend>,
+        mut config: RuntimeConfig,
+    ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         if !backend.is_read_only() {
             if let Err(err) = register_configured_embedding_models(&backend, &config) {
                 tracing::warn!(error = %err, "failed to register configured embedding models");
             }
         }
-        Self::assemble_from_backend(backend, config, false)
+        Ok(Self::assemble_from_backend(backend, config, false))
     }
 
     /// Construct a single-backend runtime after a host boot coordinator has
@@ -612,8 +633,9 @@ impl KhiveRuntime {
     /// semantics. This method never runs migrations itself.
     pub fn from_prepared_backend(
         backend: Arc<StorageBackend>,
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         if backend.attachment_cutover_status()?
             != khive_db::migrations::AttachmentCutoverStatus::Complete
         {
@@ -731,6 +753,7 @@ impl KhiveRuntime {
         self.core_embedders = Some(CoreEmbedderState {
             registry: main.embedder_registry.clone(),
             default_embedder_name: main.default_embedder_name.clone(),
+            engines: main.config.engines.clone(),
             embedding_model: main.config.embedding_model,
             additional_embedding_models: main.config.additional_embedding_models.clone(),
         });
@@ -770,6 +793,7 @@ impl KhiveRuntime {
                 None => self.clone(),
                 Some(core_embedders) => {
                     let mut core = self.clone();
+                    core.config.engines = core_embedders.engines.clone();
                     core.config.embedding_model = core_embedders.embedding_model;
                     core.config.additional_embedding_models =
                         core_embedders.additional_embedding_models.clone();
@@ -789,6 +813,7 @@ impl KhiveRuntime {
                 // `config.embedding_model` (`resolve_embedding_model`).
                 let (embedder_registry, default_embedder_name) = match &self.core_embedders {
                     Some(core_embedders) => {
+                        core_config.engines = core_embedders.engines.clone();
                         core_config.embedding_model = core_embedders.embedding_model;
                         core_config.additional_embedding_models =
                             core_embedders.additional_embedding_models.clone();
@@ -2522,6 +2547,16 @@ impl KhiveRuntime {
         &self,
         provider: impl crate::embedder_registry::EmbedderProvider + 'static,
     ) -> RuntimeResult<()> {
+        if let Some(engine) = self
+            .config
+            .engines
+            .as_ref()
+            .and_then(|engines| engines.iter().find(|engine| engine.name == provider.name()))
+        {
+            engine
+                .check_dimensions(provider.dimensions())
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        }
         let mut registry = self
             .embedder_registry
             .write()

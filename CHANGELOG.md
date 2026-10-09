@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive-runtime` accepts ordered peer `[[engines]]` entries with `name`, unit-default
+  `weight`, and checked `dims`. `EngineConfig` replaces `model`, `default`, and
+  `fusion_weight`; `RuntimeConfig` adds an authoritative optional peer list and
+  `KhiveConfig` records an explicit empty list. Legacy TOML is converted with its
+  former default first and canonical provider/index names preserved. Duplicate aliases,
+  storage-key collisions, mixed schemas, invalid dimensions, and weights that are not
+  applied by every retrieval path fail explicitly. Startup checks built-in provider
+  dimensions; custom provider binding remains unavailable pending its startup integration.
+  Direct struct literals and exhaustive `ConfigError` matches must be updated.
+  Use `disable_embedding_models()` to clear peers and legacy projections together.
+  Daemon reuse now requires the same ordered engine configuration.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
