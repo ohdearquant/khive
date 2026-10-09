@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `KhiveRuntime::resolve_prefix_in` resolves UUID prefixes in a named pack-owned table,
+  reporting distinct-ID ambiguity and storage failures. This unfiltered lookup includes all
+  namespaces and tombstones; callers retain their own authorization and row-selection policy.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
