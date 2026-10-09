@@ -1159,7 +1159,10 @@ and lifecycle evidence; completed hold includes connection reset/replacement bef
 `reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
 connection then also failed to open, permanently shrinking the physical pool by one slot below
 `max_readers`; non-zero here means the pool has fewer physical reader connections than
-configured, and each occurrence is also logged at `warn`.
+configured, and each occurrence is also logged at `warn`. A pooled reader is disqualified on
+return once it is older than `KHIVE_READER_MAX_AGE_SECS` (default 300) or has served more than
+`KHIVE_READER_MAX_OPS` checkouts (default 5000); the replacement is opened before the slot is
+reused.
 
 The timeout setting applies to each admission attempt. A verb that issues several sequential
 reads can spend more than one configured timeout in total wall time, but each attempt is bounded

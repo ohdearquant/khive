@@ -379,6 +379,8 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   An unparseable numeric value here is treated as unset (falls back to the default).
 #   KHIVE_BUSY_TIMEOUT_SECS=30           SQLite busy_timeout per connection.
 #   KHIVE_CHECKOUT_TIMEOUT_SECS=5        Max wait to check out a pooled reader connection.
+#   KHIVE_READER_MAX_AGE_SECS=300        Close and replace a pooled reader older than this on return (0 = every return).
+#   KHIVE_READER_MAX_OPS=5000            Close and replace a pooled reader after more than this many checkouts (0 = every return).
 #   WAL autocheckpoint is not configurable: disabled where the dedicated checkpoint task runs
 #   (it owns routine passes), bounded at 4000 pages on pools without one.
 #   KHIVE_WAL_HIGH_WATER_PAGES=6000      WAL size that logs a high-pressure warning. Must be > 0.
