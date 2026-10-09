@@ -2,6 +2,7 @@
 
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
+use khive_types::EventKind;
 
 use crate::event::interpret;
 use khive_brain_core::{BalancedRecallState, SectionPosteriorState};
@@ -29,6 +30,10 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
         event: &Event,
         _ctx: &FoldContext,
     ) -> BalancedRecallState {
+        // Unlike other irrelevant events, unjudged telemetry is not a training event.
+        if event.kind == EventKind::FeedbackUnjudged {
+            return state;
+        }
         let signal = interpret(event);
         state.apply_signal(&signal);
         state
@@ -99,6 +104,50 @@ mod tests {
         e.outcome = outcome;
         e.target_id = target;
         e
+    }
+
+    #[test]
+    fn unjudged_feedback_preserves_full_fold_state() {
+        let context = FoldContext::new();
+        let balanced_fold = BalancedRecallFold::new(16);
+        let section_fold = SectionPosteriorFold::new();
+        let balanced = balanced_fold.init(&context);
+        let sections = section_fold.init(&context);
+        let before_balanced = serde_json::to_value(balanced.to_snapshot()).unwrap();
+        let before_sections = serde_json::to_value(sections.to_snapshot()).unwrap();
+        let mut event = make_event(
+            "brain.feedback",
+            EventOutcome::Success,
+            Some(Uuid::new_v4()),
+        );
+        event.kind = EventKind::FeedbackUnjudged;
+        event.payload =
+            serde_json::json!({"signal": "useful", "section_signals": {"overview": "useful"}});
+
+        let balanced = balanced_fold.reduce(balanced, &event, &context);
+        let sections = section_fold.reduce(sections, &event, &context);
+        assert_eq!(
+            serde_json::to_value(balanced.to_snapshot()).unwrap(),
+            before_balanced
+        );
+        assert_eq!(
+            serde_json::to_value(sections.to_snapshot()).unwrap(),
+            before_sections
+        );
+
+        event.kind = EventKind::FeedbackExplicit;
+        let balanced = balanced_fold.reduce(balanced, &event, &context);
+        let sections = section_fold.reduce(sections, &event, &context);
+        assert_eq!(balanced.total_events, 1);
+        assert_eq!(sections.total_events, 1);
+        assert_ne!(
+            serde_json::to_value(balanced.to_snapshot()).unwrap(),
+            before_balanced
+        );
+        assert_ne!(
+            serde_json::to_value(sections.to_snapshot()).unwrap(),
+            before_sections
+        );
     }
 
     #[test]

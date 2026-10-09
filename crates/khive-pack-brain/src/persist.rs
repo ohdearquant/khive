@@ -45,6 +45,7 @@ use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlReader, SqlWriter};
+use khive_types::EventKind;
 
 use khive_brain_core::{
     validate_brain_state_snapshot_with_capacity, BrainSignal, BrainState, BrainStateSnapshot,
@@ -1233,6 +1234,11 @@ async fn load_events_since_with_window(
                 continue;
             }
         };
+        // Telemetry is retained without applying evidence validation or exclusion rules.
+        if event.kind == EventKind::FeedbackUnjudged {
+            events.push(event);
+            continue;
+        }
         if event.verb == "brain.section_feedback" {
             if let Err(error) = crate::section_feedback::decode_event(&event) {
                 push_quarantine(
@@ -1352,6 +1358,10 @@ pub async fn ensure_loaded(
             let mut bs = BrainState::from_snapshot(snapshot, entity_capacity);
 
             for event in &replay_result.events {
+                // Do not count telemetry or seed a serving profile's section state.
+                if event.kind == EventKind::FeedbackUnjudged {
+                    continue;
+                }
                 if event.verb == "brain.section_feedback" {
                     if let Err(error) = crate::section_feedback::replay(&mut bs, event) {
                         tracing::warn!(event_id = %event.id, %error, "section feedback replay skipped");
@@ -1694,6 +1704,162 @@ mod brain_007_replay_quarantine {
             .await
             .expect("seed snapshot");
         snapshot
+    }
+
+    #[tokio::test]
+    async fn unjudged_replay_is_retained_without_training_or_quarantine() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let mixed = rt
+            .authorize(Namespace::parse("unjudged-mixed").unwrap())
+            .unwrap();
+        let control = rt
+            .authorize(Namespace::parse("unjudged-control").unwrap())
+            .unwrap();
+        let sql = rt.sql();
+        let baseline = seed_snapshot(&rt, control.namespace().as_str()).await;
+        upsert_snapshot(sql.as_ref(), mixed.namespace().as_str(), &baseline, 500_000)
+            .await
+            .unwrap();
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+
+        let mut feedback = Event::new(
+            control.namespace().as_str(),
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        feedback.target_id = Some(Uuid::new_v4());
+        feedback.payload = serde_json::json!({"signal": "useful",
+            "section_signals": {"overview": "useful"},
+            "served_by_profile_id": "balanced-recall-v1"});
+        let mut telemetry = Vec::new();
+        for (verb, signal, sections) in [
+            ("brain.feedback", "unjudged", serde_json::Value::Null),
+            (
+                "brain.feedback",
+                "useful",
+                serde_json::json!({"overview": "useful"}),
+            ),
+            (
+                "brain.feedback",
+                "implicit_positive",
+                serde_json::json!({"unknown": "wrong"}),
+            ),
+            ("brain.section_feedback", "useful", serde_json::json!({})),
+        ] {
+            let mut event = feedback.clone();
+            event.id = Uuid::new_v4();
+            event.namespace = mixed.namespace().as_str().to_owned();
+            event.verb = verb.to_owned();
+            event.kind = EventKind::FeedbackUnjudged;
+            event.created_at = POLICY_EXCLUSION_WINDOW_START_US + 1;
+            event.payload = serde_json::json!({"signal": signal, "section_signals": sections,
+                "served_by_profile_id": "telemetry-only-profile"});
+            append_brain_event(
+                sql.as_ref(),
+                &event.namespace,
+                "telemetry-only-profile",
+                &event.verb,
+                &serde_json::to_value(&event).unwrap(),
+                600_001 + telemetry.len() as i64,
+            )
+            .await
+            .unwrap();
+            telemetry.push(event);
+        }
+        let loaded = load_events_since(sql.as_ref(), mixed.namespace().as_str(), 500_000)
+            .await
+            .unwrap();
+        assert_eq!(loaded.events, telemetry);
+        assert!(
+            loaded.quarantined.is_empty(),
+            "telemetry must not be quarantined or policy-excluded"
+        );
+        let state = Mutex::new(BrainState::new(16));
+        ensure_loaded(
+            &rt,
+            &mixed,
+            &Mutex::new(PersistenceTracker::new()),
+            &state,
+            16,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(state.lock().unwrap().to_snapshot()).unwrap(),
+            baseline_json
+        );
+
+        let mut snapshots = Vec::new();
+        for token in [&control, &mixed] {
+            feedback.namespace = token.namespace().as_str().to_owned();
+            append_brain_event(
+                sql.as_ref(),
+                &feedback.namespace,
+                "balanced-recall-v1",
+                &feedback.verb,
+                &serde_json::to_value(&feedback).unwrap(),
+                700_001,
+            )
+            .await
+            .unwrap();
+            let mut malformed = feedback.clone();
+            malformed.id = Uuid::new_v4();
+            malformed.payload["section_signals"] = serde_json::json!({"unknown": "wrong"});
+            append_brain_event(
+                sql.as_ref(),
+                &malformed.namespace,
+                "balanced-recall-v1",
+                &malformed.verb,
+                &serde_json::to_value(&malformed).unwrap(),
+                700_002,
+            )
+            .await
+            .unwrap();
+            let loaded = load_events_since(sql.as_ref(), token.namespace().as_str(), 500_000)
+                .await
+                .unwrap();
+            assert_eq!(loaded.quarantine_count(), 1);
+            assert_eq!(loaded.policy_excluded_count(), 0);
+            assert!(loaded.quarantined[0].reason.contains("section_signals"));
+            assert!(loaded.events.contains(&feedback));
+
+            let state = Mutex::new(BrainState::new(16));
+            ensure_loaded(
+                &rt,
+                token,
+                &Mutex::new(PersistenceTracker::new()),
+                &state,
+                16,
+            )
+            .await
+            .unwrap();
+            let state = state.lock().unwrap();
+            assert_eq!(state.balanced_recall.total_events, 1);
+            assert_eq!(
+                state
+                    .balanced_recall
+                    .entity_posteriors
+                    .get(&feedback.target_id.unwrap())
+                    .unwrap()
+                    .alpha(),
+                2.0
+            );
+            assert_eq!(state.section_states["balanced-recall-v1"].total_events, 1);
+            assert!(!state.section_states.contains_key("telemetry-only-profile"));
+            assert!(!state.profiles.contains_key("telemetry-only-profile"));
+            assert!(!state.profile_states.contains_key("telemetry-only-profile"));
+            snapshots.push(serde_json::to_value(state.to_snapshot()).unwrap());
+        }
+        assert_ne!(
+            snapshots[0], baseline_json,
+            "ordinary feedback must still train"
+        );
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "unjudged rows must not affect any persisted brain state"
+        );
     }
 
     /// Assert that section posteriors and epoch are at the initial (baseline) values,
