@@ -156,15 +156,9 @@ fn require_positive_scope(scope: Option<&str>) -> Result<&str, RuntimeError> {
 
 fn validate(params: Value) -> Result<ValidatedSearch, RuntimeError> {
     let p: SearchParams = deser(params)?;
-    let limit = match p.limit {
-        None => DEFAULT_LIMIT,
-        Some(n) if (1..=MAX_LIMIT).contains(&n) => n,
-        Some(n) => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "{VERB}: limit must be in 1..={MAX_LIMIT}; got {n}"
-            )))
-        }
-    };
+    let limit = super::validate_limit(p.limit, DEFAULT_LIMIT, MAX_LIMIT).map_err(|n| {
+        RuntimeError::InvalidInput(format!("{VERB}: limit must be in 1..={MAX_LIMIT}; got {n}"))
+    })?;
     if let Some(source) = p.source.as_deref() {
         if !VALID_SOURCES.contains(&source) {
             return Err(RuntimeError::InvalidInput(format!(
