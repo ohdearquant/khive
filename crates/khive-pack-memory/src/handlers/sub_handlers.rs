@@ -249,7 +249,7 @@ impl MemoryPack {
         let (memory_ids, notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
 
-        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize)?;
 
         let fused_candidates: Vec<Value> = fused
             .into_iter()

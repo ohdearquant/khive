@@ -618,7 +618,7 @@ impl MemoryPack {
             map
         };
 
-        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize)?;
         // Needed on both the empty and non-empty completion paths.
         let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 

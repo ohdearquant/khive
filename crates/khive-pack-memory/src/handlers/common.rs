@@ -904,7 +904,7 @@ pub(super) fn fuse_candidates(
     memory_ids: &HashSet<Uuid>,
     cfg: &RecallConfig,
     limit: usize,
-) -> Vec<SearchHit> {
+) -> Result<Vec<SearchHit>, RuntimeError> {
     let text_source: Vec<_> = candidates
         .text_hits
         .iter()
@@ -957,37 +957,35 @@ pub(super) fn fuse_candidates(
         s
     };
 
-    if sources.is_empty() || sources.iter().all(|s| s.is_empty()) {
-        return vec![];
-    }
-
     let retrieval_cfg = retrieval_hybrid_config(&cfg.fuse_strategy, limit);
     let mut emitted = HashSet::new();
-    fuse_labelled_scored(sources, &retrieval_cfg, combine_best_ranked_evidence)
-        .into_iter()
-        .map(|(id, score, label)| {
-            // A pass-through strategy returns a repeated id once per copy, and only the first
-            // copy carries the labels its appearances combine to.
-            let (source, title, snippet) = if emitted.insert(id) {
-                (label.source, label.title, label.snippet)
-            } else if vector_only {
-                (SearchSource::Vector, None, None)
-            } else {
-                (SearchSource::Text, None, None)
-            };
-            SearchHit {
-                entity_id: id,
-                score,
-                // The retrieval helper resolves custom strategies to its RRF fallback.
-                rank_score_kind: khive_runtime::RankScoreKind::of(&cfg.fuse_strategy)
-                    .unwrap_or(khive_runtime::RankScoreKind::Rrf),
-                signals: khive_runtime::SearchSignals::default(),
-                source,
-                title,
-                snippet,
-            }
-        })
-        .collect()
+    Ok(
+        fuse_labelled_scored(sources, &retrieval_cfg, combine_best_ranked_evidence)?
+            .into_iter()
+            .map(|(id, score, label)| {
+                // A pass-through strategy returns a repeated id once per copy, and only the first
+                // copy carries the labels its appearances combine to.
+                let (source, title, snippet) = if emitted.insert(id) {
+                    (label.source, label.title, label.snippet)
+                } else if vector_only {
+                    (SearchSource::Vector, None, None)
+                } else {
+                    (SearchSource::Text, None, None)
+                };
+                SearchHit {
+                    entity_id: id,
+                    score,
+                    // The retrieval helper resolves custom strategies to its RRF fallback.
+                    rank_score_kind: khive_runtime::RankScoreKind::of(&cfg.fuse_strategy)
+                        .unwrap_or(khive_runtime::RankScoreKind::Rrf),
+                    signals: khive_runtime::SearchSignals::default(),
+                    source,
+                    title,
+                    snippet,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Maximum number of OR terms sent to the FTS5 trigram index per recall query.

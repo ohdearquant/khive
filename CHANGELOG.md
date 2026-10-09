@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructors and exhaustive destructurings must account for it. The `db_diagnostics` response
   now exposes this cumulative pool counter beside `reader_replacement_open_failures`, including
   successful reader recycling without changing pool behavior.
+- `khive-retrieval`'s `fuse_search_results`, `hybrid::fuse_labelled_scored`, and
+  `DualIndexRouter::merge_results` now return `Result<Vec<_>, khive_fusion::FuseError>`;
+  callers must handle or propagate failures. Invalid weighted-RRF parameters, source counts and
+  score overflow now propagate through memory recall instead of appearing as no results, including
+  empty candidate sets. The checked helper keeps its `RetrievalError` result type, and existing
+  unchecked `Weighted`/`Custom` fallback behavior is preserved.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new

@@ -551,7 +551,7 @@ mod tests {
 
         // Fuse the results -- same Id type (Uuid) means fusion works
         let config = HybridConfig::new(10);
-        let fused = fuse_search_results(vec![vec_hits, kw_hits], &config);
+        let fused = fuse_search_results(vec![vec_hits, kw_hits], &config).unwrap();
 
         assert!(!fused.is_empty());
         // The single shared UUID should appear in fused results
