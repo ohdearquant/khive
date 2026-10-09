@@ -7,18 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-08
+
 ### Changed
 
+- Breaking Rust API change: `khive_vamana::VisitedSet` (also `khive_vamana::graph::VisitedSet`) is
+  now a re-export of `khive_types::vector::VisitedSet`, the visited-node tracker shared with the
+  HNSW index. The path still resolves, but it names a different type than 0.10.0 did, so a consumer
+  that implemented a trait for the old type or depended on its crate identity adjusts to the shared
+  one.
+- Breaking Rust API change: `khive_storage::StorageError::WriterTaskTerminated` and
+  `khive_runtime::events_split::WireWriterTaskFailure::TaskTerminated` each gain a field,
+  `sqlite_full_codes: Option<(i32, i32)>`. Neither enum is `#[non_exhaustive]`, so a downstream
+  pattern that names either variant without `..`, and a literal that builds either variant, no
+  longer compiles. Add `..` to the pattern. Build the storage variant with the new
+  `StorageError::writer_task_terminated(request_state)`, which leaves the field `None`, or set the
+  field in the literal. On the events socket the field is omitted when it is `None` and defaults to
+  `None` when absent.
+- Breaking Rust API change: `khive_storage::entity::EntityFilter` gains `property_equalities` and
+  `tombstones`, and `khive_storage::event::EventFilter` gains `outcome` and `payload_equalities`.
+  Neither struct is `#[non_exhaustive]`, so an external struct literal that lists every field no
+  longer compiles; end it with `..Default::default()`. A serialized filter from 0.10.0 still
+  deserializes, and the new fields default to the earlier behavior: live rows only, with no outcome
+  or JSON restriction.
+- The `kkernel` git annotation repair preview now reads commit notes and project links for the
+  acknowledged SHAs in batches of up to 900 SHAs, where it ran two queries per SHA. The class
+  assigned to each SHA and the preview hash are preserved; 2,000 SHAs take six lookup reads.
 - Entity updates now distinguish an omitted `description` from an explicit `null`: omission
   keeps the stored value, `null` clears it, and an empty string stays a concrete value. Before,
   `description: null` was a no-op. Canonical and atomic updates also refuse a present `salience`
   or `decay_factor`, `null` included, on an entity or edge target, where it used to be ignored;
   the record is left unchanged and the refusal comes before any sibling field is applied.
 
+### Added
+
+- `khive_types::vector` adds explicit f32 byte codecs: `encode_f32_le` and `decode_f32_le` for
+  portable little-endian bytes, `encode_f32_native` and `decode_f32_native` for the host-order
+  layout that sqlite-vec stores, and `VectorCodecError`, which the decoders return when the input
+  is not a whole number of 4-byte values. `khive-storage` re-exports all five.
+  `VamanaIndex::to_bytes` now writes the vectors segment of its portable container as
+  little-endian on every target; the bytes are unchanged on little-endian hosts.
+- `khive_fs::fd_relative::FileIdentity` reports the device and inode of an open file
+  (`FileIdentity::of`) or of an entry under a held directory (`FileIdentity::at`, which identifies
+  a final symlink itself). Equality compares the objects seen by each call and does not guard
+  against later replacement or inode reuse. Unix only.
+- `khive_fs::fd_relative::unlink_at` removes a file or symlink entry under a held directory
+  without following it and refuses a directory. `rename_at` renames an entry between two held
+  directories with the kernel's ordinary replacement semantics. Neither syncs the directory. Unix
+  only.
+- `khive_fs::directory_walk::open_dir_nofollow` opens a directory read-only and refuses a symlink
+  as the final component. `khive_fs::opened_file::open_regular_file_nofollow` does the same for a
+  regular file, and refuses a FIFO or other non-regular file without waiting on it.
+  `directory_walk::read_link_at` is now public, returns a `PathBuf`, and reports a target that
+  fills the `PATH_MAX` buffer as `InvalidData`. Unix only.
+- `khive_fs::fd_relative::open_file_at` opens one writable entry, write-only or read-write, under
+  a borrowed directory descriptor. `OpenFileOptions` sets the creation policy through `Create`
+  (`No`, `IfMissing` or `Exclusive`), an optional non-blocking flag, and the creation mode, which
+  the umask filters. It always refuses a final symlink and the names `.` and `..`, sets
+  close-on-exec, and never truncates existing contents. Unix only.
+- Entity and event filters in `khive-storage` can match stored JSON and liveness.
+  `EntityFilter::property_eq` and `EventFilter::payload_eq` require SQL JSON equality on the
+  stored properties or payload for a `$.field[.subfield]` path, and the SQLite stores refuse any
+  other path as invalid input. `EventFilter::outcome` matches one event outcome.
+  `EntityFilter::include_tombstones` and `EntityFilter::tombstoned_only` select
+  `EntityTombstones::All` or `EntityTombstones::Only`; the default stays live rows. `khive-db`
+  adds `StorageBackend::list_namespaces(kind, NamespaceLiveness)`, which lists the sorted, distinct
+  namespaces that hold records of one exact kind across entities, notes and events.
+- `khive_storage::SqlStatement::new(sql, params)` builds a statement without a diagnostic label,
+  and `SqlStatement::labelled(label)` sets or replaces the label.
+- `khive_storage::SqlRow` adds typed accessors. `uuid` and `opt_uuid` read a native UUID or UUID
+  text. `f64` and `opt_f64` read a float or convert an integer. Each returns `SqlColumnError` for
+  an absent column, an invalid value or another SQL variant, and the `opt_` forms return `None`
+  for SQL NULL. `text_or_none` and `i64_or_none` return `None` for anything that is not text or an
+  integer.
+- `SqlReader::count(statement)` runs a count statement and returns its nonnegative integer scalar
+  as `u64`. A negative value, a missing row, NULL or a non-integer scalar returns
+  `StorageError::Internal`. It is a provided method, so existing `SqlReader` implementors need no
+  change.
+- `khive_db::env` is a new public module of environment readers. `env_parse_or` parses a variable
+  into any `FromStr` type and falls back to a default when the variable is missing, not Unicode or
+  unparseable. `env_flag` reads a trimmed, case-insensitive boolean (`1`, `true`, `yes`, `on` and
+  their opposites) with a default. `cached_env_flag` fixes a flag at its first read in a
+  caller-supplied `OnceLock`. The pool settings and the drain timeout read their environment
+  variables through it with the same parsing as before.
+
+### Fixed
+
+- `kkernel reindex` now walks entities and notes with a stable cursor instead of a numeric offset.
+  A record written during the run is visited once, and the pass continues after a record is
+  soft-deleted at a batch boundary.
+- When SQLite reports a full disk (`SQLITE_FULL`) and the failure ends an admitted write
+  transaction and retires the writer task, the error now carries `sqlite_disk_full` with the
+  primary and extended SQLite result codes. It still reports `request_state`
+  `side_effects_unknown`, `task_terminated: true` and `retryable: false`. Before, the same failure
+  reported a generic `writer_task_terminated` with no SQLite codes. A commit failure whose rollback
+  succeeds keeps its existing request-failed form.
+- Bulk `link` now validates every entry, including one that repeats an earlier entry's source,
+  target and relation. Before, such a repeat was counted as skipped without checking its weight,
+  metadata or endpoint rules. In the default atomic mode an invalid repeat now refuses the whole
+  batch. With `atomic=false` it is reported in `errors` and counted as failed, and an entry that
+  failed no longer reserves its key, so a later valid entry for the same edge, such as one with
+  `resurrect=true`, is applied.
+- `kkernel kg validate` exits with status 2 when the rules file is malformed TOML or uses the
+  unsupported YAML format (`.yaml` or `.yml`), as ADR-034 specifies. Before, both exited with
+  status 1, the same as a graph rule violation. An unreadable rules file and graph rule violations
+  keep status 1.
+- `exec.tree_put` now rejects an edit whose `delete` is not a boolean with
+  `edits[N].delete must be a boolean`, and publishes nothing. Before, any value other than `true`,
+  such as the string `"true"`, counted as not deleting. An omitted or `null` `delete` still means
+  no delete.
+- A task update that sets `due` together with both `due_timezone` and `timezone` now validates
+  both zone names, and a malformed one refuses the whole update. Before, a valid `due_timezone`
+  hid an invalid `timezone` and the update succeeded. When both are valid, `due_timezone` still
+  wins.
+- `knowledge.upsert_atoms` no longer treats an atom as a domain mirror because one of its tags
+  merely contains the text `type:domain`. Tags such as `type:domain-extra` or `prefix:type:domain`
+  now allow both the slug upsert and the properties-only update, while an exact `type:domain` tag
+  still refuses the update. Tag text that is not a JSON array of strings keeps the earlier
+  substring check.
+- Code source ingest (`code.ingest`) of a folder with no governing manifest, reached by a path
+  that ends in `..`, now names the project after the folder it resolves to. Before, the project
+  name came from the literal path text, so the same folder spelled `project/child/..` and
+  `project` recorded a different `source_project`. Both spellings now agree.
+- `schedule.schedule` now checks the `entity_kind` and `note_kind` of a scheduled singleton
+  `create` action by the rule `create` itself applies. An empty string, or a value that is neither
+  a string nor null, is refused with the same error `create` returns, even when the other kind is
+  the one being created. Before, a non-string value was ignored when the action was scheduled. The
+  refusal comes before any schedule is written.
+- `git.digest` now refuses a `project` argument that is not a string, with
+  `project must be a string when provided`, and writes nothing to the graph. Before, a non-string
+  value was ignored and the digest ran against an automatically resolved or created project
+  anchor. An omitted or `null` `project` still resolves the anchor automatically.
+- `comm.thread` now refuses an `after` cursor that resolves to a note which is not a message, with
+  the existing `does not resolve to a message` error. Before, any note id was accepted as a cursor.
+- Errors from opening the database backend now name it. A failure to create the database
+  directory, or to open the in-memory store, begins with `backend main:`.
+
 ### Restored
 
 - The retrieval surfaces removed in 0.10.0 are back, unchanged from 0.9.x, as the base for
-  their integration work: `KhiveRuntime::hybrid_search_with_strategy` and `KhiveRuntime::rerank`;
+  their integration work: `KhiveRuntime::hybrid_search_with_strategy`;
   `khive_retrieval::hybrid::dual_index` (`DualIndexRouter`, `DualIndexConfig`,
   `DualIndexStrategy`); `khive_retrieval::query_ir` (`QueryNode`, `FuseStrategy`,
   `FilterPredicate`, `RerankMethod`); `khive_retrieval::metrics` (`MetricEvent`,

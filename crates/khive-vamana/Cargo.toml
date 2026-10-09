@@ -27,11 +27,11 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 uuid = { workspace = true, optional = true }
-khive-quant = { version = "0.10.0", path = "../khive-quant", default-features = false }
-khive-types = { version = "0.10.0", path = "../khive-types", default-features = false }
+khive-quant = { version = "0.11.0", path = "../khive-quant", default-features = false }
+khive-types = { version = "0.11.0", path = "../khive-types", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-khive-fs = { version = "0.10.0", path = "../khive-fs" }
+khive-fs = { version = "0.11.0", path = "../khive-fs" }
 libc = { workspace = true }
 nix = { version = "0.31", features = ["dir"] }
 
