@@ -15,8 +15,8 @@ use super::schema::{
 use super::sections_index::embed_sections;
 use super::util::resolve_atom_id;
 use super::util::{
-    content_hash, deser, new_id, now_us, row_str, sql_err, validate_atom_content,
-    validate_section_content,
+    content_hash, deser, has_domain_mirror_tag, new_id, now_us, row_str, sql_err,
+    validate_atom_content, validate_section_content,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -694,7 +694,7 @@ fn prepare_import_file(
                 unknown_type = unknown_type.saturating_add(1);
                 continue;
             };
-            if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
+            if content.chars().count() < super::util::MIN_SECTION_CONTENT_LEN {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
@@ -842,10 +842,7 @@ async fn validate_existing_import_identities(
             .map_err(|error| sql_err("knowledge.import target preflight", error))?;
         if let Some(row) = existing {
             let slug = &prepared.slug;
-            if row_str(&row, "tags")
-                .unwrap_or_default()
-                .contains("type:domain")
-            {
+            if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
                 )));

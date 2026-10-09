@@ -470,12 +470,14 @@ mod project_origin_witnesses {
                     "id",
                     "relation",
                     "source_id",
-                    "weight"
+                    "weight",
+                    "weight_requested"
                 ]
             );
             assert_eq!(value["concept_id"], source.to_string());
             assert_eq!(value["source_id"], doc.to_string());
             assert_eq!(value["relation"], "introduced_by");
+            assert_eq!(value.get("weight_requested"), Some(&json!(0.75)));
             assert_eq!(value["weight"], 0.75);
             assert_eq!(value["id"].as_str().unwrap().len(), 8);
             exact_edge(&runtime, &value, source, doc).await;

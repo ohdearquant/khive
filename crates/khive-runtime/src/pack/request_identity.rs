@@ -10,7 +10,8 @@ use crate::error::RuntimeError;
 use crate::runtime::NamespaceToken;
 
 use super::{
-    DispatchHook, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime, SPECIAL_RELATIONS,
+    DispatchHook, EdgeEndpointRule, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime,
+    SPECIAL_RELATIONS,
 };
 
 /// Immutable registry that dispatches verb calls to registered packs.
@@ -19,6 +20,8 @@ use super::{
 #[derive(Clone)]
 pub struct VerbRegistry {
     pub(super) packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    /// Pack ownership and endpoint rules captured together at registry construction.
+    pub(super) attributed_edge_rules: Arc<Vec<(String, EdgeEndpointRule)>>,
     /// Pack-level by-ID resolvers, in registration order.
     pub(super) resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     /// Read-only KG lookup topology; never used to redirect a pack write.
