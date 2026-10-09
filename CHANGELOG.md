@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+
 ### Fixed
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
