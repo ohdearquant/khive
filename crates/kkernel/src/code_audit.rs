@@ -1343,7 +1343,7 @@ mod tests {
             .await
             .expect_err("AUDIT_INVALID_ENV");
         assert!(
-            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(message))) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))
+            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })) if matches!(source.downcast_ref(), Some(khive_db::SqliteError::InvalidConfig(message)) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES")))
         );
         for raw in ["0", "8192"] {
             std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", raw);
