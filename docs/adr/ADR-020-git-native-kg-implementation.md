@@ -917,3 +917,24 @@ model as `esbuild` and `turbo`.
 - NDJSON specification: <https://ndjson.org/>
 - git sparse-checkout: <https://git-scm.com/docs/git-sparse-checkout>
 - GitHub Contents API: <https://docs.github.com/en/rest/repos/contents>
+
+## Amendment (2026-10-09): scope of the §5 CLI surface after ADR-101 and ADR-102
+
+[ADR-101](ADR-101-kg-changeset-model.md) and [ADR-102](ADR-102-tiered-validate-and-merge.md)
+moved graph change onto a change-set model with MCP-client-only access to the live graph
+(ADR-102 D5) and a local, non-remote change-set and snapshot repository (ADR-102 D6). ADR-102
+restores `kg commit` for that flow and states that the restoration "does not resurrect the
+whole of ADR-020 §5's original eleven-verb workflow". This amendment records which §5 rows
+that leaves standing.
+
+Superseded by ADR-101/102 and not to be built against the project-repository `.khive/kg/`
+layout: `kg diff`, `kg resolve` (including `--ours`, `--theirs` and `--merge-properties`),
+`kg migrate` and `.khive/kg/migrations/`, and `kg validate --schema-compat <ref>`. Entity-level
+diff, conflict handling and schema evolution are change-set concerns under ADR-101 D2-D4 and
+ADR-102 D1-D4; a line-level git merge of committed NDJSON is no longer the integration path.
+§7, §9 and §10 above describe that superseded path and stay as the historical record.
+
+Still standing, as extensions of shipped verbs that do not depend on the git merge path:
+`kg import --on-conflict error|skip|update` and `--force` (§13; [ADR-036](ADR-036-kg-import-export-adapters.md)
+keeps the same flags for adapter imports), and `kg update <remote> [--ref <ref>]` (§8), which
+moves the pin `kg fetch` already consumes.
