@@ -22,7 +22,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **146 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **147 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 20 closed relations in 10 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic, ownership)          |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -60,13 +60,13 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **146 verbs** out of the box (updated from the
+All 14 packs load by default, giving **147 verbs** out of the box (updated from the
 current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                                                                                                     |
 | ------------- | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 26    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
+| **kg**        | _(bare)_     | 27    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
 | **gtd**       | `gtd.`       | 7     | Task lifecycle, timestamp census, and explicit historical repair                                                                                                                 |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                                 |
 | **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                           |
@@ -136,7 +136,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 26 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 27 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (7 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (17 verbs)           │
@@ -269,7 +269,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 146-verb catalog.
+MCP client discovers the `request` tool with the full 147-verb catalog.
 
 ### Alternative: npm
 
@@ -401,7 +401,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 146 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
+**Main after v0.7.0.** 147 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

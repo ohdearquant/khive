@@ -96,6 +96,7 @@ event rows inside the caller's visible namespaces and writes nothing.
 | `comm.transport_status` | Read | Verb | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L139) |
 | `comm.unread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L293)            |
 | `context`                    | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1091) |
+| `count`                      | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L19)   |
 | `create`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L71)   |
 | `db_diagnostics`             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1436) |
 | `delete`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L594)  |

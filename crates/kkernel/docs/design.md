@@ -58,7 +58,7 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 26 verbs: the bare names (no dot prefix) `create`, `get`,
+- The kg substrate pack owns 27 verbs: the bare names (no dot prefix) `create`, `get`,
   `list`, `stats`, `update`, `delete`, `restore`, `search`, `link`, `neighbors`, `traverse`,
   `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
   (ADR-089), `whoami`, `scan`, `db_diagnostics` (ADR-091), plus its one documented

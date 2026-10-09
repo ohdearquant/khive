@@ -7,6 +7,7 @@
 //! across all read paths, making a split impractical without duplicating the
 //! deserialization logic.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,8 +17,8 @@ use khive_storage::error::StorageError;
 #[cfg(test)]
 use khive_storage::error::WriterTaskRequestState;
 use khive_storage::event::{
-    Event, EventAppendDisposition, EventFilter, EventObservation, IdempotentEventBatchResult,
-    ObservationRole, ReferentKind,
+    Event, EventAppendDisposition, EventFilter, EventGroupBy, EventObservation,
+    IdempotentEventBatchResult, ObservationRole, ReferentKind,
 };
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EventStore;
@@ -1466,6 +1467,35 @@ impl EventStore for SqlEventStore {
                 params.iter().map(|p| p.as_ref()).collect();
             let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
             Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> Result<BTreeMap<String, u64>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "count_events_grouped",
+        )?;
+        let namespace = self.namespace.clone();
+        self.with_reader("count_events_grouped", move |conn| {
+            let (where_clause, params) = build_event_filter_sql(conn, &namespace, &filter)?;
+            // The identifier comes only from the closed enum; every filter value
+            // (including the namespace) is still bound by the shared builder.
+            let column = group_by.column();
+            let sql =
+                format!("SELECT {column}, COUNT(*) FROM events{where_clause} GROUP BY {column}");
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect()
         })
         .await
     }

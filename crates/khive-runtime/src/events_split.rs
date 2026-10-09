@@ -37,6 +37,7 @@
 //! path here degrades (drop + count + log, or a typed storage error for the
 //! synchronous lanes) instead of blocking the caller.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -46,7 +47,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use khive_db::{StorageBackend, WalCeilingPolicy};
-use khive_storage::event::{EventPageQuery, EventPageWindow, IdempotentEventBatchResult};
+use khive_storage::event::{
+    EventGroupBy, EventPageQuery, EventPageWindow, IdempotentEventBatchResult,
+};
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
     StorageResult,
@@ -74,8 +77,9 @@ use crate::daemon::{read_frame, write_frame};
 /// disposition so a proven rollback can cross the socket without falsely
 /// claiming the remote writer task terminated. Version 4 adds exact event-target
 /// filtering and the refusal kind. Older readers would ignore the new filter
-/// field, silently broadening a query, so both peers must speak version 4.
-pub const EVENTS_PROTOCOL_VERSION: u32 = 4;
+/// field, silently broadening a query. Version 5 adds grouped count requests
+/// and responses; clients and daemons must be upgraded together.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 5;
 
 /// Default bound on the fire-and-forget append queue, in batches. The byte
 /// bound below also applies, so a large batch cannot multiply this depth
@@ -599,6 +603,12 @@ pub enum EventsRequest {
         namespace: String,
         filter: EventFilter,
     },
+    CountEventsGrouped {
+        protocol_version: u32,
+        namespace: String,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    },
 }
 
 impl EventsRequest {
@@ -621,6 +631,9 @@ impl EventsRequest {
             }
             | Self::CountEvents {
                 protocol_version, ..
+            }
+            | Self::CountEventsGrouped {
+                protocol_version, ..
             } => *protocol_version,
         }
     }
@@ -632,7 +645,8 @@ impl EventsRequest {
             | Self::GetEvent { namespace, .. }
             | Self::QueryEvents { namespace, .. }
             | Self::QueryEventPage { namespace, .. }
-            | Self::CountEvents { namespace, .. } => namespace,
+            | Self::CountEvents { namespace, .. }
+            | Self::CountEventsGrouped { namespace, .. } => namespace,
         }
     }
 }
@@ -658,6 +672,9 @@ pub enum EventsResponse {
     },
     Count {
         count: u64,
+    },
+    GroupedCount {
+        counts: BTreeMap<String, u64>,
     },
     /// Typed refusal. `retryable` distinguishes transient daemon-side
     /// conditions from contract errors (bad frame, version skew).
@@ -1698,6 +1715,12 @@ async fn dispatch_events_request(
             Ok(count) => EventsResponse::Count { count },
             Err(error) => storage_error_response(&error),
         },
+        EventsRequest::CountEventsGrouped {
+            filter, group_by, ..
+        } => match store.count_events_grouped(filter, group_by).await {
+            Ok(counts) => EventsResponse::GroupedCount { counts },
+            Err(error) => storage_error_response(&error),
+        },
     }
 }
 
@@ -2429,6 +2452,23 @@ impl EventStore for ForwardingEventStore {
         }
     }
 
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        let request = EventsRequest::CountEventsGrouped {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            filter,
+            group_by,
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::GroupedCount { counts } => Ok(counts),
+            other => Err(self.unexpected("count_events_grouped", other)),
+        }
+    }
+
     async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
         crate::event_page::validate_page_query(&query)?;
         let request = EventsRequest::QueryEventPage {
@@ -2597,6 +2637,28 @@ impl EventStore for SplitEventStore {
         let legacy = self.legacy.count_events(filter.clone()).await?;
         let lane = self.lane.count_events(filter).await?;
         Ok(legacy + lane)
+    }
+
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        let mut counts = self
+            .legacy
+            .count_events_grouped(filter.clone(), group_by)
+            .await?;
+        for (key, count) in self.lane.count_events_grouped(filter, group_by).await? {
+            let total = counts.entry(key).or_default();
+            *total = total
+                .checked_add(count)
+                .ok_or_else(|| StorageError::InvalidInput {
+                    capability: khive_storage::StorageCapability::Events,
+                    operation: "count_events_grouped".into(),
+                    message: "grouped event count overflow".into(),
+                })?;
+        }
+        Ok(counts)
     }
 
     async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {

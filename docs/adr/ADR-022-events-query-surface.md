@@ -121,7 +121,7 @@ the namespace isolation contract from [ADR-007](ADR-007-namespace.md).
 the §3b canonical newest-first order — returning the most recent events first and
 disambiguating clock ties deterministically. Not overridable in v1.
 
-### 3. Aggregation — deferred
+### 3. Aggregation — original deferral
 
 `count_events` exists on `EventStore` but a `count(kind="event", ...)` verb is **not**
 added in this ADR. Downstream consumers needing aggregate counts can issue
@@ -131,6 +131,29 @@ make this feasible.
 A future verb `count(kind="event", group_by="verb")` is explicitly deferred — group-by
 semantics require a new `GROUP BY` path in the SQL builder that is disproportionate to
 the current use case.
+
+### Grouped event counts
+
+The original deferral above is lifted for `count(kind="event", group_by=...)`.
+`group_by` is one of `verb`, `kind`, or `actor`; the response is an object mapping
+stored group keys to integer counts. An empty result is `{}`, without zero-valued
+buckets. The handler sums counts across the sealed caller token's visible namespaces;
+it never adds namespaces not already authorized by that token.
+
+Optional filters are `verb`/`verbs`, `event_kind`/`event_kinds`, `actor`, `substrate`,
+`outcome`, `since`, and `until`. Singular and plural forms are merged as OR sets;
+different fields are ANDed. `since` and `until` are exclusive UTC-microsecond bounds,
+matching event-list time filtering. Unknown group keys, event kinds and unsupported
+substrates/outcomes refuse before any count. Other substrates are not accepted by
+`count`. These counts use the existing typed `EventFilter`, including its SQL-level
+outcome filter; this does not change the historical event-list handler described above.
+
+`EventStore::count_events_grouped` performs SQL `GROUP BY` over the scoped store.
+Split-event deployments aggregate both the main and events stores, and the events
+socket forwards the typed operation (protocol version 5; upgrade both peers together).
+Separate stores/namespaces are read sequentially, so concurrent appends can be observed
+between reads; the response does not promise a cross-store snapshot. It does not
+materialize or truncate event rows and does not alter append/audit behavior.
 
 ### 3a. Cognitive-primitive framing — `EventFilter` ↔ `Objective<Event>`; aggregators are `Fold<Event, State>`
 
