@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The opt-in `charter` pack installs the seven recording tables from ADR-193 and
+  provides revision-and-state checked transaction helpers. This schema foundation
+  exposes no verbs, grants no action admission, and does not enforce merges.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
