@@ -241,7 +241,7 @@ impl std::fmt::Display for PackSchemaCollisionError {
 
 impl std::error::Error for PackSchemaCollisionError {}
 
-/// Extract table names from a single DDL statement.
+/// Extract table names from every statement in a DDL entry.
 ///
 /// Handles SQL trivia, SQLite identifier quoting, optional TEMP/VIRTUAL and a
 /// `main.` qualifier. Index and other non-table DDL return no table names.
@@ -316,37 +316,44 @@ pub(super) fn extract_table_names(stmt: &str) -> Vec<String> {
         tokens.push(SqlToken::Bare(token));
     }
 
-    let keyword = |index: usize, word: &str| matches!(tokens.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
-    if !keyword(0, "CREATE") {
-        return Vec::new();
-    }
-    let mut index = 1;
-    if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
-        index += 1;
-    }
-    if keyword(index, "VIRTUAL") {
-        index += 1;
-    }
-    if !keyword(index, "TABLE") {
-        return Vec::new();
-    }
-    index += 1;
-    if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
-        index += 3;
-    }
-    let main_qualifier = matches!(
-        tokens.get(index),
-        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
-    );
-    if main_qualifier && matches!(tokens.get(index + 1), Some(SqlToken::Punctuation('.'))) {
-        index += 2;
-    }
-    match tokens.get(index) {
-        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
-            vec![name.to_ascii_lowercase()]
-        }
-        _ => Vec::new(),
-    }
+    tokens
+        .split(|token| matches!(token, SqlToken::Punctuation(';')))
+        .filter_map(|statement| {
+            let keyword = |index: usize, word: &str| matches!(statement.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
+            if !keyword(0, "CREATE") {
+                return None;
+            }
+            let mut index = 1;
+            if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
+                index += 1;
+            }
+            if keyword(index, "VIRTUAL") {
+                index += 1;
+            }
+            if !keyword(index, "TABLE") {
+                return None;
+            }
+            index += 1;
+            if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
+                index += 3;
+            }
+            let main_qualifier = matches!(
+                statement.get(index),
+                Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
+            );
+            if main_qualifier
+                && matches!(statement.get(index + 1), Some(SqlToken::Punctuation('.')))
+            {
+                index += 2;
+            }
+            match statement.get(index) {
+                Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
+                    Some(name.to_ascii_lowercase())
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Render an [`EndpointKind`] as the `"<substrate>:<kind>"` label used in

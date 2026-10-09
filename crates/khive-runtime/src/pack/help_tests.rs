@@ -954,6 +954,116 @@ fn apply_schema_plans_with_map_collision_is_an_error() {
 }
 
 #[test]
+fn schema_collision_checks_every_statement_before_any_ddl() {
+    let cases: [(
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    ); 2] = [
+        (
+            "shared",
+            &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS first_table (id INTEGER); \
+               CREATE TABLE IF NOT EXISTS shared (id INTEGER);"],
+        ),
+        (
+            "shared;table",
+            &[r#"CREATE TABLE IF NOT EXISTS "shared;table" (id INTEGER)"#],
+            &[r#"
+                ; CREATE TABLE IF NOT EXISTS first_table (id INTEGER);
+                CREATE INDEX IF NOT EXISTS first_index ON first_table(id);
+                /* a comment; between declarations */
+                CREATE TABLE IF NOT EXISTS main."shared;table" (id INTEGER)
+            "#],
+        ),
+    ];
+    for (table, first_pack, second_pack) in cases {
+        let backend = khive_db::StorageBackend::memory().expect("memory backend");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: first_pack,
+            column_additions: &[],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: second_pack,
+            column_additions: &[],
+        }));
+        let registry = builder.build().expect("registry builds");
+        let error = registry
+            .apply_schema_plans_with_map(&HashMap::new(), &backend)
+            .expect_err("later statements must not evade table ownership");
+        assert_eq!(error.pack_a, "pack_alpha");
+        assert_eq!(error.pack_b, "pack_beta");
+        assert_eq!(error.table, table);
+        let table_count: i64 = backend
+            .pool()
+            .reader()
+            .expect("reader")
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN (?1, 'first_table')",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("schema count");
+        assert_eq!(table_count, 0, "collision must precede all pack DDL");
+    }
+}
+
+#[test]
+fn schema_multi_statement_entries_preserve_quoted_and_comment_semicolons() {
+    let backend = khive_db::StorageBackend::memory().expect("memory backend");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register_boxed(Box::new(SchemaPack {
+        pack_name: "pack_alpha",
+        statements: &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+        column_additions: &[],
+    }));
+    builder.register_boxed(Box::new(SchemaPack {
+        pack_name: "pack_beta",
+        statements: &[r#"
+            ;; CREATE TABLE IF NOT EXISTS "first;table" (
+                id INTEGER,
+                value TEXT DEFAULT 'it''s; CREATE TABLE shared (id INTEGER); still text'
+            );
+            -- ; CREATE TABLE shared (id INTEGER);
+            CREATE INDEX IF NOT EXISTS first_index ON "first;table"(id);
+            /* ; CREATE TABLE shared (id INTEGER); */
+            CREATE TABLE IF NOT EXISTS unique_second (id INTEGER)
+        "#],
+        column_additions: &[],
+    }));
+    let registry = builder.build().expect("registry builds");
+    registry
+        .apply_schema_plans_with_map(&HashMap::new(), &backend)
+        .expect("unique tables must register despite semicolons inside quotes or comments");
+
+    let reader = backend.pool().reader().expect("reader");
+    for table in ["shared", "first;table", "unique_second"] {
+        let table_count: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("schema count");
+        assert_eq!(table_count, 1, "every table must be installed: {table}");
+    }
+    let default_value: String = reader
+        .query_row(
+            "SELECT dflt_value FROM pragma_table_info(?1) WHERE name = 'value'",
+            ["first;table"],
+            |row| row.get(0),
+        )
+        .expect("quoted default");
+    assert_eq!(
+        default_value,
+        "'it''s; CREATE TABLE shared (id INTEGER); still text'"
+    );
+}
+
+#[test]
 fn schema_collision_normalizes_sql_identifiers_before_any_ddl() {
     let spellings: [&'static [&'static str]; 7] = [
         &["CREATE TABLE IF NOT EXISTS \"shared\"(id INTEGER)"],

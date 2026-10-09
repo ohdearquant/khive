@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pack schema registration now checks table ownership in every statement of a schema entry,
+  refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
+  comments remain part of those tokens.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
