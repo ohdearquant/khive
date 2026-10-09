@@ -1,5 +1,10 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
 mod code_map;
+mod sql_functions;
+#[cfg(test)]
+pub(crate) use sql_functions::register_rfc3339_key;
+use sql_functions::{register_read_functions, register_writer_clock};
+pub(crate) use sql_functions::{rfc3339_instant_key, strict_rfc3339_key};
 #[path = "pool/identity_registry.rs"]
 mod identity_registry;
 #[cfg(any(test, feature = "test-support"))]
@@ -2683,7 +2688,7 @@ impl ConnectionPool {
         // Expression indexes over these keys are maintained by every writer
         // (the write-queue task and per-store standalone writers included), so
         // each of them needs the same functions the pooled writer registers.
-        register_rfc3339_key(&conn)?;
+        register_read_functions(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         if self.config.code_map_vfs.is_none() {
             self.checkpoint_ownership
@@ -3414,80 +3419,6 @@ fn register_namespace_trigram(conn: &Connection) -> Result<(), SqliteError> {
     crate::namespace_trigram_proto::register(conn).map_err(SqliteError::InvalidData)
 }
 
-fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
-    // Evaluated by SQLite at statement execution, never deterministic: stream
-    // observation deadlines use the same UTC microsecond source as note stamps.
-    conn.create_scalar_function(
-        "khive_now_micros",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        |_| Ok(chrono::Utc::now().timestamp_micros()),
-    )?;
-    Ok(())
-}
-
-/// Order-preserving UTC key across Chrono's signed timestamp range, with
-/// nanoseconds kept after the sign-adjusted epoch seconds.
-pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
-    let mut key = Vec::with_capacity(12);
-    key.extend_from_slice(&((instant.timestamp() as u64) ^ (1_u64 << 63)).to_be_bytes());
-    key.extend_from_slice(&instant.timestamp_subsec_nanos().to_be_bytes());
-    key
-}
-
-/// The outbox deadline grammar is stricter than the general timestamp filter.
-/// This is shared by app-maintained stored keys, V44 backfill, and the read
-/// residual; no schema expression calls an application-defined function.
-pub(crate) fn strict_rfc3339_key(text: &str) -> Option<Vec<u8>> {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)))
-}
-
-/// Register timestamp-key functions for read filters on pooled connections.
-pub(crate) fn register_rfc3339_key(conn: &Connection) -> rusqlite::Result<()> {
-    use rusqlite::functions::FunctionFlags;
-    use rusqlite::types::ValueRef;
-
-    conn.create_scalar_function(
-        "khive_rfc3339_key",
-        1,
-        FunctionFlags::SQLITE_UTF8
-            | FunctionFlags::SQLITE_DETERMINISTIC
-            | FunctionFlags::SQLITE_INNOCUOUS,
-        |ctx| {
-            let text = match ctx.get_raw(0) {
-                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
-                _ => None,
-            };
-            let key = text
-                .and_then(|text| text.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                .map(rfc3339_instant_key);
-            Ok(key)
-        },
-    )?;
-    // The outbox's legacy retry predicate used parse_from_rfc3339, while the
-    // general key above accepts Chrono's relaxed DateTime FromStr grammar.
-    // Keep the strict grammar separate so a relaxed-only future value still
-    // fails open as malformed, instead of postponing the message forever.
-    conn.create_scalar_function(
-        "khive_rfc3339_strict_key",
-        1,
-        FunctionFlags::SQLITE_UTF8
-            | FunctionFlags::SQLITE_DETERMINISTIC
-            | FunctionFlags::SQLITE_INNOCUOUS,
-        |ctx| {
-            let text = match ctx.get_raw(0) {
-                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
-                _ => None,
-            };
-            let key = text.and_then(strict_rfc3339_key);
-            Ok(key)
-        },
-    )?;
-    Ok(())
-}
-
 fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
@@ -3495,7 +3426,7 @@ fn configure_writer_connection(
     #[cfg(feature = "namespace-trigram-proto")]
     register_namespace_trigram(conn)?;
     register_writer_clock(conn)?;
-    register_rfc3339_key(conn)?;
+    register_read_functions(conn)?;
     if config.read_only {
         // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
         // wal_autocheckpoint, journal_size_limit all require write access to
@@ -3549,7 +3480,7 @@ fn configure_writer_connection(
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
     #[cfg(feature = "namespace-trigram-proto")]
     register_namespace_trigram(conn)?;
-    register_rfc3339_key(conn)?;
+    register_read_functions(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
     conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
