@@ -541,11 +541,17 @@ impl EntityTypeRegistry {
         for (owner, def) in all {
             let canonical_type = to_snake_case(def.type_name);
             let canonical_key = format!("{}:{}", def.kind.name(), canonical_type);
-            if let Some((first_owner, _)) = seen.get(&canonical_key) {
+            if let Some((first_owner, first_type)) = seen.get(&canonical_key) {
                 if *first_owner != owner {
                     return Err(format!(
                         "duplicate entity_type {canonical_key:?}: claimed by both \
                          {first_owner:?} and {owner:?}"
+                    ));
+                }
+                if *first_type != canonical_type {
+                    return Err(format!(
+                        "entity_type alias {canonical_key:?}: claimed by both {first_owner:?} \
+                         (canonical {first_type:?}) and {owner:?} (canonical {canonical_type:?})"
                     ));
                 }
             } else {
