@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Propose the `kg.proposal_cleanup` operator contract: hide old applied or rejected
+  proposals using an archive marker while retaining their identity and event history.
+  Retention follows last projection activity; implementation awaits amendment acceptance.
+
 ### Fixed
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
