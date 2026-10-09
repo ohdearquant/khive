@@ -3,9 +3,9 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: khive maintainers
-**Proposed amendment**: [resolved-proposal cleanup](#amendment-proposed-resolved-proposal-cleanup-2026-10-09)
-defines the deferred operator command. Existing decisions remain accepted; this
-addition requires acceptance before dependent implementation merges.
+**Amendment**: [resolved-proposal cleanup](#amendment-resolved-proposal-cleanup-2026-10-09)
+(accepted 2026-10-09) defines the deferred operator command. Its implementation
+lands on its own gates.
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
@@ -330,9 +330,9 @@ when a durable apply needs post-commit reconciliation.
 Hard-state (status != 'open' | 'changes_requested') rows are retained for
 audit. A `proposal_cleanup` operator command is deferred; future work must
 define the CLI surface, retention policy, and safe-delete semantics.
-The [Proposed cleanup amendment](#amendment-proposed-resolved-proposal-cleanup-2026-10-09)
-below specifies those choices for review; this historical deferral remains in
-force until the amendment is accepted and implemented.
+The [cleanup amendment](#amendment-resolved-proposal-cleanup-2026-10-09)
+below specifies those choices; the command is not shipped until that contract is
+implemented.
 
 **Review history retrieval (Fix 7):** The projection stores only aggregates
 (`review_count`, `approve_count`, `reject_count`). Individual `ProposalReviewed`
@@ -513,8 +513,8 @@ verbs and the apply worker each have policy hooks:
 | MCP `get(id=<proposal_id>)`                                       | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
 | CLI `kkernel exec 'kg.proposal_cleanup(older_than="<duration>")'` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
 
-The cleanup row remains deferred; its proposed contract is in the
-[2026-10-09 amendment](#amendment-proposed-resolved-proposal-cleanup-2026-10-09).
+The cleanup row is not yet shipped; its accepted contract is in the
+[2026-10-09 amendment](#amendment-resolved-proposal-cleanup-2026-10-09).
 
 `list(kind=proposal)` dispatches to a new `kg.list_proposals` handler under
 the kg pack — it queries `proposals_open` directly, supports the standard
@@ -1164,12 +1164,12 @@ reviewer test.
   approve lands on the nested governance-bearing proposal — proving the
   recursive evaluation of A1 is load-bearing rather than incidental.
 
-## Amendment (Proposed): resolved-proposal cleanup (2026-10-09)
+## Amendment: resolved-proposal cleanup (2026-10-09)
 
-**Status**: Proposed. This amendment defines the previously deferred cleanup
-contract for [#4810](https://github.com/ohdearquant/khive/issues/4810). It does not
-change the accepted status of the base ADR or claim a shipped handler. Dependent
-implementation requires this amendment's acceptance first.
+**Status**: Accepted (2026-10-09). This amendment defines the previously deferred
+cleanup contract for [#4810](https://github.com/ohdearquant/khive/issues/4810).
+Acceptance of the text is not implementation acceptance and claims no shipped
+handler; the dependent implementation lands on its own gates.
 
 ### C1. Operator surface
 

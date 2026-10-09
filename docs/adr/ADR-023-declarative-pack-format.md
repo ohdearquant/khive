@@ -128,15 +128,15 @@ The same handler is reachable as `memory.recall` from MCP and as
 `kkernel exec 'memory.recall(...)'` from the CLI. The CLI is the operator's window into the
 full surface; MCP is the agent's filtered view.
 
-**Proposed operator subhandler:** ADR-046's
-[resolved-proposal cleanup amendment](ADR-046-event-sourced-proposals.md#amendment-proposed-resolved-proposal-cleanup-2026-10-09)
+**Accepted operator subhandler:** ADR-046's
+[resolved-proposal cleanup amendment](ADR-046-event-sourced-proposals.md#amendment-resolved-proposal-cleanup-2026-10-09)
 specifies the exact name `kg.proposal_cleanup` with `Visibility::Subhandler`
-and `VerbCategory::Declaration`. Upon acceptance and implementation, it is
+and `VerbCategory::Declaration`. Once implemented, it is
 callable through `kkernel exec`, while MCP execution is refused in every form
 and named help retains the internal/non-callable description above. The
 explicit `kg.` spelling applies to this operator subhandler; it does not
-rename the bare public KG verbs or add a public verb. This note records a
-Proposed contract, not an available handler or an authorization exemption.
+rename the bare public KG verbs or add a public verb. This note records an
+accepted contract, not an available handler or an authorization exemption.
 
 This replaces the previous `VerbDef` type. Migration is mechanical: rename
 `VerbDef` → `HandlerDef`, add `visibility: Visibility::Verb` to every existing
