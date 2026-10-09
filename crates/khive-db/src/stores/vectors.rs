@@ -446,6 +446,16 @@ impl SqliteVecStore {
         query_embedding: &[f32],
         candidate_ids: &[Uuid],
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
+        self.score_candidates_with_kind(query_embedding, candidate_ids, None)
+            .await
+    }
+
+    async fn score_candidates_with_kind(
+        &self,
+        query_embedding: &[f32],
+        candidate_ids: &[Uuid],
+        kind: Option<SubstrateKind>,
+    ) -> Result<Vec<VectorSearchHit>, StorageError> {
         let dims = self.dimensions;
         if query_embedding.len() != dims {
             return Err(StorageError::InvalidInput {
@@ -475,6 +485,7 @@ impl SqliteVecStore {
         let namespace = self.namespace.clone();
         let embedding_model = self.embedding_model.clone();
         let query_vec = query_embedding.to_vec();
+        let kind_filter = kind.map(|kind| kind.to_string());
         let ids: Vec<String> = candidate_ids.iter().map(|id| id.to_string()).collect();
 
         self.with_reader("score_candidates", move |conn| {
@@ -484,7 +495,7 @@ impl SqliteVecStore {
                 "SELECT e.subject_id, vec_distance_cosine(e.embedding, ?1) as distance \
                  FROM {table} e \
                  WHERE e.namespace = ?2 AND e.embedding_model = ?3 \
-                   AND e.subject_id = ?4"
+                   AND e.subject_id = ?4 AND (?5 IS NULL OR e.kind = ?5)"
             );
             let mut stmt = conn.prepare(&sql)?;
 
@@ -495,7 +506,13 @@ impl SqliteVecStore {
                 for id in chunk.iter().filter(|id| seen.insert(*id)) {
                     let row: Option<(String, f64)> = stmt
                         .query_row(
-                            rusqlite::params![query_blob, &namespace, &embedding_model, id],
+                            rusqlite::params![
+                                query_blob,
+                                &namespace,
+                                &embedding_model,
+                                id,
+                                &kind_filter
+                            ],
                             |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .optional()?;

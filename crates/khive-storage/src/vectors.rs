@@ -77,6 +77,31 @@ pub trait VectorStore: Send + Sync + 'static {
 
     // --- New methods (default impls; backends opt in by overriding) ---
 
+    /// Score exactly the supplied candidates in this store's namespace and model.
+    ///
+    /// Return one hit per unique stored subject, omitting absent or out-of-scope
+    /// IDs and applying `kind` when supplied. Preserve the backend's ordinary
+    /// search scoring and field aggregation semantics; no field is selected here.
+    /// Sort by descending score, then ascending subject ID, with one-based ranks.
+    /// Candidates must not be cut by a namespace-wide top-k search first.
+    ///
+    /// The default refuses the operation. Backends opt in only when they can
+    /// provide exact candidate scoring; callers must propagate unsupported errors
+    /// rather than fall back to searching and intersecting the whole namespace.
+    async fn score_candidates(
+        &self,
+        query_embedding: &[f32],
+        candidate_ids: &[Uuid],
+        kind: Option<SubstrateKind>,
+    ) -> StorageResult<Vec<VectorSearchHit>> {
+        let _ = (query_embedding, candidate_ids, kind);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "score_candidates".into(),
+            message: "backend does not support exact candidate scoring".into(),
+        })
+    }
+
     /// Declare what this backend supports (called at runtime policy construction).
     ///
     /// Default returns a conservative, backend-neutral baseline with all optional
