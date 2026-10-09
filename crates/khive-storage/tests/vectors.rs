@@ -32,6 +32,7 @@ struct TestVectorStore {
     delete_called: AtomicBool,
     /// Tracks whether `insert` was called (set by the last `insert` call).
     insert_called: AtomicBool,
+    search_called: AtomicBool,
 }
 
 impl TestVectorStore {
@@ -41,6 +42,7 @@ impl TestVectorStore {
             fail_insert: AtomicBool::new(false),
             delete_called: AtomicBool::new(false),
             insert_called: AtomicBool::new(false),
+            search_called: AtomicBool::new(false),
         }
     }
 
@@ -103,6 +105,7 @@ impl VectorStore for TestVectorStore {
     }
 
     async fn search(&self, _request: VectorSearchRequest) -> StorageResult<Vec<VectorSearchHit>> {
+        self.search_called.store(true, Ordering::SeqCst);
         Ok(vec![VectorSearchHit {
             subject_id: Uuid::nil(),
             score: DeterministicScore::from_f64(0.9),
@@ -129,6 +132,25 @@ impl VectorStore for TestVectorStore {
 // ---------------------------------------------------------------------------
 // Test cases — capabilities
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn exact_candidate_scoring_defaults_to_unsupported_without_searching() {
+    let store = TestVectorStore::new();
+    let error = store
+        .score_candidates(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[Uuid::nil()],
+            Some(SubstrateKind::Entity),
+        )
+        .await
+        .expect_err("exact scoring requires an implementation");
+    assert!(matches!(
+        error,
+        StorageError::Unsupported { capability: StorageCapability::Vectors, operation, .. }
+            if operation == "score_candidates"
+    ));
+    assert!(!store.search_called.load(Ordering::SeqCst));
+}
 
 /// STORAGE-AUD-001 / #485: the backend-neutral trait default must not
 /// advertise sqlite-vec-specific capabilities. A minimal `VectorStore` that

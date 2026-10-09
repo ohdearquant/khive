@@ -15,6 +15,19 @@ use khive_storage::{decode_f32_native, encode_f32_native};
 
 #[async_trait]
 impl VectorStore for SqliteVecStore {
+    async fn score_candidates(
+        &self,
+        query_embedding: &[f32],
+        candidate_ids: &[Uuid],
+        kind: Option<SubstrateKind>,
+    ) -> StorageResult<Vec<VectorSearchHit>> {
+        let mut unique_ids = candidate_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        self.score_candidates_with_kind(query_embedding, &unique_ids, kind)
+            .await
+    }
+
     async fn insert(
         &self,
         subject_id: Uuid,
