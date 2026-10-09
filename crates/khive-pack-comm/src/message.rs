@@ -116,29 +116,6 @@ pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-/// Resolve a raw id string (full UUID or 8+ hex-char short prefix) to a UUID.
-pub(crate) async fn resolve_id(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    raw: &str,
-    verb: &str,
-) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = raw.parse::<Uuid>() {
-        return Ok(uuid);
-    }
-    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return match runtime.resolve_prefix(token, raw).await? {
-            Some(uuid) => Ok(uuid),
-            None => Err(RuntimeError::InvalidInput(format!(
-                "{verb}: no record matches prefix: {raw:?}"
-            ))),
-        };
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
-    )))
-}
-
 fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError) -> RuntimeError {
     match error {
         RuntimeError::Storage(StorageError::WriterTaskTerminated {

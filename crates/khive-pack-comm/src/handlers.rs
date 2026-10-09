@@ -25,8 +25,8 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
-    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, short_id,
+    validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
     COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{

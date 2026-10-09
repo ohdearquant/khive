@@ -13,7 +13,7 @@ use super::read_cluster_tests;
 use super::validation::{
     addressed_recipient, caller_inherits_legacy_pool, caller_is_addressee, legacy_recipient,
 };
-use crate::message::{note_to_message_json, resolve_id, short_id};
+use crate::message::{note_to_message_json, short_id};
 
 const MAX_BULK_READ_IDS: usize = 500;
 
@@ -286,7 +286,9 @@ pub(super) async fn validate_read_target(
     token: &NamespaceToken,
     raw: &str,
 ) -> Result<(Uuid, Note), RuntimeError> {
-    let id = resolve_id(runtime, token, raw, "read").await?;
+    let id = runtime
+        .resolve_uuid_or_prefix_for_verb(token, raw, "read")
+        .await?;
 
     let store = runtime.notes(token)?;
     let note = store
