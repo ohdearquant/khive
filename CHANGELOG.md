@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Direct struct literals and exhaustive `ConfigError` matches must be updated.
   Use `disable_embedding_models()` to clear peers and legacy projections together.
   Daemon reuse now requires the same ordered engine configuration.
+- `khive_db::diagnostics::ReaderContentionDiagnostics` adds `reader_discards`; direct struct
+  constructors and exhaustive destructurings must account for it. The `db_diagnostics` response
+  now exposes this cumulative pool counter beside `reader_replacement_open_failures`, including
+  successful reader recycling without changing pool behavior.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
