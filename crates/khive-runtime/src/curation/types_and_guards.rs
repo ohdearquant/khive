@@ -820,7 +820,7 @@ pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError)
             source,
         } => match source.downcast::<MergeSqlError>() {
             Ok(error) => match *error {
-                MergeSqlError::Sqlite(error) => RuntimeError::Sqlite(error),
+                MergeSqlError::Sqlite(error) => RuntimeError::from(error),
                 MergeSqlError::Refusal(error) => error,
             },
             Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {

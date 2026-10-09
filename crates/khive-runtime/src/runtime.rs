@@ -1512,7 +1512,7 @@ impl KhiveRuntime {
                         identity.model_key()
                     ))
                 } else {
-                    RuntimeError::Sqlite(error)
+                    RuntimeError::from(error)
                 }
             })?;
 

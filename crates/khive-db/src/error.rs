@@ -152,7 +152,10 @@ impl SqliteError {
 
     /// Capacity admission is a property of the SQLite file, so its refusals
     /// carry `StorageCapability::Sql` whichever store requested the write.
-    pub(crate) fn into_storage_error(
+    /// Concrete backend callers use the same mapping as trait implementations:
+    /// capacity and writer-settlement failures retain their storage taxonomy,
+    /// and other failures remain typed sources of `StorageError::Driver`.
+    pub fn into_storage_error(
         self,
         capability: StorageCapability,
         operation: &'static str,

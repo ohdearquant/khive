@@ -630,9 +630,6 @@ pub enum RuntimeError {
     #[error("storage: {0}")]
     Storage(#[from] khive_storage::StorageError),
 
-    #[error("sqlite: {0}")]
-    Sqlite(khive_db::SqliteError),
-
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
 
@@ -880,23 +877,15 @@ pub enum RuntimeError {
     },
 }
 
+// Compatibility bridge for concrete backend callers while ADR-071's raw-SQL
+// and backend-handle migrations remain in progress. Classification belongs to
+// the database boundary; the runtime exposes only the storage error envelope.
 impl From<khive_db::SqliteError> for RuntimeError {
     fn from(error: khive_db::SqliteError) -> Self {
-        match error {
-            khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
-            khive_db::SqliteError::InheritedWriterTransaction
-            | khive_db::SqliteError::WriterSettlementUnknown => {
-                Self::Storage(khive_storage::StorageError::writer_task_terminated(
-                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                ))
-            }
-            khive_db::SqliteError::WriterPoisoned => {
-                Self::Storage(khive_storage::StorageError::writer_task_terminated(
-                    khive_storage::WriterTaskRequestState::NotStarted,
-                ))
-            }
-            error => Self::Sqlite(error),
-        }
+        Self::Storage(match error {
+            khive_db::SqliteError::RequestReadStopped(error) => error,
+            error => error.into_storage_error(khive_storage::StorageCapability::Sql, "runtime"),
+        })
     }
 }
 
@@ -998,7 +987,6 @@ impl RuntimeError {
         match self {
             Self::AuditObligation { .. } => "AuditObligation",
             Self::Storage(_) => "Storage",
-            Self::Sqlite(_) => "Sqlite",
             Self::Query(_) => "Query",
             Self::NotFound(_) => "NotFound",
             Self::InvalidInput(_) => "InvalidInput",
@@ -1043,11 +1031,9 @@ impl RuntimeError {
     ///
     /// Store implementations retain [`khive_db::SqliteError`] as the typed
     /// source of `StorageError::Driver`; this method carries that structure
-    /// through the runtime wrapper for the MCP wire serializer. A direct
-    /// `RuntimeError::Sqlite` follows the same classification path.
+    /// through the runtime wrapper for the MCP wire serializer.
     pub fn writer_pool_checkout_timeout_context(&self) -> Option<WriterPoolCheckoutTimeoutContext> {
         let (sqlite_error, capability, operation) = match self.refusal_source() {
-            Self::Sqlite(error) => (error, None, None),
             Self::Storage(khive_storage::StorageError::Driver {
                 capability,
                 operation,
@@ -1308,7 +1294,7 @@ mod refusal_event_context_tests {
 
     #[test]
     fn refusal_events_preserve_retry_and_writer_finality_contexts() {
-        let checkout = RuntimeError::Sqlite(khive_db::SqliteError::WriterPoolCheckoutTimeout {
+        let checkout = RuntimeError::from(khive_db::SqliteError::WriterPoolCheckoutTimeout {
             timeout: Duration::from_millis(17),
         })
         .with_refusal_events(failed());
