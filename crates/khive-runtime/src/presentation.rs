@@ -1303,6 +1303,9 @@ fn parse_tz_offset_secs(tail: &str) -> Option<i64> {
 }
 
 fn parse_digits(b: &[u8]) -> Option<i64> {
+    if !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
     let s = std::str::from_utf8(b).ok()?;
     s.parse().ok()
 }
