@@ -621,7 +621,7 @@ learn(name, description?, domain?, tags?) → {id, full_id, kind, name, domain, 
 ### 4. `cite` — provenance citation
 
 ```
-cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, source_id, weight}
+cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, source_id, weight_requested, weight}
 ```
 
 - `concept_id` is the concept being introduced (graph-source in `introduced_by` terms).
@@ -631,6 +631,10 @@ cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, sou
   clamped**. This is consistent with how other handlers treat weight: the substrate does
   not admit out-of-range weights; clamping is preferable to an error for an optional
   quality annotation. The effective weight is reflected in the response.
+- `weight_requested` reports the original numeric argument before clamping. It is `null`
+  when `weight` is omitted or explicitly `null`; both requests still use effective
+  `weight: 1.0`. For example, a request with `weight: 1.5` returns
+  `weight_requested: 1.5` and `weight: 1.0`. The field is output-only.
 - The underlying edge relation is `EdgeRelation::IntroducedBy` (ADR-002). The pack does
   not bypass the closed edge ontology.
 
@@ -688,7 +692,6 @@ before `khive-pack-template`, reflecting the dependency ordering.
 ### What this ADR does NOT cover
 
 - Idempotent variant (`learn_or_get`) — deferred; no current demand from agent workflows.
-- `weight_requested` surfacing in `cite` response — deferred; low-priority annotation.
 - Pagination for `topic` — callers who need full pagination should use the kg pack's
   `list(kind="concept")` which has explicit `offset` support.
 - ADR amendment for ADR-002 or ADR-001 — not needed; the knowledge pack uses existing

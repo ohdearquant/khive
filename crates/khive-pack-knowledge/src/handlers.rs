@@ -192,6 +192,7 @@ impl KnowledgePack {
             "relation": "introduced_by",
             "concept_id": concept_id.as_hyphenated().to_string(),
             "source_id": source_id.as_hyphenated().to_string(),
+            "weight_requested": p.weight,
             "weight": weight,
         }))
     }
