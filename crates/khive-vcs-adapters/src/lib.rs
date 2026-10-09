@@ -11,6 +11,9 @@ pub use record::{EdgeRecord, EntityRecord};
 mod adapter;
 pub use adapter::FormatAdapter;
 
+mod csv_adapter;
+pub use csv_adapter::{CsvFormatAdapter, DelimitedFormat};
+
 mod json_adapter;
 pub use json_adapter::JsonFormatAdapter;
 

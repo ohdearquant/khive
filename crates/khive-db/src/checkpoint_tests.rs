@@ -725,6 +725,7 @@ fn db_diagnostics_reports_short_reader_backfill_ceiling_without_a_pin() {
 
 #[derive(Clone, Debug, Default)]
 struct CapturedEvent {
+    level: Option<tracing::Level>,
     message: Option<String>,
     open_tx_count: Option<u64>,
     oldest_tx_age_secs: Option<String>,
@@ -803,6 +804,7 @@ impl tracing::Subscriber for CaptureSubscriber {
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
         let mut visitor = CapturedEventVisitor::default();
+        visitor.0.level = Some(*event.metadata().level());
         event.record(&mut visitor);
         self.events.lock().unwrap().push(visitor.0);
     }
@@ -5813,5 +5815,67 @@ fn checkpoint_timing_accumulates_per_store_and_saturates() {
             busy_ticks: u64::MAX,
             error_ticks: u64::MAX,
         }
+    );
+}
+
+#[test]
+fn pooled_checkout_warning_is_once_per_episode_across_aged_successors() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("checkout-warning.db")),
+        max_readers: 2,
+        reader_checkout_warn_after: Duration::from_secs(1),
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(crate::disk_guard_config::EffectiveDiskGuardConfig {
+            reserve_bytes: 0,
+            ..Default::default()
+        }),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    let mut sweep = ReaderCheckoutSweepState::default();
+    assert!(capture(|| sweep.sweep_at(&pool, Instant::now())).is_empty());
+    let first = pool.reader().unwrap();
+    let second = pool.reader().unwrap();
+    let observed_at = Instant::now() + Duration::from_secs(2);
+    assert!(pool.oldest_checkout_age_at(observed_at).unwrap() > Duration::from_secs(1));
+    let events = capture(|| {
+        sweep.sweep_at(&pool, observed_at);
+        sweep.sweep_at(&pool, observed_at);
+        drop(first);
+        assert!(pool.oldest_checkout_age_at(observed_at).unwrap() > Duration::from_secs(1));
+        sweep.sweep_at(&pool, observed_at);
+    });
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].message.as_deref(),
+        Some("ADR-091 Plank 1: pooled reader checkout exceeded warning age")
+    );
+    assert_eq!(events[0].level, Some(tracing::Level::WARN));
+    drop(second);
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert!(capture(|| sweep.sweep_at(&pool, observed_at)).is_empty());
+    let _next = pool.reader().unwrap();
+    let next_observation = Instant::now() + Duration::from_secs(2);
+    assert_eq!(capture(|| sweep.sweep_at(&pool, next_observation)).len(), 1);
+}
+
+#[test]
+fn checkout_warning_threshold_is_strict_and_rearms_below_it() {
+    let threshold = Duration::from_secs(1);
+    let mut sweep = ReaderCheckoutSweepState::default();
+    assert_eq!(sweep.observe(Some(threshold), threshold), None);
+    let old = Duration::from_secs(2);
+    assert_eq!(sweep.observe(Some(old), threshold), Some(old));
+    assert_eq!(sweep.observe(Some(old), threshold), None);
+    assert_eq!(sweep.observe(Some(Duration::ZERO), threshold), None);
+    assert_eq!(sweep.observe(Some(old), threshold), Some(old));
+    assert_eq!(sweep.observe(None, threshold), None);
+    assert_eq!(sweep.observe(None, Duration::ZERO), None);
+    assert_eq!(sweep.observe(Some(Duration::ZERO), Duration::ZERO), None);
+    assert_eq!(
+        sweep.observe(Some(Duration::from_nanos(1)), Duration::ZERO),
+        Some(Duration::from_nanos(1))
     );
 }

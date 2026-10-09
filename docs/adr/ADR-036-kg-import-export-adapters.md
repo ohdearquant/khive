@@ -479,11 +479,12 @@ crates/khive-vcs-adapters/
     adapter.rs       -- FormatAdapter trait
     error.rs         -- AdapterError
     record.rs        -- EntityRecord / EdgeRecord
-    json_adapter.rs  -- JsonFormatAdapter
+    json_adapter.rs  -- JsonFormatAdapter and shared record validation
+    csv_adapter.rs   -- CsvFormatAdapter for CSV and TSV
 ```
 
-CSV/TSV import is shipped in the Deno CLI (`cli/lib/importers/csv.ts`), not as Rust
-`csv.rs` / `tsv.rs` modules in `khive-vcs-adapters`. Mapping, schema inference,
+CSV/TSV import is available in the Deno CLI (`cli/lib/importers/csv.ts`) and the Rust
+`CsvFormatAdapter` in `khive-vcs-adapters`. Mapping, schema inference,
 BibTeX, Turtle/N-Triples, JSON-LD, GraphML, GEXF, Markdown, and non-NDJSON export
 modules are deferred.
 
@@ -491,8 +492,16 @@ modules are deferred.
 
 The user-facing Deno `khive kg import` path handles CSV/TSV/JSON adapter inputs directly,
 converts adapter records to a `KgArchive`, and delegates to the standard import path.
-`kkernel kg import` accepts archive/json/ndjson and validates/converts records for runtime
-import. It does not instantiate CSV/TSV/BibTeX/RDF/GraphML/GEXF/Markdown Rust adapters.
+`kkernel kg import` accepts archive/json/ndjson/csv/tsv and validates/converts records for runtime
+import. It infers `.csv` and `.tsv`, retaining archive JSON as the default for other extensions
+(including `.ndjson`, which still requires an explicit `--format ndjson` for flat records). `--default-kind` supplies missing CSV/TSV entity kinds. BibTeX/RDF/GraphML/GEXF/Markdown
+Rust adapters remain deferred.
+
+An existing Rust CLI gap against §6 remains: every adapter edge endpoint must occur among the
+entities in the same import. The tabular adapter can parse edge lists, but the CLI refuses a
+standalone edge-only file even when its endpoints already exist in the target database. This
+validation happens before opening the target database; existing-target endpoint resolution is
+not implemented by the CSV/TSV work.
 
 ### Schema inference integration
 
@@ -501,10 +510,10 @@ taxonomy values are rejected through validation.
 
 ### Phasing
 
-| State    | Scope                                                                                                                                                   |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Shipped  | Deno CSV/TSV/JSON import; Rust `FormatAdapter`/record/error types; Rust `JsonFormatAdapter`; `kkernel kg import` archive/json/ndjson                    |
-| Deferred | mapping files, schema modes, Rust CSV/TSV modules, BibTeX/RDF/JSON-LD/GraphML/GEXF/Markdown, non-NDJSON export formats other than archive compatibility |
+| State    | Scope                                                                                                                                          |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shipped  | Deno CSV/TSV/JSON import; Rust `FormatAdapter`/record/error types; Rust JSON/CSV/TSV adapters; `kkernel kg import` archive/json/ndjson/csv/tsv |
+| Deferred | mapping files, schema modes, BibTeX/RDF/JSON-LD/GraphML/GEXF/Markdown, non-NDJSON export formats other than archive compatibility              |
 
 ## Amendment 1 (2026-08-09): fail-closed generic JSON identity and timestamps
 

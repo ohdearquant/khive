@@ -81,10 +81,12 @@ to move files between server directories and the blob store without returning
 bytes through those tools. `blob.get` keeps its existing small-object base64
 behavior.
 
-## `message.rs::resolve_id`
+## Message id resolution
 
-Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
-is resolved via `runtime.resolve_prefix` (namespace-scoped).
+Handlers resolve a caller-supplied message id through the shared runtime
+helper `KhiveRuntime::resolve_uuid_or_prefix_for_verb`, which accepts a 36-char
+hyphenated UUID or an 8+ hex-char short prefix and labels its errors with the
+calling verb. The prefix lookup is namespace-scoped.
 
 ## `message.rs::attach_outbound_id_to_ambiguous_write`
 

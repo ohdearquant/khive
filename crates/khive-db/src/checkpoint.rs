@@ -544,6 +544,35 @@ fn log_tx_age_emission(emission: &TxAgeEmission) {
     }
 }
 
+#[derive(Default)]
+struct ReaderCheckoutSweepState {
+    was_above_warn: bool,
+}
+
+impl ReaderCheckoutSweepState {
+    fn observe(&mut self, oldest: Option<Duration>, threshold: Duration) -> Option<Duration> {
+        let above_warn = oldest.is_some_and(|age| age > threshold);
+        let warning = oldest.filter(|_| above_warn && !self.was_above_warn);
+        // A different oldest checkout does not begin a new episode while
+        // another checkout still exceeds the threshold.
+        self.was_above_warn = above_warn;
+        warning
+    }
+
+    fn sweep_at(&mut self, pool: &ConnectionPool, now: Instant) {
+        let oldest = pool.oldest_checkout_age_at(now);
+        let threshold = pool.config().reader_checkout_warn_after;
+        if let Some(age) = self.observe(oldest, threshold) {
+            tracing::warn!(
+                oldest_checkout_age_secs = age.as_secs_f64(),
+                reader_checkout_warn_secs = threshold.as_secs_f64(),
+                database = ?pool.canonical_path(),
+                "ADR-091 Plank 1: pooled reader checkout exceeded warning age"
+            );
+        }
+    }
+}
+
 /// ADR-091 Amendment 2 Plank B: per-process walpin sidecar state, carried
 /// across ticks by whichever sweep owns it (the daemon's `run_checkpoint_task`
 /// or a session's `run_session_sweep_task`). Once the registry's oldest span
@@ -1068,8 +1097,10 @@ pub struct SweepBackend {
 /// and its own walpin sidecar (`None` if the sidecar is disabled or this
 /// backend's origin is `Memory`).
 struct BackendSweep {
+    pool: Arc<ConnectionPool>,
     filter: khive_storage::tx_registry::TxOriginFilter,
     tx_age_state: TxAgeSweepState,
+    reader_checkout_state: ReaderCheckoutSweepState,
     sidecar: Option<WalpinSidecarState>,
 }
 
@@ -1115,8 +1146,10 @@ pub async fn run_session_sweep_task(
             config.interval,
         );
         sweeps.push(BackendSweep {
+            pool: backend.pool,
             filter,
             tx_age_state: TxAgeSweepState::default(),
+            reader_checkout_state: ReaderCheckoutSweepState::default(),
             sidecar,
         });
     }
@@ -1133,6 +1166,9 @@ pub async fn run_session_sweep_task(
         }
 
         for sweep in sweeps.iter_mut() {
+            sweep
+                .reader_checkout_state
+                .sweep_at(&sweep.pool, Instant::now());
             let oldest = khive_storage::tx_registry::oldest_for(&sweep.filter);
             for emission in sweep.tx_age_state.observe(
                 oldest.as_ref().map(|s| (s.id, s.age, s.label.clone())),
@@ -1574,6 +1610,7 @@ pub async fn run_checkpoint_task(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut severity_state = CheckpointSeverityState::default();
     let mut tx_age_state = TxAgeSweepState::default();
+    let mut reader_checkout_state = ReaderCheckoutSweepState::default();
     let mut was_above_high_water = false;
     #[cfg(unix)]
     let legacy_walpin_fallback_interval = DEFAULT_SESSION_SWEEP_INTERVAL;
@@ -1837,6 +1874,7 @@ pub async fn run_checkpoint_task(
         // down. Edge-triggered per rung, same debounce idiom as the severity
         // ladder below, so a sustained stale span logs once per rung rather
         // than once per tick.
+        reader_checkout_state.sweep_at(&pool, Instant::now());
         let oldest_tx = tx_filter
             .as_ref()
             .and_then(khive_storage::tx_registry::oldest_for);

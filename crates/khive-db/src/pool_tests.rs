@@ -1079,6 +1079,7 @@ fn discarded_reader_replacement_open_failure_is_recorded() {
 
     let reader = pool.reader().unwrap();
     reader.discard();
+    assert!(pool.oldest_checkout_age().is_some());
     // The replacement open this triggers on drop must fail deterministically:
     // remove the file a fresh SQLITE_OPEN_READ_ONLY open needs.
     std::fs::remove_file(&path).unwrap();
@@ -1088,6 +1089,7 @@ fn discarded_reader_replacement_open_failure_is_recorded() {
     drop(reader);
 
     let after = pool.reader_acquisition_snapshot();
+    assert_eq!(pool.oldest_checkout_age(), None);
     assert_eq!(
         after.reader_replacement_open_failures - before.reader_replacement_open_failures,
         1,
@@ -3296,4 +3298,114 @@ fn a_checkout_taken_outside_the_resolve_route_reports_no_operation() {
         snapshot.max_completed_hold_operation, None,
         "an unlabelled route must report no operation rather than borrow one"
     );
+}
+
+#[test]
+fn outstanding_reader_age_tracks_each_lease_through_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("checkout-age.db")),
+        max_readers: 2,
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(EffectiveDiskGuardConfig {
+            reserve_bytes: 0,
+            ..Default::default()
+        }),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    assert_eq!(pool.oldest_checkout_age(), None);
+    let first = pool.reader().unwrap();
+    let second = pool.reader().unwrap();
+    let observed_at = Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        pool.oldest_checkout_age_at(observed_at),
+        Some(observed_at.duration_since(first.checked_out_at))
+    );
+    assert!(pool.oldest_checkout_age_at(observed_at).unwrap() > Duration::from_secs(1));
+    drop(first);
+    assert_eq!(
+        pool.oldest_checkout_age_at(observed_at),
+        Some(observed_at.duration_since(second.checked_out_at))
+    );
+    second.discard();
+    drop(second);
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert_eq!(pool.available_readers(), 2);
+}
+
+#[test]
+fn checkout_age_clears_after_query_error_unwind_and_failed_acquisition() {
+    let pool = ConnectionPool::new(PoolConfig {
+        path: None,
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    let reader = pool.reader().unwrap();
+    assert!(reader
+        .query_row::<i64, _, _>("SELECT missing_column", [], |row| row.get(0))
+        .is_err());
+    assert!(
+        pool.oldest_checkout_age().is_some(),
+        "the failed query still owns its checkout"
+    );
+    drop(reader);
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _reader = pool.reader().unwrap();
+        assert!(pool.oldest_checkout_age().is_some());
+        panic!("exercise reader drop during unwinding");
+    }))
+    .is_err());
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert!(pool.reader_until(|| true).unwrap().is_none());
+    assert_eq!(pool.oldest_checkout_age(), None);
+    pool.sql_bridge_reader_slots.close();
+    assert!(pool.reader().is_err());
+    assert_eq!(pool.oldest_checkout_age(), None);
+}
+
+#[test]
+fn owned_shared_checkout_age_clears_after_rollback_or_poison() {
+    for poison in [false, true] {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        assert!(pool
+            .checkout_shared_reader_transaction(|| true)
+            .unwrap()
+            .is_none());
+        assert_eq!(pool.oldest_checkout_age(), None);
+        let reader = pool
+            .checkout_shared_reader_transaction(|| false)
+            .unwrap()
+            .unwrap();
+        reader.conn().execute_batch("BEGIN DEFERRED").unwrap();
+        assert!(
+            pool.oldest_checkout_age_at(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                > Duration::from_secs(1)
+        );
+        if poison {
+            reader.poison();
+        }
+        drop(reader);
+        assert_eq!(pool.oldest_checkout_age(), None);
+        if poison {
+            assert!(pool.reader().is_err());
+        } else {
+            let next = pool.reader().unwrap();
+            assert!(next.conn().is_autocommit());
+            assert!(pool.oldest_checkout_age().is_some());
+            drop(next);
+            assert_eq!(pool.oldest_checkout_age(), None);
+        }
+    }
 }
