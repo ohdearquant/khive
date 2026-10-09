@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `git.push` accepts the optional boolean `force` validation field and refuses
   `true` with `force_denied` before transport. False and omission retain ordinary
   push behavior; null and non-boolean values return `invalid_params`.
+### Fixed
+
+- Pack schema registration now checks table ownership in every statement of a schema entry,
+  refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
+  comments remain part of those tokens.
 
 ### Breaking (Rust crates)
 
