@@ -12,10 +12,10 @@ categories.workspace = true
 description = "Code ontology pack - typed edge rules and audit findings vocabulary"
 
 [dependencies]
-khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
-khive-storage = { version = "0.10.0", path = "../khive-storage" }
-khive-fs = { version = "0.10.0", path = "../khive-fs" }
+khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
+khive-storage = { version = "0.11.0", path = "../khive-storage" }
+khive-fs = { version = "0.11.0", path = "../khive-fs" }
 tokio = { workspace = true }
 inventory = { workspace = true }
 async-trait = { workspace = true }
@@ -31,8 +31,8 @@ syn = { workspace = true }
 quote = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.10.0", path = "../khive-db", features = ["test-support"] }
-khive-pack-kg = { version = "0.10.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.11.0", path = "../khive-db", features = ["test-support"] }
+khive-pack-kg = { version = "0.11.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 

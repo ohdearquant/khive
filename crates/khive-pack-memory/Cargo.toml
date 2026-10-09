@@ -15,17 +15,17 @@ description = "Memory verb pack — remember/recall semantics with decay-aware r
 bench = false
 
 [dependencies]
-khive-types = { version = "0.10.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
-khive-fusion = { version = "0.10.0", path = "../khive-fusion" }
-khive-retrieval = { version = "0.10.0", path = "../khive-retrieval", features = ["ann"] }
-khive-score = { version = "0.10.0", path = "../khive-score" }
-khive-brain-core = { version = "0.10.0", path = "../khive-brain-core" }
-khive-text = { version = "0.10.0", path = "../khive-text" }
-khive-vamana = { version = "0.10.0", path = "../khive-vamana" }
+khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
+khive-fusion = { version = "0.11.0", path = "../khive-fusion" }
+khive-retrieval = { version = "0.11.0", path = "../khive-retrieval", features = ["ann"] }
+khive-score = { version = "0.11.0", path = "../khive-score" }
+khive-brain-core = { version = "0.11.0", path = "../khive-brain-core" }
+khive-text = { version = "0.11.0", path = "../khive-text" }
+khive-vamana = { version = "0.11.0", path = "../khive-vamana" }
 blake3 = { workspace = true }
 inventory = { workspace = true }
-khive-storage = { version = "0.10.0", path = "../khive-storage" }
+khive-storage = { version = "0.11.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,14 +38,14 @@ lru = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.10.0", path = "../khive-db", features = ["test-support"] }
-khive-pack-kg = { version = "0.10.0", path = "../khive-pack-kg" }
-khive-pack-brain = { version = "0.10.0", path = "../khive-pack-brain" }
+khive-db = { version = "0.11.0", path = "../khive-db", features = ["test-support"] }
+khive-pack-kg = { version = "0.11.0", path = "../khive-pack-kg" }
+khive-pack-brain = { version = "0.11.0", path = "../khive-pack-brain" }
 # Dev-only: the acceptance arm for this pack's creation-admission hook proves it
 # coexists with another kind's own `KindHook` (gtd's `task`), which needs that
 # pack registered in the fixture. gtd depends on kg, not on memory, so unlike
 # khive-pack-kg's pairing with gtd this is not a cycle and carries a version.
-khive-pack-gtd = { version = "0.10.0", path = "../khive-pack-gtd" }
+khive-pack-gtd = { version = "0.11.0", path = "../khive-pack-gtd" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }

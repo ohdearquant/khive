@@ -61,7 +61,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
 # unstable; the workspace MSRV is the CI toolchain, 1.95.
