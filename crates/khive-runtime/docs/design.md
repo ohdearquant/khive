@@ -230,6 +230,9 @@
 
 - `micros_to_iso` is the single conversion point from internal `i64` microsecond timestamps to ISO-8601
 - `Agent` mode: short UUIDs (8-char) except strict round-trip fields, exact UTC timestamps with relative labels on list rows, lifecycle nulls preserved, scores truncated to 3 sig-figs
+- Finite score inputs remain numeric, including subnormals. If three-significant-digit
+  rounding would exceed the finite `f64` range, presentation retains the original
+  value; signed zero and non-score numeric fields retain their values.
 - `Human` mode at the MCP layer is identical to `Verbose`; terminal formatting is applied by the CLI layer
 - `full_id`, `context_entity_id`, `thread_id`, `outbound_ref`, `parent_id`, `session_id`, and `project_id` are explicitly excluded from UUID shortening in Agent mode to preserve strict chaining, correlation, ancestry, filtering, and provenance handles
 - `memory.feedback` and `comm.delivered` are `AlwaysVerbose` because their generic `target_id` / `id` fields are exact strict-verb inputs
