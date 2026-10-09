@@ -694,7 +694,7 @@ fn prepare_import_file(
                 unknown_type = unknown_type.saturating_add(1);
                 continue;
             };
-            if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
+            if content.chars().count() < super::util::MIN_SECTION_CONTENT_LEN {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
