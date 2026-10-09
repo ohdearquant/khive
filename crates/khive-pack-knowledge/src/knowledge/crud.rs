@@ -1174,7 +1174,7 @@ impl KnowledgeHandlers {
                         format!(
                             "SELECT {select_columns} FROM knowledge_atoms \
                              WHERE namespace = ?1 AND deleted_at IS NULL \
-                             AND tags NOT LIKE '%type:domain%'{} \
+                             AND NOT khive_tag_contains(tags, 'type:domain'){} \
                              ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
                             data_status_clause
                         ),
@@ -1182,7 +1182,7 @@ impl KnowledgeHandlers {
                     )
                 };
                 let count_sql = format!(
-                    "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{}",
+                    "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND NOT khive_tag_contains(tags, 'type:domain'){}",
                     count_status_clause
                 );
 

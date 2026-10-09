@@ -146,10 +146,7 @@ pub(super) fn tags_to_json(tags: Option<&Vec<String>>) -> String {
 /// Classify valid stored tag arrays by exact element, retaining the historical
 /// guard for malformed or non-array legacy tag text.
 pub(super) fn has_domain_mirror_tag(tags: &str) -> bool {
-    match serde_json::from_str::<Vec<String>>(tags) {
-        Ok(tags) => tags.iter().any(|tag| tag == "type:domain"),
-        Err(_) => tags.contains("type:domain"),
-    }
+    khive_types::tag_contains(tags, "type:domain")
 }
 
 pub(super) fn row_str(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
@@ -425,7 +422,7 @@ pub(super) async fn compute_embedding_coverage(
                  FROM knowledge_atoms a \
                  WHERE a.namespace = ?1 \
                    AND a.deleted_at IS NULL \
-                   AND a.tags NOT LIKE '%type:domain%' \
+                   AND NOT khive_tag_contains(a.tags, 'type:domain') \
                    AND a.id IN ( \
                        SELECT v.subject_id FROM {table_name} v \
                        WHERE v.namespace = ?1 \

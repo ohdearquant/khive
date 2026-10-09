@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
   Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
   writer while retaining their update and proposal guards.
+### Fixed
+
+- Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
+  decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
+  remain visible, and an additive migration rebuilds the cursor index without rewriting rows.
 
 ### Breaking (Rust crates)
 

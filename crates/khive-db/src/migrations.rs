@@ -409,6 +409,8 @@ const V52_UP: &str = include_str!("../sql/052-comm-core-indexes.sql");
 const V53_UP: &str = include_str!("../sql/053-entity-kind-list-order.sql");
 const MEMORY_VISIBILITY_CUTOVER_VERSION: u32 = 54;
 const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
+
+const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -759,6 +761,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: MEMORY_VISIBILITY_CUTOVER_VERSION,
         name: "memory_visibility_epochs",
         up: V54_UP,
+    },
+    VersionedMigration {
+        version: 55,
+        name: "knowledge_atom_cursor_all_live_tags",
+        up: V55_UP,
     },
 ];
 
@@ -2274,3 +2281,7 @@ mod schedule_core_index_migration_tests;
 #[cfg(test)]
 #[path = "comm_core_index_migration_tests.rs"]
 mod comm_core_index_migration_tests;
+
+#[cfg(test)]
+#[path = "knowledge_cursor_tag_migration_tests.rs"]
+mod knowledge_cursor_tag_migration_tests;
