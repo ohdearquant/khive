@@ -24,10 +24,12 @@ use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{
-    entity_fts_document, note_fts_document, secret_gate, GateRef, IngestAuditStore,
-    InterceptedDispatchResult, KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
+    entity_fts_document, note_fts_document, secret_gate, EntityCandidateAdmission,
+    EntityCandidateContext, EntityCandidateMutation, EntityCandidateOrigin,
+    EntityCandidatePrepared, GateRef, IngestAuditStore, InterceptedDispatchResult, KhiveRuntime,
+    Namespace, NamespaceToken, PackRegistry, RuntimeError, VerbRegistry,
 };
-use khive_storage::{Entity, EntityStore, Note, NoteStore, SqlStatement, SqlValue, SubstrateKind};
+use khive_storage::{Entity, Note, NoteStore, SqlStatement, SqlValue, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
 /// task to exit after the last write returned. Generous relative to any
@@ -225,15 +227,10 @@ where
     )
     .with_context(|| format!("{} failed validation", args.findings.display()))?;
 
-    // Preflight every entity/note content and nested property value through
-    // the same secret gate the shared `create` verb path applies
-    // (`crate::secret_gate::check`/`check_json`). This path writes directly
-    // through the storage traits rather than `registry.dispatch("create",
-    // ...)` — explicit-id creation (required for the content-derived UUIDv5
-    // identity that makes re-ingest idempotent) has no dispatch-level
-    // equivalent today — so the gate has to run here instead of being
-    // inherited for free from the shared create handler.
-    preflight_secret_gate(&batch)?;
+    // Prepare entity admission before opening a database, retaining each
+    // candidate's immutable manifest snapshot through its eventual write.
+    // Notes retain their ordinary blocking scanner on this direct path.
+    let entity_candidates = preflight_secret_gate(&batch)?;
 
     if args.dry_run {
         return dry_run_report(cfg.db_path.as_deref(), &batch).await;
@@ -279,7 +276,7 @@ where
         let entities = runtime
             .entities(&token)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for entity in &batch.entities {
+        for (entity, prepared) in batch.entities.iter().zip(entity_candidates) {
             let existing = entities
                 .get_entity_including_deleted(entity.id)
                 .await
@@ -288,18 +285,27 @@ where
                 report.entities_skipped_existing += 1;
                 continue;
             }
+            let finalized = match persist_ingest_entity(&runtime, &token, prepared).await? {
+                EntityCandidateAdmission::Conflict => {
+                    report.entities_skipped_existing += 1;
+                    continue;
+                }
+                EntityCandidateAdmission::Committed(_) => true,
+                EntityCandidateAdmission::Legacy(_) => false,
+            };
             report.entities_created += 1;
-            persist_ingest_entity(entities.as_ref(), entity).await?;
 
             let doc = entity_fts_document(entity);
             let embed_body = doc.body.clone();
-            if let Ok(fts) = runtime.text(&token) {
-                if let Err(e) = fts.upsert_document(doc).await {
-                    tracing::warn!(
-                        entity_id = %entity.id,
-                        error = %e,
-                        "code-ingest: entity FTS indexing failed (non-fatal)"
-                    );
+            if !finalized {
+                if let Ok(fts) = runtime.text(&token) {
+                    if let Err(e) = fts.upsert_document(doc).await {
+                        tracing::warn!(
+                            entity_id = %entity.id,
+                            error = %e,
+                            "code-ingest: entity FTS indexing failed (non-fatal)"
+                        );
+                    }
                 }
             }
             for model_name in &embedding_model_names {
@@ -469,15 +475,30 @@ where
     settle_writer_drain(ingest_result, writer_join, WRITER_DRAIN_TIMEOUT).await
 }
 
-// ADR-115 requires each direct write to check its final candidate, independently
-// of the earlier whole-batch preflight that protects the no-filesystem-effect path.
-async fn persist_ingest_entity(store: &dyn EntityStore, entity: &Entity) -> Result<()> {
-    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    store
-        .upsert_entity(entity.clone())
+// The runtime consumes the same prepared candidate that passed the pre-database
+// check. Only its unchanged legacy decision reaches the ordinary store writer.
+async fn persist_ingest_entity(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    prepared: EntityCandidatePrepared,
+) -> Result<EntityCandidateAdmission> {
+    let admission = runtime
+        .try_commit_manifest_entity_candidate(
+            token,
+            prepared,
+            EntityCandidateMutation::CreateIfAbsent,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let EntityCandidateAdmission::Legacy(entity) = &admission {
+        runtime
+            .entities(token)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .upsert_entity(entity.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    Ok(admission)
 }
 
 async fn persist_ingest_note(store: &dyn NoteStore, note: &Note) -> Result<()> {
@@ -560,29 +581,38 @@ async fn settle_writer_drain(
     ingest_result
 }
 
-/// Scan every entity/note content field and nested property value in `batch`
-/// through the runtime secret gate, before any storage write is attempted.
-/// Mirrors the fields `khive-runtime/src/operations.rs`'s `create_entity`/
-/// `create_note_inner` scan (name/description/properties for entities,
-/// content/name/properties for notes) so a credential embedded in finding
-/// evidence is rejected here exactly as it would be on the shared `create`
-/// verb path, rather than persisting verbatim.
-fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
+/// Scan a final entity before database construction and retain its snapshot.
+fn prepare_ingest_entity(entity: &Entity, record: &str) -> Result<EntityCandidatePrepared> {
+    let context =
+        EntityCandidateContext::new(&entity.namespace, EntityCandidateOrigin::CodeFindingsIngest);
+    secret_gate::locate(context.check_name_description(&entity.name), record, "name")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(description) = &entity.description {
+        secret_gate::locate(
+            context.check_name_description(description),
+            record,
+            "description",
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    secret_gate::locate(
+        context.check_properties(entity.properties.as_ref()),
+        record,
+        "properties",
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    secret_gate::locate(context.check_tags(&entity.tags), record, "tags")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    context
+        .prepare(entity.clone())
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Validate the complete batch before any storage construction or write.
+fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<Vec<EntityCandidatePrepared>> {
+    let mut prepared = Vec::with_capacity(batch.entities.len());
     for (index, entity) in batch.entities.iter().enumerate() {
-        let record = format!("entity[{index}]");
-        secret_gate::check_at(&entity.name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(description) = &entity.description {
-            secret_gate::check_at(description, &record, "description")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if let Some(properties) = &entity.properties {
-            secret_gate::check_json_at(properties, &record, "properties")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        secret_gate::check_tags_at(&entity.tags, &record, "tags")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        prepared.push(prepare_ingest_entity(entity, &format!("entity[{index}]"))?);
     }
     for (index, note) in batch.notes.iter().enumerate() {
         let record = format!("note[{index}]");
@@ -598,7 +628,7 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Report what `code_ingest_batch` would create/skip without writing
@@ -776,6 +806,10 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
     name.push("-shm");
     PathBuf::from(name)
 }
+
+#[cfg(test)]
+#[path = "code_ingest/entity_admission_tests.rs"]
+mod entity_admission_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2007,9 +2041,8 @@ mod tests {
             .as_object_mut()
             .expect("entity properties object");
         entity_properties.insert("khive:secret_gate".into(), serde_json::json!("forged"));
-        let entity_error = persist_ingest_entity(entities.as_ref(), &entity)
-            .await
-            .expect_err("the entity writer must reject the reserved key");
+        let entity_error = prepare_ingest_entity(&entity, "entity")
+            .expect_err("the entity writer's preparation must reject the reserved key");
         assert!(entity_error.to_string().contains("khive:secret_gate"));
         assert!(entities.get_entity(entity.id).await.unwrap().is_none());
         entity
@@ -2019,7 +2052,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("khive:secret_gate");
-        persist_ingest_entity(entities.as_ref(), &entity)
+        let token = runtime
+            .authorize(Namespace::parse(&entity.namespace).unwrap())
+            .unwrap();
+        let prepared = prepare_ingest_entity(&entity, "entity").unwrap();
+        persist_ingest_entity(&runtime, &token, prepared)
             .await
             .expect("the ordinary entity candidate must persist");
         assert!(entities.get_entity(entity.id).await.unwrap().is_some());
