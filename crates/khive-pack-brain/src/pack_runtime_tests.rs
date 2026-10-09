@@ -288,6 +288,7 @@ fn runtime() -> KhiveRuntime {
         disk_guard_config: None,
         volume_lock_dir: None,
         default_namespace: Namespace::local(),
+        engines: None,
         embedding_model: None,
         additional_embedding_models: vec![],
         gate: Arc::new(khive_runtime::AllowAllGate),
