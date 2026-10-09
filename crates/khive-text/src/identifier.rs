@@ -31,9 +31,7 @@ pub fn is_identifier(text: &str) -> bool {
         let a = chars[i];
         let b = chars[i + 1];
         if (a.is_ascii_lowercase() && b.is_ascii_uppercase())
-            || (a.is_ascii_uppercase()
-                && b.is_ascii_uppercase()
-                && chars.get(i + 2).is_some_and(char::is_ascii_lowercase))
+            || is_acronym_boundary(&chars, i + 1)
             || (a.is_ascii_alphabetic() && b.is_ascii_digit())
             || (a.is_ascii_digit() && b.is_ascii_alphabetic())
         {
@@ -42,6 +40,16 @@ pub fn is_identifier(text: &str) -> bool {
     }
 
     false
+}
+
+fn is_acronym_boundary(chars: &[char], index: usize) -> bool {
+    // A single lowercase suffix belongs to the acronym (APIs, IDs, URLs).
+    // A following word such as Parser has a longer lowercase run.
+    index > 0
+        && chars[index - 1].is_ascii_uppercase()
+        && chars[index].is_ascii_uppercase()
+        && chars.get(index + 1).is_some_and(char::is_ascii_lowercase)
+        && chars.get(index + 2).is_some_and(char::is_ascii_lowercase)
 }
 
 /// Split `text` on separators (`_`, `-`, `.`, `/`, `::`) and camelCase/digit boundaries,
@@ -95,8 +103,8 @@ pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
                 // e.g. camelCase: split before 'C'
                 parts.push(current.clone());
                 current.clear();
-            } else if prev.is_ascii_uppercase() && i + 1 < n && chars[i + 1].is_ascii_lowercase() {
-                // e.g. "GPTModel": push accumulated "GP", keep "T" for new part
+            } else if is_acronym_boundary(&chars, i) {
+                // e.g. "XMLParser": push "XML", start the next part with "P".
                 parts.push(current.clone());
                 current.clear();
             }

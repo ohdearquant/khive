@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
 
+### Fixed
+
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole, while still splitting acronym-to-word boundaries such as `XMLParser` and `HTTPServer`.
+
 ## [0.11.0] - 2026-10-08
 
 ### Changed
