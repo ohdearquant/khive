@@ -3,6 +3,9 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: khive maintainers
+**Proposed amendment**: [resolved-proposal cleanup](#amendment-proposed-resolved-proposal-cleanup-2026-10-09)
+defines the deferred operator command. Existing decisions remain accepted; this
+addition requires acceptance before dependent implementation merges.
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
@@ -327,6 +330,9 @@ when a durable apply needs post-commit reconciliation.
 Hard-state (status != 'open' | 'changes_requested') rows are retained for
 audit. A `proposal_cleanup` operator command is deferred; future work must
 define the CLI surface, retention policy, and safe-delete semantics.
+The [Proposed cleanup amendment](#amendment-proposed-resolved-proposal-cleanup-2026-10-09)
+below specifies those choices for review; this historical deferral remains in
+force until the amendment is accepted and implemented.
 
 **Review history retrieval (Fix 7):** The projection stores only aggregates
 (`review_count`, `approve_count`, `reject_count`). Individual `ProposalReviewed`
@@ -506,6 +512,9 @@ verbs and the apply worker each have policy hooks:
 | MCP `list(kind=proposal, status="open")`                          | Browse open proposals                                     | Lists from `proposals_open` projection |
 | MCP `get(id=<proposal_id>)`                                       | Fetch a single proposal's `ProposalCreated` payload       | Resolves to the event payload          |
 | CLI `kkernel exec 'kg.proposal_cleanup(older_than="<duration>")'` | Archive resolved proposals (deferred — not shipped in v1) | Future operator housekeeping           |
+
+The cleanup row remains deferred; its proposed contract is in the
+[2026-10-09 amendment](#amendment-proposed-resolved-proposal-cleanup-2026-10-09).
 
 `list(kind=proposal)` dispatches to a new `kg.list_proposals` handler under
 the kg pack — it queries `proposals_open` directly, supports the standard
@@ -1154,3 +1163,167 @@ reviewer test.
   rejected shape is admitted at propose time, and the denied reviewer's
   approve lands on the nested governance-bearing proposal — proving the
   recursive evaluation of A1 is load-bearing rather than incidental.
+
+## Amendment (Proposed): resolved-proposal cleanup (2026-10-09)
+
+**Status**: Proposed. This amendment defines the previously deferred cleanup
+contract for [#4810](https://github.com/ohdearquant/khive/issues/4810). It does not
+change the accepted status of the base ADR or claim a shipped handler. Dependent
+implementation requires this amendment's acceptance first.
+
+### C1. Operator surface
+
+The exact registered name is `kg.proposal_cleanup`, with
+`Visibility::Subhandler` and `VerbCategory::Declaration`. It is callable through
+the ordinary `kkernel exec` dispatch path:
+
+```bash
+kkernel exec 'kg.proposal_cleanup(older_than="30d")'
+```
+
+The explicit `kg.` spelling names this operator subhandler; it does not rename
+the public KG verbs or add a public verb. Under
+[ADR-023](ADR-023-declarative-pack-format.md#2-handlers-vs-verbs--two-tier-visibility),
+MCP execution is refused in single, batch and chain forms. Named `help=true`
+may describe it with `visibility: "internal"` and `callable_via_mcp: false`,
+without running cleanup. The CLI uses the same registered handler and the
+normal policy path; operator visibility grants no authorization bypass.
+
+### C2. Archive marker and preserved identity
+
+Archiving sets a nullable INTEGER `archived_at` column on `proposals_open` to
+the operation's captured UTC time in microseconds. It is not a new lifecycle
+status and does not delete the projection row. Ordinary proposal lists exclude
+rows whose marker is non-null before applying pagination; existing filters,
+ordering and response shapes otherwise retain their behavior.
+
+Full-UUID and prefix proposal lookup, `get` resolution to the original
+`ProposalCreated` payload, and validation of a new proposal's `parent_id`
+continue to include archived rows under their existing rules. Cleanup changes
+no lifecycle status, counter, prior timestamp, payload, KG record or other
+projection column. Existing terminal review and withdrawal rules remain in
+force. There is no archive-list or restore API in this issue, and archiving
+does not reclaim disk space or reduce the number of retained projection rows.
+
+The additive migration is V56, following #5057's V55. If that prerequisite does
+not land in the planned order, the migration ordinal must be reallocated before
+implementation; it must not collide with V55 or modify V1. Existing projection
+rows start with a null marker, and all existing columns and events are
+preserved. An older binary may show archived rows again because it does not
+apply this new view filter; that compatibility limit is not data loss.
+
+### C3. Eligibility and retention clock
+
+A row is eligible only when all four predicates hold in the mutation:
+
+1. `namespace` equals the request's resolved primary/write namespace;
+2. `status` is `applied` or `rejected`;
+3. `archived_at IS NULL`;
+4. `updated_at < cutoff`, with strict inequality.
+
+**The retention clock is the last projection activity recorded in `updated_at`,
+not terminal resolution time; a later comment restarts the waiting period.**
+
+Thus a proposal exactly at the cutoff is retained. Open, changes-requested,
+approved, applying (including reconciliation), withdrawn and already archived
+rows are ineligible regardless of age. Cleanup covers all eligible proposers
+in the selected namespace; it adds no actor-ownership restriction. Namespace
+selection follows ordinary dispatch, including an explicit namespace argument;
+it is a query/write scope, not a tenant-isolation or authorization guarantee
+([ADR-007](ADR-007-namespace.md)). Cleanup is an explicit operator
+action, not an expiry sweep or automatic retention task.
+
+### C4. Required duration and cutoff
+
+`older_than` is required and must be a string consisting of a positive ASCII
+decimal integer followed immediately by one lowercase unit: `s`, `m`, `h` or
+`d`. Units mean fixed durations of 1, 60, 3,600 or 86,400 seconds, respectively.
+There is no default or calendar-month interpretation. Zero, signs, fractions,
+whitespace, compound intervals, unsupported units, non-string values and
+unknown handler parameters are rejected rather than coerced.
+
+Parse the integer, multiply to microseconds and subtract from one captured UTC
+time using checked arithmetic. Reject out-of-range values or cutoff overflow
+before admitting the cleanup write. Use that same captured time for both the
+cutoff and the archive marker; no public test-clock or cutoff parameter is
+introduced.
+
+### C5. One guarded mutation and count
+
+The projection writer executes one bound UPDATE through the existing
+`runtime.sql().writer().execute()` admission and settlement path. It sets only
+`archived_at` and carries every C3 predicate in the statement itself. There is
+no candidate-read/write loop, private writer, retry or fallback route, or
+separately committed per-row operation.
+
+The handler result is `{"archived": N}`, where `N` is the actual affected-row
+count. A successful repeat returns zero for rows already archived; concurrent
+calls can count each row at most once. A projection update that commits before
+cleanup's guarded mutation participates through the then-current `updated_at`
+and status. A failed write propagates the existing storage/admission/settlement
+error and returns no success count; existing settlement uncertainty must not
+be recast as proof of rollback.
+
+### C6. Policy and atomic admission
+
+The standard Gate receives the caller, resolved namespace, exact operation
+name and arguments under the existing request contract. The handler adds no
+role check or alternate authorization seam. Register the exact
+`kg.proposal_cleanup` name as **Write** under
+[ADR-129](ADR-129-fail-closed-gate-default.md), including the classifier
+revision change and its documented operation inventory. Existing write-denial
+policy applies.
+
+Cleanup is outside the atomic-admissible operation set of
+[ADR-099](ADR-099-bulk-apply-atomic-units.md). An `--atomic` request containing it
+must be refused before mutation, including sibling operations in that unit.
+Its single SQL statement does not imply admission to the multi-operation
+atomic surface.
+
+### C7. Event history
+
+No `ProposalArchived` event kind is introduced. All pre-existing proposal
+event rows and payloads are byte-preserved and remain queryable through the
+existing event capability by event UUID and `payload_proposal_id`, including
+when the event store is separate from the projection database. Cleanup never
+deletes or rewrites the event log. Normal dispatch may append its ordinary
+audit record; event preservation does not require suppressing audit or an
+unchanged total event-table count.
+
+### C8. Required implementation acceptance
+
+The following are acceptance requirements for a later implementation, not
+tests executed or supplied by this documentation amendment:
+
+- Resolve two genuine proposals through the registry, age only one beyond the
+  cutoff, call the exact cleanup name and require `archived == 1`. Exercise
+  both applied and rejected as the eligible old row. Query every pre-existing
+  lifecycle event and compare its ID and stored bytes before and after.
+- Use old and recent rows for every lifecycle state, already archived rows,
+  another namespace and distinct proposers. Assert the full eligible set and
+  that every non-marker column is unchanged. Cover equality at cutoff and one
+  microsecond before it. A later comment's projection activity must retain an
+  otherwise old terminal proposal until the new waiting period elapses.
+- Assert ordinary lists hide archived rows before pagination while full UUID
+  and unique-prefix `get` still return the original payload, archived parent
+  references remain valid, and existing terminal mutation refusals persist.
+- Test valid duration units and all C4 refusal classes, including missing,
+  null, unknown parameters, integer/multiplication overflow and subtraction
+  overflow. Refusals must leave projections unchanged and admit no cleanup
+  writer. A deterministic private cutoff seam may support boundary tests.
+- Repeat cleanup and race same-backend and separate-backend calls: the sum of
+  successful counts must equal the unique archived rows. Inject a failure
+  that is known to roll back the UPDATE, verify marker and event preservation,
+  then require a fault-free retry to return the original count. Cover existing
+  direct and queued writer routes without adding a private execution path.
+- Verify fresh and populated migration upgrades, migration replay, null
+  markers on old rows, and preservation of every prior projection column and
+  event. Run event-preservation controls with a separate event store too.
+- Exercise actual CLI dispatch success; public discovery exclusion; named MCP
+  help without execution; and MCP single, batch and chain refusal before
+  mutation. Verify explicit Gate denial, write-denial policy, exact Write
+  classification and `--atomic` refusal with an unchanged sibling mutation.
+
+This amendment changes no proposal event taxonomy, review/apply authority,
+approval threshold, durable-apply reconciliation, or governance semantics in
+the accepted base and earlier amendments.

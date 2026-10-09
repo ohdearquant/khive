@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
   reports and statistics, and guarded fix receipts. The verb remains unimplemented.
+- Propose the `kg.proposal_cleanup` operator contract: hide old applied or rejected
+  proposals using an archive marker while retaining their identity and event history.
+  Retention follows last projection activity; implementation awaits amendment acceptance.
 
 ### Fixed
 
