@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Session verb pack - store/list/resume/export over the notes substrate"
 
 [dependencies]
-khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde", "sha2"] }
 khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
 inventory = { workspace = true }
 khive-storage = { version = "0.11.0", path = "../khive-storage" }
@@ -24,7 +24,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 khive-fs = { version = "0.11.0", path = "../khive-fs" }

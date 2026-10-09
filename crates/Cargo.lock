@@ -2627,7 +2627,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -2904,6 +2903,7 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

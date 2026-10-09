@@ -18,7 +18,7 @@ use chrono::Utc;
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlWriter;
-use sha2::{Digest, Sha256};
+use khive_types::hash::framed_text_sha256;
 
 use super::parse;
 
@@ -61,26 +61,6 @@ impl From<LineTailSource> for MirrorSource {
             LineTailSource::Codex => MirrorSource::Codex,
         }
     }
-}
-
-/// SHA-256 of a framed optional parsed-text value and the exact raw line.
-/// Framing distinguishes absent text from empty text and avoids ambiguity
-/// when either field contains a delimiter. The same framing is used by the
-/// versioned backfill in `khive-db`.
-fn content_hash(text: Option<&str>, raw: &str) -> String {
-    let mut hash = Sha256::new();
-    match text {
-        Some(value) => {
-            hash.update([1]);
-            hash.update((value.len() as u64).to_be_bytes());
-            hash.update(value.as_bytes());
-        }
-        None => hash.update([0]),
-    }
-    hash.update((raw.len() as u64).to_be_bytes());
-    hash.update(raw.as_bytes());
-    let digest = hash.finalize();
-    format!("{digest:x}")
 }
 
 /// Identifies which CLI produced the JSONL file being mirrored, for the
@@ -1568,7 +1548,7 @@ async fn write_events_and_cursor_on_writer(
         } else {
             now_us
         };
-        let event_hash = content_hash(ev.text.as_deref(), &ev.raw);
+        let event_hash = framed_text_sha256(ev.text.as_deref(), &ev.raw).to_string();
 
         // sessions row: create-only (see docs guide — replay is a no-op via
         // `DO NOTHING`; `last_seen_at` advances below only on a new message).

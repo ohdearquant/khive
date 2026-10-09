@@ -231,14 +231,13 @@ fn parse_chunk(
                 if length != dimensions {
                     return Err("memory delta vector dimensions mismatch".into());
                 }
-                let mut vector = Vec::with_capacity(length);
-                for _ in 0..length {
-                    let value =
-                        f32::from_le_bytes(take(payload, &mut offset, 4)?.try_into().unwrap());
-                    if !value.is_finite() {
-                        return Err("memory delta vector has non-finite value".into());
-                    }
-                    vector.push(value);
+                let byte_len = length
+                    .checked_mul(4)
+                    .ok_or("memory delta vector length overflow")?;
+                let vector = khive_storage::decode_f32_le(take(payload, &mut offset, byte_len)?)
+                    .map_err(|error| error.to_string())?;
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err("memory delta vector has non-finite value".into());
                 }
                 Some(vector)
             }
@@ -573,6 +572,7 @@ fn clear_with_scan_budget_then(
 
 #[cfg(test)]
 mod tests {
+    include!("delta_codec_tests.rs");
     use super::super::{segment_commit_digest, write_external_ids_sidecar};
     use super::*;
     use std::fs;

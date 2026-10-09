@@ -10,6 +10,15 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 const MODEL: &str = "cursor_interleaving_test";
 const MARKERS: [&str; 4] = ["cursoralpha", "cursorbravo", "cursorcharlie", "cursordelta"];
 
+const SENTINEL: &str = "cursorforeign";
+
+#[derive(Clone, Copy)]
+enum Mutation {
+    Insert,
+    SoftDelete,
+    HardDelete,
+}
+
 #[derive(Clone)]
 enum Records {
     Entities(Arc<dyn EntityStore>),
@@ -25,17 +34,17 @@ impl Records {
         }
     }
 
-    async fn put(&self, id: Uuid, marker: &str, created_at: i64) {
+    async fn put(&self, namespace: &str, id: Uuid, marker: &str, created_at: i64) {
         match self {
             Self::Entities(store) => {
-                let mut row = Entity::new("local", "concept", marker);
+                let mut row = Entity::new(namespace, "concept", marker);
                 row.id = id;
                 row.created_at = created_at;
                 row.updated_at = created_at;
                 store.upsert_entity(row).await.unwrap();
             }
             Self::Notes(store) => {
-                let mut row = Note::new("local", "observation", marker);
+                let mut row = Note::new(namespace, "observation", marker);
                 row.id = id;
                 row.created_at = created_at;
                 row.updated_at = created_at;
@@ -44,15 +53,32 @@ impl Records {
         }
     }
 
-    async fn delete(&self, id: Uuid) {
+    async fn delete(&self, id: Uuid, mode: DeleteMode) {
+        let hard = matches!(mode, DeleteMode::Hard);
         let deleted = match self {
-            Self::Entities(store) => store.delete_entity(id, DeleteMode::Soft).await.unwrap(),
-            Self::Notes(store) => store.delete_note(id, DeleteMode::Soft).await.unwrap(),
+            Self::Entities(store) => store.delete_entity(id, mode).await.unwrap(),
+            Self::Notes(store) => store.delete_note(id, mode).await.unwrap(),
         };
-        assert!(
-            deleted,
-            "the fetched boundary must exist before its soft delete"
-        );
+        assert!(deleted, "the fetched boundary must exist before deletion");
+        if hard {
+            self.assert_absent(id).await;
+        }
+    }
+
+    async fn assert_absent(&self, id: Uuid) {
+        let absent = match self {
+            Self::Entities(store) => store
+                .get_entity_including_deleted(id)
+                .await
+                .unwrap()
+                .is_none(),
+            Self::Notes(store) => store
+                .get_note_including_deleted(id)
+                .await
+                .unwrap()
+                .is_none(),
+        };
+        assert!(absent, "hard deletion must remove the boundary row");
     }
 
     async fn assert_row(&self, id: Uuid, marker: &str, deleted: bool) {
@@ -77,7 +103,7 @@ impl Records {
 
 struct InterleavingService {
     records: Records,
-    insert: bool,
+    mutation: Mutation,
     boundary: Uuid,
     added: Uuid,
     fired: Arc<AtomicBool>,
@@ -95,11 +121,13 @@ impl EmbeddingService for InterleavingService {
         self.seen.lock().unwrap().extend_from_slice(texts);
         if !self.fired.swap(true, Ordering::SeqCst) {
             assert_eq!(texts, &[MARKERS[0].to_string()]);
-            if self.insert {
-                // Newest by the old DESC sort, but last by immutable insertion sequence.
-                self.records.put(self.added, MARKERS[3], 400).await;
-            } else {
-                self.records.delete(self.boundary).await;
+            match self.mutation {
+                Mutation::Insert => {
+                    // Newest by the old DESC sort, but last by immutable insertion sequence.
+                    self.records.put("local", self.added, MARKERS[3], 400).await;
+                }
+                Mutation::SoftDelete => self.records.delete(self.boundary, DeleteMode::Soft).await,
+                Mutation::HardDelete => self.records.delete(self.boundary, DeleteMode::Hard).await,
             }
         }
         Ok(texts.iter().map(|_| vec![1.0; 8]).collect())
@@ -136,7 +164,7 @@ fn no_models(mut cfg: RuntimeConfig) -> RuntimeConfig {
     cfg
 }
 
-async fn interleaved_reindex(entities: bool, insert: bool) {
+async fn interleaved_reindex(entities: bool, mutation: Mutation) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("cursor.db");
     let config = write_empty_test_config(dir.path());
@@ -155,6 +183,7 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
             .unwrap(),
         )
     };
+    let foreign_id = Uuid::new_v4();
     let ids = [
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -165,9 +194,16 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
         let rt = KhiveRuntime::new(resolve()).unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let records = Records::from_runtime(&rt, &token, entities);
+        let foreign_token = rt.authorize(Namespace::parse("foreign").unwrap()).unwrap();
+        let foreign_records = Records::from_runtime(&rt, &foreign_token, entities);
+        foreign_records
+            .put("foreign", foreign_id, SENTINEL, 500)
+            .await;
         // Align initial insertion and DESC orders so the mutation targets either first page.
         for i in 0..3 {
-            records.put(ids[i], MARKERS[i], 300 - i as i64 * 100).await;
+            records
+                .put("local", ids[i], MARKERS[i], 300 - i as i64 * 100)
+                .await;
         }
         let fts = if entities {
             rt.text(&token).unwrap()
@@ -214,7 +250,7 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
             let token = rt.authorize(Namespace::local())?;
             rt.register_embedder(InterleavingProvider(Arc::new(InterleavingService {
                 records: Records::from_runtime(rt, &token, entities),
-                insert,
+                mutation,
                 boundary: ids[0],
                 added: ids[3],
                 fired: Arc::clone(&fired),
@@ -229,7 +265,11 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
         fired.load(Ordering::SeqCst),
         "the actual embed call must perform the mutation"
     );
-    let expected_len = if insert { 4 } else { 3 };
+    let expected_len = if matches!(mutation, Mutation::Insert) {
+        4
+    } else {
+        3
+    };
     let mut expected = MARKERS[..expected_len]
         .iter()
         .map(|s| s.to_string())
@@ -256,7 +296,11 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
         rt.text_for_notes(&token).unwrap()
     };
     for i in 0..expected_len {
-        let deleted = !insert && i == 0;
+        let deleted = !matches!(mutation, Mutation::Insert) && i == 0;
+        if deleted && matches!(mutation, Mutation::HardDelete) {
+            records.assert_absent(ids[i]).await;
+            continue;
+        }
         records.assert_row(ids[i], MARKERS[i], deleted).await;
         if deleted {
             continue;
@@ -281,6 +325,35 @@ async fn interleaved_reindex(entities: bool, insert: bool) {
             vec![ids[i]]
         );
     }
+    let foreign_token = rt.authorize(Namespace::parse("foreign").unwrap()).unwrap();
+    let foreign_records = Records::from_runtime(&rt, &foreign_token, entities);
+    foreign_records
+        .assert_row(foreign_id, SENTINEL, false)
+        .await;
+    assert!(vectors
+        .batch_exists(&[foreign_id], "foreign")
+        .await
+        .unwrap()
+        .is_empty());
+    let foreign_fts = if entities {
+        rt.text(&foreign_token).unwrap()
+    } else {
+        rt.text_for_notes(&foreign_token).unwrap()
+    };
+    assert!(
+        foreign_fts
+            .search(TextSearchRequest {
+                query: SENTINEL.into(),
+                mode: TextQueryMode::Plain,
+                filter: None,
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "reindex must not backfill the foreign sentinel"
+    );
 }
 
 #[tokio::test]
@@ -288,7 +361,7 @@ async fn entity_reindex_visits_newer_insert_once() {
     if crate::test_process::run_in_child() {
         return;
     }
-    interleaved_reindex(true, true).await;
+    interleaved_reindex(true, Mutation::Insert).await;
 }
 
 #[tokio::test]
@@ -296,7 +369,7 @@ async fn note_reindex_visits_newer_insert_once() {
     if crate::test_process::run_in_child() {
         return;
     }
-    interleaved_reindex(false, true).await;
+    interleaved_reindex(false, Mutation::Insert).await;
 }
 
 #[tokio::test]
@@ -304,7 +377,7 @@ async fn entity_reindex_continues_after_boundary_soft_delete() {
     if crate::test_process::run_in_child() {
         return;
     }
-    interleaved_reindex(true, false).await;
+    interleaved_reindex(true, Mutation::SoftDelete).await;
 }
 
 #[tokio::test]
@@ -312,5 +385,21 @@ async fn note_reindex_continues_after_boundary_soft_delete() {
     if crate::test_process::run_in_child() {
         return;
     }
-    interleaved_reindex(false, false).await;
+    interleaved_reindex(false, Mutation::SoftDelete).await;
+}
+
+#[tokio::test]
+async fn entity_reindex_continues_after_boundary_hard_delete() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    interleaved_reindex(true, Mutation::HardDelete).await;
+}
+
+#[tokio::test]
+async fn note_reindex_continues_after_boundary_hard_delete() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    interleaved_reindex(false, Mutation::HardDelete).await;
 }

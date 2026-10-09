@@ -23,9 +23,9 @@ use khive_runtime::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
     KhiveConfig, KhiveRuntime, Namespace,
 };
-use khive_storage::entity::Entity;
+use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::error::StorageError;
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteFilter};
 use khive_storage::types::VectorRecord;
 use khive_storage::VectorStore;
 use khive_types::{Pack, SubstrateKind};
@@ -584,10 +584,27 @@ async fn run_reindex_with_setup(
 
         let mut entity_after = None;
         loop {
-            let (batch, next_after) = rt
-                .list_entities_after(&token, None, None, &[], entity_after, batch_size)
+            let page = rt
+                .entities(&token)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .query_entities_after(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        legacy_entity_type_fallback: true,
+                        namespaces: token
+                            .visible_namespaces()
+                            .iter()
+                            .map(|ns| ns.as_str().to_owned())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    entity_after,
+                    batch_size,
+                )
                 .await
+                .map_err(khive_runtime::RuntimeError::from)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (batch, next_after) = (page.items, page.next_after);
             let n = batch.len();
             if n == 0 {
                 break;
@@ -639,16 +656,32 @@ async fn run_reindex_with_setup(
         entity_bar.finish();
 
         // ── notes ─────────────────────────────────────────────────────────────────
-        let note_total = count_notes(&rt, &ns_str).await;
+        let note_total = count_notes(&rt, &token).await;
         let note_bar = ProgressBar::new("notes");
         note_bar.update(0, note_total);
 
         let mut note_after = None;
         loop {
-            let (batch, next_after) = rt
-                .list_notes_after(&token, None, note_after, batch_size)
+            let page = rt
+                .notes(&token)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .query_notes_filtered_after(
+                    token.namespace().as_str(),
+                    &NoteFilter {
+                        namespaces: token
+                            .visible_namespaces()
+                            .iter()
+                            .map(|ns| ns.as_str().to_owned())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    note_after,
+                    batch_size,
+                )
                 .await
+                .map_err(khive_runtime::RuntimeError::from)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (batch, next_after) = (page.items, page.next_after);
             let n = batch.len();
             if n == 0 {
                 break;
@@ -1117,26 +1150,14 @@ fn quote_sqlite_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
-    use khive_storage::types::{SqlStatement, SqlValue};
-    let sql = rt.sql();
-    let Ok(mut reader) = sql.reader().await else {
+async fn count_notes(rt: &KhiveRuntime, token: &khive_runtime::NamespaceToken) -> u64 {
+    let Ok(notes) = rt.notes(token) else {
         return 0;
     };
-    let row = reader
-        .query_row(SqlStatement {
-            sql: sql!("notes_count").into(),
-            params: vec![SqlValue::Text(ns.to_owned())],
-            label: None,
-        })
-        .await;
-    match row {
-        Ok(Some(r)) => match r.get("cnt") {
-            Some(SqlValue::Integer(n)) => *n as u64,
-            _ => 0,
-        },
-        _ => 0,
-    }
+    notes
+        .count_notes(token.namespace().as_str(), None)
+        .await
+        .unwrap_or(0)
 }
 
 fn render_human_report(report: &ReindexReport) -> String {
