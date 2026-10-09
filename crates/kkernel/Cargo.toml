@@ -64,6 +64,7 @@ sha2 = { workspace = true }
 lattice-embed = { workspace = true }
 
 [dev-dependencies]
+inventory = { workspace = true }
 khive-db = { version = "0.11.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-template = { version = "0.11.0", path = "../khive-pack-template" }
 libc = { workspace = true }

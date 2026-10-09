@@ -58,7 +58,11 @@ fn pack_list_reports_linked_versions_in_json_and_human_output() {
         let name = pack["name"].as_str().expect("pack name");
         let version = pack["version"].as_str().expect("version string");
         assert!(!version.is_empty(), "{name} has no version");
-        assert_eq!(version, env!("CARGO_PKG_VERSION"), "{name}");
+        let registration = inventory::iter::<khive_runtime::PackRegistration>
+            .into_iter()
+            .find(|registration| registration.0.name() == name)
+            .expect("listed pack must have a named factory");
+        assert_eq!(version, registration.0.version(), "{name}");
         let verb_count = pack["verbs"].as_array().expect("verb list").len();
         let expected = format!("# {name} {version} ({verb_count} verbs)");
         assert!(
