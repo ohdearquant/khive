@@ -279,6 +279,7 @@ mod tests {
         let path = tmp.path().join("engine_test.db");
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(path.clone()),
+            volume_lock_dir: Some(tmp.path().join("volume-locks")),
             ..RuntimeConfig::no_embeddings()
         })
         .expect("create and migrate engine test database");
