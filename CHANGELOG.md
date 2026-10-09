@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
+### Added
+
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
 
 ### Breaking (Rust crates)
 
