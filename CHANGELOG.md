@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
+  descriptor-relative atomic publication helpers. Checkpoints retain their separate metadata
+  commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
