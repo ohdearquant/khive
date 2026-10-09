@@ -2427,6 +2427,10 @@ no_embed = true
     #[tokio::test]
     #[serial]
     async fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let dir = TempDir::new().expect("temp dir");
         let main_path = dir.path().join("main.db");
         let khive_cfg =
