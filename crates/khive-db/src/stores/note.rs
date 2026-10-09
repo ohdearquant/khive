@@ -1,7 +1,10 @@
 //! SQL-backed `NoteStore` implementation.
 
+mod guarded_patch;
 pub mod recipient;
 pub mod transport;
+
+use guarded_patch::note_patch_properties_statement;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,8 +16,8 @@ use uuid::Uuid;
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::StorageError;
 use khive_storage::note::{
-    FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
-    NoteVisibility, SortDir,
+    FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NotePropertyPatch,
+    NoteSeekAfter, NoteTagMode, NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -1751,6 +1754,20 @@ impl NoteStore for SqlNoteStore {
             .map(|rows| rows > 0)
         })
         .await
+    }
+
+    async fn try_patch_note_properties(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        kind: &str,
+        patch: &NotePropertyPatch,
+    ) -> StorageResult<bool> {
+        let statement = note_patch_properties_statement(id, namespace, kind, patch)?;
+        let bridge =
+            crate::SqlBridge::new(Arc::clone(&self.pool), self.pool.canonical_path().is_some());
+        let mut writer = khive_storage::SqlAccess::writer(&bridge).await?;
+        Ok(writer.execute(statement).await? == 1)
     }
 
     async fn patch_note_property_atomic(

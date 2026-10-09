@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn guarded_property_patch_requires_a_declared_reservation_check() {
+    assert!(STORE_WRITES.contains(&"try_patch_note_properties"));
+    let sites = scan_sources(&[(
+        "sample/src/lib.rs".into(),
+        "fn write(store: &dyn NoteStore) { reject_reserved_secret_gate_property(Some(&properties)); store.try_patch_note_properties(id, ns, kind, &patch); }".into(),
+    )])
+    .unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].class, DetectedClass::WholeObject);
+    assert!(check_inventory(&sites, &[], 0)
+        .unwrap_err()
+        .contains("unmapped"));
+    let row = RouteInventoryEntry {
+        id: "synthetic.guarded-patch",
+        site: "sample/src/lib.rs::write",
+        expected_writes: 1,
+        target: Substrate::Note,
+        write_class: WriteClass::WholeObject,
+        reservation: Reservation::NamedCheck {
+            function: "reject_reserved_secret_gate_property",
+            file: "khive-runtime/src/secret_gate.rs",
+        },
+        ..ROUTE_INVENTORY[0]
+    };
+    check_inventory(&sites, &[row], 1).unwrap();
+    let unchecked = scan_sources(&[(
+        "sample/src/lib.rs".into(),
+        "fn write(store: &dyn NoteStore) { store.try_patch_note_properties(id, ns, kind, &patch); }".into(),
+    )])
+    .unwrap();
+    assert!(check_inventory(&unchecked, &[row], 1).is_err());
+}
+
+#[test]
 fn synthetic_census_controls() {
     let vector_sites = scan_sources(&[(
         "sample/src/lib.rs".into(),

@@ -429,6 +429,130 @@ async fn duplicate_quarantine_repair_preserves_a_competing_attachment() {
     );
 }
 
+#[tokio::test]
+async fn duplicate_quarantine_repair_refuses_a_changed_property_precondition() {
+    use std::sync::Arc;
+
+    use khive_runtime::{ChannelIngestCapability, Namespace, RuntimeError};
+    use khive_storage::BlobStore as _;
+    use tokio::sync::Barrier;
+
+    let runtime = Arc::new(super::KhiveRuntime::memory().unwrap());
+    let blob_root = tempfile::tempdir().unwrap();
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0).unwrap(),
+    );
+    let content_ref = blob_store
+        .put(b"guarded replay original".to_vec())
+        .await
+        .unwrap();
+    runtime.install_blob_store(blob_store).unwrap();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let legacy = Note::new("local", "message", "quarantine").with_properties(json!({
+        "external_id": "imap:mail.example.com:17:guarded-repair",
+        "direction": "inbound",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+        "channel_kind": "email",
+        "channel_slug": "mailbox@example.com",
+        "quarantined": true,
+        "unrelated": {"kept": true},
+    }));
+    let note_id = legacy.id;
+    let raw = runtime.backend().notes().unwrap();
+    assert!(raw.try_insert_note(legacy.clone()).await.unwrap());
+    let body = json!({
+        "from": "email:quarantine",
+        "to": "local",
+        "content": "quarantine replay",
+        "channel_kind": "email",
+        "channel_slug": "mailbox@example.com",
+        "external_id": "imap:mail.example.com:mailbox@example.com:17:guarded-repair",
+        "legacy_external_id": "imap:mail.example.com:17:guarded-repair",
+        "metadata": {
+            "quarantined": true,
+            "quarantine_content_ref": content_ref.to_string(),
+        },
+    });
+    let arrived = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let replay = {
+        let runtime = Arc::clone(&runtime);
+        let token = token.clone();
+        let body = body.clone();
+        tokio::spawn(super::race_seam::AFTER_QUARANTINE_ROLE_READ.scope(
+            (Arc::clone(&arrived), Arc::clone(&resume)),
+            async move {
+                super::handle_ingest(
+                    &runtime,
+                    &InboxSignal::new(),
+                    Some(&ChannelIngestCapability::grant_for_direct_composition()),
+                    &Ok(None),
+                    &token,
+                    body,
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+            },
+        ))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived.wait())
+        .await
+        .expect("replay must pause after reading the absent attachment");
+    assert!(raw
+        .set_note_property(note_id, "quarantined", json!(false), legacy.updated_at + 1)
+        .await
+        .unwrap());
+    let changed = raw.get_note(note_id).await.unwrap().unwrap();
+    resume.wait().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(15), replay)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("changed quarantine evidence must refuse the repair");
+    assert!(matches!(error, RuntimeError::InvalidInput(ref message)
+        if message == "ingest: duplicate quarantine changed during retention repair"));
+    assert_eq!(raw.get_note(note_id).await.unwrap().unwrap(), changed);
+    assert_eq!(
+        runtime
+            .core()
+            .attachments()
+            .unwrap()
+            .get_attachment(note_id, "quarantine-original")
+            .await
+            .unwrap()
+            .unwrap()
+            .content_ref,
+        content_ref
+    );
+
+    assert!(raw
+        .set_note_property(note_id, "quarantined", json!(true), changed.updated_at + 1)
+        .await
+        .unwrap());
+    let ack = super::handle_ingest(
+        &runtime,
+        &InboxSignal::new(),
+        Some(&ChannelIngestCapability::grant_for_direct_composition()),
+        &Ok(None),
+        &token,
+        body,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .expect("matching evidence must allow the same replay");
+    assert_eq!(ack["deduplicated"], true);
+    let repaired = raw.get_note(note_id).await.unwrap().unwrap();
+    assert_eq!(
+        repaired.properties.as_ref().unwrap()["quarantine_content_ref"],
+        content_ref.to_string()
+    );
+    assert_eq!(
+        repaired.properties.as_ref().unwrap()["unrelated"],
+        json!({"kept": true})
+    );
+    assert!(repaired.expires_at.is_some());
+}
+
 /// A pre-retention row stored under the legacy IMAP key has a channel slug
 /// and no `expires_at`. Replaying its quarantined message attaches the
 /// original bytes to that row, so cleanup must be able to select the row

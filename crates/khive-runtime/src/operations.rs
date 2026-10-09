@@ -37,6 +37,8 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use rusqlite::OptionalExtension;
 
+mod quarantine_note_retention;
+
 #[cfg(test)]
 mod batch_edge_tests;
 
@@ -4544,72 +4546,6 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Note>> {
         self.try_create_note_impl(token, kind, name, content, properties, false, None, None)
             .await
-    }
-
-    /// Like [`Self::try_create_note`] but permits the caller to establish the
-    /// transport-owned `message` properties that `try_create_note` refuses.
-    ///
-    /// This is a deliberately named, separate entry point rather than a flag
-    /// on `try_create_note` so the trust decision is visible at every call
-    /// site: `comm.ingest` (`khive-pack-comm/src/handlers/ingest.rs`) is the sole
-    /// legitimate caller, because it is the only code that has just derived
-    /// quarantine disposition and channel provenance from the inbound
-    /// transport itself. The caller set is bounded by possession, not
-    /// documentation: the required [`crate::ChannelIngestCapability`] is
-    /// constructible only inside this crate and granted at pack registration
-    /// exclusively to channel-transport packs. Every other write path uses
-    /// `try_create_note`, which rejects those properties
-    /// unconditionally.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn try_create_note_as_trusted_ingest(
-        &self,
-        _capability: &crate::pack::ChannelIngestCapability,
-        token: &NamespaceToken,
-        kind: &str,
-        name: Option<&str>,
-        content: &str,
-        properties: Option<serde_json::Value>,
-        expires_after: Option<std::time::Duration>,
-    ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(
-            token,
-            kind,
-            name,
-            content,
-            properties,
-            true,
-            None,
-            expires_after,
-        )
-        .await
-    }
-
-    /// Publish a trusted inbound message and its original-byte attachment in
-    /// one database transaction. Channel quarantine must not advertise a
-    /// reference in note metadata before GC can see its attachment owner.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn try_create_note_as_trusted_ingest_with_attachment(
-        &self,
-        _capability: &crate::pack::ChannelIngestCapability,
-        token: &NamespaceToken,
-        kind: &str,
-        name: Option<&str>,
-        content: &str,
-        properties: Option<serde_json::Value>,
-        attachment: NewAttachment,
-        expires_after: Option<std::time::Duration>,
-    ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(
-            token,
-            kind,
-            name,
-            content,
-            properties,
-            true,
-            Some(attachment),
-            expires_after,
-        )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]
