@@ -35,6 +35,7 @@ use rmcp::{handler::server::wrapper::Parameters, ErrorData as McpError};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 include!("server/plan_tests.rs");
+include!("server/disabled_verbs_tests.rs");
 include!("server/search_text_reason_tests.rs");
 include!("server/search_text_mode_tests.rs");
 include!("server/search_ranking_tests.rs");
@@ -5040,6 +5041,7 @@ fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
             "kg".to_string(),
             PackConfig {
                 backend: "main".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -5236,6 +5238,7 @@ fn config_id_encodes_disabled_wal_ceiling_for_every_backend() {
         "kg".to_string(),
         PackConfig {
             backend: "main".to_string(),
+            verbs_disabled: Vec::new(),
             no_embed: false,
         },
     )]);
@@ -5516,6 +5519,7 @@ fn config_id_differs_when_pack_no_embed_differs() {
             PackConfig {
                 backend: "main".to_string(),
                 no_embed,
+                verbs_disabled: Vec::new(),
             },
         )]),
         ..KhiveConfig::default()

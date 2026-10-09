@@ -583,6 +583,7 @@ mod tests {
                 "comm".into(),
                 PackConfig {
                     backend: "old-comm".into(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             )]

@@ -613,6 +613,25 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig, config: &RuntimeCon
     format!(";backends=[{backends}];pack_backends=[{pack_backends}]")
 }
 
+fn disabled_verb_policy_suffix(config: &khive_runtime::KhiveConfig) -> String {
+    let disabled: std::collections::BTreeMap<_, _> = config
+        .packs
+        .iter()
+        .filter_map(|(pack, policy)| {
+            let verbs: std::collections::BTreeSet<_> = policy.verbs_disabled.iter().collect();
+            (!verbs.is_empty()).then_some((pack, verbs))
+        })
+        .collect();
+    if disabled.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ";disabled_verbs={}",
+            serde_json::to_string(&disabled).expect("string policy serializes")
+        )
+    }
+}
+
 /// Resolve any path headed into `config_id` fingerprinting — a declared
 /// `[[backends]].path` or the resolved `RuntimeConfig.db_path` (itself
 /// derived from `--db`/`KHIVE_DB`) — to a stable, cwd-independent string
@@ -1053,15 +1072,26 @@ impl KhiveMcpServer {
                 runtime,
             });
         }
-        Self::with_mounted_packs(runtime, packs, Vec::new())
+        Self::with_mounted_packs(runtime, packs, Vec::new(), None)
     }
 
     /// Build a prepared runtime's native registry and start its configured sources.
     #[allow(clippy::result_large_err)]
     pub async fn new_with_mounts(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
+        Self::new_with_mounts_and_config(runtime, None).await
+    }
+
+    /// Build a prepared runtime's registry with resolved operator configuration.
+    /// Applies disabled-handler policy and includes it in daemon identity. As with
+    /// [`Self::new_with_mounts`], storage preparation remains the caller's job.
+    #[allow(clippy::result_large_err)]
+    pub async fn new_with_mounts_and_config(
+        runtime: KhiveRuntime,
+        config: Option<&khive_runtime::KhiveConfig>,
+    ) -> Result<Self, PackRegError> {
         let packs = runtime.config().packs.clone();
         let mounted = khive_mounts::start_mounts(&runtime).await;
-        Self::with_mounted_packs(runtime, &packs, mounted)
+        Self::with_mounted_packs(runtime, &packs, mounted, config)
     }
 
     #[allow(clippy::result_large_err)]
@@ -1069,6 +1099,7 @@ impl KhiveMcpServer {
         runtime: KhiveRuntime,
         packs: &[String],
         mounted: Vec<khive_mounts::MountedPack>,
+        config: Option<&khive_runtime::KhiveConfig>,
     ) -> Result<Self, PackRegError> {
         #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
         let channel_loop_admission = ChannelLoopAdmission::for_single_runtime(&runtime, packs);
@@ -1076,7 +1107,7 @@ impl KhiveMcpServer {
         let default_namespace = runtime.config().default_namespace.clone();
         let config_id = compute_config_id_with_runtime_policies(
             runtime.config(),
-            None,
+            config,
             runtime.ann_fresh_tail_enabled(),
             runtime.is_read_only(),
         );
@@ -1118,6 +1149,11 @@ impl KhiveMcpServer {
                     failure: PackRegFailure::Registry(source),
                     runtime: runtime.clone(),
                 })?;
+        }
+        if let Some(config) = config {
+            for (pack, policy) in &config.packs {
+                builder.with_disabled_verbs(pack, &policy.verbs_disabled);
+            }
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
