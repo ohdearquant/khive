@@ -10,7 +10,7 @@ use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
-use crate::message::{dual_write_message_with_identity, resolve_id, short_id, MessageWrite};
+use crate::message::{dual_write_message_with_identity, short_id, MessageWrite};
 use crate::params::deser;
 
 use super::validation::{
@@ -56,7 +56,9 @@ pub(crate) async fn handle_reply(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReplyParams = deser(params)?;
-    let id = resolve_id(runtime, token, &p.id, "reply").await?;
+    let id = runtime
+        .resolve_uuid_or_prefix_for_verb(token, &p.id, "reply")
+        .await?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "reply: `content` must not be empty".into(),

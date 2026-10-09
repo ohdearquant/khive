@@ -33,7 +33,9 @@ pub(crate) async fn handle_thread(
     };
 
     // Resolve and validate the passed ID.
-    let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
+    let passed_uuid = runtime
+        .resolve_uuid_or_prefix_for_verb(token, &p.id, "thread")
+        .await?;
 
     let (canonical_thread_id, selected_raw_thread_id, root_note): (String, Option<String>, Note) = {
         let store = runtime.notes(token)?;
@@ -294,7 +296,9 @@ pub(crate) async fn handle_thread(
             let looks_like_id = raw.parse::<Uuid>().is_ok()
                 || (raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()));
             if looks_like_id {
-                let cursor_uuid = resolve_id(runtime, token, raw, "thread").await?;
+                let cursor_uuid = runtime
+                    .resolve_uuid_or_prefix_for_verb(token, raw, "thread")
+                    .await?;
                 let cursor_store = runtime.notes(token)?;
                 let cursor_note = cursor_store
                     .get_note(cursor_uuid)
