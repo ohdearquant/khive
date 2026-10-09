@@ -810,13 +810,83 @@ async fn remote_push_compares_at_local_remote_and_native_effect_seams() {
 }
 
 #[tokio::test]
-async fn remote_push_rejects_every_force_and_omission_before_network() {
+async fn remote_push_force_true_is_unconditionally_denied_before_transport() {
+    // This fixture has both the git-write Gate and an allow policy for this actor.
+    let f = Fixture::new(true, None).await;
+    let mut p = f.push();
+    p["force"] = json!(true);
+    let receipt = f.refusal(&f.actor, "git.push", p, "force_denied").await;
+    assert_eq!(receipt.reason.as_deref(), Some("force_denied"));
+    assert_eq!(receipt.inputs["force"], true);
+    assert!(f.remote.state.lock().unwrap().calls.is_empty());
+    assert_eq!(f.remote.state.lock().unwrap().push_calls, 0);
+    assert!(
+        !f.dir.path().join("reads").exists(),
+        "force denial must happen before resolving a platform credential"
+    );
+}
+
+#[tokio::test]
+async fn remote_push_false_and_omitted_force_preserve_the_ordinary_push() {
+    for force in [Some(false), None] {
+        // Each successful push advances its bare remote, so controls need fresh fixtures.
+        let f = Fixture::new(true, None).await;
+        let local_refs = git(&f.repo, &["show-ref"]);
+        let mut p = f.push();
+        if let Some(force) = force {
+            p["force"] = json!(force);
+        }
+        let result = f.call(&f.actor, "git.push", p).await.unwrap();
+        assert_eq!(result["sha"], f.head);
+        assert_eq!(remote_head(&f.remote.bare), Some(f.head.clone()));
+        assert_eq!(git(&f.repo, &["show-ref"]), local_refs);
+        let receipt = f.last(&f.actor).await;
+        assert_eq!(receipt.disposition, Disposition::Committed);
+        assert_eq!(receipt.reason, None);
+        assert_eq!(
+            receipt.inputs.get("force"),
+            force.map(|_| json!(false)).as_ref()
+        );
+        let state = f.remote.state.lock().unwrap();
+        assert_eq!(state.push_calls, 1);
+        assert_eq!(state.writes, 1);
+        assert!(state.calls.iter().any(|call| call["op"] == "remote_ref"));
+        assert!(state.calls.iter().any(|call| call["op"] == "push"
+            && call["sha"] == f.head
+            && call["expected_remote"] == f.base));
+    }
+}
+
+#[tokio::test]
+async fn remote_push_rejects_non_boolean_force_before_transport() {
+    let f = Fixture::new(true, None).await;
+    for force in [
+        Value::Null,
+        json!(0),
+        json!(1),
+        json!(-1),
+        json!(1.5),
+        json!("true"),
+        json!("false"),
+        json!([]),
+        json!({}),
+    ] {
+        let mut p = f.push();
+        p["force"] = force;
+        let receipt = f
+            .refusal(&f.actor, "git.push", p, "force must be a boolean")
+            .await;
+        assert_eq!(receipt.reason.as_deref(), Some("invalid_params"));
+        assert!(f.remote.state.lock().unwrap().calls.is_empty());
+    }
+    assert_eq!(f.remote.state.lock().unwrap().push_calls, 0);
+    assert!(!f.dir.path().join("reads").exists());
+}
+
+#[tokio::test]
+async fn remote_push_rejects_unknown_overrides_and_omission_before_network() {
     let f = Fixture::new(true, None).await;
     for extra in [
-        json!({"force":true}),
-        json!({"force":1}),
-        json!({"force":"true"}),
-        json!({"force":[]}),
         json!({"force_with_lease":true}),
         json!({"force_with_lease":false}),
         json!({"refspec":"+HEAD:refs/heads/main"}),
@@ -1264,6 +1334,23 @@ async fn remote_pack_schema_covers_all_verbs_with_required_nullable_compare() {
         schema["properties"]["expected_remote"]["type"],
         json!(["string", "null"])
     );
+    assert_eq!(schema["properties"]["force"]["type"], "boolean");
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("force")));
+    assert!(help["description"]
+        .as_str()
+        .unwrap()
+        .contains("force_denied"));
+    assert!(help["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "force"
+            && p["type"] == "boolean"
+            && p["required"] == false
+            && p["description"].as_str().unwrap().contains("force_denied")));
     assert!(help["params"]
         .as_array()
         .unwrap()
