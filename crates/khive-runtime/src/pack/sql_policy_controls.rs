@@ -405,6 +405,45 @@ const Q: &str = "SELECT production FROM notes";
     }
 
     #[test]
+    fn named_keep_opts_in_only_its_unconverted_source_and_remains_exact() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/query.rs");
+        let original = r#"const Q: &str = "SELECT id FROM notes";"#;
+        let mut sources = BTreeMap::from([
+            (path.clone(), original.into()),
+            (
+                root.join("demo/src/unconverted.rs"),
+                r#"const Q: &str = "SELECT unrelated FROM notes";"#.into(),
+            ),
+        ]);
+        let keep = || Keep {
+            name: "one_dynamic_query",
+            path: "demo/src/query.rs",
+            sql: "SELECT id FROM notes",
+            reason: "Opt one source into the policy before converting its crate.",
+        };
+        assert!(inline_errors(&sources, &root, &[], &[keep()]).is_empty());
+        sources.insert(
+            path.clone(),
+            format!("{original}\nconst EXTRA: &str = \"SELECT extra FROM notes\";"),
+        );
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline SQL: demo/src/query.rs: SELECT extra FROM notes"]
+        );
+        sources.insert(path.clone(), format!("{original}\n{original}"));
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline keep one_dynamic_query expected once, found 2"]
+        );
+        sources.remove(&path);
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline keep one_dynamic_query expected once, found 0"]
+        );
+    }
+
+    #[test]
     fn named_keeps_are_exact_live_single_statement_exceptions() {
         let root = PathBuf::from("/crates");
         let path = root.join("demo/src/lib.rs");

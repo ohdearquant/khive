@@ -674,7 +674,10 @@ fn inline_errors(
     for (path, text) in sources {
         let relative = path.strip_prefix(root).unwrap().to_string_lossy();
         let crate_name = relative.split('/').next().unwrap();
-        if !converted.contains(&crate_name) || !production_source(path) {
+        // A named keep can opt one source file into the policy before its
+        // entire crate is converted. Other unconverted files stay excluded.
+        let explicitly_kept = keeps.iter().any(|keep| keep.path == relative);
+        if (!converted.contains(&crate_name) && !explicitly_kept) || !production_source(path) {
             continue;
         }
         for statement in sql_literals(&strip_test_modules(text)) {
@@ -818,6 +821,7 @@ pub(super) fn check(sources: Vec<(PathBuf, String)>, crates_root: &Path) {
 }
 
 const INLINE_KEEPS: &[Keep] = &[
+    Keep { name: "runtime_pack_table_prefix", path: "khive-runtime/src/operations/resolve_prefix_in.rs", sql: "SELECT DISTINCT candidate.{id_column} AS resolved_id FROM {table} AS candidate WHERE candidate.{id_column} >= ?1 AND candidate.{id_column} < ?2{filters} ORDER BY candidate.{id_column} LIMIT 2", reason: "Static pack table and ID column are validated and quoted at runtime; prefix bounds and namespace are bound values; filters are fixed clauses." },
     Keep { name: "memory_ann_protected_tail", path: "khive-pack-memory/src/ann.rs", sql: "WITH tail AS MATERIALIZED ( SELECT seq, subject_id, op FROM ann_write_log WHERE embedding_model = ?1 AND kind = 'note' AND field = 'note.content' AND seq > ?2 ORDER BY seq LIMIT ?5 ), summary AS MATERIALIZED ( SELECT COUNT(*) AS raw_count, ({minimum}) AS min_watermark FROM tail ), selected AS MATERIALIZED ( SELECT seq, subject_id, op FROM tail WHERE (SELECT raw_count FROM summary) <= ?4 ) SELECT 0 AS is_summary, summary.raw_count, summary.min_watermark, NULL AS seq, NULL AS subject_id, NULL AS op, NULL AS vector_model, NULL AS vector_kind, NULL AS vector_field, NULL AS embedding, NULL AS live_note_id FROM summary UNION ALL SELECT 1 AS is_summary, NULL AS raw_count, NULL AS min_watermark, selected.seq, selected.subject_id, selected.op, vectors.embedding_model AS vector_model, vectors.kind AS vector_kind, vectors.field AS vector_field, vectors.embedding, live_note.id AS live_note_id FROM selected LEFT JOIN {table_name} AS vectors ON vectors.subject_id = selected.subject_id LEFT JOIN notes AS live_note ON live_note.id = selected.subject_id AND live_note.deleted_at IS NULL ORDER BY is_summary, seq", reason: "Trusted vector table identifier is embedded in the capped tail and registry snapshot statement." },
     Keep { name: "memory_session_exact_snapshot", path: "khive-pack-memory/src/ann.rs", sql: "WITH session_proof AS MATERIALIZED ( SELECT ({proof}) AS has_fence), {knn_ctes}session_union AS MATERIALIZED ({union}), session_ranked AS MATERIALIZED ( SELECT c.subject_id, c.distance FROM session_union c JOIN notes n ON n.id = c.subject_id AND n.namespace = c.vector_namespace AND n.deleted_at IS NULL ORDER BY c.distance, c.subject_id LIMIT ?2) SELECT p.has_fence, r.subject_id, r.distance FROM session_proof p LEFT JOIN session_ranked r ON 1 = 1 ORDER BY r.distance, r.subject_id", reason: "Fence predicate, per-namespace KNN CTEs and union arms are assembled for one snapshot." },
     Keep { name: "session_union_arm", path: "khive-pack-memory/src/ann.rs", sql: "SELECT subject_id, vector_namespace, distance FROM session_knn_{index}", reason: "Per-namespace CTE identifier contains the runtime index." },
