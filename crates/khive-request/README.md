@@ -51,8 +51,10 @@ form is a parse error (`DslError::PrevRefInJsonForm`).
   JSON form, is rejected at parse time rather than deferred to a runtime lookup miss.
 - **Write-key conflict detection** (`write_keys_for_op_pub`) is a preflight check over a
   parallel batch: two ops that target the same UUID via `update`/`delete` (`id`),
-  `merge` (`into_id`/`from_id`), or `link` (`source_id`/`target_id`) reject the whole
-  batch before any op dispatches, rather than racing.
+  `merge` (`into_id`/`from_id`), or `link` (`source_id`/`target_id`) receive per-op
+  conflict refusals before dispatch. Unrelated operations still run. The
+  `conflict_ops` list identifies all direct participants, including self; see
+  [write-conflict keys](docs/api/write-conflicts.md) for parallel-chain details.
 - **`RESERVED_ENVELOPE_ARGS`** (`presentation`, `presentation_per_op`) are
   envelope-level fields; passing them inside a verb's own argument list is rejected
   (`DslError::ReservedEnvelopeArg`).

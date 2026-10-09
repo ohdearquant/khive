@@ -1693,23 +1693,7 @@ impl KhiveMcpServer {
                 // Detect ops that target the same write key in the same parallel/single
                 // batch. Conflicting ops receive per-op error entries; non-conflicting ops
                 // execute normally. `results.length == summary.total` is preserved.
-                let conflict_indices: std::collections::HashSet<usize> = {
-                    let mut seen: std::collections::HashMap<String, usize> =
-                        std::collections::HashMap::new();
-                    let mut bad: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    for (i, op) in ops.iter().enumerate() {
-                        for key in khive_request::write_keys_for_op_pub(op) {
-                            if let Some(&prior) = seen.get(&key) {
-                                bad.insert(prior);
-                                bad.insert(i);
-                            } else {
-                                seen.insert(key, i);
-                            }
-                        }
-                    }
-                    bad
-                };
+                let conflict_ops = khive_request::write_key_conflict_ops(&ops);
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
@@ -1726,7 +1710,7 @@ impl KhiveMcpServer {
 
                 // Independent dispatch — bounded concurrency, results restored to input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
-                    let conflict_with: Option<String> = if conflict_indices.contains(&i) {
+                    let conflict_with: Option<String> = if !conflict_ops[i].is_empty() {
                         Some(format!(
                             "conflict: writes overlap with another op in this batch (op #{})",
                             i
@@ -1735,6 +1719,7 @@ impl KhiveMcpServer {
                         None
                     };
 
+                    let participants = conflict_ops[i].clone();
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
                     let schedule_ticker_last_tick_micros =
@@ -1762,7 +1747,9 @@ impl KhiveMcpServer {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
-                            return failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
+                            let mut entry = failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
+                            entry["conflict_ops"] = json!(participants);
+                            return entry;
                         }
                         // AlwaysVerbose verbs override the caller's presentation mode.
                         let presentation_policy = registry.presentation_policy_for(&tool);
@@ -2087,6 +2074,7 @@ impl KhiveMcpServer {
         };
         let budget = Arc::new(UnitBudget::new(response_budget));
         let unit_conflicts = unit_write_key_conflicts(&ops, &ranges);
+        let conflict_ops = khive_request::unit_write_key_conflict_ops(&ops, &ranges);
         let presentation_per_op: Arc<Vec<Option<PresentationMode>>> =
             Arc::new(presentation_per_op.unwrap_or_default());
 
@@ -2105,6 +2093,7 @@ impl KhiveMcpServer {
                     })
                     .collect();
                 let conflicts = unit_conflicts.get(&unit_index).cloned();
+                let participants = conflict_ops[range.clone()].to_vec();
                 let budget = budget.clone();
                 let presentation_per_op = presentation_per_op.clone();
                 UnitTask {
@@ -2141,6 +2130,9 @@ impl KhiveMcpServer {
                                             .to_string(),
                                     ),
                                 ));
+                            }
+                            for (entry, indices) in entries.iter_mut().zip(participants) {
+                                entry["conflict_ops"] = json!(indices);
                             }
                             return UnitOutcome {
                                 unit_index,
@@ -4518,11 +4510,15 @@ fn save_to_write_error(message: String, result: &Value) -> McpError {
 }
 
 fn dsl_err_to_mcp(e: DslError) -> McpError {
+    let mut data = json!({ "reason": RefusalReason::ParseError.as_str(),
+        "kind":"parse_error", "message":e.to_string() });
+    if let DslError::WriteKeyConflict { conflict_ops, .. } = &e {
+        data["conflict_ops"] = json!(conflict_ops);
+    }
     McpError::invalid_params(
         e.to_string(),
         Some(error_with_disposition(
-            json!({ "reason": RefusalReason::ParseError.as_str(),
-            "kind":"parse_error", "message":e.to_string() }),
+            data,
             DomainDisposition::NotCommitted,
         )),
     )
