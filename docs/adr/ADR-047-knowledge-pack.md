@@ -691,7 +691,8 @@ before `khive-pack-template`, reflecting the dependency ordering.
 
 ### What this ADR does NOT cover
 
-- Idempotent variant (`learn_or_get`) — deferred; no current demand from agent workflows.
+- Idempotent variant (`learn_or_get`) — not pursued under the knowledge pack's document-corpus scope;
+  create-or-reuse on a derived name belongs to the graph layer's shared entity creation path.
 - Pagination for `topic` — callers who need full pagination should use the kg pack's
   `list(kind="concept")` which has explicit `offset` support.
 - ADR amendment for ADR-002 or ADR-001 — not needed; the knowledge pack uses existing
