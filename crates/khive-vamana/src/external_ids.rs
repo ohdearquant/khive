@@ -127,74 +127,35 @@ pub fn write_external_ids_sidecar(
 /// re-created `O_EXCL | O_NOFOLLOW` relative to that descriptor.
 #[cfg(unix)]
 fn write_via_dirfd(dir: &std::path::Path, buf: &[u8]) -> Result<(), ExternalIdsWriteError> {
+    use khive_fs::atomic_publish::{publish_atomic_at_detailed, AtomicPublishPhase, StaleTmp};
     use std::io::Write as _;
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 
     let dir_file = open_dir_with_trusted_symlinks(dir)?;
     verify_original_dir_identity(dir, &dir_file)?;
-    let dir_fd = dir_file.as_raw_fd();
-
-    const TMP_NAME: &std::ffi::CStr = c"external_ids.bin.tmp";
-
-    // SAFETY: both arguments are live for the call; `unlinkat` removes a
-    // planted symlink or stale tmp as a directory entry, never through it.
-    let rc = unsafe { libc::unlinkat(dir_fd, TMP_NAME.as_ptr(), 0) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENOENT) {
-            return Err(ExternalIdsWriteError::io(
-                "remove stale external_ids.bin.tmp",
-                err,
-            ));
-        }
-    }
-
-    // SAFETY: the name and `dir_fd` are live for the call; the fd returned
-    // on success is uniquely owned and wrapped immediately below.
-    let tmp_fd = unsafe {
-        libc::openat(
-            dir_fd,
-            TMP_NAME.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644 as libc::c_uint,
-        )
-    };
-    if tmp_fd < 0 {
-        return Err(ExternalIdsWriteError::io(
-            "create external_ids.bin.tmp",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `tmp_fd` was just returned by the successful `openat` above and
-    // is uniquely owned by this `File`, which closes it exactly once on drop.
-    let mut f = unsafe { std::fs::File::from_raw_fd(tmp_fd) };
-    f.write_all(buf)
-        .map_err(|e| ExternalIdsWriteError::io("write external_ids.bin.tmp", e))?;
-    f.sync_all()
-        .map_err(|e| ExternalIdsWriteError::io("sync external_ids.bin.tmp", e))?;
-    drop(f);
-
-    // SAFETY: both names are NUL-terminated C strings; `dir_fd` is a live,
-    // open directory descriptor for the call's duration, and the rename is
-    // performed relative to it rather than a re-resolved path.
-    let rc = unsafe {
-        libc::renameat(
-            dir_fd,
-            TMP_NAME.as_ptr(),
-            dir_fd,
-            c"external_ids.bin".as_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(ExternalIdsWriteError::io(
-            "rename external_ids.bin.tmp -> external_ids.bin",
-            std::io::Error::last_os_error(),
-        ));
-    }
-
-    dir_file
-        .sync_all()
-        .map_err(|e| ExternalIdsWriteError::io("sync segment dir", e))
+    publish_atomic_at_detailed(
+        &dir_file,
+        "external_ids.bin.tmp",
+        "external_ids.bin",
+        StaleTmp::Unlink,
+        |file| file.write_all(buf),
+    )
+    .map_err(|error| {
+        let context = match error.phase() {
+            AtomicPublishPhase::RemoveTmp => "remove stale external_ids.bin.tmp",
+            // Names are fixed valid constants; Unlink does not inspect or refuse a
+            // stale regular/nonregular entry before unlink. Keep these unreachable
+            // phase mappings explicit without discarding the original I/O source.
+            AtomicPublishPhase::ValidateNames
+            | AtomicPublishPhase::InspectTmp
+            | AtomicPublishPhase::RefuseTmp
+            | AtomicPublishPhase::CreateTmp => "create external_ids.bin.tmp",
+            AtomicPublishPhase::WriteTmp => "write external_ids.bin.tmp",
+            AtomicPublishPhase::SyncTmp => "sync external_ids.bin.tmp",
+            AtomicPublishPhase::Rename => "rename external_ids.bin.tmp -> external_ids.bin",
+            AtomicPublishPhase::SyncDirectory => "sync segment dir",
+        };
+        ExternalIdsWriteError::io(context, error.into_source())
+    })
 }
 
 #[cfg(unix)]

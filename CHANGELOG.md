@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
+### Changed
+
+- Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
+  descriptor-relative atomic publication helpers. Checkpoints retain their separate metadata
+  commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
 
 ### Breaking (Rust crates)
 

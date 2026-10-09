@@ -31,6 +31,26 @@ additionally refuses both dot components before opening a writable entry.
 Otherwise the helpers return the raw `std::io::Error` of the failing call; callers add their own
 context.
 
+## `atomic_publish` (Unix only)
+
+`stage_atomic_at` exclusively creates a staging file under a held directory, invokes a writer
+callback, then syncs and closes that file. `publish_atomic_at` additionally renames the staged
+file over its destination and syncs the directory. Use the staged operation when a multi-file
+checkpoint has separate metadata and segment publication boundaries.
+
+Both use mode 0644 filtered by umask, no-follow and close-on-exec. `StaleTmp::Refuse` replaces a
+stale regular file but refuses nonregular entries, including symlinks. `StaleTmp::Unlink` removes
+the stale file or symlink entry without following it; directories refuse. Both names are checked
+before publication has any filesystem effect: empty, slash-containing, NUL-containing and dot
+names refuse, as do equal staging and destination names. Backslash is an ordinary Unix name;
+callers can impose stricter naming policy.
+
+The `_detailed` variants retain the failing phase and original `io::Error`; the convenience
+functions return that original error directly, preserving native errno. No error automatically
+cleans up a partial staging file. A directory-sync failure happens after rename and does not mean
+the old destination was restored. Callers own directory validation, writer serialization, and any
+multi-file commit protocol. Holding the directory pins its inode even if its pathname changes.
+
 ## `directory_walk` (Unix only)
 
 `walk_to_directory(path, policy, budget)` opens every directory along a path with `O_DIRECTORY` and
