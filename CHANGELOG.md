@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- MCP configuration fingerprinting and verb catalog helpers now live together in the server
+  config module, preserving public entry points, daemon identity values, and catalog output.
+
 ### Breaking (Rust crates)
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
