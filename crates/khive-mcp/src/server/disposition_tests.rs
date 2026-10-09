@@ -1275,6 +1275,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "supervisor_marker",
         "khive-runtime/src/daemon/supervisor_marker.rs",
     ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "lifecycle",
+        "khive-runtime/src/daemon/lifecycle.rs",
+    ),
 ];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
