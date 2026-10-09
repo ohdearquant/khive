@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
+
+### Added
+
+- The opt-in `charter` pack installs the seven recording tables from ADR-193 and
+  provides revision-and-state checked transaction helpers. This schema foundation
+  exposes no verbs, grants no action admission, and does not enforce merges.
+- `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
+  Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
+  writer while retaining their update and proposal guards.
 
 ### Breaking (Rust crates)
 
@@ -32,12 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `unidentified_candidates`. Direct constructors and exhaustive destructurings
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
-
-### Fixed
-
-- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
-  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 
 ## [0.11.0] - 2026-10-08
 

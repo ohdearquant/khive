@@ -1,0 +1,23 @@
+[package]
+name = "khive-pack-charter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Charter recording tables and revision-checked transitions"
+
+[dependencies]
+khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
+khive-storage = { version = "0.11.0", path = "../khive-storage" }
+inventory = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
