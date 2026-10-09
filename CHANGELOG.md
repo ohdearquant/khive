@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `khive-db` moves checkpoint escalation and transaction-age state into a dedicated
+  module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
+
 ### Breaking (Rust crates)
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
