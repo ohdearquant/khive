@@ -1249,6 +1249,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
     ),
     (
         "khive-runtime/src/daemon.rs",
+        "locks",
+        "khive-runtime/src/daemon/locks.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
         "store_guard",
         "khive-runtime/src/daemon/store_guard.rs",
     ),
