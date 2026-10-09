@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
+
 ### Fixed
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
