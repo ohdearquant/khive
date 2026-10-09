@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_storage::NoteFilter` adds `max_created_at`, `max_expires_at`,
+  `include_deleted`, `expiry_fallback` and `time_order`; exhaustive struct literals
+  must add them or use `..Default::default()`. `FilterOp` adds
+  `MissingNullOrSpaceEmptyText` and `TrueOrTextTrue`; exhaustive matches must handle
+  both. Typed expiry fallback and native timestamp ordering preserve complete
+  legacy cleanup predicates before LIMIT. The `created_before` / `expires_before` builders use
+  inclusive Unix-microsecond bounds, and `include_deleted` affects reads only.
+  Existing serialized filters retain live-only, unbounded defaults.
+  `AttachmentStore::delete_attachment_if` adds a conditional ID/role/substrate/ref
+  delete with an `Unsupported` default and an atomic SQLite implementation;
+  comm cleanup adoption remains separate.
+
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
