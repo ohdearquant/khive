@@ -243,14 +243,9 @@ impl KindHook for ChannelHealthHook {
         //
         // Falsifier: if `create` ever accepts a caller-supplied id, the derivation could be
         // applied on all three paths instead and this refusal would be the wrong shape.
-        Err(RuntimeError::InvalidInput(
-            "kind=channel_health is not creatable through shared `create`, `stream.batch`, or \
-             standalone `stream.append` — `comm.heartbeat` addresses a channel's health row by an id derived from \
-             the namespace, channel kind and slug, so a row written here gets an unrelated id \
-             that no heartbeat will ever find or update and that leaves two rows for one \
-             channel; use `comm.heartbeat` instead"
-                .into(),
-        ))
+        khive_runtime::hooks::refuse_shared_create("channel_health", "comm.heartbeat")
+            .prepare_create(_runtime, _args)
+            .await
     }
 
     async fn validate_note_update(

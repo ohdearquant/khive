@@ -44,6 +44,7 @@ mod fence_identity;
 pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod hooks;
 mod index_repair;
 pub use index_repair::IndexRepairReport;
 pub mod input_schema;
