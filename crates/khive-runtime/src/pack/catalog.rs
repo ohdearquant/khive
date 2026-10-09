@@ -280,15 +280,23 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// Merged set of note kinds across all registered packs (deduplicated,
-    /// first-seen order preserved).
-    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+    /// Collect declared kinds once, retaining their first-seen registration order.
+    fn collect_pack_kinds(
+        &self,
+        select: impl Fn(&dyn PackRuntime) -> &'static [&'static str],
+    ) -> Vec<&'static str> {
         let mut seen = std::collections::HashSet::new();
         self.packs
             .iter()
-            .flat_map(|p| p.note_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
+            .flat_map(|pack| select(pack.as_ref()).iter().copied())
+            .filter(|kind| seen.insert(*kind))
             .collect()
+    }
+
+    /// Merged set of note kinds across all registered packs (deduplicated,
+    /// first-seen order preserved).
+    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+        self.collect_pack_kinds(|pack| pack.note_kinds())
     }
 
     /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
@@ -321,23 +329,13 @@ impl VerbRegistry {
     /// Merged set of entity kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_entity_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.entity_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.entity_kinds())
     }
 
     /// Merged set of brain profile consumer kinds requested by registered
     /// packs (deduplicated, first-seen order preserved).
     pub fn all_brain_consumer_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.brain_consumer_kinds().iter().copied())
-            .filter(|kind| seen.insert(*kind))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.brain_consumer_kinds())
     }
 
     /// Names of packs in topological load order.

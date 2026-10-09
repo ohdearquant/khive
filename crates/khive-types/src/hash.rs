@@ -1,9 +1,22 @@
-//! 256-bit content hash for checkpoint integrity verification.
+//! Content hashes and non-cryptographic change-detection fingerprints.
 
 use core::fmt;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// Compute the 64-bit FNV-1a fingerprint of every byte in `data`.
+///
+/// Uses the standard offset basis and wrapping multiplication. This is a
+/// non-cryptographic fingerprint; it is not an integrity or security boundary.
+pub fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 /// 256-bit (32-byte) content hash.
 ///
@@ -82,5 +95,24 @@ impl fmt::Display for Hash32 {
             write!(f, "{b:02x}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fnv1a_64_matches_published_vectors() {
+        // draft-eastlake-fnv-19, Appendix C: strings with and without NUL.
+        let cases: &[(&[u8], u64)] = &[
+            (b"", 0xcbf2_9ce4_8422_2325),
+            (b"a", 0xaf63_dc4c_8601_ec8c),
+            (b"foobar", 0x8594_4171_f739_67e8),
+            (b"\0", 0xaf63_bd4c_8601_b7df),
+            (b"a\0", 0x089b_e207_b544_f1e4),
+            (b"foobar\0", 0x3453_1ca7_168b_8f38),
+        ];
+        for &(bytes, expected) in cases {
+            assert_eq!(crate::fnv1a_64(bytes), expected);
+        }
     }
 }

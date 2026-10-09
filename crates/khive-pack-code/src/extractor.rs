@@ -125,11 +125,7 @@ pub(crate) struct ExtractedFile {
 /// token-stream rendering rather than a whole file. Not a security
 /// boundary, purely a changed-vs-unchanged signal (B4).
 pub(crate) fn fnv1a(content: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in content.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let hash = khive_types::fnv1a_64(content.as_bytes());
     format!("{hash:016x}")
 }
 
