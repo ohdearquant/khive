@@ -383,6 +383,30 @@ impl AttachmentStore for SqlAttachmentStore {
         .await
     }
 
+    async fn delete_attachment_if(
+        &self,
+        record_uuid: Uuid,
+        role: &str,
+        expected_substrate: AttachmentSubstrate,
+        expected_ref: &ContentRef,
+    ) -> Result<bool, StorageError> {
+        validate_attachment_role(role)?;
+        let mut statement = delete_attachment_statement(record_uuid, role);
+        statement
+            .sql
+            .push_str(" AND substrate = ?3 AND content_ref = ?4");
+        statement.params.extend([
+            SqlValue::Text(expected_substrate.as_str().to_string()),
+            SqlValue::Text(expected_ref.to_string()),
+        ]);
+        self.with_writer("delete_attachment_if", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
     async fn delete_attachment(&self, record_uuid: Uuid, role: &str) -> Result<bool, StorageError> {
         validate_attachment_role(role)?;
         let statement = delete_attachment_statement(record_uuid, role);
