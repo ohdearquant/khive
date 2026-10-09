@@ -51,7 +51,7 @@ pub(super) fn is_stop(w: &str) -> bool {
 
 // ─── content hash and validation ─────────────────────────────────────────────
 
-/// Minimum section content length in bytes.
+/// Minimum section content length in Unicode scalar values.
 pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
 
 /// Minimum atom content length in words.
@@ -83,11 +83,11 @@ pub(super) fn content_hash(content: &str) -> String {
 
 /// Validate that section content meets the 80-character minimum.
 pub(super) fn validate_section_content(content: &str) -> Result<(), RuntimeError> {
-    if content.len() < MIN_SECTION_CONTENT_LEN {
+    let character_count = content.chars().count();
+    if character_count < MIN_SECTION_CONTENT_LEN {
         return Err(RuntimeError::InvalidInput(format!(
             "section content must be at least {} characters (got {})",
-            MIN_SECTION_CONTENT_LEN,
-            content.len()
+            MIN_SECTION_CONTENT_LEN, character_count
         )));
     }
     Ok(())
