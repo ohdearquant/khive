@@ -32,7 +32,7 @@ const SESSION: ParamDef = crate::local_vocab::SESSION;
 
 pub(crate) const PUSH: HandlerDef = HandlerDef {
     name: "git.push",
-    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. All caller force/remote/refspec overrides refuse. HTTPS uses actor-only credentials. An absolute path or file:/// remote configured with slug=\"\" uses no credential or actor row and records credential.source=none. Durable receipt, no retries. Requires a git that advertises the `git reflog write ` subcommand, which first shipped in Git 2.51: the receipt marker is written with it, and without it the verb refuses unsupported_toolchain before any credential or network use, recording the version found and the missing capability. The check reads the capability, never the version number.",
+    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. Optional force must be boolean: true always refuses force_denied before transport; false and omission preserve the ordinary push. Caller remote/refspec overrides refuse. HTTPS uses actor-only credentials. An absolute path or file:/// remote configured with slug=\"\" uses no credential or actor row and records credential.source=none. Durable receipt, no retries. Requires a git that advertises the `git reflog write ` subcommand, which first shipped in Git 2.51: the receipt marker is written with it, and without it the verb refuses unsupported_toolchain before any credential or network use, recording the version found and the missing capability. The check reads the capability, never the version number.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -40,6 +40,7 @@ pub(crate) const PUSH: HandlerDef = HandlerDef {
         p("branch", "string", true, "Branch to push."),
         p("expected_local", "string", true, "Required exact 40-hex local branch head."),
         p("expected_remote", "string|null", true, "Required exact remote SHA, or explicit null only when the remote branch must not exist. Omission is invalid_params."),
+        p("force", "boolean", false, "Validation only: true always refuses force_denied before transport. False or omission requests an ordinary push; null and non-booleans are invalid_params."),
         SESSION,
     ],
 };

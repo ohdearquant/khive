@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
   their separate size limits, refusal messages and exact stored cursor bytes.
+### Fixed
+
+- `git.push` accepts the optional boolean `force` validation field and refuses
+  `true` with `force_denied` before transport. False and omission retain ordinary
+  push behavior; null and non-boolean values return `invalid_params`.
 
 ### Breaking (Rust crates)
 
