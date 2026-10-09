@@ -207,6 +207,7 @@ impl PackRuntime for KnowledgePack {
             }
             "knowledge.get" => KnowledgeHandlers::get(&self.runtime, token, params).await,
             "knowledge.list" => KnowledgeHandlers::list(&self.runtime, token, params).await,
+            "knowledge.export" => KnowledgeHandlers::export(&self.runtime, token, params).await,
             "knowledge.delete_atoms" => {
                 KnowledgeHandlers::delete_atoms(&self.runtime, token, params).await
             }

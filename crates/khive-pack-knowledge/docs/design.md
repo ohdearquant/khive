@@ -16,7 +16,7 @@
 
 ### Knowledge Pack Verb Surface (ADR-047)
 
-- This pack implements the 19 verb corpus surface: atoms/domains CRUD, TF-IDF search with
+- This pack implements the 20 verb corpus surface: atoms/domains CRUD, TF-IDF search with
   embedding rerank, fold, import, edit, challenge, adjudicate, and concept-tier sugar.
 - Domain matching is case-insensitive: domain values are trimmed and lowercased before storage
   and comparison. The same normalized value is used in `properties.domain`, promoted tags,
@@ -216,7 +216,7 @@
 
 ### ADR-016: Request DSL
 
-- All 19 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
+- All 20 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
   only — `handlers` and `knowledge` modules are `pub(crate)`.
 
 ## Consistency Notes
@@ -236,7 +236,7 @@ RRF fusion, and post-hydration filters. The handlers remain in `knowledge/search
 | ----------------------- | ---------------------------------------------------------------------------------------- |
 | `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry                 |
 | `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim                       |
-| `vocab.rs`              | Pack schema statements and the handler descriptor table (19 public verbs + 1 subhandler) |
+| `vocab.rs`              | Pack schema statements and the handler descriptor table (20 public verbs + 1 subhandler) |
 | `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                                   |
 | `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                                   |
 | `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence                |

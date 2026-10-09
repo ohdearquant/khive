@@ -288,7 +288,7 @@ caller receives the server-generated UUID.
 | `schedule.agenda`   | List upcoming events and ticker liveness      | "What's on the calendar, and is its ticker running?"          |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
-### Knowledge pack — 19 verbs (`knowledge.` prefix)
+### Knowledge pack — 20 verbs (`knowledge.` prefix)
 
 | Verb                       | What it does                                            | When to use                                  |
 | -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
@@ -301,6 +301,7 @@ caller receives the server-generated UUID.
 | `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
 | `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
 | `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
+| `knowledge.export`         | Deterministic JSONL snapshot of one namespace's corpus  | Back up or hand off a corpus                 |
 | `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
 | `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
 | `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
