@@ -18,17 +18,22 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .as_deref()
         .map(canonical_fingerprint_path)
         .unwrap_or_else(|| ":memory:".to_string());
-    let primary = config
-        .embedding_model
-        .as_ref()
-        .map(|m| format!("{m:?}"))
+    let engines = config.configured_engines();
+    let primary = engines
+        .first()
+        .map(|engine| engine.name.clone())
         .unwrap_or_else(|| "none".to_string());
-    let mut extra: Vec<String> = config
-        .additional_embedding_models
+    let mut extra: Vec<String> = engines
         .iter()
-        .map(|m| format!("{m:?}"))
+        .skip(1)
+        .map(|engine| engine.name.clone())
         .collect();
     extra.sort();
+    let mut peers_hasher = Sha256::new();
+    peers_hasher.update(b"khive.ordered-engine-peers.v1");
+    peers_hasher
+        .update(serde_json::to_vec(&engines).expect("engine configuration is JSON serializable"));
+    let engine_peers = format!("{:x}", peers_hasher.finalize());
     let mut outbound: Vec<String> = config
         .allowed_outbound_namespaces
         .iter()
@@ -164,7 +169,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // whoever restarts it.
     let base = format!(
         concat!(
-            "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};",
+            "packs=[{}];db={};embed={};extra=[{}];engine_peers={};fresh_tail={};",
             "blob_hydration_bytes={};backend={};outbound=[{}]{};",
             "git_write={};brain={};telemetry={};display_tz={};",
             "visibility_receipts={}"
@@ -173,6 +178,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         db,
         primary,
         extra.join(","),
+        engine_peers,
         ann_fresh_tail_enabled,
         config.blob_hydration_bytes,
         backend,
@@ -209,4 +215,113 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .map(disabled_verb_policy_suffix)
         .unwrap_or_default();
     format!("{base}{topology}{blob_file_transfers}{disk_guard}{disabled_verbs}")
+}
+
+#[cfg(test)]
+mod ordered_peer_tests {
+    use super::compute_config_id_with_runtime_policies;
+    use khive_runtime::{
+        daemon::{config_ids_compatible, first_config_mismatch_field},
+        EngineConfig, RuntimeConfig,
+    };
+    use lattice_embed::EmbeddingModel;
+
+    fn fingerprint(config: &RuntimeConfig) -> String {
+        compute_config_id_with_runtime_policies(config, None, true, false)
+    }
+
+    fn configured() -> RuntimeConfig {
+        RuntimeConfig {
+            db_path: None,
+            engines: Some(
+                [
+                    EmbeddingModel::AllMiniLmL6V2,
+                    EmbeddingModel::BgeSmallEnV15,
+                    EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+                ]
+                .into_iter()
+                .map(|model| EngineConfig {
+                    name: model.to_string(),
+                    weight: 1.0,
+                    dims: None,
+                })
+                .collect(),
+            ),
+            ..RuntimeConfig::no_embeddings()
+        }
+    }
+
+    #[test]
+    fn reordered_nonfirst_peers_cannot_reuse_a_daemon() {
+        let original = configured();
+        let mut reordered = original.clone();
+        reordered.engines.as_mut().unwrap().swap(1, 2);
+        let original_id = fingerprint(&original);
+        let reordered_id = fingerprint(&reordered);
+        assert_ne!(original_id, reordered_id);
+        assert!(!config_ids_compatible(&original_id, &reordered_id));
+        assert_eq!(
+            first_config_mismatch_field(&original_id, Some(&reordered_id)),
+            "engine_peers"
+        );
+    }
+
+    #[test]
+    fn peer_dimensions_and_weights_are_part_of_daemon_identity() {
+        let original = configured();
+        let original_id = fingerprint(&original);
+        let mut dimensions = original.clone();
+        dimensions.engines.as_mut().unwrap()[1].dims = Some(384);
+        let mut weight = original.clone();
+        weight.engines.as_mut().unwrap()[1].weight = 2.0;
+        for changed in [dimensions, weight] {
+            let changed_id = fingerprint(&changed);
+            assert_ne!(original_id, changed_id);
+            assert!(!config_ids_compatible(&original_id, &changed_id));
+            assert_eq!(
+                first_config_mismatch_field(&original_id, Some(&changed_id)),
+                "engine_peers"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_fallback_and_prepared_peers_have_the_same_identity() {
+        for primary in [None, Some(EmbeddingModel::AllMiniLmL6V2)] {
+            let config = RuntimeConfig {
+                db_path: None,
+                embedding_model: primary,
+                additional_embedding_models: vec![
+                    EmbeddingModel::BgeSmallEnV15,
+                    EmbeddingModel::BgeSmallEnV15,
+                    EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+                ],
+                ..RuntimeConfig::no_embeddings()
+            };
+            let before = fingerprint(&config);
+            let mut prepared = config.clone();
+            prepared.prepare_engines().unwrap();
+            assert_eq!(before, fingerprint(&prepared));
+
+            let mut explicit = config;
+            explicit.engines = Some(prepared.configured_engines());
+            assert_eq!(before, fingerprint(&explicit));
+        }
+    }
+
+    #[test]
+    fn aliases_and_disabled_peers_ignore_stale_legacy_projections() {
+        let mut canonical = configured();
+        let mut aliased = canonical.clone();
+        aliased.engines.as_mut().unwrap()[2].name = "paraphrase".into();
+        aliased.embedding_model = Some(EmbeddingModel::BgeSmallEnV15);
+        aliased.additional_embedding_models.clear();
+        assert_eq!(fingerprint(&canonical), fingerprint(&aliased));
+
+        canonical.disable_embedding_models();
+        let disabled_id = fingerprint(&canonical);
+        canonical.embedding_model = Some(EmbeddingModel::AllMiniLmL6V2);
+        canonical.additional_embedding_models = vec![EmbeddingModel::BgeSmallEnV15];
+        assert_eq!(disabled_id, fingerprint(&canonical));
+    }
 }
