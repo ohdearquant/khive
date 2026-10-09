@@ -41,6 +41,7 @@ khive-pack-git = { version = "0.11.0", path = "../khive-pack-git" }
 khive-pack-blob = { version = "0.11.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.11.0", path = "../khive-pack-moodboard", optional = true }
 khive-pack-workspace = { version = "0.11.0", path = "../khive-pack-workspace" }
+khive-pack-charter = { version = "0.11.0", path = "../khive-pack-charter" }
 khive-request = { version = "0.11.0", path = "../khive-request" }
 khive-changeset = { version = "0.11.0", path = "../khive-changeset" }
 khive-repo-showcase = { version = "0.11.0", path = "../khive-repo-showcase" }
