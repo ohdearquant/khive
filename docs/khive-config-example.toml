@@ -251,6 +251,14 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 # through core() still embed with the main runtime's embedders. Flipping the
 # flag changes the config_id (daemon restart required).
 
+# Optional `verbs_disabled` hides registered public handlers from the capability
+# catalog and refuses their dispatch. Names must belong to this loaded pack;
+# unknown, foreign, unloaded-pack, and internal-handler names refuse boot.
+# Operator introspection still lists all handlers. This policy changes config_id.
+# A policy-only entry may omit backend (defaults to "main"):
+# [packs.memory]
+# verbs_disabled = ["memory.remember", "memory.prune"]
+
 # [packs.knowledge]
 # backend = "knowledge"
 

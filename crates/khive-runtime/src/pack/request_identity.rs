@@ -48,6 +48,7 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     pub(super) available_verbs: Arc<Vec<&'static str>>,
+    pub(super) disabled_verbs: Arc<HashSet<&'static str>>,
     /// Static handler metadata indexed once at build time. Duplicate internal
     /// subhandler names retain the first pack's declaration, as before.
     pub(super) handler_by_name: Arc<HashMap<&'static str, &'static HandlerDef>>,

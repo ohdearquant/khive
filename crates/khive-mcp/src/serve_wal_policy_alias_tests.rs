@@ -34,6 +34,7 @@ fn duplicate_sqlite_path_config(db_path: &std::path::Path) -> KhiveConfig {
                 "comm".to_string(),
                 PackConfig {
                     backend: "alias".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );

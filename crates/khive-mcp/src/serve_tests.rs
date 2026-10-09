@@ -1630,6 +1630,7 @@ async fn db_diagnostics_lists_main_and_routed_secondary() {
             "comm".into(),
             PackConfig {
                 backend: "second".into(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -1716,6 +1717,7 @@ async fn db_diagnostics_deduplicates_shared_canonical_file_and_keeps_all_names()
                 "kg".into(),
                 PackConfig {
                     backend: "alias".into(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             ),
@@ -1723,6 +1725,7 @@ async fn db_diagnostics_deduplicates_shared_canonical_file_and_keeps_all_names()
                 "comm".into(),
                 PackConfig {
                     backend: "second".into(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             ),
@@ -1894,6 +1897,7 @@ async fn multi_backend_boots_ok_with_two_memory_backends() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -2026,6 +2030,7 @@ async fn message_filter_accepts_distinct_backend_names_for_one_open_store() {
             "comm".to_string(),
             PackConfig {
                 backend: "comm-alias".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -3274,6 +3279,7 @@ async fn read_only_blob_secondary_refuses_put_beside_writable_main() {
             "blob".to_string(),
             PackConfig {
                 backend: "blob-snapshot".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -3345,6 +3351,7 @@ async fn writable_blob_secondary_accepts_put_beside_read_only_main() {
             "blob".to_string(),
             PackConfig {
                 backend: "blob-writable".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -3420,6 +3427,7 @@ async fn secondary_pack_runtime_core_resolves_to_main_after_build_registry() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -3523,6 +3531,7 @@ async fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
                 "kg".to_string(),
                 PackConfig {
                     backend: "direct".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -3530,6 +3539,7 @@ async fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "alias".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -3622,6 +3632,7 @@ async fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -3688,6 +3699,7 @@ fn sqlite_multi_backend_config(main_path: PathBuf, secondary_path: PathBuf) -> K
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -3709,6 +3721,7 @@ async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {
         "code".to_string(),
         khive_runtime::PackConfig {
             backend: "secondary".to_string(),
+            verbs_disabled: Vec::new(),
             no_embed: false,
         },
     );
@@ -4231,6 +4244,7 @@ async fn concrete_db_override_with_backends_declared_is_rejected() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -4321,6 +4335,7 @@ async fn multi_backend_preserves_actor_filtering() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -4459,6 +4474,7 @@ async fn multi_backend_registry_rejects_undefined_pack_backend() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -4523,6 +4539,7 @@ async fn multi_backend_server_rejects_undefined_pack_backend() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -4702,6 +4719,7 @@ async fn multi_backend_read_only_construction_and_pack_schema_paths_acquire_no_w
             "comm".to_string(),
             PackConfig {
                 backend: "comm-store".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -4824,6 +4842,7 @@ async fn mixed_topology_channel_admission_follows_the_runtime_that_backs_each_lo
             "comm".to_string(),
             PackConfig {
                 backend: "comm-store".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -4948,6 +4967,7 @@ async fn mixed_topology_refuses_inbound_polling_when_the_blob_backend_is_read_on
             "blob".to_string(),
             PackConfig {
                 backend: "blob-store".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),
@@ -5847,6 +5867,7 @@ async fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -5921,6 +5942,7 @@ async fn concrete_db_override_with_backends_declared_is_rejected_via_build_serve
                 "comm".to_string(),
                 PackConfig {
                     backend: "secondary".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
@@ -5996,6 +6018,7 @@ fn config_id_folds_backend_topology_when_non_empty() {
         "comm".to_string(),
         PackConfig {
             backend: "secondary".to_string(),
+            verbs_disabled: Vec::new(),
             no_embed: false,
         },
     );
@@ -8551,6 +8574,7 @@ mod routed_email_outbox_tests {
                     "kg".to_string(),
                     PackConfig {
                         backend: "kg-store".to_string(),
+                        verbs_disabled: Vec::new(),
                         no_embed: false,
                     },
                 ),
@@ -8558,6 +8582,7 @@ mod routed_email_outbox_tests {
                     "comm".to_string(),
                     PackConfig {
                         backend: "kg-store".to_string(),
+                        verbs_disabled: Vec::new(),
                         no_embed: false,
                     },
                 ),
@@ -8698,6 +8723,7 @@ mod routed_email_outbox_tests {
                     "comm".to_string(),
                     PackConfig {
                         backend: "comm-store".to_string(),
+                        verbs_disabled: Vec::new(),
                         no_embed: true,
                     },
                 ),
@@ -8708,6 +8734,7 @@ mod routed_email_outbox_tests {
                     "gtd".to_string(),
                     PackConfig {
                         backend: BackendId::MAIN.to_string(),
+                        verbs_disabled: Vec::new(),
                         no_embed: true,
                     },
                 ),
@@ -8814,6 +8841,7 @@ mod routed_email_outbox_tests {
                 "comm".to_string(),
                 PackConfig {
                     backend: "comm-store".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             )]),
@@ -12471,6 +12499,7 @@ fn issue2768_multi_config(
             "tool".into(),
             khive_runtime::PackConfig {
                 backend: "tool-store".into(),
+                verbs_disabled: Vec::new(),
                 no_embed: true,
             },
         )]),
