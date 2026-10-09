@@ -7,21 +7,15 @@
 //!
 //! ## Scope note (read before extending)
 //!
-//! The declared entry points are not yet wired to a real storage backend
-//! in this run — `secret_gate_finalizer.rs` states plainly: "Nothing in
-//! this module is wired to a caller yet". The executable contract's §6
-//! description of the harness (direct FTS/vector/edge/event row queries
-//! against a live database) describes the harness *after* the
-//! runtime-ingress lane lands the real `FinalizationEffects` backend. That
-//! backend does not exist in this worktree yet, so this harness cannot
-//! honestly claim to query live storage state for the transactional path.
-//! Instead it drives the real, already-implemented `transaction::finalize`
-//! state machine end-to-end through an in-memory `FinalizationEffects` fake
-//! whose own booleans stand in for record/stamp/audit row existence —
+//! This module tests the storage-independent `transaction::finalize` state
+//! machine through an in-memory `FinalizationEffects` fake. Real entity route
+//! acceptance, including row/index/event readback and rollback, lives in
+//! `entity_route_tests`; note constructors remain unwired. The fake uses
+//! booleans to stand in for record/stamp/audit row existence —
 //! every row of [`generated_acceptance_matrix`] that is observable through
 //! `finalize` is asserted this way, keyed off the declaration itself so no
-//! entry point can be silently skipped. This is recorded as a gap, not
-//! substituted silently: see `acceptance_harness.md` "Known gaps".
+//! entry point can be silently skipped. These mechanism cases are not
+//! evidence that an unwired note route can consume a manifest exemption.
 //!
 //! Case kinds that belong to the manifest scanner (legacy-scanner
 //! behavior, one-byte miss, wrong-scope miss, one-snapshot refresh race)
@@ -132,7 +126,6 @@ mod tests {
     /// reservation boundary; see the module doc comment).
     const FINALIZE_OBSERVABLE: &[MatrixCaseKind] = &[
         MatrixCaseKind::FixtureMatch,
-        MatrixCaseKind::SupportedEcho,
         MatrixCaseKind::RecordWriteFailure,
         MatrixCaseKind::StampFailure,
         MatrixCaseKind::SuccessAuditFailure,
@@ -158,6 +151,7 @@ mod tests {
         MatrixCaseKind::OneByteMiss,
         MatrixCaseKind::WrongScopeMiss,
         MatrixCaseKind::ReservedKeyMutation,
+        MatrixCaseKind::SupportedEcho,
         MatrixCaseKind::OneSnapshotRefreshRace,
     ];
 
@@ -193,7 +187,7 @@ mod tests {
             };
 
             match row.case {
-                MatrixCaseKind::FixtureMatch | MatrixCaseKind::SupportedEcho => {
+                MatrixCaseKind::FixtureMatch => {
                     let mut effects = AcceptanceEffects::default();
                     let sink = CapturingLogSink::new();
                     let outcome = finalize(&mut effects, &sink, &input);
@@ -417,6 +411,9 @@ mod tests {
             reject_reserved_secret_gate_property(Some(&reserved)).is_err(),
             "ReservedKeyMutation: the shared reservation validator must reject the key"
         );
+        // Echo support is deferred: an exact echoed stamp is caller-supplied
+        // input and must still be refused, never counted as a successful case.
+        assert!(reject_reserved_secret_gate_property(Some(&reserved.clone())).is_err());
 
         // OneSnapshotRefreshRace: a snapshot cloned via `ManifestManager::current`
         // before a later `refresh` must not observe that refresh — see

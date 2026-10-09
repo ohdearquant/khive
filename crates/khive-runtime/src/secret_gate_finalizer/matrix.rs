@@ -71,10 +71,105 @@ pub(crate) fn generated_acceptance_matrix() -> Vec<MatrixRow> {
     rows
 }
 
+/// Cases required of the currently wired storage routes. Caller echo
+/// support remains deferred; its appearance still reaches reservation refusal.
+pub(crate) fn generated_wired_acceptance_matrix() -> Vec<MatrixRow> {
+    generated_acceptance_matrix()
+        .into_iter()
+        .filter(|row| row.entry_point.wired && row.case != MatrixCaseKind::SupportedEcho)
+        .collect()
+}
+
+/// Source witnesses are separate from execution results: these tests are not
+/// evidence of a passed native run. Missing route-specific witnesses remain
+/// visible even where the shared finalizer state-machine harness has a case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteWitness {
+    SourceTest(&'static str),
+    Missing(&'static str),
+    Deferred(&'static str),
+}
+
+pub(crate) fn route_witness(row: MatrixRow) -> RouteWitness {
+    use MatrixCaseKind as Case;
+    use RouteWitness::{Deferred, Missing, SourceTest};
+    if !row.entry_point.wired {
+        return Deferred("note storage routes are not wired");
+    }
+    match (row.entry_point.id, row.case) {
+        (_, Case::SupportedEcho) => Deferred("caller echo is not enabled; reserved keys refuse"),
+        (_, Case::FixtureMatch) => {
+            SourceTest("declared_entity_routes_persist_stamp_and_one_exact_audit")
+        }
+        ("entity.create", Case::LegacyScannerBehavior) => {
+            SourceTest("empty_manifest_keeps_clean_writes_and_legacy_refusals")
+        }
+        ("entity.update", Case::LegacyScannerBehavior) => SourceTest(
+            "empty_manifest_update_preserves_patch_scanning_and_nonempty_scans_final_state",
+        ),
+        ("entity.bulk", Case::LegacyScannerBehavior) => {
+            SourceTest("empty_manifest_keeps_clean_writes_and_legacy_refusals")
+        }
+        (_, Case::OneByteMiss | Case::WrongScopeMiss | Case::ReservedKeyMutation) => {
+            SourceTest("generated_negative_candidates_refuse_on_every_wired_route")
+        }
+        (
+            _,
+            Case::RecordWriteFailure
+            | Case::StampFailure
+            | Case::SuccessAuditFailure
+            | Case::SecondOrderFailureAuditFailure,
+        ) => SourceTest("generated_faults_preserve_each_route_and_classify_failure_audit_loss"),
+        ("entity.create", Case::OneSnapshotRefreshRace) => {
+            SourceTest("direct_preflight_snapshot_survives_refresh_and_next_context_sees_empty")
+        }
+        ("entity.update", Case::OneSnapshotRefreshRace) => {
+            SourceTest("actual_update_keeps_its_snapshot_when_embedding_refreshes_the_manifest")
+        }
+        ("entity.bulk", Case::OneSnapshotRefreshRace) => {
+            SourceTest("prepared_bulk_uses_one_snapshot_across_manifest_refresh")
+        }
+        _ => Missing("new route requires its own storage witness"),
+    }
+}
+
+/// Real shared-handler hook normalization runs outside the runtime constructor.
+/// The runtime suite does not substitute a manually mutated argument for that
+/// handler integration witness.
+pub(crate) const MISSING_HANDLER_WITNESS: &str =
+    "shared create handler: hook-introduced matched value, second secret, and reserved stamp";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn wired_witnesses_report_missing_and_deferred_routes_explicitly() {
+        let rows = generated_acceptance_matrix();
+        assert!(generated_wired_acceptance_matrix()
+            .iter()
+            .all(|row| matches!(route_witness(*row), RouteWitness::SourceTest(_))));
+        assert!(rows
+            .iter()
+            .filter(|row| !row.entry_point.wired)
+            .all(|row| matches!(route_witness(*row), RouteWitness::Deferred(_))));
+        assert!(MISSING_HANDLER_WITNESS.contains("hook-introduced"));
+    }
+
+    #[test]
+    fn wired_matrix_contains_entity_families_without_activating_notes_or_echo() {
+        let rows = generated_wired_acceptance_matrix();
+        let families: BTreeSet<_> = rows.iter().map(|row| row.entry_point.id).collect();
+        assert_eq!(
+            families,
+            BTreeSet::from(["entity.create", "entity.update", "entity.bulk"])
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.case != MatrixCaseKind::SupportedEcho));
+        assert_eq!(rows.len(), families.len() * (MatrixCaseKind::ALL.len() - 1));
+    }
 
     /// Generation: the matrix is actually produced, and its size is the
     /// exact cross product of declaration rows and case kinds — not a
