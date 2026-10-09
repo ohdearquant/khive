@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pack-version regressions compare each linked pack with its factory's declared version and cover
+  independent factory versions through the production JSON and human list formatter (#5086).
+
 ### Breaking (Rust crates)
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
