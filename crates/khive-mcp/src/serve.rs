@@ -3785,12 +3785,13 @@ async fn build_registry_for_multi_backend_inner(
 }
 
 async fn build_registry_for_multi_backend_inner_with_max_readers(
-    base_config: RuntimeConfig,
+    mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    base_config.prepare_engines()?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let PreparedStorageTopology {
         base_config,
@@ -3815,11 +3816,11 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
     // main's models even when the pack itself is `no_embed`.
-    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
+    let default_runtime = KhiveRuntime::try_from_backend(main_backend.clone(), {
         let mut cfg = base_config.clone();
         cfg.backend_id = BackendId::main();
         cfg
-    })
+    })?
     .with_outbound_email_policy(email_policy)
     .with_declared_backend_db_paths(declared_backend_db_paths.clone())
     .with_diagnostic_backends(diagnostic_backends.clone());
@@ -3843,8 +3844,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
             // `RuntimeConfig::no_embeddings`. `core()`-routed concept writes
             // are NOT affected: `build_pack_runtime` hands every secondary
             // pack the main runtime's embedder wiring for core().
-            rt_config.embedding_model = None;
-            rt_config.additional_embedding_models = Vec::new();
+            rt_config.disable_embedding_models();
         }
         per_pack_runtimes_local.insert(
             pack_name.clone(),
@@ -4907,6 +4907,7 @@ async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    config.prepare_engines()?;
     #[cfg(unix)]
     preflight_events_socket_for_boot(&config, &[], false)?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
@@ -5690,11 +5691,8 @@ fn resolve_actor_from_config(
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
-            Ok(RuntimeConfig {
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                ..resolved
-            })
+            resolved.disable_embedding_models();
+            Ok(resolved)
         }
         None => {
             let mut resolved = base;
