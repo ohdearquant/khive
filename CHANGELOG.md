@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Refactored
+
+- Move MCP server state, registration errors, and stdio settings into a dedicated
+  core module, preserving public server entry points and existing function bodies.
+
 ### Fixed
 
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
