@@ -62,6 +62,11 @@ This ADR decides how to close all seven gaps and restore the polystore boundary.
 
 ### 1. `BackendHandle` — the single runtime seam
 
+> Amended by [Amendment A2](#amendment-a2-retrieval-tiers-are-factories-from_sqlite-builds-the-core-only-2026-10-09):
+> the retrieval tier is three optional store factories rather than three bound stores, and
+> `from_sqlite` builds the required core and opens no retrieval store. The sketch below is the
+> original design.
+
 `KhiveRuntime` will hold a `BackendHandle` instead of `Arc<StorageBackend>`:
 
 ```rust
@@ -698,3 +703,113 @@ accepted ADRs therefore give different answers to how the runtime reaches migrat
 
 - #330 (this ADR and its companion amendments to ADR-015, ADR-028, ADR-043 and ADR-044)
 - #2113 (ADR-015's 2026-08-16 implementation amendment and `KhiveRuntime::from_prepared_backend`)
+
+## Amendment A2: retrieval tiers are factories; `from_sqlite` builds the core only (2026-10-09)
+
+**Status**: Accepted (2026-10-09)
+
+### Context
+
+§1 gives `BackendHandle` three optional retrieval slots that each hold one bound store, and an
+infallible `from_sqlite(Arc<StorageBackend>) -> Self` that fills every slot. Neither can be built
+as written.
+
+- Opening a SQLite retrieval store needs a binding, can fail, and creates the store's table on
+  first use. In `crates/khive-db/src/backend.rs`,
+  `StorageBackend::vectors_for_namespace(model_key, embedding_model, dimensions, namespace)` creates
+  the vector table, `sparse_for_namespace(model_key, namespace)` creates the sparse table, and
+  `text_with_tokenizer(table_key, tokenizer)` creates the FTS5 table. All three return `Result`.
+- The runtime chooses that binding per operation. The note vector publish path
+  (`crates/khive-runtime/src/note_index.rs`) opens the vector store for the note's model,
+  dimensions and namespace, and `KhiveRuntime::vectors` and `KhiveRuntime::vectors_for_model`
+  (`crates/khive-runtime/src/runtime.rs`) select the model at call time. With ordered peer engines
+  ([ADR-031](ADR-031-multi-engine-retrieval.md) Amendment 5) one runtime serves several embedding
+  models.
+
+A slot that holds one `Arc<dyn VectorStore>` holds one binding, so it cannot represent a runtime
+with several models or namespaces, and an infallible constructor cannot open stores whose opening
+needs a binding and can fail.
+
+### Decision
+
+1. The required core is unchanged from Amendment A1: `entity`, `note`, `graph`, `event` and `sql`.
+2. The retrieval tier is three optional factories. A factory opens a store for one binding when an
+   operation needs it. Opening is fallible and may create the store's table. The factory traits are
+   backend-neutral and live in `khive-storage` beside the store traits; the SQLite implementations
+   live in `khive-db`.
+
+   ```rust
+   // crates/khive-storage
+   pub trait VectorStoreFactory: Send + Sync + 'static {
+       fn open(
+           &self,
+           model_key: &str,
+           embedding_model: &str,
+           dimensions: usize,
+           namespace: &str,
+       ) -> StorageResult<Arc<dyn VectorStore>>;
+   }
+
+   pub trait SparseStoreFactory: Send + Sync + 'static {
+       fn open(&self, model_key: &str, namespace: &str) -> StorageResult<Arc<dyn SparseStore>>;
+   }
+
+   pub trait TextSearchFactory: Send + Sync + 'static {
+       fn open(&self, table_key: &str, tokenizer: &str) -> StorageResult<Arc<dyn TextSearch>>;
+   }
+
+   // crates/khive-runtime/src/backend_handle.rs
+   pub struct BackendHandle {
+       entity: Arc<dyn EntityStore>,
+       note:   Arc<dyn NoteStore>,
+       graph:  Arc<dyn GraphStore>,
+       event:  Arc<dyn EventStore>,
+       sql:    Arc<dyn SqlAccess>,
+       vector: Option<Arc<dyn VectorStoreFactory>>,
+       sparse: Option<Arc<dyn SparseStoreFactory>>,
+       text:   Option<Arc<dyn TextSearchFactory>>,
+   }
+   ```
+
+3. `BackendHandle::from_sqlite(backend: Arc<StorageBackend>) -> Self` stays infallible. It fills the
+   five core slots and sets each retrieval factory to the backend, which implements all three
+   factory traits. It opens no retrieval store and creates no table.
+4. `BackendHandle::from_parts` takes the five core handles and an `Option` factory per retrieval
+   tier.
+5. The core accessors return their handle. The retrieval accessors take the binding and return a
+   `Result`: `vector(model_key, embedding_model, dimensions, namespace)`,
+   `sparse(model_key, namespace)` and `text(table_key, tokenizer)`. An absent factory answers a
+   typed missing-capability error that names the tier; a factory failure is a storage error.
+
+### Acceptance for the implementation
+
+- `from_sqlite` on a file-backed backend fills the five core slots, and `vector(...)` on that
+  handle returns a store.
+- Constructing the handle creates no retrieval table; the first `vector(...)` call does.
+- `from_parts` with `vector: None` answers the named missing-capability error from `vector(...)`.
+
+### Alternatives considered
+
+- **A fallible `from_sqlite` taking an explicit binding bundle.** Rejected. One binding per handle
+  contradicts ordered peer engines, and creating tables at construction puts a side effect into a
+  seam that the boot path and tests construct freely.
+- **A core-only handle, with the retrieval tier deferred to a later amendment.** Rejected. The
+  cloud session-store seam named in §Rationale needs the retrieval tier represented on the handle;
+  without it the runtime keeps reaching the concrete `StorageBackend` for vectors and the seam does
+  not close, while §1 goes on describing slots that cannot be filled.
+- **Bound single-store slots filled with the default model.** Rejected. A handle-wide default
+  binding hides the per-operation choice of model and namespace that the runtime already makes.
+
+### Consequences
+
+- §1's sketch and accessor paragraph, the sentence "The SQLite backend fills every slot", and the
+  retrieval-tier wording in §Rationale are read as amended here. The optional-tier intent is
+  unchanged: a backend without semantic or lexical search leaves the factories `None`.
+- Phase 4 adds the three factory traits to `khive-storage` and implements them for
+  `StorageBackend` in `khive-db`. Runtime retrieval moves from the concrete backend's store
+  constructors to the handle's accessors with the same arguments, without a behaviour change.
+- No code change follows from this amendment alone.
+
+### Refs
+
+- #4706 (implements §1 as amended here)
