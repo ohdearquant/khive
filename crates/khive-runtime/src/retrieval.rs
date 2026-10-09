@@ -14,7 +14,7 @@ use khive_retrieval::hybrid::{combine_leg_first_appearance, fuse_labelled, HitLa
 use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorRecord,
-    VectorSearchHit, VectorSearchRequest,
+    VectorSearchHit,
 };
 use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
@@ -23,6 +23,8 @@ use khive_types::SubstrateKind;
 pub use khive_retrieval::{
     HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource,
 };
+
+mod single_engine;
 
 /// Bounds provider input and per-page outcome memory while amortizing model setup.
 pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
@@ -567,53 +569,6 @@ impl KhiveRuntime {
         out
     }
 
-    /// Search vectors using either a caller-provided embedding or query text.
-    ///
-    /// Existing callers pass `query_embedding: Some(vec)` to avoid re-embedding.
-    /// Text callers pass `query_embedding: None, query_text: Some(...)` and the
-    /// runtime embeds internally.
-    pub async fn vector_search(
-        &self,
-        token: &NamespaceToken,
-        query_embedding: Option<Vec<f32>>,
-        query_text: Option<&str>,
-        top_k: u32,
-        kind: Option<SubstrateKind>,
-    ) -> RuntimeResult<Vec<VectorSearchHit>> {
-        let embedding = match query_embedding {
-            Some(vec) => vec,
-            None => {
-                let text = query_text.ok_or_else(|| {
-                    RuntimeError::InvalidInput(
-                        "vector search requires query_embedding or query_text".into(),
-                    )
-                })?;
-                if text.trim().is_empty() {
-                    return Err(RuntimeError::InvalidInput(
-                        "query_text must not be empty".into(),
-                    ));
-                }
-                self.embed_query_for_token(token, text).await?
-            }
-        };
-
-        let ns = token.namespace().as_str().to_owned();
-        let hits = self
-            .vectors(token)?
-            .search(VectorSearchRequest {
-                query_vectors: vec![embedding],
-                top_k,
-                namespace: Some(ns),
-                kind,
-                embedding_model: None,
-                filter: None,
-                backend_hints: None,
-            })
-            .await;
-        crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-        hits.map_err(RuntimeError::from)
-    }
-
     /// The note-search vector leg uses the pack-owned graph when that model
     /// has an installed, consumer-protected bridge. Only a missing graph for
     /// this consumer takes the existing exact sqlite-vec route.
@@ -1083,55 +1038,6 @@ impl KhiveRuntime {
             vector_hits.retain(|hit| hit.score >= score_floor);
         }
         Ok((vector_hits, vector_error))
-    }
-
-    /// Exact KNN over the full namespace's vector store.
-    ///
-    /// sqlite-vec uses brute-force cosine — results are exact, not approximate.
-    /// Cost is O(N · D) per query. For small-to-medium namespaces (~hundreds of
-    /// thousands of vectors) this is well within latency budgets.
-    pub async fn knn(
-        &self,
-        token: &NamespaceToken,
-        query_vector: Vec<f32>,
-        top_k: u32,
-    ) -> RuntimeResult<Vec<VectorSearchHit>> {
-        let ns = token.namespace().as_str().to_owned();
-        Ok(self
-            .vectors(token)?
-            .search(VectorSearchRequest {
-                query_vectors: vec![query_vector],
-                top_k,
-                namespace: Some(ns),
-                kind: Some(SubstrateKind::Entity),
-                embedding_model: None,
-                filter: None,
-                backend_hints: None,
-            })
-            .await?)
-    }
-
-    /// Exact KNN restricted to a candidate set.
-    ///
-    /// Useful for reranking the top-N results from `hybrid_search` (or any other
-    /// retrieval path) with exact cosine similarity against a query vector.
-    /// Returns hits sorted by similarity (highest first), truncated to `top_k`.
-    /// Equal scores use ascending IDs; duplicate IDs yield one hit. Missing or
-    /// out-of-scope entity vectors are omitted. An unsupported backend returns
-    /// its capability error instead of falling back to namespace-wide search.
-    pub async fn rerank(
-        &self,
-        token: &NamespaceToken,
-        query_vector: &[f32],
-        candidate_ids: &[Uuid],
-        top_k: u32,
-    ) -> RuntimeResult<Vec<VectorSearchHit>> {
-        let mut hits = self
-            .vectors(token)?
-            .score_candidates(query_vector, candidate_ids, Some(SubstrateKind::Entity))
-            .await?;
-        hits.truncate(top_k as usize);
-        Ok(hits)
     }
 
     async fn embed_backfill_page(

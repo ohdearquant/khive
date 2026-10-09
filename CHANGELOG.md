@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
