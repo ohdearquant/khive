@@ -6,6 +6,7 @@ pub mod agent;
 pub mod attachment;
 pub mod blob;
 pub mod capability;
+pub mod embedding_space;
 pub mod entity;
 mod env;
 pub mod error;
@@ -34,6 +35,7 @@ pub use blob::{
     MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
+pub use embedding_space::{EmbeddingSpaceIdentity, EmbeddingSpaceIdentityError, EmbeddingSpaceKey};
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use env::read_env_number;
 pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
