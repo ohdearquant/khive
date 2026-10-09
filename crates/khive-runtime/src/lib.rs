@@ -226,6 +226,10 @@ pub use runtime::{
     NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+pub use secret_gate_finalizer::{
+    EntityCandidateAdmission, EntityCandidateContext, EntityCandidateMutation,
+    EntityCandidateOrigin, EntityCandidatePrepared, EntityFinalizationPlan,
+};
 pub use telemetry_config::{
     TelemetryCarrier, TelemetryChannelConfig, TelemetryConfig, TelemetryFailurePosture,
     TelemetryPolicy,

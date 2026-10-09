@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- `khive_runtime::AtomicOpPlan` adds `FinalizeEntity` for runtime-owned entity admission.
+  Downstream exhaustive matches must handle the new variant. Its plan has no public constructor;
+  direct ingest uses `EntityCandidateContext` and `try_commit_manifest_entity_candidate`.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
@@ -20,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `unidentified_candidates`. Direct constructors and exhaustive destructurings
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
+
+### Changed
+
+- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
+  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
+  attachments and exemption audit commit together. Production manifests remain empty; non-empty
+  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ## [0.11.0] - 2026-10-08
 
