@@ -29,9 +29,9 @@ use super::scoring::{
 use super::sections::to_slug;
 use super::util::{
     atom_embed_text, atom_embed_text_fields, atom_from_row, deser, domain_from_row,
-    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
-    sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
-    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN, SERVABLE_SECTION,
+    estimate_compose_item_tokens, explicitly_requested_status, has_domain_mirror_tag, is_stop,
+    row_bool, row_i64, row_str, sql_err, status_multiplier, status_sql_clause, status_values,
+    CANDIDATE_POOL, CHARS_PER_TOKEN, D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN, SERVABLE_SECTION,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -150,14 +150,14 @@ fn prototype_fts_target(term: &str) -> Option<(&'static str, String)> {
 
 /// SQL eligibility predicate for the public atom/domain kind filter.
 ///
-/// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
+/// Domain mirrors use the shared decoded-tag and legacy-text classifier. Applying
 /// this predicate in FTS hydration and recovery is load-bearing: filtering after
 /// `LIMIT` lets the wrong kind consume every candidate slot.
 fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
     match type_filter {
-        Some("domain") => format!(" AND {atom_alias}.tags LIKE '%\"type:domain\"%'"),
+        Some("domain") => format!(" AND khive_tag_contains({atom_alias}.tags, 'type:domain')"),
         Some(filter) if !filter.is_empty() => {
-            format!(" AND {atom_alias}.tags NOT LIKE '%\"type:domain\"%'")
+            format!(" AND NOT khive_tag_contains({atom_alias}.tags, 'type:domain')")
         }
         _ => String::new(),
     }
@@ -2023,12 +2023,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
             ));
             hit.finalized = row_bool(row, "finalized");
             hit.status = row_str(row, "status");
-            let tags_arr: Vec<String> = hit
-                .tags
-                .as_deref()
-                .and_then(|tags| serde_json::from_str(tags).ok())
-                .unwrap_or_default();
-            hit.is_domain = tags_arr.iter().any(|t| t == "type:domain");
+            hit.is_domain = has_domain_mirror_tag(hit.tags.as_deref().unwrap_or(""));
         }
     }
 
