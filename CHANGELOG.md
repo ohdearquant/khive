@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
   descriptor-relative atomic publication helpers. Checkpoints retain their separate metadata
   commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
+### Changed
+
+- Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
+  their separate size limits, refusal messages and exact stored cursor bytes.
 
 ### Breaking (Rust crates)
 

@@ -9,10 +9,11 @@ use khive_runtime::{KhiveRuntime, NamespaceToken};
 use khive_storage::graph::{
     CommitAnnotationCursorValue, CommitAnnotationGuard, CommitAnnotationInsertOutcome,
 };
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ingest_cursor::snapshot;
 use crate::source::{parse_source, repo_identity, DigestSource};
 
 const CURSOR_MAX_BYTES: i64 = 8 * 1024;
@@ -99,48 +100,42 @@ fn oid(value: &str) -> bool {
 async fn cursor_snapshot(runtime: &KhiveRuntime, project_id: Uuid) -> Result<Vec<CursorRow>> {
     let mut reader = runtime.sql().reader().await?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: crate::sql::sql!("annotation_repair_cursor_snapshot_select").into(),
-            params: vec![
-                SqlValue::Text(project_id.to_string()),
-                SqlValue::Integer(CURSOR_MAX_BYTES),
-            ],
-            label: Some("git_annotation_repair_cursor_snapshot".into()),
-        })
+        .query_all(snapshot::statement(
+            &project_id.to_string(),
+            "commits",
+            "commits_checkpoint",
+            CURSOR_MAX_BYTES,
+            "git_annotation_repair_cursor_snapshot",
+        ))
         .await?;
-    let mut snapshot = Vec::with_capacity(rows.len());
-    for row in rows {
-        let kind = row
-            .text("kind")
-            .map_err(|_| anyhow!("stored kind has an invalid type"))?
-            .to_owned();
-        let value_type = row
-            .text("value_type")
-            .map_err(|_| anyhow!("stored value_type has an invalid type"))?
-            .to_owned();
-        let value_bytes = match row.get("value_bytes") {
-            Some(SqlValue::Integer(value)) if *value >= 0 => Some(*value),
-            Some(SqlValue::Null) => None,
-            _ => bail!("stored cursor length has an invalid type"),
-        };
-        if value_bytes.is_some_and(|size| size > CURSOR_MAX_BYTES) {
-            bail!("stored {kind} cursor exceeds the repair size limit");
-        }
-        let value = match row.get("value") {
-            Some(SqlValue::Blob(value)) => Some(value.clone()),
-            Some(SqlValue::Null) => None,
-            _ => bail!("stored cursor value has an invalid type"),
-        };
-        snapshot.push(CursorRow {
-            kind,
-            updated_at: row
-                .i64("updated_at")
-                .map_err(|_| anyhow!("stored updated_at has an invalid type"))?,
-            value_type,
-            value,
-        });
+    rows.iter().map(decode_cursor_row).collect()
+}
+
+fn decode_cursor_row(row: &SqlRow) -> Result<CursorRow> {
+    let kind = row
+        .text("kind")
+        .map_err(|_| anyhow!("stored kind has an invalid type"))?
+        .to_owned();
+    let value_type = row
+        .text("value_type")
+        .map_err(|_| anyhow!("stored value_type has an invalid type"))?
+        .to_owned();
+    let value_bytes = snapshot::value_bytes(row)
+        .map_err(|_| anyhow!("stored cursor length has an invalid type"))?;
+    if value_bytes.is_some_and(|size| size > CURSOR_MAX_BYTES) {
+        bail!("stored {kind} cursor exceeds the repair size limit");
     }
-    Ok(snapshot)
+    let value = snapshot::value(row)
+        .map_err(|_| anyhow!("stored cursor value has an invalid type"))?
+        .map(|value| value.to_vec());
+    Ok(CursorRow {
+        kind,
+        updated_at: row
+            .i64("updated_at")
+            .map_err(|_| anyhow!("stored updated_at has an invalid type"))?,
+        value_type,
+        value,
+    })
 }
 
 fn cursor_text<'a>(rows: &'a [CursorRow], kind: &str) -> Result<Option<&'a str>> {
@@ -794,6 +789,10 @@ mod test_hooks {
 #[cfg(test)]
 #[path = "reconcile/batch_tests.rs"]
 mod batch_tests;
+
+#[cfg(test)]
+#[path = "reconcile/cursor_snapshot_tests.rs"]
+mod cursor_snapshot_tests;
 
 #[cfg(test)]
 mod tests {
