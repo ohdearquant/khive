@@ -27,23 +27,9 @@ mod static_sql_source;
 use parsed_sources::{index_module_bindings, parse_production_sources, scan_source};
 use static_sql_source::{CanonicalBindings, StaticSqlSources};
 
-const STORE_WRITES: &[&str] = &[
-    "upsert_entity",
-    "upsert_entities",
-    "upsert_entity_with_attachments",
-    "insert_entity_if_absent",
-    "replace_entity_if_unchanged",
-    "upsert_note",
-    "upsert_notes",
-    "insert_note_if_absent",
-    "try_insert_note",
-    "try_insert_note_with_attachments",
-    "replace_note_if_unchanged",
-    "update_note_properties",
-    "set_note_property",
-    "try_patch_note_property",
-    "patch_note_property_atomic",
-];
+#[path = "route_census_store_methods.rs"]
+mod store_methods;
+use store_methods::STORE_WRITES;
 
 // The complement is explicit, including readers: a new trait method of any
 // spelling makes the census red until its properties behavior is classified.
