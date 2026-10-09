@@ -33,6 +33,9 @@ pub enum KgCommand {
     /// Compare DB state against `.khive/kg/{entities,edges}.ndjson`.
     Status(StatusArgs),
 
+    /// Render entity and edge changes in the working tree against a Git commit.
+    Diff(DiffArgs),
+
     /// Manage the pre-commit hook for KG validation.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -42,6 +45,18 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+/// CLI arguments for the read-only `kkernel kg diff` renderer.
+#[derive(clap::Parser, Debug)]
+pub struct DiffArgs {
+    /// Commit, tag or branch to compare the working tree against.
+    #[arg(default_value = "HEAD")]
+    pub reference: String,
+
+    /// Repository containing `.khive/kg/`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
 }
 
 /// CLI arguments for `kkernel kg validate`.
