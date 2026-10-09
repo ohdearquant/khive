@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
+  Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
+  writer while retaining their update and proposal guards.
+
 ### Breaking (Rust crates)
 
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
