@@ -1077,6 +1077,8 @@ pub struct QuarantinedRow {
 
 /// Result of a replay load: valid events and the full skip manifest.
 pub struct LoadEventsResult {
+    /// Replayed events. `FeedbackUnjudged` telemetry rows are included without validation; a
+    /// consumer that trains on these events must skip that kind, as the fold does.
     pub events: Vec<khive_storage::event::Event>,
     /// All rows skipped during replay — malformed/semantically invalid rows
     /// (quarantine) and readable rows excluded by policy — each tagged with
