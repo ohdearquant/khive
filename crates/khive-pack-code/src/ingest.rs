@@ -263,7 +263,7 @@ impl ValidatedFinding {
         if !is_valid_severity(&severity) {
             return Err(CodeIngestError::InvalidValue {
                 field: "severity",
-                value: severity,
+                value: khive_runtime::secret_gate::mask_secrets(&severity).into_owned(),
                 valid: "critical | high | medium | low | info",
             });
         }
@@ -272,7 +272,7 @@ impl ValidatedFinding {
         if !is_valid_confidence(&confidence) {
             return Err(CodeIngestError::InvalidValue {
                 field: "confidence",
-                value: confidence,
+                value: khive_runtime::secret_gate::mask_secrets(&confidence).into_owned(),
                 valid: "high | medium | low",
             });
         }

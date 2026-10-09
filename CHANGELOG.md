@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Finding create/update and findings-file ingestion mask credential-shaped rejected enum values
+  while retaining ordinary values, error kinds, and accepted-value lists (Refs #4585).
+
 ### Breaking (Rust crates)
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use

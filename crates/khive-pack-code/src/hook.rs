@@ -47,6 +47,7 @@ fn validate_finding_enum(key: &str, value: &Value) -> Result<(), RuntimeError> {
         .as_str()
         .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a string")))?;
     if !is_valid(text) {
+        let text = khive_runtime::secret_gate::mask_secrets(text);
         return Err(RuntimeError::InvalidInput(format!(
             "invalid {key} {text:?}; valid: {valid_values}"
         )));
