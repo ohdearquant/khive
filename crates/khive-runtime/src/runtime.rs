@@ -2482,8 +2482,8 @@ impl KhiveRuntime {
     }
 
     /// Resolve the service and its document-preparation attestation from the
-    /// same registry entry. A pack can replace a built-in name while a cold
-    /// service is initializing, so a second registry lookup would be unsafe.
+    /// same registry entry. Cloning it also avoids holding a registry lock
+    /// across the asynchronous service resolution.
     pub(crate) async fn embedder_with_input_attestation(
         &self,
         name: &str,
@@ -2495,9 +2495,10 @@ impl KhiveRuntime {
     /// Register a custom embedding provider with this runtime.
     ///
     /// The provider is added to the shared [`EmbedderRegistry`] so all clones
-    /// of this runtime see the new provider immediately. If a provider with the
-    /// same name already exists it is replaced (last-writer wins — see
-    /// [`crate::EmbedderRegistry::register`] for the rationale).
+    /// of this runtime see the new provider immediately. Setup may replace a
+    /// provider before it is selected for resolution. Later duplicates are
+    /// refused and logged; use [`try_register_embedder`](Self::try_register_embedder)
+    /// when the caller needs to handle registration errors.
     ///
     /// Packs should call this from [`crate::PackRuntime::register_embedders`] (the
     /// hook is invoked by the transport during pack initialisation, before the
@@ -2508,14 +2509,24 @@ impl KhiveRuntime {
         &self,
         provider: impl crate::embedder_registry::EmbedderProvider + 'static,
     ) {
-        if let Ok(mut registry) = self.embedder_registry.write() {
-            registry.register(provider);
-        } else {
-            tracing::warn!(
-                "embedder registry lock poisoned — embedder {} not registered",
-                std::any::type_name::<dyn crate::embedder_registry::EmbedderProvider>()
-            );
+        if let Err(error) = self.try_register_embedder(provider) {
+            tracing::warn!(%error, "embedder registration refused");
         }
+    }
+
+    /// Register a custom embedding provider and return serving-duplicate or lock errors.
+    ///
+    /// Unlike [`register_embedder`](Self::register_embedder), this method lets
+    /// callers fail initialization when registration cannot be completed.
+    pub fn try_register_embedder(
+        &self,
+        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
+    ) -> RuntimeResult<()> {
+        let mut registry = self
+            .embedder_registry
+            .write()
+            .map_err(|_| RuntimeError::Internal("embedder registry lock poisoned".into()))?;
+        registry.register(provider)
     }
 
     /// Install a deterministic backend for exact-input provenance tests.

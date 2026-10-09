@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,11 +87,14 @@ fn memory_runtime_denied_with(cause: String) -> Arc<KhiveRuntime> {
     )
 }
 
-/// An `EmbeddingService` that always succeeds with a fixed vector — used to
-/// stand up a runtime whose vector arm can later be broken independently of
-/// entity creation (which also embeds).
+/// An `EmbeddingService` that succeeds with a fixed vector until its `fail`
+/// flag is set — used to stand up a runtime whose vector arm can later be
+/// broken independently of entity creation (which also embeds). The provider
+/// is registered once: the registry refuses to replace a provider that has
+/// already served, so the service changes behaviour instead.
 struct ConstantEmbeddingService {
     dimensions: usize,
+    fail: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +104,11 @@ impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
         texts: &[String],
         _model: lattice_embed::EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(lattice_embed::EmbedError::ModelInitialization(
+                "injected vector-arm failure".to_string(),
+            ));
+        }
         Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
     }
 
@@ -115,6 +124,7 @@ impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
 struct ConstantEmbedderProvider {
     name: String,
     dimensions: usize,
+    fail: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -132,61 +142,15 @@ impl khive_runtime::EmbedderProvider for ConstantEmbedderProvider {
     ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
         Ok(Arc::new(ConstantEmbeddingService {
             dimensions: self.dimensions,
+            fail: Arc::clone(&self.fail),
         }))
     }
 }
 
-/// An `EmbeddingService` that always fails — drives a real vector-arm
-/// failure (not an `Unconfigured` short-circuit) through the coordinator's
-/// fan-out.
-struct FailingEmbeddingService;
-
-#[async_trait::async_trait]
-impl lattice_embed::EmbeddingService for FailingEmbeddingService {
-    async fn embed(
-        &self,
-        _texts: &[String],
-        _model: lattice_embed::EmbeddingModel,
-    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-        Err(lattice_embed::EmbedError::ModelInitialization(
-            "injected vector-arm failure".to_string(),
-        ))
-    }
-
-    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "coordinator-test-failing-embedding"
-    }
-}
-
-struct FailingEmbedderProvider {
-    name: String,
-    dimensions: usize,
-}
-
-#[async_trait::async_trait]
-impl khive_runtime::EmbedderProvider for FailingEmbedderProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn dimensions(&self) -> usize {
-        self.dimensions
-    }
-
-    async fn build(
-        &self,
-    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
-        Ok(Arc::new(FailingEmbeddingService))
-    }
-}
-
-/// A runtime configured with a healthy (constant) embedder — entity creation
-/// and search both work until [`break_vector_arm`] swaps the provider out.
-fn memory_runtime_with_constant_embeddings() -> Arc<KhiveRuntime> {
+/// A runtime configured with a healthy (constant) embedder, with the flag that
+/// breaks it — entity creation and search both work until [`break_vector_arm`]
+/// sets the flag.
+fn memory_runtime_with_constant_embeddings() -> (Arc<KhiveRuntime>, Arc<AtomicBool>) {
     let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
     let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
         db_path: None,
@@ -195,22 +159,19 @@ fn memory_runtime_with_constant_embeddings() -> Arc<KhiveRuntime> {
         ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
+    let fail = Arc::new(AtomicBool::new(false));
     runtime.register_embedder(ConstantEmbedderProvider {
         name: model.to_string(),
         dimensions: model.dimensions(),
+        fail: Arc::clone(&fail),
     });
-    Arc::new(runtime)
+    (Arc::new(runtime), fail)
 }
 
-/// Swap the runtime's registered embedder for the always-failing one, keyed
-/// under the same model name so the vector leg picks it up on the next
-/// embed call — `EmbedderRegistry::register` overwrites by name.
-fn break_vector_arm(runtime: &KhiveRuntime) {
-    let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
-    runtime.register_embedder(FailingEmbedderProvider {
-        name: model.to_string(),
-        dimensions: model.dimensions(),
-    });
+/// Make the runtime's registered embedder fail from the next embed call on,
+/// so the vector leg of a search errors while the text leg still runs.
+fn break_vector_arm(fail: &AtomicBool) {
+    fail.store(true, Ordering::SeqCst);
 }
 
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
@@ -761,7 +722,7 @@ async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error() {
-    let runtime = memory_runtime_with_constant_embeddings();
+    let (runtime, vector_arm) = memory_runtime_with_constant_embeddings();
     let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
     let ns = Namespace::local();
 
@@ -779,7 +740,7 @@ async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error()
         .await
         .map(|(row, _report)| row)
         .expect("create entity");
-    break_vector_arm(&runtime);
+    break_vector_arm(&vector_arm);
 
     let request = validated_kg_search(serde_json::json!({
         "kind": "entity",
@@ -816,7 +777,7 @@ async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error()
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn search_notes_still_fails_loud_on_vector_arm_error() {
-    let runtime = memory_runtime_with_constant_embeddings();
+    let (runtime, vector_arm) = memory_runtime_with_constant_embeddings();
     let ns = Namespace::local();
     let token = runtime.authorize(ns).unwrap();
     runtime
@@ -831,7 +792,7 @@ async fn search_notes_still_fails_loud_on_vector_arm_error() {
         )
         .await
         .expect("create note");
-    break_vector_arm(&runtime);
+    break_vector_arm(&vector_arm);
 
     let result = runtime
         .search_notes(
@@ -859,7 +820,7 @@ async fn search_notes_still_fails_loud_on_vector_arm_error() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_error() {
-    let runtime = memory_runtime_with_constant_embeddings();
+    let (runtime, vector_arm) = memory_runtime_with_constant_embeddings();
     let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
     let ns = Namespace::local();
 
@@ -876,7 +837,7 @@ async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_er
         )
         .await
         .expect("create note");
-    break_vector_arm(&runtime);
+    break_vector_arm(&vector_arm);
 
     let request = validated_kg_search(serde_json::json!({
         "kind": "note",
@@ -912,7 +873,7 @@ async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_er
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend() {
     let mut registry = BackendRegistry::new();
-    let rt_broken = memory_runtime_with_constant_embeddings();
+    let (rt_broken, broken_arm) = memory_runtime_with_constant_embeddings();
     let rt_healthy = memory_runtime();
     registry.register(backend_id("broken"), Arc::clone(&rt_broken));
     registry.register(backend_id("healthy"), Arc::clone(&rt_healthy));
@@ -933,7 +894,7 @@ async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend
         .await
         .map(|(row, _report)| row)
         .expect("create on broken backend");
-    break_vector_arm(&rt_broken);
+    break_vector_arm(&broken_arm);
 
     let tok_healthy = rt_healthy.authorize(ns.clone()).unwrap();
     rt_healthy
@@ -3824,7 +3785,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
 /// short-circuit in `khive-mcp/src/server.rs`).
 #[tokio::test]
 async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() {
-    let rt_broken = memory_runtime_with_constant_embeddings();
+    let (rt_broken, broken_arm) = memory_runtime_with_constant_embeddings();
     let rt_healthy = memory_runtime();
     let ns = Namespace::local();
 
@@ -3842,7 +3803,7 @@ async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() 
         .await
         .map(|(row, _report)| row)
         .expect("create entity");
-    break_vector_arm(&rt_broken);
+    break_vector_arm(&broken_arm);
 
     let server = two_backend_server(Arc::clone(&rt_broken), Arc::clone(&rt_healthy));
 
