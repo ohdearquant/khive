@@ -317,8 +317,8 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;
+mod resolve_prefix_in;
 mod resolve_uuid_or_prefix;
-
 #[cfg(any(test, feature = "fault-injection"))]
 pub use fault_injection::{
     arm_entity_compensation_fail_scoped, arm_fts_fail_many_partial_scoped,
