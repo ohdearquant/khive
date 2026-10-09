@@ -109,36 +109,42 @@ fn main_config(path: &Path) -> RuntimeConfig {
     }
 }
 
+fn sqlite_source(error: &RuntimeError) -> &SqliteError {
+    let RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. }) = error else {
+        panic!("expected storage driver failure: {error:?}");
+    };
+    source.downcast_ref().expect("typed SQLite source")
+}
+
 fn assert_same_refusal(event_error: &RuntimeError, main_error: &RuntimeError) {
-    match (event_error, main_error) {
+    match (sqlite_source(event_error), sqlite_source(main_error)) {
+        (SqliteError::InvalidConfig(event), SqliteError::InvalidConfig(main)) => {
+            assert_eq!(event, main)
+        }
         (
-            RuntimeError::Sqlite(SqliteError::InvalidConfig(event)),
-            RuntimeError::Sqlite(SqliteError::InvalidConfig(main)),
-        ) => assert_eq!(event, main),
-        (
-            RuntimeError::Sqlite(SqliteError::WalCapacityUnavailable {
+            SqliteError::WalCapacityUnavailable {
                 bytes: event_bytes,
                 capability: event_capability,
-            }),
-            RuntimeError::Sqlite(SqliteError::WalCapacityUnavailable {
+            },
+            SqliteError::WalCapacityUnavailable {
                 bytes: main_bytes,
                 capability: main_capability,
-            }),
+            },
         ) => assert_eq!(
             (event_bytes, event_capability),
             (main_bytes, main_capability)
         ),
         (
-            RuntimeError::Sqlite(SqliteError::WalCeilingBelowMinimum {
+            SqliteError::WalCeilingBelowMinimum {
                 bytes: event_bytes,
                 page_size: event_page,
                 minimum_bytes: event_minimum,
-            }),
-            RuntimeError::Sqlite(SqliteError::WalCeilingBelowMinimum {
+            },
+            SqliteError::WalCeilingBelowMinimum {
                 bytes: main_bytes,
                 page_size: main_page,
                 minimum_bytes: main_minimum,
-            }),
+            },
         ) => assert_eq!(
             (event_bytes, event_page, event_minimum),
             (main_bytes, main_page, main_minimum)
@@ -192,10 +198,7 @@ async fn daemon_case(root: &Path, raw: Option<&str>) {
             .downcast_ref::<RuntimeError>()
             .expect("typed runtime refusal");
         assert_same_refusal(event_error, &main_error);
-        if matches!(
-            event_error,
-            RuntimeError::Sqlite(SqliteError::InvalidConfig(_))
-        ) {
+        if matches!(sqlite_source(event_error), SqliteError::InvalidConfig(_)) {
             assert!(!db.parent().expect("fixture parent").exists());
         }
         assert!(!socket.exists());
@@ -254,12 +257,12 @@ fn cache_case(root: &Path, readonly: bool) {
     let original = open().expect("initial configured backend");
     std::env::set_var(WAL_ENV, "abc");
     assert!(
-        matches!(open(), Err(RuntimeError::Sqlite(SqliteError::InvalidConfig(message)))
+        matches!(sqlite_source(&open().err().expect("invalid environment")), SqliteError::InvalidConfig(message)
         if message.contains(WAL_ENV))
     );
     std::env::set_var(WAL_ENV, if readonly { "0" } else { "8192" });
     assert!(
-        matches!(open(), Err(RuntimeError::Sqlite(SqliteError::InvalidConfig(message)))
+        matches!(sqlite_source(&open().err().expect("changed policy")), SqliteError::InvalidConfig(message)
         if message.contains("drain and restart"))
     );
     std::env::set_var(WAL_ENV, if readonly { "8192" } else { "0" });
@@ -366,11 +369,7 @@ async fn events_wal_child() {
                     .err()
                     .expect("event opener must refuse main policy");
                 assert_same_refusal(&event_error, &main_error);
-                if !readonly
-                    && matches!(
-                        event_error,
-                        RuntimeError::Sqlite(SqliteError::InvalidConfig(_))
-                    )
+                if !readonly && matches!(sqlite_source(&event_error), SqliteError::InvalidConfig(_))
                 {
                     assert!(!db.parent().expect("fixture parent").exists());
                 }

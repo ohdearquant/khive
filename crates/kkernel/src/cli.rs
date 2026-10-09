@@ -1216,7 +1216,7 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
             let packs = pack_introspect::list_packs()?;
             if human {
                 for p in &packs {
-                    println!("# {} ({} verbs)", p.name, p.verbs.len());
+                    println!("# {} {} ({} verbs)", p.name, p.version, p.verbs.len());
                     if !p.requires.is_empty() {
                         println!("  requires: {}", p.requires.join(", "));
                     }

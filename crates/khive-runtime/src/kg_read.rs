@@ -453,17 +453,17 @@ mod tests {
         assert!(matches!(
             khive_storage::scope_request_read_deadline(expired, resolver.by_id(&token, id, false))
                 .await,
-            Err(RuntimeError::Storage(_) | RuntimeError::Sqlite(_))
+            Err(RuntimeError::Storage(_))
         ));
         assert!(matches!(
             khive_storage::scope_request_read_deadline(expired, resolver.prefix("bad01234", false))
                 .await,
-            Err(RuntimeError::Storage(_) | RuntimeError::Sqlite(_))
+            Err(RuntimeError::Storage(_))
         ));
         assert!(matches!(
             khive_storage::scope_request_read_deadline(expired, resolver.prefix("deadbeef", false))
                 .await,
-            Err(RuntimeError::Storage(_) | RuntimeError::Sqlite(_))
+            Err(RuntimeError::Storage(_))
         ));
     }
 

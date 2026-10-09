@@ -61,7 +61,7 @@ fn append_proof_uses_typed_finality_and_never_retryability_or_error_text() {
             NotCommitted,
         ),
         (
-            RuntimeError::Sqlite(khive_db::SqliteError::WriterPoolCheckoutTimeout {
+            RuntimeError::from(khive_db::SqliteError::WriterPoolCheckoutTimeout {
                 timeout: std::time::Duration::from_millis(9),
             }),
             NotCommitted,

@@ -1478,7 +1478,7 @@ mod tests {
             .expect("target still governed by captured policy");
         assert!(matches!(
             file,
-            RuntimeError::Sqlite(khive_db::SqliteError::WalCapacityUnavailable { bytes: 8192, .. })
+            RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. }) if matches!(source.downcast_ref(), Some(khive_db::SqliteError::WalCapacityUnavailable { bytes: 8192, .. }))
         ));
     }
 

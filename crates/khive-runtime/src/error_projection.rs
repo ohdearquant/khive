@@ -178,7 +178,6 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "message": missing.to_string(),
         }),
         other @ (RuntimeError::Storage(_)
-        | RuntimeError::Sqlite(_)
         | RuntimeError::Query(_)
         | RuntimeError::InvalidInput(_)
         | RuntimeError::UnknownVerb(_)
@@ -309,7 +308,6 @@ impl SqliteCapacityFailure {
 fn sqlite_capacity_failure(error: &RuntimeError) -> Option<SqliteCapacityFailure> {
     match error {
         RuntimeError::Storage(storage) => sqlite_capacity_failure_from_storage(storage),
-        RuntimeError::Sqlite(sqlite) => sqlite_capacity_failure_from_sqlite(sqlite),
         _ => None,
     }
 }
