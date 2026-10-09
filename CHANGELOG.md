@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `kkernel kg init` now creates the canonical `.khive/config.toml` with valid engine settings,
+  preserves existing project configurations, and refuses the obsolete config path before writing
+  scaffolding. Only the exact old generated ignore file is migrated to the canonical filename.
+
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 
