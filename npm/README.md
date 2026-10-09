@@ -26,7 +26,7 @@ runtime warm.
 
 | Pack          | Verbs | What it does                                                                                                                                                               |
 | ------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | 26    | Entities, edges, notes, graph queries, proposals                                                                                                                           |
+| **kg**        | 27    | Entities, edges, notes, graph queries, proposals                                                                                                                           |
 | **gtd**       | 7     | Task lifecycle, timestamp census, and explicit historical repair                                                                                                           |
 | **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                           |
 | **brain**     | 17    | Bayesian user profiles + feedback loop                                                                                                                                     |

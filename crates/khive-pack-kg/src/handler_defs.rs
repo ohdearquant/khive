@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (26 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (27 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,26 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 27] = [
+    HandlerDef {
+        name: "count",
+        description: "Count matching events in storage, grouped by verb, kind or actor. Only caller-visible namespaces contribute; an empty result is an empty object.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "kind", param_type: "string", required: true, description: "Required substrate: event.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "group_by", param_type: "string", required: true, description: "Count per stored verb, kind or actor; returns a key-to-count object over caller-visible namespaces.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "verb", param_type: "string", required: false, description: "Exact event verb; merged with verbs.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "verbs", param_type: "array of string", required: false, description: "Allowed event verbs, ORed together.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "event_kind", param_type: "string", required: false, description: "Typed event kind; merged with event_kinds.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "event_kinds", param_type: "array of string", required: false, description: "Allowed typed event kinds, ORed together.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Exact stored actor attribution.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "substrate", param_type: "string", required: false, description: "Exact event substrate: entity, note or event.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "outcome", param_type: "string", required: false, description: "Exact outcome: success, denied or error.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "since", param_type: "integer", required: false, description: "Exclusive lower created_at bound in UTC microseconds.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "until", param_type: "integer", required: false, description: "Exclusive upper created_at bound in UTC microseconds.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",

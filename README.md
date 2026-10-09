@@ -66,7 +66,7 @@ before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                                                                                                     |
 | ------------- | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 26    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
+| **kg**        | _(bare)_     | 27    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
 | **gtd**       | `gtd.`       | 7     | Task lifecycle, timestamp census, and explicit historical repair                                                                                                                 |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                                 |
 | **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                           |
@@ -136,7 +136,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 26 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 27 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (7 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (17 verbs)           │
