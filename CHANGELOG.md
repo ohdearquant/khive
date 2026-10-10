@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Vamana v2 saves use one checkpoint-owned publication boundary: metadata is
+  published and synced through the shared Unix helper before the four staged
+  segments are promoted. Sidecar reads and cleanup share component-name conversion,
+  preserving their refusal policy and native I/O errors (Refs #4498).
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
