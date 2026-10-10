@@ -2,6 +2,7 @@
 
 pub mod brain_signal;
 pub mod brain_state;
+pub mod evidence;
 pub mod posterior;
 pub mod profile;
 pub mod query_class;
@@ -15,6 +16,7 @@ pub use brain_state::{
     validate_brain_state_snapshot, validate_brain_state_snapshot_with_capacity, BrainState,
     BrainStateSnapshot,
 };
+pub use evidence::{EvidenceHalfLifeDays, EvidencePolarity, EvidencePosterior, EvidenceUpdate};
 pub use posterior::{BetaPosterior, EntityPosteriors};
 pub use profile::{
     resolve_consumer_profile, BalancedRecallSnapshot, BalancedRecallState, ConsumerKind,
