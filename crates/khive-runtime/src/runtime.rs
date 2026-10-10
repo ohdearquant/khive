@@ -2585,16 +2585,19 @@ impl KhiveRuntime {
     /// Optionally filter by `engine_name`. Returns an empty vec when the
     /// `_embedding_models` table does not yet exist (e.g. no migrations have run
     /// or no models have been registered). All other SQL errors are propagated.
+    /// Malformed required fields, unknown statuses and invalid non-NULL optional
+    /// dimensions/UUIDs are warned and skipped. The legacy optional timestamps
+    /// retain their non-integer-to-None compatibility behavior.
     pub async fn list_embedding_models(
         &self,
         engine_filter: Option<&str>,
-    ) -> RuntimeResult<Vec<khive_db::EmbeddingModelRegistryRecord>> {
+    ) -> RuntimeResult<Vec<crate::EmbeddingModelRecord>> {
         use khive_storage::{SqlStatement, SqlValue};
 
         let (sql_text, params) = if let Some(engine) = engine_filter {
             (
-                "SELECT engine_name, model_id, key_version, dim, status, \
-                 activated_at, superseded_at \
+                "SELECT id, engine_name, model_id, key_version, dim, output_dim, status, \
+                 activated_at, superseded_at, superseded_by, canonical_key, created_at \
                  FROM _embedding_models WHERE engine_name = ?1 \
                  ORDER BY engine_name, activated_at IS NULL, activated_at"
                     .to_string(),
@@ -2602,8 +2605,8 @@ impl KhiveRuntime {
             )
         } else {
             (
-                "SELECT engine_name, model_id, key_version, dim, status, \
-                 activated_at, superseded_at \
+                "SELECT id, engine_name, model_id, key_version, dim, output_dim, status, \
+                 activated_at, superseded_at, superseded_by, canonical_key, created_at \
                  FROM _embedding_models \
                  ORDER BY engine_name, activated_at IS NULL, activated_at"
                     .to_string(),
@@ -2631,56 +2634,10 @@ impl KhiveRuntime {
             Err(e) => return Err(crate::RuntimeError::Storage(e)),
         };
 
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            macro_rules! required_text {
-                ($col:expr) => {
-                    match row.get($col) {
-                        Some(SqlValue::Text(s)) => s.clone(),
-                        other => {
-                            tracing::warn!(column = $col, value = ?other, "skipping registry row: unexpected type");
-                            continue;
-                        }
-                    }
-                };
-            }
-            let engine_name = required_text!("engine_name");
-            let model_id = required_text!("model_id");
-            let key_version = required_text!("key_version");
-            let dimensions = match row.get("dim") {
-                Some(SqlValue::Integer(n)) => match u32::try_from(*n) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        tracing::warn!(dim = n, "skipping registry row: dim out of u32 range");
-                        continue;
-                    }
-                },
-                other => {
-                    tracing::warn!(column = "dim", value = ?other, "skipping registry row: unexpected type");
-                    continue;
-                }
-            };
-            let status = required_text!("status");
-            let activated_at = match row.get("activated_at") {
-                Some(SqlValue::Integer(n)) => Some(*n),
-                _ => None,
-            };
-            let superseded_at = match row.get("superseded_at") {
-                Some(SqlValue::Integer(n)) => Some(*n),
-                _ => None,
-            };
-            records.push(khive_db::EmbeddingModelRegistryRecord {
-                engine_name,
-                model_id,
-                key_version,
-                dimensions,
-                status,
-                activated_at,
-                superseded_at,
-            });
-        }
-
-        Ok(records)
+        Ok(rows
+            .iter()
+            .filter_map(crate::EmbeddingModelRecord::from_sql_row)
+            .collect())
     }
 }
 

@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete with an `Unsupported` default and an atomic SQLite implementation;
   comm cleanup adoption remains separate.
 
+- `KhiveRuntime::list_embedding_models` now returns runtime-owned `EmbeddingModelRecord`
+  values with all twelve persisted registry fields. Rust callers use `dim` instead of
+  `dimensions` and the `EmbeddingModelStatus` enum instead of a status string. Status serde
+  values remain lowercase; `kkernel engine list/status` retain their seven-field JSON shape.
+  Invalid required fields, unknown statuses and invalid non-NULL optional dimensions/UUIDs
+  are skipped with a warning. Existing optional timestamp decoding still maps non-integers
+  to `None`; reads never fabricate missing identity or lifecycle history.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new

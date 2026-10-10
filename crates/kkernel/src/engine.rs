@@ -255,8 +255,8 @@ async fn fetch_model_records(
             engine_name: r.engine_name,
             model_id: r.model_id,
             key_version: r.key_version,
-            dimensions: r.dimensions,
-            status: r.status,
+            dimensions: r.dim,
+            status: r.status.as_str().to_owned(),
             activated_at: r.activated_at,
             superseded_at: r.superseded_at,
         })
@@ -313,6 +313,44 @@ mod tests {
         cmd_engine_status(args)
             .await
             .expect("engine status succeeds on empty registry");
+    }
+
+    #[tokio::test]
+    async fn registered_model_keeps_the_seven_field_cli_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registered-model.db");
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(path.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        runtime
+            .backend()
+            .register_embedding_model("cli-engine", "cli-model", "v1", 384)
+            .unwrap();
+        let registry = runtime.list_embedding_models(None).await.unwrap();
+        assert_eq!(registry.len(), 1);
+        let activated_at = registry[0].activated_at;
+        assert!(activated_at.is_some());
+        drop(runtime);
+        #[cfg(unix)]
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
+
+        let records = fetch_model_records(Some(&path), Some("cli-engine"))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&records).unwrap(),
+            serde_json::json!([{
+                "engine_name": "cli-engine",
+                "model_id": "cli-model",
+                "key_version": "v1",
+                "dimensions": 384,
+                "status": "active",
+                "activated_at": activated_at,
+                "superseded_at": null,
+            }]),
+        );
     }
 
     #[test]
