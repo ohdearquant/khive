@@ -265,9 +265,10 @@ impl VerbRegistry {
         })
     }
 
-    /// Test/diagnostic-only accessor for the underlying ADR-133 audit-batch
-    /// seam. `None` when no `EventStore` was configured (the batch is lazily
-    /// constructed from one). Exposed so admission-pressure mechanism tests
+    /// This registry's shared ADR-133 audit-batch seam. The recall handler
+    /// uses this same instance for its best-effort `RecallExecuted` rows.
+    /// `None` when no `EventStore` was configured (the batch is constructed
+    /// from one). Admission-pressure mechanism tests also use it so they
     /// can saturate and drain the SAME instance a real dispatch uses
     /// (#2117, #2147, #2208, #2217) instead of testing a
     /// look-alike.

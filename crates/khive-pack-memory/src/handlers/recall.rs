@@ -11,9 +11,10 @@ use uuid::Uuid;
 
 use khive_brain_core::{compute_query_class, PackTunable, ServeAttribution};
 use khive_fusion::FusionStrategy;
+use khive_runtime::audit_batch::{AuditBatchControl, AuditProducer, PreparedAuditRow};
 use khive_runtime::{
-    micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
-    SearchSource, VerbRegistry,
+    micros_to_iso, EventAttribution, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity,
+    RuntimeError, SearchSource, VerbRegistry,
 };
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
@@ -1318,6 +1319,7 @@ impl MemoryPack {
             emit_recall_executed_event(
                 &runtime,
                 &token,
+                &registry,
                 RecallExecutedFields {
                     actor,
                     served_by_profile_id,
@@ -1379,6 +1381,7 @@ struct RecallExecutedFields {
 async fn emit_recall_executed_event(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
+    registry: &VerbRegistry,
     fields: RecallExecutedFields,
 ) {
     let RecallExecutedFields {
@@ -1392,17 +1395,24 @@ async fn emit_recall_executed_event(
         ann_degraded,
         ann_degraded_reason,
     } = fields;
-    let store = match rt.events(token) {
-        Ok(store) => store,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                namespace = token.namespace().as_str(),
-                event_kind = "recall_executed",
-                "recall_executed event store acquisition failed; recall result is unaffected"
-            );
-            return;
+    let batch = registry.audit_batch_handle();
+    // Only the legacy no-batch route obtains a token-decorated runtime store.
+    // A configured batch owns accepted rows even after its caller times out.
+    let store = if batch.is_none() {
+        match rt.events(token) {
+            Ok(store) => Some(store),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    namespace = token.namespace().as_str(),
+                    event_kind = "recall_executed",
+                    "recall_executed event store acquisition failed; recall result is unaffected"
+                );
+                return;
+            }
         }
+    } else {
+        None
     };
     let result_count = target_ids.len();
     // A degraded recall that returns nothing is a different state from a
@@ -1437,11 +1447,31 @@ async fn emit_recall_executed_event(
     )
     .with_payload(payload)
     .with_duration_us(latency_us);
-    if let Err(err) = store.append_event(event).await {
-        tracing::warn!(
-            error = %err,
-            "recall_executed event append failed; recall result is unaffected"
-        );
+    if let Some(batch) = batch {
+        // The registry sink is raw: attribution must come from the sealed
+        // caller token rather than the identity used to build the registry.
+        let row = PreparedAuditRow {
+            event: EventAttribution::from_token(token).stamp(event),
+            producer: AuditProducer::RecallExecuted,
+        };
+        if let Err(reason) = batch.submit(row).await {
+            tracing::warn!(
+                ?reason,
+                namespace = token.namespace().as_str(),
+                event_kind = "recall_executed",
+                "recall_executed batch submission failed; recall result is unaffected"
+            );
+        }
+        // Never resubmit or direct-append: a timed-out row may still commit.
+        return;
+    }
+    if let Some(store) = store {
+        if let Err(err) = store.append_event(event).await {
+            tracing::warn!(
+                error = %err,
+                "recall_executed event append failed; recall result is unaffected"
+            );
+        }
     }
 }
 
@@ -1462,3 +1492,7 @@ mod loop_3711_tests;
 #[cfg(test)]
 #[path = "recall_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recall_audit_batch_tests.rs"]
+mod audit_batch_tests;
