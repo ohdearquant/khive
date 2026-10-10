@@ -223,7 +223,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
     /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
-    /// `comm.delivered`, `comm.transport_status`, `git.digest`, `git.ingest_cursor`.
+    /// `comm.delivered`, `comm.transport_status`, `git.digest`, `git.ingest_cursor`, `schema`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -245,6 +245,7 @@ pub enum VerbPresentationPolicy {
     /// otherwise make the returned result differ from the stored result.
     /// `git.ingest_cursor` preserves raw checkpoint strings, full project UUIDs,
     /// and stored microsecond timestamps for persisted-position inspection.
+    /// `schema` preserves empty vocabulary arrays and its complete content-hashed payload.
     AlwaysVerbose,
     /// Preserve only the root append receipt's `created_at` string in Agent mode.
     StreamAppendReceipt,
@@ -278,7 +279,8 @@ impl HandlerDef {
             | "comm.delivered"
             | "comm.transport_status"
             | "git.digest"
-            | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
+            | "git.ingest_cursor"
+            | "schema" => VerbPresentationPolicy::AlwaysVerbose,
             "stream.append" => VerbPresentationPolicy::StreamAppendReceipt,
             "stream.batch" => VerbPresentationPolicy::StreamBatchReceipts,
             "schedule.agenda" => VerbPresentationPolicy::AgendaContinuation,
@@ -749,6 +751,7 @@ mod tests {
             "comm.transport_status",
             "git.digest",
             "git.ingest_cursor",
+            "schema",
         ];
         for name in always_verbose {
             let h = HandlerDef {

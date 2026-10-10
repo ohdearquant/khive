@@ -43,6 +43,10 @@ event rows inside the caller's visible namespaces and writes nothing.
 Revision `domain-effects-v12` classifies `knowledge.export` as `Read`: it renders the
 selected namespace's live corpus rows as JSONL in the response and writes no file and no row.
 
+Revision `domain-effects-v13` classifies `schema` as `Read`: it projects loaded
+registry declarations without reading or mutating graph records. Ordinary Gate
+admission and configured dispatch audit behavior still apply.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -189,6 +193,7 @@ selected namespace's live corpus rows as JSONL in the response and writes no fil
 | `schedule.cancel`            | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L135)    |
 | `schedule.remind`            | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L25)     |
 | `schedule.schedule`          | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L54)     |
+| `schema`                          | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
 | `search`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L716)  |
 | `session.export`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L171)      |
 | `session.list`               | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L115)      |

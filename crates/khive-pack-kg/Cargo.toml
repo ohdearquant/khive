@@ -15,7 +15,7 @@ description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search
 bench = false
 
 [dependencies]
-khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.11.0", path = "../khive-types", features = ["serde", "blake3"] }
 khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
 khive-score = { version = "0.11.0", path = "../khive-score" }
 khive-query = { version = "0.11.0", path = "../khive-query" }
