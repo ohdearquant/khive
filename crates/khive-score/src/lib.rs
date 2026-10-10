@@ -4,6 +4,7 @@ mod comparator;
 pub mod distance;
 mod ops;
 mod score;
+pub mod vector;
 
 pub use comparator::{cmp_asc_then_id, cmp_desc_then_id, Ranked};
 // REASON: re-export the deprecated legacy function so downstream callers receive
