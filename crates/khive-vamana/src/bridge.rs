@@ -27,6 +27,35 @@ pub struct AnnBridgeCore {
     pub commit_digest: Option<[u8; 32]>,
 }
 
+/// Keeps bridge access and generation stamping on the pack wrapper without moving its lifecycle state.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! impl_ann_bridge_helpers {
+    ($bridge:ty, $(#[$generation_doc:meta])*) => {
+        impl ::std::ops::Deref for $bridge {
+            type Target = $crate::bridge::AnnBridgeCore;
+
+            fn deref(&self) -> &$crate::bridge::AnnBridgeCore {
+                &self.core
+            }
+        }
+
+        impl ::std::ops::DerefMut for $bridge {
+            fn deref_mut(&mut self) -> &mut $crate::bridge::AnnBridgeCore {
+                &mut self.core
+            }
+        }
+
+        impl $bridge {
+            $(#[$generation_doc])*
+            pub(crate) fn with_generation(mut self, generation: u64) -> Self {
+                self.generation = generation;
+                self
+            }
+        }
+    };
+}
+
 impl AnnBridgeCore {
     pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         if dim == 0 {
