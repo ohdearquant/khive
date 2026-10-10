@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Identifier splitting restores acronym boundaries in `DBUsers` and `APIUsage` while keeping
+  terminal plural suffixes in `APIs`, `IDs`, `URLs`, and `APIsFoo`. `URLsafe` now splits as
+  `ur`, `lsafe`; `XMLIsEmpty` follows the dictionary-free rule as `xmlis`, `empty` (#5103).
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
