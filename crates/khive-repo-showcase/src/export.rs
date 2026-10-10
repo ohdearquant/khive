@@ -442,7 +442,7 @@ fn prop_ordered_string_array(
 }
 
 fn validate_edge_weight(edge_id: &str, weight: f64) -> Result<(), ExportError> {
-    if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+    if !khive_types::validate_edge_weight(weight) {
         return Err(ExportError::InvalidData(format!(
             "edge {edge_id} has weight {weight}; khive.repo.v1 requires a finite value in [0,1]"
         )));

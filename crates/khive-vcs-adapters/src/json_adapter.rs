@@ -212,7 +212,7 @@ fn extract_weight(
                 field: "weight".into(),
                 reason: "weight is not a finite f64".into(),
             })?;
-            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(AdapterError::InvalidField {
                     index,
                     field: "weight".into(),
