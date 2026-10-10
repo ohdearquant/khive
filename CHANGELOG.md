@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default to disabled; the separately default-enabled backfill flag keeps its existing parser.
   Session maintenance uses shared typed SQL row accessors while preserving its error messages
   and rejection of negative counts.
+### Added
+
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
 
 ### Breaking (Rust crates)
 
