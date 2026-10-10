@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
   outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
   with the caller.
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
 
 ### Changed
 
@@ -38,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
 - Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
   their separate size limits, refusal messages and exact stored cursor bytes.
+- Session mirror enable flags now use the shared boolean parser: `on` and surrounding
+  whitespace on recognized true values enable the configured source. All four flags still
+  default to disabled; the separately default-enabled backfill flag keeps its existing parser.
+  Session maintenance uses shared typed SQL row accessors while preserving its error messages
+  and rejection of negative counts.
 
 ### Fixed
 
@@ -55,23 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
-### Added
-
-- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
-  checks both strategies even on empty input, preserves the candidate union without a final
-  limit, and accepts an async custom-executor adapter without a runtime dependency.
-### Changed
-
-- Session mirror enable flags now use the shared boolean parser: `on` and surrounding
-  whitespace on recognized true values enable the configured source. All four flags still
-  default to disabled; the separately default-enabled backfill flag keeps its existing parser.
-  Session maintenance uses shared typed SQL row accessors while preserving its error messages
-  and rejection of negative counts.
-### Added
-
-- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
-  checking its dimensions and finite coordinates even for empty requests. Existing methods
-  remain single-engine compatibility delegates to the configured first/default engine.
 
 ### Breaking (Rust crates)
 
