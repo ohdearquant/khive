@@ -171,3 +171,47 @@ the stale row.
 FAILURE MODE (pre-#546): this test could not even be written against the
 old `insert` body — there was no failpoint hook to arm. Removing the shared
 helper (or its transaction rollback) makes this fail.
+
+## `scan_vectors` — ordered stored-vector pages (#3686)
+
+`SqliteVecStore::scan_vectors(VectorScanRequest)` implements the optional storage
+capability with one `with_reader("vec_scan_vectors", ...)` call and one SELECT per
+page. It retains the existing request cancellation, deadline and reader-admission
+path. It does not initialize tables, write data, load an embedding model or consult
+an ANN index.
+
+The request requires exact `namespace`, `embedding_model` and `field` strings;
+`kind: None` removes only the kind restriction. Empty strings and punctuation are
+literal values. The handle chooses the physical table, while `embedding_model`
+filters rows in that table. Only the constructor-validated table name is assembled
+into SQL; all selectors, the optional UUID boundary and the limit are bound values.
+This dynamic identifier is why the query remains beside the implementation.
+
+The query applies every filter before binary ascending `subject_id` order and
+LIMIT. `after` is exclusive and does not require an existing boundary row. Reuse
+all selectors with a returned cursor; changing them is a new interval query. The
+nonzero u32 limit is an explicit row budget, not a bound on database scan work or
+embedding bytes. SQLite fetches at most `limit + 1` rows without MATCH. If a
+lookahead exists, `next_after` names the last returned row; otherwise it is `None`,
+including an exactly full terminal page. There is no total-count query.
+
+Every encountered row, including lookahead, is decoded before returning a page.
+Malformed or noncanonical stored UUID text and wrong embedding byte lengths refuse
+the whole page as `StorageError::Driver` for Vectors/`vec_scan_vectors`, preserving
+the native conversion source. The byte-length calculation is checked. Valid
+native f32 bytes are decoded without normalization or scoring, preserving signed
+zero. The result supports multiple vectors per subject; sqlite-vec supplies one.
+This does not promise lossless JSON representation of nonfinite f32 values.
+
+Each page is one statement observation. It is **not** a snapshot across calls:
+new rows above the boundary may appear, passed IDs cannot recur, and later pages
+can observe updates or deletions. A previously advertised next page may become
+empty. These are raw vector rows even when an owner is missing or soft-deleted;
+there is no live-owner join or authorization decision here.
+
+Other implementations inherit an explicit `Unsupported` default. Existing
+`get_vectors`, similarity search and capability flags retain their contracts.
+In particular, `supports_vector_read` continues to describe requested-ID reads.
+The existing ANN corpus scans keep their same-statement watermark semantics;
+`khive_runtime::config::sanitize_key` already provides the public shared model-key
+helper used by both in-tree builders. This API does not replace those scans.
