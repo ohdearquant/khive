@@ -81,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
+### Changed
+
+- `khive-db` moves checkpoint escalation and transaction-age state into a dedicated
+  module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
 
 ### Breaking (Rust crates)
 
