@@ -60,7 +60,13 @@ fn preserve_driver_refusal(error: StorageError) -> StorageError {
         StorageError::WriterTaskRequestFailed {
             request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
             source,
-        } if matches!(source.as_ref(), StorageError::Driver { .. }) => *source,
+        } if matches!(
+            source.without_sqlite_write_stage(),
+            StorageError::Driver { .. }
+        ) =>
+        {
+            *source
+        }
         other => other,
     }
 }

@@ -2,8 +2,66 @@
 
 use std::time::Duration;
 
+use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
 use khive_storage::{StorageCapability, StorageError, WriterTaskRequestState};
 use thiserror::Error;
+
+// Inspect only owned error shapes. User callbacks may supply cyclic or effectful
+// source() implementations; attaching evidence must not invoke those again.
+pub(crate) fn native_write_failure(
+    error: &(dyn std::error::Error + 'static),
+    stage: SqliteWriteStage,
+) -> Option<SqliteWriteFailure> {
+    if let Some(error) = error.downcast_ref::<StorageError>() {
+        return match error {
+            StorageError::SqliteWrite { failure, .. } => Some(*failure),
+            StorageError::Driver { source, .. } => native_write_failure(source.as_ref(), stage),
+            StorageError::WriterTaskRequestFailed { source, .. } => {
+                native_write_failure(source.as_ref(), stage)
+            }
+            _ => None,
+        };
+    }
+    if let Some(error) = error.downcast_ref::<SqliteError>() {
+        return match error {
+            SqliteError::Write { stage, source } => native_write_failure(source, *stage),
+            SqliteError::WriteSettlementUnknown { failure } => Some(*failure),
+            SqliteError::Rusqlite(source) => native_write_failure(source, stage),
+            _ => None,
+        };
+    }
+    if let Some(
+        rusqlite::Error::SqliteFailure(code, _)
+        | rusqlite::Error::SqlInputError { error: code, .. },
+    ) = error.downcast_ref::<rusqlite::Error>()
+    {
+        return Some(SqliteWriteFailure {
+            stage,
+            primary_code: code.extended_code & 0xff,
+            extended_code: code.extended_code,
+            settlement_unknown: false,
+        });
+    }
+    None
+}
+
+pub(crate) fn with_write_stage(error: StorageError, stage: SqliteWriteStage) -> StorageError {
+    match native_write_failure(&error, stage) {
+        Some(failure) => error.with_sqlite_write_failure(failure),
+        None => error,
+    }
+}
+
+pub(crate) fn statement_failure(error: StorageError) -> StorageError {
+    with_write_stage(error, SqliteWriteStage::Statement)
+}
+
+pub(crate) fn unknown_write_settlement(mut error: StorageError) -> StorageError {
+    if let StorageError::SqliteWrite { failure, .. } = &mut error {
+        failure.settlement_unknown = true;
+    }
+    error
+}
 
 /// Stable ADR-194 capacity stages. The refusal stage is reserved for the WAL
 /// I/O limiter; this configuration-only slice emits only unavailable.
@@ -13,6 +71,12 @@ pub const SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE: &str = "sqlite_wal_capacity_una
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
+    #[error("sqlite error: {source}")]
+    Write {
+        stage: SqliteWriteStage,
+        #[source]
+        source: rusqlite::Error,
+    },
     /// A request-scoped read or store acquisition stopped, or read cleanup failed.
     #[error(transparent)]
     RequestReadStopped(khive_storage::StorageError),
@@ -33,6 +97,10 @@ pub enum SqliteError {
     /// The writer could not prove transaction settlement before retirement.
     #[error("writer transaction settlement is unknown; connection retired")]
     WriterSettlementUnknown,
+
+    /// Source-free native evidence retained when cleanup cannot prove settlement.
+    #[error("writer transaction settlement is unknown; connection retired")]
+    WriteSettlementUnknown { failure: SqliteWriteFailure },
 
     /// An earlier write on this database could not prove its settlement, so
     /// every later write is refused before it starts. Only the write whose
@@ -142,6 +210,41 @@ pub enum SqliteError {
 }
 
 impl SqliteError {
+    /// Attach a known write boundary while retaining the original native driver error.
+    pub fn write(error: rusqlite::Error, stage: SqliteWriteStage) -> Self {
+        if matches!(
+            error,
+            rusqlite::Error::SqliteFailure(..) | rusqlite::Error::SqlInputError { .. }
+        ) {
+            Self::Write {
+                stage,
+                source: error,
+            }
+        } else {
+            Self::Rusqlite(error)
+        }
+    }
+
+    pub(crate) fn settlement_with_cause(
+        error: &(dyn std::error::Error + 'static),
+        stage: SqliteWriteStage,
+    ) -> Self {
+        match native_write_failure(error, stage) {
+            Some(mut failure) => {
+                failure.settlement_unknown = true;
+                Self::WriteSettlementUnknown { failure }
+            }
+            None => Self::WriterSettlementUnknown,
+        }
+    }
+
+    pub fn write_failure(&self) -> Option<SqliteWriteFailure> {
+        match self {
+            Self::Write { stage, source } => native_write_failure(source, *stage),
+            Self::WriteSettlementUnknown { failure } => Some(*failure),
+            _ => None,
+        }
+    }
     /// Stable structured stage for an ADR-194 WAL-capacity failure.
     pub fn wal_capacity_stage(&self) -> Option<&'static str> {
         match self {
@@ -161,6 +264,9 @@ impl SqliteError {
         operation: &'static str,
     ) -> StorageError {
         match self {
+            error @ Self::Write { stage, .. } => {
+                with_write_stage(StorageError::driver(capability, operation, error), stage)
+            }
             Self::CapacityFloor {
                 volume,
                 available_bytes,
@@ -178,6 +284,10 @@ impl SqliteError {
                 phase,
                 message,
             },
+            Self::WriteSettlementUnknown { failure } => {
+                StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
+                    .with_sqlite_write_failure(failure)
+            }
             Self::InheritedWriterTransaction | Self::WriterSettlementUnknown => {
                 StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
             }

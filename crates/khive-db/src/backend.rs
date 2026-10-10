@@ -1159,31 +1159,39 @@ impl StorageBackend {
         let writer = self.pool.autocommit_write_unit()?;
         writer
             .conn()
-            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
+            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)
+            .map_err(|error| {
+                SqliteError::write(error, khive_storage::error::SqliteWriteStage::Statement)
+            })?;
 
         let now = chrono::Utc::now().timestamp_micros();
         let canonical_key =
             format!("{engine_name}:{model_id}:{key_version}:{dimensions}").into_bytes();
         let id = uuid::Uuid::new_v4();
-        writer.conn().execute(
-            "INSERT INTO _embedding_models \
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO _embedding_models \
              (id, engine_name, model_id, key_version, dim, output_dim, status, \
               activated_at, superseded_at, superseded_by, canonical_key, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'active', ?6, NULL, NULL, ?7, ?8) \
              ON CONFLICT(canonical_key) DO UPDATE SET \
                 status = 'active', \
                 activated_at = COALESCE(_embedding_models.activated_at, excluded.activated_at)",
-            rusqlite::params![
-                id.as_bytes().as_slice(),
-                engine_name,
-                model_id,
-                key_version,
-                dimensions as i64,
-                now,
-                canonical_key,
-                now,
-            ],
-        )?;
+                rusqlite::params![
+                    id.as_bytes().as_slice(),
+                    engine_name,
+                    model_id,
+                    key_version,
+                    dimensions as i64,
+                    now,
+                    canonical_key,
+                    now,
+                ],
+            )
+            .map_err(|error| {
+                SqliteError::write(error, khive_storage::error::SqliteWriteStage::Statement)
+            })?;
         Ok(())
     }
 

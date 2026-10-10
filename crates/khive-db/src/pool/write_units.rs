@@ -557,7 +557,11 @@ impl<'pool> WriterGuard<'pool> {
                 "checkpoint writer checkout cannot start a logical transaction".to_string(),
             ));
         }
-        self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        self.guard
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| {
+                SqliteError::write(error, khive_storage::error::SqliteWriteStage::Begin)
+            })?;
         if let Err(error) = self.admission.check() {
             self.rollback_or_retire("capacity admission")?;
             return Err(error);
@@ -570,14 +574,32 @@ impl<'pool> WriterGuard<'pool> {
         match f(&self.guard) {
             Ok(result) => {
                 if let Err(err) = self.guard.execute_batch("COMMIT") {
-                    self.rollback_or_retire("commit failure")?;
-                    return Err(err.into());
+                    if self.rollback_or_retire("commit failure").is_err() {
+                        return Err(SqliteError::settlement_with_cause(
+                            &err,
+                            khive_storage::error::SqliteWriteStage::Commit,
+                        ));
+                    }
+                    return Err(SqliteError::write(
+                        err,
+                        khive_storage::error::SqliteWriteStage::Commit,
+                    ));
                 }
                 Ok(result)
             }
             Err(err) => {
-                self.rollback_or_retire("transaction body failure")?;
-                Err(err)
+                if self.rollback_or_retire("transaction body failure").is_err() {
+                    return Err(SqliteError::settlement_with_cause(
+                        &err,
+                        khive_storage::error::SqliteWriteStage::Statement,
+                    ));
+                }
+                Err(match err {
+                    SqliteError::Rusqlite(error) => {
+                        SqliteError::write(error, khive_storage::error::SqliteWriteStage::Statement)
+                    }
+                    other => other,
+                })
             }
         }
     }
@@ -667,9 +689,15 @@ impl ConnectionPool {
         if let Err(error) = writer.guard.execute_batch("BEGIN IMMEDIATE") {
             if !writer.guard.is_autocommit() {
                 writer.pool.retire_pooled_writer(&writer.guard);
-                return Err(SqliteError::WriterSettlementUnknown);
+                return Err(SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Begin,
+                ));
             }
-            return Err(error.into());
+            return Err(SqliteError::write(
+                error,
+                khive_storage::error::SqliteWriteStage::Begin,
+            ));
         }
         if let Err(error) = writer.admission.check() {
             writer.rollback_or_retire("capacity admission")?;
@@ -777,9 +805,15 @@ impl ConnectionPool {
         }
         if let Err(error) = unit.conn().execute_batch("BEGIN IMMEDIATE") {
             if !unit.conn().is_autocommit() {
-                return Err(SqliteError::WriterSettlementUnknown);
+                return Err(SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Begin,
+                ));
             }
-            return Err(error.into());
+            return Err(SqliteError::write(
+                error,
+                khive_storage::error::SqliteWriteStage::Begin,
+            ));
         }
         if let Err(error) = self.write_admission.check() {
             if unit.conn().execute_batch("ROLLBACK").is_err() || !unit.conn().is_autocommit() {

@@ -31,6 +31,39 @@ pub enum WriterTaskRequestState {
     SideEffectsUnknown,
 }
 
+/// The SQLite boundary that returned a native write failure, independently of settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteWriteStage {
+    #[serde(rename = "sqlite_begin_busy")]
+    Begin,
+    #[serde(rename = "sqlite_statement_failure")]
+    Statement,
+    #[serde(rename = "sqlite_commit_failure")]
+    Commit,
+}
+
+impl SqliteWriteStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "sqlite_begin_busy",
+            Self::Statement => "sqlite_statement_failure",
+            Self::Commit => "sqlite_commit_failure",
+        }
+    }
+}
+
+/// Native evidence only; the enclosing error still owns retry and settlement policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SqliteWriteFailure {
+    pub stage: SqliteWriteStage,
+    pub primary_code: i32,
+    pub extended_code: i32,
+    /// Existing cleanup evidence; false does not prove rollback or any final outcome.
+    #[serde(default)]
+    pub settlement_unknown: bool,
+}
+
 impl fmt::Display for WriterTaskRequestState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -68,6 +101,12 @@ impl fmt::Display for CapacityUnavailablePhase {
 /// Unified error type for all storage operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("{source}")]
+    SqliteWrite {
+        failure: SqliteWriteFailure,
+        #[source]
+        source: Box<StorageError>,
+    },
     #[error("{capability:?} resource not found: {resource} ({key})")]
     NotFound {
         capability: StorageCapability,
@@ -309,6 +348,34 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Return native write evidence through a request-finality envelope.
+    pub fn sqlite_write_failure(&self) -> Option<SqliteWriteFailure> {
+        match self {
+            Self::SqliteWrite { failure, .. } => Some(*failure),
+            Self::WriterTaskRequestFailed { source, .. } => source.sqlite_write_failure(),
+            _ => None,
+        }
+    }
+
+    /// Borrow the original policy error without discarding any request-finality envelope.
+    pub fn without_sqlite_write_stage(&self) -> &Self {
+        match self {
+            Self::SqliteWrite { source, .. } => source.without_sqlite_write_stage(),
+            _ => self,
+        }
+    }
+
+    /// Attach native evidence once; the original error still owns Display and retry policy.
+    pub fn with_sqlite_write_failure(self, failure: SqliteWriteFailure) -> Self {
+        if self.sqlite_write_failure().is_some() {
+            self
+        } else {
+            Self::SqliteWrite {
+                failure,
+                source: Box::new(self),
+            }
+        }
+    }
     /// Construct a terminal writer outcome without native SQLite evidence.
     ///
     /// The request state and existing retry policy are unchanged.
@@ -348,7 +415,9 @@ impl StorageError {
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
-            Self::WriterTaskRequestFailed { source, .. } => source.capability(),
+            Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } => {
+                source.capability()
+            }
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::AdmissionTimeout { .. }
@@ -365,7 +434,9 @@ impl StorageError {
 
     /// Whether this error is transient and the operation may succeed on retry.
     pub fn is_retryable(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_retryable();
         }
         matches!(
@@ -397,7 +468,9 @@ impl StorageError {
     /// "successful" search (issue #389).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_fts5_syntax_error`.
     pub fn is_fts5_syntax_error(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_fts5_syntax_error();
         }
         let Self::Driver {
@@ -432,7 +505,9 @@ impl StorageError {
     /// also hide genuine write failures (disk full, corruption).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_unique_constraint_violation`.
     pub fn is_unique_constraint_violation(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_unique_constraint_violation();
         }
         let Self::Driver {

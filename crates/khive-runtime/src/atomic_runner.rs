@@ -611,7 +611,7 @@ pub(crate) async fn run_prepared_atomic_unit<T: Send + 'static, E: Send + 'stati
 }
 
 pub(crate) fn atomic_unit_error_allows_recorded_refusal(error: &StorageError) -> bool {
-    match error {
+    match error.without_sqlite_write_stage() {
         StorageError::WriterTaskTerminated { .. } => false,
         StorageError::WriterTaskRequestFailed { request_state, .. } => {
             *request_state == khive_storage::WriterTaskRequestState::TransactionRolledBack
@@ -1383,40 +1383,58 @@ mod tests {
         enum Fault {
             Request(WriterTaskRequestState),
             Terminated(WriterTaskRequestState),
+            EvidenceRequest(WriterTaskRequestState),
+            EvidenceTerminated(WriterTaskRequestState),
         }
 
         impl Fault {
             fn error(self) -> StorageError {
-                match self {
-                    Self::Request(request_state) => StorageError::WriterTaskRequestFailed {
-                        request_state,
-                        source: Box::new(StorageError::Internal(
-                            "lost atomic acknowledgement".into(),
-                        )),
-                    },
-                    Self::Terminated(request_state) => {
+                let error = match self {
+                    Self::Request(request_state) | Self::EvidenceRequest(request_state) => {
+                        StorageError::WriterTaskRequestFailed {
+                            request_state,
+                            source: Box::new(StorageError::Internal(
+                                "lost atomic acknowledgement".into(),
+                            )),
+                        }
+                    }
+                    Self::Terminated(request_state) | Self::EvidenceTerminated(request_state) => {
                         StorageError::writer_task_terminated(request_state)
                     }
+                };
+                if matches!(self, Self::EvidenceRequest(_) | Self::EvidenceTerminated(_)) {
+                    error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
+                        stage: khive_storage::error::SqliteWriteStage::Commit,
+                        primary_code: rusqlite::ffi::SQLITE_IOERR,
+                        extended_code: rusqlite::ffi::SQLITE_IOERR_FSYNC,
+                        settlement_unknown: false,
+                    })
+                } else {
+                    error
                 }
             }
 
             fn assert_preserved(self, error: StorageError) {
-                match (self, error) {
+                assert_eq!(
+                    error.sqlite_write_failure().is_some(),
+                    matches!(self, Self::EvidenceRequest(_) | Self::EvidenceTerminated(_))
+                );
+                match (self, error.without_sqlite_write_stage()) {
                     (
-                        Self::Request(expected),
+                        Self::Request(expected) | Self::EvidenceRequest(expected),
                         StorageError::WriterTaskRequestFailed {
                             request_state,
                             source,
                         },
                     ) => {
-                        assert_eq!(request_state, expected);
-                        assert!(matches!(*source, StorageError::Internal(ref message)
+                        assert_eq!(*request_state, expected);
+                        assert!(matches!(source.as_ref(), StorageError::Internal(message)
                             if message == "lost atomic acknowledgement"));
                     }
                     (
-                        Self::Terminated(expected),
+                        Self::Terminated(expected) | Self::EvidenceTerminated(expected),
                         StorageError::WriterTaskTerminated { request_state, .. },
-                    ) => assert_eq!(request_state, expected),
+                    ) => assert_eq!(*request_state, expected),
                     (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
                 }
             }
@@ -1524,6 +1542,8 @@ mod tests {
             for fault in [
                 Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
                 Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::EvidenceRequest(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::EvidenceTerminated(WriterTaskRequestState::SideEffectsUnknown),
                 Fault::Terminated(WriterTaskRequestState::TransactionRolledBack),
             ] {
                 let pool = scratch_pool("recorded_uncertain");
@@ -1574,6 +1594,8 @@ mod tests {
             for fault in [
                 Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
                 Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::EvidenceRequest(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::EvidenceTerminated(WriterTaskRequestState::SideEffectsUnknown),
             ] {
                 let pool = scratch_pool("committed_ack_lost");
                 seed_schema(&pool);

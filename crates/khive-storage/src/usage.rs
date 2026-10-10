@@ -193,7 +193,7 @@ pub fn count(unit: UsageUnit, n: u64) {
 /// even if earlier work already produced measured counters. The original result
 /// and error remain unchanged.
 pub fn account_event_write(outcome: Result<u64, &crate::StorageError>) {
-    match outcome {
+    match outcome.map_err(crate::StorageError::without_sqlite_write_stage) {
         Ok(committed_rows) => count(UsageUnit::EventRows, committed_rows),
         Err(
             crate::StorageError::WriterTaskRequestFailed {
@@ -304,5 +304,34 @@ mod tests {
         assert_eq!(ctx.shipping_snapshot(), None);
         assert_eq!(ctx.freeze(), serde_json::json!({"db_round_trips": 1}));
         assert_eq!(ctx.shipping_snapshot(), None);
+    }
+    #[tokio::test]
+    async fn native_evidence_preserves_unknown_event_accounting() {
+        for terminal in [false, true] {
+            let context = UsageContext::new();
+            let error = if terminal {
+                crate::StorageError::writer_task_terminated(
+                    crate::WriterTaskRequestState::SideEffectsUnknown,
+                )
+            } else {
+                crate::StorageError::WriterTaskRequestFailed {
+                    request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+                    source: Box::new(crate::StorageError::Internal("unsettled".into())),
+                }
+            }
+            .with_sqlite_write_failure(crate::error::SqliteWriteFailure {
+                stage: crate::error::SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            });
+            scope(context.clone(), async {
+                account_event_write(Ok(1));
+                account_event_write(Err(&error));
+            })
+            .await;
+            assert_eq!(context.snapshot()["event_rows"], 1);
+            assert!(context.shipping_snapshot().is_none());
+        }
     }
 }

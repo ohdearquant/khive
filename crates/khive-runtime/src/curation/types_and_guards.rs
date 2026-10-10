@@ -690,6 +690,36 @@ pub(super) enum MergeSqlError {
     Refusal(RuntimeError),
 }
 
+impl MergeSqlError {
+    pub(super) fn into_storage_error(
+        self,
+        capability: khive_storage::StorageCapability,
+        operation: &'static str,
+    ) -> khive_storage::StorageError {
+        let failure = match &self {
+            Self::Sqlite(SqliteError::Rusqlite(error)) => match error {
+                rusqlite::Error::SqliteFailure(code, _)
+                | rusqlite::Error::SqlInputError { error: code, .. } => {
+                    Some(khive_storage::error::SqliteWriteFailure {
+                        stage: khive_storage::error::SqliteWriteStage::Statement,
+                        primary_code: code.extended_code & 0xff,
+                        extended_code: code.extended_code,
+                        settlement_unknown: false,
+                    })
+                }
+                _ => None,
+            },
+            Self::Sqlite(error) => error.write_failure(),
+            Self::Refusal(_) => None,
+        };
+        let error = khive_storage::StorageError::driver(capability, operation, self);
+        match failure {
+            Some(failure) => error.with_sqlite_write_failure(failure),
+            None => error,
+        }
+    }
+}
+
 impl std::fmt::Display for MergeSqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

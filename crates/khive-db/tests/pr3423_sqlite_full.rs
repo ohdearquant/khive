@@ -179,13 +179,25 @@ async fn auto_rollback_full_keeps_cause_specific_escalation() {
         auto_rolled_back,
         "fixture must actually exercise SQLite automatic rollback"
     );
+    assert_eq!(
+        failed
+            .as_ref()
+            .err()
+            .and_then(StorageError::sqlite_write_failure),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_FULL,
+            extended_code: rusqlite::ffi::SQLITE_FULL,
+            settlement_unknown: true,
+        })
+    );
     assert!(
         matches!(
-            failed,
+            failed.as_ref().map_err(StorageError::without_sqlite_write_stage),
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
                 sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, extended)),
-            }) if extended & 0xff == rusqlite::ffi::SQLITE_FULL
+            }) if *extended & 0xff == rusqlite::ffi::SQLITE_FULL
         ),
         "this scoped telemetry test preserves the inspected retirement policy"
     );
