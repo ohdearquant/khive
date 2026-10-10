@@ -117,7 +117,7 @@ pub(crate) struct PreparedAtomicNotes {
 /// visibility into that helper, so the check is reproduced here to keep the
 /// atomic path's embedding validation observably identical to the canonical
 /// `create_note_inner` -> `VectorStore::insert` path.
-fn non_finite_index(data: &[f32]) -> Option<usize> {
+pub(crate) fn non_finite_index(data: &[f32]) -> Option<usize> {
     data.iter().position(|v| !v.is_finite())
 }
 

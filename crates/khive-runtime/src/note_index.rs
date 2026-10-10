@@ -92,7 +92,7 @@ impl KhiveRuntime {
                 },
             ));
         }
-        if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+        if let Some(index) = crate::atomic_message::non_finite_index(vector) {
             return Err(crate::atomic_message::non_finite_vector_error(
                 index,
                 vector[index],
