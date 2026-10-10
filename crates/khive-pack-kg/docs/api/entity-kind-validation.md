@@ -26,9 +26,9 @@ get/update/delete/merge is namespace-agnostic — the Gate is the authz seam, no
 filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this function closes
 the gap for the _prefix_ form, which previously fell through to the primary-namespace-only
 `resolve_prefix` and was invisible for any row stamped with a non-primary namespace (#391
-§3). It is an exact copy of `resolve_uuid_async` except the prefix-resolution branch.
+§3). The two public unfiltered wrappers share a private resolver; scoped name resolution and the selected runtime prefix branch remain unchanged.
 
-`resolve_uuid_unfiltered_including_deleted` is the same function again, but also matching
+`resolve_uuid_unfiltered_including_deleted` selects the existing prefix branch that also matches
 soft-deleted rows — used by the hard-delete by-ID path (#391 §3).
 
 ## `validate_entity_type`

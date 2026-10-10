@@ -71,7 +71,8 @@ impl ProposalsProjectionWorker {
         Ok(())
     }
 
-    /// Called after a `ProposalReviewed` event is emitted.
+    /// Projection-only compatibility entrypoint used by the external projection controls.
+    /// Production review uses `reviewed_and_emit` to commit the event and projection together.
     pub async fn on_proposal_reviewed(
         &self,
         token: &NamespaceToken,
@@ -163,7 +164,8 @@ impl ProposalsProjectionWorker {
         .await
     }
 
-    /// Called after a `ProposalWithdrawn` event is emitted.
+    /// Projection-only compatibility entrypoint used by the external projection controls.
+    /// Production withdrawal uses `withdrawn_and_emit` to commit the event and projection together.
     pub async fn on_proposal_withdrawn(
         &self,
         token: &NamespaceToken,

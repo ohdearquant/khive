@@ -610,21 +610,7 @@ pub async fn resolve_uuid_unfiltered(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = Uuid::from_str(s) {
-        return Ok(uuid);
-    }
-    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered(s).await {
-            Ok(Some(uuid)) => return Ok(uuid),
-            Ok(None) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "no record matches prefix: {s:?}"
-                )))
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    resolve_name_async(s, runtime, token).await
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, false).await
 }
 
 /// Same as [`resolve_uuid_unfiltered`], but the prefix-resolution branch also matches
@@ -639,11 +625,25 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, true).await
+}
+
+async fn resolve_uuid_unfiltered_with_deleted(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    include_deleted: bool,
+) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered_including_deleted(s).await {
+        let resolved = if include_deleted {
+            runtime.resolve_prefix_unfiltered_including_deleted(s).await
+        } else {
+            runtime.resolve_prefix_unfiltered(s).await
+        };
+        match resolved {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -655,6 +655,54 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
     }
     resolve_name_async(s, runtime, token).await
 }
+
+/// Caller-driven scan windows; stopping, cursor movement and filtering stay at the call site.
+/// The initial window is exact. Subsequent windows retain the existing saturated growth rule.
+pub(super) struct ScanWindows {
+    next: Option<u32>,
+    previous: u32,
+    cap: u32,
+    floor: u32,
+}
+
+impl ScanWindows {
+    pub(super) fn new(initial: u32, cap: u32, floor: u32) -> Self {
+        Self {
+            next: Some(initial),
+            previous: initial,
+            cap,
+            floor,
+        }
+    }
+
+    pub(super) fn grow(&mut self, remaining: u32, double_previous: bool) {
+        let doubled = if double_previous {
+            self.previous.saturating_mul(2)
+        } else {
+            0
+        };
+        self.next = Some(
+            remaining
+                .saturating_mul(2)
+                .max(doubled)
+                .clamp(self.floor, self.cap),
+        );
+    }
+}
+
+impl Iterator for ScanWindows {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let window = self.next.take()?;
+        self.previous = window;
+        Some(window)
+    }
+}
+
+#[cfg(test)]
+#[path = "common/scan_window_tests.rs"]
+mod scan_window_tests;
 
 // ---- Output formatting helpers ----
 
@@ -1110,13 +1158,15 @@ pub fn normalize_entity_timestamps(mut v: Value) -> Value {
     v
 }
 
-pub(crate) fn normalize_entity_timestamps_array(v: Value) -> Value {
+fn map_array(v: Value, normalize: impl Fn(Value) -> Value) -> Value {
     match v {
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(normalize_entity_timestamps).collect())
-        }
-        other => normalize_entity_timestamps(other),
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize).collect()),
+        other => normalize(other),
     }
+}
+
+pub(crate) fn normalize_entity_timestamps_array(v: Value) -> Value {
+    map_array(v, normalize_entity_timestamps)
 }
 
 const TIMESTAMP_KEYS: &[&str] = &[
@@ -1166,12 +1216,7 @@ pub(crate) fn normalize_event_timestamps(mut v: Value) -> Value {
 }
 
 pub(crate) fn normalize_event_timestamps_array(v: Value) -> Value {
-    match v {
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(normalize_event_timestamps).collect())
-        }
-        other => normalize_event_timestamps(other),
-    }
+    map_array(v, normalize_event_timestamps)
 }
 
 pub(crate) fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
