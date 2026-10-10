@@ -4,8 +4,6 @@
 **Date**: 2026-05-23
 **Authors**: khive maintainers
 
-The [proposed configuration-bound remote-read amendment](#amendment-2-2026-10-10-configuration-bound-remote-entity-reads) below awaits maintainer acceptance. It describes an intended contract, not shipped remote resolution or a change to this record's accepted header status.
-
 ## Context
 
 [ADR-020](ADR-020-git-native-kg-implementation.md) establishes the git-native KG implementation:
@@ -393,7 +391,8 @@ swap leaves the old or the new cache. No production code reads `.khive/kg/remote
 
 ## Amendment 2 (2026-10-10): configuration-bound remote entity reads
 
-**Status: Proposed — pending maintainer acceptance.** Refs #4794.
+**Status: Accepted (2026-10-10).** Refs #4794. Acceptance of the text is not
+implementation acceptance; the dependent implementation lands on its own gates.
 
 ### Context and scope
 
@@ -403,14 +402,13 @@ read, rather than a parser that discards remote origin and passes a UUID to the
 local backend. A local row and a cached row can have the same UUID and different
 contents. Remote addressing must continue to select the cached row in that case.
 
-This proposal binds the namespace segment and the runtime's project context.
-It changes the intended `get(id=...)` read contract only after this amendment is
-accepted and implemented. The current shipped-behavior descriptions above remain
-accurate until then. Acceptance would replace the remote-read deferral for this
-entry, while keeping ordinary local reference behavior and Part 2's verification
-and publication contract. It adds one response field, the additive `remote` key
-defined below, and authorizes no dependent implementation before the final text
-is accepted.
+This amendment binds the namespace segment and the runtime's project context.
+It changes the `get(id=...)` read contract once implemented. The current
+shipped-behavior descriptions above remain accurate until then. It replaces the
+remote-read deferral for this entry, while keeping ordinary local reference
+behavior and Part 2's verification and publication contract. It adds one
+response field, the additive `remote` key defined below. Dependent code follows
+this text.
 
 ### Reference parsing and namespace authority
 
@@ -426,7 +424,7 @@ is accepted.
    response label. Two different namespaces cannot alias the same configured
    remote merely because the cache contains no namespace field.
 3. Namespace authority does not come from entity NDJSON, cache `meta.json`, the
-   archive content hash, or the namespace supplied by a caller. This proposal
+   archive content hash, or the namespace supplied by a caller. This amendment
    requires no new namespace metadata in the cache: existing and newly fetched
    caches are subject to the same selected-configuration check. It does not
    change content-hash canonicalization, pin semantics, or schema serialization.
@@ -442,7 +440,7 @@ is accepted.
    execution must preserve that binding; it cannot substitute a caller's ambient
    cwd or silently address another project's same-named remote. Supporting a
    different project requires a runtime constructed for that configuration,
-   rather than an inferred root or an unreviewed request override. This proposal
+   rather than an inferred root or an unreviewed request override. This amendment
    does not add a public forwarding field or change daemon identity by itself.
 3. After validating the remote name, namespace and identifier, the read returns
    the selected cached entity with its remote origin retained. It must not
@@ -501,7 +499,9 @@ These are required future checks, not results from this documentation change:
 - Shared prefixes are ambiguous across all cache entities; a unique longer
   prefix succeeds. Absent IDs, duplicate IDs and malformed rows refuse.
 - The configured namespace succeeds; a different valid namespace refuses on
-  the same cache and UUID. Changing the selected configuration is observed at
+  the same cache and UUID. The fixture configures remote `origin` with namespace
+  `local`, so #4794's example `kg://origin/local/<short-id>` resolves; the same
+  reference with any other namespace refuses. Changing the selected configuration is observed at
   resolution time, without rewriting the old cache's metadata. A malformed
   reserved form never selects a same-spelled local entity name.
 - Two runtimes bound to different projects, each with remote `origin` and the
@@ -516,12 +516,13 @@ These are required future checks, not results from this documentation change:
 
 The paired successful reads and must-refuse cases above are the driven
 adversarial acceptance instrument for the new remote-read boundary. Their actual
-execution output, including each refusal control's result, is required before
-final contract acceptance; listing the cases supplies no execution evidence.
+execution output, including each refusal control's result, is required in the
+implementation pull request before implementation acceptance; listing the cases
+supplies no execution evidence.
 
 ### Unchanged and deferred work
 
-This proposal leaves notes, remote edge serialization, global remote search,
+This amendment leaves notes, remote edge serialization, global remote search,
 ordinary local namespace policy, hash verification, fetch configuration and
 validation CLI behavior unchanged. #4795's broader schema-declared remote
 handling and #4796's remote-validation entry remain separate work. The bounded
