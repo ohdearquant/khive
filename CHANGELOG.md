@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default to disabled; the separately default-enabled backfill flag keeps its existing parser.
   Session maintenance uses shared typed SQL row accessors while preserving its error messages
   and rejection of negative counts.
+- MCP configuration fingerprinting and verb catalog helpers now live together in the server
+  config module, preserving public entry points, daemon identity values, and catalog output.
+- Extract blob garbage-collection ownership and database lock handling into a
+  private module while retaining the existing public API and lock behavior.
 
 ### Fixed
 
@@ -73,14 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
-### Changed
-
-- MCP configuration fingerprinting and verb catalog helpers now live together in the server
-  config module, preserving public entry points, daemon identity values, and catalog output.
-### Changed
-
-- Extract blob garbage-collection ownership and database lock handling into a
-  private module while retaining the existing public API and lock behavior.
 
 ### Breaking (Rust crates)
 
