@@ -50,6 +50,50 @@ store. Namespace-scoped variants
 non-empty; the store itself remains namespace-agnostic — callers pass namespace on
 each query.
 
+## Filtered note reads and guarded attachment cleanup
+
+`NoteFilter::created_before(micros)` and `expires_before(micros)` add inclusive
+upper bounds (`<=`) measured in microseconds since the Unix epoch. An expiry
+bound excludes notes whose `expires_at` is absent. Bounds compose with the
+existing namespace, property and minimum-creation selectors and apply to filtered
+pages, counts and cursors. Defaults remain live-only and unbounded.
+
+`NoteFilter::include_deleted()` includes tombstones in those reads. It does not
+relax the live-row precondition of either scalar or atomic property patches.
+Tombstone reads do not pin indexes whose predicates require live notes.
+Both filtered patch APIs also validate each JSON filter path before writer
+admission; malformed paths refuse without changing any target.
+
+`NoteFilter::expiry_fallback` accepts a `NoteExpiryFallback` with inclusive
+`expires_at_or_before` and `created_at_or_before` bounds. It matches an expiry at
+or before the first bound, or an absent expiry with creation at or before the
+second. A future expiry never falls back to old creation time. Other bounds
+remain additional AND constraints.
+
+For a bounded cleanup page, `time_order` accepts `NoteTimeOrder::ExpiresAt` or
+`ExpiresAtOrCreatedAt`: ascending expiry or `COALESCE(expires_at, created_at)`,
+then ascending ID. Counted, count-free and bounded pages apply this order before
+LIMIT. Counts ignore ordering; keyed/sequence reads and filtered mutations
+reject it. It cannot be combined with property/instant/unordered ordering or
+cursor fields. Existing ordering remains unchanged when it is absent.
+
+Two generic property operators preserve legacy JSON selectors:
+`MissingNullOrSpaceEmptyText` matches missing/null values or text empty after
+SQLite's ASCII-space-only trim; tabs and Unicode whitespace do not match.
+`TrueOrTextTrue` matches JSON boolean true or exact text `"true"`, excluding
+numeric 1. Their `PropertyFilter.value` is unused. These predicates run in SQL
+before ordering and LIMIT, so rejected rows cannot starve a bounded page.
+
+`AttachmentStore::delete_attachment_if(id, role, substrate, &content_ref)` removes
+one attachment only while all four values match in the same conditional write.
+It returns `false` for a missing or changed attachment, leaves other roles and
+owners untouched, and does not delete blob content. SQLite uses its existing
+writer admission and queue routes; backends without this primitive return
+`Unsupported` instead of using a read followed by an unguarded delete.
+
+These are storage foundations for comm cleanup; comm consumers still use their
+existing queries and cleanup policy.
+
 ## Migrations
 
 Two migration systems coexist, both defined in `migrations.rs`:

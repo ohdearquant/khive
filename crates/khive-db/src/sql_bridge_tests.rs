@@ -4145,7 +4145,16 @@ async fn failed_rollback_poisons_handle_reuse_fails_loud() {
     )
     .await;
     let batch_error = batch.expect_err("invalid second statement must fail the batch");
-    let poison = match &batch_error {
+    assert_eq!(
+        batch_error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_ERROR,
+            extended_code: rusqlite::ffi::SQLITE_ERROR,
+            settlement_unknown: true,
+        })
+    );
+    let poison = match batch_error.without_sqlite_write_stage() {
         StorageError::Driver { source, .. } => source
             .downcast_ref::<PoisonedBatchError>()
             .expect("failed rollback must retain its typed poison wrapper"),
@@ -4242,7 +4251,16 @@ async fn non_transient_begin_failure_poisons_handle() {
     )
     .await;
     let batch_error = batch.expect_err("BEGIN inside an open transaction must fail");
-    let poison = match &batch_error {
+    assert_eq!(
+        batch_error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Begin,
+            primary_code: rusqlite::ffi::SQLITE_ERROR,
+            extended_code: rusqlite::ffi::SQLITE_ERROR,
+            settlement_unknown: false,
+        })
+    );
+    let poison = match batch_error.without_sqlite_write_stage() {
         StorageError::Driver { source, .. } => source
             .downcast_ref::<PoisonedBatchError>()
             .expect("failed BEGIN must retain its typed poison wrapper"),
@@ -4649,9 +4667,24 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
                 })
             }))
             .await;
+        if mode == "commit" {
+            assert_eq!(
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(StorageError::sqlite_write_failure),
+                Some(khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: rusqlite::ffi::SQLITE_AUTH,
+                    extended_code: rusqlite::ffi::SQLITE_AUTH,
+                    settlement_unknown: true,
+                })
+            );
+        }
         assert!(
-            matches!(result, Err(StorageError::WriterTaskTerminated { request_state, .. })
-                if request_state == expected),
+            matches!(result.as_ref().map_err(StorageError::without_sqlite_write_stage),
+                Err(StorageError::WriterTaskTerminated { request_state, .. })
+                if *request_state == expected),
             "{mode}: {result:?}"
         );
         assert!(

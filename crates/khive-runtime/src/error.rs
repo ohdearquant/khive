@@ -1110,7 +1110,7 @@ impl RuntimeError {
         let Self::Storage(error) = self.refusal_source() else {
             return None;
         };
-        match error {
+        match error.without_sqlite_write_stage() {
             khive_storage::StorageError::WriterTaskRequestFailed {
                 request_state,
                 source,
@@ -1139,16 +1139,20 @@ impl RuntimeError {
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = source {
-            return Some(RetryableFailureContext {
-                stage: WRITER_TASK_BEGIN_BUSY_STAGE,
-                timeout: Duration::from_millis(*timeout_ms),
-                capability: None,
-                operation: Some("writer_task_begin".to_string()),
-                pool_identity: None,
-                scope: None,
-                retry_after_ms: None,
-            });
+        if let Self::Storage(error) = source {
+            if let khive_storage::StorageError::WriterTaskBusy { timeout_ms } =
+                error.without_sqlite_write_stage()
+            {
+                return Some(RetryableFailureContext {
+                    stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+                    timeout: Duration::from_millis(*timeout_ms),
+                    capability: None,
+                    operation: Some("writer_task_begin".to_string()),
+                    pool_identity: None,
+                    scope: None,
+                    retry_after_ms: None,
+                });
+            }
         }
         if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
             operation,

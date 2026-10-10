@@ -303,7 +303,7 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                line" inbox. Default: off. Only the literal "1" enables it.
 #
 # ── Session transcript mirror (pack `session`, ADR-080) ──────────────────────────
-#   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes.
+#   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes/on.
 #   KHIVE_MIRROR_PROJECTS_DIR=~/.claude/projects   Root scanned for Claude Code transcripts.
 #   KHIVE_MIRROR_CODEX_ENABLED=false   Enable the Codex CLI mirror (independent of the above).
 #   KHIVE_MIRROR_CODEX_DIR=~/.codex/sessions   Root scanned for Codex transcripts.

@@ -150,16 +150,29 @@ fn automatic_rollback_full_reaches_runtime_projection() {
             assert!(was_in_transaction, "writer must start the transaction");
             assert!(auto_rolled_back, "SQLite must automatically end it");
             let error = failed.expect_err("bounded insert must fail");
-            assert!(matches!(&error, StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-            sqlite_full_codes: Some(codes),
-        } if *codes == raw_codes));
+            assert_eq!(
+                error.sqlite_write_failure(),
+                Some(khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Statement,
+                    primary_code: raw_codes.0,
+                    extended_code: raw_codes.1,
+                    settlement_unknown: true,
+                })
+            );
+            assert!(matches!(
+                error.without_sqlite_write_stage(),
+                StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                    sqlite_full_codes: Some(codes),
+                } if *codes == raw_codes
+            ));
             assert_eq!(error.capability(), None);
             assert!(!error.is_retryable());
-            assert!(std::error::Error::source(&error).is_none());
+            assert!(std::error::Error::source(error.without_sqlite_write_stage()).is_none());
             let value =
                 runtime_error_value(RuntimeError::Storage(error), DomainDisposition::Unknown);
             assert_eq!(value["stage"], "sqlite_disk_full");
+            assert_eq!(value["sqlite_write_stage"], "sqlite_statement_failure");
             assert_eq!(value["code"], "sqlite_disk_full");
             assert_eq!(value["capability"], "sql");
             assert_eq!(value["sqlite_primary_code"], raw_codes.0);

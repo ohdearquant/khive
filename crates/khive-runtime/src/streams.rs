@@ -103,7 +103,7 @@ impl StreamAppendFailure {
             || source.admission_failure_context().is_some()
             || matches!(
                 &source,
-                RuntimeError::Storage(StorageError::WriterTaskBusy { .. })
+                RuntimeError::Storage(error) if matches!(error.without_sqlite_write_stage(), StorageError::WriterTaskBusy { .. })
             )
         {
             StreamAppendDisposition::NotCommitted

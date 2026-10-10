@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
   proposals using an archive marker while retaining their identity and event history.
   Retention follows last projection activity. The handler remains unimplemented.
+- Accept ADR-037 configuration-bound namespace and project-root rules for remote
+  cached-entity reads, preserving origin and refusing remote mutations. The read
+  remains unimplemented.
 
 ### Added
 
@@ -28,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
   outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
   with the caller.
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
 
 ### Changed
 
@@ -38,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
 - Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
   their separate size limits, refusal messages and exact stored cursor bytes.
+- Session mirror enable flags now use the shared boolean parser: `on` and surrounding
+  whitespace on recognized true values enable the configured source. All four flags still
+  default to disabled; the separately default-enabled backfill flag keeps its existing parser.
+  Session maintenance uses shared typed SQL row accessors while preserving its error messages
+  and rejection of negative counts.
 
 ### Fixed
 
@@ -57,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 
 ### Breaking (Rust crates)
+
+- Memory's `RecallFtsGatherMode` now re-exports the canonical storage `TextGatherMode` instead of
+  declaring a separate enum. Its public path, variant imports, `Copy` behavior, serialized config,
+  and search options remain supported; code depending on the old nominal type identity must adapt.
 
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
   `RuntimeError::Storage`, retaining typed driver sources and the existing capacity,
@@ -85,6 +103,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   score overflow now propagate through memory recall instead of appearing as no results, including
   empty candidate sets. The checked helper keeps its `RetrievalError` result type, and existing
   unchecked `Weighted`/`Custom` fallback behavior is preserved.
+- `khive_storage::NoteFilter` adds `max_created_at`, `max_expires_at`,
+  `include_deleted`, `expiry_fallback` and `time_order`; exhaustive struct literals
+  must add them or use `..Default::default()`. `FilterOp` adds
+  `MissingNullOrSpaceEmptyText` and `TrueOrTextTrue`; exhaustive matches must handle
+  both. Typed expiry fallback and native timestamp ordering preserve complete
+  legacy cleanup predicates before LIMIT. The `created_before` / `expires_before` builders use
+  inclusive Unix-microsecond bounds, and `include_deleted` affects reads only.
+  Existing serialized filters retain live-only, unbounded defaults.
+  `AttachmentStore::delete_attachment_if` adds a conditional ID/role/substrate/ref
+  delete with an `Unsupported` default and an atomic SQLite implementation;
+  comm cleanup adoption remains separate.
+
+- `KhiveRuntime::list_embedding_models` now returns runtime-owned `EmbeddingModelRecord`
+  values with all twelve persisted registry fields. Rust callers use `dim` instead of
+  `dimensions` and the `EmbeddingModelStatus` enum instead of a status string. Status serde
+  values remain lowercase; `kkernel engine list/status` retain their seven-field JSON shape.
+  Invalid required fields, unknown statuses and invalid non-NULL optional dimensions/UUIDs
+  are skipped with a warning. Existing optional timestamp decoding still maps non-integers
+  to `None`; reads never fabricate missing identity or lifecycle history.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new

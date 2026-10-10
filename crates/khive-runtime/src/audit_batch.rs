@@ -517,7 +517,7 @@ enum RetryDecision {
 }
 
 fn classify_store_error(err: &StorageError) -> RetryDecision {
-    match err {
+    match err.without_sqlite_write_stage() {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
@@ -566,7 +566,7 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
 /// error is not one of the typed transient variants `classify_store_error`
 /// retries on its own.
 fn is_sqlite_busy_or_locked(err: &StorageError) -> bool {
-    let StorageError::Driver { source, .. } = err else {
+    let StorageError::Driver { source, .. } = err.without_sqlite_write_stage() else {
         return false;
     };
     matches!(

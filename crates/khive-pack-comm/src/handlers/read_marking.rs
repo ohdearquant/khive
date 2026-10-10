@@ -401,7 +401,7 @@ enum MarkReadFailure {
 /// not be reported as a definite failure. Same match shape as
 /// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
 fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
-    match error {
+    match error.without_sqlite_write_stage() {
         khive_storage::StorageError::WriterTaskTerminated {
             request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
             ..
@@ -539,6 +539,34 @@ pub(super) fn read_response(
                     "properties": original_properties,
                 }),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_does_not_change_mark_read_finality() {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+        for state in [
+            WriterTaskRequestState::NotStarted,
+            WriterTaskRequestState::TransactionRolledBack,
+            WriterTaskRequestState::SideEffectsUnknown,
+        ] {
+            let error = StorageError::writer_task_terminated(state).with_sqlite_write_failure(
+                khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: 10,
+                    extended_code: 1034,
+                    settlement_unknown: false,
+                },
+            );
+            assert_eq!(
+                matches!(classify_mark_read_error(&error), MarkReadFailure::Unknown),
+                state == WriterTaskRequestState::SideEffectsUnknown
+            );
         }
     }
 }

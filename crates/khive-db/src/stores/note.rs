@@ -14,7 +14,7 @@ use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::error::StorageError;
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, NoteKeyCursor, NoteSeekAfter, NoteTagMode,
-    NoteVisibility, SortDir,
+    NoteTimeOrder, NoteVisibility, SortDir,
 };
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
@@ -490,6 +490,7 @@ impl SqlNoteStore {
                 .map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn())
                 .map_err(|e| map_err(e, op))
+                .map_err(crate::error::statement_failure)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
@@ -863,10 +864,44 @@ fn json_type_expr(path: &str) -> String {
     format!("json_type(properties, '{path}')")
 }
 
+fn validate_note_time_order(
+    filter: &NoteFilter,
+    operation: &'static str,
+    supports_time_order: bool,
+) -> StorageResult<()> {
+    if filter.time_order.is_some()
+        && (!supports_time_order
+            || filter.order_by.is_some()
+            || filter.order_by_instant
+            || filter.unordered
+            || filter.after.is_some()
+            || filter.after_instant.is_some())
+    {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: "time_order requires a native-order page without property order, unordered mode or cursors; fixed-order reads and filtered mutations do not support it".into(),
+        });
+    }
+    Ok(())
+}
+
+fn note_time_order_clause(order: NoteTimeOrder) -> &'static str {
+    match order {
+        NoteTimeOrder::ExpiresAt => " ORDER BY expires_at ASC, id ASC",
+        NoteTimeOrder::ExpiresAtOrCreatedAt => {
+            " ORDER BY COALESCE(expires_at, created_at) ASC, id ASC"
+        }
+    }
+}
+
 /// Deterministic total order shared by exact-count and count-free filtered
 /// pages. Keeping the clause in one helper prevents the cheaper projection
 /// from drifting into a different offset sequence.
 fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
+    if let Some(order) = filter.time_order {
+        return note_time_order_clause(order).to_string();
+    }
     if filter.unordered {
         return String::new();
     }
@@ -992,7 +1027,10 @@ fn build_note_filter_where(
             )
         };
 
-    let mut conditions = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut conditions = vec![ns_condition];
+    if !filter.include_deleted {
+        conditions.push("deleted_at IS NULL".to_string());
+    }
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if let Some(kind) = &filter.kind {
@@ -1103,6 +1141,18 @@ fn build_note_filter_where(
                 conditions.push(format!(
                     "CASE WHEN {type_expr} = 'text' THEN {text_match} ELSE 1 END"
                 ));
+            }
+            FilterOp::MissingNullOrSpaceEmptyText => {
+                let expr = json_extract_expr(&pf.json_path);
+                let ty = json_type_expr(&pf.json_path);
+                conditions.push(format!(
+                    "({ty} IS NULL OR {ty} = 'null' OR ({ty} = 'text' AND trim({expr}) = ''))"
+                ));
+            }
+            FilterOp::TrueOrTextTrue => {
+                let expr = json_extract_expr(&pf.json_path);
+                let ty = json_type_expr(&pf.json_path);
+                conditions.push(format!("({expr} = 'true' OR {ty} = 'true')"));
             }
             FilterOp::JsonTypeEq => {
                 let type_expr = json_type_expr(&pf.json_path);
@@ -1235,6 +1285,8 @@ fn build_note_filter_where(
                     | FilterOp::TextInOrNonText(_)
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeMissing
+                    | FilterOp::MissingNullOrSpaceEmptyText
+                    | FilterOp::TrueOrTextTrue
                     | FilterOp::JsonTypeMissingOrNullIndexed
                     | FilterOp::EqOrLegacyIndexed
                     | FilterOp::JsonTypeNeMissing
@@ -1262,6 +1314,23 @@ fn build_note_filter_where(
         conditions.push(format!("created_at >= ?{}", params.len()));
     }
 
+    if let Some(max_ts) = filter.max_created_at {
+        params.push(Box::new(max_ts));
+        conditions.push(format!("created_at <= ?{}", params.len()));
+    }
+    if let Some(max_ts) = filter.max_expires_at {
+        params.push(Box::new(max_ts));
+        conditions.push(format!("expires_at <= ?{}", params.len()));
+    }
+    if let Some(cutoff) = filter.expiry_fallback {
+        params.push(Box::new(cutoff.expires_at_or_before));
+        let expiry = params.len();
+        params.push(Box::new(cutoff.created_at_or_before));
+        let creation = params.len();
+        conditions.push(format!(
+            "((expires_at IS NOT NULL AND expires_at <= ?{expiry}) OR (expires_at IS NULL AND created_at <= ?{creation}))"
+        ));
+    }
     if let Some(scope) = &filter.mailbox {
         conditions.push(mailbox_condition(scope, &mut params));
     }
@@ -1515,7 +1584,11 @@ fn execute_filtered_note_property_patch(
     value_json: &str,
     updated_at: i64,
 ) -> Result<usize, rusqlite::Error> {
-    let (where_clause, mut params) = build_note_filter_where(namespace, filter)?;
+    let (mut where_clause, mut params) = build_note_filter_where(namespace, filter)?;
+    // A read selector cannot relax either property-patch method's live-row guard.
+    if filter.include_deleted {
+        where_clause.push_str(" AND deleted_at IS NULL");
+    }
     let updating_due = json_path == "$.next_attempt_at";
     let due_source = if updating_due {
         serde_json::from_str::<serde_json::Value>(value_json)
@@ -1595,6 +1668,7 @@ impl NoteStore for SqlNoteStore {
         after: Option<&NoteKeyCursor>,
         page: PageRequest,
     ) -> StorageResult<(Vec<Note>, Option<NoteKeyCursor>)> {
+        validate_note_time_order(filter, "query_keyed_notes", false)?;
         if !filter.namespaces.is_empty()
             || filter.order_by.is_some()
             || filter.after.is_some()
@@ -1731,6 +1805,10 @@ impl NoteStore for SqlNoteStore {
         value: serde_json::Value,
         updated_at: i64,
     ) -> Result<bool, StorageError> {
+        validate_note_time_order(filter, "try_patch_note_property", false)?;
+        for property in &filter.property_filters {
+            validate_json_path(&property.json_path)?;
+        }
         let namespace = namespace.to_string();
         let filter = filter.clone();
         let value_json = serde_json::to_string(&value).map_err(|e| {
@@ -1762,6 +1840,10 @@ impl NoteStore for SqlNoteStore {
         value: serde_json::Value,
         updated_at: i64,
     ) -> Result<(), StorageError> {
+        validate_note_time_order(filter, "patch_note_property_atomic", false)?;
+        for property in &filter.property_filters {
+            validate_json_path(&property.json_path)?;
+        }
         let mut seen = HashSet::with_capacity(ids.len());
         ids.retain(|id| seen.insert(*id));
         if ids.is_empty() {
@@ -2199,6 +2281,7 @@ impl NoteStore for SqlNoteStore {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> Result<Page<Note>, StorageError> {
+        validate_note_time_order(filter, "query_notes_filtered", true)?;
         if filter.unordered {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Notes,
@@ -2288,6 +2371,7 @@ impl NoteStore for SqlNoteStore {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> Result<Page<Note>, StorageError> {
+        validate_note_time_order(filter, "query_notes_filtered_count_free", true)?;
         for property_filter in &filter.property_filters {
             validate_json_path(&property_filter.json_path)?;
         }
@@ -2504,6 +2588,7 @@ impl NoteStore for SqlNoteStore {
         after: Option<SeekCursor>,
         limit: u32,
     ) -> Result<SeekPage<Note>, StorageError> {
+        validate_note_time_order(filter, "query_notes_filtered_after", false)?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -2570,6 +2655,7 @@ impl NoteStore for SqlNoteStore {
         filter: &NoteFilter,
         max_rows: u32,
     ) -> Result<Vec<Note>, StorageError> {
+        validate_note_time_order(filter, "query_notes_filtered_bounded", true)?;
         if filter.unordered {
             return Err(StorageError::InvalidInput {
                 capability: StorageCapability::Notes,
@@ -2598,15 +2684,16 @@ impl NoteStore for SqlNoteStore {
             // Tie-break on `id` in addition to the primary sort key so the
             // snapshot ordering is fully deterministic even when many rows
             // share the same `created_at` (or the same custom sort value).
-            let order_clause = match &filter.order_by {
-                Some((path, dir)) => {
+            let order_clause = match (filter.time_order, &filter.order_by) {
+                (Some(order), _) => note_time_order_clause(order).to_string(),
+                (None, Some((path, dir))) => {
                     let dir_str = match dir {
                         SortDir::Asc => "ASC",
                         SortDir::Desc => "DESC",
                     };
                     format!(" ORDER BY {} {dir_str}, id ASC", json_extract_expr(path))
                 }
-                None => " ORDER BY created_at DESC, id ASC".to_string(),
+                (None, None) => " ORDER BY created_at DESC, id ASC".to_string(),
             };
 
             let data_sql = format!(

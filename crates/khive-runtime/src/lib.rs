@@ -30,6 +30,7 @@ pub mod curation;
 pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
+pub mod embedding;
 pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
@@ -138,6 +139,7 @@ pub use daemon::{
 };
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
+pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
     BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
@@ -163,7 +165,7 @@ pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use kg_read::KgNeighborRead;
-pub use khive_db::env::env_parse_or;
+pub use khive_db::env::{env_flag, env_parse_or};
 pub use khive_db::{
     checkpoint_once, run_checkpoint_task, run_migrations, stores::event::event_insert_statements,
     CheckpointConfig, CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,

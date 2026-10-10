@@ -241,12 +241,13 @@ async fn poisoned_batch_wrapper_preserves_real_busy_cause_and_counts_once() {
         held_lease: None,
     };
     let mapped = writer.map_direct_batch_failure(BatchFailure {
+        stage: khive_storage::error::SqliteWriteStage::Statement,
         error: raw,
         poison_reason: Some(BatchPoisonReason::RollbackFailed(
             rusqlite::Error::InvalidQuery,
         )),
     });
-    let StorageError::Driver { source, .. } = &mapped else {
+    let StorageError::Driver { source, .. } = mapped.without_sqlite_write_stage() else {
         panic!("wrapper changed");
     };
     let preserved = source
@@ -274,7 +275,10 @@ async fn queued_sql_and_atomic_refusals_do_not_double_count() {
     let mut writer = bridge.writer().await.unwrap();
     let holder = fixture.lock(false);
     let error = writer.execute(statement(INSERT)).await.unwrap_err();
-    assert!(matches!(error, StorageError::WriterTaskBusy { .. }));
+    assert!(matches!(
+        error.without_sqlite_write_stage(),
+        StorageError::WriterTaskBusy { .. }
+    ));
     let error = bridge
         .atomic_unit(Box::new(|writer| {
             Box::pin(async move {
@@ -284,7 +288,10 @@ async fn queued_sql_and_atomic_refusals_do_not_double_count() {
         }))
         .await
         .unwrap_err();
-    assert!(matches!(error, StorageError::WriterTaskBusy { .. }));
+    assert!(matches!(
+        error.without_sqlite_write_stage(),
+        StorageError::WriterTaskBusy { .. }
+    ));
     let snapshot = fixture.pool.writer_acquisition_snapshot();
     assert_eq!(snapshot.writer_task_begin_busy, 2);
     assert_eq!(snapshot.direct_busy_refusals, 0);
@@ -384,4 +391,60 @@ async fn manual_atomic_cyclic_source_returns_original_error_and_rolls_back() {
             .unwrap();
         assert_eq!(rows, 0, "callback write escaped rollback");
     }
+}
+
+#[test]
+fn poisoned_commit_preserves_native_evidence_and_existing_driver_policy() {
+    use super::standalone_batch::{execute_standalone_batch, BatchHandleDisposition};
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    fn deny_settlement(context: AuthContext<'_>) -> Authorization {
+        match context.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Unknown | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }
+    let fixture = Fixture::new(true, false);
+    let conn = fixture.pool.open_standalone_writer().unwrap();
+    conn.authorizer(Some(deny_settlement)).unwrap();
+    let (disposition, result) = execute_standalone_batch(
+        &conn,
+        &[statement(INSERT)],
+        fixture.pool.origin(),
+        None,
+        || Ok(()),
+    );
+    assert_eq!(disposition, BatchHandleDisposition::Poison);
+    assert!(!conn.is_autocommit());
+    let Err(StandaloneWriteError::Sql(failure)) = result else {
+        panic!("expected native commit failure");
+    };
+    assert_eq!(
+        failure.stage,
+        khive_storage::error::SqliteWriteStage::Commit
+    );
+    let writer = SqliteWriter {
+        observe_direct_errors: true,
+        event_rows: None,
+        handle: None,
+        writer_task: None,
+        origin: fixture.pool.origin(),
+        db: crate::timeout_sink::db_label(&fixture.pool),
+        pool: Arc::clone(&fixture.pool),
+        held_lease: None,
+    };
+    let error = writer.map_direct_batch_failure(failure);
+    let evidence = error.sqlite_write_failure().unwrap();
+    assert!(evidence.settlement_unknown);
+    assert_eq!(evidence.extended_code, rusqlite::ffi::SQLITE_AUTH);
+    assert!(!error.is_retryable());
+    let StorageError::Driver { source, .. } = error.without_sqlite_write_stage() else {
+        panic!("driver policy changed");
+    };
+    let poison = source.downcast_ref::<PoisonedBatchError>().unwrap();
+    assert!(matches!(
+        poison.poison_reason,
+        BatchPoisonReason::RollbackFailed(_)
+    ));
 }

@@ -96,6 +96,13 @@ fn settle_pooled_call<T>(
                  could not prove autocommit; reporting the settlement failure"
             );
         }
+        let settlement = match &result {
+            Err(original) => SqliteError::settlement_with_cause(
+                original,
+                khive_storage::error::SqliteWriteStage::Statement,
+            ),
+            Ok(_) => settlement,
+        };
         return Err(settlement.into_storage_error(StorageCapability::Sql, operation));
     }
     result?;
@@ -681,6 +688,18 @@ fn rollback_interrupted_read_transaction(
 }
 
 /// Map a rusqlite error to `StorageError`.
+fn map_write_err(e: rusqlite::Error, op: &'static str) -> StorageError {
+    crate::error::statement_failure(map_rusqlite_err(e, op))
+}
+
+fn map_write_boundary_err(
+    e: rusqlite::Error,
+    op: &'static str,
+    stage: khive_storage::error::SqliteWriteStage,
+) -> StorageError {
+    crate::error::with_write_stage(map_rusqlite_err(e, op), stage)
+}
+
 fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sql, op, e)
 }
@@ -1888,12 +1907,12 @@ impl khive_storage::SqlWriter for SqliteWriter {
             return writer_task
                 .send_bounded(move |conn| {
                     let mut stmt = prepare_cached_sql_statement(conn, &statement.sql)
-                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                        .map_err(|e| map_write_err(e, "execute"))?;
                     bind_params(&mut stmt, &statement.params)
-                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                        .map_err(|e| map_write_err(e, "execute"))?;
                     let affected = stmt
                         .raw_execute()
-                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                        .map_err(|e| map_write_err(e, "execute"))?;
                     if let Some(event_rows) = event_rows.as_deref() {
                         event_rows.observe(&statement, affected as u64);
                     }
@@ -1926,6 +1945,11 @@ impl khive_storage::SqlWriter for SqliteWriter {
             operation: "execute".into(),
             message: "connection already consumed".into(),
         })?;
+        let stage = match transaction_control_head(&statement.sql) {
+            Some("BEGIN") => khive_storage::error::SqliteWriteStage::Begin,
+            Some("COMMIT" | "END") => khive_storage::error::SqliteWriteStage::Commit,
+            _ => khive_storage::error::SqliteWriteStage::Statement,
+        };
         let event_rows = self.event_rows.clone();
         let pool = Arc::clone(&self.pool);
         let (handle, result) = tokio::task::spawn_blocking(move || {
@@ -1936,7 +1960,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         self.handle = Some(handle);
         let affected = result.map_err(|failure| match failure {
             StandaloneWriteError::Refused(error) => error,
-            StandaloneWriteError::Sql(error) => self.map_direct_error(error, "execute"),
+            StandaloneWriteError::Sql(error) => self.map_direct_error(error, "execute", stage),
         })?;
         Ok(affected as u64)
     }
@@ -1966,9 +1990,9 @@ impl khive_storage::SqlWriter for SqliteWriter {
             return writer_task
                 .send_bounded(move |conn| {
                     let prepared = prepare_batch_statements(conn, &statements)
-                        .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
+                        .map_err(|e| map_write_err(e, "execute_batch"))?;
                     execute_prepared_batch(conn, prepared, &statements, event_rows.as_deref())
-                        .map_err(|e| map_rusqlite_err(e, "execute_batch"))
+                        .map_err(|e| map_write_err(e, "execute_batch"))
                 })
                 .await;
         }
@@ -2018,7 +2042,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             return writer_task
                 .send_bounded(move |conn| {
                     conn.execute_batch(&script)
-                        .map_err(|e| map_rusqlite_err(e, "execute_script"))
+                        .map_err(|e| map_write_err(e, "execute_script"))
                 })
                 .await;
         }
@@ -2038,7 +2062,11 @@ impl khive_storage::SqlWriter for SqliteWriter {
         self.handle = handle;
         result.map_err(|failure| match failure {
             StandaloneWriteError::Refused(error) => error,
-            StandaloneWriteError::Sql(error) => self.map_direct_error(error, "execute_script"),
+            StandaloneWriteError::Sql(error) => self.map_direct_error(
+                error,
+                "execute_script",
+                khive_storage::error::SqliteWriteStage::Statement,
+            ),
         })
     }
 
@@ -2059,7 +2087,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             let pool = Arc::clone(&self.pool);
             let execute = move |conn: &rusqlite::Connection| {
                 execute_top_level_maintenance(&pool, conn, maintenance)
-                    .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+                    .map_err(|e| map_write_err(e, "execute_script_top_level"))
             };
             return if maintenance == TopLevelMaintenance::WalCheckpointTruncate {
                 writer_task.send_checkpoint_bounded(execute).await
@@ -2085,9 +2113,11 @@ impl khive_storage::SqlWriter for SqliteWriter {
         self.handle = Some(handle);
         result.map_err(|failure| match failure {
             StandaloneWriteError::Refused(error) => error,
-            StandaloneWriteError::Sql(error) => {
-                self.map_direct_error(error, "execute_script_top_level")
-            }
+            StandaloneWriteError::Sql(error) => self.map_direct_error(
+                error,
+                "execute_script_top_level",
+                khive_storage::error::SqliteWriteStage::Statement,
+            ),
         })
     }
 }
@@ -2587,12 +2617,12 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             })?;
             let result = (|| {
                 let mut stmt = prepare_cached_sql_statement(&guard, &statement.sql)
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                    .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
                 bind_params(&mut stmt, &statement.params)
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                    .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
                 let rows = stmt
                     .raw_execute()
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                    .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
                 Ok(rows as u64)
             })();
             settle_pooled_call(&guard, "pool_writer.execute", result)
@@ -2617,28 +2647,47 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             })?;
             let result = (|| {
                 let prepared = prepare_batch_statements(&guard, &statements)
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-                guard
-                    .execute_batch("BEGIN IMMEDIATE")
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
+                    .map_err(|e| map_write_err(e, "pool_writer.execute_batch"))?;
+                guard.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+                    map_write_boundary_err(
+                        e,
+                        "pool_writer.execute_batch",
+                        khive_storage::error::SqliteWriteStage::Begin,
+                    )
+                })?;
                 let _tx_handle = khive_storage::tx_registry::register_scoped(
                     Some("pool_writer.execute_batch".to_string()),
                     pool.origin(),
                 );
                 let result = execute_prepared_batch(&guard, prepared, &statements, None)
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"));
+                    .map_err(|e| map_write_err(e, "pool_writer.execute_batch"));
                 match result {
                     Ok(total) => {
                         if let Err(e) = guard.execute_batch("COMMIT") {
-                            let _ = guard.execute_batch("ROLLBACK");
-                            Err(map_rusqlite_err(e, "pool_writer.execute_batch"))
+                            let unsettled =
+                                guard.execute_batch("ROLLBACK").is_err() || !guard.is_autocommit();
+                            let error = map_write_boundary_err(
+                                e,
+                                "pool_writer.execute_batch",
+                                khive_storage::error::SqliteWriteStage::Commit,
+                            );
+                            Err(if unsettled {
+                                crate::error::unknown_write_settlement(error)
+                            } else {
+                                error
+                            })
                         } else {
                             Ok(total)
                         }
                     }
                     Err(e) => {
-                        let _ = guard.execute_batch("ROLLBACK");
-                        Err(e)
+                        let unsettled =
+                            guard.execute_batch("ROLLBACK").is_err() || !guard.is_autocommit();
+                        Err(if unsettled {
+                            crate::error::unknown_write_settlement(e)
+                        } else {
+                            e
+                        })
                     }
                 }
             })();
@@ -2660,7 +2709,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             })?;
             let result = guard
                 .execute_batch(&script)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"));
+                .map_err(|e| map_write_err(e, "pool_writer.execute_script"));
             settle_pooled_call(&guard, "pool_writer.execute_script", result)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
@@ -2774,12 +2823,12 @@ impl khive_storage::SqlWriter for InlineWriter {
         // Boundary: `execute_batch` owns transaction-control rejection;
         // `atomic_unit` uses this one-statement primitive for its own boundary.
         let mut stmt = prepare_cached_sql_statement(self.conn(), &statement.sql)
-            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+            .map_err(|e| map_write_err(e, "inline.execute"))?;
         bind_params(&mut stmt, &statement.params)
-            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+            .map_err(|e| map_write_err(e, "inline.execute"))?;
         let affected = stmt
             .raw_execute()
-            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+            .map_err(|e| map_write_err(e, "inline.execute"))?;
         if let Some(event_rows) = self.event_rows.as_deref() {
             event_rows.observe(&statement, affected as u64);
         }
@@ -2796,14 +2845,14 @@ impl khive_storage::SqlWriter for InlineWriter {
         // front, same contract as every other `execute_batch`.
         reject_transaction_control_statements(&statements, "inline.execute_batch")?;
         let prepared = prepare_batch_statements(self.conn(), &statements)
-            .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
+            .map_err(|e| map_write_err(e, "inline.execute_batch"))?;
         execute_prepared_batch(
             self.conn(),
             prepared,
             &statements,
             self.event_rows.as_deref(),
         )
-        .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))
+        .map_err(|e| map_write_err(e, "inline.execute_batch"))
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -2811,7 +2860,7 @@ impl khive_storage::SqlWriter for InlineWriter {
         // outside the `execute_batch` transaction-control contract.
         self.conn()
             .execute_batch(&script)
-            .map_err(|e| map_rusqlite_err(e, "inline.execute_script"))
+            .map_err(|e| map_write_err(e, "inline.execute_script"))
     }
 }
 
@@ -3153,12 +3202,18 @@ impl khive_storage::SqlAccess for SqlBridge {
                     if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
                         if !conn.is_autocommit() {
                             pool.retire_pooled_writer(conn);
-                            return Err(StorageError::writer_task_terminated(
-                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                            ));
+                            return Err(SqliteError::settlement_with_cause(
+                                &error,
+                                khive_storage::error::SqliteWriteStage::Begin,
+                            )
+                            .into_storage_error(StorageCapability::Sql, "atomic_unit.begin"));
                         }
-                        return Err(map_rusqlite_err(error, "atomic_unit.begin"))
-                            .inspect_err(|error| pool.record_direct_writer_error(error));
+                        return Err(map_write_boundary_err(
+                            error,
+                            "atomic_unit.begin",
+                            khive_storage::error::SqliteWriteStage::Begin,
+                        ))
+                        .inspect_err(|error| pool.record_direct_writer_error(error));
                     }
                     let _tx_handle = khive_storage::tx_registry::register_scoped(
                         Some("atomic_unit".to_string()),

@@ -118,19 +118,26 @@ pub(crate) fn short_id(uuid: Uuid) -> String {
 
 fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError) -> RuntimeError {
     match error {
-        RuntimeError::Storage(StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-            ..
-        }) => RuntimeError::Khive(
-            KhiveError::conflict(format!(
-                "dual_write delivery outcome is uncertain (side_effects_unknown); \
+        RuntimeError::Storage(ref storage)
+            if matches!(
+                storage.without_sqlite_write_stage(),
+                StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                    ..
+                }
+            ) =>
+        {
+            RuntimeError::Khive(
+                KhiveError::conflict(format!(
+                    "dual_write delivery outcome is uncertain (side_effects_unknown); \
                  call comm.delivered(id=\"{outbound_id}\") before retrying"
-            ))
-            .with_details(Details::new_owned([(
-                "outbound_id",
-                outbound_id.to_string(),
-            )])),
-        ),
+                ))
+                .with_details(Details::new_owned([(
+                    "outbound_id",
+                    outbound_id.to_string(),
+                )])),
+            )
+        }
         other => other,
     }
 }
@@ -929,28 +936,40 @@ mod tests {
 
     #[test]
     fn side_effects_unknown_surfaces_outbound_confirmation_id() {
-        let outbound_id = Uuid::new_v4();
-        let error = RuntimeError::Storage(StorageError::writer_task_terminated(
-            WriterTaskRequestState::SideEffectsUnknown,
-        ));
+        for with_evidence in [false, true] {
+            let outbound_id = Uuid::new_v4();
+            let error =
+                StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown);
+            let error = if with_evidence {
+                error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: 10,
+                    extended_code: 1034,
+                    settlement_unknown: false,
+                })
+            } else {
+                error
+            };
+            let error = RuntimeError::Storage(error);
 
-        let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
-        let RuntimeError::Khive(khive_error) = &annotated else {
-            panic!("expected RuntimeError::Khive, got {annotated:?}");
-        };
-        assert_eq!(khive_error.kind(), khive_types::ErrorKind::Conflict);
-        assert_eq!(khive_error.retry_hint(), khive_types::RetryHint::NoRetry);
-        assert_eq!(
-            khive_error
-                .details()
-                .and_then(|d| d.get("outbound_id"))
-                .map(str::to_string),
-            Some(outbound_id.to_string())
-        );
-        assert!(khive_error.message().contains("side_effects_unknown"));
-        assert!(khive_error
-            .message()
-            .contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+            let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
+            let RuntimeError::Khive(khive_error) = &annotated else {
+                panic!("expected RuntimeError::Khive, got {annotated:?}");
+            };
+            assert_eq!(khive_error.kind(), khive_types::ErrorKind::Conflict);
+            assert_eq!(khive_error.retry_hint(), khive_types::RetryHint::NoRetry);
+            assert_eq!(
+                khive_error
+                    .details()
+                    .and_then(|d| d.get("outbound_id"))
+                    .map(str::to_string),
+                Some(outbound_id.to_string())
+            );
+            assert!(khive_error.message().contains("side_effects_unknown"));
+            assert!(khive_error
+                .message()
+                .contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+        }
     }
 
     #[test]

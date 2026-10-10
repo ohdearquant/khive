@@ -92,6 +92,43 @@ source-compatibility changes for downstream exhaustive patterns or literal
 constructors. Use the terminal factory for outcomes without native evidence and
 `..` in patterns that inspect only request state.
 
+## Native SQLite write evidence (ADR-135 F6)
+
+`StorageError::SqliteWrite { failure, source }` preserves a native SQLite failure alongside the
+original storage error. `SqliteWriteFailure` carries `stage`, `primary_code`, `extended_code`, and
+`settlement_unknown`. The wrapper delegates Display, capability, retryability and specialized
+classifiers to its source. `sqlite_write_failure()` finds evidence through request-finality wrappers;
+`without_sqlite_write_stage()` borrows the original error without removing request finality.
+
+| Stage                      | Boundary                                                                                 |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| `sqlite_begin_busy`        | SQLite failed to begin the write transaction, including non-BUSY native BEGIN errors     |
+| `sqlite_statement_failure` | A statement failed after writer acquisition                                              |
+| `sqlite_commit_failure`    | COMMIT failed and existing settlement evidence permits a definite-failure classification |
+
+Runtime/MCP adds `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code`. A definite
+native failure also supplies its stage as caller-facing `code` and `stage`. Existing terminal or
+`side_effects_unknown` outcomes retain their caller-facing code/stage, while the separate
+`sqlite_write_stage` identifies the boundary that produced the original cause. Native FULL retains
+`sqlite_disk_full` precedence. These fields change neither request state nor retry policy, and retained
+terminal evidence has no original native error source that could duplicate FULL escalation.
+
+`settlement_unknown: true` records an already-observed cleanup failure, including a standalone poisoned
+batch. That evidence prevents a COMMIT cause from being reported as a definite commit failure. The
+serde default `false` means only that this evidence was not supplied; it does not prove rollback and
+cannot override an existing unknown or terminal outcome. Opaque migration scripts retain script-level
+statement attribution; no per-statement transaction boundary is inferred inside arbitrary SQL text.
+
+The events socket adds optional `sqlite_write_failure` evidence to its error frame. Frames without
+it retain the previous behavior; frames carrying it retain the existing request-failed versus
+terminated distinction and reconstruct the original retry policy. Existing domain-specific adapters
+that turn ambiguous errors into recovery guidance or degraded read results retain those policies.
+
+These are Rust source-compatibility changes: downstream exhaustive matches must handle the new
+`StorageError::SqliteWrite` and `khive_db::SqliteError::{Write, WriteSettlementUnknown}` variants.
+`EventsResponse::Error` literal constructors need the new optional field; new `SqliteWriteFailure`
+literals must include all fields. Use `..` in patterns that inspect only existing fields.
+
 ## Bounded blob read failures
 
 `BlobTooLarge`, `BlobSizeMismatch`, and `BlobDigestMismatch` are typed
@@ -148,12 +185,12 @@ until the connection's configured busy timeout expired. The writer task never
 invoked the request operation, so retrying that one failed operation is safe.
 The variant is capability-neutral and `is_retryable()` returns `true`.
 
-MCP preserves this proof with `code`/`stage` set to
-`writer_task_begin_busy`, `operation: "writer_task_begin"`, and
-`retryable: true`. Its `scope` and `retry_after_ms` are null: unlike
+MCP preserves this proof with `operation: "writer_task_begin"` and `retryable: true`.
+Without native evidence its `code`/`stage` remains `writer_task_begin_busy`; a native
+BEGIN refusal uses `sqlite_begin_busy` and the native code fields described above. Its `scope` and `retry_after_ms` are null: unlike
 `writer_queue_saturated`, the queue did accept this request, and no separate
-backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
-pool error and are not promoted by rendered-message matching.
+backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the original pool error's policy and gain native
+stage/code evidence when available; no promotion relies on rendered-message matching.
 
 ## Typed storage-admission timeout
 

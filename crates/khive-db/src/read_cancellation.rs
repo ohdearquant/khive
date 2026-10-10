@@ -706,7 +706,7 @@ where
 /// `None` for every other storage error and for driver errors that are not
 /// SQLite failures.
 pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite::ErrorCode> {
-    let StorageError::Driver { source, .. } = error else {
+    let StorageError::Driver { source, .. } = error.without_sqlite_write_stage() else {
         return None;
     };
     if let Some(error) = source.downcast_ref::<rusqlite::Error>() {
@@ -715,7 +715,8 @@ pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite
     source
         .downcast_ref::<crate::error::SqliteError>()
         .and_then(|error| match error {
-            crate::error::SqliteError::Rusqlite(error) => error.sqlite_error_code(),
+            crate::error::SqliteError::Rusqlite(error)
+            | crate::error::SqliteError::Write { source: error, .. } => error.sqlite_error_code(),
             _ => None,
         })
 }

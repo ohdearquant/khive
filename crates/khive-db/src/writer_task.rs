@@ -364,7 +364,9 @@ where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
     let body_started = Instant::now();
-    let operation_outcome = catch_unwind(AssertUnwindSafe(|| operation(conn)));
+    let operation_outcome = catch_unwind(AssertUnwindSafe(|| {
+        operation(conn).map_err(crate::error::statement_failure)
+    }));
     let body = body_started.elapsed();
 
     match operation_outcome {
@@ -400,9 +402,19 @@ where
                         RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
                             result: Err(StorageError::WriterTaskRequestFailed {
                                 request_state: WriterTaskRequestState::TransactionRolledBack,
-                                source: Box::new(StorageError::Pool {
-                                    operation: commit_operation.into(),
-                                    message: commit_error.to_string(),
+                                source: Box::new({
+                                    let failure = crate::error::native_write_failure(
+                                        &commit_error,
+                                        khive_storage::error::SqliteWriteStage::Commit,
+                                    );
+                                    let error = StorageError::Pool {
+                                        operation: commit_operation.into(),
+                                        message: commit_error.to_string(),
+                                    };
+                                    match failure {
+                                        Some(failure) => error.with_sqlite_write_failure(failure),
+                                        None => error,
+                                    }
                                 }),
                             }),
                             terminal_state: None,
@@ -415,6 +427,7 @@ where
                                 result: Err(writer_task_terminated_with_cause(
                                     request_state,
                                     &commit_error,
+                                    khive_storage::error::SqliteWriteStage::Commit,
                                 )),
                                 terminal_state: Some(request_state),
                                 body,
@@ -448,6 +461,7 @@ where
                         result: Err(writer_task_terminated_with_cause(
                             request_state,
                             &operation_error,
+                            khive_storage::error::SqliteWriteStage::Statement,
                         )),
                         terminal_state: Some(request_state),
                         body,
@@ -528,7 +542,9 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             ..
         } = *self;
         let body_started = Instant::now();
-        let outcome = catch_unwind(AssertUnwindSafe(|| op(conn)));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            op(conn).map_err(crate::error::statement_failure)
+        }));
         let body = body_started.elapsed();
         let telemetry_db = telemetry.db.clone();
         telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
@@ -542,13 +558,21 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                 let _ = reply.send(outcome);
                 None
             }
-            Ok(_outcome) => {
+            Ok(outcome) => {
                 tracing::error!(
                     "writer task: top-level request returned with an open transaction; request \
                      side effects are unknown"
                 );
                 let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                let _ = reply.send(Err(writer_task_terminated(request_state)));
+                let error = match outcome {
+                    Err(error) => writer_task_terminated_with_cause(
+                        request_state,
+                        &error,
+                        khive_storage::error::SqliteWriteStage::Statement,
+                    ),
+                    Ok(_) => writer_task_terminated(request_state),
+                };
+                let _ = reply.send(Err(error));
                 Some(request_state)
             }
             Err(_panic_payload) => {
@@ -628,6 +652,7 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
 fn writer_task_terminated_with_cause(
     request_state: WriterTaskRequestState,
     error: &(dyn std::error::Error + 'static),
+    stage: khive_storage::error::SqliteWriteStage,
 ) -> StorageError {
     let mut source = Some(error);
     let mut sqlite_full_codes = None;
@@ -644,14 +669,24 @@ fn writer_task_terminated_with_cause(
     }
     // The original error was already escalated at the failing boundary.
     // A source-free pair preserves caller evidence without duplicating that sink event.
-    StorageError::WriterTaskTerminated {
+    let terminal = StorageError::WriterTaskTerminated {
         request_state,
         sqlite_full_codes,
+    };
+    match crate::error::native_write_failure(error, stage) {
+        Some(mut failure) => {
+            failure.settlement_unknown =
+                request_state == WriterTaskRequestState::SideEffectsUnknown;
+            terminal.with_sqlite_write_failure(failure)
+        }
+        None => terminal,
     }
 }
 
 fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> StorageError {
-    if crate::timeout_sink::is_busy_or_locked(&error) {
+    let failure =
+        crate::error::native_write_failure(&error, khive_storage::error::SqliteWriteStage::Begin);
+    let mapped = if crate::timeout_sink::is_busy_or_locked(&error) {
         StorageError::WriterTaskBusy {
             timeout_ms: u64::try_from(busy_timeout.as_millis()).unwrap_or(u64::MAX),
         }
@@ -660,6 +695,10 @@ fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> St
             operation: "writer_task_begin".into(),
             message: error.to_string(),
         }
+    };
+    match failure {
+        Some(failure) => mapped.with_sqlite_write_failure(failure),
+        None => mapped,
     }
 }
 
@@ -1322,7 +1361,10 @@ async fn run_writer_task(
                         // never enters the retry loop's busy arm) still
                         // needs its counter recorded at this seam.
                         let begin_error = writer_task_begin_error(e, busy_timeout);
-                        if !matches!(&begin_error, StorageError::WriterTaskBusy { .. }) {
+                        if !matches!(
+                            begin_error.without_sqlite_write_stage(),
+                            StorageError::WriterTaskBusy { .. }
+                        ) {
                             acquisition_counters.record_writer_task_begin_error();
                         }
                         sealed::Sealed::reply_error_after_begin(
@@ -1392,7 +1434,8 @@ mod tests {
                 Some("rendered text is irrelevant".to_string()),
             );
             assert!(matches!(
-                writer_task_begin_error(error, Duration::from_millis(175)),
+                writer_task_begin_error(error, Duration::from_millis(175))
+                    .without_sqlite_write_stage(),
                 StorageError::WriterTaskBusy { timeout_ms: 175 }
             ));
         }
@@ -1402,7 +1445,7 @@ mod tests {
             Some("database is locked".to_string()),
         );
         assert!(matches!(
-            writer_task_begin_error(structural, Duration::from_millis(175)),
+            writer_task_begin_error(structural, Duration::from_millis(175)).without_sqlite_write_stage(),
             StorageError::Pool { ref operation, .. } if operation == "writer_task_begin"
         ));
     }
@@ -1455,9 +1498,12 @@ mod tests {
         result: Result<T, StorageError>,
         expected: WriterTaskRequestState,
     ) {
-        match result {
+        match result
+            .as_ref()
+            .map_err(StorageError::without_sqlite_write_stage)
+        {
             Err(StorageError::WriterTaskTerminated { request_state, .. }) => {
-                assert_eq!(request_state, expected)
+                assert_eq!(*request_state, expected)
             }
             other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
         }
@@ -1471,14 +1517,19 @@ mod tests {
             Some("synthetic classifier control".into()),
         );
         let wrapped = StorageError::driver(khive_storage::StorageCapability::Sql, "nested", native);
-        let error =
-            writer_task_terminated_with_cause(WriterTaskRequestState::SideEffectsUnknown, &wrapped);
-        assert!(matches!(error, StorageError::WriterTaskTerminated {
+        let error = writer_task_terminated_with_cause(
+            WriterTaskRequestState::SideEffectsUnknown,
+            &wrapped,
+            khive_storage::error::SqliteWriteStage::Statement,
+        );
+        assert!(
+            matches!(error.without_sqlite_write_stage(), StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
             sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, code)),
-        } if code == extended));
+        } if *code == extended)
+        );
         assert!(
-            std::error::Error::source(&error).is_none(),
+            std::error::Error::source(error.without_sqlite_write_stage()).is_none(),
             "evidence must not replay the original sink cause"
         );
         assert!(!error.is_retryable());
@@ -1492,8 +1543,10 @@ mod tests {
             assert!(matches!(
                 writer_task_terminated_with_cause(
                     WriterTaskRequestState::SideEffectsUnknown,
-                    &native
-                ),
+                    &native,
+                    khive_storage::error::SqliteWriteStage::Statement,
+                )
+                .without_sqlite_write_stage(),
                 StorageError::WriterTaskTerminated {
                     sqlite_full_codes: None,
                     ..
@@ -1702,7 +1755,7 @@ mod tests {
 
         assert!(
             matches!(
-                &reply,
+                reply.as_ref().map_err(StorageError::without_sqlite_write_stage),
                 Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
             "expected typed retryable writer-task contention, got {reply:?}"
@@ -1766,7 +1819,7 @@ mod tests {
 
         assert!(
             matches!(
-                &result,
+                result.as_ref().map_err(StorageError::without_sqlite_write_stage),
                 Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
             "expected a typed retryable error on contended BEGIN IMMEDIATE, got {result:?}"
@@ -2123,7 +2176,7 @@ mod tests {
                 request_state: WriterTaskRequestState::TransactionRolledBack,
                 source,
             }) => assert!(
-                matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                matches!(source.without_sqlite_write_stage(), StorageError::Pool { operation, .. }
                     if operation == "writer_task_commit"),
                 "the proven-rollback wrapper must retain the typed COMMIT error: {source:?}"
             ),
@@ -2270,6 +2323,13 @@ mod tests {
         let reply = reply_rx
             .try_recv()
             .expect("active request must receive a typed terminal reply");
+        let evidence = reply.as_ref().unwrap_err().sqlite_write_failure().unwrap();
+        assert_eq!(
+            evidence.stage,
+            khive_storage::error::SqliteWriteStage::Commit
+        );
+        assert_eq!(evidence.primary_code, rusqlite::ffi::SQLITE_AUTH);
+        assert_eq!(evidence.extended_code, rusqlite::ffi::SQLITE_AUTH);
         assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert!(
