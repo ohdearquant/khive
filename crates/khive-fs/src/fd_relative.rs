@@ -198,8 +198,12 @@ pub struct OpenFileOptions {
 /// Always uses `O_NOFOLLOW | O_CLOEXEC`. The name passes through [`c_name`], with
 /// an additional refusal of `.` and `..`; the older read/directory helpers keep
 /// their existing dot-component policy. This does not require a regular file.
-pub fn open_file_at(parent: BorrowedFd<'_>, name: &str, opts: OpenFileOptions) -> io::Result<File> {
-    let name = c_name(OsStr::new(name))?;
+pub fn open_file_at(
+    parent: BorrowedFd<'_>,
+    name: impl AsRef<OsStr>,
+    opts: OpenFileOptions,
+) -> io::Result<File> {
+    let name = c_name(name.as_ref())?;
     if matches!(name.to_bytes(), b"." | b"..") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

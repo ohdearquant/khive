@@ -267,3 +267,116 @@ fn publication_stays_in_held_directory_after_its_path_is_replaced() {
     assert!(!moved.join("tmp").exists());
     assert!(!original.join("tmp").exists());
 }
+
+#[test]
+fn exclusive_policy_preserves_every_incumbent_without_invoking_writer() {
+    for entry in ["regular", "symlink", "fifo", "directory"] {
+        let scratch = Scratch::new();
+        let dir = scratch.open();
+        let tmp = scratch.path().join("tmp");
+        fs::write(scratch.path().join("target"), b"precious target").unwrap();
+        fs::write(scratch.path().join("final"), b"old final").unwrap();
+        match entry {
+            "regular" => fs::write(&tmp, b"incumbent").unwrap(),
+            "symlink" => symlink("target", &tmp).unwrap(),
+            "directory" => fs::create_dir(&tmp).unwrap(),
+            "fifo" => {
+                let name = CString::new(tmp.as_os_str().as_bytes()).unwrap();
+                // SAFETY: name is a live NUL-terminated path in this private scratch directory.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::symlink_metadata(&tmp).unwrap().file_type();
+        let mut called = false;
+        let error =
+            publish_atomic_at_detailed(&dir, "tmp", "final", StaleTmp::RefuseExisting, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.phase(), AtomicPublishPhase::CreateTmp);
+        assert!(!called);
+        assert_eq!(fs::symlink_metadata(&tmp).unwrap().file_type(), before);
+        if entry == "regular" {
+            assert_eq!(fs::read(&tmp).unwrap(), b"incumbent");
+        }
+        if entry == "symlink" {
+            assert_eq!(fs::read_link(&tmp).unwrap(), Path::new("target"));
+        }
+        assert_eq!(
+            fs::read(scratch.path().join("target")).unwrap(),
+            b"precious target"
+        );
+        assert_eq!(
+            fs::read(scratch.path().join("final")).unwrap(),
+            b"old final"
+        );
+    }
+}
+
+#[test]
+fn exclusive_publication_preserves_os_names_and_requested_creation_mode() {
+    use khive_fs::atomic_publish::AtomicPublishOptions;
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new();
+    let dir = scratch.open();
+    let name = OsStr::from_bytes(b"archive-\xff");
+    let reference = scratch.path().join("reference");
+    File::options()
+        .write(true)
+        .create_new(true)
+        .open(&reference)
+        .unwrap();
+    let mode = fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+    publish_atomic_at(
+        &dir,
+        "tmp",
+        name,
+        AtomicPublishOptions {
+            stale: StaleTmp::RefuseExisting,
+            mode: 0o666,
+        },
+        |file| file.write_all(b"new archive"),
+    )
+    .unwrap();
+    assert_eq!(fs::read(scratch.path().join(name)).unwrap(), b"new archive");
+    assert_eq!(
+        fs::metadata(scratch.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        mode
+    );
+    stage_atomic_at(&dir, "old-policy", StaleTmp::Refuse, |_| Ok(())).unwrap();
+    assert_eq!(
+        fs::metadata(scratch.path().join("old-policy"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        mode & 0o644
+    );
+}
+
+#[test]
+fn exclusive_policy_validates_names_before_any_entry_change() {
+    let scratch = Scratch::new();
+    let dir = scratch.open();
+    fs::write(scratch.path().join("tmp"), b"incumbent").unwrap();
+    for name in ["", ".", "..", "a/b", "nul\0name"] {
+        let error = publish_atomic_at_detailed(&dir, "tmp", name, StaleTmp::RefuseExisting, |_| {
+            panic!("writer must not run")
+        })
+        .unwrap_err();
+        assert_eq!(error.phase(), AtomicPublishPhase::ValidateNames);
+        assert_eq!(fs::read(scratch.path().join("tmp")).unwrap(), b"incumbent");
+    }
+    let error = publish_atomic_at_detailed(&dir, "tmp", "tmp", StaleTmp::RefuseExisting, |_| {
+        panic!("writer must not run")
+    })
+    .unwrap_err();
+    assert_eq!(error.phase(), AtomicPublishPhase::ValidateNames);
+    assert_eq!(fs::read(scratch.path().join("tmp")).unwrap(), b"incumbent");
+}

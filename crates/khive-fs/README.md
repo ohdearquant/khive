@@ -38,12 +38,18 @@ callback, then syncs and closes that file. `publish_atomic_at` additionally rena
 file over its destination and syncs the directory. Use the staged operation when a multi-file
 checkpoint has separate metadata and segment publication boundaries.
 
-Both use mode 0644 filtered by umask, no-follow and close-on-exec. `StaleTmp::Refuse` replaces a
-stale regular file but refuses nonregular entries, including symlinks. `StaleTmp::Unlink` removes
-the stale file or symlink entry without following it; directories refuse. Both names are checked
-before publication has any filesystem effect: empty, slash-containing, NUL-containing and dot
-names refuse, as do equal staging and destination names. Backslash is an ordinary Unix name;
-callers can impose stricter naming policy.
+Passing a `StaleTmp` retains mode 0644 filtered by umask; `AtomicPublishOptions`
+selects a creation mode explicitly. Both operations use no-follow and close-on-exec.
+`StaleTmp::Refuse` replaces a stale regular file but refuses nonregular entries, including
+symlinks. `StaleTmp::Unlink` removes a stale file or symlink without following it; directories
+refuse. `StaleTmp::RefuseExisting` instead refuses every existing entry through exclusive
+creation, without inspecting or unlinking an incumbent. This additive enum variant must be
+handled by exhaustive downstream matches. Existing policies retain their behavior.
+
+Names accept `AsRef<OsStr>` without lossy UTF-8 conversion, including `open_file_at`.
+Both names are checked before publication has any filesystem effect: empty, slash-containing,
+NUL-containing and dot names refuse, as do equal staging and destination names. Backslash is an
+ordinary Unix name; callers can impose stricter naming policy.
 
 The `_detailed` variants retain the failing phase and original `io::Error`; the convenience
 functions return that original error directly, preserving native errno. No error automatically
