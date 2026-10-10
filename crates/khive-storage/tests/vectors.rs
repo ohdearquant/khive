@@ -452,3 +452,104 @@ async fn vector_metadata_filter_is_empty_with_property_filters() {
     };
     assert!(!with_prop.is_empty());
 }
+
+#[tokio::test]
+async fn vector_scan_default_is_explicitly_unsupported_through_dyn_store() {
+    let store = TestVectorStore::new();
+    let capability: &dyn VectorStore = &store;
+    let error = capability
+        .scan_vectors(khive_storage::VectorScanRequest {
+            namespace: "ns:test".into(),
+            embedding_model: "test".into(),
+            field: "body".into(),
+            kind: None,
+            after: None,
+            limit: std::num::NonZeroU32::new(1).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Unsupported {
+        capability: StorageCapability::Vectors, operation, ..
+    } if operation == "scan_vectors"));
+    assert!(!store.search_called.load(Ordering::SeqCst));
+    assert!(!store.insert_called.load(Ordering::SeqCst));
+    assert!(!store.delete_called.load(Ordering::SeqCst));
+}
+
+#[test]
+fn vector_scan_request_wire_rejects_invalid_cursor_limit_and_kind() {
+    use khive_storage::VectorScanRequest;
+    let valid = serde_json::json!({
+        "namespace": "", "embedding_model": "m'_%", "field": "body",
+        "kind": "note", "after": "00000000-0000-0000-0000-00000000000a", "limit": 1
+    });
+    let request: VectorScanRequest = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(request.namespace, "");
+    assert_eq!(request.embedding_model, "m'_%");
+    assert_eq!(request.kind, Some(SubstrateKind::Note));
+    assert_eq!(request.after, Some(Uuid::from_u128(10)));
+    assert_eq!(serde_json::to_value(&request).unwrap(), valid);
+    for (field, value) in [
+        ("after", serde_json::json!("not-a-uuid")),
+        ("after", serde_json::json!(2)),
+        ("limit", serde_json::json!(0)),
+        ("limit", serde_json::json!(-1)),
+        ("limit", serde_json::json!(4_294_967_296_u64)),
+        ("limit", serde_json::json!(1.5)),
+        ("limit", serde_json::json!(null)),
+        ("kind", serde_json::json!("concept")),
+        ("namespace", serde_json::json!(null)),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<VectorScanRequest>(invalid).is_err(),
+            "{field}"
+        );
+    }
+    for field in ["namespace", "embedding_model", "field", "limit"] {
+        let mut invalid = valid.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<VectorScanRequest>(invalid).is_err(),
+            "{field}"
+        );
+    }
+    let mut optional = valid;
+    optional["kind"] = serde_json::Value::Null;
+    optional["after"] = serde_json::Value::Null;
+    optional["limit"] = serde_json::json!(u32::MAX);
+    let request: VectorScanRequest = serde_json::from_value(optional).unwrap();
+    assert!(request.kind.is_none());
+    assert!(request.after.is_none());
+    assert_eq!(request.limit.get(), u32::MAX);
+}
+
+#[test]
+fn vector_scan_page_wire_preserves_multiple_vectors_and_terminal_cursor() {
+    use khive_storage::{VectorScanEntry, VectorScanPage};
+    let page = VectorScanPage {
+        items: vec![VectorScanEntry {
+            subject_id: Uuid::from_u128(7),
+            vectors: vec![vec![1.0, -0.25], vec![0.125, 2.0]],
+        }],
+        next_after: Some(Uuid::from_u128(7)),
+    };
+    let value = serde_json::to_value(&page).unwrap();
+    assert_eq!(
+        value["items"][0]["vectors"],
+        serde_json::json!([[1.0, -0.25], [0.125, 2.0]])
+    );
+    assert_eq!(
+        serde_json::from_value::<VectorScanPage>(value).unwrap(),
+        page
+    );
+    let empty = VectorScanPage {
+        items: vec![],
+        next_after: None,
+    };
+    assert_eq!(
+        serde_json::to_value(empty).unwrap(),
+        serde_json::json!({"items": [], "next_after": null})
+    );
+}

@@ -81,11 +81,11 @@ pub use types::{
     TextDocument, TextFilter, TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit,
     TextSearchOptions, TextSearchRequest, TextTermStats, TextTermStatsRequest, TimeRange,
     TraversalExecutionBudget, TraversalOptions, TraversalRequest, VectorIndexKind,
-    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
-    MAX_TRAVERSAL_WORK,
+    VectorMetadataFilter, VectorRecord, VectorScanEntry, VectorScanPage, VectorScanRequest,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS,
+    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

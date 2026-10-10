@@ -12,8 +12,8 @@ use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, StorageResult,
-    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo,
+    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorScanPage, VectorScanRequest,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
 };
 
 /// Storage capability for dense vector embeddings and similarity search.
@@ -235,6 +235,25 @@ pub trait VectorStore: Send + Sync + 'static {
             capability: StorageCapability::Vectors,
             operation: "get_vectors".into(),
             message: "this backend does not support stored vector reads".into(),
+        })
+    }
+
+    /// Enumerate persisted vectors by exact selectors and an exclusive UUID boundary.
+    ///
+    /// See [`VectorScanRequest`] and [`VectorScanPage`] for ordering, row budgets
+    /// and concurrent-write semantics. Each call is one observation; following
+    /// cursors does not hold a snapshot or an ANN-log watermark across calls.
+    /// This read does not filter on subject liveness or require an ANN index.
+    ///
+    /// The default refuses with [`StorageError::Unsupported`], without falling
+    /// back to search or returning an empty success. Existing capability flags,
+    /// including `supports_vector_read`, do not advertise this separate method.
+    async fn scan_vectors(&self, request: VectorScanRequest) -> StorageResult<VectorScanPage> {
+        let _ = request;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "scan_vectors".into(),
+            message: "this backend does not support stored vector enumeration".into(),
         })
     }
 
