@@ -45,6 +45,40 @@ pub enum CommitAnnotationInsertOutcome {
     CursorChanged,
 }
 
+/// A validated symmetric-edge patch and the exact persisted snapshot it replaces.
+///
+/// The caller supplies canonical endpoints for a symmetric relation. `namespace`
+/// belongs to the stored record, independently of the store's routing namespace.
+/// Snapshot timestamps use raw microseconds so overflow is refused without a
+/// lossy timestamp conversion. Creation time, deletion state and target backend
+/// are not replaced by this request.
+#[derive(Clone, Debug)]
+pub struct SymmetricEdgeUpdateRequest {
+    pub namespace: String,
+    pub id: LinkId,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: EdgeRelation,
+    pub weight: f64,
+    pub metadata: Option<serde_json::Value>,
+    pub expected_updated_at_micros: i64,
+    pub expected_deleted_at_micros: Option<i64>,
+}
+
+/// Committed disposition of a guarded symmetric-edge update.
+#[derive(Debug)]
+pub enum SymmetricEdgeUpdateOutcome {
+    /// No competing natural key existed; the requested edge was updated.
+    Updated,
+    /// A live or tombstoned canonical row survived unchanged and the requested
+    /// duplicate was deleted. Its stored ID remains raw: parsing belongs after
+    /// commit, so malformed legacy data cannot change the transaction outcome.
+    Absorbed(String),
+    /// The requested row disappeared or no longer matched its revision or
+    /// deletion marker. Neither the update nor the conflict deletion occurred.
+    Stale,
+}
+
 /// Directed edge CRUD and graph traversal over the knowledge graph.
 #[async_trait]
 pub trait GraphStore: Send + Sync + 'static {
@@ -159,6 +193,28 @@ pub trait GraphStore: Send + Sync + 'static {
             capability: StorageCapability::Graph,
             operation: "replace_edge_if_unchanged".into(),
             message: "this backend does not implement guarded edge replacement".into(),
+        })
+    }
+    /// Apply a validated symmetric-edge patch in one writer transaction.
+    ///
+    /// First require a representable revision strictly after the snapshot, even
+    /// if a competing natural key will absorb this edge. Then probe that key in
+    /// the request's record namespace, including tombstones. A competing row
+    /// survives unchanged; only the requested duplicate may be deleted. With no
+    /// competitor, replace the requested patch fields and advance its revision.
+    /// Both mutations compare the snapshot's revision and deletion marker.
+    ///
+    /// The default refuses rather than substituting an unguarded upsert or a
+    /// caller-side read/delete sequence. Errors can report unknown settlement;
+    /// callers must not infer rollback or retry an ambiguous result.
+    async fn update_symmetric_edge_if_unchanged(
+        &self,
+        _request: SymmetricEdgeUpdateRequest,
+    ) -> StorageResult<SymmetricEdgeUpdateOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "update_symmetric_edge_if_unchanged".into(),
+            message: "this backend does not implement guarded symmetric-edge updates".into(),
         })
     }
     /// Insert or update a single edge, re-checking that both endpoints still
