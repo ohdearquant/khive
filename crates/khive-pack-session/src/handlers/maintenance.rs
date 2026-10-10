@@ -42,21 +42,15 @@ fn nonnegative(value: i64, field: &str) -> Result<u64, RuntimeError> {
 }
 
 fn integer_column(row: &SqlRow, field: &str) -> Result<u64, RuntimeError> {
-    match row.get(field) {
-        Some(SqlValue::Integer(value)) => nonnegative(*value, field),
-        _ => Err(RuntimeError::Internal(format!(
-            "session maintenance: missing integer {field}"
-        ))),
-    }
+    let value = row.i64(field).map_err(|_| {
+        RuntimeError::Internal(format!("session maintenance: missing integer {field}"))
+    })?;
+    nonnegative(value, field)
 }
 
 fn text_column<'a>(row: &'a SqlRow, field: &str) -> Result<&'a str, RuntimeError> {
-    match row.get(field) {
-        Some(SqlValue::Text(value)) => Ok(value),
-        _ => Err(RuntimeError::Internal(format!(
-            "session maintenance: missing text {field}"
-        ))),
-    }
+    row.text(field)
+        .map_err(|_| RuntimeError::Internal(format!("session maintenance: missing text {field}")))
 }
 
 async fn scalar_u64<R: SqlReader + ?Sized>(
@@ -293,12 +287,91 @@ async fn vacuum_result_after_commit<R: SqlReader + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use khive_runtime::{KhiveRuntime, RuntimeConfig};
+    use khive_runtime::{KhiveRuntime, RuntimeConfig, RuntimeError};
+    use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{allocated_bytes, handle_stats, handle_vacuum, vacuum_result_after_commit};
+    use super::{
+        allocated_bytes, handle_stats, handle_vacuum, integer_column, text_column,
+        vacuum_result_after_commit,
+    };
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
+
+    #[test]
+    fn maintenance_integer_decode_preserves_nonnegative_values_and_errors() {
+        for value in [0, 23, i64::MAX] {
+            let row = SqlRow {
+                columns: vec![SqlColumn {
+                    name: "bytes".into(),
+                    value: SqlValue::Integer(value),
+                }],
+            };
+            assert_eq!(integer_column(&row, "bytes").unwrap(), value as u64);
+        }
+        for value in [
+            None,
+            Some(SqlValue::Null),
+            Some(SqlValue::Float(23.0)),
+            Some(SqlValue::Text("23".into())),
+            Some(SqlValue::Blob(vec![23])),
+            Some(SqlValue::Integer(-1)),
+        ] {
+            let expected = if matches!(value, Some(SqlValue::Integer(-1))) {
+                "session maintenance: negative bytes"
+            } else {
+                "session maintenance: missing integer bytes"
+            };
+            let row = SqlRow {
+                columns: value
+                    .map(|value| SqlColumn {
+                        name: "bytes".into(),
+                        value,
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+            assert!(matches!(
+                integer_column(&row, "bytes"),
+                Err(RuntimeError::Internal(message)) if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn maintenance_text_decode_preserves_text_and_domain_errors() {
+        for value in ["", "session_messages_fts", "会话"] {
+            let row = SqlRow {
+                columns: vec![SqlColumn {
+                    name: "name".into(),
+                    value: SqlValue::Text(value.into()),
+                }],
+            };
+            assert_eq!(text_column(&row, "name").unwrap(), value);
+        }
+        for value in [
+            None,
+            Some(SqlValue::Null),
+            Some(SqlValue::Integer(23)),
+            Some(SqlValue::Float(23.0)),
+            Some(SqlValue::Blob(b"sessions".to_vec())),
+        ] {
+            let row = SqlRow {
+                columns: value
+                    .map(|value| SqlColumn {
+                        name: "name".into(),
+                        value,
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+            assert!(matches!(
+                text_column(&row, "name"),
+                Err(RuntimeError::Internal(message))
+                    if message == "session maintenance: missing text name"
+            ));
+        }
+    }
 
     async fn setup() -> (KhiveRuntime, TempDir) {
         let directory = TempDir::new().expect("temporary database directory");

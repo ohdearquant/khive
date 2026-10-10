@@ -195,33 +195,25 @@ impl MirrorConfig {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
 
-        let enabled = std::env::var("KHIVE_MIRROR_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let enabled = khive_runtime::env_flag("KHIVE_MIRROR_ENABLED", false);
 
         let projects_dir = std::env::var("KHIVE_MIRROR_PROJECTS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".claude").join("projects"));
 
-        let codex_enabled = std::env::var("KHIVE_MIRROR_CODEX_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let codex_enabled = khive_runtime::env_flag("KHIVE_MIRROR_CODEX_ENABLED", false);
 
         let codex_sessions_dir = std::env::var("KHIVE_MIRROR_CODEX_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".codex").join("sessions"));
 
-        let chatgpt_enabled = std::env::var("KHIVE_MIRROR_CHATGPT_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let chatgpt_enabled = khive_runtime::env_flag("KHIVE_MIRROR_CHATGPT_ENABLED", false);
 
         let chatgpt_exports_dir = std::env::var("KHIVE_MIRROR_CHATGPT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".chatgpt").join("exports"));
 
-        let claude_ai_enabled = std::env::var("KHIVE_MIRROR_CLAUDE_AI_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let claude_ai_enabled = khive_runtime::env_flag("KHIVE_MIRROR_CLAUDE_AI_ENABLED", false);
 
         let claude_ai_exports_dir = std::env::var("KHIVE_MIRROR_CLAUDE_AI_DIR")
             .map(PathBuf::from)
