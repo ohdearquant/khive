@@ -203,6 +203,62 @@ impl VectorSearchRequest {
     }
 }
 
+/// Select one page of persisted vector records through [`crate::VectorStore::scan_vectors`].
+///
+/// Selectors are exact strings, including empty strings: no trimming, model
+/// aliasing, namespace fallback or wildcard expansion occurs. The handle selects
+/// the physical store; `embedding_model` filters within it rather than opening
+/// another store. Namespace filtering does not authorize a read.
+///
+/// A continuation reuses the selectors with `after = page.next_after`. Each call
+/// is a separate observation, not a snapshot spanning pages. With concurrent
+/// writes, later pages may see newly inserted or updated records above the
+/// boundary, omit deleted records, and miss insertions at or below the boundary.
+/// Records whose subjects are missing or soft-deleted are still eligible.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorScanRequest {
+    /// Exact stored namespace.
+    pub namespace: String,
+    /// Exact stored embedding model name, with no implicit default.
+    pub embedding_model: String,
+    /// Exact embedding field name.
+    pub field: String,
+    /// Optional substrate filter; `None` includes every substrate kind.
+    pub kind: Option<SubstrateKind>,
+    /// Exclusive ascending UUID boundary; the boundary record need not exist.
+    /// Changing selectors makes this a new interval query, not a continuation.
+    pub after: Option<Uuid>,
+    /// Explicit nonzero row budget. This bounds returned records, not query
+    /// work or vector byte size. Backends may read one extra matching record
+    /// to determine whether a continuation exists. No silent clamp is applied.
+    pub limit: std::num::NonZeroU32,
+}
+
+/// One complete persisted vector record in a [`VectorScanPage`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorScanEntry {
+    /// Identity within the selected namespace, model and field.
+    pub subject_id: Uuid,
+    /// Stored representations without rescoring or normalization. Single-vector
+    /// backends return one inner vector; the contract also permits multi-vector
+    /// records. Lossless transport of nonfinite f32 bits is not a JSON guarantee.
+    pub vectors: Vec<Vec<f32>>,
+}
+
+/// A count-free page in ascending subject UUID order.
+///
+/// A supporting backend returns each subject once in an unchanged selected
+/// dataset. A read or decoding error fails the whole page, including errors in
+/// lookahead records; it must not silently skip records or return a partial page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorScanPage {
+    /// At most the requested limit of complete vector records.
+    pub items: Vec<VectorScanEntry>,
+    /// Last emitted ID if a further matching record was observed; otherwise
+    /// `None`. A concurrent deletion can make the subsequent page empty.
+    pub next_after: Option<Uuid>,
+}
+
 /// Configuration for a vector orphan-sweep pass.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrphanSweepConfig {
