@@ -397,7 +397,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "signal",
                 param_type: "string",
                 required: false,
-                description: "Feedback signal. unjudged appends feedback_unjudged telemetry without training; useful, not_useful, and wrong record judgments. Omission means abstain: no event is recorded.",
+                description: "Feedback signal. unjudged appends feedback_unjudged telemetry without training; useful, not_useful, and wrong record judgments. Omission means abstain: no feedback event or posterior update.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
