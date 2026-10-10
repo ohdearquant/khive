@@ -5,7 +5,9 @@ pub mod distance;
 mod ops;
 mod score;
 
-pub use comparator::{cmp_asc_then_id, cmp_desc_then_id, Ranked};
+pub use comparator::{
+    cmp_asc_then_id, cmp_desc_then_id, cmp_desc_then_id_f32, cmp_desc_then_id_f64, Ranked,
+};
 // REASON: re-export the deprecated legacy function so downstream callers receive
 // the deprecation warning at their call sites, not here in the crate facade.
 #[allow(deprecated)]
