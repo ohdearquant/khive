@@ -27,7 +27,7 @@ use khive_types::EdgeRelation;
 use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
-use crate::sql::sql;
+use crate::sql::{sql, EntityRows};
 use khive_runtime::process_retry::{
     spawn_retrying_executable_busy, spawn_retrying_executable_busy_async,
     EXECUTABLE_BUSY_BACKOFF_MS,
@@ -900,13 +900,7 @@ async fn resolve_id(
     _token: &NamespaceToken,
     raw: &str,
 ) -> Result<Option<Uuid>> {
-    if let Ok(u) = Uuid::parse_str(raw) {
-        return Ok(Some(u));
-    }
-    runtime
-        .resolve_prefix_unfiltered(raw)
-        .await
-        .map_err(anyhow::Error::new)
+    resolve_project_id(runtime, raw).await
 }
 
 /// Resolve an explicit `git.digest(project)` UUID or 8+ hex prefix without a
@@ -1719,16 +1713,14 @@ async fn find_document_for_path(
 
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
-        .query_row(SqlStatement {
-            sql: sql!("documents_by_path_select").into(),
-            params: vec![
-                SqlValue::Text(namespace),
-                SqlValue::Text(path.to_string()),
-                SqlValue::Text(file_name.to_string()),
-                SqlValue::Text(like_pattern),
-            ],
-            label: Some("git_ingest_find_document_for_path".into()),
-        })
+        .query_row(
+            EntityRows::DocumentsByPath {
+                path,
+                file_name,
+                like_pattern: &like_pattern,
+            }
+            .statement(&namespace),
+        )
         .await
         .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| r.uuid("id").ok()))
@@ -1746,14 +1738,10 @@ async fn load_code_modules_by_snapshot_path(
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("code_modules_by_snapshot_path_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(source_revision.to_string()),
-            ],
-            label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
-        })
+        .query_all(
+            EntityRows::CodeModulesBySnapshotPath(source_revision)
+                .statement(token.namespace().as_str()),
+        )
         .await
         .map_err(anyhow::Error::new)?;
 

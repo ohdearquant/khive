@@ -23,7 +23,7 @@ use crate::source::{
     canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
     repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
-use crate::sql::sql;
+use crate::sql::{sql, EntityRows};
 use crate::GitPack;
 
 /// Recover the typed error when a digest ingest/resolution failure chain
@@ -574,8 +574,7 @@ fn append_unique_ids(target: &mut Vec<Uuid>, candidates: impl IntoIterator<Item 
 }
 
 struct ProjectQuery<T> {
-    statement: &'static str,
-    label: &'static str,
+    select: for<'a> fn(&'a str) -> EntityRows<'a>,
     decode: fn(&SqlRow) -> Option<T>,
 }
 
@@ -588,14 +587,7 @@ async fn find_projects<T>(
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
-        .query_all(SqlStatement {
-            sql: query.statement.into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(value.to_string()),
-            ],
-            label: Some(query.label.into()),
-        })
+        .query_all((query.select)(value).statement(token.namespace().as_str()))
         .await
         .map_err(anyhow::Error::new)?;
     Ok(rows.iter().filter_map(query.decode).collect())
@@ -607,8 +599,7 @@ async fn find_projects<T>(
 // `created_at`, id tie-break) and the condition surfaced as a report warning,
 // never an arbitrary or silent pick (ADR-088 Amendment 2).
 const PROJECTS_BY_SLUG: ProjectQuery<Uuid> = ProjectQuery {
-    statement: sql!("projects_by_slug_select"),
-    label: "git_digest_find_projects_by_slug",
+    select: EntityRows::ProjectsBySlug,
     decode: |row| row.uuid("id").ok(),
 };
 
@@ -622,8 +613,7 @@ const PROJECTS_BY_SLUG: ProjectQuery<Uuid> = ProjectQuery {
 /// normalized URL evidence below. Raw equality alone never overwrites an
 /// already-derived identity.
 const PROJECTS_BY_LEGACY_REPO_URL: ProjectQuery<Uuid> = ProjectQuery {
-    statement: sql!("projects_by_legacy_repo_url_select"),
-    label: "git_digest_find_projects_by_legacy_repo_url",
+    select: EntityRows::ProjectsByLegacyRepoUrl,
     decode: |row| row.uuid("id").ok(),
 };
 
@@ -633,8 +623,7 @@ const PROJECTS_BY_LEGACY_REPO_URL: ProjectQuery<Uuid> = ProjectQuery {
 /// higher-precedence step-1 lookup. SQL ordering makes candidate selection
 /// deterministic before the async normalization pass (#1708).
 const PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String)> = ProjectQuery {
-    statement: sql!("projects_without_canonical_slug_select"),
-    label: "git_digest_find_projects_without_canonical_slug",
+    select: EntityRows::ProjectsWithoutCanonicalSlug,
     decode: |row| {
         let id = row.uuid("id").ok()?;
         let url = row.text_or_none("repo_url")?.to_owned();
@@ -649,8 +638,7 @@ const PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String)> = ProjectQue
 /// present-but-noncanonical slugs remain URL-reconciliation candidates.
 const SOFT_DELETED_PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String, i64)> =
     ProjectQuery {
-        statement: sql!("soft_deleted_projects_without_canonical_slug_select"),
-        label: "git_digest_find_soft_deleted_projects_without_canonical_slug",
+        select: EntityRows::SoftDeletedProjectsWithoutCanonicalSlug,
         decode: |row| {
             let id = row.uuid("id").ok()?;
             let deleted_at = row.i64_or_none("deleted_at").unwrap_or(0);
@@ -760,15 +748,10 @@ async fn find_orphaned_anchor(
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("orphaned_projects_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-                SqlValue::Text(repo_url.to_string()),
-            ],
-            label: Some("git_digest_find_orphaned_anchor".into()),
-        })
+        .query_all(
+            EntityRows::OrphanedProjects { identity, repo_url }
+                .statement(token.namespace().as_str()),
+        )
         .await
         .map_err(anyhow::Error::new)?;
     let mut dead_projects: Vec<(Uuid, i64)> = rows

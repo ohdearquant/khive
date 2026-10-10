@@ -7,14 +7,14 @@
 fn shared_sql_macro_reads_own_statement_file_and_trims_its_newline() {
     let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("sql")
-        .join("projects_by_slug_select.sql");
+        .join("git_receipts_owned_select.sql");
     let on_disk = std::fs::read_to_string(&file).expect("read this crate's statement file");
     assert!(
         on_disk.ends_with('\n'),
         "{file:?} must end with a newline, or the trim checks below prove nothing"
     );
 
-    let from_macro: &'static str = khive_runtime::sql!("projects_by_slug_select");
+    let from_macro: &'static str = khive_runtime::sql!("git_receipts_owned_select");
 
     assert!(!from_macro.is_empty(), "statement is empty");
     assert!(
