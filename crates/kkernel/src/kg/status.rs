@@ -49,6 +49,10 @@ mod tests {
 
     #[tokio::test]
     async fn status_hashes_clean_after_sync() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path();
         let entity_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
@@ -85,6 +89,10 @@ mod tests {
     /// canonical endpoint order; status must compare the same canonical triple.
     #[tokio::test]
     async fn status_hashes_clean_after_sync_with_reversed_symmetric_edge() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         for relation in ["competes_with", "composed_with"] {
             let tmp = TempDir::new().unwrap();
             let repo = tmp.path();
@@ -141,6 +149,10 @@ mod tests {
     /// `status_hashes_clean_after_sync` but with a real `entity_type` set.
     #[tokio::test]
     async fn status_hashes_clean_after_sync_with_entity_type() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path();
         let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";

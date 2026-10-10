@@ -526,6 +526,10 @@ mod tests {
 
     #[tokio::test]
     async fn export_creates_archive_json() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let output_path = tmp.path().join("archive.json");
@@ -573,6 +577,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn export_refuses_symlinked_output_to_db() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("working.db");
 
@@ -622,6 +630,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn export_refuses_symlinked_temp_to_db() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("working.db");
 
@@ -672,6 +684,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_roundtrip() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-test.db");
         let entity_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -708,6 +724,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-resource.db");
         let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
@@ -757,6 +777,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-json-resource.db");
         let entity_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
@@ -795,6 +819,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_ndjson_adapter_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-ndjson-resource.db");
         let entity_id = "abababab-abab-abab-abab-abababababab";
@@ -833,6 +861,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_rejects_unregistered_entity_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-unknown-kind.db");
         let entity_id = "12345678-1234-1234-1234-123456789012";
@@ -858,6 +890,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_imports_entities() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-json.db");
         let e1_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -895,6 +931,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_ndjson_adapter_imports_entity() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-ndjson.db");
         let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
@@ -1044,6 +1084,10 @@ mod tests {
     /// + import-time `Utc::now()`.
     #[tokio::test]
     async fn import_json_adapter_preserves_entity_type_and_timestamps() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-adr020.db");
         let entity_id = "77777777-7777-7777-7777-777777777777";
@@ -1093,6 +1137,10 @@ mod tests {
     /// was a warning that skipped just the bad element and kept going.
     #[tokio::test]
     async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-488.db");
         let baseline_id = "88888888-8888-8888-8888-888888888888";
@@ -1165,6 +1213,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_rejects_malformed_timestamp_without_db_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-malformed-time.db");
         let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1219,6 +1271,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_rejects_malformed_edge_timestamp_without_creating_target() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("archive-malformed-edge-time.db");
         let source = Uuid::new_v4();
