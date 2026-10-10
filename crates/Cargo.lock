@@ -2847,6 +2847,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-rule-evaluator"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "khive-runtime"
 version = "0.11.0"
 dependencies = [
@@ -3052,6 +3063,7 @@ dependencies = [
  "khive-repo-showcase",
  "khive-request",
  "khive-retrieval",
+ "khive-rule-evaluator",
  "khive-runtime",
  "khive-score",
  "khive-storage",

@@ -1,0 +1,20 @@
+[package]
+name = "khive-rule-evaluator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Pure configurable graph rule evaluation over in-memory NDJSON"
+
+[dependencies]
+khive-types = { version = "0.11.0", path = "../khive-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+# Explicit std without workspace clock/serde features: hosts supply the instant.
+chrono = { version = "0.4", default-features = false, features = ["std"] }

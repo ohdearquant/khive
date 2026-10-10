@@ -16,6 +16,7 @@ pub mod agent;
 #[cfg(feature = "serde")]
 pub mod canonical_json;
 pub mod edge;
+pub mod edge_rules;
 pub mod email_address;
 pub mod entity;
 pub mod entity_type;
@@ -43,6 +44,10 @@ pub use agent::{AgentRecord, AgentState, TerminalReason};
 #[cfg(feature = "serde")]
 pub use canonical_json::canonical_json_bytes;
 pub use edge::{EdgeCategory, EdgeRelation};
+pub use edge_rules::{
+    base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
+    BASE_ENTITY_ENDPOINT_RULES,
+};
 pub use entity::{validate_edge_weight, Entity, EntityKind, Link, PropertyValue};
 pub use entity_type::{
     to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,

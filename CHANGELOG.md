@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Configurable graph rules share the pure `khive-rule-evaluator` crate between
+  `kg validate` and `kg commit`, using captured NDJSON inputs and explicit citation
+  time. Runtime and offline checks share the canonical endpoint table and matcher.
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix

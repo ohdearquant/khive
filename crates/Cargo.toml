@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "khive-types",
+    "khive-rule-evaluator",
     "khive-changeset",
     "khive-score",
     "khive-quant",

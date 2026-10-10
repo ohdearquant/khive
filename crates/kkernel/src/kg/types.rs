@@ -441,26 +441,7 @@ pub struct ValidationReport {
     pub summary: ValidationSummary,
 }
 
-/// Result for a single validation rule in a `kkernel kg validate` run.
-#[derive(Debug, Serialize)]
-pub struct RuleResult {
-    pub id: String,
-    pub severity: &'static str,
-    pub passed: bool,
-    pub violations: Vec<Violation>,
-}
-
-/// A single rule violation with location metadata and a fixability flag.
-#[derive(Debug, Serialize)]
-pub struct Violation {
-    pub entity_id: Option<String>,
-    pub entity_name: Option<String>,
-    pub entity_kind: Option<String>,
-    pub rule_id: String,
-    pub severity: &'static str,
-    pub message: String,
-    pub fixable: bool,
-}
+pub use khive_rule_evaluator::{RuleResult, Violation};
 
 /// Aggregate counts from a `kkernel kg validate` run.
 #[derive(Debug, Serialize)]

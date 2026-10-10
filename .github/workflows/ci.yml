@@ -924,6 +924,68 @@ jobs:
           fi
           echo "$actual_output"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Rule evaluator wasm32 compile check (ADR-101 D5)
+        run: cargo check --locked -p khive-rule-evaluator --target wasm32-unknown-unknown
+      - name: Rule evaluator native suite and result transcripts
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-native.log
+      - name: Rule evaluator wasm32-wasip1 suite and result transcripts
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator --target wasm32-wasip1 -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-wasm.log
+      - name: Assert full rule-result bytes match on native and wasm32
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          prefix = "RULE_EVALUATOR_GOLDEN:"
+          expected = {"full", "partial"}
+
+          def transcripts(log):
+              rows = [line for line in log.splitlines() if line.startswith(prefix)]
+              if len(rows) != 2:
+                  raise ValueError("expected exactly two nonempty result transcripts")
+              values = {}
+              for line in rows:
+                  label, payload = line[len(prefix):].split(":", 1)
+                  if label in values or label not in expected:
+                      raise ValueError("duplicate or unexpected result transcript")
+                  decoded = json.loads(payload)
+                  if not isinstance(decoded, list) or not decoded:
+                      raise ValueError("empty or invalid result transcript")
+                  values[label] = payload
+              if set(values) != expected:
+                  raise ValueError("missing named result transcript")
+              return values
+
+          def compare(native, wasm):
+              if transcripts(native) != transcripts(wasm):
+                  raise ValueError("native and wasm32 rule-result bytes differ")
+
+          native = Path("/tmp/rules-native.log").read_text()
+          wasm = Path("/tmp/rules-wasm.log").read_text()
+          compare(native, wasm)
+          # Comparator controls: status-only, missing and two-empty captures
+          # must never make a parity gate vacuously pass.
+          changed = native.replace('"passed":false', '"passed":true', 1)
+          if changed == native:
+              raise ValueError("fixture lost its failing-rule positive control")
+          missing = "\n".join(line for line in native.splitlines()
+                              if not line.startswith(prefix + "partial:"))
+          for left, right in [(native, changed), (native, missing), ("", "")]:
+              try:
+                  compare(left, right)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError("parity comparator accepted a negative control")
+          print("native and wasm32: two complete rule-result JSON transcripts match")
+          PY
+
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown
       # ADR-101 D5 requires CI to run the SAME test suite against native and

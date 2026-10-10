@@ -48,6 +48,7 @@ cd "$SCRIPT_DIR/../crates"
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
     khive-types
+    khive-rule-evaluator # pure rules; needs khive-types, used by kkernel
     khive-score
     khive-quant
     khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first
