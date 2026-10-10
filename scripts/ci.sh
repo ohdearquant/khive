@@ -111,6 +111,14 @@ phase_no_stubs_scan() {
     # Locks in the scanner's own fixture coverage so a future parser change
     # cannot silently regress it without the fixtures ever running in CI.
     sh "$SCRIPT_DIR/lint-stub-markers.sh" --self-test
+
+    echo "=== Source File Size Cap (line cap with a shrink-only allow-list) ==="
+    # Runs in this phase so every lane that runs the stub scan, both suites and
+    # every shard, runs the cap too, and before any cargo phase like the scan.
+    sh "$SCRIPT_DIR/lint-source-file-size.sh"
+
+    echo "=== Source File Size Cap self-test ==="
+    sh "$SCRIPT_DIR/lint-source-file-size.sh" --self-test
 }
 
 phase_no_stubs() {
