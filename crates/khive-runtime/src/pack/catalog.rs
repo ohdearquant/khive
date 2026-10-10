@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::context::ContextContributor;
 use crate::error::RuntimeError;
 use crate::operations::{LinkSpec, Resolved};
 use crate::runtime::NamespaceToken;
@@ -426,6 +427,13 @@ impl VerbRegistry {
             .iter()
             .flat_map(|pack| select(pack.as_ref()))
             .collect()
+    }
+
+    /// Optional context sources in the registry's topological pack order.
+    ///
+    /// Omits packs returning `None`, without caching, deduplicating or invoking contributors.
+    pub fn context_contributors(&self) -> Vec<Arc<dyn ContextContributor>> {
+        self.collect_pack_items(|pack| pack.context_contributor())
     }
 
     /// All pack-declared edge endpoint rules across registered packs.

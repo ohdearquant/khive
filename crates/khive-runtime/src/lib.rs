@@ -22,6 +22,7 @@ pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
+pub mod context;
 pub mod cost_unit;
 pub mod credentials;
 mod visibility_receipts;
@@ -98,6 +99,8 @@ pub use streams::{
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
+
+pub use context::{ContextContributor, ContextRequest, ContextSlice, ScoreSemantics};
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use agent_lifecycle::{

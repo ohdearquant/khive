@@ -49,6 +49,36 @@ row, or provenance record and leaving the draft and its review history unchanged
 kinds keep their default admission, and this seam never narrows what shared `create` already
 accepts, only what the proposal route accepts.
 
+## context_contributor
+
+`PackRuntime::context_contributor` defaults to `None`. A pack may return an instance-owned
+`Arc<dyn ContextContributor>`; `VerbRegistry::context_contributors` collects these capabilities
+in the registry's topological pack order, omitting `None` without deduplicating or caching them.
+Discovery calls the accessor only: it does not invoke `contribute` or dispatch a verb.
+
+```ignore
+fn context_contributor(&self) -> Option<Arc<dyn ContextContributor>> {
+    Some(self.context_source.clone())
+}
+```
+
+`ContextContributor::contribute` borrows a `ContextRequest` and the caller's authorized
+`NamespaceToken`, returning owned `ContextSlice` records or the original `RuntimeError`.
+Implementations must honor token visibility and release all read snapshots before returning.
+The request owns its query, entity IDs, consumer kind and relation filters; its traversal
+fields use the existing `Direction` vocabulary. The type supplies no defaults, parsing,
+clamping or profile resolution. `budget_hint` is advisory for the total assembly, not a
+per-contributor allocation.
+
+A slice owns its kind, ID and JSON content and carries static pack attribution. Scores retain
+source-partition semantics: `decay_weighted`, `rerank`, `graph_proximity`, `relevance` or `none`.
+A score is optional and is neither normalized nor made comparable across packs. Slice and score
+semantics support serialization; they do not introduce a request wire parser.
+
+This is the capability foundation requested by #4735 under Proposed ADR-092. No composer,
+contributor implementation, context verb, profile consumer, timeout, budget allocator or
+serve-ledger integration is activated by this API.
+
 ## brain_consumer_kinds
 
 Packs that request brain profile resolution declare their exact wire-level consumer values in
