@@ -69,6 +69,7 @@ CRATES=(
     khive-runtime
     khive-vcs-adapters
     khive-changeset      # needs khive-types (above)
+    khive-graph-diff     # needs khive-types (above); pure graph-state diff
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
