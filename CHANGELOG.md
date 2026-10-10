@@ -123,6 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
+- Finding create/update and findings-file ingestion mask credential-shaped rejected enum values
+  while retaining ordinary values, error kinds, and accepted-value lists (Refs #4585).
 
 ### Breaking (Rust crates)
 
