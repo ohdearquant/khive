@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
+  `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
+  constructors must supply it. Recall handlers supply zero pending graph gathering,
+  default weights remain empty, and rerank provenance records the recognized feature.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
