@@ -12,7 +12,10 @@ use uuid::Uuid;
 
 use khive_score::DeterministicScore;
 use khive_storage::entity::EntityTypeCounts;
-use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
+use khive_storage::graph::{
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    SymmetricEdgeUpdateRequest,
+};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
@@ -34,8 +37,6 @@ use khive_db::stores::graph::{
 };
 use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statements;
-use khive_db::{pool::RuntimeWriteOperation, SqliteError};
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod batch_edge_tests;
@@ -6779,22 +6780,6 @@ pub struct QueryResult {
     pub truncated: bool,
 }
 
-/// Outcome of [`KhiveRuntime::update_edge_symmetric_dml`]'s in-transaction DML.
-#[derive(Debug)]
-enum SymmetricEdgeUpdateOutcome {
-    /// A canonical row already existed (ADR-039 DO NOTHING): the
-    /// requested edge was deleted, the existing canonical row (this id)
-    /// left untouched.
-    Absorbed(String),
-    /// No conflict; the requested edge was updated in place.
-    Updated,
-    /// No conflict, but the in-place `UPDATE` matched zero rows because
-    /// the row's revision or deletion marker moved after it was fetched —
-    /// a concurrent writer raced this update and must be refused, not
-    /// silently overwritten by a stale full-row write.
-    Stale,
-}
-
 impl KhiveRuntime {
     // ---- Query operations ----
 
@@ -7671,135 +7656,6 @@ impl KhiveRuntime {
         }
     }
 
-    /// DML-only body of the symmetric-relation conflict-resolution path in
-    /// [`Self::update_edge`]. Runs the conflict-check SELECT, then either the
-    /// DELETE+UPDATE (case b, a canonical row already exists) or the
-    /// in-place UPDATE (case a, no conflict). Callers own the surrounding transaction
-    /// boundary — this function issues DML only, no `BEGIN`/`COMMIT`/`ROLLBACK`.
-    ///
-    /// The in-place update is guarded on the fetched snapshot's revision and
-    /// deletion marker (mirrors the non-symmetric `replace_edge_if_unchanged`
-    /// guard) and requires the replacement revision to strictly advance.
-    /// Shares its DML text with the atomic `prepare_update_edge` symmetric
-    /// branch — see docs/operations.md#update_edge_symmetric_dml.
-    #[allow(clippy::too_many_arguments)]
-    fn update_edge_symmetric_dml(
-        conn: &rusqlite::Connection,
-        ns: &str,
-        edge_id_str: &str,
-        canon_src_str: &str,
-        canon_tgt_str: &str,
-        relation_str: &str,
-        weight: f64,
-        metadata: Option<String>,
-        expected_updated_at_micros: i64,
-        expected_deleted_at_micros: Option<i64>,
-    ) -> Result<SymmetricEdgeUpdateOutcome, SqliteError> {
-        // `updated_at` is stored in MICROSECONDS on `graph_edges` (every other
-        // write path — `edge_upsert_statement`, `edge_soft_delete_statement` —
-        // uses `timestamp_micros()`; the column is read back via
-        // `micros_to_datetime`). `timestamp()` (seconds) here was a
-        // pre-existing bug in this raw-SQL path, found while unifying it with
-        // the atomic builder (which already used `timestamp_micros()`
-        // correctly).
-        //
-        // The replacement revision must strictly advance past the snapshot
-        // even when two operations land inside one clock microsecond;
-        // saturating to i64::MAX would let the CAS accept a write without
-        // advancing its revision, so that is not a valid fallback (mirrors
-        // the note path).
-        let minimum_updated_at_micros =
-            expected_updated_at_micros.checked_add(1).ok_or_else(|| {
-                SqliteError::InvalidData(format!(
-                    "update_edge: edge {edge_id_str} updated_at is already at i64::MAX \
-                         and cannot advance"
-                ))
-            })?;
-        let now_ts = chrono::Utc::now()
-            .timestamp_micros()
-            .max(minimum_updated_at_micros);
-
-        // Check for a conflicting canonical row (same namespace + natural key,
-        // different id). This catches conflicts whether or not endpoints were flipped.
-        let conflict_id: Option<String> = conn
-            .query_row(
-                khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
-                rusqlite::params![
-                    &ns,
-                    &canon_src_str,
-                    &canon_tgt_str,
-                    &relation_str,
-                    &edge_id_str
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(SqliteError::Rusqlite)?;
-
-        if let Some(existing_id) = conflict_id {
-            // Case (b): canonical row already exists — ADR-039's edge-conflict
-            // contract is ON CONFLICT DO NOTHING: drop the non-canonical edge
-            // and leave the existing canonical row untouched (live or
-            // tombstoned). Refreshing it from the discarded edge's
-            // weight/target_backend/metadata and forcing deleted_at = NULL
-            // would silently overwrite the survivor and resurrect a
-            // tombstone — the same defect already fixed on the merge-rewire
-            // path (`merge_entity_sql`/`merge_note_sql`); this path binds the
-            // same shared `EDGE_SYMMETRIC_*_SQL` text and must honor the same
-            // contract. Return the surviving id unchanged so the caller
-            // re-fetches its real (unmodified) attributes.
-            //
-            // Guarded on the fetched snapshot's revision and deletion marker:
-            // a concurrent writer that changed this edge between fetch and
-            // this write must be refused, not silently deleted just because
-            // a canonical survivor happens to exist. Zero affected rows here
-            // means stale, not "no conflict" — the probe above already
-            // confirmed a conflicting canonical row exists.
-            let affected = conn
-                .execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL,
-                    rusqlite::params![
-                        &ns,
-                        &edge_id_str,
-                        expected_updated_at_micros,
-                        expected_deleted_at_micros,
-                    ],
-                )
-                .map_err(SqliteError::Rusqlite)?;
-            if affected == 0 {
-                return Ok(SymmetricEdgeUpdateOutcome::Stale);
-            }
-            Ok(SymmetricEdgeUpdateOutcome::Absorbed(existing_id))
-        } else {
-            // Case (a): no conflict — update source_id/target_id in-place,
-            // preserving the original edge UUID. Guarded on the fetched
-            // snapshot's revision and deletion marker: a concurrent writer
-            // that moved this edge between fetch and this write must be
-            // refused, not silently overwritten by a stale full-row update.
-            let affected = conn
-                .execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
-                    rusqlite::params![
-                        &canon_src_str,
-                        &canon_tgt_str,
-                        &relation_str,
-                        weight,
-                        now_ts,
-                        metadata,
-                        &ns,
-                        &edge_id_str,
-                        expected_updated_at_micros,
-                        expected_deleted_at_micros,
-                    ],
-                )
-                .map_err(SqliteError::Rusqlite)?;
-            if affected == 0 {
-                return Ok(SymmetricEdgeUpdateOutcome::Stale);
-            }
-            Ok(SymmetricEdgeUpdateOutcome::Updated)
-        }
-    }
-
     /// Patch-style edge update. Only `Some(_)` fields are applied.
     ///
     /// When `relation` is `Some(new_rel)`, validates that the edge's existing endpoints
@@ -7870,7 +7726,7 @@ impl KhiveRuntime {
         // For symmetric relations, canonicalise endpoint order and check
         // for natural-key conflicts regardless of whether endpoints were flipped.
         //
-        // The raw-SQL path is used for ALL symmetric relations because `upsert_edge`
+        // The guarded graph operation is used for ALL symmetric relations because `upsert_edge`
         // resolves ON CONFLICT(namespace,id) first and cannot detect a duplicate at
         // the natural key (namespace, source_id, target_id, relation) with a different
         // id. Bug-fix: this path must also run when endpoints are already canonical
@@ -7880,77 +7736,19 @@ impl KhiveRuntime {
             canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
 
         if edge.relation.is_symmetric() {
-            // Raw-SQL path (mirrors merge_entity_sql).
-            // Use record_ns (the stored edge namespace) — NOT token.namespace() — so that
-            // WHERE namespace = ?N predicates match the actual row.
-            let ns = record_ns.clone();
-            let edge_id_str = edge_id.to_string();
-            let relation_str = edge.relation.to_string();
-            let canon_src_str = canon_src.to_string();
-            let canon_tgt_str = canon_tgt.to_string();
-            let weight = edge.weight;
-            let metadata = edge
-                .metadata
-                .as_ref()
-                .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-            let expected_updated_at_micros = expected_updated_at.timestamp_micros();
-            let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
-
-            let pool = self.backend().pool_arc();
-            let writer_task = pool
-                .writer_task_for_runtime_write(RuntimeWriteOperation::UpdateSymmetricEdge)
-                .map_err(RuntimeError::Storage)?;
-
-            let outcome: SymmetricEdgeUpdateOutcome = if let Some(writer_task) = writer_task {
-                writer_task
-                    .send(move |conn| {
-                        Self::update_edge_symmetric_dml(
-                            conn,
-                            &ns,
-                            &edge_id_str,
-                            &canon_src_str,
-                            &canon_tgt_str,
-                            &relation_str,
-                            weight,
-                            metadata,
-                            expected_updated_at_micros,
-                            expected_deleted_at_micros,
-                        )
-                        .map_err(|e| {
-                            khive_storage::StorageError::driver(
-                                khive_storage::StorageCapability::Graph,
-                                "update_edge",
-                                e,
-                            )
-                        })
-                    })
-                    .await
-                    .map_err(RuntimeError::Storage)?
-            } else {
-                tokio::task::spawn_blocking(move || {
-                    let guard = pool.writer()?;
-                    guard.transaction(|conn| {
-                        Self::update_edge_symmetric_dml(
-                            conn,
-                            &ns,
-                            &edge_id_str,
-                            &canon_src_str,
-                            &canon_tgt_str,
-                            &relation_str,
-                            weight,
-                            metadata,
-                            expected_updated_at_micros,
-                            expected_deleted_at_micros,
-                        )
-                    })
+            let outcome = graph
+                .update_symmetric_edge_if_unchanged(SymmetricEdgeUpdateRequest {
+                    namespace: record_ns.clone(),
+                    id: edge_id.into(),
+                    source_id: canon_src,
+                    target_id: canon_tgt,
+                    relation: edge.relation,
+                    weight: edge.weight,
+                    metadata: edge.metadata.clone(),
+                    expected_updated_at_micros: expected_updated_at.timestamp_micros(),
+                    expected_deleted_at_micros: expected_deleted_at.map(|v| v.timestamp_micros()),
                 })
-                .await
-                .map_err(|e| {
-                    RuntimeError::Internal(format!("update_edge: spawn_blocking join: {e}"))
-                })?
-                .map_err(RuntimeError::from)?
-            };
+                .await?;
 
             match outcome {
                 SymmetricEdgeUpdateOutcome::Absorbed(sid) => {

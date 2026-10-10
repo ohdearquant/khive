@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept ADR-037 configuration-bound namespace and project-root rules for remote
   cached-entity reads, preserving origin and refusing remote mutations. The read
   remains unimplemented.
+- Accept ADR-035 embedding pipeline configuration, legacy-key compatibility and
+  import strictness rules, with an ADR-001 companion distinguishing explicit import
+  from VCS snapshot degradation; edge relations remain closed. The configuration
+  remains unimplemented.
 
 ### Added
 
@@ -52,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default to disabled; the separately default-enabled backfill flag keeps its existing parser.
   Session maintenance uses shared typed SQL row accessors while preserving its error messages
   and rejection of negative counts.
+- MCP configuration fingerprinting and verb catalog helpers now live together in the server
+  config module, preserving public entry points, daemon identity values, and catalog output.
+- Extract blob garbage-collection ownership and database lock handling into a
+  private module while retaining the existing public API and lock behavior.
 
 ### Fixed
 
@@ -122,6 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Invalid required fields, unknown statuses and invalid non-NULL optional dimensions/UUIDs
   are skipped with a warning. Existing optional timestamp decoding still maps non-integers
   to `None`; reads never fabricate missing identity or lifecycle history.
+- Symmetric-edge runtime updates now use the guarded `GraphStore` capability. Direct-fallback
+  backend failures carry `graph`/`update_edge` operation context, and blocking-task join failures
+  return `RuntimeError::Storage` instead of `Internal`; reasons and rendered prefixes on those paths
+  change. Concrete causes and writer-settlement distinctions are retained. Backends without the new
+  transaction method explicitly return `Unsupported`.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
