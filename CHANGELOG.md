@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config module, preserving public entry points, daemon identity values, and catalog output.
 - Extract blob garbage-collection ownership and database lock handling into a
   private module while retaining the existing public API and lock behavior.
+- `khive-db` moves checkpoint escalation and transaction-age state into a dedicated
+  module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
+- Extract runtime daemon wire frames and framing into a private module while preserving public paths,
+  protocol constants, error normalization, and source-reader coverage.
 
 ### Fixed
 
@@ -77,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
+- Pack-version regressions compare each linked pack with its factory's declared version and cover
+  independent factory versions through the production JSON and human list formatter (#5086).
 
 ### Breaking (Rust crates)
 
@@ -146,6 +152,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `unidentified_candidates`. Direct constructors and exhaustive destructurings
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
+- `khive-storage` adds `StorageError::SqliteWrite` and `khive-db` adds
+  `SqliteError::{Write, WriteSettlementUnknown}`, carrying native SQLite write evidence
+  (`SqliteWriteFailure`: stage, primary and extended codes, settlement flag). Exhaustive matches
+  must handle the new variants, `SqliteWriteFailure` literals must include every field, and
+  `EventsResponse::Error` literals need the new optional `sqlite_write_failure` field. On the
+  wire, a native `BEGIN` refusal now reports `code`/`stage` `sqlite_begin_busy` instead of
+  `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
+  `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
+  `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
 
 ## [0.11.0] - 2026-10-08
 
