@@ -2163,6 +2163,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-graph-diff"
+version = "0.11.0"
+dependencies = [
+ "khive-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "khive-hnsw"
 version = "0.11.0"
 dependencies = [

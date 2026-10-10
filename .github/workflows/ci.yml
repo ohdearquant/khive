@@ -956,6 +956,53 @@ jobs:
           fi
           echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
 
+      # Pure graph-state diff uses the same native/WASM suite, plus a separate
+      # nocapture invocation of its golden fixture for actual result-byte parity.
+      - name: Graph diff wasm32-unknown-unknown build (ADR-101 D5)
+        run: cargo build --locked -p khive-graph-diff --target wasm32-unknown-unknown
+      - name: Graph diff native suite and golden bytes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff -- --test-threads=1 2>&1 | tee /tmp/graph-diff-native.log
+          cargo test --locked -p khive-graph-diff --test graph_diff parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/graph-diff-native-golden.log
+      - name: Graph diff wasm32-wasip1 suite and golden bytes
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 -- --test-threads=1 2>&1 | tee /tmp/graph-diff-wasm.log
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/graph-diff-wasm-golden.log
+      - name: Assert graph diff suite and result-byte parity
+        run: |
+          set -euo pipefail
+          for platform in native wasm; do
+            grep -E '^test .* \.\.\. (ok|FAILED)$' "/tmp/graph-diff-${platform}.log" | sort > "/tmp/graph-diff-${platform}.sorted"
+            test -s "/tmp/graph-diff-${platform}.sorted"
+            grep '^GRAPH_DIFF_PARITY:' "/tmp/graph-diff-${platform}-golden.log" > "/tmp/graph-diff-${platform}.bytes"
+          done
+          diff -u /tmp/graph-diff-native.sorted /tmp/graph-diff-wasm.sorted
+          assert_graph_diff_bytes() {
+            test "$(wc -l < "$1")" -eq 2 || return 1
+            test "$(wc -l < "$2")" -eq 2 || return 1
+            cmp -s "$1" "$2"
+          }
+          assert_graph_diff_bytes /tmp/graph-diff-native.bytes /tmp/graph-diff-wasm.bytes
+          # The exact comparator used above must reject changed result bytes,
+          # missing fixtures and a vacuous pair of empty transcripts.
+          sed '1s/$/ /' /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-mutated.bytes
+          head -n 1 /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-missing.bytes
+          : > /tmp/graph-diff-empty.bytes
+          for invalid in mutated missing empty; do
+            if assert_graph_diff_bytes /tmp/graph-diff-native.bytes "/tmp/graph-diff-${invalid}.bytes"; then
+              echo "graph diff parity accepted ${invalid} fixture bytes" >&2
+              exit 1
+            fi
+          done
+          if assert_graph_diff_bytes /tmp/graph-diff-empty.bytes /tmp/graph-diff-empty.bytes; then
+            echo "graph diff parity accepted empty fixture transcripts" >&2
+            exit 1
+          fi
+
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
     needs: resolve-revision
