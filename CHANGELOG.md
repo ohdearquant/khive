@@ -181,6 +181,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return `RuntimeError::Storage` instead of `Internal`; reasons and rendered prefixes on those paths
   change. Concrete causes and writer-settlement distinctions are retained. Backends without the new
   transaction method explicitly return `Unsupported`.
+- `khive_runtime::AtomicOpPlan` adds `FinalizeEntity` for runtime-owned entity admission.
+  Downstream exhaustive matches must handle the new variant. Its plan has no public constructor;
+  direct ingest uses `EntityCandidateContext` and `try_commit_manifest_entity_candidate`.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
@@ -201,6 +204,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
   `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
   `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
+
+### Fixed
+
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
+### Changed
+
+- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
+  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
+  attachments and exemption audit commit together. Production manifests remain empty; non-empty
+  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ## [0.11.0] - 2026-10-08
 

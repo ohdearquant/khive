@@ -35,7 +35,9 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
-use khive_runtime::{entity_fts_document, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
+#[cfg(test)]
+use khive_runtime::entity_fts_document;
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::SqlStatement;
 use khive_storage::{Direction, Edge, Entity, LinkId, NeighborQuery};
 use khive_types::EdgeRelation;
@@ -47,6 +49,14 @@ use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 use crate::safe_source::{self, SourceReadError};
+
+mod direct_entity;
+#[cfg(test)]
+use direct_entity::gate_check;
+use direct_entity::{
+    advancing_entity_revision, candidate_context, gate_check_with_context, mutate_entity,
+    mutate_entity_with_context,
+};
 
 mod file_pending;
 use file_pending::{stamp_l2_declarations, FileReference};
@@ -752,28 +762,6 @@ async fn get_entity_opt(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))
 }
 
-/// Runs the runtime secret gate over `entity`'s name, description, and
-/// properties, the same content the gate checks for every other write
-/// (ADR-085 D6 #4). The direct storage-layer call `upsert_entity` wraps does
-/// not run this check on its own path, so callers of this pipeline get no
-/// gate coverage unless it happens here.
-///
-/// `description` is checked because L2 symbols store their exact
-/// documentation text there — L1/L1.5 entities
-/// never set `description`, so this is additive and does not change their
-/// gate coverage.
-fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
-    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
-    secret_gate::check_at(&entity.name, "entity", "name")?;
-    if let Some(description) = &entity.description {
-        secret_gate::check_at(description, "entity", "description")?;
-    }
-    if let Some(properties) = &entity.properties {
-        secret_gate::check_json_at(properties, "entity", "properties")?;
-    }
-    Ok(())
-}
-
 const MAX_ROW_REBASE_ATTEMPTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,55 +778,6 @@ impl RowMutationOutcome {
     }
 }
 
-fn gate_allows_entity(
-    entity: &Entity,
-    file: &str,
-    report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    if let Err(err) = gate_check(entity) {
-        return match err {
-            RuntimeError::SecretDetected(secret) => {
-                report.blocked_count += 1;
-                report.blocked.push(BlockedWrite {
-                    file: file.to_string(),
-                    detector: secret.detector.to_string(),
-                    masked_excerpt: secret.masked,
-                });
-                Ok(false)
-            }
-            other => Err(other.into()),
-        };
-    }
-    Ok(true)
-}
-
-async fn index_entity(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    entity: &Entity,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    rt.text(token)?
-        .upsert_document(entity_fts_document(entity))
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
-    #[cfg(test)]
-    l2_batch_tests::observe_fts_write(entity.id);
-    #[cfg(test)]
-    l2_recovery_tests::observe_fts_write();
-    report.fts_indexed += 1;
-    Ok(())
-}
-
-fn advancing_entity_revision(requested: i64, current: i64) -> Result<i64, CodeSourceIngestError> {
-    let minimum = current.checked_add(1).ok_or_else(|| {
-        CodeSourceIngestError::Storage(format!(
-            "entity revision {current} cannot advance past i64::MAX"
-        ))
-    })?;
-    Ok(requested.max(minimum))
-}
-
 fn advancing_edge_revision(
     requested: DateTime<Utc>,
     current: DateTime<Utc>,
@@ -853,83 +792,6 @@ fn advancing_edge_revision(
     DateTime::from_timestamp_micros(micros).ok_or_else(|| {
         CodeSourceIngestError::Storage(format!("edge revision {micros} is out of range"))
     })
-}
-
-async fn mutate_entity<F>(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    id: Uuid,
-    file: &str,
-    report: &mut CodeSourceIngestReport,
-    mut apply: F,
-) -> Result<RowMutationOutcome, CodeSourceIngestError>
-where
-    F: FnMut(Option<&Entity>) -> Option<Entity>,
-{
-    let store = rt.entities(token)?;
-    for _ in 0..MAX_ROW_REBASE_ATTEMPTS {
-        let current = store
-            .get_entity_including_deleted(id)
-            .await
-            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-        #[cfg(test)]
-        l2_batch_tests::observe_row_read(id);
-        #[cfg(test)]
-        race_seam::pause_after_row_read().await;
-        #[cfg(test)]
-        l2_recovery_tests::after_entity_read(id).await;
-        let Some(mut replacement) = apply(current.as_ref()) else {
-            return Ok(RowMutationOutcome::Unchanged);
-        };
-        if replacement.id != id {
-            return Err(CodeSourceIngestError::Storage(format!(
-                "entity mutation for {id} produced replacement {}",
-                replacement.id
-            )));
-        }
-        replacement.deleted_at = None;
-        secret_gate::reject_reserved_secret_gate_property(replacement.properties.as_ref())?;
-
-        let outcome = if let Some(snapshot) = current.as_ref() {
-            replacement.created_at = snapshot.created_at;
-            replacement.version = snapshot.version;
-            replacement.updated_at =
-                advancing_entity_revision(replacement.updated_at, snapshot.updated_at)?;
-            if !gate_allows_entity(&replacement, file, report)? {
-                return Ok(RowMutationOutcome::Blocked);
-            }
-            store
-                .replace_entity_if_unchanged(
-                    replacement.clone(),
-                    snapshot.updated_at,
-                    snapshot.deleted_at,
-                )
-                .await
-                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                .then_some(RowMutationOutcome::Updated)
-        } else {
-            if !gate_allows_entity(&replacement, file, report)? {
-                return Ok(RowMutationOutcome::Blocked);
-            }
-            store
-                .insert_entity_if_absent(replacement.clone())
-                .await
-                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                .then_some(RowMutationOutcome::Created)
-        };
-
-        if let Some(outcome) = outcome {
-            #[cfg(test)]
-            l2_batch_tests::observe_row_write(id);
-            #[cfg(test)]
-            l2_recovery_tests::after_entity_commit(&replacement);
-            index_entity(rt, token, &replacement, report).await?;
-            return Ok(outcome);
-        }
-    }
-    Err(CodeSourceIngestError::Storage(format!(
-        "entity {id} changed during all {MAX_ROW_REBASE_ATTEMPTS} code-map rebase attempts"
-    )))
 }
 
 async fn mutate_edge<F>(
@@ -1336,7 +1198,8 @@ async fn record_unresolved_batch(
     // mutation used to be refused before any of them could write. Keep that
     // per-item report behavior without rebuilding and rechecking the growing
     // list K times.
-    if let Err(error) = gate_check(&current) {
+    let context = candidate_context(token.namespace().as_str());
+    if let Err(error) = gate_check_with_context(&context, &current) {
         match error {
             RuntimeError::SecretDetected(secret) => {
                 for item in pending {
@@ -1360,7 +1223,7 @@ async fn record_unresolved_batch(
             continue;
         }
         let candidate = serde_json::to_value(&item.spec).expect("serializes");
-        match secret_gate::check_json_at(&candidate, "entity", "properties") {
+        match context.check_properties(Some(&candidate)) {
             Ok(()) => {
                 staged_seen.insert(item.spec.clone());
                 allowed.push(item);
@@ -1380,36 +1243,44 @@ async fn record_unresolved_batch(
         return Ok(());
     };
     let mut appended = 0usize;
-    let outcome = mutate_entity(rt, token, entity_id, &first.file, report, |current| {
-        let mut entity = current?.clone();
-        let mut list = entity
-            .properties
-            .as_ref()
-            .map(read_unresolved)
-            .unwrap_or_default();
-        let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
-        appended = 0;
-        for item in &allowed {
-            if seen.insert(item.spec.clone()) {
-                list.push(item.spec.clone());
-                appended += 1;
+    let outcome = mutate_entity_with_context(
+        rt,
+        token,
+        &context,
+        entity_id,
+        &first.file,
+        report,
+        |current| {
+            let mut entity = current?.clone();
+            let mut list = entity
+                .properties
+                .as_ref()
+                .map(read_unresolved)
+                .unwrap_or_default();
+            let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
+            appended = 0;
+            for item in &allowed {
+                if seen.insert(item.spec.clone()) {
+                    list.push(item.spec.clone());
+                    appended += 1;
+                }
             }
-        }
-        if appended == 0 {
-            return None;
-        }
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(
-            "unresolved_specifiers".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
+            if appended == 0 {
+                return None;
+            }
+            let mut props = entity
+                .properties
+                .clone()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            props.insert(
+                "unresolved_specifiers".into(),
+                serde_json::to_value(&list).expect("serializes"),
+            );
+            entity.properties = Some(Value::Object(props));
+            Some(entity)
+        },
+    )
     .await?;
     if outcome.wrote() {
         report.unresolved_recorded += appended as u64;
@@ -3408,7 +3279,8 @@ where
         return Ok(false);
     }
     advancing_entity_revision(current.updated_at, current.updated_at)?;
-    if let Err(error) = gate_check(&current) {
+    let context = candidate_context(token.namespace().as_str());
+    if let Err(error) = gate_check_with_context(&context, &current) {
         match error {
             RuntimeError::SecretDetected(secret) => {
                 for item in pending
@@ -3438,11 +3310,9 @@ where
             occurrences.push(item);
             continue;
         }
-        match secret_gate::check_json_at(
+        match context.check_properties(Some(
             &serde_json::to_value(&item.value).expect("serializes"),
-            "entity",
-            "properties",
-        ) {
+        )) {
             Ok(()) => {
                 seen.insert(item.value.clone());
                 allowed.push(item.value.clone());
@@ -3465,29 +3335,37 @@ where
     #[cfg(test)]
     l2_batch_tests::pause_before_batch().await;
     let mut attempted_files = Vec::new();
-    let outcome = mutate_entity(rt, token, id, &pending[0].file, report, |current| {
-        attempted_files.clear();
-        let mut entity = current?.clone();
-        let mut list = read_list(&entity);
-        let present: HashSet<T> = list.iter().cloned().collect();
-        attempted_files.extend(
-            occurrences
-                .iter()
-                .filter(|item| !present.contains(&item.value))
-                .map(|item| item.file.clone()),
-        );
-        if append_l2_pending(&mut list, &allowed) == 0 {
-            return None;
-        }
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
+    let outcome = mutate_entity_with_context(
+        rt,
+        token,
+        &context,
+        id,
+        &pending[0].file,
+        report,
+        |current| {
+            attempted_files.clear();
+            let mut entity = current?.clone();
+            let mut list = read_list(&entity);
+            let present: HashSet<T> = list.iter().cloned().collect();
+            attempted_files.extend(
+                occurrences
+                    .iter()
+                    .filter(|item| !present.contains(&item.value))
+                    .map(|item| item.file.clone()),
+            );
+            if append_l2_pending(&mut list, &allowed) == 0 {
+                return None;
+            }
+            let mut props = entity
+                .properties
+                .clone()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
+            entity.properties = Some(Value::Object(props));
+            Some(entity)
+        },
+    )
     .await?;
     if outcome == RowMutationOutcome::Blocked {
         let refusal = report
@@ -4408,6 +4286,9 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 #[cfg(test)]
 #[path = "source_ingest/owner_alias_tests.rs"]
 mod owner_alias_tests;
+
+#[cfg(test)]
+mod direct_entity_tests;
 
 #[cfg(test)]
 #[path = "source_ingest/reresolve_projection_tests.rs"]

@@ -9,6 +9,26 @@ use super::{
     SqlStatement, SqlValue, SqliteError, SubstrateKind, Uuid, Value,
 };
 
+use crate::secret_gate_finalizer::entity_admission::{
+    EntityAdmission, OrdinaryEntityUpdateContext,
+};
+use crate::EntityCandidateMutation;
+
+#[derive(Clone, Copy)]
+enum EntityUpdateRoute<'a> {
+    ReservationOnly,
+    OrdinaryConstructor(&'a OrdinaryEntityUpdateContext),
+}
+
+struct PreparedEntityUpdate {
+    entity: Entity,
+    reindex_required: bool,
+    changed_fields: Vec<&'static str>,
+    expected_updated_at: i64,
+    expected_deleted_at: Option<i64>,
+    original: Entity,
+}
+
 impl KhiveRuntime {
     /// Patch-style entity update.
     ///
@@ -39,6 +59,34 @@ impl KhiveRuntime {
         expected: Option<&Entity>,
         remove_properties: &[&str],
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
+        let prepared = self
+            .prepare_entity_update_for_route(
+                token,
+                id,
+                patch,
+                expected,
+                remove_properties,
+                EntityUpdateRoute::ReservationOnly,
+            )
+            .await?;
+        Ok((
+            prepared.entity,
+            prepared.reindex_required,
+            prepared.changed_fields,
+            prepared.expected_updated_at,
+            prepared.expected_deleted_at,
+        ))
+    }
+
+    async fn prepare_entity_update_for_route(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        expected: Option<&Entity>,
+        remove_properties: &[&str],
+        route: EntityUpdateRoute<'_>,
+    ) -> RuntimeResult<PreparedEntityUpdate> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if !remove_properties.is_empty() {
             let removals = Value::Object(
@@ -49,17 +97,29 @@ impl KhiveRuntime {
             );
             crate::secret_gate::reject_reserved_secret_gate_property(Some(&removals))?;
         }
-        if let Some(ref name) = patch.name {
-            crate::secret_gate::check_at(name, "entity", "name")?;
-        }
-        if let Some(Some(ref desc)) = patch.description {
-            crate::secret_gate::check_at(desc, "entity", "description")?;
-        }
-        if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json_at(props, "entity", "properties")?;
-        }
-        if let Some(ref tags) = patch.tags {
-            crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
+        if matches!(route, EntityUpdateRoute::ReservationOnly) {
+            if let Some(ref name) = patch.name {
+                crate::secret_gate::check_at(name, "entity", "name")?;
+            }
+            if let Some(Some(ref desc)) = patch.description {
+                crate::secret_gate::check_at(desc, "entity", "description")?;
+            }
+            if let Some(ref props) = patch.properties {
+                crate::secret_gate::check_json_at(props, "entity", "properties")?;
+            }
+            if let Some(ref tags) = patch.tags {
+                crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
+            }
+        } else if let EntityUpdateRoute::OrdinaryConstructor(context) = route {
+            context.check_patch(
+                patch.name.as_deref(),
+                patch
+                    .description
+                    .as_ref()
+                    .and_then(|value| value.as_deref()),
+                patch.properties.as_ref(),
+                patch.tags.as_deref(),
+            )?;
         }
         let store = self.entities(token)?;
         let mut entity = store.get_entity(id).await?.ok_or_else(|| {
@@ -78,6 +138,7 @@ impl KhiveRuntime {
                 return Err(stale_entity_snapshot_error(id));
             }
         }
+        let original = entity.clone();
         let expected_updated_at = entity.updated_at;
         let expected_deleted_at = entity.deleted_at;
         #[cfg(test)]
@@ -141,13 +202,14 @@ impl KhiveRuntime {
         crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
 
         if expected.is_some() && changed_fields.is_empty() {
-            return Ok((
+            return Ok(PreparedEntityUpdate {
                 entity,
                 reindex_required,
                 changed_fields,
                 expected_updated_at,
                 expected_deleted_at,
-            ));
+                original,
+            });
         }
 
         // #2943: `entity.properties`, `entity.entity_type`, and `entity.tags`
@@ -176,13 +238,14 @@ impl KhiveRuntime {
         entity.updated_at = chrono::Utc::now()
             .timestamp_micros()
             .max(minimum_updated_at);
-        Ok((
+        Ok(PreparedEntityUpdate {
             entity,
             reindex_required,
             changed_fields,
             expected_updated_at,
             expected_deleted_at,
-        ))
+            original,
+        })
     }
 
     #[cfg(test)]
@@ -217,8 +280,83 @@ impl KhiveRuntime {
         expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         crate::entity_write::validate_expected_version(expected_version)?;
-        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-            self.prepare_update_entity(token, id, patch).await?;
+        let admission = OrdinaryEntityUpdateContext::capture(token);
+        let PreparedEntityUpdate {
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+            original,
+        } = self
+            .prepare_entity_update_for_route(
+                token,
+                id,
+                patch,
+                None,
+                &[],
+                EntityUpdateRoute::OrdinaryConstructor(&admission),
+            )
+            .await?;
+        let entity = match admission.admit(token, entity)? {
+            EntityAdmission::Legacy(entity) => entity,
+            EntityAdmission::Exempt(prepared) => {
+                use crate::atomic_plan::PostCommitEffect;
+                use crate::atomic_runner::{
+                    run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
+                };
+                let mut entity = prepared.entity().clone();
+                let next_version = original
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
+                let (mut required, report) = self
+                    .prepare_admitted_entity_indexes(token, &entity, &[], reindex_required)
+                    .await?;
+                required.extend(crate::atomic_prepare::event_append_statements(
+                    token, &entity.namespace, "update", EventKind::EntityUpdated,
+                    SubstrateKind::Entity, entity.id,
+                    serde_json::json!({"id": entity.id, "namespace": entity.namespace, "changed_fields": changed_fields}),
+                )?);
+                let plan = prepared.into_plan(
+                    EntityCandidateMutation::ReplaceIfUnchanged {
+                        expected: original,
+                        expected_version,
+                    },
+                    required,
+                    PostCommitEffect::None,
+                )?;
+                match run_atomic_unit(
+                    self.sql().as_ref(),
+                    vec![AtomicOpPlan::FinalizeEntity(Box::new(plan))],
+                )
+                .await
+                {
+                    Ok(AtomicRunOutcome::Committed { .. }) => {
+                        entity.version = next_version;
+                        return Ok((entity, report));
+                    }
+                    Ok(AtomicRunOutcome::RolledBack {
+                        failure: AtomicOpFailure::EntityConflict(conflict),
+                        ..
+                    }) => {
+                        return Err(conflict.into_error().into());
+                    }
+                    Ok(AtomicRunOutcome::RolledBack {
+                        failure: AtomicOpFailure::GuardFailed { .. },
+                        ..
+                    }) => {
+                        return Err(stale_entity_snapshot_error(id));
+                    }
+                    Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                        return Err(RuntimeError::Internal(format!(
+                            "entity update finalization rolled back: {failure:?}"
+                        )));
+                    }
+                    Err(error) => return Err(RuntimeError::Storage(error.0)),
+                }
+            }
+        };
 
         self.persist_prepared_entity_update(
             token,

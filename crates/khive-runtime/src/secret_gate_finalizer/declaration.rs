@@ -30,6 +30,8 @@ pub(crate) struct FinalizerEntryPoint {
     pub(crate) mutation: &'static str,
     pub(crate) substrate: Substrate,
     pub(crate) origins: &'static [&'static str],
+    /// Whether real runtime routes currently bind this constructor to storage.
+    pub(crate) wired: bool,
 }
 
 /// The complete, closed set of admission-capable finalizer entry points.
@@ -44,6 +46,7 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "create",
         substrate: Substrate::Entity,
         origins: &["runtime", "code.ingest"],
+        wired: true,
     },
     FinalizerEntryPoint {
         id: "entity.update",
@@ -51,6 +54,7 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "update",
         substrate: Substrate::Entity,
         origins: &["runtime", "code.ingest"],
+        wired: true,
     },
     FinalizerEntryPoint {
         id: "entity.bulk",
@@ -58,6 +62,7 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "bulk",
         substrate: Substrate::Entity,
         origins: &["runtime"],
+        wired: true,
     },
     FinalizerEntryPoint {
         id: "note.create",
@@ -65,6 +70,7 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "create",
         substrate: Substrate::Note,
         origins: &["runtime", "code.ingest"],
+        wired: false,
     },
     FinalizerEntryPoint {
         id: "note.update",
@@ -72,6 +78,7 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "update",
         substrate: Substrate::Note,
         origins: &["runtime", "code.ingest"],
+        wired: false,
     },
     FinalizerEntryPoint {
         id: "note.atomic_message",
@@ -79,11 +86,12 @@ pub(crate) const FINALIZER_ENTRY_POINTS: &[FinalizerEntryPoint] = &[
         mutation: "atomic message",
         substrate: Substrate::Note,
         origins: &["runtime"],
+        wired: false,
     },
 ];
 
-/// A source-level properties write. This inventory describes reservation
-/// coverage today; it grants no route stamp authority (ADR-115 Amendment 5).
+/// A source-level properties write. Stamp authority belongs only to the
+/// opaque finalized-candidate writer; legacy arms retain reservation checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct RouteInventoryEntry {
@@ -115,7 +123,7 @@ pub(crate) struct RuntimeTableWriteInventoryEntry {
 
 pub(crate) const RUNTIME_TABLE_WRITE_INVENTORY: &[RuntimeTableWriteInventoryEntry] = &[
     RuntimeTableWriteInventoryEntry {
-        site: "khive-runtime/src/atomic_message.rs::vector_insert_statements",
+        site: "khive-runtime/src/atomic_message.rs::vector_insert_statements_for_substrate",
         expected_writes: 1,
         properties_route: None,
     },
@@ -163,6 +171,8 @@ pub(crate) enum Reservation {
         file: &'static str,
     },
     ByConstruction,
+    /// The private constructor scanned the complete candidate before stamping.
+    FinalizedCandidate,
     PrivilegedEscape,
 }
 
@@ -181,6 +191,7 @@ pub(crate) enum TransactionOwner {
 #[allow(dead_code)]
 pub(crate) enum StampCapability {
     ReservationOnly,
+    AdmissionCapable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +206,19 @@ pub(crate) enum Acceptance {
 /// fails, rather than being inferred into this table.
 #[allow(dead_code)]
 pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
+    RouteInventoryEntry {
+        id: "runtime.finalized.entity",
+        site: "khive-runtime/src/secret_gate_finalizer/entity_transaction.rs::PreparedEntityExemption::into_plan",
+        expected_writes: 2,
+        target: Substrate::Entity,
+        write_class: WriteClass::WholeObject,
+        kind_policy: KindPolicy::SpecializedWriter,
+        reservation: Reservation::FinalizedCandidate,
+        transaction: TransactionOwner::RunAtomicUnit,
+        stamp: StampCapability::AdmissionCapable,
+        family: None,
+        acceptance: Acceptance::Test { path: "khive-runtime/src/secret_gate_finalizer/entity_route_tests.rs::declared_entity_routes_persist_stamp_and_one_exact_audit" },
+    },
     RouteInventoryEntry {
         id: "runtime.atomic.entity.create",
         site: "khive-runtime/src/atomic_prepare/add_update.rs::prepare_add_entity",
@@ -215,7 +239,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
-        reservation: Reservation::NamedCheck { function: "prepare_update_entity", file: "khive-runtime/src/operations.rs" },
+        reservation: Reservation::NamedCheck { function: "prepare_update_entity", file: "khive-runtime/src/curation/entity_curation.rs" },
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.update"),
@@ -223,7 +247,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.bulk.entity",
-        site: "khive-runtime/src/operations.rs::bulk_entity_plan",
+        site: "khive-runtime/src/operations/entity_bulk.rs::bulk_entity_plan",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
@@ -405,12 +429,12 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "code.source.mutate",
-        site: "khive-pack-code/src/source_ingest.rs::mutate_entity",
+        site: "khive-pack-code/src/source_ingest/direct_entity.rs::mutate_entity_with_context",
         expected_writes: 2,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
-        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        reservation: Reservation::NamedCheck { function: "try_commit_manifest_entity_candidate", file: "khive-runtime/src/secret_gate_finalizer/entity_direct.rs" },
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: None,
@@ -730,7 +754,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.claim_entity",
-        site: "khive-runtime/src/operations.rs::KhiveRuntime::claim_entity_if_absent",
+        site: "khive-runtime/src/operations/entity_create.rs::KhiveRuntime::claim_entity_if_absent",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
@@ -743,7 +767,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.create_entity_inner",
-        site: "khive-runtime/src/operations.rs::KhiveRuntime::create_entity_with_embedding_report_inner",
+        site: "khive-runtime/src/operations/entity_create.rs::KhiveRuntime::create_entity_with_embedding_report_inner",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
@@ -800,7 +824,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
-        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        reservation: Reservation::NamedCheck { function: "try_commit_manifest_entity_candidate", file: "khive-runtime/src/secret_gate_finalizer/entity_direct.rs" },
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.create"),

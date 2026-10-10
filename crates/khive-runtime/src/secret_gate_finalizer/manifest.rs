@@ -416,6 +416,13 @@ pub(crate) mod fixture {
     }
 
     impl TestOnlyManifestFixture {
+        pub(crate) fn for_scope(scope: RuntimeFieldScope) -> Self {
+            Self {
+                field_scope: scope,
+                ..Self::new()
+            }
+        }
+
         /// Builds one non-empty exact entry. The credential-shaped value is
         /// assembled at runtime from disjoint fragments — never stored as one
         /// contiguous secret-shaped literal in source.

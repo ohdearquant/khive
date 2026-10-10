@@ -10,7 +10,10 @@ fn one_write_route() -> RouteInventoryEntry {
             function: "reject_reserved_secret_gate_property",
             file: "khive-runtime/src/secret_gate.rs",
         },
-        ..ROUTE_INVENTORY[0]
+        ..*ROUTE_INVENTORY
+            .iter()
+            .find(|route| route.id == "runtime.atomic.entity.create")
+            .expect("entity create route keeps its Missing acceptance")
     }
 }
 

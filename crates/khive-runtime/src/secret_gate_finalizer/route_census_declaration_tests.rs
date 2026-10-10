@@ -21,7 +21,10 @@ fn both_properties_writes_pass_when_both_are_declared() {
             file: "khive-runtime/src/secret_gate.rs",
         },
         expected_writes: 2,
-        ..ROUTE_INVENTORY[0]
+        ..*ROUTE_INVENTORY
+            .iter()
+            .find(|route| route.id == "runtime.atomic.entity.create")
+            .expect("entity create route keeps its Missing acceptance")
     };
     let result = check_population(&population, &[row], &[], 1);
     assert!(
@@ -66,7 +69,10 @@ fn mapped_placeholder_rows() -> (RouteInventoryEntry, RuntimeTableWriteInventory
                 file: "khive-runtime/src/secret_gate.rs",
             },
             expected_writes: 1,
-            ..ROUTE_INVENTORY[0]
+            ..*ROUTE_INVENTORY
+                .iter()
+                .find(|route| route.id == "runtime.atomic.entity.create")
+                .expect("entity create route keeps its Missing acceptance")
         },
         RuntimeTableWriteInventoryEntry {
             site: "sample/src/lib.rs::write",
