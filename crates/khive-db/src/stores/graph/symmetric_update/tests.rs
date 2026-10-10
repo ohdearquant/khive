@@ -325,11 +325,26 @@ async fn failing_statement_side_effects_roll_back_on_both_writer_routes() {
         } else {
             error
         };
+        // The native write failure carries its SQLite stage and codes beside the driver error.
+        let StorageError::SqliteWrite { failure, source } = driver else {
+            panic!("expected staged native write failure, got {driver:?}")
+        };
+        assert_eq!(
+            failure.stage,
+            khive_storage::error::SqliteWriteStage::Statement
+        );
+        assert_eq!(
+            failure.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        );
+        // The direct route stages the statement error itself; the queued route keeps the
+        // original driver error under the same staged wrapper.
+        let driver = *source;
         assert!(
             matches!(driver, StorageError::Driver {
             capability: StorageCapability::Graph, ref operation, ref source
         } if operation == "update_edge" && matches!(source.downcast_ref::<SqliteError>(),
-            Some(SqliteError::Rusqlite(_)))),
+            Some(SqliteError::Write { .. } | SqliteError::Rusqlite(_)))),
             "preserve concrete cause: {driver:?}"
         );
         assert_eq!(fixture.rows(), before);
