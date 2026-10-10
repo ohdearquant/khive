@@ -70,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking (Rust crates)
 
+- Memory's `RecallFtsGatherMode` now re-exports the canonical storage `TextGatherMode` instead of
+  declaring a separate enum. Its public path, variant imports, `Copy` behavior, serialized config,
+  and search options remain supported; code depending on the old nominal type identity must adapt.
+
 - `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
   `RuntimeError::Storage`, retaining typed driver sources and the existing capacity,
   retry, and writer-settlement wire codes. Callers matching the removed variant
