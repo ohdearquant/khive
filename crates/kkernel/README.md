@@ -54,24 +54,64 @@ kkernel exec --pending-events          # cron-friendly: fire due scheduled_event
 
 ## Subcommands
 
-| Subcommand | Purpose                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------- |
-| `mcp`      | Serve the MCP `request` surface — stdio, `--daemon`, or a registered transport              |
-| `exec`     | Run a verb DSL expression (or `--ops-file batch.jsonl`) through the pack registry           |
-| `sync`     | Build a working SQLite database from `.khive/kg/*.ndjson` sources                           |
-| `kg`       | `validate` / `init` / `fetch` / `export` / `import` / `status` / `hook` — KG versioning ops |
-| `db`       | `migrate` / `check` — apply or report pending schema migrations                             |
-| `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface              |
-| `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                               |
-| `vector`   | Vector store capabilities and orphan sweep                                                  |
-| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms        |
-| `backend`  | `list` / `info <name>` — inspect registered storage backends                                |
+| Subcommand | Purpose                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------ |
+| `mcp`      | Serve the MCP `request` surface — stdio, `--daemon`, or a registered transport                         |
+| `exec`     | Run a verb DSL expression (or `--ops-file batch.jsonl`) through the pack registry                      |
+| `sync`     | Build a working SQLite database from `.khive/kg/*.ndjson` sources                                      |
+| `kg`       | `validate` / `init` / `fetch` / `update` / `export` / `import` / `status` / `hook` — KG versioning ops |
+| `db`       | `migrate` / `check` — apply or report pending schema migrations                                        |
+| `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface                         |
+| `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                                          |
+| `vector`   | Vector store capabilities and orphan sweep                                                             |
+| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms                   |
+| `backend`  | `list` / `info <name>` — inspect registered storage backends                                           |
 
 All subcommands emit JSON on stdout by default (for piping/parsing); pass `--human`
 where supported for a readable table. `kkernel kg`, `kkernel sync`, and the NDJSON-to-SQLite
 rebuild logic they wrap live in [`khive-vcs`](https://crates.io/crates/khive-vcs) and
 [`khive-vcs-adapters`](https://crates.io/crates/khive-vcs-adapters); `kkernel`'s own
 `kg/` module is a thin CLI wrapper over those libraries.
+
+### Updating a remote commit
+
+`kkernel kg update origin --ref v2 --repo .` resolves a remote Git ref to its full
+40-character commit SHA and writes only that remote's `commit` in the existing
+`.khive/kg/schema.yaml`. The JSON receipt includes `remote`, `requested_ref`,
+`previous_commit`, `commit`, and `updated`. Annotated tags are peeled to a commit;
+tags that name trees or blobs refuse.
+
+```yaml
+format_version: "2.0.0"
+remotes:
+  - name: origin
+    url: /path/to/remote.git
+    ref: main
+    commit: "1111111111111111111111111111111111111111"
+```
+
+Use either `url` (a Git URL or a local repository path) or `repo: owner/name` (a
+GitHub shorthand), never both. Relative local paths are resolved against `--repo`,
+which defaults to the current directory. Omitted `--ref` uses the selected remote's
+`ref`, then its `HEAD`; it does not assume a branch named `main`. Ref input must be
+one branch/tag/ref name or full SHA, without refspec destinations, wildcards or
+revision expressions. A malformed or unsupported schema, missing/duplicate remote,
+unresolvable ref, or non-commit object leaves the original schema intact.
+
+This Git `commit` is independent of the optional SHA-256 archive `pin`. Update does
+not change that pin, `khive_version`, other schema values, NDJSON, cached archives,
+or a database. Current `kg fetch` still takes explicit `--url`/`--ref`/`--pin`
+arguments; it does not load schema remotes. `kg init` does not create schema.yaml.
+
+Successful edits preserve YAML values but normalize formatting and discard comments.
+An unchanged commit returns `updated: false` without rewriting any bytes. Updates
+use a unique temporary Git repository and a sibling staged schema file. Concurrent
+updates refuse while `.khive/state/kg-update.lock` is held; retry after the other
+command completes. Detected intervening schema edits refuse too, but external
+editors that ignore that lock are not covered by an atomic compare-and-swap. Files
+are synced before publication, and the schema directory is synced on Unix. If
+durability confirmation fails after publication, the error explicitly says the new
+commit was published; inspect the schema before retrying.
 
 ## Configuration
 

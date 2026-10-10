@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod hash;
+pub mod remote_pin;
 pub mod sync;
 pub mod types;
 

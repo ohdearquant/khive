@@ -774,7 +774,7 @@ fn fsync_dir_best_effort(dir: &Path) {
 /// scp-style `user@host:path` remotes) from git stderr before it reaches a
 /// caller-visible error — ADR-037 §157 prohibits leaking remote URLs. See
 /// `docs/api/sync.md` for the exact matched forms.
-fn redact_git_stderr(raw: &str) -> String {
+pub(crate) fn redact_git_stderr(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0;
