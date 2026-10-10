@@ -159,6 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   temporary instead of replacing it, keeps the original filename bytes, creates the file with
   mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
   staging policies keep mode 0644 and their behavior (#5068).
+- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
+  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
+  (#5087).
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
