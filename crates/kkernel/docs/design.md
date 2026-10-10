@@ -89,7 +89,7 @@
   input/schema/identity/reference/taxonomy checks plus warning-severity sort order. A conditional
   error-severity note-kind check also runs when `notes.ndjson` is present. Configurable rules from
   `rules.toml` run afterward.
-- `kkernel kg init` creates `.khive/kg/` and writes `khive.toml` with defaults.
+- `kkernel kg init` creates `.khive/kg/` and writes `.khive/config.toml` with the default engine.
 - See `docs/kg-rules.md` for the rule TOML format.
 
 ### KG status and fetch/sync alias (ADR-036, ADR-037)

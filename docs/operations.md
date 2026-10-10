@@ -23,7 +23,7 @@ explicitly and describes what the code does.
 | `sync`                               | yes (target DB)                            | Rebuild a SQLite DB from `.khive/kg/{entities,edges}.ndjson`                            |
 | `pack list` / `pack handler <name>`  | no                                         | Introspect registered packs (verbs, note/entity kinds)                                  |
 | `kg validate`                        | no (mutates only with `--fix`)             | Structural + rule-based lint of tracked `.khive/kg/*.ndjson`                            |
-| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `khive.toml`, pre-commit hook, optional CI workflow                |
+| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `config.toml`, pre-commit hook, optional CI workflow               |
 | `kg hook install\|uninstall\|status` | yes (`.git/hooks/`)                        | Wire/unwire the pre-commit hook                                                         |
 | `kg fetch` (alias `kg sync`)         | yes (cache dir)                            | Pull a remote KG archive with SHA-256 pin verification                                  |
 | `kg export`                          | no (writes an output file, not the DB)     | Dump a namespace's entities+edges to one JSON archive                                   |
@@ -423,9 +423,11 @@ kkernel kg init [--repo .] [--ci] [--add-hooks]
 ```
 
 Creates `.khive/kg/`, `.khive/kg/hooks/`, empty `entities.ndjson`/`edges.ndjson`, `.khive/.gitignore`,
-a default `.khive/khive.toml`, and the tracked pre-commit hook script, every artifact is written
-only `if !path.exists()`, so re-running is safe and never clobbers existing content
-(`kg/init.rs:82-145`, confirmed by an explicit non-overwrite regression test). `--ci` additionally
+a default `.khive/config.toml`, and the tracked pre-commit hook script. Re-running is safe and never
+clobbers existing content: the config is created atomically and kept when it, or a root `khive.toml`,
+already exists; the other artifacts are written only when absent; and only the byte-exact ignore
+file written by the old initializer is migrated. A legacy `.khive/khive.toml` makes init fail before
+it writes anything. `--ci` additionally
 writes `.github/workflows/kg-validate.yml` (also existence-gated). `--add-hooks` short-circuits to
 the same logic as `kg hook install` below and skips the rest of scaffolding; use it to (re-)wire
 the git hook without touching anything else.
