@@ -1607,7 +1607,8 @@ async fn find_commit_by_sha(
     }
     rows.first()
         .map(|row| {
-            row_uuid(row)
+            row.uuid("id")
+                .ok()
                 .ok_or_else(|| anyhow!("stored commit note has an invalid ID for SHA {sha}"))
         })
         .transpose()
@@ -1663,7 +1664,8 @@ async fn commit_annotation_targets(
         .map_err(anyhow::Error::new)?;
     rows.iter()
         .map(|row| {
-            row_uuid(row)
+            row.uuid("id")
+                .ok()
                 .ok_or_else(|| anyhow!("stored commit annotation has an invalid target ID"))
         })
         .collect()
@@ -1694,15 +1696,7 @@ async fn find_by_number(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| row_uuid(&r)))
-}
-
-fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
-    match row.get("id") {
-        Some(SqlValue::Uuid(u)) => Some(*u),
-        Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-        _ => None,
-    }
+    Ok(row.and_then(|r| r.uuid("id").ok()))
 }
 
 /// Find an existing `document` entity whose `properties.source_uri` or
@@ -1737,7 +1731,7 @@ async fn find_document_for_path(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| row_uuid(&r)))
+    Ok(row.and_then(|r| r.uuid("id").ok()))
 }
 
 /// Load the live code-map module index for the exact repository snapshot
@@ -1772,7 +1766,7 @@ async fn load_code_modules_by_snapshot_path(
         // `(source_revision, source_path)` key: it occupies the slot (so any
         // second row for the same key marks the pair ambiguous) but can
         // never bind as an annotation target itself.
-        let id = row_uuid(&row);
+        let id = row.uuid("id").ok();
         modules
             .entry(path.clone())
             .and_modify(|candidate| *candidate = None)
