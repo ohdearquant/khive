@@ -13,8 +13,11 @@ description = "KG versioning — git-native core types, canonical hash, and NDJS
 khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
 khive-storage = { version = "0.11.0", path = "../khive-storage" }
 khive-types = { version = "0.11.0", path = "../khive-types" }
+khive-fs = { version = "0.11.0", path = "../khive-fs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+semver = "1"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
