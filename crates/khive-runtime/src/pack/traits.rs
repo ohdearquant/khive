@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use khive_storage::EventView;
 use serde_json::Value;
 
+use crate::context::ContextContributor;
 use crate::operations::LinkSpec;
 use crate::runtime::NamespaceToken;
 use crate::validation::ValidationRule;
@@ -174,6 +175,14 @@ pub trait PackRuntime: Send + Sync {
     /// edges — through the shared `create` path. Returning `None` keeps
     /// the kind as plain storage with no specialization.
     fn kind_hook(&self, _kind: &str) -> Option<Arc<dyn KindHook>> {
+        None
+    }
+
+    /// Optional context source, discovered without invoking contribution or dispatch.
+    ///
+    /// Return the instance-owned capability. Packs without context support keep the default.
+    /// See `docs/api/pack.md#context_contributor` for ownership and score contracts.
+    fn context_contributor(&self) -> Option<Arc<dyn ContextContributor>> {
         None
     }
 
