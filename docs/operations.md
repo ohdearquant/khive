@@ -117,8 +117,9 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
   resolves to the same path as `--db`: "would overwrite the database" (`archive.rs:20-38`).
   The write itself is atomic: it creates `<output>.<pid>.inprogress` with `O_EXCL` (refusing to
   follow a pre-existing symlink), `fsync`s it, then renames it into place (`archive.rs:54-80`).
-- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson] [--verbose]`:
-  `source` and `--db` are required, `--format` defaults to `archive`.
+- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson|csv|tsv|bibtex] [--verbose]`:
+  `source` and `--db` are required. `--format` is inferred from a `.csv`, `.tsv` or `.bib`
+  extension and otherwise defaults to `archive`.
   - `--format archive` (default): parses `source` directly as a `KgArchive` JSON envelope and
     completes format/version, entity kind/name, timestamp, and edge-weight validation before the
     target runtime is constructed. Kind validation uses the **full merged pack kind registry**
@@ -133,6 +134,11 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
     is rejected as ambiguous. Required names must be non-blank and present timestamps must be valid
     RFC 3339 strings. Entity labels retain their original nonblank bytes. Edge properties and the
     two timestamps remain top-level portable fields and persist as storage metadata/provenance.
+  - `--format bibtex`: streamed through `khive_vcs_adapters::BibtexFormatAdapter`, which maps
+    entries to paper entities and resolves crossrefs to edges. A malformed entry is skipped with a
+    warning and its neighbours are kept; duplicate keys, unresolved crossrefs, invalid UTF-8, read
+    errors and oversized entries abort before `--db` is opened. `--default-kind` is refused. The
+    JSON summary adds an `adapter` object with `entries`, `skipped` and `warnings`.
   - A malformed record anywhere in an archive, `json`, or `ndjson` input aborts before the target
     runtime is constructed; `--db` is neither created nor migrated and earlier valid records are
     not partially applied.

@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Move MCP server state, registration errors, and stdio settings into a dedicated
   core module, preserving public server entry points and existing function bodies.
+### Added
+
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
 
 ### Fixed
 
