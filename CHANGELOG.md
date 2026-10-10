@@ -67,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `comm.read` preserves typed storage errors from its initial message lookup, including
+  admission-timeout code, stage, and retry guidance. Bulk read and mark-read validation
+  retain the same error source without marking messages after a failed lookup. (#4958)
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
