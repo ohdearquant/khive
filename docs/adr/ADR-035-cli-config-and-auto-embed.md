@@ -4,11 +4,6 @@
 **Date**: 2026-05-23
 **Authors**: khive maintainers
 
-**Pending amendment**: the [2026-10-10 proposal](#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786)
-revises embedding pipeline and import-strictness configuration. The affected text below is
-marked proposed; the accepted header does not approve that amendment or claim its implementation
-has shipped.
-
 ## Context
 
 ADR-020 defines the `.khive/` directory layout, the NDJSON format, and the `kkernel kg commit`
@@ -59,7 +54,7 @@ This means:
 - The embedding model is a **project-level setting** — committed to git, enforced across
   the team, not overridable per-user.
 - Device preferences are a provider concern, not a second model-selection authority.
-  Under the proposed amendment, legacy `embed.device` is recognized but ignored; this ADR
+  Under the 2026-10-10 amendment, legacy `embed.device` is recognized but ignored; this ADR
   introduces no device selector or per-key merge of a second TOML file.
 
 ## Decision
@@ -72,9 +67,9 @@ The selected config file carries all configuration for khive. ADR-028's
 
 **Canonical project-level file** (`.khive/config.toml` — committed to git):
 
-The `[embed]` and `[schema]` settings in this expanded example express the **proposed**
-2026-10-10 contract. They are not a claim of shipped support. The minimal initializer
-template in §4 remains engine-only.
+The `[embed]` and `[schema]` settings in this expanded example express the 2026-10-10
+amendment's contract, which is accepted but not yet implemented. They are not a claim of
+shipped support. The minimal initializer template in §4 remains engine-only.
 
 ```toml
 # .khive/config.toml — project configuration
@@ -103,7 +98,7 @@ backend = "main"
 [packs.gtd]
 backend = "main"
 
-# --- Proposed embedding pipeline configuration (ADR-035 amendment) ---
+# --- Embedding pipeline configuration (2026-10-10 amendment, not yet implemented) ---
 
 [embed]
 auto_embed = true           # automatic serving work; explicit reindex still runs
@@ -112,7 +107,7 @@ batch_size = 128            # reindex batch size; CLI --batch-size takes precede
 [embed.fields]
 include = ["name", "description"]  # entity fields concatenated for embedding
 
-# --- Proposed import validation (ADR-035 amendment) ---
+# --- Import validation (2026-10-10 amendment, not yet implemented) ---
 
 [schema]
 strict = true               # false admits unknown entity kinds; relations stay closed
@@ -167,23 +162,23 @@ Pack selection is the exception specified by ADR-027 Amendment 3: `--pack` >
 `KHIVE_PACKS` > `runtime.packs` > the built-in production set. Each layer replaces
 the complete set; an empty layer falls through rather than selecting zero packs.
 
-| Option                         | CLI flag                         | Env var                             | Config key                | Default           |
-| ------------------------------ | -------------------------------- | ----------------------------------- | ------------------------- | ----------------- |
-| Namespace                      | `--namespace`                    | `KHIVE_NAMESPACE`                   | `runtime.namespace`       | `default`         |
-| Loaded packs                   | `--pack` (repeat)                | `KHIVE_PACKS`                       | `runtime.packs`           | production set    |
-| DB path                        | `--db`                           | `KHIVE_DB`                          | `runtime.db_path`         | `~/.khive/kg.db`  |
-| Recall min_score               | (n/a, per-call)                  | `KHIVE_RECALL_MIN_SCORE`            | `memory.recall.min_score` | `None` (no floor) |
-| Disable embeddings             | `kkernel mcp --no-embed`         | `KHIVE_NO_EMBED`                    | (none)                    | `false`           |
-| Automatic embedding (proposed) | `--no-embed` forces off          | `KHIVE_NO_EMBED=1` forces off       | `embed.auto_embed`        | `true`            |
-| Reindex batch size (proposed)  | `kkernel reindex --batch-size`   | (none)                              | `embed.batch_size`        | `128`             |
-| Reindex model                  | `kkernel reindex --model <name>` | `KHIVE_EMBEDDING_MODEL`             | `[[engines]]`             | built-in engine   |
-| Additional models              | (none)                           | `KHIVE_ADDITIONAL_EMBEDDING_MODELS` | `[[engines]]`             | none              |
-| Log level                      | `--log-level`                    | `KHIVE_LOG`                         | `runtime.log_level`       | `info`            |
-| Authorization gate             | `--gate`                         | `KHIVE_GATE`                        | `runtime.gate`            | `allow-all`       |
-| Brain profile                  | `--brain-profile`                | `KHIVE_BRAIN_PROFILE`               | `runtime.brain_profile`   | `None`            |
+| Option                              | CLI flag                         | Env var                             | Config key                | Default           |
+| ----------------------------------- | -------------------------------- | ----------------------------------- | ------------------------- | ----------------- |
+| Namespace                           | `--namespace`                    | `KHIVE_NAMESPACE`                   | `runtime.namespace`       | `default`         |
+| Loaded packs                        | `--pack` (repeat)                | `KHIVE_PACKS`                       | `runtime.packs`           | production set    |
+| DB path                             | `--db`                           | `KHIVE_DB`                          | `runtime.db_path`         | `~/.khive/kg.db`  |
+| Recall min_score                    | (n/a, per-call)                  | `KHIVE_RECALL_MIN_SCORE`            | `memory.recall.min_score` | `None` (no floor) |
+| Disable embeddings                  | `kkernel mcp --no-embed`         | `KHIVE_NO_EMBED`                    | (none)                    | `false`           |
+| Automatic embedding (unimplemented) | `--no-embed` forces off          | `KHIVE_NO_EMBED=1` forces off       | `embed.auto_embed`        | `true`            |
+| Reindex batch size (unimplemented)  | `kkernel reindex --batch-size`   | (none)                              | `embed.batch_size`        | `128`             |
+| Reindex model                       | `kkernel reindex --model <name>` | `KHIVE_EMBEDDING_MODEL`             | `[[engines]]`             | built-in engine   |
+| Additional models                   | (none)                           | `KHIVE_ADDITIONAL_EMBEDDING_MODELS` | `[[engines]]`             | none              |
+| Log level                           | `--log-level`                    | `KHIVE_LOG`                         | `runtime.log_level`       | `info`            |
+| Authorization gate                  | `--gate`                         | `KHIVE_GATE`                        | `runtime.gate`            | `allow-all`       |
+| Brain profile                       | `--brain-profile`                | `KHIVE_BRAIN_PROFILE`               | `runtime.brain_profile`   | `None`            |
 
-The shipped disable row stays as accepted. The proposed automatic-embedding row adds its config key
-beside it and is a force-off exception to the general precedence:
+The shipped disable row stays as accepted. The automatic-embedding row from the 2026-10-10
+amendment adds its config key beside it and is a force-off exception to the general precedence:
 either existing no-embed control overrides `auto_embed=true`; no force-on flag or environment
 variable is added. Reindex batch precedence is explicit CLI value > selected config > 128,
 with no environment tier. Explicit reindex ignores only `auto_embed`, as specified below.
@@ -226,12 +221,12 @@ continue working as before.
 
 ### 3. `[embed]` and `[schema]` sections
 
-**Proposed contract — pending the 2026-10-10 amendment's acceptance and implementation.**
+**2026-10-10 amendment contract — accepted, pending implementation.**
 `[embed]` controls the automatic pipeline; `[schema]` controls import validation. Neither
 registers engines. The existing `--no-embed` / `KHIVE_NO_EMBED` controls and explicit
 `kkernel reindex` workflow remain; no `--auto-embed` or `KHIVE_AUTO_EMBED` control is added.
 
-**Proposed defaults** (when the selected file omits the setting):
+**Defaults** (when the selected file omits the setting):
 
 | Key                    | Default                   |
 | ---------------------- | ------------------------- |
@@ -254,7 +249,7 @@ cannot silently reuse a daemon with a different effective policy.
 
 `batch_size` applies only to `kkernel reindex`, including its existing knowledge pass; it
 does not set global import/backfill concurrency. An explicit CLI `--batch-size` takes
-precedence over config, which takes precedence over 128. The proposed default replaces the
+precedence over config, which takes precedence over 128. The 128 default replaces the
 historical design value 64 to preserve shipped no-config behavior. An explicitly stored 64
 remains 64; no config is rewritten. Config values must be positive integers. The effective
 maximum is 500, and the CLI's existing zero-to-one clamp remains. Explicit flag presence is
@@ -290,7 +285,7 @@ unchanged. Unknown relations are refused in **both** modes: the ADR-002 relation
 stays closed. Relaxed import does not register a new kind, relax ordinary create validation,
 or bypass other validation, including endpoint rules, reserved properties and secret checks.
 This preflight guarantee does not introduce transactionality for later operational failures.
-The proposed entry-point boundary and its scoped relationship to ADR-001's VCS snapshot
+The entry-point boundary and its scoped relationship to ADR-001's VCS snapshot
 rule are specified in the amendment's [import policy boundary](#import-policy-boundary).
 
 ### 4. `kkernel kg init` writes `.khive/config.toml`
@@ -387,9 +382,9 @@ vector work. An operator who normally runs the server with `--no-embed` can ther
 separate `kkernel reindex` invocation without that server flag, using a config that declares
 the desired `[[engines]]`, to populate vectors on an explicit schedule.
 
-**Proposed configuration interaction:** explicit `kkernel reindex`, including `--id` repair,
-ignores only `embed.auto_embed`. It uses the same selected file, engines, ordered entity
-fields and namespace rules; it neither reloads a different config nor reconstructs a default
+**Configuration interaction (2026-10-10 amendment):** explicit `kkernel reindex`, including
+`--id` repair, ignores only `embed.auto_embed`. It uses the same selected file, engines,
+ordered entity fields and namespace rules; it neither reloads a different config nor reconstructs a default
 engine. Note-kind restrictions remain unless an explicit `--model` overrides them. Existing
 failed-embedding/failed-insert retention, `--keep-existing` skips, healthy-vector preservation
 under `--id`, namespace/revision fences and partial-failure reporting remain in force. A full
@@ -438,7 +433,7 @@ kkernel reindex --config .khive/config.toml --db ~/.khive/khive.db \
   --namespace local
 ```
 
-Under the **proposed** field-selection contract, changing `embed.fields.include` likewise
+Under the 2026-10-10 field-selection contract, changing `embed.fields.include` likewise
 requires explicit reindex for existing vectors to use the new input. The edit alone causes no
 startup rewrite. `--keep-existing` still skips existing vectors, failed replacements preserve
 old vectors, and whitespace-only input does not remove an old vector. Set `auto_embed=false`
@@ -446,8 +441,9 @@ to suppress automatic serving work while retaining this explicit maintenance wor
 
 ### 8. Config validation
 
-The following `[embed]` and `[schema]` validation belongs to the **proposed** 2026-10-10
-amendment; it is not a claim that the current loader implements these keys:
+The following `[embed]` and `[schema]` validation belongs to the 2026-10-10 amendment,
+accepted but not yet implemented; it is not a claim that the current loader implements
+these keys:
 
 - `embed.auto_embed` is a boolean.
 - `embed.batch_size` is a positive integer.
@@ -487,7 +483,7 @@ import entry points.
 `[[engines]]` (ADR-028) declares the process-wide registry of loaded embedding models —
 the names and dimensions that `EmbedderRegistry::from_config` uses to instantiate models.
 
-`[[engines]]` remains the sole model authority under the **proposed** amendment. Its canonical
+`[[engines]]` remains the sole model authority under the 2026-10-10 amendment. Its canonical
 ordered peer contract and legacy-input conversion are supplied by the engine-configuration
 prerequisite (#5043); this amendment does not recreate a `default = true` selector as a second
 canonical contract. Existing engine input, including the minimal §4 template, remains subject
@@ -532,7 +528,7 @@ override the project's `[[engines]]`, a collaborator with a different default wo
 produce incompatible vectors. The project config must win on embedding-related keys.
 
 Machine-local overrides use only existing option-specific CLI/environment contracts.
-The proposed legacy `embed.device` key is ignored, not a new override. The global file
+The legacy `embed.device` key is ignored, not a new override. The global file
 is a fallback for projects without a project config, not a merge source.
 
 ### Why inline writes plus an explicit repair command
@@ -554,17 +550,17 @@ as separating source files from build artifacts in a standard software project.
 
 ## Alternatives Considered
 
-| Alternative                                                 | Pros                         | Cons                                                                  | Why rejected                                                                      |
-| ----------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Separate active topology and embedding files in one project | Clear file roles             | Two files to manage; split mental context                             | One selected file is simpler and sufficient                                       |
-| Per-key project/global TOML merge                           | Machine-local overlays       | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable                               |
-| YAML config format                                          | Familiar                     | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project                       |
-| JSON config format                                          | Machine-writable             | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                                             |
-| Vectors stored in NDJSON (committed)                        | Single source of truth       | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                                        |
-| Dedicated committed vector file (separate from NDJSON)      | Separates vectors from text  | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                                         |
-| Manual repair only                                          | Explicit control             | Silent quality degradation when users forget                          | Inline create/update plus explicit reindex covers both paths                      |
-| Embed on every embedding-bearing write                      | Fresh vectors for new writes | Adds model latency to those writes                                    | Shipped default; `mcp --no-embed` is the explicit opt-out                         |
-| `embed.model` as a second model selector                    | User flexibility             | Conflicting authorities and incompatible vectors across collaborators | `[[engines]]` owns the registry; legacy embed keys are ignored under the proposal |
+| Alternative                                                 | Pros                         | Cons                                                                  | Why rejected                                                                       |
+| ----------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Separate active topology and embedding files in one project | Clear file roles             | Two files to manage; split mental context                             | One selected file is simpler and sufficient                                        |
+| Per-key project/global TOML merge                           | Machine-local overlays       | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable                                |
+| YAML config format                                          | Familiar                     | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project                        |
+| JSON config format                                          | Machine-writable             | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                                              |
+| Vectors stored in NDJSON (committed)                        | Single source of truth       | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                                         |
+| Dedicated committed vector file (separate from NDJSON)      | Separates vectors from text  | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                                          |
+| Manual repair only                                          | Explicit control             | Silent quality degradation when users forget                          | Inline create/update plus explicit reindex covers both paths                       |
+| Embed on every embedding-bearing write                      | Fresh vectors for new writes | Adds model latency to those writes                                    | Shipped default; `mcp --no-embed` is the explicit opt-out                          |
+| `embed.model` as a second model selector                    | User flexibility             | Conflicting authorities and incompatible vectors across collaborators | `[[engines]]` owns the registry; legacy embed keys are ignored under the amendment |
 
 ## Consequences
 
@@ -584,7 +580,7 @@ as separating source files from build artifacts in a standard software project.
   top-up across the configured engine set.
 - The embedding model is recorded in `.khive/config.toml`, committed alongside the KG data.
   Changing the model produces a one-line diff in git that reviewers can see and approve.
-- The proposed legacy-key compatibility keeps older configs loadable without making
+- The amendment's legacy-key compatibility keeps older configs loadable without making
   `embed.device` or `embed.model` a second engine authority.
 - `kkernel kg init` writes a valid, well-commented `.khive/config.toml` that makes its defaults
   explicit and reviewable in the initial PR.
@@ -601,7 +597,7 @@ as separating source files from build artifacts in a standard software project.
   supported. Model availability errors from lattice-embed are propagated at runtime.
 - Changing `[[engines]]` requires re-embedding the affected corpus (potentially slow for large
   KGs). The explicit workflow is documented in §7.
-- Under the proposal, changing entity input fields likewise requires explicit reindex;
+- Under the amendment, changing entity input fields likewise requires explicit reindex;
   existing vectors are not silently rewritten when a config is edited.
 
 ### Neutral
@@ -623,10 +619,10 @@ as separating source files from build artifacts in a standard software project.
 
 2. **Per-namespace model selection.** Multi-namespace deployments may eventually need
    different models per namespace. `[[engines]]` remains the selected file's registry;
-   the proposed legacy `embed.model` key selects nothing. Namespace-scoped model selection
+   the legacy `embed.model` key selects nothing. Namespace-scoped model selection
    is deferred until a real use case requires it.
 
-3. **Legacy dimension comparison (resolved by the proposed amendment).** Compare
+3. **Legacy dimension comparison (resolved by the 2026-10-10 amendment).** Compare
    `embed.dimensions` only with the default engine's declared dimension. Do not initialize
    a model or defer a legacy mismatch warning until first embed. Provider identity and
    actual-dimension checks remain part of engine validation.
@@ -691,12 +687,12 @@ and provenance in that table, including when replacement embedding fails.
 
 ## Amendment 2026-10-10: embedding pipeline and import strictness (#4785, #4786)
 
-**Status: Proposed — pending maintainer acceptance.** This section and the text marked
-proposed in §§1–3, 5, 7–9 and the affected rationale/consequences specify intended behavior,
-not shipped support. The record's accepted header and earlier dated amendments remain
-unchanged. Dependent implementation follows acceptance of the final amendment; embedding
-implementation also follows landing the engine-configuration and runtime integration
-prerequisites #5043 and #5050. A documentation merge alone does not establish acceptance.
+**Status: Accepted (2026-10-10).** Acceptance of the text is not implementation acceptance.
+This section and the text it amends in §§1–3, 5, 7–9 and the affected rationale/consequences
+specify intended behavior, not shipped support. Earlier dated amendments remain unchanged.
+Embedding implementation follows landing the engine-configuration and runtime integration
+prerequisites #5043 and #5050. Implementation acceptance requires the evidence below, executed
+and reported in the implementation pull request.
 
 ### Scope and compatibility
 
@@ -719,7 +715,7 @@ automatic serving embedding while permitting explicit reindex of entity names in
 of 64. They do not replace the file's engine declarations:
 
 ```toml
-# Proposed pipeline settings; existing [[engines]] remains authoritative.
+# Pipeline settings; existing [[engines]] remains authoritative.
 [embed]
 auto_embed = false
 batch_size = 64
@@ -750,13 +746,12 @@ does not change the separate VCS snapshot synchronization policy.
 [ADR-001's accepted forward-compatibility rule](ADR-001-entity-kind-taxonomy.md#forward-compatibility-vcs-import)
 requires an older-version VCS snapshot importer to downgrade an unknown kind to `Concept`,
 clear `entity_type`, preserve the original kind/type metadata, add `khive:degraded_kind`
-and warn. This amendment proposes a **scoped supersession** of that rule for the explicit
+and warn. This amendment makes a **scoped supersession** of that rule for the explicit
 operator/library import routes just named, even when their input bytes have snapshot
 shape. VCS snapshot synchronization through `khive_vcs::run_sync` retains the ADR-001
 degradation contract; `[schema].strict` does not select its policy. The
-[independently Proposed ADR-001 companion](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786)
-records the same boundary. Both proposals require acceptance together before this scoped
-supersession binds; neither changes the existing accepted record by publication alone.
+[ADR-001 companion](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786),
+accepted together with this amendment, records the same boundary.
 
 The same otherwise-valid unknown-kind snapshot bytes therefore have three deliberately
 different intended outcomes: explicit strict import refuses before writes; explicit
@@ -764,7 +759,7 @@ relaxed import retains the raw kind with its warning; older-version VCS synchron
 degrades under ADR-001. Choose by entry point and its explicit policy, not by guessing
 provenance from JSON shape. The current synchronization validator rejects unknown kinds;
 that divergence from the accepted degradation contract is an implementation gap, not
-evidence that degradation already ships or authority to broaden this proposal's scope.
+evidence that degradation already ships or authority to broaden this amendment's scope.
 
 Unknown relations remain errors in both modes under the closed
 [ADR-002 ontology](ADR-002-edge-ontology.md) and

@@ -9,11 +9,10 @@ sub-procedure with a mandatory split for records naming both a technique and a d
 of it, and step 9 gains a question-note requirement for records carrying deployment
 vocabulary without an instance identifier. See "Service/concept tie-break" below.
 
-**Proposed companion (2026-10-10, #4786)**: the
+**Amended 2026-10-10 (#4786)**: the
 [explicit-import/VCS policy boundary](#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786)
-below proposes a scoped change to the forward-compatibility clause together with
-ADR-035. It remains independently Proposed; the accepted header and existing
-clauses are unchanged.
+below scopes the forward-compatibility clause to VCS snapshot synchronization;
+explicit operator and library imports follow ADR-035's import policy.
 
 ## Context
 
@@ -597,19 +596,18 @@ into rows a backfill can promote through the normal write path, with validation.
 
 ## Amendment 2026-10-10: explicit import and VCS snapshot policy boundary (#4786)
 
-**Status: Proposed — pending acceptance together with the ADR-035 import
-amendment.** This companion proposes the scope of the accepted
+**Status: Accepted (2026-10-10), together with the ADR-035 import
+amendment.** Acceptance of the text is not implementation acceptance. This
+companion scopes the accepted
 [forward-compatibility clause](#forward-compatibility-vcs-import); it does not
-mark the record superseded, change the accepted header or claim new
-implementation. Publication of either companion alone does not make the scoped
-change binding.
+mark the record superseded or claim new implementation.
 
 The
 [ADR-035 amendment](ADR-035-cli-config-and-auto-embed.md#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786)
-proposes strict-by-default explicit operator import through `kkernel kg import`,
+specifies strict-by-default explicit operator import through `kkernel kg import`,
 including archive JSON and adapter/NDJSON inputs, and through
-`KhiveRuntime::import_kg` library calls. For those entry points alone, once both
-amendments are accepted, their selected import policy supersedes this record's
+`KhiveRuntime::import_kg` library calls. For those entry points alone, their
+selected import policy supersedes this record's
 snapshot degradation rule: strict import refuses unknown entity kinds before
 writes; an explicitly relaxed import retains their original spelling and warns
 once per distinct unknown kind. This applies even when the document's bytes have
@@ -626,8 +624,8 @@ Entry point, rather than guessed provenance or JSON shape, selects the policy.
 
 The current synchronization validator rejects unknown kinds rather than
 implementing that accepted degradation rule. This is an existing implementation
-gap. Neither the separate control path nor this proposal establishes that
-degradation already ships. The companion proposes no broader synchronization
+gap. Neither the separate control path nor this amendment establishes that
+degradation already ships. The companion makes no broader synchronization
 redesign or new kind registration.
 
 Acceptance evidence must use the same otherwise-valid unknown-kind snapshot
@@ -636,6 +634,6 @@ synchronization. Observe pre-write refusal in the strict case, retained raw
 spelling with the warning in the relaxed case, and every field, metadata key,
 tag and warning of the degradation contract in the VCS case. These are required
 future observations, not executed results. The paired relaxed-import allow and
-refusal controls required by ADR-035 also remain pending. Dependent implementation
-waits on acceptance of both companions; implementation acceptance waits on that
-evidence, executed and reported in the implementation pull request.
+refusal controls required by ADR-035 also remain pending. Implementation
+acceptance waits on that evidence, executed and reported in the implementation
+pull request.

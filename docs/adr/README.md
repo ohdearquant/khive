@@ -269,7 +269,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
-- [ADR-001 companion: explicit import and VCS snapshot policy boundary](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786) (2026-10-10): independently Proposed entry-point boundary for unknown-kind operator import and the existing VCS degradation contract (#4786).
+- [ADR-001 companion: explicit import and VCS snapshot policy boundary](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786) (2026-10-10): entry-point boundary for unknown-kind operator import and the existing VCS degradation contract (#4786).
 - [ADR-015 amendment: live entity list indexes](ADR-015-schema-migrations.md#proposed-amendment-live-entity-list-indexes-2026-10-04) (2026-10-04): proposed V50 live entity namespace/order and namespace/type/order indexes, bounded eligible first-page plans, and one unforced retry for a missing index (#3689).
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
 - [ADR-031 Amendment 5](ADR-031-multi-engine-retrieval.md#amendment-5-2026-10-08-ordered-peer-engines-and-explicit-retrieval-strategies) (2026-10-08): proposed ordered peer `[[engines]]`, a per-query retrieval strategy that is always resolved and disclosed, weighted reciprocal rank fusion, and a shared executor in khive-retrieval.
@@ -281,7 +281,7 @@ Amendments to accepted records:
 - [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
 - [ADR-027 Amendment 4](ADR-027-dynamic-pack-loading.md#amendment-4-2026-09-12-installable-pack-distributions-and-what-stays-rejected) (2026-09-12): installable pack distributions, and what stays rejected.
 - [ADR-028 Amendment A3](ADR-028-pack-scoped-backends.md#amendment-a3-backend-route-validation-and-search-runtime-selection-2026-09-14) (2026-09-14): backend route validation and search runtime selection.
-- [ADR-035 amendment: embedding pipeline and import strictness](ADR-035-cli-config-and-auto-embed.md#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786) (2026-10-10): proposed embedding configuration, legacy-key compatibility and unknown-entity-kind import policy (#4785, #4786).
+- [ADR-035 amendment: embedding pipeline and import strictness](ADR-035-cli-config-and-auto-embed.md#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786) (2026-10-10): embedding configuration, legacy-key compatibility and unknown-entity-kind import policy (#4785, #4786).
 - [ADR-037 Amendment 2](ADR-037-remote-resolution-and-hash-verification.md#amendment-2-2026-10-10-configuration-bound-remote-entity-reads) (2026-10-10): configuration-bound namespace and project-root contract for cached remote entity reads (#4794).
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14) (2026-09-14): inbox and thread limit disclosure.
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-comm-message-file-attachments-2026-10-02) (2026-10-02): comm message file attachments, with confined `blob.import` and `blob.export`.
