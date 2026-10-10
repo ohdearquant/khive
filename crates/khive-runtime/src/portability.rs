@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use khive_storage::types::{EdgeFilter, LinkId, PageRequest};
 use khive_storage::{EdgeRelation, EntityFilter};
+use khive_types::{EntityKind, ImportKindPolicy};
+use std::str::FromStr;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -132,6 +134,13 @@ pub struct ImportSummary {
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
 }
 
+/// Pure preflight result. Unknown kinds are distinct and in first-record order.
+/// Preflight emits no warnings and opens no destination store.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportValidation {
+    pub unknown_entity_kinds: Vec<String>,
+}
+
 // ── KhiveRuntime impl ─────────────────────────────────────────────────────────
 
 impl KhiveRuntime {
@@ -244,6 +253,16 @@ impl KhiveRuntime {
         archive: &KgArchive,
         token: &NamespaceToken,
     ) -> RuntimeResult<ImportSummary> {
+        self.import_kg_with_policy(archive, token, ImportKindPolicy::Strict)
+            .await
+    }
+
+    /// Validate the complete archive without destination access or warnings.
+    pub fn validate_kg_import(
+        &self,
+        archive: &KgArchive,
+        policy: ImportKindPolicy,
+    ) -> RuntimeResult<ImportValidation> {
         if archive.format != "khive-kg" {
             return Err(RuntimeError::InvalidInput(format!(
                 "unsupported archive format {:?}; expected \"khive-kg\"",
@@ -257,13 +276,48 @@ impl KhiveRuntime {
             )));
         }
 
-        let ns = token.namespace().as_str().to_owned();
-
         // Complete deterministic validation before opening a store or issuing
         // the first write. Endpoint existence and namespace checks remain at
         // write time because they depend on mutable target state.
+        let kinds = self.import_entity_kind_registry()?;
+        let mut validation = ImportValidation::default();
+        let mut seen_unknown = HashSet::new();
         for (index, entity) in archive.entities.iter().enumerate() {
-            self.validate_entity_kind(&entity.kind)?;
+            if entity.kind.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "archive entity {index} kind must be non-blank"
+                )));
+            }
+            let base_kind = EntityKind::from_str(&entity.kind).is_ok();
+            let normalized = entity.kind.trim().to_ascii_lowercase();
+            let known =
+                kinds.iter().any(|kind| kind == &entity.kind) || (kinds.is_empty() && base_kind);
+            if !known {
+                // A recognized alias/case variant is not an unknown kind. Keep
+                // archive exact-vocabulary validation; adapters normalize first.
+                let recognized = base_kind
+                    || kinds
+                        .iter()
+                        .any(|kind| kind.eq_ignore_ascii_case(&normalized));
+                if policy == ImportKindPolicy::Strict || recognized {
+                    let valid = if kinds.is_empty() {
+                        EntityKind::ALL
+                            .iter()
+                            .map(|kind| kind.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        kinds.join(", ")
+                    };
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "archive entity {index} ({}) has unknown entity kind {:?} (or non-canonical spelling); valid: {valid}",
+                        entity.id, entity.kind
+                    )));
+                }
+                if seen_unknown.insert(entity.kind.clone()) {
+                    validation.unknown_entity_kinds.push(entity.kind.clone());
+                }
+            }
             // Archive content is caller-controlled input: the runtime-owned
             // `khive:secret_gate` property key is reservation-only on import,
             // exactly as on every other properties-bearing write path
@@ -288,6 +342,26 @@ impl KhiveRuntime {
                 crate::secret_gate::check_json_at(p, &record, "properties")?;
             }
         }
+
+        Ok(validation)
+    }
+
+    /// Import with explicit admission for unknown entity kinds only.
+    /// Every other deterministic check precedes writes; operational store/index
+    /// failures retain the existing import behavior and are not transactional.
+    pub async fn import_kg_with_policy(
+        &self,
+        archive: &KgArchive,
+        token: &NamespaceToken,
+        policy: ImportKindPolicy,
+    ) -> RuntimeResult<ImportSummary> {
+        let validation = self.validate_kg_import(archive, policy)?;
+        for kind in validation.unknown_entity_kinds {
+            tracing::warn!(target: "khive.import.schema",
+                kind = %crate::secret_gate::bounded_masked_log_text(&kind),
+                "preserving unknown entity kind during explicit import");
+        }
+        let ns = token.namespace().as_str().to_owned();
 
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
@@ -440,11 +514,27 @@ impl KhiveRuntime {
         json: &str,
         token: &NamespaceToken,
     ) -> RuntimeResult<ImportSummary> {
+        self.import_kg_json_with_policy(json, token, ImportKindPolicy::Strict)
+            .await
+    }
+
+    /// Decode and import JSON with explicit unknown-entity-kind admission.
+    /// Closed edge relations still fail during deserialization.
+    pub async fn import_kg_json_with_policy(
+        &self,
+        json: &str,
+        token: &NamespaceToken,
+        policy: ImportKindPolicy,
+    ) -> RuntimeResult<ImportSummary> {
         let archive: KgArchive =
             serde_json::from_str(json).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        self.import_kg(&archive, token).await
+        self.import_kg_with_policy(&archive, token, policy).await
     }
 }
+
+#[cfg(test)]
+#[path = "portability_import_policy_tests.rs"]
+mod import_policy_tests;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
