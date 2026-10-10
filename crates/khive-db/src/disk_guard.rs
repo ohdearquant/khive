@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -339,8 +339,16 @@ fn volume_key(_probe_path: &Path) -> std::io::Result<(VolumeKey, Option<PathBuf>
 }
 
 struct ProcessRegistry {
-    held: Mutex<HashMap<ProcessSlotKey, SlotHolder>>,
+    slots: Mutex<HashMap<ProcessSlotKey, SlotState>>,
     available: Condvar,
+}
+
+#[derive(Default)]
+struct SlotState {
+    holder: Option<SlotHolder>,
+    // Enqueue and grant under the same mutex, so a newly arriving request
+    // cannot overtake a waiter after the previous holder releases the slot.
+    waiters: VecDeque<ThreadId>,
 }
 
 /// The in-process slot a lease takes. Outside the workspace test marker it is
@@ -383,7 +391,7 @@ struct SlotHolder {
 fn process_registry() -> &'static ProcessRegistry {
     static REGISTRY: OnceLock<ProcessRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| ProcessRegistry {
-        held: Mutex::new(HashMap::new()),
+        slots: Mutex::new(HashMap::new()),
         available: Condvar::new(),
     })
 }
@@ -392,7 +400,12 @@ struct ProcessSlot(ProcessSlotKey);
 
 impl ProcessSlot {
     fn detach_from_thread(&self) {
-        if let Some(holder) = process_registry().held.lock().get_mut(&self.0) {
+        if let Some(holder) = process_registry()
+            .slots
+            .lock()
+            .get_mut(&self.0)
+            .and_then(|slot| slot.holder.as_mut())
+        {
             holder.thread = None;
         }
     }
@@ -401,7 +414,14 @@ impl ProcessSlot {
 impl Drop for ProcessSlot {
     fn drop(&mut self) {
         let registry = process_registry();
-        registry.held.lock().remove(&self.0);
+        let mut slots = registry.slots.lock();
+        if let Some(slot) = slots.get_mut(&self.0) {
+            slot.holder = None;
+            if slot.waiters.is_empty() {
+                slots.remove(&self.0);
+            }
+        }
+        drop(slots);
         registry.available.notify_all();
     }
 }
@@ -417,41 +437,68 @@ fn acquire_process_slot(
 ) -> Result<ProcessSlot, LeaseRefusal> {
     let registry = process_registry();
     let current = std::thread::current().id();
-    let mut held = registry.held.lock();
+    let mut slots = registry.slots.lock();
+    if Instant::now() >= deadline {
+        return Err(LeaseRefusal::TimedOut(lock_error(
+            "timed out waiting for in-process volume lease",
+        )));
+    }
+    if let Some(holder) = slots.get(&key).and_then(|slot| slot.holder.as_ref()) {
+        if holder.thread == Some(current) {
+            return Err(LeaseRefusal::Refused(SqliteError::VolumeLeaseReentry {
+                holder_site: holder.site.to_string(),
+                requester_site: requester.to_string(),
+            }));
+        }
+    }
+    if let std::collections::hash_map::Entry::Vacant(entry) = slots.entry(key.clone()) {
+        // An absent slot has no earlier waiter. Preserve the allocation-free
+        // queue fast path for the ordinary uncontended acquisition.
+        entry.insert(SlotState {
+            holder: Some(SlotHolder {
+                thread: Some(current),
+                site: requester,
+            }),
+            waiters: VecDeque::new(),
+        });
+        return Ok(ProcessSlot(key));
+    }
+    // This synchronous acquire cannot have another pending acquire on the
+    // same thread. Re-entry by the current holder was refused above.
+    slots
+        .entry(key.clone())
+        .or_default()
+        .waiters
+        .push_back(current);
     loop {
         if Instant::now() >= deadline {
+            let slot = slots.get_mut(&key).expect("queued volume lease slot");
+            slot.waiters.retain(|waiter| *waiter != current);
+            if slot.holder.is_none() && slot.waiters.is_empty() {
+                slots.remove(&key);
+            }
+            drop(slots);
+            registry.available.notify_all();
             return Err(LeaseRefusal::TimedOut(lock_error(
                 "timed out waiting for in-process volume lease",
             )));
         }
-        match held.get(&key) {
-            None => {
-                held.insert(
-                    key.clone(),
-                    SlotHolder {
-                        thread: Some(current),
-                        site: requester,
-                    },
-                );
-                return Ok(ProcessSlot(key));
-            }
-            Some(holder) if holder.thread == Some(current) => {
-                return Err(LeaseRefusal::Refused(SqliteError::VolumeLeaseReentry {
-                    holder_site: holder.site.to_string(),
-                    requester_site: requester.to_string(),
-                }));
-            }
-            Some(_) => {}
+        let slot = slots.get_mut(&key).expect("queued volume lease slot");
+        if slot.holder.is_none() && slot.waiters.front() == Some(&current) {
+            slot.waiters.pop_front();
+            slot.holder = Some(SlotHolder {
+                thread: Some(current),
+                site: requester,
+            });
+            return Ok(ProcessSlot(key));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(LeaseRefusal::TimedOut(lock_error(
-                "timed out waiting for in-process volume lease",
-            )));
-        }
-        registry.available.wait_for(&mut held, remaining);
+        registry.available.wait_for(&mut slots, remaining);
     }
 }
+
+#[cfg(all(test, any(unix, windows)))]
+mod fifo_tests;
 
 /// A volume lease bound to the thread that took it. Re-entry detection keys
 /// on that thread, so the lease must not move: it is `!Send`, which makes

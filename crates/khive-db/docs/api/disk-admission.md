@@ -48,6 +48,19 @@ Callers can supply an explicit directory through `PoolConfig.volume_lock_dir`,
 `StorageBackend::sqlite_with_volume_lock_dir`, or the constructor accepting both
 captured policies. Test callers use private fixture directories.
 
+Within one process, requests for a volume slot are queued in the order they
+enter its registry mutex. Only the front waiter can acquire a free slot; a new
+arrival cannot overtake queued requests. An expired waiter removes itself and
+retains the same `CapacityUnavailable` lock-phase error and deadline. The FIFO
+order does not extend to separate processes competing for the advisory file
+lock. Same-thread re-entry still refuses immediately, and detached leases retain
+exclusion until their eventual release.
+
+Under `KHIVE_TEST_HARNESS=1`, private lock directories also isolate in-process
+slots. File-backed test fixtures must own a private directory for their whole
+runtime lifetime or run through the isolated child-process helper. A private
+database filename alone does not isolate a physical-volume lease.
+
 Memory and read-only backends do not take the disk lease or capacity probe.
 Diagnostics report the resolved numeric values and their configuration sources,
 the identified volume and probe path, and any inability to inspect that volume.
