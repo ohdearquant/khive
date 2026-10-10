@@ -47,6 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
   caller filters, explicit depth and entry caps, and optional within-root symlink following.
   Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
 
 ### Changed
 
@@ -72,21 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
 - Extract runtime daemon wire frames and framing into a private module while preserving public paths,
   protocol constants, error normalization, and source-reader coverage.
-### Changed
-
 - Move MCP server state, registration errors, and stdio settings into a dedicated
   core module, preserving public server entry points and existing function bodies.
-### Added
-
-- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
-  entries into document/paper records with authors properties, `@string` expansion
-  and crossref edges. Malformed entries report skip counts and optional warnings;
-  fatal source errors refuse the import before the target database opens.
-### Added
-
-- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
-  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
-  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+- Split the `kkernel exec` run paths into a private module while preserving the public entry point,
+  test module paths, and tracing targets.
+- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
+  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
+  attachments and exemption audit commit together. Production manifests remain empty; non-empty
+  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ### Fixed
 
@@ -113,16 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
-### Added
-
-- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
-  without training or consuming a serve-ledger grade. Later caller-judged
-  auto-feedback with the same scorer/serve pair commits its grade and posterior
-  update exactly once; manual feedback behavior is unchanged.
-### Changed
-
-- Split the `kkernel exec` run paths into a private module while preserving the public entry point,
-  test module paths, and tracing targets.
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 
 ### Breaking (Rust crates)
 
@@ -204,18 +201,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
   `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
   `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
-
-### Fixed
-
-- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
-  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
-### Changed
-
-- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
-  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
-  attachments and exemption audit commit together. Production manifests remain empty; non-empty
-  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ## [0.11.0] - 2026-10-08
 
