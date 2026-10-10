@@ -515,7 +515,7 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 27 verbs: 11 base + propose/review/withdraw (3) + verbs
+        // kg pack ships 28 verbs (including schema): 11 base + propose/review/withdraw (3) + verbs
         // + stats (2) + count (1, ADR-022) + context (1, ADR-089) + resolve (1)
         // + whoami (1) + scan (1)
         // + db_diagnostics (1, ADR-091) + stream.append/read/stat/batch (4,
@@ -523,8 +523,8 @@ mod tests {
         // entries are its notes)
         assert_eq!(
             info.verbs.len(),
-            27,
-            "kg pack must expose 27 verbs; got {}: {:?}",
+            28,
+            "kg pack must expose 28 verbs; got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );
