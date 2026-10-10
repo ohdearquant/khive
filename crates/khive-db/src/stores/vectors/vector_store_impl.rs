@@ -389,22 +389,21 @@ impl VectorStore for SqliteVecStore {
                 ));
             }
 
-            // Push namespace+embedding_model (and optionally kind) directly into
-            // the MATCH predicate so sqlite-vec evaluates them before computing
-            // global top-k, preventing cross-namespace recall starvation.
+            // Filter before the exact scan's total order and limit. A MATCH
+            // query cannot order by a second key, so boundary ties require the
+            // scalar distance over all eligible rows.
             let kind_clause = if kind_filter.is_some() {
                 "AND kind = ?5"
             } else {
                 ""
             };
             let sql = format!(
-                "SELECT subject_id, distance \
+                "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
                  FROM {t} \
-                 WHERE embedding MATCH ?1 \
-                   AND namespace = ?3 \
+                 WHERE namespace = ?3 \
                    AND embedding_model = ?4 \
                    {kind_clause} \
-                 ORDER BY distance \
+                 ORDER BY exact_distance, subject_id \
                  LIMIT ?2",
                 t = table,
                 kind_clause = kind_clause
