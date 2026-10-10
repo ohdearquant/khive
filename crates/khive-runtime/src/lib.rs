@@ -14,6 +14,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
+pub mod backend_handle;
 pub mod blob;
 pub mod bounded_read;
 pub mod build_info;
@@ -114,6 +115,7 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
+pub use backend_handle::{BackendHandle, BackendHandleError, RetrievalTier};
 pub use blob::{
     resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,

@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries into document/paper records with authors properties, `@string` expansion
   and crossref edges. Malformed entries report skip counts and optional warnings;
   fatal source errors refuse the import before the target database opens.
+### Added
+
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
 
 ### Fixed
 

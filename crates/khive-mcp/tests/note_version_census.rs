@@ -685,6 +685,36 @@ enum MarkerDisposition {
 // forwarding wrappers do not infer provenance from the current binary.
 const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     (
+        "khive-db/src/backend/core_stores/note.rs",
+        "upsert_note",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "insert_note_if_absent",
+        "insert_note_if_absent",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "upsert_notes",
+        "upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "try_insert_note",
+        "try_insert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "try_insert_note_with_attachments",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
         DB,
         "note_insert_if_absent_statement",
         "note_upsert_statement",
