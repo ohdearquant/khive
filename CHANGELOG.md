@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Edge-weight and moodboard hash validators use the shared `khive-types` predicates,
+  preserving numeric boundaries, hash lengths and validation diagnostics.
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix

@@ -250,7 +250,7 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
             edge_id
         );
     }
-    if !(0.0..=1.0).contains(&weight) {
+    if !khive_types::validate_edge_weight(weight) {
         bail!(
             "edge {} weight {weight} is outside the valid range [0.0, 1.0]",
             edge_id

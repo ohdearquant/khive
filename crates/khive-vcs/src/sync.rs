@@ -1059,7 +1059,7 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
             )
         })?;
 
-        if !r.weight.is_finite() || !(0.0..=1.0).contains(&r.weight) {
+        if !khive_types::validate_edge_weight(r.weight) {
             bail!(
                 "edge {i} ({}): weight {} out of range; must be finite and in [0.0, 1.0]",
                 r.edge_id,

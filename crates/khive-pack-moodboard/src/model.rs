@@ -1063,11 +1063,7 @@ fn optional_checkpoint_attestation() -> Result<Option<String>, RuntimeError> {
 }
 
 fn validate_sha256(name: &str, value: &str) -> Result<(), RuntimeError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if value.len() != 64 || !khive_types::is_lowercase_hex(value) {
         return Err(RuntimeError::Unconfigured(format!(
             "{name} must be exactly 64 lowercase hexadecimal characters"
         )));

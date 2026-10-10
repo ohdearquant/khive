@@ -112,10 +112,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn is_lower_hex_64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64 && khive_types::is_lowercase_hex(value)
 }
 
 pub(crate) fn validate_features(
