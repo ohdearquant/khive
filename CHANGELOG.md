@@ -146,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `unidentified_candidates`. Direct constructors and exhaustive destructurings
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
+- `khive-storage` adds `StorageError::SqliteWrite` and `khive-db` adds
+  `SqliteError::{Write, WriteSettlementUnknown}`, carrying native SQLite write evidence
+  (`SqliteWriteFailure`: stage, primary and extended codes, settlement flag). Exhaustive matches
+  must handle the new variants, `SqliteWriteFailure` literals must include every field, and
+  `EventsResponse::Error` literals need the new optional `sqlite_write_failure` field. On the
+  wire, a native `BEGIN` refusal now reports `code`/`stage` `sqlite_begin_busy` instead of
+  `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
+  `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
+  `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
 
 ## [0.11.0] - 2026-10-08
 
