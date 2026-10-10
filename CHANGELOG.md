@@ -117,9 +117,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
-- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
-  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 
 ### Breaking (Rust crates)
 
