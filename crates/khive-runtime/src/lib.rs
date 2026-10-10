@@ -31,6 +31,7 @@ pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
 pub mod embedding;
+pub mod embedding_reranker;
 pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
@@ -140,6 +141,7 @@ pub use daemon::{
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
+pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
     BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
