@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Named-vector and memory session exact search select equal-distance boundary hits by
+  subject UUID before limiting candidates, keeping their order stable across database reopen.
+
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
