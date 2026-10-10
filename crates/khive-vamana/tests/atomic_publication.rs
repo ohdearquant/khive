@@ -5,8 +5,8 @@ use std::io;
 use std::os::unix::fs::symlink;
 
 use khive_vamana::{
-    write_auxiliary_sidecar_atomic, write_external_ids_sidecar, ExternalIdsWriteError,
-    VamanaConfig, VamanaError, VamanaIndex,
+    write_auxiliary_sidecar_atomic, write_external_ids_sidecar, AuxiliarySidecarCleaner,
+    AuxiliarySidecarReader, ExternalIdsWriteError, VamanaConfig, VamanaError, VamanaIndex,
 };
 
 #[test]
@@ -139,4 +139,91 @@ fn external_id_remove_and_rename_failures_keep_context_and_native_source() {
         fs::read(dir.path().join("external_ids.bin/child")).unwrap(),
         b"precious"
     );
+}
+
+#[test]
+fn sidecar_reader_and_cleaner_preserve_component_policy_and_missing_entry_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("precious");
+    fs::write(&target, b"outside bytes").unwrap();
+    fs::write(dir.path().join("pack.bin"), b"sidecar bytes").unwrap();
+    symlink(&target, dir.path().join("linked.bin")).unwrap();
+    fs::create_dir(dir.path().join("directory.bin")).unwrap();
+    let reader = AuxiliarySidecarReader::open(dir.path()).unwrap();
+    let cleaner = AuxiliarySidecarCleaner::open(dir.path()).unwrap();
+
+    assert_eq!(
+        reader.read_bounded("pack.bin", 13).unwrap(),
+        Some(b"sidecar bytes".to_vec())
+    );
+    assert_eq!(
+        reader.read_prefix("pack.bin", 7).unwrap(),
+        Some(b"sidecar".to_vec())
+    );
+    assert_eq!(reader.read_bounded("missing.bin", 13).unwrap(), None);
+    assert_eq!(reader.read_prefix("missing.bin", 7).unwrap(), None);
+    cleaner.remove_and_sync("missing.bin").unwrap();
+    assert!(reader
+        .read_bounded("linked.bin", 13)
+        .unwrap_err()
+        .raw_os_error()
+        .is_some());
+    let error = reader.read_bounded("directory.bin", 13).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint sidecar is not a regular file"
+    );
+    assert!(cleaner
+        .remove_and_sync("directory.bin")
+        .unwrap_err()
+        .raw_os_error()
+        .is_some());
+    assert!(dir.path().join("directory.bin").is_dir());
+    assert_eq!(
+        reader.read_bounded("pack.bin", 12).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    let mut before_names: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    before_names.sort();
+    for invalid in ["", ".", "..", "a/b", "a\\b", "nul\0suffix"] {
+        assert_eq!(
+            reader.read_bounded(invalid, 13).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            reader.read_prefix(invalid, 7).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            cleaner.remove_and_sync(invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut after_names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        after_names.sort();
+        assert_eq!(after_names, before_names);
+        assert_eq!(
+            fs::read(dir.path().join("pack.bin")).unwrap(),
+            b"sidecar bytes"
+        );
+        assert_eq!(
+            fs::read_link(dir.path().join("linked.bin")).unwrap(),
+            target
+        );
+        assert!(dir.path().join("directory.bin").is_dir());
+        assert_eq!(fs::read(&target).unwrap(), b"outside bytes");
+    }
+    cleaner.remove_and_sync("linked.bin").unwrap();
+    assert!(fs::symlink_metadata(dir.path().join("linked.bin")).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"outside bytes");
+    cleaner.remove_and_sync("pack.bin").unwrap();
+    assert_eq!(reader.read_bounded("pack.bin", 13).unwrap(), None);
 }
