@@ -113,6 +113,19 @@ impl FromStr for EntityKind {
     }
 }
 
+/// Entity-kind admission for an explicit archive import.
+///
+/// This policy never changes relation validation or registers new kinds for
+/// ordinary writes. VCS snapshot degradation is a separate policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImportKindPolicy {
+    /// Refuse entity kinds outside the importer's installed vocabulary.
+    #[default]
+    Strict,
+    /// Preserve genuinely unknown, nonblank entity-kind spellings verbatim.
+    PreserveUnknown,
+}
+
 /// A graph node with a type, display name, and key-value properties.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

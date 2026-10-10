@@ -42,6 +42,14 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("config TOML policy error in {path}, key {key}: {source}")]
+    SchemaParse {
+        path: PathBuf,
+        key: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
+
     #[error("exactly one engine must be marked `default = true`; found {found}")]
     DefaultCount { found: usize },
 
@@ -246,6 +254,7 @@ impl ConfigError {
     fn in_file(self, path: &Path) -> Self {
         match self {
             already @ (ConfigError::Parse { .. }
+            | ConfigError::SchemaParse { .. }
             | ConfigError::ExplicitConfigMissing { .. }
             | ConfigError::InFile { .. }) => already,
             other => ConfigError::InFile {
@@ -1290,12 +1299,39 @@ impl WebSectionConfig {
     }
 }
 
+/// Explicit import schema policy. Missing or empty sections preserve strict
+/// admission. Unknown keys are ignored with a loader warning (ADR-035).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SchemaSectionConfig {
+    #[serde(default = "schema_strict_default")]
+    pub strict: bool,
+}
+
+fn schema_strict_default() -> bool {
+    true
+}
+
+impl Default for SchemaSectionConfig {
+    fn default() -> Self {
+        Self { strict: true }
+    }
+}
+
+// Parse the original text, rather than a TOML Value, so type errors retain the
+// source span. Other sections remain under the full loader's validation.
+#[derive(Deserialize)]
+struct SchemaSyntaxProbe {
+    #[serde(default)]
+    schema: SchemaSectionConfig,
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
+/// - `[schema]`: explicit import unknown-entity-kind admission
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
@@ -1311,6 +1347,10 @@ impl WebSectionConfig {
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    /// Admission policy for explicit KG imports only; never VCS sync or create.
+    #[serde(default)]
+    pub schema: SchemaSectionConfig,
+
     /// Read by `credentials::read_tables` at load, never by this derive.
     #[serde(skip)]
     pub credentials: Vec<crate::credentials::CredentialConfig>,
@@ -1511,12 +1551,37 @@ impl KhiveConfig {
                 path: diagnostic_path.clone(),
                 source,
             })?;
+        let schema_probe: SchemaSyntaxProbe =
+            toml::from_str(&raw).map_err(|source| ConfigError::SchemaParse {
+                path: diagnostic_path.clone(),
+                key: if document
+                    .get("schema")
+                    .is_some_and(|value| !value.is_table())
+                {
+                    "schema"
+                } else {
+                    "schema.strict"
+                },
+                source,
+            })?;
+        let unknown_schema_keys: Vec<String> = document
+            .get("schema")
+            .and_then(toml::Value::as_table)
+            .map(|table| {
+                table
+                    .keys()
+                    .filter(|key| key.as_str() != "strict")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
+        cfg.schema = schema_probe.schema;
         cfg.engines_declared = engines_declared;
         crate::credentials::read_tables(&raw, &mut cfg)
             .map_err(|error| ConfigError::from(error).in_file(&diagnostic_path))?;
@@ -1524,6 +1589,12 @@ impl KhiveConfig {
             .map_err(|error| error.in_file(&diagnostic_path))?;
         for engine in &mut cfg.engines {
             engine.name = canonical_engine_name(&engine.name);
+        }
+        for key in unknown_schema_keys {
+            tracing::warn!(target: "khive.config.schema",
+                key = %crate::secret_gate::bounded_masked_log_text(&key),
+                file = %crate::secret_gate::bounded_masked_log_text(&diagnostic_path.to_string_lossy()),
+                "ignoring unknown schema configuration key");
         }
         Ok(Some(cfg))
     }
@@ -2085,6 +2156,10 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
         ..KhiveConfig::default()
     }
 }
+
+#[cfg(test)]
+#[path = "engine_config_schema_tests.rs"]
+mod schema_tests;
 
 // ---- Tests ----
 
