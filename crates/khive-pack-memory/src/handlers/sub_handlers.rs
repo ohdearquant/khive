@@ -308,12 +308,13 @@ impl MemoryPack {
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
 
-        const FEATURE_NAMES: [&str; 5] = [
+        const FEATURE_NAMES: [&str; 6] = [
             "relevance",
             "salience",
             "temporal",
             "text_match",
             "vector_match",
+            "graph_proximity",
         ];
         let mut ignored_weights: Vec<String> = cfg
             .reranker_weights
@@ -403,6 +404,7 @@ impl MemoryPack {
                     temporal,
                     text_match,
                     vector_match,
+                    graph_proximity: 0.0,
                 };
                 let rerank_score = weighted_rerank(&features, &cfg.reranker_weights);
 
@@ -418,6 +420,7 @@ impl MemoryPack {
                         features.temporal as f32,
                         f32::from(features.text_match),
                         f32::from(features.vector_match),
+                        features.graph_proximity as f32,
                     ];
                     let final_score = rerank_score as f32;
                     // Keep identity even when score narrowing is not representable.
@@ -449,6 +452,7 @@ impl MemoryPack {
                         "temporal" => features.temporal,
                         "text_match" => f64::from(features.text_match),
                         "vector_match" => f64::from(features.vector_match),
+                        "graph_proximity" => features.graph_proximity,
                         _ => continue,
                     };
                     rerank_scores.insert(name.clone(), json!(weight * fv));
