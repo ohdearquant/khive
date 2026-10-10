@@ -152,6 +152,19 @@ async fn guarded_delete_rejects_invalid_roles_and_propagates_database_failure() 
         } else {
             error
         };
+        // The native write failure carries its SQLite stage and codes beside the driver error.
+        let StorageError::SqliteWrite { failure, source } = error else {
+            panic!("expected staged native write failure, got {error:?}")
+        };
+        assert_eq!(
+            failure.stage,
+            khive_storage::error::SqliteWriteStage::Statement
+        );
+        assert_eq!(
+            failure.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        );
+        let error = *source;
         let StorageError::Driver {
             capability: StorageCapability::Attachments,
             operation,
