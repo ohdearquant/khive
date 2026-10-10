@@ -73,6 +73,15 @@ rebuild logic they wrap live in [`khive-vcs`](https://crates.io/crates/khive-vcs
 [`khive-vcs-adapters`](https://crates.io/crates/khive-vcs-adapters); `kkernel`'s own
 `kg/` module is a thin CLI wrapper over those libraries.
 
+`kkernel kg export` publishes one archive through an exclusive temporary sibling, retaining
+non-UTF-8 filenames and ordinary destination replacement. It refuses every pre-existing
+temporary entry and checks file sync before rename. Unix uses `khive-fs` and syncs the held
+parent directory after rename; parent-directory sync is Unix-only. A directory-sync error can
+leave the new archive installed. Failed writes, file syncs and renames remove the temporary
+owned by that attempt, reporting any cleanup failure alongside the original error. An
+incumbent temporary is never removed. Callers must serialize exports sharing the same names;
+newly created ancestor directories are not recursively synced.
+
 ## Configuration
 
 Resolution precedence for the default namespace: `--actor` > `--namespace` (legacy alias) >

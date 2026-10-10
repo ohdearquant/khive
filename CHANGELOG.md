@@ -63,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `kkernel kg export` checks file sync and cleans its owned temporary on write,
+  sync or rename failure. Unix uses shared atomic publication with parent sync,
+  exclusive refusal of existing temporaries, original filename bytes and mode0666
+  under umask; existing shared staging policies retain mode0644 and their behavior.
+
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
