@@ -297,7 +297,7 @@ delete/update at all.
 
 ### `exec` local-dispatch fallback server (ADR-067, ADR-028 §8)
 
-`build_local_fallback_server` (`src/exec.rs`) is the server constructor for both of
+`build_local_fallback_server` (`src/exec/run.rs`) is the server constructor for both of
 `kkernel exec`'s non-daemon dispatch paths: the daemon-unreachable/mismatch fallback inside
 `run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path (which deliberately
 never attempts the daemon fast path at all — bulk apply needs cross-op atomicity the daemon
@@ -333,7 +333,7 @@ raw request paths continue to call `parse_request` and retain the 1 MiB limit.
 They do not forward through, stop, or lease a live daemon. If that daemon has the same SQLite
 file open, the CLI runtime is a second process with an independent connection pool. ADR-067's
 writer task and `KHIVE_WRITE_QUEUE=1` serialize writes only inside one pool/process; they do not
-coordinate the CLI process with the daemon. The boot/recovery guard in `exec.rs` protects runtime
+coordinate the CLI process with the daemon. The boot/recovery guard in `exec/run.rs` protects runtime
 construction and schema initialization only and is dropped before request execution.
 
 Cross-process writes therefore use SQLite's WAL writer lock as their only serialization seam.
