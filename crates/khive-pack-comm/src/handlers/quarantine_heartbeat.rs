@@ -50,20 +50,15 @@ pub(super) async fn detach_deleted_legacy_original(
             "cleanup_expired_quarantine: deleted note {id} has a mismatched original owner"
         )));
     }
-    let detached = core
-        .sql()
-        .writer()
-        .await?
-        .execute(SqlStatement {
-            sql: khive_runtime::sql!("quarantine_original_detach").into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(expected.as_str().to_string()),
-            ],
-            label: Some("comm_cleanup_legacy_quarantine_original".into()),
-        })
+    let detached = attachments
+        .delete_attachment_if(
+            id,
+            "quarantine-original",
+            AttachmentSubstrate::Note,
+            &expected,
+        )
         .await?;
-    if detached != 1 {
+    if !detached {
         return Err(RuntimeError::Internal(format!(
             "cleanup_expired_quarantine: deleted note {id} original owner changed during cleanup"
         )));
