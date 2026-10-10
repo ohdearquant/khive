@@ -18,7 +18,8 @@
 - Unknown entity keys fold into the `properties` map rather than being rejected.
 - Schema mode strictness applies only to entity kinds; edge relations are always validated
   against the closed set regardless of schema mode.
-- Phase P0 formats: `csv`, `tsv`, `json`, `ndjson`. Deferred to P1/P2: BibTeX, Turtle,
+- Phase P0 formats: `csv`, `tsv`, `json`, `ndjson`. BibTeX P1 import is implemented.
+  Deferred to P1/P2: Turtle,
   JSON-LD, streaming JSON, GraphML, GEXF, Markdown.
 
 ### Git-Native KG Implementation (field shapes) (ADR-020)
@@ -54,5 +55,10 @@
 - ADR-036 §7 specifies streaming JSON parse (requiring an `impl Read` pipeline). The current
   `JsonFormatAdapter` uses eager `serde_json::from_str` — the full source is loaded before
   iteration. Streaming is deferred to P1. This is documented in `docs/api/adapter-protocol.md`.
-- The `PHASE0_FORMATS` constant in `lib.rs` includes `csv` and `tsv`, but no CSV/TSV adapters
-  are implemented yet. These are P0 aspirational entries.
+- CSV/TSV use the eager `CsvFormatAdapter`. The `PHASE0_FORMATS` constant remains a
+  historical phase list, so it does not include P1 BibTeX.
+- BibTeX reads bounded frames from `BufRead` and uses pinned `serde_bibtex` for
+  grammar validation. Explicit token capture keeps macro expansion under local
+  byte limits. Converted records and reference tables remain buffered; source
+  streaming does not imply constant memory for the whole import. See
+  [BibTeX API](api/bibtex-adapter.md) for mapping, failure and limit contracts.

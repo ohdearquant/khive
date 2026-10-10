@@ -51,14 +51,14 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "DELETE",
         "{table}",
         1,
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "INSERT",
         "{table}",
         1,

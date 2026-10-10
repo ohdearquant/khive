@@ -1,7 +1,7 @@
 //! Vector embedding storage and similarity search capability.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -15,6 +15,17 @@ use crate::types::{
     VectorMetadataFilter, VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest,
     VectorStoreCapabilities, VectorStoreInfo,
 };
+
+/// Opens a dense vector store for one model and namespace binding.
+pub trait VectorStoreFactory: Send + Sync + 'static {
+    fn open(
+        &self,
+        model_key: &str,
+        embedding_model: &str,
+        dimensions: usize,
+        namespace: &str,
+    ) -> StorageResult<Arc<dyn VectorStore>>;
+}
 
 /// Storage capability for dense vector embeddings and similarity search.
 #[async_trait]

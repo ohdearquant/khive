@@ -2279,6 +2279,8 @@ fn check_inventory(
                 DetectedClass::WholeObject | DetectedClass::FixedKeySet(_),
             ) => match row.reservation {
                 Reservation::NamedCheck { function, .. } if site.calls.contains(function) => {}
+                Reservation::FinalizedCandidate
+                    if finalization_tests::is_finalized_candidate_site(site, row) => {}
                 _ => failures.push(format!(
                     "{}: whole-object write lacks its named check/callee",
                     site.key
@@ -2466,42 +2468,12 @@ mod route_census_synthetic_controls_tests;
 mod route_census_static_sql_tests;
 
 #[cfg(test)]
+#[path = "route_census_finalization_tests.rs"]
+mod finalization_tests;
+
+#[cfg(test)]
 #[path = "route_census_shadowing_tests.rs"]
 mod shadowing_tests;
-
-#[test]
-fn source_census_matches_closed_route_inventory() {
-    let sources = live_workspace_sources();
-    check_store_trait_methods(&sources).expect("store method surface drifted");
-    let sql_sources = live_workspace_sql();
-    let mut population =
-        scan_source_population_with_sql(&sources, &sql_sources).expect("parse workspace sources");
-    check_sql_asset_reach(&sql_sources, &population.resolved_sql)
-        .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
-    population
-        .properties
-        .extend(scan_migration_sources(&live_migration_sources()));
-    population.properties.sort_by(|a, b| a.key.cmp(&b.key));
-    for site in &population.properties {
-        eprintln!(
-            "ROUTE SITE | {} | count={} | {:?} | {:?} | {:?}",
-            site.key, site.write_count, site.target, site.class, site.evidence
-        );
-    }
-    for site in &population.runtime_tables {
-        eprintln!(
-            "RUNTIME TABLE SITE | {} | count={} | {:?}",
-            site.key, site.write_count, site.evidence
-        );
-    }
-    check_population(
-        &population,
-        ROUTE_INVENTORY,
-        RUNTIME_TABLE_WRITE_INVENTORY,
-        PINNED_MISSING_ACCEPTANCE,
-    )
-    .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
-}
 
 #[test]
 fn migration_sql_is_inventoried() {

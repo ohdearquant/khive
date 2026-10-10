@@ -1226,6 +1226,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server/disk_policy.rs",
     ),
     (
+        "khive-mcp/src/server.rs",
+        "server_core",
+        "khive-mcp/src/server/server_core.rs",
+    ),
+    (
         "khive-mcp/src/daemon.rs",
         "executable",
         "khive-mcp/src/daemon/executable.rs",
@@ -1254,6 +1259,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/daemon.rs",
         "liveness",
         "khive-mcp/src/daemon/liveness.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "forward_or_spawn",
+        "khive-mcp/src/daemon/forward_or_spawn.rs",
     ),
     (
         "khive-runtime/src/daemon.rs",

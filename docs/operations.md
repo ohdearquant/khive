@@ -23,7 +23,7 @@ explicitly and describes what the code does.
 | `sync`                               | yes (target DB)                            | Rebuild a SQLite DB from `.khive/kg/{entities,edges}.ndjson`                            |
 | `pack list` / `pack handler <name>`  | no                                         | Introspect registered packs (verbs, note/entity kinds)                                  |
 | `kg validate`                        | no (mutates only with `--fix`)             | Structural + rule-based lint of tracked `.khive/kg/*.ndjson`                            |
-| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `khive.toml`, pre-commit hook, optional CI workflow                |
+| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `config.toml`, pre-commit hook, optional CI workflow               |
 | `kg hook install\|uninstall\|status` | yes (`.git/hooks/`)                        | Wire/unwire the pre-commit hook                                                         |
 | `kg fetch` (alias `kg sync`)         | yes (cache dir)                            | Pull a remote KG archive with SHA-256 pin verification                                  |
 | `kg export`                          | no (writes an output file, not the DB)     | Dump a namespace's entities+edges to one JSON archive                                   |
@@ -117,8 +117,9 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
   resolves to the same path as `--db`: "would overwrite the database" (`archive.rs:20-38`).
   The write itself is atomic: it creates `<output>.<pid>.inprogress` with `O_EXCL` (refusing to
   follow a pre-existing symlink), `fsync`s it, then renames it into place (`archive.rs:54-80`).
-- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson] [--verbose]`:
-  `source` and `--db` are required, `--format` defaults to `archive`.
+- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson|csv|tsv|bibtex] [--verbose]`:
+  `source` and `--db` are required. `--format` is inferred from a `.csv`, `.tsv` or `.bib`
+  extension and otherwise defaults to `archive`.
   - `--format archive` (default): parses `source` directly as a `KgArchive` JSON envelope and
     completes format/version, entity kind/name, timestamp, and edge-weight validation before the
     target runtime is constructed. Kind validation uses the **full merged pack kind registry**
@@ -133,6 +134,11 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
     is rejected as ambiguous. Required names must be non-blank and present timestamps must be valid
     RFC 3339 strings. Entity labels retain their original nonblank bytes. Edge properties and the
     two timestamps remain top-level portable fields and persist as storage metadata/provenance.
+  - `--format bibtex`: streamed through `khive_vcs_adapters::BibtexFormatAdapter`, which maps
+    entries to paper entities and resolves crossrefs to edges. A malformed entry is skipped with a
+    warning and its neighbours are kept; duplicate keys, unresolved crossrefs, invalid UTF-8, read
+    errors and oversized entries abort before `--db` is opened. `--default-kind` is refused. The
+    JSON summary adds an `adapter` object with `entries`, `skipped` and `warnings`.
   - A malformed record anywhere in an archive, `json`, or `ndjson` input aborts before the target
     runtime is constructed; `--db` is neither created nor migrated and earlier valid records are
     not partially applied.
@@ -423,9 +429,11 @@ kkernel kg init [--repo .] [--ci] [--add-hooks]
 ```
 
 Creates `.khive/kg/`, `.khive/kg/hooks/`, empty `entities.ndjson`/`edges.ndjson`, `.khive/.gitignore`,
-a default `.khive/khive.toml`, and the tracked pre-commit hook script, every artifact is written
-only `if !path.exists()`, so re-running is safe and never clobbers existing content
-(`kg/init.rs:82-145`, confirmed by an explicit non-overwrite regression test). `--ci` additionally
+a default `.khive/config.toml`, and the tracked pre-commit hook script. Re-running is safe and never
+clobbers existing content: the config is created atomically and kept when it, or a root `khive.toml`,
+already exists; the other artifacts are written only when absent; and only the byte-exact ignore
+file written by the old initializer is migrated. A legacy `.khive/khive.toml` makes init fail before
+it writes anything. `--ci` additionally
 writes `.github/workflows/kg-validate.yml` (also existence-gated). `--add-hooks` short-circuits to
 the same logic as `kg hook install` below and skips the rest of scaffolding; use it to (re-)wire
 the git hook without touching anything else.

@@ -14,7 +14,7 @@ pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
     Validate(ValidateArgs),
 
-    /// Initialize `.khive/kg/` and write `.khive/khive.toml` with defaults.
+    /// Initialize `.khive/kg/` and write `.khive/config.toml` with defaults.
     Init(InitArgs),
 
     /// Fetch a remote KG archive into `.khive/kg/remotes/<remote>/`.
@@ -189,7 +189,7 @@ pub struct ImportArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Import format. Infer CSV or TSV by extension; otherwise use archive JSON.
+    /// Import format. Infer CSV, TSV or BibTeX by extension; otherwise use archive JSON.
     #[arg(long, value_enum)]
     pub format: Option<ImportFormat>,
 
@@ -210,6 +210,7 @@ pub enum ImportFormat {
     Ndjson,
     Csv,
     Tsv,
+    Bibtex,
 }
 
 /// CLI arguments for `kkernel kg status`.
