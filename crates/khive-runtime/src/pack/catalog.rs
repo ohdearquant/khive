@@ -514,13 +514,31 @@ impl VerbRegistry {
     /// before the first verb dispatch, so that custom embedding providers
     /// contributed by packs are reachable via `KhiveRuntime::embedder(name)`.
     ///
-    /// Packs whose `register_embedders` is the default no-op pay no overhead.
-    /// The method is idempotent when the underlying registry uses last-wins
-    /// semantics for duplicate provider names.
+    /// This low-level hook dispatcher does not finalize configured peers.
+    /// Hosts use [`Self::initialize_embedding_engines`] for serialized,
+    /// idempotent registration and fallible metadata binding before serving.
     pub fn call_register_embedders(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_embedders(runtime);
         }
+    }
+
+    /// Register pack providers and finalize configured engines before serving.
+    ///
+    /// Repeated aliases of one runtime registry initialize once. Distinct
+    /// no-embedding runtimes bind an empty list without running provider hooks;
+    /// their main/core registry is unaffected. No model services are built.
+    pub fn initialize_embedding_engines(
+        &self,
+        runtimes: &[&KhiveRuntime],
+    ) -> Result<(), RuntimeError> {
+        let mut seen = std::collections::HashSet::new();
+        for runtime in runtimes {
+            if seen.insert(runtime.embedding_registry_identity()) {
+                runtime.initialize_embedding_engines(|| self.call_register_embedders(runtime))?;
+            }
+        }
+        Ok(())
     }
 
     /// Invoke `PackRuntime::register_entity_type_validator` on every registered pack.

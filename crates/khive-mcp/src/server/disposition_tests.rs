@@ -1207,6 +1207,11 @@ impl ErrorConstructorCensus {
 const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
     (
         "khive-mcp/src/server.rs",
+        "pack_setup",
+        "khive-mcp/src/server/pack_setup.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
         "search_diagnostics",
         "khive-mcp/src/server/search_diagnostics.rs",
     ),
