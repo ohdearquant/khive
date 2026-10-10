@@ -283,7 +283,7 @@ impl KhiveRuntime {
         };
 
         let vector_hits = if !matches!(&strategy, FusionStrategy::KeywordOnly)
-            && (query_vector.is_some() || self.config().embedding_model.is_some())
+            && (query_vector.is_some() || !self.default_embedder_name().is_empty())
         {
             self.vector_search(
                 token,
