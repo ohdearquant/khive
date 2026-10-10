@@ -91,10 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves existing project configurations, and refuses the obsolete config path before writing
   scaffolding. Only the exact old generated ignore file is migrated to the canonical filename.
 
+- Identifier splitting restores acronym boundaries in `DBUsers` and `APIUsage` while keeping
+  terminal plural suffixes in `APIs`, `IDs`, `URLs`, and `APIsFoo`. `URLsafe` now splits as
+  `ur`, `lsafe`; `XMLIsEmpty` follows the dictionary-free rule as `xmlis`, `empty` (#5103).
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  whole (a terminal lowercase `s` after an acronym), while still splitting acronym-to-word
   boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 - Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
   decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
