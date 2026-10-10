@@ -50,8 +50,8 @@ pub use entity_type::{
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
-    ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
+    EventSink, ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload,
+    ProposalWithdrawnPayload, RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
