@@ -1472,7 +1472,7 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
     // than rejecting a differently-attributed same-uid connection to a cold
     // local-dispatch fallback. `config_id`: which governs packs/db/embed
     // coherence for the shared warm engine: remains a hard reject for every
-    // field other than a daemon-side superset of the client's extra embedders.
+    // field; only legacy IDs allow a superset of the client's extra embedders.
     } else if !config_ids_compatible(&frame.config_id, dispatcher.config_id()) {
         DaemonResponseFrame {
             ok: false,

@@ -317,6 +317,7 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;
+mod resolve_prefix_in;
 mod resolve_uuid_or_prefix;
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -336,6 +337,7 @@ use fault_injection::{
 };
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use fault_injection::{consume_fts_fail_fault, consume_vector_fail_fault};
+pub use resolve_prefix_in::PrefixScope;
 
 /// A note search result with UUID, salience-weighted RRF score, and display text.
 #[derive(Clone, Debug)]

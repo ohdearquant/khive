@@ -106,8 +106,7 @@ pub(super) fn resolve_target(args: &EntityTypeBackfillArgs) -> Result<ResolvedTa
     let path = validated.path.clone();
     config.db_path = Some(path.clone());
     config.backend_id = BackendId::parse(&backend_name)?;
-    config.embedding_model = None;
-    config.additional_embedding_models.clear();
+    config.disable_embedding_models();
     // This detached command must not open the discovery anchor's event plane.
     config.events_split = None;
     let target = ResolvedTarget {

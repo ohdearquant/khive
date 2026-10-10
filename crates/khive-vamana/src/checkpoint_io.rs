@@ -290,68 +290,14 @@ impl CheckpointDirectory {
     pub(crate) fn stage(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         {
-            use std::{
-                ffi::CString,
-                io::Write as _,
-                os::fd::{AsRawFd as _, FromRawFd as _},
-            };
-            let name = component_name(name)?;
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let dir_fd = self.dir.as_raw_fd();
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: pointers and descriptor are live. AT_SYMLINK_NOFOLLOW
-            // inspects the directory entry itself rather than its target.
-            let rc = unsafe {
-                libc::fstatat(
-                    dir_fd,
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc == 0 {
-                // SAFETY: fstatat succeeded and initialized the structure.
-                let stat = unsafe { stat.assume_init() };
-                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "checkpoint staging entry is not a regular file",
-                    ));
-                }
-                // A stale regular staging inode is safe to replace. An entry
-                // swapped in after fstatat is only unlinked, never followed.
-                // SAFETY: the name and descriptor remain live.
-                if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            } else {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
-                }
-            }
-            // SAFETY: O_EXCL and O_NOFOLLOW prevent a concurrent planted link
-            // from being opened. The returned descriptor has one owner.
-            let fd = unsafe {
-                libc::openat(
-                    dir_fd,
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o644 as libc::c_uint,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: fd was freshly returned by openat.
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(bytes)?;
-            file.sync_all()
+            use khive_fs::atomic_publish::{stage_atomic_at_detailed, StaleTmp};
+            use std::io::Write as _;
+
+            component_name(name)?;
+            stage_atomic_at_detailed(&self.dir, name, StaleTmp::Refuse, |file| {
+                file.write_all(bytes)
+            })
+            .map_err(checkpoint_publication_error)
         }
         #[cfg(windows)]
         {
@@ -373,16 +319,12 @@ impl CheckpointDirectory {
         component_name(to)?;
         #[cfg(unix)]
         {
-            use std::{ffi::CString, os::fd::AsRawFd as _};
-            let from =
-                CString::new(from).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let to = CString::new(to).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let dir_fd = self.dir.as_raw_fd();
-            // SAFETY: both names and the pinned directory descriptor are live.
-            if unsafe { libc::renameat(dir_fd, from.as_ptr(), dir_fd, to.as_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            khive_fs::fd_relative::rename_at(
+                &self.dir,
+                std::ffi::OsStr::new(from),
+                &self.dir,
+                std::ffi::OsStr::new(to),
+            )
         }
         #[cfg(windows)]
         {
@@ -449,9 +391,22 @@ pub fn write_auxiliary_sidecar_atomic(path: &Path, name: &str, bytes: &[u8]) -> 
     component_name(name)?;
     let checkpoint = CheckpointDirectory::open(path)?;
     let staged = format!("{name}.tmp");
-    checkpoint.stage(&staged, bytes)?;
-    checkpoint.rename(&staged, name)?;
-    checkpoint.sync()
+    #[cfg(unix)]
+    {
+        use khive_fs::atomic_publish::{publish_atomic_at_detailed, StaleTmp};
+        use std::io::Write as _;
+
+        publish_atomic_at_detailed(&checkpoint.dir, &staged, name, StaleTmp::Refuse, |file| {
+            file.write_all(bytes)
+        })
+        .map_err(checkpoint_publication_error)
+    }
+    #[cfg(not(unix))]
+    {
+        checkpoint.stage(&staged, bytes)?;
+        checkpoint.rename(&staged, name)?;
+        checkpoint.sync()
+    }
 }
 
 /// Remove an obsolete pack-owned sidecar after a full segment publication.
@@ -477,14 +432,27 @@ pub fn remove_auxiliary_sidecars(path: &Path, names: &[String]) -> io::Result<()
     first_error.map_or(Ok(()), Err)
 }
 
+#[cfg(unix)]
+fn checkpoint_publication_error(error: khive_fs::atomic_publish::AtomicPublishError) -> io::Error {
+    if error.phase() == khive_fs::atomic_publish::AtomicPublishPhase::RefuseTmp {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint staging entry is not a regular file",
+        )
+    } else {
+        error.into_source()
+    }
+}
+
 fn component_name(name: &str) -> io::Result<&str> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-    {
+    if matches!(name, "." | "..") || name.contains('\\') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    #[cfg(unix)]
+    khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    #[cfg(not(unix))]
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     Ok(name)

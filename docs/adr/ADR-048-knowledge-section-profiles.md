@@ -4,6 +4,22 @@
 **Date**: 2026-05-27
 **Authors**: khive maintainers
 
+## Amendment (2026-10-09): graph lint contract (#4813)
+
+**Status: Accepted (2026-10-09).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates. The public
+contract is specified in the revised
+[section 9](#9-kg-lint--configurable-graph-hygiene-rules-deferred).
+
+This amendment specifies all thirteen built-in `knowledge.lint` rules, the
+caller-visible statistics population, typed reports, and three guarded fix
+families with honest partial outcomes. It corrects `missing-entity-type` to use
+the canonical entity column. Custom `knowledge.lint_config` rules and the broader
+graph export remain deferred; shipped namespace corpus export is unchanged.
+
+Dependent code PRs follow this accepted text. Register the verb only after its
+complete implementation is integrated.
+
 ## Amendment (2026-10-04): eight section types
 
 **Status: Accepted (2026-10-04).** Acceptance of the text is not implementation
@@ -930,57 +946,316 @@ The graph needs a linting system analogous to `clippy` for Rust or `eslint` for
 JavaScript. Static rules catch structural problems; configurable rules encode
 project-specific conventions. The output is machine-readable and actionable.
 
-**`knowledge.lint`** verb — run lint rules and report violations:
+The [2026-10-09 amendment](#amendment-2026-10-09-graph-lint-contract-4813)
+specifies the thirteen built-in rules, statistics, and three guarded fix families
+for #4813 below. `knowledge.lint` is still unimplemented. Custom rules and
+`knowledge.lint_config` remain a separate deferred scope.
 
-```
-knowledge.lint(rules?: [...], fix?: false, severity?: "warn") → {
-  violations: [
-    {
-      rule: "min-edge-density",
-      severity: "error",
-      entity_id: "abc123",
-      entity_name: "Sinkhorn Algorithm",
-      entity_kind: "concept",
-      message: "concept entity has 2 edges, minimum is 4",
-      suggestion: "Add instance_of, introduced_by, or competes_with edges",
-      auto_fixable: false
-    },
-    ...
-  ],
-  summary: {
-    total: N,
-    errors: N,
-    warnings: N,
-    fixed: N,    // when fix=true
-    by_rule: {"min-edge-density": 3, "orphan-entity": 1, ...}
-  },
-  stats: {
-    total_entities: N,
-    total_edges: N,
-    avg_density: f64,
-    entity_kinds: {"concept": N, "project": N, ...},
-    edge_relations: {"implements": N, "depends_on": N, ...}
+#### Lint request and caller scope
+
+`knowledge.lint(rules?: [...], fix?: false, severity?: "warn")` accepts:
+
+| Parameter  | Contract                                                                                                                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `rules`    | Omitted selects all thirteen built-ins. Otherwise a nonempty array of exact rule IDs from the table below; repeated IDs are evaluated once. Unknown IDs, non-string members, and an empty array are `InvalidInput`. The sole special selector is `["stats-only"]`. |
+| `fix`      | Boolean, default `false`. `true` requests the guarded fixes described below for the reported violations only.                                                                                                                                                      |
+| `severity` | Exact `"error"`, `"warn"`, or `"info"`, default `"warn"`. This is a minimum severity: `error` reports errors, `warn` errors and warnings, `info` all three. It does not change a rule's severity.                                                                  |
+
+Wrong parameter types, explicit nulls, and unknown severity spellings are
+`InvalidInput`. `stats-only` cannot be combined with another rule or `fix=true`;
+its response is exactly `{ "stats": LintStats }`. A valid severity has no effect
+in stats-only mode. Selectors and severity filter violations and fix candidates,
+not the statistics population.
+
+The verb has access class **Write**, using the strongest effect of its parameters
+as `gtd.repair` does. Inspection with `fix=false` changes no domain rows; normal
+dispatch audit behavior is unaffected. Caller identity and namespace visibility
+come from the request token, never from caller-supplied actor or namespace fields.
+Each fix also passes the ordinary create, update, or delete gate for its record.
+A Write admission alone does not authorize those mutations.
+
+Inspection covers the caller-visible graph across its registered backend owners,
+not just the database assigned to the knowledge pack. Graph entities, notes, and
+edges are distinct from the knowledge corpus tables: corpus atoms and sections do
+not enter these counts unless they independently exist as graph records. Apply
+normal namespace and mailbox visibility before reports, counts, endpoint
+inspection, or error text can disclose a record. An edge hidden by endpoint
+visibility cannot contribute to the visible report or aggregates.
+
+Walk every page using existing cancellation/deadline checks. A read error,
+unavailable endpoint owner, or deadline failure returns an error, never a
+successful truncated report. An absent endpoint is distinct from a confirmed
+soft-deleted endpoint. This walk is a captured observation, not a promised
+cross-table or cross-backend snapshot.
+
+Keep backend identity together with namespace and record identity during capture
+and fix routing. Visiting the same backend through several pack registrations
+must not repeat its records. Repeated edge IDs with identical record data count
+once across backends; contradictory records with the same ID, including conflicting
+namespace or substrate identity, fail inspection rather than silently selecting a
+row. Apply the same conflict detection to entity and note identity. A deduplicated
+read does not establish a unique mutation owner: an action without an unambiguous
+owning database is unsupported. Internal backend identity must not expose database
+paths or credentials in the report.
+
+#### Built-in rules
+
+Degree is the number of distinct visible, non-deleted incident edge IDs for a live
+entity. Incoming and outgoing edges count; a self-loop counts once. A dangling
+edge counts at its live end only. The degree rules and density statistics use this
+raw incidence population. Positive semantic relation witnesses have the separate
+liveness requirement described after the table.
+
+| Rule ID                  | Severity | Predicate                                                                                                                                                                                                                                                                       |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `orphan-entity`          | error    | A live entity has degree zero.                                                                                                                                                                                                                                                  |
+| `dangling-edge`          | error    | A non-deleted edge has a confirmed soft-deleted source or target; report once per edge even if both endpoints are deleted. A hard-missing or unavailable endpoint is not evidence of this predicate.                                                                            |
+| `min-edge-density`       | error    | A live concept has degree below 4, project below 3, or person below 1. Other kinds have no invented minimum.                                                                                                                                                                    |
+| `direction-violation`    | error    | The resolved `(source_kind, relation, target_kind)` fails the current ADR-002 contract or loaded pack `EDGE_RULES`, including applicable subtype and annotates endpoint rules. Use the shared link-contract validation; absence or deletion alone is not a direction violation. |
+| `missing-entity-type`    | warn     | A live project/resource has canonical `Entity.entity_type` equal to `None` or the empty string. A type stored only in `properties.entity_type` does not satisfy this rule; the message identifies that legacy property-only case.                                               |
+| `missing-introduced-by`  | warn     | A live concept whose `properties.type` is the string `"paper"` lacks an outgoing `introduced_by` witness.                                                                                                                                                                       |
+| `missing-implements`     | warn     | A live project lacks an outgoing `implements` witness to a live concept.                                                                                                                                                                                                        |
+| `duplicate-name`         | warn     | Two or more live entities share `(namespace, kind, exact name)`. One violation per group, with all observed member IDs. Names compare exactly, without case folding or whitespace normalization.                                                                                |
+| `superseded-not-marked`  | warn     | A live entity has an incoming `supersedes` witness from a live source, but `properties.status` is not the string `"deprecated"`.                                                                                                                                                |
+| `concept-no-parent`      | warn     | A live concept lacks an outgoing `instance_of`, `extends`, or `variant_of` witness.                                                                                                                                                                                             |
+| `paper-missing-metadata` | info     | A live concept whose `properties.type` is the string `"paper"` lacks one or more of the object members `authors`, `year`, and `source`. Report once per entity and name the missing members.                                                                                    |
+| `low-weight-edge`        | info     | A non-deleted edge has weight strictly below `0.3`; equality does not violate the rule.                                                                                                                                                                                         |
+| `note-no-annotates`      | info     | A live note lacks an outgoing `annotates` witness. Valid targets include entity, note, edge, and event substrates under the current link contract.                                                                                                                              |
+
+A positive semantic relation witness is a visible, non-deleted edge with live
+endpoints and the required direction and endpoint kind. It must pass the existing
+shared link-contract validation, including self-loop rejection and subtype/direction
+checks. A tombstoned endpoint does not satisfy `missing-introduced-by`, `missing-implements`,
+`superseded-not-marked`, `concept-no-parent`, or `note-no-annotates`. Edge and event
+annotation targets use their own live/deleted state; they are not coerced to
+entities. This does not remove the edge from raw incidence counts or suppress its
+separate `dangling-edge` violation.
+
+Direction validation may use a resolved tombstone's stored kind/subtype: deletion
+does not change its endpoint type. A stored edge can therefore have both a
+direction violation and a dangling-edge violation. Missing kind information does
+not invent a direction failure. Tombstone resolution still applies caller-visible
+namespace and mailbox policy before any report or aggregate can disclose it;
+a successful by-ID storage lookup alone is not permission to reveal the row.
+
+The two legacy paper rules apply literally to `kind=concept` plus the string
+`properties.type="paper"`; document-kind papers are outside this amendment.
+Property presence is object-member presence: present null counts as present for
+`paper-missing-metadata`, with no new author/year/source value-type constraint.
+Canonical `entity_type` is a separate column and is not a property-coverage key.
+A stored nonfinite edge weight or undecodable record fails inspection rather than
+being silently skipped or reclassified as a lint violation.
+
+#### Typed report and statistics
+
+The following types specify JSON fields and presence, not shipped Rust APIs.
+`Uuid` means a full canonical lowercase dashed UUID; `Count` means a nonnegative
+integer. Map keys and result order are deterministic. Optional fields are omitted,
+not null. No subject carries two ID fields.
+
+```typescript
+type LintSubject =
+  | {
+    substrate: "entity";
+    namespace: string;
+    entity_id: Uuid;
+    entity_name: string;
+    entity_kind: string;
   }
-}
+  | { substrate: "edge"; namespace: string; edge_id: Uuid }
+  | { substrate: "note"; namespace: string; note_id: Uuid; note_kind: string };
+
+type LintViolation = LintSubject & {
+  rule: RuleId; // One of the thirteen IDs above.
+  severity: "error" | "warn" | "info";
+  message: string;
+  suggestion: string;
+  auto_fixable: boolean;
+  member_ids?: Uuid[]; // Required only for duplicate-name; absent for other rules.
+};
+
+type LintSummary = {
+  total: Count;
+  errors: Count;
+  warnings: Count;
+  infos: Count;
+  by_rule: Partial<Record<RuleId, Count>>; // Only rules with reported violations.
+  fixed?: Count; // Present exactly when fix=true; confirmed commits only.
+};
+
+type PropertyCoverage = Record<string, { present: Count; total: Count }>;
+type LintStats = {
+  total_entities: Count;
+  total_notes: Count;
+  total_edges: Count;
+  entity_kinds: Record<string, Count>;
+  note_kinds: Record<string, Count>;
+  edge_relations: Record<string, Count>;
+  avg_density: number;
+  density_histogram: Record<string, Count>;
+  property_coverage: { entities: PropertyCoverage; notes: PropertyCoverage };
+};
+
+type LintReport = {
+  violations: LintViolation[];
+  summary: LintSummary;
+  stats: LintStats;
+};
+
+type LintResponse =
+  | { stats: LintStats } // stats-only
+  | (LintReport & {
+    fixes?: FixReceipt[]; // Present exactly when fix=true, including an empty array.
+  });
 ```
 
-**Built-in lint rules** (always available, severity configurable):
+`duplicate-name` uses an entity subject. Sort its distinct `member_ids`
+lexicographically by canonical UUID and set `entity_id` to the first member. This
+is a stable representative, **not a merge winner**. The group supplies the common
+namespace, kind, and name. `summary.by_rule["duplicate-name"]` counts groups, not
+members. Every other violation uses the subject whose predicate failed: entities
+for entity rules, edges for dangling/direction/weight rules, notes for annotations.
 
-| Rule ID                  | Default | What it checks                                                                                    |
-| ------------------------ | ------- | ------------------------------------------------------------------------------------------------- |
-| `orphan-entity`          | error   | Entities with 0 edges                                                                             |
-| `dangling-edge`          | error   | Edges where source or target is soft-deleted                                                      |
-| `min-edge-density`       | error   | Entity below kind-specific minimum (concept ≥ 4, project ≥ 3, person ≥ 1)                         |
-| `direction-violation`    | error   | Edge where (source_kind, relation, target_kind) is not in the ADR-002 contract or pack EDGE_RULES |
-| `missing-entity-type`    | warn    | project/resource entity without `entity_type` in properties                                       |
-| `missing-introduced-by`  | warn    | concept with `properties.type=paper` but no `introduced_by` edge                                  |
-| `missing-implements`     | warn    | project entity with no `implements` edge to any concept                                           |
-| `duplicate-name`         | warn    | Multiple entities of the same kind with identical names                                           |
-| `superseded-not-marked`  | warn    | Entity with incoming `supersedes` edge but no `properties.status=deprecated`                      |
-| `concept-no-parent`      | warn    | concept with no `instance_of`, `extends`, or `variant_of` edge                                    |
-| `paper-missing-metadata` | info    | concept with type=paper missing authors/year/source in properties                                 |
-| `low-weight-edge`        | info    | Edge with weight < 0.3 (possibly speculative)                                                     |
-| `note-no-annotates`      | info    | Note with no `annotates` edge                                                                     |
+Sort violations by rule ID, namespace, substrate, and subject UUID, each
+lexicographically. `summary.total = errors + warnings + infos` counts this
+filtered, pre-fix array, and `by_rule` partitions the same array. Fixes never erase
+or rewrite reported violations or recompute the report's statistics.
+`auto_fixable` describes the rule's fix family: true for the three families below,
+false otherwise. It does not promise that the current backend can execute the
+particular action; that is the receipt's job.
+
+| Statistic                        | Population and meaning                                                                                                                                                                                                                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `total_entities`, `entity_kinds` | Caller-visible, non-deleted entity rows, deduplicated by identity; counts partition by stored kind.                                                                                                                                                                                          |
+| `total_notes`, `note_kinds`      | Caller-visible, non-deleted note rows, deduplicated by identity; counts partition by stored kind.                                                                                                                                                                                            |
+| `total_edges`, `edge_relations`  | Caller-visible, non-deleted edge rows, including dangling edges and deduplicated by edge ID; counts partition by stored relation. This is not a count restricted to live endpoints.                                                                                                          |
+| `avg_density`                    | Sum of the distinct incident non-deleted edge counts of the live entities, divided by `total_entities`. An edge between two live entities contributes once to each; a self-loop once; a dangling edge only at its live end. Zero when there are no live entities; always finite.             |
+| `density_histogram`              | Decimal nonnegative degree strings to the number of live entities at that degree. Omit empty buckets; the bucket counts sum to `total_entities`.                                                                                                                                             |
+| `property_coverage.entities`     | For every top-level property key observed on live entities, `present` is the count of entities whose properties object contains that exact key, and `total` is `total_entities`. Present null counts; absent/non-object properties contain no keys. Values and nested keys are not exported. |
+| `property_coverage.notes`        | The same key-presence calculation over live notes, with `total_notes` as each denominator. Edge metadata, events, corpus rows, and canonical entity columns are outside both property maps.                                                                                                  |
+
+All counts refer to the captured pre-fix population, regardless of rule selection
+or severity. Empty populations produce zero totals, zero average density, and empty
+maps. This contract states arithmetic and populations, not a measured performance
+result or a coherent database-wide snapshot.
+
+#### Guarded fixes and partial outcomes
+
+Collect the complete report and prepare all action candidates before the first
+mutation. There is at most one action for each reported auto-fixable violation:
+
+| Rule                    | Action                    | Mutation and in-transaction predicate                                                                                                                                                                                                                                                                  |
+| ----------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dangling-edge`         | `soft_delete_edge`        | Soft-delete the observed edge only while its exact observed record remains live/unchanged and at least one observed local endpoint is still tombstoned.                                                                                                                                                |
+| `duplicate-name`        | `propose_duplicate_merge` | Create one `question` note identifying all observed members, after checking that each member is live and retains its observed namespace, kind, exact name, and revision. Never merge entities or choose a winner. A newly arrived duplicate does not invalidate a proposal about the observed members. |
+| `superseded-not-marked` | `mark_deprecated`         | Set only `properties.status="deprecated"` through the normal property update while the entity retains its observed revision and a qualifying observed incoming supersedes edge and its source remain live/unchanged. Preserve unrelated properties.                                                    |
+
+A duplicate proposal uses the group's namespace and the request token's actor;
+it cannot silently write the question into a default namespace. The ordinary
+note-create gate still decides whether that write is authorized.
+
+Each action is one guarded atomic unit in its owning database, including its normal
+domain write, indexes, and mandatory events. Predicate checks run inside that unit
+before mutation. Reuse the normal prepared create/update/delete policy and the
+runtime's existing transaction-settlement owner; apply post-commit effects only
+from confirmed committed effects. Do not acquire another database or do an
+unbounded inspection while holding the writer. Entity guards include version,
+not just timestamps. The knowledge pack never gains raw SQL or database handles.
+
+Every predicate witness needed by a fix must be checkable in that same unit. Keep
+reporting violations whose sole witness lives in another database, but return
+`unsupported` for their fix. Missing atomic/guard capability or an ambiguous owner
+is also unsupported, without a fallback connection or unguarded write. No
+cross-backend atomicity is promised. A predicate that changed since capture gives
+`conflict` and changes no domain rows for that action. Ordinary policy refusals or
+storage failures remain errors, not invented predicate conflicts.
+
+Attempt actions in violation order. They do not chain: a fix cannot generate,
+expand, or refresh candidates for this call. Earlier committed actions remain
+committed if a later action conflicts or fails. Receipts are returned for each
+completed action, including conflict and unsupported outcomes:
+
+```typescript
+type FixAction = "soft_delete_edge" | "propose_duplicate_merge" | "mark_deprecated";
+type ActionIdentity = {
+  violation_index: Count; // Zero-based index into this report's violations.
+  action: FixAction;
+};
+type FixReceipt =
+  | {
+    violation_index: Count;
+    action: "soft_delete_edge" | "mark_deprecated";
+    status: "committed";
+  }
+  | {
+    violation_index: Count;
+    action: "propose_duplicate_merge";
+    status: "committed";
+    question_note_id: Uuid;
+  }
+  | (ActionIdentity & { status: "conflict" | "unsupported"; reason: string });
+```
+
+A committed `propose_duplicate_merge` receipt requires `question_note_id`; every
+other receipt omits it. Conflict means a guarded predicate no longer holds;
+unsupported means no action was attempted under the required contract. Reasons
+are caller-safe explanatory text, not a second status vocabulary.
+`summary.fixed` equals the number of committed receipts, including committed
+question proposals; it is not the number of violations removed. Non-fixable
+violations have no action or receipt.
+
+An unconfirmed write outcome stops further actions and returns an error, with no
+retry, fallback, or claim of rollback. Preserve the underlying typed cause and its
+writer-settlement evidence. The amendment requires a **new typed runtime failure
+context and canonical error projection** carrying `details.lint_fix` with this
+exact structured payload:
+
+```typescript
+type LintFixFailureDetail = {
+  outcome: "unknown" | "failed";
+  failed_action: ActionIdentity;
+  confirmed_receipts: FixReceipt[];
+  report: LintReport;
+};
+```
+
+For an unknown outcome, `outcome` is `"unknown"`, the enclosing error's
+`domain_disposition` is `"unknown"`, and `retryable` is `false`. `failed_action`
+identifies the one action whose settlement is unknown; it has no receipt in
+`confirmed_receipts`. That array preserves all earlier confirmed receipts in
+order, and `report.summary.fixed` counts only its committed entries. The frozen
+report supplies the failed action's namespace and exact subject identity without
+exposing internal backend handles. Unattempted actions have no receipts.
+
+A definite policy/storage failure after action processing has begun uses the same
+payload with `outcome="failed"`. A confirmed committed action has its committed
+receipt even if a subsequent post-commit obligation fails; a confirmed rolled-back
+action has no committed receipt. Preserve that action's settlement in the typed
+cause. The enclosing lint error retains `domain_disposition="unknown"` and
+`retryable=false`: a failed handler has not returned canonical success, and a
+nested refusal must not project the whole multi-action call as `not_committed`.
+Per-action receipts establish the confirmed effects. Parameter/admission/inspection
+errors before there is an action need no lint-fix payload. This intended structured extension
+is not already supplied by `RuntimeError`, and must not be encoded as JSON text
+inside the bounded string-only `KhiveError::Details` map. All public error
+transports must preserve the typed detail through the canonical projector.
+
+#### Implementation and acceptance sequence
+
+Dependent code PRs reference #4813 and follow this accepted text. Registration
+is the last implementation step, after the full inspection, thirteen-rule report,
+statistics, guarded fixes, and error projection are integrated. No read-only
+subset or helper alone completes #4813.
+
+Knowledge owns strict parameters, rule evaluation, and the wire report. Runtime
+owns authorized multi-backend inspection and typed fix preparation; database
+predicate builders own bound SQL and reuse the existing runtime atomic runner.
+This amendment requires no new storage trait or schema migration. Native validation
+must cover real registry dispatch, visibility and duplicate identity, all rule
+boundaries, every page, pre-fix statistics, deterministic changed-witness conflicts,
+all three fix families, direct and queued writers, and confirmed rollback versus
+unknown settlement. Source preparation and document checks are not proof that
+those tests passed.
 
 **Custom lint rules** (configurable via `knowledge.lint_config`):
 
@@ -1006,27 +1281,6 @@ knowledge.lint_config(rules=[
 The rule config is stored in `knowledge_atoms` as a domain-type resource (meta —
 the lint config is itself a knowledge artifact). Changes to lint rules are tracked
 as knowledge edits with observation notes.
-
-**Auto-fix** (`fix=true`): Some rules support auto-fix:
-
-- `dangling-edge` → soft-delete the edge
-- `duplicate-name` → propose merge (creates a `question` note, doesn't auto-merge)
-- `superseded-not-marked` → set `properties.status = "deprecated"`
-
-Non-fixable violations return `auto_fixable: false` with a `suggestion` string.
-
-**Integration with agent workflows**:
-
-Agents should run `knowledge.lint(severity="error")` after any batch KG operation
-(entity creation, edge wiring, polish). The `/kg-polish` skill already uses health
-checks — lint replaces and extends that surface. The lint result is structured for
-programmatic consumption: an orchestrator can dispatch fix agents per violation type.
-
-**State introspection** (`knowledge.lint(rules=["stats-only"])`):
-
-Returns only the `stats` section — entity/edge/note counts by kind, density
-histogram, relation distribution, property coverage. This is the "dashboard view"
-for understanding graph state without running any violation checks.
 
 **`knowledge.export`** verb — version-controllable graph dump:
 

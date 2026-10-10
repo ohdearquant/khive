@@ -1433,10 +1433,8 @@ fn runtime_config_from_khive_config_actor_id_with_engines() {
     };
     let cfg = KhiveConfig {
         engines: vec![crate::engine_config::EngineConfig {
-            name: "default".to_string(),
-            model: "all-minilm-l6-v2".to_string(),
-            default: true,
-            fusion_weight: None,
+            name: "all-minilm-l6-v2".to_string(),
+            weight: 1.0,
             dims: None,
         }],
         actor: ActorConfig {
@@ -1560,10 +1558,8 @@ fn runtime_config_from_khive_config_engines_present_preserves_env_actor_when_tom
 
     let cfg = KhiveConfig {
         engines: vec![crate::engine_config::EngineConfig {
-            name: "default".to_string(),
-            model: "all-minilm-l6-v2".to_string(),
-            default: true,
-            fusion_weight: None,
+            name: "all-minilm-l6-v2".to_string(),
+            weight: 1.0,
             dims: None,
         }],
         actor: ActorConfig::default(), // no [actor] id

@@ -393,15 +393,15 @@ impl SidecarDirHandle {
     }
 
     fn rename_over(&self, from: &str, to: &str) -> io::Result<()> {
-        let c_from = name_cstring(from)?;
-        let c_to = name_cstring(to)?;
-        // SAFETY: both names are NUL-terminated for the call; both are
-        // relative to this same, live directory fd.
-        let rc = unsafe { libc::renameat(self.raw(), c_from.as_ptr(), self.raw(), c_to.as_ptr()) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        // Preserve the sidecar's NUL diagnostics before shared component validation.
+        let _ = name_cstring(from)?;
+        let _ = name_cstring(to)?;
+        khive_fs::fd_relative::rename_at(
+            &self.0,
+            std::ffi::OsStr::new(from),
+            &self.0,
+            std::ffi::OsStr::new(to),
+        )
     }
 
     pub(super) fn unlink_tolerant(&self, name: &str) -> io::Result<()> {

@@ -34,6 +34,8 @@ pub mod pack;
 pub mod refusal;
 pub mod sql_like;
 pub mod substrate;
+#[cfg(feature = "serde")]
+pub mod tag_match;
 pub mod timestamp;
 pub mod vector;
 
@@ -77,6 +79,8 @@ pub use pack::{
 pub use refusal::RefusalReason;
 pub use sql_like::escape_like_literal;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
+#[cfg(feature = "serde")]
+pub use tag_match::tag_contains;
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
 

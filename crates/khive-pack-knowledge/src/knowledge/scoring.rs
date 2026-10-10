@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use super::matching;
 use super::schema::{Atom, SearchParams};
 use super::util::{
-    atom_embed_text, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_EXACT_NAME,
-    D_W_NAME, D_W_TAGS, STOP_WORDS,
+    atom_embed_text, has_domain_mirror_tag, D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM,
+    D_W_CONTENT, D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, STOP_WORDS,
 };
 
 fn is_stop(w: &str) -> bool {
@@ -89,10 +89,7 @@ pub(super) fn load_candidates_from_atoms(
         .iter()
         .filter_map(|atom| {
             let tags_str = atom.tags_display();
-            let is_domain = {
-                let tags_arr: Vec<String> = serde_json::from_str(&atom.tags).unwrap_or_default();
-                tags_arr.iter().any(|t| t == "type:domain")
-            };
+            let is_domain = has_domain_mirror_tag(&atom.tags);
             if (want_domain && !is_domain) || (want_atom && is_domain) {
                 return None;
             }

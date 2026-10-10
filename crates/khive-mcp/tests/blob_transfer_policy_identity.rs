@@ -45,6 +45,11 @@ fn transfer_disabled_identity(base: &RuntimeConfig) -> String {
     assert!(base.additional_embedding_models.is_empty());
     assert!(base.credentials.is_empty());
     assert!(base.visibility_receipts.is_none());
+    assert!(base.configured_engines().is_empty());
+    // An empty ordered peer list serializes as `[]` under the peer domain.
+    let mut engine_peers = Sha256::new();
+    engine_peers.update(b"khive.ordered-engine-peers.v1");
+    engine_peers.update(b"[]");
     let mut git = Sha256::new();
     git.update(b"khive.git-write-policy.v2");
     git.update(serde_json::to_vec(&base.mounts).unwrap());
@@ -57,12 +62,13 @@ fn transfer_disabled_identity(base: &RuntimeConfig) -> String {
     telemetry.update(serde_json::to_vec(&base.telemetry).unwrap());
     format!(
         concat!(
-            "packs=[blob];db=:memory:;embed=none;extra=[];fresh_tail={};",
+            "packs=[blob];db=:memory:;embed=none;extra=[];engine_peers={:x};fresh_tail={};",
             "blob_hydration_bytes={};backend={:?}:wal_ceiling_bytes=0;",
             "outbound=[];git_write={:x};brain={:x};telemetry={:x};",
             "display_tz=UTC;visibility_receipts=",
             "90b56d7d55c456ceb209a1e71c875ebc247c19c0bbcf9804aff3b5ba2417bece"
         ),
+        engine_peers.finalize(),
         khive_runtime::ann_fresh_tail_enabled_from_env(),
         base.blob_hydration_bytes,
         base.backend_id,

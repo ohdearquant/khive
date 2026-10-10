@@ -92,6 +92,7 @@ fn embedding_runtime_config(extras: &[lattice_embed::EmbeddingModel]) -> Runtime
     let mut config = memory_runtime_config();
     config.default_namespace = Namespace::parse("test").unwrap();
     config.packs = vec!["kg".to_string(), "memory".to_string()];
+    config.engines = None;
     config.embedding_model = Some(PRIMARY_MODEL);
     config.additional_embedding_models = extras.to_vec();
     config
@@ -200,8 +201,8 @@ async fn stop_embedding_daemon(daemon: tokio::task::JoinHandle<()>) {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_omits_vectors_for_undeclared_extra_models() {
-    let (_dir, daemon, runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+async fn daemon_refuses_an_unconfigured_extra_peer_before_dispatch() {
+    let (_dir, daemon, _runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
     let client_config = embedding_runtime_config(&[]);
     let client_id = crate::server::compute_config_id(&client_config, None);
     let response = exchange(
@@ -212,16 +213,11 @@ async fn daemon_omits_vectors_for_undeclared_extra_models() {
         ),
     )
     .await;
-    let namespace = created_namespace(&response);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1,
-        "the client's primary model must receive the note vector"
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        0,
-        "a daemon-only extra must not receive the note vector"
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
     assert_eq!(
         server.config_id(),
@@ -233,8 +229,8 @@ async fn daemon_omits_vectors_for_undeclared_extra_models() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_uses_only_client_declared_extra_models() {
-    let (_dir, daemon, runtime, _server, socket) =
+async fn daemon_refuses_a_different_peer_subset_before_dispatch() {
+    let (_dir, daemon, _runtime, _server, socket) =
         start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
     let client_config = embedding_runtime_config(&[EXTRA_MODEL]);
     let client_id = crate::server::compute_config_id(&client_config, None);
@@ -246,19 +242,11 @@ async fn daemon_uses_only_client_declared_extra_models() {
         ),
     )
     .await;
-    let namespace = created_namespace(&response);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
-        0,
-        "the daemon's second extra is outside the client's declaration"
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
 
     stop_embedding_daemon(daemon).await;
@@ -298,47 +286,22 @@ async fn equal_configuration_keeps_the_daemons_full_embedder_set() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_treats_an_undeclared_explicit_model_as_unknown() {
-    let (_dir, daemon, runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+async fn explicit_model_request_cannot_override_peer_config_mismatch() {
+    let (_dir, daemon, _runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
     let client_id = crate::server::compute_config_id(&embedding_runtime_config(&[]), None);
     let response = exchange(
         &socket,
         &embedding_request_frame(
             "memory.remember(content=\"outside the client model set\", memory_type=\"semantic\", embedding_model=\"bge-small-en-v1.5\")",
-            client_id.clone(),
-        ),
-    )
-    .await;
-    assert!(response.ok, "MCP dispatch failed: {:?}", response.error);
-    let result: serde_json::Value =
-        serde_json::from_str(response.result.as_deref().expect("remember response"))
-            .expect("JSON response");
-    let entry = &result["results"][0];
-    assert_eq!(entry["ok"], false, "{result}");
-    assert!(
-        entry
-            .to_string()
-            .contains("unknown embedding model: bge-small-en-v1.5"),
-        "the explicit model must have the in-process unknown-model result: {entry}"
-    );
-    // A declared write through the same client lands one primary vector, so
-    // the counts below read the namespace this client's writes use.
-    let anchor = exchange(
-        &socket,
-        &embedding_request_frame(
-            "create(kind=\"observation\", content=\"declared model anchor\")",
             client_id,
         ),
     )
     .await;
-    let namespace = created_namespace(&anchor);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        0
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
     stop_embedding_daemon(daemon).await;
 }

@@ -312,8 +312,8 @@ pub fn process_ref_from_env() -> Option<String> {
 /// supported async khive-mcp/kkernel host builders. Direct backend assembly is
 /// reserved for an already-coordinated database; use
 /// [`crate::KhiveRuntime::from_prepared_backend`] when that precondition has
-/// been established. `embedding_model` remains as the primary-model config
-/// shorthand beside the provider registry.
+/// been established. `engines` is the ordered peer configuration; absent peers
+/// retain the legacy programmatic model shorthand until startup preparation.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Named custody references; secret material stays inside credential providers.
@@ -352,7 +352,11 @@ pub struct RuntimeConfig {
     pub volume_lock_dir: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
-    /// Local embedding model. `None` alone does not disable embedding: setting
+    /// Ordered participating engines. `Some`, including an empty list, is
+    /// authoritative; `None` converts the legacy model fields at startup.
+    pub engines: Option<Vec<crate::engine_config::EngineConfig>>,
+    /// Legacy local embedding model, used when `engines` is absent and otherwise
+    /// projected from its first peer at startup. `None` alone does not disable embedding: setting
     /// only this field to `None` while `additional_embedding_models` is
     /// non-empty still registers those models. Both `embedding_model` and
     /// `additional_embedding_models` must be empty to disable built-in
@@ -365,7 +369,8 @@ pub struct RuntimeConfig {
     /// This field persists for backward compatibility until the embedder registry
     /// is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
-    /// Additional embedding models to make available by request name.
+    /// Legacy additional embedding models, used when `engines` is absent and
+    /// otherwise projected from its remaining peers at startup.
     ///
     /// `embedding_model` remains the default used by existing `embed()` and
     /// `embed_batch()` callers. This list adds non-default models that can be
@@ -568,6 +573,7 @@ impl Default for RuntimeConfig {
             disk_guard_config: None,
             volume_lock_dir: crate::daemon::volume_lock_dir().ok(),
             default_namespace: Namespace::local(),
+            engines: None,
             embedding_model,
             additional_embedding_models,
             gate: Arc::new(AllowAllGate),
@@ -596,6 +602,70 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Effective ordered peers with canonical built-in names, without binding
+    /// providers or mutating the configuration. Startup must still validate them.
+    pub fn configured_engines(&self) -> Vec<crate::engine_config::EngineConfig> {
+        match &self.engines {
+            Some(engines) => engines
+                .iter()
+                .cloned()
+                .map(|mut engine| {
+                    engine.name = crate::engine_config::canonical_engine_name(&engine.name);
+                    engine
+                })
+                .collect(),
+            None => configured_embedding_models(self)
+                .into_iter()
+                .map(|model| crate::engine_config::EngineConfig {
+                    name: model.to_string(),
+                    weight: 1.0,
+                    dims: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate and bind ordered built-in peers without loading model services.
+    ///
+    /// Legacy programmatic model fields remain accepted when `engines` is
+    /// absent. Once prepared, those fields are projections of the peer list.
+    /// Custom provider startup binding is not yet enabled.
+    pub fn prepare_engines(&mut self) -> RuntimeResult<()> {
+        use crate::embedder_registry::{EmbedderProvider, LatticeEmbedderProvider};
+
+        let mut engines = self.configured_engines();
+        crate::engine_config::validate_peer_engines(self.engines.as_deref().unwrap_or(&engines))
+            .map_err(|error| crate::RuntimeError::InvalidInput(error.to_string()))?;
+
+        let mut models = Vec::with_capacity(engines.len());
+        for engine in &mut engines {
+            let model = parse_embedding_model_alias(&engine.name).ok_or_else(|| {
+                crate::RuntimeError::InvalidInput(format!(
+                    "embedding provider `{}` cannot be bound at startup: custom provider \
+                     configuration binding is not yet supported",
+                    engine.name
+                ))
+            })?;
+            let provider = LatticeEmbedderProvider::new(model);
+            engine
+                .check_dimensions(provider.dimensions())
+                .map_err(|error| crate::RuntimeError::InvalidInput(error.to_string()))?;
+            engine.name = model.to_string();
+            models.push(model);
+        }
+        self.embedding_model = models.first().copied();
+        self.additional_embedding_models = models.into_iter().skip(1).collect();
+        self.engines = Some(engines);
+        Ok(())
+    }
+
+    /// Disable configured vector participation, including legacy model seeds.
+    pub fn disable_embedding_models(&mut self) {
+        self.engines = Some(Vec::new());
+        self.embedding_model = None;
+        self.additional_embedding_models.clear();
+    }
+
     /// The WAL ceiling policy this config asks its implicit main backend to
     /// open with. Preserves a configured ceiling for read-only reporting while
     /// ensuring a directly constructed config cannot silently drop a nonzero
@@ -686,8 +756,7 @@ impl RuntimeConfig {
         self.wal_ceiling_configured_bytes = 0;
         self.wal_ceiling_source = WalCeilingSource::BackendField;
         self.disk_guard_config = None;
-        self.embedding_model = None;
-        self.additional_embedding_models.clear();
+        self.disable_embedding_models();
         self
     }
 
@@ -901,6 +970,12 @@ pub(crate) fn build_embedder_registry(
 }
 
 fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
+    if let Some(engines) = &config.engines {
+        return engines
+            .iter()
+            .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+            .collect();
+    }
     let mut models: Vec<EmbeddingModel> = Vec::new();
     if let Some(model) = config.embedding_model {
         models.push(model);
@@ -930,16 +1005,13 @@ pub(crate) fn register_configured_embedding_models(
 
 /// Build a `RuntimeConfig` from a parsed `KhiveConfig`.
 ///
-/// For each `[[engines]]` entry:
-/// - The engine flagged `default = true` becomes `RuntimeConfig::embedding_model`.
-/// - All other engines become `RuntimeConfig::additional_embedding_models`.
-///
-/// `KhiveConfig::validate()` rejects an unrecognized engine model at load time.
-/// A caller-constructed config that bypasses validation still skips an invalid
-/// engine with a warning here.
-///
-/// If `khive_cfg.engines` is empty, the returned `RuntimeConfig` uses the
-/// env-var-derived defaults from `RuntimeConfig::default()`.
+/// Declared engines preserve their order and dimension assertions. The first
+/// peer is projected into the legacy single-model field when it is built-in;
+/// startup validates and binds the complete list before storage registration.
+/// An explicit empty list disables participation; an absent list preserves
+/// the caller's base configuration, including environment-derived defaults.
+/// Load file input with [`crate::KhiveConfig::load`] to preserve that distinction
+/// and convert legacy declarations before calling this function.
 ///
 /// When both a config file and `KHIVE_EMBEDDING_MODEL` env var are present,
 /// the caller is responsible for emitting a warning that env vars are overridden.
@@ -1063,7 +1135,7 @@ pub fn runtime_config_from_khive_config(
         .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
         .unwrap_or(base.display_timezone);
 
-    if khive_cfg.engines.is_empty() {
+    if khive_cfg.engines.is_empty() && !khive_cfg.engines_declared {
         return RuntimeConfig {
             credentials,
             visibility_receipts,
@@ -1086,31 +1158,20 @@ pub fn runtime_config_from_khive_config(
         };
     }
 
-    let mut embedding_model: Option<EmbeddingModel> = None;
-    let mut additional: Vec<EmbeddingModel> = Vec::new();
-
-    for engine in &khive_cfg.engines {
-        match parse_embedding_model_alias(&engine.model) {
-            Some(model) => {
-                if engine.default {
-                    embedding_model = Some(model);
-                } else {
-                    additional.push(model);
-                }
-            }
-            None => {
-                tracing::warn!(
-                    engine = %engine.name,
-                    model = %engine.model,
-                    "engine config: unknown model name; engine will be skipped"
-                );
-            }
-        }
-    }
+    let engines = khive_cfg.engines.clone();
+    let embedding_model = engines
+        .first()
+        .and_then(|engine| parse_embedding_model_alias(&engine.name));
+    let additional = engines
+        .iter()
+        .skip(1)
+        .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+        .collect();
 
     RuntimeConfig {
         credentials,
         visibility_receipts,
+        engines: Some(engines),
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,

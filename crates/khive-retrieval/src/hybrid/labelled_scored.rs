@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use khive_fusion::FuseError;
 use khive_score::DeterministicScore;
 
 use super::config::HybridConfig;
@@ -21,7 +22,7 @@ use super::searcher::fuse_search_results;
 /// strategy's two-source check, the fallback of a custom strategy to reciprocal rank, the `top_k`
 /// cut and `min_score` therefore behave exactly as they do there, and the ids, order and scores
 /// returned are the ones it returns. Keep an empty arm in its slot: the weighted strategy reads
-/// the position of each arm.
+/// the position of each arm. Weighted-RRF errors propagate before labels are combined.
 ///
 /// `combine(held, incoming)` is called for every appearance of an id after its first, in arm order
 /// and then position order within an arm. That covers every arm, including one the strategy does
@@ -35,7 +36,7 @@ pub fn fuse_labelled_scored<Id, L, F>(
     arms: Vec<Vec<(Id, DeterministicScore, L)>>,
     config: &HybridConfig,
     combine: F,
-) -> Vec<(Id, DeterministicScore, L)>
+) -> Result<Vec<(Id, DeterministicScore, L)>, FuseError>
 where
     Id: Eq + Hash + Clone + Ord,
     L: Clone,
@@ -49,7 +50,7 @@ where
         }
         scored_arms.push(scored);
     }
-    let ranked = fuse_search_results(scored_arms, config);
+    let ranked = fuse_search_results(scored_arms, config)?;
 
     let mut labels: HashMap<Id, L> = HashMap::new();
     for (id, _, label) in arms.into_iter().flatten() {
@@ -60,11 +61,11 @@ where
         labels.insert(id, merged);
     }
 
-    ranked
+    Ok(ranked
         .into_iter()
         .map(|(id, score)| {
             let label = labels.get(&id).expect("every scored id has a label");
             (id, score, label.clone())
         })
-        .collect()
+        .collect())
 }

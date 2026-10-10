@@ -214,12 +214,7 @@ pub(super) fn publish_blob_at(
     use std::os::fd::AsRawFd;
 
     if let Err(error) = publication.step("put_persist", || {
-        rename_entry_at(
-            source.as_raw_fd(),
-            temp_name,
-            shard2.as_raw_fd(),
-            content_ref.as_str(),
-        )
+        rename_entry_at(source, temp_name, shard2, content_ref.as_str())
     }) {
         let _ = unlink_entry_at(source.as_raw_fd(), temp_name);
         return Err(error);

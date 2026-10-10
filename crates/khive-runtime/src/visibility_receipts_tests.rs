@@ -78,10 +78,8 @@ fn receipt_configuration_survives_both_engine_conversion_branches() {
     for engines in [
         Vec::new(),
         vec![EngineConfig {
-            name: "primary".into(),
-            model: "all-minilm-l6-v2".into(),
-            default: true,
-            fusion_weight: None,
+            name: "all-minilm-l6-v2".into(),
+            weight: 1.0,
             dims: Some(384),
         }],
     ] {

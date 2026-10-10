@@ -3,4 +3,4 @@ SELECT COUNT(*) AS total_atoms,
            AS finalized_atoms
 FROM knowledge_atoms
 WHERE namespace = ?1 AND deleted_at IS NULL
-  AND tags NOT LIKE '%type:domain%'
+  AND NOT khive_tag_contains(tags, 'type:domain')

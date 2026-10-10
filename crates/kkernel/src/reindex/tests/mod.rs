@@ -17,8 +17,7 @@ async fn run_reindex_without_embeddings(args: ReindexArgs) -> Result<()> {
     run_reindex_with_setup(
         args,
         |mut cfg| {
-            cfg.embedding_model = None;
-            cfg.additional_embedding_models.clear();
+            cfg.disable_embedding_models();
             cfg
         },
         |runtime| {
