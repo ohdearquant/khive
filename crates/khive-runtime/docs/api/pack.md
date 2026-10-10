@@ -61,6 +61,31 @@ at the binding boundary but is registry-owned and must not appear in a pack decl
 variant or ADR mention alone does not make a kind bindable: a loaded pack must declare that it
 actually consumes the kind.
 
+## note_property_policies
+
+Packs declare exact `(kind, key, policy)` entries in `Pack::NOTE_PROPERTY_POLICIES` and mirror
+that slice from `PackRuntime::note_property_policies`. Both default to empty. Implement the
+runtime method explicitly alongside `pack_runtime_metadata!`; the macro does not emit it.
+`khive_types::NotePropertyPolicySpec` uses `PropertyPolicy::Derived` for values derived by the
+substrate or owning pack from trusted runtime context, and `PropertyPolicy::OwnerOnly` for
+values established by a specialized owning-pack writer.
+There is no `Free` variant: an unlisted key carries no declared restriction.
+
+Both serving and metadata-only registry builds read each pack's slice once, after existing
+metadata validation and before configuration activation. A declaration must name a kind in
+that same pack's `note_kinds()`. Duplicate `(kind, key)` pairs, even with equal policies, fail
+with `InvalidInput` naming the pack, kind and key. Keys are exact strings, without normalization
+or new grammar restrictions.
+
+`VerbRegistry::all_note_property_policies` copies the immutable boot snapshot in topological
+pack order and then declaration order. Registry clones share the snapshot; later accessor calls
+do not query packs, dispatch handlers, access storage or install validators. Comm declares the
+nine existing kind-specific protected keys for `message` and `channel_health` as `OwnerOnly`.
+
+This is the declaration foundation of Proposed ADR-125 (#4940). Declarations do not grant
+writer authority, alter existing generic create/update/merge enforcement, or prove that every
+semantic property has been declared. Adoption by those write paths remains separate work.
+
 ## register_embedders
 
 `PackRuntime::register_embedders` is called by the transport during pack initialisation, before
