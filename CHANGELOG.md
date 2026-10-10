@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
+  and atomically updates that remote in an existing schema.yaml, reporting both old
+  and new commits while preserving archive-content pins and other YAML values.
+  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
