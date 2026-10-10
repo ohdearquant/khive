@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod persist;
 pub mod policy;
 pub mod query_ir;
+pub mod query_variants;
 #[cfg(feature = "persist")]
 pub mod replay;
 pub mod search_config;
@@ -84,6 +85,11 @@ pub use persist::{
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
 pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_variants::{
+    merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
+    QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,
+    VariantAttribution, VariantRankedList, VariantSource,
+};
 pub use search_config::SearchConfig;
 pub use timeout::{
     search_with_cancellation, search_with_deadline, search_with_optional_timeout,
