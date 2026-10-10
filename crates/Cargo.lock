@@ -1989,6 +1989,7 @@ dependencies = [
  "criterion",
  "hex",
  "khive-runtime",
+ "khive-types",
  "lru 0.18.2",
  "rand 0.8.7",
  "serde",
