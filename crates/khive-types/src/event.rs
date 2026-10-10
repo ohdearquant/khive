@@ -62,6 +62,30 @@ impl fmt::Display for EventOutcome {
     }
 }
 
+/// Declared persistence destination for an event class.
+///
+/// This metadata does not route writes or provide an operator audit store.
+/// There is deliberately no default: every new event kind must choose its sink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum EventSink {
+    /// The event store exposed through ordinary caller event queries.
+    CallerEventStore,
+    /// A separate operator audit destination, outside caller event queries.
+    OperatorAudit,
+}
+
+impl EventSink {
+    /// Return the canonical snake_case declaration name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CallerEventStore => "caller_event_store",
+            Self::OperatorAudit => "operator_audit",
+        }
+    }
+}
+
 /// Discriminant for the 42 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
@@ -201,6 +225,57 @@ impl EventKind {
         Self::PhaseCancelled,
         Self::Refusal,
     ];
+
+    /// Return this class's explicitly declared persistence destination.
+    ///
+    /// Existing classes retain their caller-store declaration. The exhaustive
+    /// match makes a new kind without a sink declaration a compilation error.
+    pub const fn sink(self) -> EventSink {
+        match self {
+            Self::Audit => EventSink::CallerEventStore,
+            Self::RecallExecuted => EventSink::CallerEventStore,
+            Self::RerankExecuted => EventSink::CallerEventStore,
+            Self::SearchExecuted => EventSink::CallerEventStore,
+            Self::ToolCheckDecided => EventSink::CallerEventStore,
+            Self::LinkCreated => EventSink::CallerEventStore,
+            Self::EntityCreated => EventSink::CallerEventStore,
+            Self::EntityUpdated => EventSink::CallerEventStore,
+            Self::EntityDeleted => EventSink::CallerEventStore,
+            Self::EntityMerged => EventSink::CallerEventStore,
+            Self::NoteMerged => EventSink::CallerEventStore,
+            Self::NoteCreated => EventSink::CallerEventStore,
+            Self::NoteUpdated => EventSink::CallerEventStore,
+            Self::NoteDeleted => EventSink::CallerEventStore,
+            Self::EdgeUpdated => EventSink::CallerEventStore,
+            Self::EdgeDeleted => EventSink::CallerEventStore,
+            Self::TaskTransitioned => EventSink::CallerEventStore,
+            Self::FeedbackExplicit => EventSink::CallerEventStore,
+            Self::FeedbackUnjudged => EventSink::CallerEventStore,
+            Self::ProfileResolutionRecommended => EventSink::CallerEventStore,
+            Self::ProfileMerged => EventSink::CallerEventStore,
+            Self::EmbeddingModelChanged => EventSink::CallerEventStore,
+            Self::EmbeddingMigrationCompleted => EventSink::CallerEventStore,
+            Self::EmbeddingMigrationFailed => EventSink::CallerEventStore,
+            Self::EmbeddingDriftDetected => EventSink::CallerEventStore,
+            Self::EmbedderInitialized => EventSink::CallerEventStore,
+            Self::ProposalCreated => EventSink::CallerEventStore,
+            Self::ProposalReviewed => EventSink::CallerEventStore,
+            Self::ProposalApplied => EventSink::CallerEventStore,
+            Self::ProposalWithdrawn => EventSink::CallerEventStore,
+            Self::ChannelPollStarted => EventSink::CallerEventStore,
+            Self::ChannelPollSucceeded => EventSink::CallerEventStore,
+            Self::ChannelPollFailed => EventSink::CallerEventStore,
+            Self::ChannelBackoffArmed => EventSink::CallerEventStore,
+            Self::ChannelBackoffReset => EventSink::CallerEventStore,
+            Self::ChannelHeartbeatPersistFailed => EventSink::CallerEventStore,
+            Self::ConfigLocked => EventSink::CallerEventStore,
+            Self::CheckpointOutcomeRecorded => EventSink::CallerEventStore,
+            Self::PhaseStarted => EventSink::CallerEventStore,
+            Self::PhaseCompleted => EventSink::CallerEventStore,
+            Self::PhaseCancelled => EventSink::CallerEventStore,
+            Self::Refusal => EventSink::CallerEventStore,
+        }
+    }
 
     /// Return the canonical snake_case string for this event kind.
     pub const fn name(self) -> &'static str {
