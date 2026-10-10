@@ -3023,6 +3023,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "inventory",
  "khive-changeset",
  "khive-db",
  "khive-gate-rego",
