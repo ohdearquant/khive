@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
   checking its dimensions and finite coordinates even for empty requests. Existing methods
   remain single-engine compatibility delegates to the configured first/default engine.
+- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
+  caller filters, explicit depth and entry caps, and optional within-root symlink following.
+  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
 
 ### Changed
 
