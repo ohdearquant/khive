@@ -8,7 +8,15 @@ visible as the "current" state.
 ## Local sync — `run_sync`
 
 1. Read `<repo_root>/.khive/kg/entities.ndjson` and `edges.ndjson`.
-2. **Validate-first gate** (`validate_ndjson_records`, issue #476): full
+2. Apply ADR-001 local snapshot degradation to genuinely unknown nonblank entity kinds:
+   use `concept`, clear `entity_type`, preserve the original spelling in
+   `properties["khive:original_kind"]` and any present subtype in
+   `properties["khive:original_entity_type"]`, and add the exact `khive:degraded_kind` tag once, preserving any ordinary caller `degraded` tag.
+   Existing properties and all other fields survive; absent/null properties become an object,
+   while nonobject properties refuse. Warn once per distinct original kind after validation.
+   Known aliases/case variants remain subject to canonical snapshot validation.
+   This local policy is independent of `[schema].strict`; source NDJSON is unchanged.
+   **Validate-first gate** (`validate_ndjson_records`, issue #476): full
    ADR-020 structural validation — entity kind validity against the loaded pack
    registry (including `resource`), non-blank entity names, entity/edge
    timestamp validity, entity/edge sort order, duplicate entity ids,
@@ -46,10 +54,11 @@ batching path intact.
 1. `git clone --depth=1 --filter=blob:none` into a temporary staging
    directory.
 2. Sparse-checkout `.khive/kg/entities.ndjson` and `.khive/kg/edges.ndjson`.
-3. **Validate-first**: the same full `validate_ndjson_records` gate used by
-   local sync rejects blank names, malformed timestamps, invalid kinds,
+3. **Validate-first**: the unchanged strict `validate_ndjson_records` gate used after local
+   degradation rejects blank names, malformed timestamps, invalid kinds,
    relations/weights, duplicates, sort violations, and dangling endpoints
-   before any cache write.
+   before any cache write. The remote route never applies local degradation or rewrites
+   kind/subtype metadata before hash and pin verification.
 4. Compute the `SnapshotId` over the validated archive (see
    `snapshot-hash.md`).
 5. **Pin verification, fail-closed**: if `pin` is set and `repin=false`, a
