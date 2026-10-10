@@ -253,3 +253,189 @@ async fn disk_ingest_extracts_applicable_text_sitemap_and_feed() {
         }
     }
 }
+
+#[tokio::test]
+async fn disk_ingest_treats_filename_delimiters_as_path_data() {
+    let files = [
+        ("plain.txt", "plain.txt", "plain body"),
+        (
+            "report.txt#one",
+            "report.txt%23one",
+            "first fragment-named body",
+        ),
+        (
+            "report.txt#two",
+            "report.txt%23two",
+            "second fragment-named body",
+        ),
+        ("question?x.txt", "question%3Fx.txt", "question-named body"),
+        ("literal%23.txt", "literal%2523.txt", "percent-named body"),
+        ("scheme:name.txt", "scheme:name.txt", "colon-named body"),
+        (
+            "sub dir/page#one.txt",
+            "sub%20dir/page%23one.txt",
+            "nested body",
+        ),
+        (
+            "slash\\name.txt",
+            "slash%5Cname.txt",
+            "backslash-named body",
+        ),
+    ];
+    for (origin, expected_base) in [
+        ("https://disk.example.test/", "https://disk.example.test/"),
+        (
+            "https://disk.example.test/base/",
+            "https://disk.example.test/base/",
+        ),
+        (
+            "https://disk.example.test/base?ignored=1#ignored",
+            "https://disk.example.test/",
+        ),
+    ] {
+        let tree = tempfile::tempdir().expect("private served tree");
+        let blob_dir = tempfile::tempdir().expect("private blob directory");
+        for (name, _, body) in files {
+            let path = tree.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body.as_bytes()).unwrap();
+        }
+        let read_root = tree.path().canonicalize().unwrap();
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+        config.wal_ceiling_env_raw = None;
+        config.disk_guard_environment = Default::default();
+        config.disk_guard_config = None;
+        config.volume_lock_dir = None;
+        config.credentials.clear();
+        config.visibility_receipts = None;
+        config.mounts.clear();
+        config.events_split = None;
+        config.actor_id = Some("fixture-web-filenames".into());
+        config.default_namespace = khive_runtime::Namespace::local();
+        config.visible_namespaces.clear();
+        config.allowed_outbound_namespaces.clear();
+        config.brain_profile = None;
+        config.brain = Default::default();
+        config.packs = vec!["kg".into(), "web".into()];
+        config.web = WebSectionConfig {
+            read_roots: vec![read_root.to_str().unwrap().to_owned()],
+            ..WebSectionConfig::default()
+        };
+        assert!(config.db_path.is_none());
+        assert!(config.embedding_model.is_none());
+        assert!(config.additional_embedding_models.is_empty());
+        let runtime = KhiveRuntime::new(config).expect("memory runtime");
+        assert!(!runtime.backend().is_file_backed());
+        assert!(runtime.backend_data_dir().is_none());
+        assert!(runtime.backend_ann_root().is_none());
+        let store = khive_db::stores::blob::FsBlobStore::new(blob_dir.path().join("blobs"), 0)
+            .expect("private fs blob store");
+        runtime.install_blob_store(Arc::new(store)).unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some("fixture-web-filenames".into()));
+        builder.register(KgPack::new(runtime.clone()));
+        builder.register(WebPack::new(runtime.clone()));
+        let registry = builder.build().expect("real kg/web registry");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        let expected: std::collections::BTreeMap<_, _> = files
+            .iter()
+            .map(|(name, encoded, body)| (format!("{expected_base}{encoded}"), (*name, *body)))
+            .collect();
+        assert_eq!(expected.len(), files.len());
+        let mut first_ids = None;
+        let mut first_site = None;
+        for _ in 0..2 {
+            let reply = registry
+                .dispatch(
+                    "web.ingest",
+                    json!({
+                        "source": read_root.to_str().unwrap(),
+                        "origin": origin,
+                    }),
+                )
+                .await
+                .expect("disk ingest through real dispatch");
+            assert_eq!(reply["mode"], "disk");
+            let ingested = reply["ingested"].as_array().expect("ingested array");
+            assert_eq!(ingested.len(), files.len());
+            let unique_ids: std::collections::BTreeSet<_> = ingested
+                .iter()
+                .map(|id| id.as_str().expect("document id").to_owned())
+                .collect();
+            assert_eq!(
+                unique_ids.len(),
+                files.len(),
+                "one identity per original file"
+            );
+            let site_id = reply["site"].as_str().expect("site id").to_owned();
+            let site = registry
+                .dispatch("get", json!({"id": site_id}))
+                .await
+                .unwrap();
+            assert_eq!(site["entity_type"], "site");
+            assert_eq!(site["properties"]["scheme"], "https");
+            assert_eq!(site["properties"]["host"], "disk.example.test");
+            assert_eq!(site["properties"]["port"], 443);
+            let edges = registry.dispatch("list", json!({"kind": "edge", "source_id": site_id, "relations": ["contains"], "limit": 100}))
+                .await.unwrap();
+            let edges = edges["items"].as_array().unwrap();
+            let mut ids_by_url = std::collections::BTreeMap::new();
+            for id in unique_ids {
+                let entity = registry.dispatch("get", json!({"id": id})).await.unwrap();
+                let properties = &entity["properties"];
+                let url = properties["url"].as_str().expect("stored document URL");
+                let (name, body) = expected.get(url).expect("literal expected encoded URL");
+                let digest = blake3::hash(body.as_bytes()).to_hex().to_string();
+                assert_eq!(properties["content_digest"], digest, "{name}");
+                assert_eq!(properties["blob_ref"], digest, "{name}");
+                assert_eq!(properties["size"], body.len() as u64, "{name}");
+                assert!(
+                    edges.iter().any(|edge| edge["relation"] == "contains"
+                        && edge["source_id"] == site_id
+                        && edge["target_id"] == id),
+                    "{name}"
+                );
+                let record_uuid = uuid::Uuid::parse_str(&id).unwrap();
+                let attachment = runtime
+                    .core()
+                    .attachments()
+                    .unwrap()
+                    .get_attachment(record_uuid, "content")
+                    .await
+                    .unwrap()
+                    .expect("original body attachment");
+                assert_eq!(attachment.record_uuid, record_uuid);
+                assert_eq!(
+                    attachment.substrate,
+                    khive_storage::AttachmentSubstrate::Entity
+                );
+                assert_eq!(attachment.role, "content");
+                assert_eq!(attachment.size_bytes, Some(body.len() as u64));
+                assert_eq!(attachment.content_ref.as_str(), digest);
+                let stored = runtime
+                    .require_blob_store()
+                    .unwrap()
+                    .get_bounded_verified(&attachment.content_ref, body.len() as u64)
+                    .await
+                    .expect("original blob bytes are readable and digest-verified");
+                assert_eq!(stored, body.as_bytes(), "{name}");
+                assert!(ids_by_url.insert(url.to_owned(), id).is_none());
+            }
+            assert_eq!(
+                ids_by_url.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>()
+            );
+            if let Some(previous) = &first_ids {
+                assert_eq!(&ids_by_url, previous, "repeat ingest keeps each identity");
+                assert_eq!(first_site.as_ref(), Some(&site_id));
+            } else {
+                first_ids = Some(ids_by_url);
+                first_site = Some(site_id);
+            }
+        }
+    }
+}
