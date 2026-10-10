@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
   proposals using an archive marker while retaining their identity and event history.
   Retention follows last projection activity. The handler remains unimplemented.
+- Propose ADR-037 configuration-bound namespace and project-root rules for remote
+  cached-entity reads, preserving origin and refusing remote mutations.
 
 ### Added
 

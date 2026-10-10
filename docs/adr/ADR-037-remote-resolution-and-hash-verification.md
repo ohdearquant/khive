@@ -4,6 +4,8 @@
 **Date**: 2026-05-23
 **Authors**: khive maintainers
 
+The [proposed configuration-bound remote-read amendment](#amendment-2-2026-10-10-configuration-bound-remote-entity-reads) below awaits maintainer acceptance. It describes an intended contract, not shipped remote resolution or a change to this record's accepted header status.
+
 ## Context
 
 [ADR-020](ADR-020-git-native-kg-implementation.md) establishes the git-native KG implementation:
@@ -388,3 +390,140 @@ swap leaves the old or the new cache. No production code reads `.khive/kg/remote
   cleanup removes owned stale backups; a cleanup failure may leave one for the next publish to
   remove. The existing failure-injection arms (no mixed cache after a failure
   at any staging step) still pass.
+
+## Amendment 2 (2026-10-10): configuration-bound remote entity reads
+
+**Status: Proposed — pending maintainer acceptance.** Refs #4794.
+
+### Context and scope
+
+Part 1 records that the shipped resolver is local-only and reserves
+`kg://<remote>/<namespace>/<id>`. The reserved form needs a complete cached-entity
+read, rather than a parser that discards remote origin and passes a UUID to the
+local backend. A local row and a cached row can have the same UUID and different
+contents. Remote addressing must continue to select the cached row in that case.
+
+This proposal binds the namespace segment and the runtime's project context.
+It changes the intended `get(id=...)` read contract only after this amendment is
+accepted and implemented. The current shipped-behavior descriptions above remain
+accurate until then. Acceptance would replace the remote-read deferral for this
+entry, while keeping ordinary local reference behavior and Part 2's verification
+and publication contract. It adds one response field, the additive `remote` key
+defined below, and authorizes no dependent implementation before the final text
+is accepted.
+
+### Reference parsing and namespace authority
+
+1. `get(id=...)` recognizes `kg://<remote>/<namespace>/<id>` as a reserved remote
+   form. `<id>` is a complete UUID or an accepted 8-or-more hexadecimal UUID
+   prefix. Remote names and namespaces obey their existing validated types.
+   Missing, empty or extra segments, invalid identifiers, unsafe remote names,
+   and query or fragment adornments are parse refusals. Malformed reserved-form
+   input must never fall through to local entity-name lookup.
+2. The namespace segment must equal the namespace declared for that remote by
+   the runtime's selected configuration. The configuration is the authority and
+   is read at resolution time. A mismatch is refused; the segment is not a free
+   response label. Two different namespaces cannot alias the same configured
+   remote merely because the cache contains no namespace field.
+3. Namespace authority does not come from entity NDJSON, cache `meta.json`, the
+   archive content hash, or the namespace supplied by a caller. This proposal
+   requires no new namespace metadata in the cache: existing and newly fetched
+   caches are subject to the same selected-configuration check. It does not
+   change content-hash canonicalization, pin semantics, or schema serialization.
+
+### Runtime project binding and read result
+
+1. The project root is the root of the configuration from which the runtime was
+   constructed, recorded at construction. Cache lookup is rooted in that bound
+   project. A runtime without project configuration refuses the remote form as
+   an unknown remote. Neither ambient process cwd nor the database's parent
+   directory establishes a project root.
+2. A daemon serves its constructed configuration and its bound root. Forwarded
+   execution must preserve that binding; it cannot substitute a caller's ambient
+   cwd or silently address another project's same-named remote. Supporting a
+   different project requires a runtime constructed for that configuration,
+   rather than an inferred root or an unreviewed request override. This proposal
+   does not add a public forwarding field or change daemon identity by itself.
+3. After validating the remote name, namespace and identifier, the read returns
+   the selected cached entity with its remote origin retained. It must not
+   reduce the result to a UUID for local backend lookup, overwrite the cached
+   payload with a same-UUID local row, or import the cached entity into the
+   working database to make lookup succeed. The response is the ordinary
+   flattened entity result plus one additive top-level key,
+   `"remote": {"name": "<remote>", "namespace": "<namespace>"}`, whose values come
+   from the validated reference and the selected configuration. A local read never
+   carries the key, so its presence is the origin signal; every existing key keeps
+   its meaning.
+4. UUID-prefix matching ranges over all entities in the selected remote cache.
+   Zero matches refuse; multiple matching IDs are ambiguous and refuse. There
+   is no first-row fallback. Malformed records or duplicate identities refuse
+   rather than arbitrarily selecting a row.
+5. All mutation routes refuse a `kg://` target. A remote identifier never becomes
+   a local mutation target, including when a local row shares its UUID. Existing
+   authorization checks continue to apply to the read; this amendment creates
+   no bypass or new caller grant. `resolve(refs=...)` is a separate follow-up
+   and is outside #4794's acceptance.
+
+### Cache visibility and module ownership
+
+The read uses an already-fetched cache. It performs no implicit network fetch,
+Git command, TTL refresh, pin rewrite, cache repair, or local database write.
+Operators continue to use explicit fetch/sync paths to populate caches.
+
+A missing cache yields `RemoteCacheMissing` and means not fetched, including the
+absent window between Amendment 1's two publication renames. A backup-only state
+is also not fetched: the reader must never consult `.replaced~*` siblings. Cache
+member failures and malformed or incomplete NDJSON refuse; they do not become
+an empty remote or a local fallback. The reader must consume one coherent cache
+generation, not combine files from different generations during publication.
+Amendment 1's writer recovery and publication rules remain unchanged.
+
+The module integration must retain the dependency direction: neither
+khive-runtime nor the KG pack may depend back on khive-vcs. An injected cache
+reader or relocation of shared pure parser code may establish the seam; the
+implementation plan must identify its owner and use the existing cache format
+without copying a second competing parser or freezing a new wire API here.
+
+### Required implementation acceptance and refusal controls
+
+These are required future checks, not results from this documentation change:
+
+- A real kkernel fixture fetches a local Git remote containing multiple entities
+  and then calls `get(id=kg://...)` for a unique short ID and a full UUID. The
+  cached entity's ID, name, subtype, properties and tags survive, and the
+  response carries the `remote` key naming the remote and namespace. A local read
+  of a same-UUID row carries no `remote` key. The entity is absent from the
+  working DB.
+- A local row with the same UUID and different content cannot shadow the cached
+  entity. A refused remote mutation changes neither the local row nor cache
+  bytes. Ordinary local UUID, prefix and entity-name reads still behave as
+  before and retain their authorization refusals.
+- Shared prefixes are ambiguous across all cache entities; a unique longer
+  prefix succeeds. Absent IDs, duplicate IDs and malformed rows refuse.
+- The configured namespace succeeds; a different valid namespace refuses on
+  the same cache and UUID. Changing the selected configuration is observed at
+  resolution time, without rewriting the old cache's metadata. A malformed
+  reserved form never selects a same-spelled local entity name.
+- Two runtimes bound to different projects, each with remote `origin` and the
+  same UUID but distinct contents, read their own project. The supported
+  forwarded path observes the constructed runtime's binding as well; ambient
+  cwd changes cannot retarget the cache. A runtime with no project configuration
+  refuses the remote form.
+- Missing cache, a forced publication gap, backup-only state, unreadable or
+  nonregular cache members and truncated NDJSON refuse without a backup read,
+  mutation or network access. Concurrent publication cannot yield a mixed
+  generation to the read.
+
+The paired successful reads and must-refuse cases above are the driven
+adversarial acceptance instrument for the new remote-read boundary. Their actual
+execution output, including each refusal control's result, is required before
+final contract acceptance; listing the cases supplies no execution evidence.
+
+### Unchanged and deferred work
+
+This proposal leaves notes, remote edge serialization, global remote search,
+ordinary local namespace policy, hash verification, fetch configuration and
+validation CLI behavior unchanged. #4795's broader schema-declared remote
+handling and #4796's remote-validation entry remain separate work. The bounded
+missing-cache behavior above is necessary to make this read safe; it does not
+claim those follow-ups completed.
