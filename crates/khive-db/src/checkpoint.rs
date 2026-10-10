@@ -732,12 +732,12 @@ impl SessionSweepConfig {
 }
 
 fn session_sweep_interval_from_env() -> Duration {
-    std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS")
-        .ok()
-        .and_then(|ms| ms.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_SESSION_SWEEP_INTERVAL)
+    let millis = crate::env::env_parse_or("KHIVE_SESSION_SWEEP_INTERVAL_MS", 0_u64);
+    if millis > 0 {
+        Duration::from_millis(millis)
+    } else {
+        DEFAULT_SESSION_SWEEP_INTERVAL
+    }
 }
 
 /// One file-backed backend the session sweep observes (ADR-091 Amendment 3

@@ -157,13 +157,12 @@ const SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV: &str = "KHIVE_SLOW_WRITE_THRESHOLD_M
 /// (disabled) — a zero bound would stamp every write and turn the sink into
 /// a write log, which it is not.
 pub(crate) fn slow_write_threshold() -> Option<Duration> {
-    match std::env::var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV) {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(0) => None,
-            Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => Some(SLOW_WRITE_THRESHOLD),
-        },
-        Err(_) => Some(SLOW_WRITE_THRESHOLD),
+    match crate::env::env_parse_or(
+        SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV,
+        SLOW_WRITE_THRESHOLD.as_millis() as u64,
+    ) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
     }
 }
 
@@ -903,12 +902,12 @@ fn resolve_log_dir(db_parent: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn heartbeat_interval_from_env() -> Duration {
-    std::env::var(HEARTBEAT_MS_OVERRIDE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(HEARTBEAT_INTERVAL)
+    let millis = crate::env::env_parse_or(HEARTBEAT_MS_OVERRIDE_ENV, 0_u64);
+    if millis > 0 {
+        Duration::from_millis(millis)
+    } else {
+        HEARTBEAT_INTERVAL
+    }
 }
 
 /// Test-only: read [`WRITE_DELAY_MS_OVERRIDE_ENV`] once at writer-thread
@@ -916,11 +915,7 @@ fn heartbeat_interval_from_env() -> Duration {
 /// [`AppendSink::write_line`] treats as "no delay" — a no-op check on every
 /// write, not a behavior change.
 fn write_delay_from_env() -> Duration {
-    std::env::var(WRITE_DELAY_MS_OVERRIDE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::ZERO)
+    Duration::from_millis(crate::env::env_parse_or(WRITE_DELAY_MS_OVERRIDE_ENV, 0_u64))
 }
 
 fn pause_at_startup_barrier_for_test() {
@@ -1394,6 +1389,45 @@ mod tests {
             return;
         }
         assert_eq!(resolve_log_dir(None), None);
+    }
+
+    #[test]
+    fn heartbeat_and_write_delay_keep_distinct_zero_defaults() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env_remove(HEARTBEAT_MS_OVERRIDE_ENV)
+                .env_remove(WRITE_DELAY_MS_OVERRIDE_ENV);
+        }) {
+            return;
+        }
+        for (key, read, fallback) in [
+            (
+                HEARTBEAT_MS_OVERRIDE_ENV,
+                heartbeat_interval_from_env as fn() -> Duration,
+                Duration::from_secs(300),
+            ),
+            (
+                WRITE_DELAY_MS_OVERRIDE_ENV,
+                write_delay_from_env as fn() -> Duration,
+                Duration::ZERO,
+            ),
+        ] {
+            assert_eq!(read(), fallback);
+            for value in ["0", "invalid", " 25 ", "18446744073709551616"] {
+                crate::test_process::set_var(key, value);
+                assert_eq!(read(), fallback, "{key}={value:?}");
+            }
+            crate::test_process::set_var(key, "25");
+            assert_eq!(read(), Duration::from_millis(25));
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                crate::test_process::set_var(key, std::ffi::OsStr::from_bytes(b"\xff"));
+                assert_eq!(read(), fallback);
+            }
+            crate::test_process::remove_var(key);
+            assert_eq!(read(), fallback);
+        }
     }
 
     #[test]

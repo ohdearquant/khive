@@ -371,11 +371,17 @@ impl Default for PoolConfig {
                 v.to_str()
                     .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             }),
-            write_queue_capacity: std::env::var("KHIVE_WRITE_QUEUE_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
+            write_queue_capacity: {
+                let capacity = crate::env::env_parse_or(
+                    "KHIVE_WRITE_QUEUE_CAPACITY",
+                    DEFAULT_WRITE_QUEUE_CAPACITY,
+                );
+                if capacity > 0 {
+                    capacity
+                } else {
+                    DEFAULT_WRITE_QUEUE_CAPACITY
+                }
+            },
             write_routing_strict: std::env::var("KHIVE_WRITE_ROUTING")
                 .map(|v| v.eq_ignore_ascii_case("strict"))
                 .unwrap_or(false),
