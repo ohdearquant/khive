@@ -70,5 +70,9 @@ pub fn compose_registry_with_extra_packs(
         rt.install_edge_rules(registry.all_edge_rules());
     }
 
+    let mut embedding_runtimes = vec![default_runtime];
+    embedding_runtimes.extend(runtimes.values());
+    registry.initialize_embedding_engines(&embedding_runtimes)?;
+
     Ok(registry)
 }

@@ -625,36 +625,27 @@ impl RuntimeConfig {
         }
     }
 
-    /// Validate and bind ordered built-in peers without loading model services.
+    /// Validate and canonicalize ordered peers without resolving providers.
     ///
     /// Legacy programmatic model fields remain accepted when `engines` is
     /// absent. Once prepared, those fields are projections of the peer list.
-    /// Custom provider startup binding is not yet enabled.
+    /// Hosts finalize provider binding after registering their custom providers.
     pub fn prepare_engines(&mut self) -> RuntimeResult<()> {
-        use crate::embedder_registry::{EmbedderProvider, LatticeEmbedderProvider};
-
         let mut engines = self.configured_engines();
         crate::engine_config::validate_peer_engines(self.engines.as_deref().unwrap_or(&engines))
             .map_err(|error| crate::RuntimeError::InvalidInput(error.to_string()))?;
 
-        let mut models = Vec::with_capacity(engines.len());
         for engine in &mut engines {
-            let model = parse_embedding_model_alias(&engine.name).ok_or_else(|| {
-                crate::RuntimeError::InvalidInput(format!(
-                    "embedding provider `{}` cannot be bound at startup: custom provider \
-                     configuration binding is not yet supported",
-                    engine.name
-                ))
-            })?;
-            let provider = LatticeEmbedderProvider::new(model);
-            engine
-                .check_dimensions(provider.dimensions())
-                .map_err(|error| crate::RuntimeError::InvalidInput(error.to_string()))?;
-            engine.name = model.to_string();
-            models.push(model);
+            engine.name = crate::engine_config::canonical_engine_name(&engine.name);
         }
-        self.embedding_model = models.first().copied();
-        self.additional_embedding_models = models.into_iter().skip(1).collect();
+        self.embedding_model = engines
+            .first()
+            .and_then(|engine| parse_embedding_model_alias(&engine.name));
+        self.additional_embedding_models = engines
+            .iter()
+            .skip(1)
+            .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+            .collect();
         self.engines = Some(engines);
         Ok(())
     }
@@ -963,8 +954,9 @@ pub(crate) fn build_embedder_registry(
         registry.register_builtin(LatticeEmbedderProvider::new(model));
     }
     let default_embedder_name = config
-        .embedding_model
-        .map(|model| Arc::<str>::from(model.to_string()))
+        .configured_engines()
+        .first()
+        .map(|engine| Arc::<str>::from(engine.name.as_str()))
         .unwrap_or_else(|| Arc::<str>::from(""));
     (registry, default_embedder_name)
 }
@@ -1007,7 +999,7 @@ pub(crate) fn register_configured_embedding_models(
 ///
 /// Declared engines preserve their order and dimension assertions. The first
 /// peer is projected into the legacy single-model field when it is built-in;
-/// startup validates and binds the complete list before storage registration.
+/// hosts bind the complete list after provider registration, before serving.
 /// An explicit empty list disables participation; an absent list preserves
 /// the caller's base configuration, including environment-derived defaults.
 /// Load file input with [`crate::KhiveConfig::load`] to preserve that distinction

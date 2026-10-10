@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
+  host composition register providers before binding ordered peers and their declared
+  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
+  runtimes keep no configured default while explicit manual named access remains available.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.

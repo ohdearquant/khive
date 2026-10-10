@@ -19,9 +19,11 @@ use khive_storage::{
 use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
 
+#[cfg(test)]
+use crate::config::vec_model_key;
 use crate::config::{
     build_embedder_registry, parse_embedding_model_alias, register_configured_embedding_models,
-    sanitize_key, vec_model_key,
+    sanitize_key,
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::note_search_ann::NoteSearchAnnProvider;
@@ -30,6 +32,7 @@ use crate::pack::KindHook;
 #[path = "runtime/config_access.rs"]
 mod config_access;
 mod embedder_init;
+mod engine_binding;
 mod events_disk_policy;
 mod serving_policy;
 
@@ -1003,7 +1006,7 @@ impl KhiveRuntime {
     /// source of truth for the policy every fan-out and single-backend
     /// dispatch path uses to report `arm_participation`/`vector_selected`.
     pub fn vector_arm_selected(&self) -> bool {
-        self.config.embedding_model.is_some()
+        !self.default_embedder_name().is_empty()
     }
 
     /// Return a reference to the underlying storage backend.
@@ -1377,8 +1380,11 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
-        let model = self.resolve_embedding_model(None)?;
-        self.vectors_for_embedding_model(token, model)
+        let name = self.default_embedder_name();
+        if name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.vectors_for_model(token, name)
     }
 
     /// Get a VectorStore for a specific named embedding model, scoped to the token's namespace.
@@ -1585,19 +1591,6 @@ impl KhiveRuntime {
             .ok()?
             .get_provider(model_name)
             .map(|p| p.dimensions())
-    }
-
-    fn vectors_for_embedding_model(
-        &self,
-        token: &NamespaceToken,
-        model: EmbeddingModel,
-    ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
-        Ok(self.backend.vectors_for_namespace(
-            &vec_model_key(model),
-            &model.to_string(),
-            model.dimensions(),
-            token.namespace().as_str(),
-        )?)
     }
 
     /// Get a TextSearch index for the entity corpus (single shared table).
@@ -2423,161 +2416,6 @@ impl KhiveRuntime {
             Ok(rules) => f(&rules),
             Err(_) => f(&[]),
         }
-    }
-
-    /// Return the name of the default embedding model (empty string if none configured).
-    pub fn default_embedder_name(&self) -> &str {
-        self.default_embedder_name.as_ref()
-    }
-
-    /// Resolve a model name (or `None` for the default) to an `EmbeddingModel`.
-    ///
-    /// Returns `UnknownModel` if the name is not in the registry, or
-    /// `Unconfigured` if `None` is passed and no default model is set.
-    pub fn resolve_embedding_model(&self, name: Option<&str>) -> RuntimeResult<EmbeddingModel> {
-        let model = match name {
-            Some(raw) => parse_embedding_model_alias(raw)
-                .ok_or_else(|| crate::RuntimeError::UnknownModel(raw.to_string()))?,
-            None => self
-                .config
-                .embedding_model
-                .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
-        };
-        let key = model.to_string();
-        if request_excludes_embedder(&key) {
-            return Err(crate::RuntimeError::UnknownModel(
-                name.unwrap_or_else(|| self.default_embedder_name())
-                    .to_string(),
-            ));
-        }
-        let contains = self
-            .embedder_registry
-            .read()
-            .map(|reg| reg.contains(&key))
-            .unwrap_or(false);
-        if contains {
-            Ok(model)
-        } else {
-            Err(crate::RuntimeError::UnknownModel(
-                name.unwrap_or_else(|| self.default_embedder_name())
-                    .to_string(),
-            ))
-        }
-    }
-
-    /// Names of all registered embedding models in this runtime.
-    ///
-    /// Includes both built-in lattice models and any custom embedders
-    /// registered by packs via [`register_embedder`](Self::register_embedder).
-    /// Useful for operations that must touch every model's storage (e.g.,
-    /// scoped vector deletion on note delete). The default model is included.
-    pub fn registered_embedding_model_names(&self) -> Vec<String> {
-        self.embedder_registry
-            .read()
-            .map(|reg| {
-                reg.names()
-                    .into_iter()
-                    .filter(|name| !request_excludes_embedder(name))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Get the lazily-initialized embedding service for the named model.
-    ///
-    /// Accepts both built-in lattice model names (e.g. `"all-minilm-l6-v2"`,
-    /// `"paraphrase"`) and custom provider names registered via
-    /// [`register_embedder`](Self::register_embedder).
-    ///
-    /// For lattice model names, aliases (e.g. `"paraphrase"`) are resolved to
-    /// their canonical key before looking up the registry. For custom providers
-    /// the name must match exactly as supplied during registration.
-    ///
-    /// First call for any name loads the underlying service (cold start cost);
-    /// subsequent calls are cheap (registry caches the `Arc`).
-    pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        Ok(self.embedder_inner(name, None).await?.0)
-    }
-
-    pub(crate) async fn embedder_with_token(
-        &self,
-        token: &NamespaceToken,
-        name: &str,
-    ) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        Ok(self.embedder_inner(name, Some(token)).await?.0)
-    }
-
-    /// Resolve the service and its document-preparation attestation from the
-    /// same registry entry. Cloning it also avoids holding a registry lock
-    /// across the asynchronous service resolution.
-    pub(crate) async fn embedder_with_input_attestation(
-        &self,
-        name: &str,
-        token: Option<&NamespaceToken>,
-    ) -> RuntimeResult<(Arc<dyn EmbeddingService>, bool)> {
-        self.embedder_inner(name, token).await
-    }
-
-    /// Register a custom embedding provider with this runtime.
-    ///
-    /// The provider is added to the shared [`EmbedderRegistry`] so all clones
-    /// of this runtime see the new provider immediately. Setup may replace a
-    /// provider before it is selected for resolution. Later duplicates are
-    /// refused and logged; use [`try_register_embedder`](Self::try_register_embedder)
-    /// when the caller needs to handle registration errors.
-    ///
-    /// Packs should call this from [`crate::PackRuntime::register_embedders`] (the
-    /// hook is invoked by the transport during pack initialisation, before the
-    /// first verb dispatch).
-    ///
-    /// [`EmbedderRegistry`]: crate::embedder_registry::EmbedderRegistry
-    pub fn register_embedder(
-        &self,
-        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
-    ) {
-        if let Err(error) = self.try_register_embedder(provider) {
-            tracing::warn!(%error, "embedder registration refused");
-        }
-    }
-
-    /// Register a custom embedding provider and return serving-duplicate or lock errors.
-    ///
-    /// Unlike [`register_embedder`](Self::register_embedder), this method lets
-    /// callers fail initialization when registration cannot be completed.
-    pub fn try_register_embedder(
-        &self,
-        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
-    ) -> RuntimeResult<()> {
-        if let Some(engine) = self
-            .config
-            .engines
-            .as_ref()
-            .and_then(|engines| engines.iter().find(|engine| engine.name == provider.name()))
-        {
-            engine
-                .check_dimensions(provider.dimensions())
-                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        }
-        let mut registry = self
-            .embedder_registry
-            .write()
-            .map_err(|_| RuntimeError::Internal("embedder registry lock poisoned".into()))?;
-        registry.register(provider)
-    }
-
-    /// Install a deterministic backend for exact-input provenance tests.
-    /// The test adapter, not the supplied backend, owns lattice passage
-    /// prefixing; this API is absent unless `test-internals` is enabled.
-    #[cfg(feature = "test-internals")]
-    pub fn register_test_audited_embedder(
-        &self,
-        model: EmbeddingModel,
-        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
-    ) {
-        self.embedder_registry
-            .write()
-            .expect("test embedder registry lock")
-            .register_test_audited(model, provider);
     }
 
     /// List registered embedding models via `SqlAccess`, routing through the
