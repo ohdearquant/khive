@@ -858,6 +858,7 @@ impl MemoryPack {
                     temporal: breakdown.temporal,
                     text_match: matches!(source, SearchSource::Text | SearchSource::Both),
                     vector_match: matches!(source, SearchSource::Vector | SearchSource::Both),
+                    graph_proximity: 0.0,
                 };
                 weighted_rerank(&features, &cfg.reranker_weights) as f32
             } else {

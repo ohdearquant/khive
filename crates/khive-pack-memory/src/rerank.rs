@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-/// Input features per recall candidate for weighted reranking (relevance, salience, temporal, text_match, vector_match).
-#[derive(Debug, Clone)]
+/// Precomputed recall features; numeric values default to zero and membership flags to false.
+#[derive(Debug, Clone, Default)]
 pub struct RerankFeatures {
     /// Fused retrieval score from RRF or weighted fusion.
     pub relevance: f64,
@@ -16,6 +16,8 @@ pub struct RerankFeatures {
     pub text_match: bool,
     /// True when candidate appeared in vector search results.
     pub vector_match: bool,
+    /// Precomputed graph proximity; the recall handlers currently supply zero.
+    pub graph_proximity: f64,
 }
 
 /// Weighted feature-combination rerank score, normalized before accumulation.
@@ -45,6 +47,10 @@ pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>
         (
             weights.get("vector_match").copied().unwrap_or(0.0),
             f64::from(features.vector_match),
+        ),
+        (
+            weights.get("graph_proximity").copied().unwrap_or(0.0),
+            features.graph_proximity,
         ),
     ];
     // Unknown feature names remain ignored, including in the scale.
@@ -88,7 +94,21 @@ mod tests {
             temporal: 0.4,
             text_match: true,
             vector_match: false,
+            graph_proximity: 0.0,
         }
+    }
+
+    #[test]
+    fn graph_proximity_combines_with_relevance() {
+        let features = RerankFeatures {
+            relevance: 0.5,
+            graph_proximity: 1.0,
+            ..Default::default()
+        };
+        let weights = [("relevance".into(), 0.6), ("graph_proximity".into(), 0.4)]
+            .into_iter()
+            .collect();
+        assert_close(weighted_rerank(&features, &weights), 0.7);
     }
 
     #[test]

@@ -78,7 +78,9 @@ The default weight is `0.3`, making both clamp endpoints reachable at posterior 
 
 ## `weighted_rerank`
 
-`RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, and boolean text/vector membership. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, and `vector_match`.
+`RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, boolean text/vector membership, and precomputed graph proximity. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, `vector_match`, and `graph_proximity`. Its `Default` sets numeric features to zero and membership flags to false; direct struct constructors must supply the new `graph_proximity` field or use a default update.
+
+Typed callers can supply a precomputed graph proximity. The recall handlers currently supply zero and do not read a candidate JSON `graph_proximity` field or gather graph neighbors. Graph gathering is separate follow-up work. The default `RecallConfig.reranker_weights` remains empty. Configuring a positive graph weight includes it in normalization even with a zero feature: relevance `0.5` with weights `relevance: 0.6` and `graph_proximity: 0.4` scores `0.3` in the handlers, while a typed caller supplying graph proximity `1.0` scores `0.7`. An absent or zero graph weight leaves the previous weighted result unchanged.
 
 The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value. Finite feature magnitudes are also scaled during accumulation so intermediate sums stay bounded.
 
@@ -93,7 +95,7 @@ The event omits `model_id`, reports no served profile, and sets both hook flags 
 `false`. Optional `query_id` is an opaque caller-supplied string, preserved exactly;
 omission or `null` leaves it absent. It is never generated or required to be a UUID.
 Its `tiers` list includes only positive recognized weights, in the fixed
-order `relevance`, `salience`, `temporal`, `text_match`, `vector_match`.
+order `relevance`, `salience`, `temporal`, `text_match`, `vector_match`, `graph_proximity`.
 `ignored_weights` separately lists every unknown configured key in lexical order,
 including unknown keys with zero weight. The existing response's
 `active_rerankers` continues to include all positive keys, including ignored ones.
