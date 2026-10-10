@@ -92,6 +92,7 @@ mail-parser = "0.9"
 rusqlite = { version = "0.40" }
 anyhow = "1.0.103"
 thiserror = "2.0"
+zstd = "0.13.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
