@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
+  merging. Original-query fallback preserves its bytes, generated variants are validated
+  as a whole, and admitted IDs retain variant and retrieval-source attribution.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
