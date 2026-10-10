@@ -1186,7 +1186,7 @@ fn init_tracing(level: &str) {
     // (issue #1586) is emitted on that target at startup, and the global
     // default level is `warn` — without this pin the disclosure would be
     // silently filtered for every operator who never sets KHIVE_LOG.
-    let filter = format!("{level},khive.boot=info,lattice_inference=error");
+    let filter = format!("{level},khive.boot=info,khive.import.schema=warn,khive.config.schema=warn,lattice_inference=error");
     tracing_subscriber::fmt()
         .with_writer(|| BestEffortWriter(std::io::stderr()))
         .with_env_filter(filter)

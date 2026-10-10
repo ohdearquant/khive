@@ -20,6 +20,7 @@
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
+#   [schema]        explicit import unknown-entity-kind admission
 #   [runtime]       brain profile + default output format
 #   [display]       rendering timezone (ADR-169)
 #   [gate]          optional static caller-enrollment allowlist
@@ -32,6 +33,17 @@
 # ADR references: ADR-031 (multi-engine retrieval), ADR-035 (unified khive.toml),
 # ADR-028 (pack-scoped backends), ADR-007 (namespace / actor model), ADR-078 (output
 # format), ADR-169 (timezone-correct timestamps).
+
+# ── [schema] — explicit KG import admission ────────────────────────────────────
+# Missing files, sections, or strict keys (including an empty section) use true.
+# false preserves unknown nonblank entity kinds verbatim and warns once per kind.
+# Edge relations remain closed in both modes. Unknown keys warn and are ignored;
+# strict must be a TOML boolean. This controls `kkernel kg import` only: ordinary
+# creates keep their registered vocabulary, while local VCS sync degrades unknown
+# kinds to concept and records original kind/subtype provenance plus the
+# khive:degraded_kind tag.
+[schema]
+strict = true
 
 # ── [actor] — identity and namespace scope ──────────────────────────────────────
 #

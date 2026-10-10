@@ -179,7 +179,7 @@ async fn sync_does_not_reuse_crashed_fixed_temp_name() {
 }
 
 #[tokio::test]
-async fn sync_accepts_registered_resource_kind_and_rejects_nonsense() {
+async fn sync_accepts_registered_resource_kind_and_degrades_unknown_kind() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path();
     let db_path = repo.join("working.db");
@@ -202,16 +202,37 @@ async fn sync_accepts_registered_resource_kind_and_rejects_nonsense() {
     assert_eq!(stored_kind, "resource");
     drop(db);
 
-    let nonsense = format!(r#"{{"id":"{entity_id}","kind":"nonsense","name":"Bad"}}"#);
+    let nonsense = format!(
+        r#"{{"id":"{entity_id}","kind":"nonsense","entity_type":"future-type","name":"Unknown","properties":{{"keep":true}},"tags":["degraded","tag"]}}"#
+    );
     write_repo(repo, &nonsense, "");
-    let invalid_db = repo.join("invalid.db");
-    let err = run_sync(repo, &invalid_db, "test-ns")
+    let degraded_db = repo.join("degraded.db");
+    let report = run_sync(repo, &degraded_db, "test-ns").await.unwrap();
+    assert_eq!(report.entities, 1);
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(degraded_db),
+        embedding_model: None,
+        ..Default::default()
+    })
+    .unwrap();
+    let token = runtime
+        .authorize(khive_types::Namespace::parse("test-ns").unwrap())
+        .unwrap();
+    let stored = runtime
+        .get_entity(&token, Uuid::parse_str(entity_id).unwrap())
         .await
-        .expect_err("unknown pack kind must be rejected");
-    assert!(format!("{err:#}").contains("unknown kind \"nonsense\""));
-    assert!(
-        !invalid_db.exists(),
-        "invalid input must fail before DB build"
+        .unwrap();
+    assert_eq!(stored.kind, "concept");
+    assert_eq!(stored.entity_type, None);
+    assert_eq!(stored.name, "Unknown");
+    assert_eq!(stored.tags, ["degraded", "tag", "khive:degraded_kind"]);
+    let properties = stored.properties.as_ref().unwrap();
+    assert_eq!(properties["keep"], true);
+    assert_eq!(properties["khive:original_kind"], "nonsense");
+    assert_eq!(properties["khive:original_entity_type"], "future-type");
+    assert_eq!(
+        fs::read_to_string(repo.join(".khive/kg/entities.ndjson")).unwrap(),
+        nonsense
     );
 }
 
@@ -535,16 +556,152 @@ async fn assert_sync_rejected_before_db_write(
 }
 
 #[tokio::test]
-async fn sync_rejects_unknown_entity_kind_before_db_write() {
-    let tmp = TempDir::new().unwrap();
-    let repo = tmp.path();
-    let db_path = repo.join(".khive/state/working.db");
-    let id = "11111111-1111-1111-1111-111111111111";
-    let entities = format!(
-        r#"{{"id":"{id}","kind":"not-a-real-kind","name":"Bad","properties":{{}},"tags":[]}}"#
-    );
+async fn local_sync_degrades_unknown_kind_and_preserves_provenance_fields() {
+    for properties in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!({"keep":true})),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = Uuid::from_u128(1);
+        let mut entity = serde_json::json!({"id":id,"kind":" Unknown型 ","entity_type":"custom-subtype","name":"Kept","description":"full text","tags":["tag","degraded","khive:degraded_kind"],"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-03T03:04:05Z"});
+        if let Some(properties) = properties {
+            entity["properties"] = properties;
+        }
+        let original = entity.to_string();
+        write_repo(repo, &original, "");
+        let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
+        assert_eq!(report.entities, 1);
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let token = runtime
+            .authorize(khive_types::Namespace::parse("test-ns").unwrap())
+            .unwrap();
+        let actual = runtime.get_entity(&token, id).await.unwrap();
+        assert_eq!(actual.kind, "concept");
+        assert_eq!(actual.entity_type, None);
+        assert_eq!(actual.name, "Kept");
+        assert_eq!(actual.description.as_deref(), Some("full text"));
+        assert_eq!(
+            actual.created_at,
+            chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .timestamp_micros()
+        );
+        assert_eq!(
+            actual.updated_at,
+            chrono::DateTime::parse_from_rfc3339("2026-01-03T03:04:05Z")
+                .unwrap()
+                .timestamp_micros()
+        );
+        assert_eq!(actual.tags, ["tag", "degraded", "khive:degraded_kind"]);
+        let properties = actual.properties.as_ref().unwrap();
+        assert_eq!(properties["khive:original_kind"], " Unknown型 ");
+        assert_eq!(properties["khive:original_entity_type"], "custom-subtype");
+        let document = runtime
+            .text(&token)
+            .unwrap()
+            .get_document("test-ns", id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.record_kind.as_deref(), Some("concept"));
+        assert_eq!(document.metadata, actual.properties);
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".khive/kg/entities.ndjson")).unwrap(),
+            original
+        );
+    }
+}
 
-    assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
+#[tokio::test]
+async fn local_degradation_keeps_strict_shared_validator_and_other_refusals() {
+    let a = Uuid::from_u128(1);
+    let b = Uuid::from_u128(2);
+    let valid = serde_json::json!({"id":a,"kind":"Unknown","name":"A","properties":{}});
+    // This is the very validator called by remote publication: it remains strict.
+    let remote_records: Vec<NdjsonEntity> = vec![serde_json::from_value(valid.clone()).unwrap()];
+    assert!(validate_ndjson_records(&remote_records, &[]).is_err());
+    for case in 0..12 {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let mut first = valid.clone();
+        let mut second = serde_json::json!({"id":b,"kind":"concept","name":"B","properties":{}});
+        let mut edge = serde_json::json!({"edge_id":Uuid::from_u128(3),"source":a,"target":b,"relation":"extends","weight":0.7});
+        let expected = match case {
+            0 => {
+                first["properties"] = serde_json::json!([1]);
+                "must be an object"
+            }
+            1 => {
+                first["kind"] = serde_json::json!(" ");
+                "non-blank"
+            }
+            2 => {
+                second["name"] = serde_json::json!(" ");
+                "non-blank"
+            }
+            3 => {
+                edge["relation"] = serde_json::json!("future");
+                "invalid edge relation"
+            }
+            4 => {
+                edge["weight"] = serde_json::json!(1.1);
+                "out of range"
+            }
+            5 => {
+                second["created_at"] = serde_json::json!("bad");
+                "invalid created_at"
+            }
+            6 => {
+                first["properties"] = serde_json::json!({"khive:secret_gate":"forged"});
+                "khive:secret_gate"
+            }
+            7 => {
+                edge["properties"] = serde_json::json!({"khive:web_receipt":"forged"});
+                "khive:web_receipt"
+            }
+            8 => {
+                edge["properties"] = serde_json::json!({"api_key":"AKIAFAKEKEY1234567890"});
+                "secret"
+            }
+            9 => {
+                second["id"] = serde_json::json!(a);
+                "duplicate entity"
+            }
+            10 => {
+                second["id"] = serde_json::json!(Uuid::from_u128(0));
+                "not sorted"
+            }
+            11 => {
+                edge["target"] = serde_json::json!(Uuid::from_u128(9));
+                "dangling target"
+            }
+            _ => unreachable!(),
+        };
+        let entities = format!("{first}\n{second}");
+        assert_sync_rejected_before_db_write(
+            repo,
+            &db_path,
+            &entities,
+            &edge.to_string(),
+            expected,
+        )
+        .await;
+        assert!(!with_extension_suffix(&db_path, ".sync.lock").exists());
+        // Repeat against an absent nested destination: validation cannot create parents.
+        let absent = repo.join("absent/nested/target.db");
+        assert!(run_sync(repo, &absent, "test-ns").await.is_err());
+        assert!(!absent.parent().unwrap().exists());
+        assert!(!absent.exists());
+    }
 }
 
 /// The normal parser accepts aliases, but sync must not store one as the

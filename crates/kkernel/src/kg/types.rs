@@ -178,6 +178,10 @@ pub struct ExportArgs {
 /// CLI arguments for `kkernel kg import`.
 #[derive(clap::Parser, Debug)]
 pub struct ImportArgs {
+    /// Explicit config selection; otherwise use the normal config discovery order.
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
+
     /// Source archive or adapter input file.
     pub source: PathBuf,
 
