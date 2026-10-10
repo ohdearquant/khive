@@ -12,6 +12,7 @@ categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
+khive-rule-evaluator = { version = "0.11.0", path = "../khive-rule-evaluator" }
 khive-mounts = { version = "0.11.0", path = "../khive-mounts" }
 khive-pack-agent = { version = "0.11.0", path = "../khive-pack-agent", optional = true }
 khive-runtime = { version = "0.11.0", path = "../khive-runtime" }
