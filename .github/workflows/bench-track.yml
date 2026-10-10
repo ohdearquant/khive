@@ -63,7 +63,7 @@ jobs:
   changes:
     name: Select changed benchmark components
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
