@@ -23,6 +23,8 @@ pub struct VerbRegistry {
     /// Pack ownership and endpoint rules captured together at registry construction.
     pub(super) attributed_edge_rules: Arc<Vec<(String, EdgeEndpointRule)>>,
     pub(super) pack_versions: Arc<HashMap<String, &'static str>>,
+    /// Validated property-policy declarations captured once, before activation.
+    pub(super) note_property_policies: Arc<Vec<khive_types::NotePropertyPolicySpec>>,
     /// Pack-level by-ID resolvers, in registration order.
     pub(super) resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     /// Read-only KG lookup topology; never used to redirect a pack write.

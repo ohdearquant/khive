@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_storage::EventView;
+use khive_types::NotePropertyPolicySpec;
 use serde_json::Value;
 
 use crate::operations::LinkSpec;
@@ -158,6 +159,14 @@ pub trait PackRuntime: Send + Sync {
     /// and future enforcement.  Defaults to empty so existing packs compile
     /// without changes.
     fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
+    /// Property-policy metadata for this pack's own note kinds.
+    ///
+    /// Mirror `Pack::NOTE_PROPERTY_POLICIES`. Boot validates and snapshots this
+    /// slice once, before activation. It does not install write enforcement.
+    fn note_property_policies(&self) -> &'static [NotePropertyPolicySpec] {
         &[]
     }
 

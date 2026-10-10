@@ -385,6 +385,28 @@ pub struct NoteKindSpec {
     pub lifecycle: NoteLifecycleSpec,
 }
 
+/// Declared ownership policy for one note property.
+///
+/// This metadata does not itself enforce writes or grant authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertyPolicy {
+    /// The substrate or owning pack derives this property from trusted runtime context.
+    Derived,
+    /// Only the owning pack's specialized writer establishes this property.
+    OwnerOnly,
+}
+
+/// Property policy for a note kind declared by the same pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotePropertyPolicySpec {
+    /// The owned note kind.
+    pub kind: &'static str,
+    /// The exact property key, without normalization.
+    pub key: &'static str,
+    /// The property's declared ownership policy.
+    pub policy: PropertyPolicy,
+}
+
 /// Which registered embedding spaces a note kind writes by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NoteEmbeddingPolicy {
@@ -516,6 +538,13 @@ pub trait Pack {
     /// these at boot time for introspection and future enforcement.  Defaults
     /// to empty so existing packs compile without changes.
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
+
+    /// Property policies for note kinds owned by this pack.
+    ///
+    /// Mirror this slice through `PackRuntime::note_property_policies`. The
+    /// registry validates and snapshots it at boot; declarations alone do not
+    /// change write enforcement. Unlisted keys carry no declared restriction.
+    const NOTE_PROPERTY_POLICIES: &'static [NotePropertyPolicySpec] = &[];
 
     /// Write-time embedding policy for note kinds declared in `NOTE_KINDS`.
     /// Unlisted kinds retain the all-model default.
