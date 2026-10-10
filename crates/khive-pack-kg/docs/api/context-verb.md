@@ -1,56 +1,82 @@
 # The `context` verb
 
-Technical reference for `handle_context` (`handlers/context.rs`) — entity-anchored graph
-context assembly (ADR-089): resolving anchors, expanding neighbors, and packing the result
-within a byte budget.
+Technical reference for `handle_context` (`handlers/context.rs`): entity anchors, scoped
+neighbor expansion, and a bounded paired graph payload. The payload follows the draft
+[ADR-140](../../../../docs/adr/ADR-140-context-graph-payload.md), which remains Proposed;
+architecture acceptance is required before dependent implementation merges. ADR-089 remains
+Accepted and unchanged.
 
-## `relations_all_symmetric`
+## Response and endpoint metadata
 
-Mirrors `normalize_symmetric_direction` in `khive-runtime/src/operations.rs` (private to that
-crate) — kept in lockstep because `neighbors_with_query` forces `Direction::Both` under this
-exact condition regardless of the direction actually requested, and the handler must know
-that happened to tag direction correctly instead of issuing a second, redundant call.
+Every successful response includes `anchors`, `edges`, `truncated`, and `dropped`.
+`edges` is an array, including for zero-hop, isolated-anchor, empty-search, and wholly
+budget-cut results. `dropped.edges` is always present and equals `dropped.neighbors`;
+`dropped.stage` remains `"budget"`.
 
-## `fetch_directed_neighbors`
+Each edge has exactly `source_id`, `source_name`, `target_id`, `target_name`, `relation`,
+`weight`, `direction`, `hop`, and `via`. Its relation, weight, direction, hop, and via match
+the corresponding nested neighbor. Flat edge order follows anchor order and each anchor's
+neighbor order. Hop 1 uses the anchor as parent and `via: null`; hop 2 uses the actual `via`
+record as parent. Explicit anchors are still entities; discovered endpoints and hop-2
+parents can be entities, notes, or mailbox-visible messages.
 
-Fetches up to `fanout` neighbors of `node_id`, each tagged with its actual direction relative
-to `node_id` — it can't just trust a `direction` field on a plain `NeighborHit` because
-`neighbors_with_query_directed` only ever tags hits `Out`/`In` (`Both` never appears in a
-`DirectedNeighborHit`).
+Outgoing edges reproduce parent → neighbor; incoming edges reproduce neighbor → parent.
+Selected symmetric hits use `"both"` and deterministic parent → neighbor endpoint order,
+which carries no stored assertion direction. Endpoint names come from the existing scoped
+metadata maps. An unnamed note or message has a JSON `null` name on either side; content,
+subject, UUID, and empty strings are not substitutes.
+
+If either endpoint lacks scoped metadata at assembly time, omit the whole pair before
+budget accounting. Preserve the visited decision: no rediscovery, metadata refetch, extra
+graph read, fabricated endpoint, truncation flag, or dropped-count increment. Namespace and
+mailbox visibility apply to the entire payload, including IDs, names, and `via`.
+
+## `relations_all_symmetric` and `fetch_directed_neighbors`
+
+The all-symmetric filter check mirrors runtime `normalize_symmetric_direction`; the storage
+operation can normalize its query to both directions under that condition. The handler
+normalizes every selected symmetric hit to `"both"`, including absent, empty, mixed, and
+all-symmetric filters. It preserves each query's existing selection semantics rather than
+adding reverse hits to direction-filtered queries.
+
+The both-direction branch uses the existing directed UNION ALL query, whose results are
+already ordered by descending weight then UUID and limited to the existing fanout window.
+The handler does not change selection, ordering, mailbox refill, or per-node caps.
 
 ## `assemble_within_budget`
 
-A deterministic-order budget walk: it appends anchor entity records and their neighbor
-records (each already produced in final display order) until the next record's compact-JSON
-Unicode-scalar length would push the running total past `budget`. Returns (assembled anchors,
-truncated, dropped anchors, dropped neighbors). A budget exactly equal to the cumulative size
-does NOT truncate — the stop condition is "would push the running total PAST budget", so a
-record landing exactly on the boundary still fits.
+Assembly first admits a prefix of anchor entity records. It then admits a prefix of
+neighbor/edge pairs for each admitted anchor. An oversized next pair stops that anchor's
+neighbor pass; later admitted anchors may still contribute fitting pairs. Anchor priority
+is preserved, and later pairs under the same anchor cannot skip an oversized predecessor.
+
+Each cost is the Unicode-scalar length of compact JSON: an anchor's entity record, or the
+sum of a pair's neighbor and edge records. Endpoint names and null fields are charged;
+response envelopes, containers, and separators are excluded. This is a character budget,
+not a UTF-8 byte count. Exact fits are admitted. The effective-budget bounds and
+`budget_clamped` remain unchanged.
+
+A budget-cut pair is emitted in neither location. Drops for budget-cut anchors include
+those anchors' pairs. The assembler returns anchors, edges, truncation, dropped anchors,
+and dropped pairs; the same pair count supplies both dropped neighbor and edge counts.
+ADR-140 explicitly proposes this two-pass/per-anchor rule as a replacement for ADR-089
+§Semantics item 5's generic global-stop prose upon acceptance.
 
 ## `handle_context` stage notes
 
-- **Directed-neighbor fetch**: a single UNION ALL query for both directions (ADR-089
-  context-verb optimization) instead of two separate direction-scoped calls — halves the
-  storage neighbor SELECT count for this branch. The op already returns hits in global
-  weight-descending, node_id-ascending order truncated to `fanout`, so no local
-  re-sort/truncate is needed.
-- **Stage 1 (anchor resolution)**: `entity_ids` is an explicit entity-anchor contract
-  (ADR-089 §1: "honored in full"). `resolve_uuid_async` accepts any syntactically valid
-  UUID without checking substrate or existence, so a random UUID, a note UUID, or an edge
-  UUID would otherwise resolve here and then silently vanish from the response in Stage 4's
-  lenient "missing entity" fallback. The handler fails loudly instead: one batch existence
-  check names every offending id.
-- **Query-anchor overfetch**: fetches a larger candidate window than `limit` so that anchors
-  which collapse into `entity_ids` duplicates don't under-fill the query leg — ADR-089 §1
-  promises search "fills up to `limit` additional anchors" after explicit ids, which requires
-  looking past the first `limit` hits when some of them overlap explicit anchors. Bounded by
-  a documented cap so a pathological overlap can't turn into an unbounded search.
-- **Stage 2 (expansion), hop-1 stratum**: one stratum across all hop-1 parents under an
-  anchor, sorted by weight desc, then neighbor id, then parent id (the last key only
-  arbitrates true ties — same neighbor, same weight, different parent — so the "first
-  discovering parent" is deterministic).
-- **Stage 4 (assembly)**: explicit `entity_ids` anchors are already verified to exist in
-  Stage 1; the Stage 4 existence check only guards the residual race of an anchor deleted
-  concurrently between resolution and this fetch, or a neighbor entity that vanished the same
-  way. During expansion, the handler treats `NotFound` for a node that vanished after discovery
-  as an empty neighbor list. Missing nodes never enter the budget accounting.
+- **Anchor resolution:** explicit `entity_ids` are verified as scoped live entities in one
+  batch. Missing IDs and non-entity IDs fail; the graph payload does not relax that contract.
+- **Query anchors:** bounded overfetch avoids under-filling when query hits overlap explicit
+  anchors. Explicit anchors retain their order and query hits fill additional positions.
+- **Expansion:** hop-1 precedes hop-2. Each stratum sorts by weight descending, neighbor UUID,
+  and parent UUID for true ties. The first discovering parent and existing visited set own
+  a node. `NotFound` after discovery retains the existing empty-expansion behavior.
+- **Hydration:** existing scoped entity, note, owning-backend, and mailbox reads build the
+  metadata maps once. Assembly builds both endpoint fields from those maps.
+- **Assembly:** available endpoint pairs are formed and costed before budgeting. Metadata
+  missing after expansion is an omission, while budget-cut pairs alone affect budget drops.
+
+The private unit-test hydration barrier exists only under `cfg(test)`. It is keyed by a
+unique fixture namespace, serialized by the test guard, and uses finite watchdogs around
+actual registry context/delete calls to exercise stage-2/stage-3 races; it introduces no
+production state or public runtime hook.

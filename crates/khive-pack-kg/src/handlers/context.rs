@@ -155,7 +155,9 @@ async fn fetch_directed_neighbors(
         return Ok(hits
             .into_iter()
             .map(|(h, dir)| {
-                let tag = if dir == Direction::Out {
+                let tag = if h.relation.is_symmetric() {
+                    "both"
+                } else if dir == Direction::Out {
                     "outgoing"
                 } else {
                     "incoming"
@@ -185,7 +187,17 @@ async fn fetch_directed_neighbors(
     } else {
         "incoming"
     };
-    Ok(hits.into_iter().map(|h| (h, tag)).collect())
+    Ok(hits
+        .into_iter()
+        .map(|h| {
+            let tag = if h.relation.is_symmetric() {
+                "both"
+            } else {
+                tag
+            };
+            (h, tag)
+        })
+        .collect())
 }
 
 async fn fetch_mailbox_neighbors(
@@ -286,10 +298,122 @@ fn compact_len(v: &Value) -> Result<usize, RuntimeError> {
     Ok(s.chars().count())
 }
 
+/// The two projections of one discovery step share a single admission cost.
+struct ContextPair {
+    neighbor: Value,
+    edge: Value,
+    size: usize,
+}
+
+impl ContextPair {
+    fn new(neighbor: Value, edge: Value) -> Result<Self, RuntimeError> {
+        let size = compact_len(&neighbor)? + compact_len(&edge)?;
+        Ok(Self {
+            neighbor,
+            edge,
+            size,
+        })
+    }
+}
+
 struct AnchorBlock {
     entity_json: Value,
     entity_size: usize,
-    neighbor_jsons: Vec<(Value, usize)>,
+    pairs: Vec<ContextPair>,
+}
+
+// Only the library unit-test target has this private, namespace-scoped barrier.
+// No state or public test API is compiled into production or integration targets.
+#[cfg(test)]
+mod hydration_pause {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct Pause {
+        id: Uuid,
+        entered: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    fn pauses() -> &'static Mutex<HashMap<String, Pause>> {
+        static PAUSES: OnceLock<Mutex<HashMap<String, Pause>>> = OnceLock::new();
+        PAUSES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) struct Arm {
+        namespace: String,
+        id: Uuid,
+        entered: Option<oneshot::Receiver<()>>,
+        resume: Option<oneshot::Sender<()>>,
+    }
+
+    impl Arm {
+        pub(super) async fn reached(&mut self) {
+            tokio::time::timeout(Duration::from_secs(10), self.entered.take().unwrap())
+                .await
+                .expect("context expansion watchdog")
+                .expect("context must reach the hydration barrier");
+        }
+
+        pub(super) fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
+    impl Drop for Arm {
+        fn drop(&mut self) {
+            self.release();
+            let mut entries = pauses().lock().expect("hydration pause lock");
+            if entries
+                .get(&self.namespace)
+                .is_some_and(|pause| pause.id == self.id)
+            {
+                entries.remove(&self.namespace);
+            }
+        }
+    }
+
+    pub(super) fn arm(namespace: &str) -> Arm {
+        let id = Uuid::new_v4();
+        let (entered, reached) = oneshot::channel();
+        let (resume, released) = oneshot::channel();
+        let mut entries = pauses().lock().expect("hydration pause lock");
+        assert!(!entries.contains_key(namespace), "one pause per namespace");
+        entries.insert(
+            namespace.to_owned(),
+            Pause {
+                id,
+                entered,
+                resume: released,
+            },
+        );
+        Arm {
+            namespace: namespace.to_owned(),
+            id,
+            entered: Some(reached),
+            resume: Some(resume),
+        }
+    }
+
+    pub(super) async fn wait(namespace: &str) {
+        let pause = {
+            pauses()
+                .lock()
+                .expect("hydration pause lock")
+                .remove(namespace)
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            // Arm drop releases the read even if the mutation/assertion panics.
+            let _ = tokio::time::timeout(Duration::from_secs(10), pause.resume)
+                .await
+                .expect("context hydration release watchdog");
+        }
+    }
 }
 
 impl KgPack {
@@ -532,6 +656,9 @@ impl KgPack {
             plog(call_id, "expand", t.elapsed().as_micros());
         }
 
+        #[cfg(test)]
+        hydration_pause::wait(token.namespace().as_str()).await;
+
         // ---- Stage 3: batch entity metadata fetch (anchors + all neighbors) ----
         let t3 = if prof { Some(Instant::now()) } else { None };
         let mut all_ids: Vec<Uuid> = anchor_ids.clone();
@@ -654,9 +781,15 @@ impl KgPack {
             });
             let entity_size = compact_len(&entity_json)?;
 
-            let mut neighbor_jsons = Vec::with_capacity(per_anchor_neighbors[i].len());
+            let mut pairs = Vec::with_capacity(per_anchor_neighbors[i].len());
             for rec in &per_anchor_neighbors[i] {
                 let Some(ne) = meta_for(&rec.id) else {
+                    continue;
+                };
+                let parent_id = rec.via.unwrap_or(*anchor);
+                let Some(parent) = meta_for(&parent_id) else {
+                    // Separate scoped reads can lose a parent after discovery.
+                    // Skip both projections before budgeting; retain visited ownership.
                     continue;
                 };
                 let nj = json!({
@@ -671,17 +804,44 @@ impl KgPack {
                     "via": rec.via.map(|v| v.to_string()),
                     "description": ne.description,
                 });
-                let size = compact_len(&nj)?;
-                neighbor_jsons.push((nj, size));
+                let (source_id, source_name, target_id, target_name) =
+                    if rec.direction == "incoming" {
+                        (
+                            rec.id,
+                            ne.name.as_deref(),
+                            parent_id,
+                            parent.name.as_deref(),
+                        )
+                    } else {
+                        // Symmetric "both" uses deterministic parent-first endpoints.
+                        (
+                            parent_id,
+                            parent.name.as_deref(),
+                            rec.id,
+                            ne.name.as_deref(),
+                        )
+                    };
+                let edge = json!({
+                    "source_id": source_id.to_string(),
+                    "source_name": source_name,
+                    "target_id": target_id.to_string(),
+                    "target_name": target_name,
+                    "relation": rec.relation.as_str(),
+                    "weight": rec.weight,
+                    "direction": rec.direction,
+                    "hop": rec.hop,
+                    "via": rec.via.map(|v| v.to_string()),
+                });
+                pairs.push(ContextPair::new(nj, edge)?);
             }
             blocks.push(AnchorBlock {
                 entity_json,
                 entity_size,
-                neighbor_jsons,
+                pairs,
             });
         }
 
-        let (out_anchors, truncated, dropped_anchors, dropped_neighbors) =
+        let (out_anchors, out_edges, truncated, dropped_anchors, dropped_neighbors) =
             assemble_within_budget(&blocks, budget);
 
         if let Some(t) = t4 {
@@ -690,6 +850,7 @@ impl KgPack {
 
         let mut response = json!({
             "anchors": out_anchors,
+            "edges": out_edges,
             "truncated": truncated,
             // `stage` is additive: every drop this handler produces originates in the
             // Stage-4 budget walk — `fanout`/`hops` bound the neighbor candidate pool
@@ -697,6 +858,7 @@ impl KgPack {
             "dropped": {
                 "anchors": dropped_anchors,
                 "neighbors": dropped_neighbors,
+                "edges": dropped_neighbors,
                 "stage": "budget",
             },
         });
@@ -737,7 +899,7 @@ impl KgPack {
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
-) -> (Vec<Value>, bool, usize, usize) {
+) -> (Vec<Value>, Vec<Value>, bool, usize, usize) {
     let mut running = 0usize;
     let mut truncated = false;
     let mut included: Vec<bool> = vec![false; blocks.len()];
@@ -752,19 +914,21 @@ fn assemble_within_budget(
     }
 
     let mut out_anchors: Vec<Value> = Vec::with_capacity(blocks.len());
+    let mut out_edges: Vec<Value> = Vec::new();
     let mut committed_neighbors: Vec<usize> = vec![0; blocks.len()];
     for (i, block) in blocks.iter().enumerate() {
         if !included[i] {
             continue;
         }
         let mut neighbor_out: Vec<Value> = Vec::new();
-        for (nj, size) in &block.neighbor_jsons {
-            if running + size > budget {
+        for pair in &block.pairs {
+            if running + pair.size > budget {
                 truncated = true;
                 break;
             }
-            running += size;
-            neighbor_out.push(nj.clone());
+            running += pair.size;
+            neighbor_out.push(pair.neighbor.clone());
+            out_edges.push(pair.edge.clone());
             committed_neighbors[i] += 1;
         }
         out_anchors.push(json!({
@@ -778,10 +942,16 @@ fn assemble_within_budget(
     let dropped_neighbors: usize = blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| b.neighbor_jsons.len() - committed_neighbors[i])
+        .map(|(i, b)| b.pairs.len() - committed_neighbors[i])
         .sum();
 
-    (out_anchors, truncated, dropped_anchors, dropped_neighbors)
+    (
+        out_anchors,
+        out_edges,
+        truncated,
+        dropped_anchors,
+        dropped_neighbors,
+    )
 }
 
 #[cfg(test)]
@@ -795,19 +965,19 @@ mod tests {
     ) -> AnchorBlock {
         let entity_json = json!({ "id": name, "filler": "x".repeat(entity_size_filler) });
         let entity_size = compact_len(&entity_json).unwrap();
-        let neighbor_jsons = neighbor_sizes
+        let pairs = neighbor_sizes
             .iter()
             .enumerate()
             .map(|(idx, &sz)| {
                 let nj = json!({ "id": format!("{name}-n{idx}"), "filler": "x".repeat(sz) });
-                let size = compact_len(&nj).unwrap();
-                (nj, size)
+                let edge = json!({ "source_id": name, "target_id": nj["id"] });
+                ContextPair::new(nj, edge).unwrap()
             })
             .collect();
         AnchorBlock {
             entity_json,
             entity_size,
-            neighbor_jsons,
+            pairs,
         }
     }
 
@@ -836,12 +1006,19 @@ mod tests {
         let blocks = vec![anchor_block("a1", 4, &[4, 4]), anchor_block("a2", 4, &[4])];
         let total: usize = blocks
             .iter()
-            .map(|b| b.entity_size + b.neighbor_jsons.iter().map(|(_, s)| s).sum::<usize>())
+            .map(|b| b.entity_size + b.pairs.iter().map(|pair| pair.size).sum::<usize>())
             .sum();
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, total);
+        let (out, edges, truncated, d_anchors, d_neighbors) =
+            assemble_within_budget(&blocks, total);
         assert!(!truncated);
         assert_eq!(d_anchors, 0);
         assert_eq!(d_neighbors, 0);
+        assert_eq!(
+            edges.len(),
+            out.iter()
+                .map(|anchor| anchor["neighbors"].as_array().unwrap().len())
+                .sum::<usize>()
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 2);
         assert_eq!(out[1]["neighbors"].as_array().unwrap().len(), 1);
@@ -853,14 +1030,21 @@ mod tests {
         // the spec's stop condition is "would push the running total PAST
         // budget", i.e. a record landing exactly on the boundary still fits.
         let blocks = vec![anchor_block("a1", 4, &[4])];
-        let exact_total = blocks[0].entity_size + blocks[0].neighbor_jsons[0].1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, exact_total);
+        let exact_total = blocks[0].entity_size + blocks[0].pairs[0].size;
+        let (out, edges, truncated, d_anchors, d_neighbors) =
+            assemble_within_budget(&blocks, exact_total);
         assert!(
             !truncated,
             "exact-fit budget must not be reported as truncated"
         );
         assert_eq!(d_anchors, 0);
         assert_eq!(d_neighbors, 0);
+        assert_eq!(
+            edges.len(),
+            out.iter()
+                .map(|anchor| anchor["neighbors"].as_array().unwrap().len())
+                .sum::<usize>()
+        );
         assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 1);
     }
 
@@ -868,11 +1052,12 @@ mod tests {
     fn assemble_within_budget_one_char_over_boundary_truncates_the_overflowing_record() {
         let blocks = vec![anchor_block("a1", 4, &[4, 4])];
         let entity_size = blocks[0].entity_size;
-        let first_neighbor_size = blocks[0].neighbor_jsons[0].1;
+        let first_neighbor_size = blocks[0].pairs[0].size;
         // Budget fits the anchor entity plus the first neighbor exactly, but not
         // a single Unicode scalar more — the second neighbor must be dropped.
         let budget = entity_size + first_neighbor_size;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+        let (out, edges, truncated, d_anchors, d_neighbors) =
+            assemble_within_budget(&blocks, budget);
         assert!(truncated);
         assert_eq!(d_anchors, 0, "the anchor's entity record itself fit");
         assert_eq!(
@@ -880,6 +1065,7 @@ mod tests {
             "exactly the overflowing neighbor is dropped"
         );
         assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 1);
+        assert_eq!(edges.len(), 1);
     }
 
     #[test]
@@ -887,9 +1073,11 @@ mod tests {
         let blocks = vec![anchor_block("a1", 4, &[4]), anchor_block("a2", 4, &[4])];
         // Budget too small even for the first anchor's entity record.
         let budget = blocks[0].entity_size - 1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+        let (out, edges, truncated, d_anchors, d_neighbors) =
+            assemble_within_budget(&blocks, budget);
         assert!(truncated);
         assert!(out.is_empty(), "no anchor entity fit at all");
+        assert!(edges.is_empty());
         assert_eq!(d_anchors, 2, "both anchors dropped");
         assert_eq!(d_neighbors, 2, "both anchors' single neighbor each dropped");
     }
@@ -901,8 +1089,9 @@ mod tests {
         // (but still selected) anchor's own entity record out of the result. Only
         // that first anchor's oversized neighbor should be dropped.
         let blocks = vec![anchor_block("a1", 4, &[2000]), anchor_block("a2", 4, &[4])];
-        let budget = blocks[0].entity_size + blocks[1].entity_size + blocks[1].neighbor_jsons[0].1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+        let budget = blocks[0].entity_size + blocks[1].entity_size + blocks[1].pairs[0].size;
+        let (out, edges, truncated, d_anchors, d_neighbors) =
+            assemble_within_budget(&blocks, budget);
         assert!(truncated);
         assert_eq!(
             out.len(),
@@ -928,26 +1117,144 @@ mod tests {
             1,
             "second anchor's small neighbor still fits"
         );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["source_id"], "a2");
     }
 
     #[test]
     fn assemble_within_budget_hop_and_via_pass_through_untouched() {
         let hop1 = json!({ "id": "n1", "hop": 1, "via": Value::Null });
         let hop2 = json!({ "id": "n2", "hop": 2, "via": "n1" });
-        let sz1 = compact_len(&hop1).unwrap();
-        let sz2 = compact_len(&hop2).unwrap();
+        let pair1 = ContextPair::new(hop1, json!({ "hop": 1, "via": null })).unwrap();
+        let pair2 = ContextPair::new(hop2, json!({ "hop": 2, "via": "n1" })).unwrap();
+        let size = pair1.size + pair2.size;
         let block = AnchorBlock {
             entity_json: json!({ "id": "a1" }),
             entity_size: compact_len(&json!({ "id": "a1" })).unwrap(),
-            neighbor_jsons: vec![(hop1, sz1), (hop2, sz2)],
+            pairs: vec![pair1, pair2],
         };
-        let budget = block.entity_size + sz1 + sz2;
-        let (out, truncated, ..) = assemble_within_budget(&[block], budget);
+        let budget = block.entity_size + size;
+        let (out, edges, truncated, ..) = assemble_within_budget(&[block], budget);
         assert!(!truncated);
         let neighbors = out[0]["neighbors"].as_array().unwrap();
         assert_eq!(neighbors[0]["hop"], 1);
         assert_eq!(neighbors[0]["via"], Value::Null);
         assert_eq!(neighbors[1]["hop"], 2);
         assert_eq!(neighbors[1]["via"], "n1");
+        assert_eq!(edges[0]["hop"], 1);
+        assert_eq!(edges[0]["via"], Value::Null);
+        assert_eq!(edges[1]["hop"], 2);
+        assert_eq!(edges[1]["via"], "n1");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn context_pairs_use_scoped_metadata_after_controlled_real_deletion() {
+        use khive_runtime::{RuntimeConfig, VerbRegistryBuilder};
+        use std::time::Duration;
+
+        async fn entity(registry: &VerbRegistry, name: &str) -> String {
+            registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "concept", "name": name, "skip_dedup_check": true,
+                    }),
+                )
+                .await
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        // None is the barrier's positive control. The other cases delete an
+        // actual selected neighbor or via parent after expansion, before hydration.
+        for removed in [None, Some("child"), Some("parent")] {
+            let namespace = format!("context-race-{}", Uuid::new_v4().simple());
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                ..RuntimeConfig::no_embeddings()
+            })
+            .unwrap();
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_default_namespace(namespace.clone());
+            builder.register(KgPack::new(runtime.clone()));
+            let registry = builder.build().unwrap();
+            runtime.install_edge_rules(registry.all_edge_rules());
+            registry.call_register_entity_type_validators(&runtime);
+            let anchor = entity(&registry, "Race anchor").await;
+            let parent = entity(&registry, "Race parent").await;
+            let child = entity(&registry, "Race child").await;
+            for (source, target) in [(&anchor, &parent), (&parent, &child)] {
+                registry
+                    .dispatch(
+                        "link",
+                        json!({
+                            "source_id": source, "target_id": target,
+                            "relation": "depends_on", "weight": 0.8,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let args = json!({"entity_ids": [anchor], "hops": 2, "direction": "outgoing", "budget": 65536});
+            let before = registry.dispatch("context", args.clone()).await.unwrap();
+            assert_eq!(before["edges"].as_array().unwrap().len(), 2, "{before}");
+            assert_eq!(before["edges"][1]["via"], parent);
+            let mut pause = hydration_pause::arm(&namespace);
+            let reader = registry.clone();
+            let task = tokio::spawn(async move { reader.dispatch("context", args).await });
+            pause.reached().await;
+            if let Some(which) = removed {
+                let id = if which == "parent" { &parent } else { &child };
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    registry.dispatch("delete", json!({"id": id})),
+                )
+                .await
+                .expect("delete watchdog")
+                .expect("actual selected record deletion");
+            }
+            pause.release();
+            let after = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("context completion watchdog")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after["truncated"], false, "{after}");
+            assert_eq!(after["dropped"]["anchors"], 0);
+            assert_eq!(after["dropped"]["neighbors"], 0);
+            assert_eq!(after["dropped"]["edges"], 0);
+            assert_eq!(after["anchors"].as_array().unwrap().len(), 1);
+            match removed {
+                None => assert_eq!(after, before),
+                Some("child") => {
+                    assert_eq!(after["edges"].as_array().unwrap().len(), 1);
+                    assert_eq!(after["edges"][0]["target_id"], parent);
+                    assert_eq!(
+                        after["anchors"][0]["neighbors"].as_array().unwrap().len(),
+                        1
+                    );
+                    assert!(!after.to_string().contains(&child));
+                }
+                Some("parent") => {
+                    // The child still exists, but cannot acquire an invented
+                    // parent name or a new visited owner after its parent vanished.
+                    registry
+                        .dispatch("get", json!({"id": child}))
+                        .await
+                        .unwrap();
+                    assert!(after["edges"].as_array().unwrap().is_empty());
+                    assert!(after["anchors"][0]["neighbors"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty());
+                    assert!(!after.to_string().contains(&parent));
+                    assert!(!after.to_string().contains(&child));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }
