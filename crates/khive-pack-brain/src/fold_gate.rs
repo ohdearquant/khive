@@ -342,7 +342,7 @@ async fn apply_gate_within_tx(
 /// transaction. Returns `true` if this call claimed the key (first time
 /// seen), `false` if a prior call already holds it (0 rows affected — the
 /// primary key rejected the conflicting insert).
-async fn claim_dedup_within_tx(
+pub(crate) async fn claim_dedup_within_tx(
     writer: &mut dyn SqlWriter,
     scorer_run_id: &str,
     serve_ledger_id: &str,

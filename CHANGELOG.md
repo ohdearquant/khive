@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
+### Added
+
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
 
 ### Breaking (Rust crates)
 
