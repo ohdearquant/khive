@@ -227,7 +227,7 @@ impl TryFrom<LinkRaw> for Link {
                 raw.weight
             ));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !validate_edge_weight(raw.weight) {
             return Err(alloc::format!(
                 "Link weight must be in [0.0, 1.0], got {}",
                 raw.weight

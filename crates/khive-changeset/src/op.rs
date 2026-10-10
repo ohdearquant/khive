@@ -123,7 +123,7 @@ impl TryFrom<LinkOpRaw> for LinkOp {
         if !raw.weight.is_finite() {
             return Err(format!("LinkOp weight must be finite, got {}", raw.weight));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !khive_types::validate_edge_weight(raw.weight) {
             return Err(format!(
                 "LinkOp weight must be in [0.0, 1.0], got {}",
                 raw.weight
@@ -308,7 +308,7 @@ impl EdgePatch {
             if !w.is_finite() {
                 return Err(format!("EdgePatch weight must be finite, got {w}"));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!("EdgePatch weight must be in [0.0, 1.0], got {w}"));
             }
         }
@@ -466,7 +466,7 @@ fn validate_update_congruence(
             check_touched("relation", p.relation.is_some(), pre.relation.is_some())?;
             check_touched("weight", p.weight.is_some(), pre.weight.is_some())?;
             if let Some(w) = pre.weight {
-                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                if !khive_types::validate_edge_weight(w) {
                     return Err(format!(
                         "UpdateOp edge preimage weight must be finite and in [0.0, 1.0], got {w}"
                     ));
