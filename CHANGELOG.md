@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept ADR-037 configuration-bound namespace and project-root rules for remote
   cached-entity reads, preserving origin and refusing remote mutations. The read
   remains unimplemented.
+- Propose ADR-035 embedding pipeline configuration, legacy-key compatibility and
+  import strictness rules, with an ADR-001 companion distinguishing explicit import
+  from VCS snapshot degradation; edge relations remain closed.
 
 ### Added
 
