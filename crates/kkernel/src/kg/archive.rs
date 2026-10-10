@@ -59,26 +59,147 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
     }
-    // Write through a temp sibling + atomic rename so a symlinked --output is
-    // replaced rather than followed into the source DB. The temp is created with
-    // O_EXCL (create_new): a pre-existing temp path — including a planted symlink
-    // to the DB — fails the create rather than being followed, closing the whole
-    // symlink-overwrite class, not just --output itself.
     use std::io::Write as _;
-    let mut tmp_name = args.output.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".{}.inprogress", std::process::id()));
-    let tmp = args.output.with_file_name(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
+    publish_export_with(&args.output, |file| file.write_all(json.as_bytes()))
+        .with_context(|| format!("publish export {}", args.output.display()))
+}
+
+fn export_temporary_name(output: &Path) -> std::ffi::OsString {
+    let mut name = output.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.inprogress", std::process::id()));
+    name
+}
+
+/// Both original errors remain owned; the primary I/O error stays in the chain.
+#[derive(Debug)]
+struct ExportCleanupFailure {
+    primary: std::io::Error,
+    cleanup: std::io::Error,
+}
+
+impl std::fmt::Display for ExportCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; cleanup of owned export temporary also failed: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for ExportCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn owned_export_error(primary: std::io::Error, cleanup: std::io::Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => anyhow::Error::new(primary),
+        Err(cleanup) => anyhow::Error::new(ExportCleanupFailure { primary, cleanup }),
+    }
+}
+
+#[cfg(unix)]
+fn publish_export_with(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use khive_fs::atomic_publish::{publish_atomic_at_detailed, AtomicPublishOptions, StaleTmp};
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Preserve existing parent symlink resolution while holding one directory for
+    // creation, rename, cleanup and the final directory sync.
+    let dir = std::fs::File::open(parent)
+        .with_context(|| format!("open export directory {}", parent.display()))?;
+    let tmp_name = export_temporary_name(output);
+    publish_atomic_at_detailed(
+        &dir,
+        &tmp_name,
+        output.file_name().unwrap_or_default(),
+        AtomicPublishOptions {
+            stale: StaleTmp::RefuseExisting,
+            mode: 0o666,
+        },
+        writer,
+    )
+    .map_err(|error| {
+        let phase = error.phase();
+        finish_unix_export_error(&dir, &tmp_name, phase, error.into_source())
+    })
+}
+
+#[cfg(unix)]
+fn finish_unix_export_error(
+    dir: &std::fs::File,
+    tmp_name: &std::ffi::OsStr,
+    phase: khive_fs::atomic_publish::AtomicPublishPhase,
+    source: std::io::Error,
+) -> anyhow::Error {
+    use khive_fs::atomic_publish::AtomicPublishPhase;
+    let error = match phase {
+        AtomicPublishPhase::WriteTmp | AtomicPublishPhase::SyncTmp | AtomicPublishPhase::Rename => {
+            owned_export_error(source, khive_fs::fd_relative::unlink_at(dir, tmp_name))
+        }
+        // Before creation the entry belongs to someone else. After rename there
+        // is no owned temporary; a later writer may already have reused its name.
+        _ => anyhow::Error::new(source),
+    };
+    error.context(format!("export publication failed during {phase:?}"))
+}
+
+#[cfg(not(unix))]
+#[derive(Default)]
+struct ExportSync {
+    #[cfg(test)]
+    file: Option<fn(&std::fs::File) -> std::io::Result<()>>,
+}
+
+#[cfg(not(unix))]
+impl ExportSync {
+    fn sync(&self, file: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(sync) = self.file {
+            return sync(file);
+        }
+        file.sync_all()
+    }
+}
+
+#[cfg(not(unix))]
+fn publish_export_with(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    publish_export_portable(output, writer, ExportSync::default())
+}
+
+#[cfg(not(unix))]
+fn publish_export_portable(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    sync: ExportSync,
+) -> Result<()> {
+    let tmp = output.with_file_name(export_temporary_name(output));
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .with_context(|| format!("create temp {}", tmp.display()))?;
-    f.write_all(json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    f.sync_all().ok();
-    drop(f);
-    std::fs::rename(&tmp, &args.output)
-        .with_context(|| format!("finalize {}", args.output.display()))?;
+        .with_context(|| format!("create export temporary {}", tmp.display()))?;
+    let written = writer(&mut file).and_then(|()| sync.sync(&file));
+    // Windows must release the file before remove_file or rename.
+    drop(file);
+    if let Err(source) = written {
+        return Err(owned_export_error(source, std::fs::remove_file(&tmp))
+            .context(format!("write or sync export temporary {}", tmp.display())));
+    }
+    if let Err(source) = std::fs::rename(&tmp, output) {
+        return Err(owned_export_error(source, std::fs::remove_file(&tmp))
+            .context(format!("finalize export {}", output.display())));
+    }
+    // Parent-directory synchronization is provided by the Unix path.
     Ok(())
 }
 
@@ -1267,5 +1388,241 @@ mod tests {
             err.to_string().contains("outside the valid range"),
             "expected range error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_publication_tests {
+    use super::*;
+    use std::io::{self, Write};
+    use tempfile::TempDir;
+
+    fn temporary(output: &Path) -> std::path::PathBuf {
+        let mut name = output.file_name().unwrap().to_os_string();
+        name.push(format!(".{}.inprogress", std::process::id()));
+        output.with_file_name(name)
+    }
+
+    fn primary_io(error: &anyhow::Error) -> &io::Error {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn actual_export_refuses_incumbent_regular_temporary() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        std::fs::write(temporary(&output), b"incumbent").unwrap();
+        let error = cmd_export(ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(primary_io(&error).kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert_eq!(std::fs::read(temporary(&output)).unwrap(), b"incumbent");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn actual_export_refuses_temp_symlink_and_replaces_output_symlink() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        let target = scratch.path().join("precious");
+        std::fs::write(&target, b"target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &output).unwrap();
+        std::os::unix::fs::symlink(&target, temporary(&output)).unwrap();
+        let args = || ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        };
+        assert!(cmd_export(args()).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target bytes");
+        assert!(std::fs::symlink_metadata(temporary(&output))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(temporary(&output)).unwrap();
+        cmd_export(args()).await.unwrap();
+        assert!(!std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let archive: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(archive["format"], "khive-kg");
+        assert_eq!(std::fs::read(&target).unwrap(), b"target bytes");
+        assert!(!temporary(&output).exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn actual_export_accepts_non_utf8_output_name() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = TempDir::new().unwrap();
+        let output = scratch
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"archive-\xff.json"));
+        cmd_export(ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        })
+        .await
+        .unwrap();
+        let archive: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(archive["format"], "khive-kg");
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    fn writer_failure_removes_only_its_owned_temporary_on_every_target() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        let error = publish_export_with(&output, |file| {
+            file.write_all(b"partial archive")?;
+            #[cfg(unix)]
+            {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "original writer failure",
+                ))
+            }
+        })
+        .unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        #[cfg(not(unix))]
+        {
+            assert_eq!(primary_io(&error).kind(), io::ErrorKind::WriteZero);
+            assert_eq!(primary_io(&error).to_string(), "original writer failure");
+        }
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    fn real_rename_failure_removes_owned_temporary() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("child"), b"incumbent child").unwrap();
+        let error = publish_export_with(&output, |file| file.write_all(b"archive")).unwrap_err();
+        assert!(primary_io(&error).raw_os_error().is_some());
+        assert_eq!(
+            std::fs::read(output.join("child")).unwrap(),
+            b"incumbent child"
+        );
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detailed_failure_finalizer_cleans_sync_tmp_but_keeps_postrename_output() {
+        use khive_fs::atomic_publish::AtomicPublishPhase;
+        let scratch = TempDir::new().unwrap();
+        let dir = std::fs::File::open(scratch.path()).unwrap();
+        let output = scratch.path().join("archive.json");
+        let temp = temporary(&output);
+        std::fs::write(&output, b"old destination").unwrap();
+        std::fs::write(&temp, b"partial archive").unwrap();
+        // Inject the detailed phase at the actual private finalizer. Shared helper
+        // tests separately establish that real sync refusal produces this phase.
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::SyncTmp,
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert!(!temp.exists());
+        std::fs::write(&temp, b"new archive").unwrap();
+        std::fs::rename(&temp, &output).unwrap();
+        std::fs::write(&temp, b"reused name").unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::SyncDirectory,
+            io::Error::from_raw_os_error(libc::EIO),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::EIO));
+        assert_eq!(std::fs::read(&output).unwrap(), b"new archive");
+        assert_eq!(std::fs::read(&temp).unwrap(), b"reused name");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detailed_creation_refusal_preserves_incumbent_and_cleanup_failure_retains_both_errors() {
+        use khive_fs::atomic_publish::AtomicPublishPhase;
+        let scratch = TempDir::new().unwrap();
+        let dir = std::fs::File::open(scratch.path()).unwrap();
+        let temp = scratch.path().join("tmp");
+        std::fs::write(&temp, b"incumbent").unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::CreateTmp,
+            io::Error::from_raw_os_error(libc::EEXIST),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(std::fs::read(&temp).unwrap(), b"incumbent");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::WriteTmp,
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        let combined = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ExportCleanupFailure>())
+            .unwrap();
+        assert!(combined.cleanup.raw_os_error().is_some());
+        assert!(format!("{error:#}").contains("cleanup"));
+        assert!(temp.is_dir());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn portable_sync_failure_closes_file_before_owned_cleanup() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        let error = publish_export_portable(
+            &output,
+            |file| file.write_all(b"archive"),
+            ExportSync {
+                file: Some(|_| Err(io::Error::new(io::ErrorKind::Other, "sync refused"))),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(primary_io(&error).to_string(), "sync refused");
+        assert!(!temporary(&output).exists());
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
     }
 }
