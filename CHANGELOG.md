@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `khive-brain-core` exposes evidence-only posteriors with explicit event/read clocks,
+  checked half-lives, decay-before-add and a fixed read-time prior. Regressed writes
+  preserve the entry; invalid or overflowing updates refuse atomically. Existing
+  posterior storage, folds and serving paths remain unchanged.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
