@@ -45,9 +45,15 @@ pub fn property_cas_statements(
     expected: &[(&str, SqlValue)],
     set: &[(&str, SqlValue)],
 ) -> Result<Vec<SqlStatement>, StorageError> {
-    let (table, advance_version) = match table {
-        "notes" => ("\"notes\"", false),
-        "entities" => ("\"entities\"", true),
+    let (prefix, advance_version) = match table {
+        "notes" => (
+            "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')",
+            false,
+        ),
+        "entities" => (
+            "UPDATE \"entities\" SET properties = json_set(COALESCE(properties, '{}')",
+            true,
+        ),
         _ => return Err(invalid("unsupported property CAS table".into())),
     };
     validate_entries(expected, true)?;
@@ -57,7 +63,7 @@ pub fn property_cas_statements(
     }
 
     let mut params = vec![SqlValue::Uuid(id)];
-    let mut sql = format!("UPDATE {table} SET properties = json_set(COALESCE(properties, '{{}}')");
+    let mut sql = prefix.to_owned();
     for (path, value) in set {
         params.push(SqlValue::Text((*path).into()));
         let path_index = params.len();
