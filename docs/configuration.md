@@ -516,7 +516,8 @@ cover yet.
   `[packs.*]` deployment model, pack routing, cross-backend operation limits.
 - `crates/khive-runtime/src/engine_config.rs`: `KhiveConfig::load`,
   `load_with_home_fallback`, `load_with_roots`, `BackendConfig`, `PackConfig`.
-- `crates/khive-mcp/src/serve.rs`: `build_registry_for_multi_backend` (the
-  `--db` / `[[backends]]` fail-loud check), `resolve_runtime_config`.
+- `crates/khive-mcp/src/serve/storage_topology.rs`: `build_registry_for_multi_backend`
+  and the `--db` / `[[backends]]` fail-loud check.
+- `crates/khive-mcp/src/serve/runtime_config.rs`: `resolve_runtime_config`.
 - `crates/khive-mcp/src/args.rs`: the `kkernel mcp` CLI argument surface
   (`--db`, `--config`, `--actor`, `--namespace`, `--pack`, `--brain-profile`).
