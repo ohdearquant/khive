@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-11
+
 ### Documentation
 
 - Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
