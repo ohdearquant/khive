@@ -15,7 +15,7 @@ use khive_storage::types::{
 
 use super::common::{
     deser, parse_direction, parse_relation, render_query_result, resolve_uuid_async, to_json,
-    NeighborProjection, NeighborsParams, QueryParams, TraverseParams, HARD_CAP,
+    DoublingWindowIter, NeighborProjection, NeighborsParams, QueryParams, TraverseParams, HARD_CAP,
 };
 use super::message_scope::{
     message_endpoint_permitted, message_neighbor_permitted, resolve_mailbox_graph_id,
@@ -135,8 +135,10 @@ impl KgPack {
             let mut merged = Vec::new();
             let mut scan_incomplete = false;
             for namespace in namespaces {
-                query.limit = admitted_target;
+                let mut windows = admitted_target
+                    .map(|first| DoublingWindowIter::new(first, MESSAGE_NEIGHBOR_SCAN_CAP));
                 loop {
+                    query.limit = windows.as_mut().and_then(|iter| iter.next());
                     let options = KgNeighborRead {
                         query: query.clone(),
                         after,
@@ -205,7 +207,9 @@ impl KgPack {
                         scan_incomplete = true;
                         break;
                     }
-                    query.limit = Some(window.saturating_mul(2).min(MESSAGE_NEIGHBOR_SCAN_CAP));
+                    if let Some(windows) = windows.as_mut() {
+                        windows.advance(window, 0, true);
+                    }
                 }
             }
             merged.sort_by_key(|hit| (hit.node_id, hit.edge_id));
