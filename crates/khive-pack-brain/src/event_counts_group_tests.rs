@@ -425,6 +425,176 @@ async fn more_cross_cells_than_marginal_keys_do_not_create_another_cap() {
     );
 }
 
+#[tokio::test]
+async fn kind_grouped_admission_matches_per_kind_counts_at_window_boundaries() {
+    let (runtime, registry) = fixture(true);
+    for (kind, time) in [
+        (EventKind::Audit, SINCE),
+        (EventKind::Audit, SINCE + 2),
+        (EventKind::FeedbackExplicit, SINCE),
+        (EventKind::FeedbackExplicit, SINCE + 1),
+        (EventKind::SearchExecuted, UNTIL - 1),
+        (EventKind::Audit, SINCE - 1),
+        (EventKind::FeedbackExplicit, UNTIL),
+    ] {
+        seed(&runtime, "local", "window.verb", CALLER, kind, time).await;
+    }
+    seed(
+        &runtime,
+        "lambda:visible",
+        "window.verb",
+        CALLER,
+        EventKind::Audit,
+        SINCE,
+    )
+    .await;
+    let store = runtime.backend().events_for_namespace("local").unwrap();
+    let filter = EventFilter {
+        actors: vec![CALLER.into()],
+        after: Some(SINCE - 1),
+        before: Some(UNTIL),
+        ..EventFilter::default()
+    };
+    let grouped = store
+        .count_events_grouped(filter.clone(), khive_storage::event::EventGroupBy::Kind)
+        .await
+        .unwrap();
+    let mut separate = std::collections::BTreeMap::new();
+    for kind in EventKind::ALL {
+        let count = store
+            .count_events(EventFilter {
+                kinds: vec![*kind],
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        if count != 0 {
+            separate.insert(kind.name().to_string(), count);
+        }
+    }
+    assert_eq!(grouped, separate);
+    assert_eq!(
+        grouped,
+        std::collections::BTreeMap::from([
+            ("audit".to_string(), 2),
+            ("feedback_explicit".to_string(), 2),
+            ("search_executed".to_string(), 1),
+        ])
+    );
+
+    let (all, total, truncated) = fetch_event_counts_window(store.as_ref(), &filter, true, 20)
+        .await
+        .unwrap();
+    assert_eq!((all.len(), total, truncated), (5, 5, false));
+    assert!(all.iter().all(|event| event.namespace == "local"
+        && event.created_at >= SINCE
+        && event.created_at < UNTIL));
+    let expected_ids: std::collections::BTreeSet<_> = all.iter().map(|event| event.id).collect();
+    assert_eq!(expected_ids.len(), 5);
+    let (sample, total, truncated) = fetch_event_counts_window(store.as_ref(), &filter, true, 1)
+        .await
+        .unwrap();
+    assert_eq!((sample.len(), total, truncated), (2, 5, true));
+    assert_eq!(sample[0].kind, EventKind::Audit);
+    assert_ne!(sample[1].kind, EventKind::Audit);
+    assert!(sample.iter().all(|event| expected_ids.contains(&event.id)));
+
+    let feedback_filter = EventFilter {
+        kinds: vec![EventKind::FeedbackExplicit],
+        ..filter.clone()
+    };
+    let (feedback, total, truncated) =
+        fetch_event_counts_window(store.as_ref(), &feedback_filter, false, 1)
+            .await
+            .unwrap();
+    assert_eq!((feedback.len(), total, truncated), (1, 2, true));
+    assert_eq!(feedback[0].kind, EventKind::FeedbackExplicit);
+    let (exhaustive, total, truncated) =
+        fetch_event_counts_window_exhaustive(store.as_ref(), &filter, 2, 5)
+            .await
+            .unwrap();
+    assert_eq!((exhaustive.len(), total, truncated), (5, 5, false));
+    assert_eq!(
+        exhaustive
+            .iter()
+            .map(|event| event.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_ids
+    );
+    let empty_filter = EventFilter {
+        actors: vec!["lambda:no-events".into()],
+        ..filter.clone()
+    };
+    let (empty, total, truncated) =
+        fetch_event_counts_window(store.as_ref(), &empty_filter, false, 1)
+            .await
+            .unwrap();
+    assert_eq!((empty.len(), total, truncated), (0, 0, false));
+
+    for exhaustive in [false, true] {
+        let mut args = window();
+        args["all_actors"] = json!(true);
+        args["exhaustive"] = json!(exhaustive);
+        args["group_by"] = json!(["verb", "actor"]);
+        let result = registry.dispatch("brain.event_counts", args).await.unwrap();
+        assert_eq!(result["window_event_total"], 5);
+        assert_eq!(result["total"], 5);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["scope"]["namespace"], "local");
+        assert_eq!(
+            result["counts_by_kind"],
+            json!({"audit": 2, "feedback_explicit": 2, "search_executed": 1})
+        );
+        assert_eq!(cross_sum(&result["counts_by_verb_and_actor"]), 5);
+    }
+}
+
+/// Default grouped refusal must be propagated before any fallback or row read.
+struct UngroupedEvents;
+
+#[async_trait::async_trait]
+impl khive_storage::event::EventStore for UngroupedEvents {
+    async fn append_event(&self, _: Event) -> khive_storage::StorageResult<()> {
+        panic!("read-only refusal fixture")
+    }
+    async fn append_events(
+        &self,
+        _: Vec<Event>,
+    ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+        panic!("read-only refusal fixture")
+    }
+    async fn get_event(&self, _: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
+        panic!("grouped refusal must precede row reads")
+    }
+    async fn query_events(
+        &self,
+        _: EventFilter,
+        _: khive_storage::PageRequest,
+    ) -> khive_storage::StorageResult<khive_storage::Page<Event>> {
+        panic!("grouped refusal must precede row reads")
+    }
+    async fn count_events(&self, _: EventFilter) -> khive_storage::StorageResult<u64> {
+        panic!("grouped refusal must not fall back to scalar counts")
+    }
+}
+
+#[tokio::test]
+async fn unsupported_grouped_admission_refuses_without_scalar_or_row_fallback() {
+    let expected = "unsupported operation for Events: count_events_grouped (this EventStore backend does not implement grouped counts)";
+    for unfiltered in [false, true] {
+        let error =
+            fetch_event_counts_window(&UngroupedEvents, &EventFilter::default(), unfiltered, 1)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidInput(message) if message == expected));
+    }
+    let error =
+        fetch_event_counts_window_exhaustive(&UngroupedEvents, &EventFilter::default(), 1, 1)
+            .await
+            .unwrap_err();
+    assert!(matches!(error, RuntimeError::InvalidInput(message) if message == expected));
+}
+
 // The opt-in allocator lives only in this unit-test binary. The mock owns
 // scalar row descriptors, so payload liveness cannot be hidden in the fixture.
 pub(crate) mod fold_controls {
@@ -654,6 +824,18 @@ pub(crate) mod fold_controls {
                 .map(|(index, _)| self.event(index))
                 .collect();
             Ok(Page { items, total: None })
+        }
+        async fn count_events_grouped(
+            &self,
+            filter: EventFilter,
+            group_by: khive_storage::event::EventGroupBy,
+        ) -> StorageResult<std::collections::BTreeMap<String, u64>> {
+            assert!(matches!(group_by, khive_storage::event::EventGroupBy::Kind));
+            let total = self.count_events(filter).await?;
+            Ok(std::collections::BTreeMap::from([(
+                EventKind::FeedbackExplicit.name().to_string(),
+                total,
+            )]))
         }
         async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
             if self.counts.fetch_add(1, Ordering::Relaxed) == 0 {
