@@ -1989,7 +1989,7 @@ dependencies = [
  "criterion",
  "hex",
  "khive-runtime",
- "lru 0.18.2",
+ "lru",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -2586,7 +2586,7 @@ dependencies = [
  "khive-types",
  "khive-vamana",
  "lattice-embed",
- "lru 0.18.2",
+ "lru",
  "parking_lot",
  "serde",
  "serde_json",
@@ -3076,7 +3076,7 @@ dependencies = [
  "khive-vcs-adapters",
  "lattice-embed",
  "libc",
- "lru 0.18.2",
+ "lru",
  "rmcp",
  "rusqlite",
  "serde",
@@ -3094,18 +3094,18 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
+checksum = "e4971127098331617112e83a785ac660a4cb41b8823abcde7d9172b39ce83cf8"
 dependencies = [
  "async-trait",
- "blake3",
  "chrono",
  "lattice-inference",
- "lru 0.16.4",
+ "lru",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3113,9 +3113,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd766cb81f951cc61af9519fd58c97e383dcb52a8e153069002b2f89f553d328"
+checksum = "a31b44c01ceef111f2c3b00dea058dff05d160148f1c49b4d5c8c42a4116c942"
 dependencies = [
  "rand 0.8.7",
  "rand_distr",
@@ -3125,9 +3125,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
+checksum = "02ccd6ca023a3941caf4bc91f1fd3268d7ce34eab2dbeb5d5773de99718537db"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3228,15 +3228,6 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
-
-[[package]]
-name = "lru"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
-dependencies = [
- "hashbrown 0.16.1",
-]
 
 [[package]]
 name = "lru"
@@ -4154,7 +4145,7 @@ dependencies = [
  "ipnet",
  "jsonschema",
  "lazy_static",
- "lru 0.18.2",
+ "lru",
  "msvc_spectre_libs",
  "num-bigint",
  "num-traits",
@@ -4884,7 +4875,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
