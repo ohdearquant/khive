@@ -125,6 +125,8 @@ async fn edge_cycle_pages_equal_weights_past_excluded_rows_and_keeps_by_id_names
         .await
         .unwrap();
 
+    // Source resolution lazily prepares entities; keep bootstrap outside read observation.
+    runtime.entities(&token).unwrap();
     let observation = runtime
         .backend()
         .pool()
