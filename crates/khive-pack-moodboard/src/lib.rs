@@ -29,7 +29,7 @@ pub use preference_artifact::{
 };
 
 pub(crate) const PACK_NAME: &str = "moodboard";
-pub(crate) const LATTICE_VERSION: &str = "0.9.0";
+pub(crate) const LATTICE_VERSION: &str = "0.11.1";
 
 /// Opt-in Moodboard visual-retrieval and preference-learning pack.
 pub struct MoodboardPack {

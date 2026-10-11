@@ -19,12 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -841,8 +835,6 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -1470,18 +1462,18 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
+checksum = "e4971127098331617112e83a785ac660a4cb41b8823abcde7d9172b39ce83cf8"
 dependencies = [
  "async-trait",
- "blake3",
  "chrono",
  "lattice-inference",
  "lru",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
@@ -1489,9 +1481,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
+checksum = "02ccd6ca023a3941caf4bc91f1fd3268d7ce34eab2dbeb5d5773de99718537db"
 dependencies = [
  "base64",
  "clap",
@@ -1562,11 +1554,11 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
