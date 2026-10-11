@@ -20,7 +20,7 @@ use crate::server::KhiveMcpServer;
 type RequestId = rmcp::model::RequestId;
 
 /// Apply the stdio response deadline at the writer itself. rmcp writes
-/// malformed-message replies inside `AsyncRwTransport::receive`, bypassing
+/// invalid-request replies inside `AsyncRwTransport::receive`, bypassing
 /// the outer transport's `send` deadline. A stalled peer must not pin that
 /// receive loop (or its writer mutex) indefinitely.
 pub(crate) struct DeadlineWriter<W> {
@@ -618,20 +618,21 @@ mod outstanding_request_tests {
         use tokio::io::AsyncWriteExt;
 
         let root = tokio_util::sync::CancellationToken::new();
-        // The parse-error reply is larger than this pipe. The client keeps
-        // the read half open but never drains it.
+        // The invalid-request reply is larger than this pipe. The client keeps
+        // the read half open but never drains it. Valid JSON with an invalid
+        // message shape reaches rmcp 2.2's reply path; syntax errors are ignored.
         let (server_io, mut client_io) = tokio::io::duplex(16);
         let (read, write) = tokio::io::split(server_io);
         let write = DeadlineWriter::new(write, std::time::Duration::from_millis(50), root.clone());
         let mut transport = AsyncRwTransport::new_server(read, write);
         client_io
-            .write_all(b"{\n")
+            .write_all(b"{}\n")
             .await
-            .expect("send a malformed request line");
+            .expect("send an invalid request line");
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(1), transport.receive())
             .await
-            .expect("parse-error write must not pin the receive loop");
+            .expect("invalid-request write must not pin the receive loop");
         assert!(
             received.is_none(),
             "write timeout must close the inner transport"
