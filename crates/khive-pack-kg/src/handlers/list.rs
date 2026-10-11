@@ -14,7 +14,7 @@ use super::common::{
     event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_entity_type,
     reconcile_specific, remap_note_status, resolve_kind_spec, tags_match_any, to_json,
-    validate_graph_read_kind, KindSpec, ListParams,
+    validate_graph_read_kind, DoublingWindowIter, KindSpec, ListParams,
 };
 use super::message_scope::{resolve_mailbox_graph_id, EdgeScope};
 use crate::sql::sql;
@@ -294,8 +294,9 @@ async fn edge_page_at(
     let mut skipped = 0u32;
     let mut raw_offset = 0u32;
     let mut withheld_seen = false;
-    let mut window = offset.saturating_add(overfetch_limit(limit)).min(cap);
-    loop {
+    let mut windows =
+        DoublingWindowIter::new(offset.saturating_add(overfetch_limit(limit)).min(cap), cap);
+    while let Some(window) = windows.next() {
         let page = runtime
             .list_edges(token, filter.clone(), window, raw_offset)
             .await?;
@@ -321,12 +322,7 @@ async fn edge_page_at(
             .saturating_sub(skipped)
             .saturating_add(missing)
             .saturating_mul(2);
-        let doubled = if withheld_seen {
-            window.saturating_mul(2)
-        } else {
-            0
-        };
-        window = next.max(doubled).clamp(1, cap);
+        windows.advance(window, next, withheld_seen);
     }
     Ok(split_overfetched(kept, limit))
 }
@@ -357,8 +353,8 @@ async fn edge_page_after(
     let mut kept: Vec<Edge> = Vec::new();
     let mut raw_after = after;
     let mut withheld_seen = false;
-    let mut window = overfetch_limit(limit).min(cap);
-    loop {
+    let mut windows = DoublingWindowIter::new(overfetch_limit(limit).min(cap), cap);
+    while let Some(window) = windows.next() {
         let (page, next_raw) = runtime
             .list_edges_after(token, filter.clone(), raw_after, window)
             .await?;
@@ -377,12 +373,7 @@ async fn edge_page_after(
         }
         raw_after = next_raw;
         let next = ((wanted - kept.len()) as u32).saturating_mul(2);
-        let doubled = if withheld_seen {
-            window.saturating_mul(2)
-        } else {
-            0
-        };
-        window = next.max(doubled).clamp(1, cap);
+        windows.advance(window, next, withheld_seen);
     }
     let (kept, has_more) = split_overfetched(kept, limit);
     let next_after = if has_more {

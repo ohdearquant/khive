@@ -36,7 +36,7 @@ use khive_runtime::{
 use khive_storage::types::{Direction, NeighborHit, NeighborQuery, PageRequest};
 use khive_storage::{EdgeRelation, Entity, EntityFilter};
 
-use super::common::{deser, parse_direction, parse_relation, ContextParams};
+use super::common::{deser, parse_direction, parse_relation, ContextParams, DoublingWindowIter};
 use super::message_scope::{message_neighbor_permitted, resolve_mailbox_graph_id};
 use crate::KgPack;
 
@@ -238,8 +238,8 @@ async fn fetch_mailbox_neighbors(
     let mut merged: Vec<(NeighborHit, &'static str)> = Vec::new();
     let mut scan_incomplete = false;
     for namespace in token.visible_namespaces() {
-        let mut window = options.fanout;
-        loop {
+        let mut windows = DoublingWindowIter::new(options.fanout, SCAN_CAP);
+        while let Some(window) = windows.next() {
             let raw = missing_neighbor_anchor_as_empty(
                 fetch_directed_neighbors(
                     runtime,
@@ -282,7 +282,7 @@ async fn fetch_mailbox_neighbors(
                 scan_incomplete = true;
                 break;
             }
-            window = window.saturating_mul(2).min(SCAN_CAP);
+            windows.advance(window, 0, true);
         }
     }
     let direction_rank = |tag: &str| match tag {
