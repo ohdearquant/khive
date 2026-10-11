@@ -228,6 +228,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-198](ADR-198-shared-fs-ancestor-link-policy.md)                    | Shared Filesystem Ancestor Link Policy                                                                     |
 | [ADR-199](ADR-199-shared-score-arithmetic.md)                           | Shared Score Arithmetic                                                                                    |
 | [ADR-200](ADR-200-external-email-policy.md)                             | External Email Policy: Sender Scope, Suppression, Unsubscribe and Screened Inbound Delivery                |
+| [ADR-201](ADR-201-brain-module-boundaries.md)                           | Brain module boundaries and shared event readers                                                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
