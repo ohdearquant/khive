@@ -551,6 +551,9 @@ impl SqliteVecStore {
 #[cfg(all(test, feature = "vectors"))]
 mod point_lookup_tests;
 
+#[cfg(all(test, feature = "vectors"))]
+mod scan_tests;
+
 #[cfg(test)]
 mod unmanaged_write_escalation_tests;
 
