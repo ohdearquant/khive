@@ -85,6 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Lattice dependencies move from 0.9.0 to 0.11.1 (`lattice-embed`, `lattice-inference`,
+  `lattice-fann`). Moodboard descriptors now report inference version 0.11.1, so their
+  fingerprints and model keys change and existing moodboard vectors need reindexing;
+  preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
+  no longer runs with the `pure` backend: std members enable `blake3/std` directly.
 - Public brain posterior folds use the shared filter and map combinators, preserving
   reducer state, standalone section-feedback handling and offered-event counts.
 - Pool configuration, WAL ceiling policy and test-store guards move into an internal
