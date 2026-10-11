@@ -1,6 +1,6 @@
 use super::*;
 use crate::embedder_registry::EmbedderProvider;
-use crate::RuntimeError;
+use crate::{NotePatch, RuntimeError};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::sync::{
