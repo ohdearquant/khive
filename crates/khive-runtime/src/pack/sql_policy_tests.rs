@@ -947,6 +947,11 @@ fn flatten(body: &str) -> String {
                 chars.next();
                 out.push(' ');
             }
+            // Decode literal quote/backslash without turning a following n into whitespace.
+            Some(escaped @ ('"' | '\\')) => {
+                chars.next();
+                out.push(escaped);
+            }
             // A line continuation, or any other escape: the backslash goes,
             // what follows is kept and judged on its own.
             _ => out.push(' '),
