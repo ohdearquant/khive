@@ -35,7 +35,7 @@ const SCHEMAS: [Schema; 7] = [
 ];
 
 fn history_ddl(name: &str) -> &str {
-    GIT_CORE_INDEXES
+    LEGACY_GIT_PROPERTY_INDEXES
         .split(';')
         .find(|sql| sql.contains(name))
         .unwrap()
@@ -52,7 +52,10 @@ fn configure(runtime: &KhiveRuntime, schema: Schema) {
     if matches!(schema, Schema::Absent) {
         return;
     }
-    writer.conn().execute_batch(GIT_CORE_INDEXES).unwrap();
+    writer
+        .conn()
+        .execute_batch(LEGACY_GIT_PROPERTY_INDEXES)
+        .unwrap();
     match schema {
         Schema::CanonicalOnly => writer
             .conn()
@@ -759,10 +762,11 @@ async fn instruction_growth_avoids_ordinary_history_and_absent_pack_double_scan(
 }
 
 #[tokio::test]
-async fn core_indexes_reopen_read_only_idempotently_and_auxiliary_batch_rolls_back() {
+async fn historical_indexes_reopen_read_only_idempotently_and_auxiliary_batch_rolls_back() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reopen.db");
     let runtime = file_runtime(&path, false);
+    install_historical_property_indexes(&runtime);
     raw_note(
         &runtime,
         "source",
@@ -787,7 +791,7 @@ async fn core_indexes_reopen_read_only_idempotently_and_auxiliary_batch_rolls_ba
     assert_eq!(
         core_before.len(),
         4,
-        "all core indexes precede pack loading"
+        "all historical fixture indexes precede pack loading"
     );
     assert!(core_before.iter().all(|row| matches!(row.get("name"), Some(SqlValue::Text(name)) if name.starts_with("idx_git_notes_"))), "pack auxiliary tables must roll back: {core_before:?}");
     install(&runtime);
@@ -819,7 +823,8 @@ fn git_schema_plan_contains_only_auxiliary_table_statements() {
         sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|token| token.eq_ignore_ascii_case("notes"))
     }
-    // This is exactly the former live-commit statement, now in core migration 049.
+    // The historical live-commit fixture remains a positive detector control.
+    // PR1 leaves the production pack plan auxiliary-only.
     let known_core_statement = history_ddl(SHA_INDEX);
     assert!(
         names_notes(known_core_statement),
