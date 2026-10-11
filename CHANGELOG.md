@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
   preserves missing vectors with their incoming scores and an explicit flag, and implements
   the retrieval `Reranker` trait without a namespace-wide candidate cut.
+- `khive-graph-diff` compares in-memory entity, edge and note NDJSON states with
+  deterministic additions, removals and field changes, preserving missing versus null.
+- Add explicit event sink declarations in `khive-types`. All existing event kinds
+  retain `caller_event_store`; the closed metadata API requires each new kind to
+  declare its sink. Event routing and storage behavior are unchanged.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
@@ -75,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reducer state, standalone section-feedback handling and offered-event counts.
 - Pool configuration, WAL ceiling policy and test-store guards move into an internal
   configuration module while preserving public paths, defaults and refusal behavior.
+- Vamana v2 saves use one checkpoint-owned publication boundary: metadata is
+  published and synced through the shared Unix helper before the four staged
+  segments are promoted. Sidecar reads and cleanup share component-name conversion,
+  preserving their refusal policy and native I/O errors (Refs #4498).
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
@@ -113,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Identifier splitting restores acronym boundaries in `DBUsers` and `APIUsage` while keeping
   terminal plural suffixes in `APIs`, `IDs`, `URLs`, and `APIsFoo`. `URLsafe` now splits as
   `ur`, `lsafe`; `XMLIsEmpty` follows the dictionary-free rule as `xmlis`, `empty` (#5103).
+- `comm.read` preserves typed storage errors from its initial message lookup, including
+  admission-timeout code, stage, and retry guidance. Bulk read and mark-read validation
+  retain the same error source without marking messages after a failed lookup. (#4958)
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
