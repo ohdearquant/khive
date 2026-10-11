@@ -956,7 +956,7 @@ fn flatten(body: &str) -> String {
 }
 
 fn sql_literals(text: &str) -> Vec<String> {
-    // Preserve the existing case-sensitive verb + structural-keyword predicate.
+    // Keep the case-sensitive verb + structural-marker predicate.
     // A leading verb alone also matches English descriptions and error labels.
     const SHAPES: [(&str, &[&str]); 10] = [
         // CTEs start with WITH rather than a statement verb.
@@ -964,7 +964,8 @@ fn sql_literals(text: &str) -> Vec<String> {
             "WITH ",
             &[" AS (", " AS MATERIALIZED (", " AS NOT MATERIALIZED ("],
         ),
-        ("SELECT ", &[" FROM "]),
+        // Zero-argument scalar calls with an AS alias need no FROM clause.
+        ("SELECT ", &[" FROM ", "() AS "]),
         ("INSERT ", &["INSERT INTO ", "INSERT OR "]),
         ("UPDATE ", &[" SET "]),
         ("DELETE ", &["DELETE FROM "]),
