@@ -616,7 +616,7 @@ fn update_notification_counter(runtime: &KhiveRuntime, id: uuid::Uuid) -> Arc<At
     calls
 }
 
-fn committed_update_failures(error: &RuntimeError, id: uuid::Uuid) -> serde_json::Value {
+pub(crate) fn committed_update_failures(error: &RuntimeError, id: uuid::Uuid) -> serde_json::Value {
     let RuntimeError::Khive(domain) = error.refusal_source() else {
         panic!("expected typed committed degradation: {error:?}");
     };
