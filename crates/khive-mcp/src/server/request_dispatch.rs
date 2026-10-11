@@ -237,7 +237,7 @@ impl KhiveMcpServer {
             .await
     }
 
-    async fn dispatch_request_inner_with_strict_refusals(
+    pub(super) async fn dispatch_request_inner_with_strict_refusals(
         &self,
         p: RequestParams,
         from_wire: bool,
@@ -265,7 +265,7 @@ impl KhiveMcpServer {
         khive_storage::scope_request_read_deadline(timeout, dispatch).await
     }
 
-    async fn dispatch_request_inner_scoped(
+    pub(super) async fn dispatch_request_inner_scoped(
         &self,
         p: RequestParams,
         from_wire: bool,
