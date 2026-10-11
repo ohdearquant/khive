@@ -1140,11 +1140,11 @@ mod tests {
             sha256_hex(&canonical_json_bytes(&serde_json::to_value(&core).unwrap()).unwrap());
         assert_eq!(
             fingerprint,
-            "b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5"
+            "a9224870bf18dc3f6344621ea1682fcc99b292bb6fd7b40f9fa2280c9dcfeade"
         );
         assert_eq!(
             format!("moodboard_{fingerprint}_4"),
-            "moodboard_b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5_4"
+            "moodboard_a9224870bf18dc3f6344621ea1682fcc99b292bb6fd7b40f9fa2280c9dcfeade_4"
         );
 
         let production_prompt =
@@ -1155,26 +1155,26 @@ mod tests {
         );
         assert_eq!(
             production_prompt.fingerprint,
-            "5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b"
+            "b9c47923a57499948eaff6ecc51833e189d37dd4c94c7e4054b7f964a07141a8"
         );
         assert_eq!(
             production_prompt.model_key,
-            "moodboard_5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b_4"
+            "moodboard_b9c47923a57499948eaff6ecc51833e189d37dd4c94c7e4054b7f964a07141a8_4"
         );
 
-        let indexed_qwen_09 = DescriptorIdentity::build(
+        let indexed_qwen = DescriptorIdentity::build(
             "hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17".to_string(),
             "6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3".to_string(),
             1024,
         )
         .unwrap();
         assert_eq!(
-            indexed_qwen_09.fingerprint,
-            "bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f"
+            indexed_qwen.fingerprint,
+            "be1791a0588e132f734456084859d7e88e8cd49522775929469e6654e869e7cd"
         );
         assert_eq!(
-            indexed_qwen_09.model_key,
-            "moodboard_bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f_1024"
+            indexed_qwen.model_key,
+            "moodboard_be1791a0588e132f734456084859d7e88e8cd49522775929469e6654e869e7cd_1024"
         );
     }
 

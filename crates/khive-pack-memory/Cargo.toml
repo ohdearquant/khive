@@ -23,7 +23,7 @@ khive-score = { version = "0.12.0", path = "../khive-score" }
 khive-brain-core = { version = "0.12.0", path = "../khive-brain-core" }
 khive-text = { version = "0.12.0", path = "../khive-text" }
 khive-vamana = { version = "0.12.0", path = "../khive-vamana" }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 inventory = { workspace = true }
 khive-storage = { version = "0.12.0", path = "../khive-storage" }
 async-trait = { workspace = true }

@@ -104,9 +104,9 @@ iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.9.0"
-lattice-inference = { version = "=0.9.0", default-features = false }
-lattice-fann = "=0.9.0"
+lattice-embed = "=0.11.1"
+lattice-inference = { version = "=0.11.1", default-features = false }
+lattice-fann = "=0.11.1"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.8"
 rand_distr = "0.4"
@@ -123,9 +123,11 @@ tempfile = "3"
 lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
-# lattice-embed 0.9.0 activates `pure` for this shared instance. The measured
-# performance risk is accepted only while 0.9.0 is pinned; evidence and the
-# merged 0.10.0 exit are recorded in docs/benchmarks/blake3-pure-0.9.0.md.
+# Lattice no longer depends on BLAKE3, so nothing outside this workspace sets
+# its features. Members that run on std enable `std` themselves, which keeps
+# runtime SIMD detection; khive-types keeps the no_std form. The `pure`
+# acceptance that applied under the 0.9.0 lattice pins, and its exit, are
+# recorded in docs/benchmarks/blake3-pure-0.9.0.md.
 blake3 = { version = "1", default-features = false }
 # Cross-platform filesystem free-space query for BlobStore's fail-closed
 # floor check (khive#292). Pure Rust (rustix on Unix, windows-sys on

@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
