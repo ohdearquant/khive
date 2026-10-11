@@ -42,7 +42,7 @@ If none of these apply, the default single-backend path (one
 ## Activation rule
 
 Multi-backend mode engages **only** when at least one `[[backends]]` entry is
-declared in the resolved config file. From `crates/khive-mcp/src/serve.rs`:
+declared in the resolved config file. From `crates/khive-mcp/src/serve/server_build.rs`:
 
 ```rust
 if khive_cfg.backends.is_empty() {
@@ -70,8 +70,8 @@ If `main` is absent, the server exits at startup with:
 add a [[backends]] entry with name = "main"
 ```
 
-(Source: `build_server_multi_backend` and `build_registry_for_multi_backend` in
-`crates/khive-mcp/src/serve.rs`.)
+(Source: `build_server_multi_backend` in `crates/khive-mcp/src/serve/server_build.rs`
+and `build_registry_for_multi_backend` in `crates/khive-mcp/src/serve/storage_topology.rs`.)
 
 ### Pack default
 
@@ -205,7 +205,7 @@ main; any legacy ref or attachment row, including one retained by a soft-deleted
 record, blocks startup rather than creating liveness invisible to main-database
 GC. The isolation test
 (`multi_backend_isolates_pack_data_to_separate_files` in
-`crates/khive-mcp/src/serve.rs`) verifies this directly: it pins the `comm` pack
+`crates/khive-mcp/src/serve_multi_backend_isolation_tests.rs`) verifies this directly: it pins the `comm` pack
 to a second on-disk backend, writes through both packs, then opens each SQLite
 file independently and asserts that each file holds only its own pack's rows and
 none of the other's.
