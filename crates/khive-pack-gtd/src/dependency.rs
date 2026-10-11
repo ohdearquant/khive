@@ -7,10 +7,13 @@ use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
 use khive_storage::note::{Note, NoteVisibility};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{Direction, NeighborCursor, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 const DEPENDENCY_WALK_MAX_NODES: usize = 20_000;
+const DEPENDENCY_EDGE_MAX_DEPTH: usize = 20_000;
+const DEPENDENCY_EDGE_MAX_SCANNED_NEIGHBORS: usize = 20_000;
+const DEPENDENCY_EDGE_PAGE_SIZE: usize = 256;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TaskDependencyDiagnostic {
@@ -464,15 +467,7 @@ pub(crate) async fn validate_dependency_links(
                 "depends_on link would create a dependency cycle: task {source} cannot depend on itself"
             )));
         }
-        if edge_path_reaches(
-            runtime,
-            token.namespace().as_str(),
-            target,
-            source,
-            &proposed,
-        )
-        .await?
-        {
+        if edge_path_reaches(runtime, token, target, source, &proposed).await? {
             return Err(RuntimeError::InvalidInput(format!(
                 "depends_on link would create a dependency cycle: {source} -> {target} closes a path back to {source}"
             )));
@@ -483,16 +478,18 @@ pub(crate) async fn validate_dependency_links(
 
 async fn edge_path_reaches(
     runtime: &KhiveRuntime,
-    namespace: &str,
+    token: &NamespaceToken,
     start: Uuid,
     goal: Uuid,
     proposed: &HashMap<Uuid, Vec<Uuid>>,
 ) -> Result<bool, RuntimeError> {
-    let mut reader = runtime.sql().reader().await?;
-    let mut queue = VecDeque::from([start]);
+    let graph = runtime.graph(token)?;
+    let notes = runtime.notes(token)?;
+    let mut queue = VecDeque::from([(start, 0usize)]);
     let mut visited = HashSet::new();
     let mut traversed_edges = 0usize;
-    while let Some(current) = queue.pop_front() {
+    let mut scanned_neighbors = 0usize;
+    while let Some((current, depth)) = queue.pop_front() {
         if current == goal {
             return Ok(true);
         }
@@ -504,9 +501,14 @@ async fn edge_path_reaches(
                 "depends_on edge cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-node safety bound"
             )));
         }
+        if depth > DEPENDENCY_EDGE_MAX_DEPTH {
+            return Err(RuntimeError::InvalidInput(format!(
+                "depends_on edge cycle validation exceeded the {DEPENDENCY_EDGE_MAX_DEPTH}-depth safety bound"
+            )));
+        }
         if let Some(targets) = proposed.get(&current) {
             traversed_edges += targets.len();
-            queue.extend(targets.iter().copied());
+            queue.extend(targets.iter().map(|&target| (target, depth + 1)));
         }
         let remaining = DEPENDENCY_WALK_MAX_NODES.saturating_sub(traversed_edges);
         if remaining == 0 {
@@ -514,36 +516,87 @@ async fn edge_path_reaches(
                 "depends_on edge cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
             )));
         }
-        let rows = reader
-            .query_all(SqlStatement {
-                // Soft-deleting a task deliberately leaves its incident graph
-                // edges in place.  Those edges are not part of the live GTD
-                // dependency graph: following them here would make an
-                // otherwise-acyclic link fail merely because a tombstoned task
-                // sits on an old path.  Require both endpoints of every
-                // traversed hop to be live task notes, matching property-walk
-                // and read-diagnostic semantics.
-                sql: khive_runtime::sql!("task-dependency-cycle-edges").into(),
-                params: vec![
-                    SqlValue::Text(current.as_hyphenated().to_string()),
-                    SqlValue::Text(namespace.to_owned()),
-                    SqlValue::Integer((remaining + 1) as i64),
-                ],
-                label: Some("gtd_dependency_cycle_edges".into()),
-            })
-            .await?;
-        if rows.len() > remaining {
-            return Err(RuntimeError::InvalidInput(format!(
-                "depends_on edge cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
-            )));
+
+        // Soft deletion leaves incident edges behind. Match the former SQL
+        // joins by requiring both endpoints to be live task notes. NoteStore
+        // reads global IDs: do not add an endpoint namespace restriction.
+        let Some(source) = notes.get_note(current).await? else {
+            continue;
+        };
+        if source.kind != "task" || source.deleted_at.is_some() {
+            continue;
         }
-        traversed_edges += rows.len();
+        let mut after = None;
+        let mut persisted_targets = Vec::new();
+        loop {
+            // The extra row distinguishes an exhausted scan budget from an
+            // exhausted adjacency, including when exactly 20,000 were read.
+            let raw_remaining =
+                DEPENDENCY_EDGE_MAX_SCANNED_NEIGHBORS.saturating_sub(scanned_neighbors);
+            let limit = DEPENDENCY_EDGE_PAGE_SIZE.min(raw_remaining + 1);
+            let hits = graph
+                .neighbors_page(
+                    current,
+                    NeighborQuery {
+                        direction: Direction::Out,
+                        relations: Some(vec![EdgeRelation::DependsOn]),
+                        limit: Some(limit as u32),
+                        min_weight: None,
+                    },
+                    after,
+                    // Kind-aware graph paging also filters endpoint namespace
+                    // and admits entities. Hydrate notes below instead.
+                    None,
+                )
+                .await?;
+            let Some(last) = hits.last() else {
+                break;
+            };
+            let next = NeighborCursor {
+                weight: last.weight,
+                node_id: last.node_id,
+                edge_id: last.edge_id,
+            };
+            let page_len = hits.len();
+            scanned_neighbors = scanned_neighbors.saturating_add(page_len);
+            let target_ids: Vec<_> = hits.iter().map(|hit| hit.node_id).collect();
+            let live_tasks: HashSet<_> = notes
+                .get_notes_batch(&target_ids)
+                .await?
+                .into_iter()
+                .filter(|note| note.kind == "task" && note.deleted_at.is_none())
+                .map(|note| note.id)
+                .collect();
+            // Membership is deduplicated; adjacency and its budget are not.
+            persisted_targets.extend(
+                hits.into_iter()
+                    .filter(|hit| live_tasks.contains(&hit.node_id))
+                    .map(|hit| hit.node_id),
+            );
+            if persisted_targets.len() > remaining {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "depends_on edge cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
+                )));
+            }
+            if scanned_neighbors > DEPENDENCY_EDGE_MAX_SCANNED_NEIGHBORS {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "depends_on edge cycle validation exceeded the {DEPENDENCY_EDGE_MAX_SCANNED_NEIGHBORS}-scanned-neighbor safety bound"
+                )));
+            }
+            after = Some(next);
+            if page_len < limit {
+                break;
+            }
+        }
+        traversed_edges += persisted_targets.len();
+        // The shared pager orders by weight, node and edge. Restore the former
+        // target-ID BFS order only after every page and safety check succeeds;
+        // finding the goal in an earlier page must not bypass a later refusal.
+        persisted_targets.sort_unstable();
         queue.extend(
-            rows.into_iter()
-                .filter_map(|row| match row.get("target_id") {
-                    Some(SqlValue::Text(raw)) => Uuid::parse_str(raw).ok(),
-                    _ => None,
-                }),
+            persisted_targets
+                .into_iter()
+                .map(|target| (target, depth + 1)),
         );
     }
     Ok(false)
