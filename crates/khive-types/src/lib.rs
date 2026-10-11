@@ -19,6 +19,8 @@ pub mod edge;
 pub mod email_address;
 pub mod entity;
 pub mod entity_type;
+#[cfg(feature = "std")]
+pub mod env;
 pub mod error;
 pub mod event;
 pub mod hash;
