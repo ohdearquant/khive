@@ -170,13 +170,32 @@ one. These items are `pub`, not `pub(crate)`, because `tests/adr133_audit_batch.
 separate crate and cannot reach `pub(crate)` items; this is a deliberate visibility widening with
 no new wire vocabulary (no MCP verb, no wire field) attached to it.
 
-## Known scope gap: `AuditProducer::RecallExecuted`
+## Recall telemetry: `AuditProducer::RecallExecuted`
 
-`RecallExecuted` is classified (`PureObservability`) but not wired to a live call site.
-`khive-pack-memory`'s recall handler (`emit_recall_executed_event`) only holds a `&KhiveRuntime`
-handle, not a `&VerbRegistry` — `AuditBatch` is owned by `VerbRegistry` (`pack.rs`), and
-`KhiveRuntime`/`runtime.rs` is a separate ownership boundary. Wiring this producer requires either
-threading a batch handle into `KhiveRuntime` or moving the recall audit emission to a layer that
-already holds the registry; both are structural changes out of scope here. The variant carries an
-`#[allow(dead_code)]` with this explanation rather than being wired against a call site it cannot
-reach from this module.
+The recall handler submits `RecallExecuted` through the same registry-owned batch
+as dispatch audit, using its existing `PureObservability` classification. The
+bounded background serve job already holds a clone of the registry; it needs no
+runtime-held batch or second batch instance. Its semantic event is built once and
+stamped from the sealed caller token before reaching the registry's raw sink, so a
+per-request namespace or actor override survives a differently configured registry.
+
+Recall results retain their existing response boundary: telemetry runs in the
+tracked background job, after any brain serve-ledger dispatch. Visibility requires
+that producer to submit and the batch to settle; this does not promise that the row
+is visible when the recall response returns. Producer admission and execution are
+still bounded. Shutdown owners should drain producers before closing the batch when
+they require their rows to be admitted, then drain accepted rows before writer teardown.
+A late producer against a closing batch reports a best-effort refusal.
+
+A batch refusal or terminal failure warns with its typed reason without changing
+the recall handler result. Generation failures use the existing pure-observability
+degradation counters; immediate preflight/closed/full-queue refusals do not promise
+a `degraded_rows` increment. A timed-out or cancelled waiter does not remove an
+accepted row, and the emitter never resubmits or direct-appends after a batch error:
+the original generation may still commit. Recall's separate dispatch obligation and
+brain accounting keep their own durability rules.
+
+When the registry has no batch, recall retains its token-decorated runtime accessor
+and direct best-effort append, including its acquisition/append warnings. This is a
+legacy no-batch route, not a fallback for a failing configured batch. ADR-133's
+baseline and Amendment 3 remain Proposed; this producer wiring changes neither status.
