@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
+
 ## [0.12.0] - 2026-10-11
 
 ### Documentation

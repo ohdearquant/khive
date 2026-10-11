@@ -54,7 +54,7 @@ policy = ["khive-gate"]
 # Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
 checkpoint = ["hnsw", "khive-fold", "khive-hnsw/checkpoint"]
 # SQLite-based persistence for HNSW and BM25 indexes
-persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand"]
+persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand", "khive-storage"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
 # The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
 storage-adapters = ["khive-storage"]
@@ -71,8 +71,8 @@ ann = ["khive-storage", "tracing"]
 criterion = { workspace = true }
 khive-score = { version = "0.12.0", path = "../khive-score" }
 khive-fusion = { version = "0.12.0", path = "../khive-fusion" }
-# Only the storage-adapters and ann registry tests use khive-db; `vectors` loads sqlite-vec.
-khive-db = { version = "0.12.0", path = "../khive-db", features = ["vectors"] }
+# Storage adapter, ANN registry and persistent weight tests use khive-db; `vectors` loads sqlite-vec.
+khive-db = { version = "0.12.0", path = "../khive-db", features = ["vectors", "test-support"] }
 
 [[bench]]
 name = "fusion_bench"
