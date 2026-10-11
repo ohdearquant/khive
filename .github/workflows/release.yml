@@ -204,11 +204,11 @@ jobs:
     environment: publish
     # npm trusted publishing: each `npm publish` below authenticates with a
     # short-lived OIDC token issued to this job, so no long-lived npm token is
-    # stored in the repository. Every published package (the six kernel
-    # subpackages, `khive` and `@khive-ai/cli`) must list this repository, the
-    # `release.yml` workflow and the `publish` environment as its trusted
-    # publisher in its npmjs.com settings; a package without that entry refuses
-    # the publish. npm generates provenance attestations automatically on this
+    # stored in the repository. Every package this job publishes (the six
+    # kernel subpackages, the umbrella and its CLI alias) must list this
+    # repository, the `release.yml` workflow and the `publish` environment as
+    # its trusted publisher in its npmjs.com settings; a package without that
+    # entry refuses the publish. npm generates provenance attestations automatically on this
     # path. Job-level permissions replace the workflow-level `contents: write`
     # for this job only; it needs to read the checkout and request the token.
     permissions:
