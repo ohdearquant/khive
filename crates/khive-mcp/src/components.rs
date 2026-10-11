@@ -36,6 +36,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::KhiveMcpServer;
 
+mod backoff;
+#[cfg(test)]
+use backoff::restart_delay_ms;
+use backoff::Backoff;
+
 /// How the host reacts when a component's future resolves with an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartClass {
@@ -519,26 +524,6 @@ fn clamped_shutdown_wait_ms(requested_ms: u64, drain_ms: u64) -> u64 {
     requested_ms.min(drain_ms.saturating_sub(SHUTDOWN_DRAIN_MARGIN_MS))
 }
 
-/// Deterministic-enough restart jitter without a rand dependency: up to a
-/// quarter of the current backoff, derived from the clock's subsecond nanos.
-fn jitter_ms(backoff_ms: u64) -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    nanos % (backoff_ms / 4 + 1)
-}
-
-/// Apply positive jitter without ever exceeding the registration's hard
-/// backoff cap. `backoff_max_ms` is an operator-facing maximum delay, not only
-/// a cap on the un-jittered base; allowing `base + jitter` past it makes a
-/// documented 60-second ceiling reach 75 seconds at steady state.
-fn restart_delay_ms(backoff_ms: u64, backoff_max_ms: u64) -> u64 {
-    let cap = backoff_max_ms.max(1);
-    let base = backoff_ms.min(cap);
-    base.saturating_add(jitter_ms(base)).min(cap)
-}
-
 async fn supervise(
     reg: ComponentRegistration,
     server: KhiveMcpServer,
@@ -546,7 +531,7 @@ async fn supervise(
     health: HealthReporter,
 ) {
     let mut restarts: u32 = 0;
-    let mut backoff_ms = reg.backoff_initial_ms.clamp(1, reg.backoff_max_ms.max(1));
+    let mut backoff = Backoff::new(reg.backoff_initial_ms, reg.backoff_max_ms);
     let drain_ms = khive_runtime::daemon::drain_timeout().as_millis() as u64;
     let shutdown_wait_ms = clamped_shutdown_wait_ms(reg.shutdown_timeout_ms, drain_ms);
     if shutdown_wait_ms < reg.shutdown_timeout_ms {
@@ -681,7 +666,7 @@ async fn supervise(
         }
 
         restarts += 1;
-        let delay = Duration::from_millis(restart_delay_ms(backoff_ms, reg.backoff_max_ms));
+        let delay = Duration::from_millis(backoff.delay_ms());
         tracing::warn!(
             component = reg.name,
             error = %error,
@@ -697,7 +682,7 @@ async fn supervise(
                 return;
             }
         }
-        backoff_ms = backoff_ms.saturating_mul(2).min(reg.backoff_max_ms.max(1));
+        backoff.advance();
     }
 }
 
