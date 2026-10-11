@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
   constructors must supply it. Recall handlers supply zero pending graph gathering,
   default weights remain empty, and rerank provenance records the recognized feature.
+- `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
+  merging. Original-query fallback preserves its bytes, generated variants are validated
+  as a whole, and admitted IDs retain variant and retrieval-source attribution.
+- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
+  and atomically updates that remote in an existing schema.yaml, reporting both old
+  and new commits while preserving archive-content pins and other YAML values.
+  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
+- Runtime packs may expose an optional `ContextContributor` capability with owned request
+  and slice types and explicit score semantics. Registry discovery preserves pack order;
+  context composition and execution remain separate.
+- `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
+  preserves missing vectors with their incoming scores and an explicit flag, and implements
+  the retrieval `Reranker` trait without a namespace-wide candidate cut.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
@@ -45,9 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
   checking its dimensions and finite coordinates even for empty requests. Existing methods
   remain single-engine compatibility delegates to the configured first/default engine.
+- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
+  caller filters, explicit depth and entry caps, and optional within-root symlink following.
+  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
 
 ### Changed
 
+- Public brain posterior folds use the shared filter and map combinators, preserving
+  reducer state, standalone section-feedback handling and offered-event counts.
+- Pool configuration, WAL ceiling policy and test-store guards move into an internal
+  configuration module while preserving public paths, defaults and refusal behavior.
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
@@ -64,13 +95,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config module, preserving public entry points, daemon identity values, and catalog output.
 - Extract blob garbage-collection ownership and database lock handling into a
   private module while retaining the existing public API and lock behavior.
+- `khive-db` moves checkpoint escalation and transaction-age state into a dedicated
+  module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
+- Extract runtime daemon wire frames and framing into a private module while preserving public paths,
+  protocol constants, error normalization, and source-reader coverage.
+- Move MCP server state, registration errors, and stdio settings into a dedicated
+  core module, preserving public server entry points and existing function bodies.
+- Split the `kkernel exec` run paths into a private module while preserving the public entry point,
+  test module paths, and tracing targets.
+- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
+  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
+  attachments and exemption audit commit together. Production manifests remain empty; non-empty
+  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ### Fixed
 
+- `kkernel kg init` now creates the canonical `.khive/config.toml` with valid engine settings,
+  preserves existing project configurations, and refuses the obsolete config path before writing
+  scaffolding. Only the exact old generated ignore file is migrated to the canonical filename.
+
+- Identifier splitting restores acronym boundaries in `DBUsers` and `APIUsage` while keeping
+  terminal plural suffixes in `APIs`, `IDs`, `URLs`, and `APIsFoo`. `URLsafe` now splits as
+  `ur`, `lsafe`; `XMLIsEmpty` follows the dictionary-free rule as `xmlis`, `empty` (#5103).
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
-  whole (a lowercase `s` after an acronym), while still splitting acronym-to-word
+  whole (a terminal lowercase `s` after an acronym), while still splitting acronym-to-word
   boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
 - Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
   decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
@@ -81,6 +131,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pack schema registration now checks table ownership in every statement of a schema entry,
   refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
   comments remain part of those tokens.
+- Pack-version regressions compare each linked pack with its factory's declared version and cover
+  independent factory versions through the production JSON and human list formatter (#5086).
+- Finding create/update and findings-file ingestion mask credential-shaped rejected enum values
+  while retaining ordinary values, error kinds, and accepted-value lists (Refs #4585).
 
 ### Breaking (Rust crates)
 
@@ -139,6 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return `RuntimeError::Storage` instead of `Internal`; reasons and rendered prefixes on those paths
   change. Concrete causes and writer-settlement distinctions are retained. Backends without the new
   transaction method explicitly return `Unsupported`.
+- `khive_runtime::AtomicOpPlan` adds `FinalizeEntity` for runtime-owned entity admission.
+  Downstream exhaustive matches must handle the new variant. Its plan has no public constructor;
+  direct ingest uses `EntityCandidateContext` and `try_commit_manifest_entity_candidate`.
 - `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
   fusion errors. This is source-breaking for consumers with exhaustive matches on
   `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
@@ -150,6 +207,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `unidentified_candidates`. Direct constructors and exhaustive destructurings
   must account for those fields. Stored events without a discriminator still decode
   as native reranks; weighted memory reranking does not invent a model identity.
+- `khive-storage` adds `StorageError::SqliteWrite` and `khive-db` adds
+  `SqliteError::{Write, WriteSettlementUnknown}`, carrying native SQLite write evidence
+  (`SqliteWriteFailure`: stage, primary and extended codes, settlement flag). Exhaustive matches
+  must handle the new variants, `SqliteWriteFailure` literals must include every field, and
+  `EventsResponse::Error` literals need the new optional `sqlite_write_failure` field. On the
+  wire, a native `BEGIN` refusal now reports `code`/`stage` `sqlite_begin_busy` instead of
+  `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
+  `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
+  `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
 
 ## [0.11.0] - 2026-10-08
 

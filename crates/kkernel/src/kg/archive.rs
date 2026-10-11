@@ -10,7 +10,8 @@ use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::EdgeRelation;
 use khive_vcs_adapters::{
-    CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter,
+    BibtexFormatAdapter, CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord,
+    FormatAdapter, JsonFormatAdapter,
 };
 use uuid::Uuid;
 
@@ -84,14 +85,6 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
 
 pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let ns = Namespace::parse(&args.namespace)?;
-    let source = std::fs::read_to_string(&args.source)
-        .with_context(|| format!("read {}", args.source.display()))?;
-
-    // Discover the merged pack vocabulary against an in-memory runtime. This
-    // deliberately happens before the target runtime exists: deterministic
-    // source failures must not create or migrate `--db` as a side effect.
-    let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
-    let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
     let format = args.format.unwrap_or_else(|| {
         match args
             .source
@@ -100,13 +93,33 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         {
             Some(extension) if extension.eq_ignore_ascii_case("csv") => ImportFormat::Csv,
             Some(extension) if extension.eq_ignore_ascii_case("tsv") => ImportFormat::Tsv,
+            Some(extension) if extension.eq_ignore_ascii_case("bib") => ImportFormat::Bibtex,
             _ => ImportFormat::Archive,
         }
     });
+    let source = if format == ImportFormat::Bibtex {
+        String::new()
+    } else {
+        std::fs::read_to_string(&args.source)
+            .with_context(|| format!("read {}", args.source.display()))?
+    };
+
+    // Discover the merged pack vocabulary before the target runtime exists.
+    let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
+    let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
     if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
         bail!("--default-kind is only supported for CSV/TSV input");
     }
+    let mut bibtex_stats = None;
     let archive = match format {
+        ImportFormat::Bibtex => {
+            let file = std::fs::File::open(&args.source)
+                .with_context(|| format!("read {}", args.source.display()))?;
+            let adapter = BibtexFormatAdapter::from_reader(std::io::BufReader::new(file))
+                .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            bibtex_stats = Some(adapter.stats());
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+        }
         ImportFormat::Archive => serde_json::from_str(&source)
             .with_context(|| format!("parse archive {}", args.source.display()))?,
         ImportFormat::Json | ImportFormat::Ndjson => {
@@ -153,7 +166,18 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         .await
         .with_context(|| format!("import {}", args.source.display()))?;
 
-    let json = serde_json::to_string(&summary).expect("serialize ImportSummary");
+    let json = if let Some(stats) = bibtex_stats {
+        let mut value = serde_json::to_value(&summary).context("serialize ImportSummary")?;
+        value["adapter"] = serde_json::json!({
+            "format": "bibtex",
+            "entries": stats.entries,
+            "skipped": stats.skipped,
+            "warnings": stats.warnings,
+        });
+        serde_json::to_string(&value).context("serialize BibTeX import summary")?
+    } else {
+        serde_json::to_string(&summary).expect("serialize ImportSummary")
+    };
     println!("{json}");
     Ok(())
 }

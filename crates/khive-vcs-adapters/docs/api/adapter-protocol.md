@@ -22,9 +22,11 @@ and accumulates non-fatal issues in `warnings`. Implementations write no databas
 
 The current modules divide responsibilities as follows: `adapter` defines the trait,
 `json_adapter` implements JSON-array parsing and shared record validation; `csv_adapter`
-implements header-based CSV/TSV parsing. `record` defines the intermediate wire shapes, and
+implements header-based CSV/TSV parsing; `bibtex_adapter` frames a reader and expands
+BibTeX tokens under explicit resource limits. `record` defines the intermediate wire shapes, and
 `error` defines the failure taxonomy. Integration coverage lives in
-`tests/json_adapter_tests.rs` and `tests/csv_adapter_tests.rs`.
+`tests/json_adapter_tests.rs`, `tests/csv_adapter_tests.rs` and
+`tests/bibtex_adapter_tests.rs`.
 
 ## Taxonomy invariants
 
@@ -60,6 +62,13 @@ It reuses JSON record validation after converting tabular cells to the intermedi
 
 ## Error boundary
 
+[`BibtexFormatAdapter`](bibtex-adapter.md) supplies a reader-backed P1 import path.
+It maps entries to document/paper records, preserves expanded authors as a property,
+and resolves `crossref` edges before construction succeeds. Complete malformed
+frames are skipped with warnings; IO, UTF-8, resource limits, duplicate keys and
+unresolved references refuse construction. Its `stats()` supplements the common
+warning interface with source entry and skip counts.
+
 Missing or blank required fields, invalid values, structural parse failures, malformed present
 RFC 3339 timestamps, unknown entity kinds, and unknown edge relations are fatal. Deferred formats
 return `AdapterError::NotYetImplemented`. Absent optional fields are accepted silently, and unknown
@@ -68,9 +77,9 @@ Callers inspect `warnings()` after draining the streams.
 
 ## Deferred formats
 
-| Priority | Format                                                  |
-| -------- | ------------------------------------------------------- |
-| P1       | BibTeX, Turtle/N-Triples, JSON-LD; streaming JSON parse |
-| P2       | GraphML, GEXF, Markdown                                 |
+| Priority | Format                                          |
+| -------- | ----------------------------------------------- |
+| P1       | Turtle/N-Triples, JSON-LD; streaming JSON parse |
+| P2       | GraphML, GEXF, Markdown                         |
 
 The JSON and delimited adapters are eager; neither performs database I/O.

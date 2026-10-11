@@ -44,13 +44,18 @@ pub fn is_identifier(text: &str) -> bool {
 
 fn is_acronym_boundary(chars: &[char], index: usize) -> bool {
     // An uppercase pair followed by a lowercase letter starts a word (XMLParser, XMLToJSON),
-    // except a plural `s`, which stays with the acronym (APIs, IDs, URLs).
+    // except a terminal plural `s` (APIs, IDs, URLs). An ASCII lowercase letter after the
+    // `s` makes it part of the next word instead (DBUsers, APIUsage).
     index > 0
         && chars[index - 1].is_ascii_uppercase()
         && chars[index].is_ascii_uppercase()
-        && chars
-            .get(index + 1)
-            .is_some_and(|&next| next.is_ascii_lowercase() && next != 's')
+        && chars.get(index + 1).is_some_and(|&next| {
+            next.is_ascii_lowercase()
+                && (next != 's'
+                    || chars
+                        .get(index + 2)
+                        .is_some_and(|after_s| after_s.is_ascii_lowercase()))
+        })
 }
 
 /// Split `text` on separators (`_`, `-`, `.`, `/`, `::`) and camelCase/digit boundaries,
@@ -267,5 +272,54 @@ mod tests {
         // => ["xml", "parser"]
         let parts = split_identifier("XMLParser", 1);
         assert_eq!(parts, vec!["xml", "parser"]);
+    }
+
+    #[test]
+    fn s_initial_words_split_at_the_acronym_boundary() {
+        for (input, expected) in [
+            ("DBUsers", vec!["db", "users"]),
+            ("APIUsage", vec!["api", "usage"]),
+            ("URLsafe", vec!["ur", "lsafe"]),
+            ("DBOwner", vec!["db", "owner"]),
+            ("HTTPServer", vec!["http", "server"]),
+        ] {
+            assert!(is_identifier(input), "{input}");
+            assert_eq!(split_identifier(input, 1), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn terminal_s_retains_acronym_without_hiding_later_boundaries() {
+        for input in ["APIs", "IDs", "URLs"] {
+            assert!(!is_identifier(input), "{input}");
+            assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+        }
+        for (input, expected) in [
+            ("APIsFoo", vec!["apis", "foo"]),
+            ("XMLIsEmpty", vec!["xmlis", "empty"]),
+            ("APIs2", vec!["apis", "2"]),
+            ("IDs_URLs", vec!["ids", "urls"]),
+        ] {
+            assert!(is_identifier(input), "{input}");
+            assert_eq!(split_identifier(input, 1), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn plural_exemption_ends_only_at_an_ascii_lowercase_continuation() {
+        for continuation in 'a'..='z' {
+            let input = format!("DBUs{continuation}");
+            assert!(is_identifier(&input), "{input}");
+            assert_eq!(
+                split_identifier(&input, 1),
+                vec!["db".to_owned(), format!("us{continuation}")],
+                "{input}"
+            );
+        }
+        // The rule is ASCII character-based, not a dictionary or Unicode word recognizer.
+        for input in ["DBUs", "DBUsé", "DBUs你"] {
+            assert!(!is_identifier(input), "{input}");
+            assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+        }
     }
 }

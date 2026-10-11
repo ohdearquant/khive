@@ -780,6 +780,7 @@ needs a binding and can fail.
    `Result`: `vector(model_key, embedding_model, dimensions, namespace)`,
    `sparse(model_key, namespace)` and `text(table_key, tokenizer)`. An absent factory answers a
    typed missing-capability error that names the tier; a factory failure is a storage error.
+   A core handle runs the backend's once-gated readiness and repair on its first operation and returns that error there; construction never does.
 
 ### Acceptance for the implementation
 

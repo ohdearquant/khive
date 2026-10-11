@@ -22,7 +22,8 @@ read, or unlisted verbs are likewise rejected before any write.
 The CLI is not the runner's sole production consumer: runtime callers can also supply prepared
 plans directly — the hard-delete path (`atomic_hard_delete_with_edge_purge` in `operations.rs`)
 constructs a `DeletePlan` and invokes `run_atomic_unit` for its row-delete + incident-edge purge.
-Tests construct plans directly as well.
+Entity admission also supplies opaque `FinalizeEntity` plans for singleton and bulk writes.
+Their constructors are runtime-private. Tests construct ordinary plans directly as well.
 
 ## Suspend-free invariant
 
@@ -35,10 +36,16 @@ suspending work.
 
 This module honors that invariant structurally, not by convention: every statement the
 commit-pass closure drives comes from `AtomicOpPlan::plan_statements` (private — the runner's own
-internal flattening step), which can only ever produce `PlanStatement`s — plain parameterized
+internal flattening step), or the runtime-owned entity finalizer's phased statement list. Both
+contain plain parameterized
 SQL, the same shape ADR-099 D1's prepare pass produces for the v1 DML-only admissible verb set
 (ADR-099 D3). There is no code path in this module that can hand `atomic_unit` an embedding call
 or any other suspending future.
+
+The entity finalizer's success observation happens after the outer commit acknowledgement.
+After a confirmed rollback, its failure audit runs in a fresh atomic unit. Neither that audit
+nor its independent diagnostic sink can turn an unknown commit acknowledgement into rollback
+evidence. Cloning a finalization plan creates independent failure state for the new invocation.
 
 The paired suspend-trap tests at the bottom of the file check the two things this promise rests
 on: the real commit pass resolving on first poll (the happy-path proof), and a hand-built closure

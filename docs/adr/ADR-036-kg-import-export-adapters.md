@@ -93,8 +93,15 @@ When `--format` is omitted, the shipped CLI infers only these extensions:
 
 JSON import is shipped, but `.json` is intentionally not inferred because both generic JSON
 adapter input and KG archive JSON use that extension. Use `--format json` explicitly for
-generic JSON arrays. BibTeX, RDF/Turtle, N-Triples, JSON-LD, GraphML, GEXF, and Markdown
+generic JSON arrays. RDF/Turtle, N-Triples, JSON-LD, GraphML, GEXF, and Markdown
 are deferred.
+
+The Rust `kkernel kg import` command separately ships `--format bibtex` and infers
+`.bib` without case sensitivity. It reads bounded entries from a reader, while
+converted records remain buffered for validation and forward crossrefs. See its
+[BibTeX adapter API](../../crates/khive-vcs-adapters/docs/api/bibtex-adapter.md) for
+resource limits and malformed-tail behavior. The legacy `khive` command and flag
+tables above and below do not gain BibTeX support from this Rust implementation.
 
 ### 2. Supported formats and phasing
 
@@ -324,20 +331,20 @@ non-NDJSON/non-archive export formats are deferred.
 
 Format coverage matrix:
 
-| Format    | Import         | Export   | Phase | Notes                                                          |
-| --------- | -------------- | -------- | ----- | -------------------------------------------------------------- |
-| NDJSON    | yes            | yes      | P0    | Canonical; lossless                                            |
-| Archive   | yes            | yes      | P0    | KG archive JSON envelope                                       |
-| CSV       | yes (Deno CLI) | deferred | P0/P1 | Rust crate CSV module is not shipped                           |
-| TSV       | yes (Deno CLI) | deferred | P0/P1 | Rust crate TSV module is not shipped                           |
-| JSON      | yes            | deferred | P0/P1 | Generic top-level array import; use `--format json` explicitly |
-| BibTeX    | deferred       | deferred | P1    |                                                                |
-| Turtle    | deferred       | deferred | P1    |                                                                |
-| N-Triples | deferred       | deferred | P1    |                                                                |
-| JSON-LD   | deferred       | deferred | P1    |                                                                |
-| GraphML   | deferred       | deferred | P2    |                                                                |
-| GEXF      | deferred       | deferred | P2    |                                                                |
-| Markdown  | deferred       | deferred | P2    |                                                                |
+| Format    | Import               | Export   | Phase | Notes                                                          |
+| --------- | -------------------- | -------- | ----- | -------------------------------------------------------------- |
+| NDJSON    | yes                  | yes      | P0    | Canonical; lossless                                            |
+| Archive   | yes                  | yes      | P0    | KG archive JSON envelope                                       |
+| CSV       | yes (Deno CLI)       | deferred | P0/P1 | Rust crate CSV module is not shipped                           |
+| TSV       | yes (Deno CLI)       | deferred | P0/P1 | Rust crate TSV module is not shipped                           |
+| JSON      | yes                  | deferred | P0/P1 | Generic top-level array import; use `--format json` explicitly |
+| BibTeX    | yes (Rust `kkernel`) | deferred | P1    | Reader-backed framing; converted records remain buffered       |
+| Turtle    | deferred             | deferred | P1    |                                                                |
+| N-Triples | deferred             | deferred | P1    |                                                                |
+| JSON-LD   | deferred             | deferred | P1    |                                                                |
+| GraphML   | deferred             | deferred | P2    |                                                                |
+| GEXF      | deferred             | deferred | P2    |                                                                |
+| Markdown  | deferred             | deferred | P2    |                                                                |
 
 ### 9. CLI flag reference
 

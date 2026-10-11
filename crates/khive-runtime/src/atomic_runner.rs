@@ -44,6 +44,7 @@ use crate::atomic_plan::{
 #[derive(Debug, Clone)]
 pub enum AtomicOpPlan {
     AddEntity(AddEntityPlan),
+    FinalizeEntity(Box<crate::EntityFinalizationPlan>),
     AddNote(Box<AddNotePlan>),
     Update(Box<UpdatePlan>),
     Delete(DeletePlan),
@@ -67,6 +68,8 @@ impl AtomicOpPlan {
     fn plan_statements(&self) -> Vec<(PlanStatement, bool)> {
         let statements = match self {
             AtomicOpPlan::AddEntity(p) => p.statements.clone(),
+            // The opaque finalizer applies its own phased statements.
+            AtomicOpPlan::FinalizeEntity(_) => Vec::new(),
             AtomicOpPlan::AddNote(p) => p.statements.clone(),
             AtomicOpPlan::Update(p) => p.statements.clone(),
             AtomicOpPlan::Delete(p) => p.statements.clone(),
@@ -303,6 +306,12 @@ pub(crate) async fn apply_plan(
     plan: &AtomicOpPlan,
     capture_note_versions: bool,
 ) -> Result<AppliedPlan, AtomicOpFailure> {
+    if let AtomicOpPlan::FinalizeEntity(plan) = plan {
+        return plan.apply(writer).await.map(|effect| AppliedPlan {
+            effect,
+            note_version: None,
+        });
+    }
     if let AtomicOpPlan::Update(plan) = plan {
         if let Some(guard) = &plan.entity_guard {
             if let Some(conflict) =
@@ -479,6 +488,14 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
     plans: Vec<AtomicOpPlan>,
     capture_note_versions: bool,
 ) -> Result<(AtomicRunOutcome, Vec<i64>), AtomicRunnerError> {
+    let finalizers: Vec<_> = plans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, plan)| match plan {
+            AtomicOpPlan::FinalizeEntity(plan) => Some((index, plan.for_settlement())),
+            _ => None,
+        })
+        .collect();
     let op: PreparedAtomicOp<Vec<i64>, (usize, AtomicOpFailure)> = Box::new(move |writer| {
         Box::pin(async move {
             let mut post_commit = Vec::new();
@@ -517,20 +534,52 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
         })
     });
 
-    match run_prepared_atomic_unit(access, op)
-        .await
-        .map_err(AtomicRunnerError)?
-    {
-        PreparedAtomicOutcome::Committed { value, post_commit } => {
+    match run_prepared_atomic_unit(access, op).await {
+        Ok(PreparedAtomicOutcome::Committed { value, post_commit }) => {
+            for (_, plan) in finalizers {
+                plan.finish_commit();
+            }
             Ok((AtomicRunOutcome::Committed { post_commit }, value))
         }
-        PreparedAtomicOutcome::RolledBack((failed_op_index, failure)) => Ok((
-            AtomicRunOutcome::RolledBack {
-                failed_op_index,
-                failure,
-            },
-            Vec::new(),
-        )),
+        Ok(PreparedAtomicOutcome::RolledBack((failed_op_index, failure))) => {
+            let mut native_source = None;
+            for (index, plan) in finalizers {
+                if index <= failed_op_index {
+                    if let Some(source) = plan.finish_rollback(access).await {
+                        native_source = Some(source);
+                    }
+                }
+            }
+            if let Some(source) = native_source {
+                return Err(AtomicRunnerError(StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source: Box::new(source),
+                }));
+            }
+            Ok((
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index,
+                    failure,
+                },
+                Vec::new(),
+            ))
+        }
+        Err(error) => {
+            // A lost acknowledgement is not proof of rollback. Only the
+            // storage owner's explicit settled state permits failure audits.
+            if matches!(
+                &error,
+                StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    ..
+                }
+            ) {
+                for (_, plan) in finalizers {
+                    let _ = plan.finish_rollback(access).await;
+                }
+            }
+            Err(AtomicRunnerError(error))
+        }
     }
 }
 

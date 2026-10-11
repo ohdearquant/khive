@@ -1213,27 +1213,7 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
     match cmd {
         PackCommand::List { human } => {
             let packs = pack_introspect::list_packs()?;
-            if human {
-                for p in &packs {
-                    println!("# {} {} ({} verbs)", p.name, p.version, p.verbs.len());
-                    if !p.requires.is_empty() {
-                        println!("  requires: {}", p.requires.join(", "));
-                    }
-                    if !p.note_kinds.is_empty() {
-                        println!("  note_kinds:   {}", p.note_kinds.join(", "));
-                    }
-                    if !p.entity_kinds.is_empty() {
-                        println!("  entity_kinds: {}", p.entity_kinds.join(", "));
-                    }
-                    for v in &p.verbs {
-                        println!("    {:<20} {}", v.name, v.description);
-                    }
-                    println!();
-                }
-            } else {
-                let json = serde_json::to_string(&packs).expect("serialize PackInfo[]");
-                println!("{json}");
-            }
+            pack_introspect::render_pack_list(&packs, human, |line| println!("{line}"));
             Ok(())
         }
         PackCommand::Handler { name, human } => {

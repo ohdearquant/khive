@@ -7,14 +7,40 @@ The in-source comments carry only short pointers here.
 
 ## Module layout
 
-`operations.rs` retains the production verb bodies and their public paths. Fault-injection state,
+`operations.rs` retains the shared types and remaining production verb bodies. Entity create and
+claim live in `operations/entity_create.rs`; bulk preparation lives in `operations/entity_bulk.rs`.
+`operations/entity_indexes.rs` prepares required indexes and attachments before admitted candidates
+enter the writer. Public method paths are unchanged. Fault-injection state,
 scoped guards and arming helpers live in `src/operations/fault_injection.rs`; the parent re-exports
 the existing public and crate-visible APIs and imports only the private state its operations use.
 The child exposes those internal items to its parent with `pub(super)` access.
 
 Unit tests remain in `src/operations_tests.rs` under the same `operations::tests` module and retain
-access to the parent helpers. Further extraction groups the remaining verb bodies by concern
-(entity, note, edge, search) while preserving their public paths.
+access to the parent helpers. Manifest route tests live separately in
+`secret_gate_finalizer/entity_route_tests.rs` and enter the real runtime methods.
+
+## Entity candidate finalization
+
+`secret_gate_finalizer/entity_admission.rs` captures one immutable manifest snapshot and checks
+the final candidate. Production snapshots are empty. Only namespace-scoped `cfg(test)` fixtures
+can supply a match; there is no caller, configuration or environment switch for admission.
+Ordinary updates preserve the legacy patch-only scan under an empty snapshot. A non-empty
+snapshot scans the complete merged candidate; caller-supplied and carried reserved stamps
+remain refused, including unchanged echoes.
+
+For a match, `entity_transaction.rs` owns the stamped row, conditional insert or revision guard,
+required effects and exemption audit inside the caller's outer atomic unit. Embeddings are
+prepared before acquiring its writer. `Exempted` is observed only after commit acknowledgement.
+Confirmed rollback allows a separate best-effort failure audit; an uncertain acknowledgement
+retains the storage error. Failure-audit errors emit a redacted diagnostic through an independent
+log sink. Cloned plans have independent failure state.
+
+Direct source and finding ingest retain a captured `EntityCandidateContext` through early
+preflight, final preparation and retries. The public facade returns either an untouched legacy
+candidate, a committed admitted candidate, or conditional-write contention. It accepts no SQL,
+manifest installation, caller stamp or audit-verb override. Source ingest keeps its bounded CAS
+rebase; finding ingest keeps its legacy upsert for clean candidates and uses insert-if-absent
+for admitted candidates. Notes, atomic prepare and administrative curation remain reservation-only.
 
 ## Fault-injection arm migration
 

@@ -15,6 +15,7 @@ chrono = { workspace = true }
 khive-types = { version = "0.11.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_bibtex = "=0.7.1"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 

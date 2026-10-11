@@ -56,7 +56,7 @@ pub use request_context::{
     wait_for_request_read_cancellation, RequestReadContext, RequestReadDeadline,
     RequestReadStopReason, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
-pub use sparse::SparseStore;
+pub use sparse::{SparseStore, SparseStoreFactory};
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter, TopLevelMaintenance};
 pub use telemetry::{
     ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
@@ -64,9 +64,9 @@ pub use telemetry::{
     CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent, PhaseCancelledPayload,
     PhaseCompletedPayload, PhaseStartedPayload,
 };
-pub use text::TextSearch;
+pub use text::{TextSearch, TextSearchFactory};
 pub use types::StorageResult;
-pub use vectors::VectorStore;
+pub use vectors::{VectorStore, VectorStoreFactory};
 
 pub use types::{
     BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,

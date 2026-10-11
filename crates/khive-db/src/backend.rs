@@ -14,10 +14,11 @@ use rusqlite::OptionalExtension;
 use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy};
-use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse, text, vectors};
 
+mod capability_factories;
 mod code_map;
+mod core_stores;
 #[path = "backend/schema_readiness.rs"]
 mod memory_visibility;
 mod pack_schema;
@@ -534,13 +535,6 @@ impl StorageBackend {
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
-    }
-
-    /// Get the SQL access capability.
-    ///
-    /// Returns an `Arc<dyn SqlAccess>` suitable for passing to services.
-    pub fn sql(&self) -> Arc<dyn khive_storage::SqlAccess> {
-        Arc::new(SqlBridge::new(Arc::clone(&self.pool), self.is_file_backed))
     }
 
     /// Apply a service's schema plan (run migrations).

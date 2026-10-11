@@ -10,6 +10,7 @@
 //! through `errno`, and every platform spells the accessor differently.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -344,6 +345,65 @@ impl Drop for DirStream {
 /// before every `readdir`, so a NULL return with a nonzero `errno` is reported as an error
 /// instead of ending the listing early.
 pub fn list_names(directory: &File) -> io::Result<Vec<OsString>> {
+    read_names(directory, None).map_err(|error| match error {
+        ListNamesError::Io(source) => source,
+        error => io::Error::other(error),
+    })
+}
+
+/// A directory read failed or encountered more entries than the caller permits.
+#[derive(Debug)]
+pub enum ListNamesError {
+    Io(io::Error),
+    LimitExceeded { max: usize },
+}
+
+impl fmt::Display for ListNamesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(formatter),
+            Self::LimitExceeded { max } => {
+                write!(formatter, "directory entry limit {max} exceeded")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ListNamesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::LimitExceeded { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for ListNamesError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// List sorted UTF-8 names, refusing rather than truncating above `max` entries.
+///
+/// Every non-dot entry counts before conversion, including hidden names, links and
+/// non-UTF-8 names. Non-UTF-8 names are omitted from the successful String result.
+/// Zero permits only an empty directory. The caller's directory position is unchanged.
+pub fn list_names_bounded(directory: &File, max: usize) -> Result<Vec<String>, ListNamesError> {
+    Ok(list_names_raw_bounded(directory, max)?
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .collect())
+}
+
+pub(crate) fn list_names_raw_bounded(
+    directory: &File,
+    max: usize,
+) -> Result<Vec<OsString>, ListNamesError> {
+    read_names(directory, Some(max))
+}
+
+fn read_names(directory: &File, max: Option<usize>) -> Result<Vec<OsString>, ListNamesError> {
     let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
     // SAFETY: `fd` is uniquely owned and `fdopendir` takes ownership of it on success.
     let stream = unsafe { libc::fdopendir(fd) };
@@ -351,7 +411,7 @@ pub fn list_names(directory: &File) -> io::Result<Vec<OsString>> {
         let error = io::Error::last_os_error();
         // SAFETY: `fdopendir` failed, so ownership of `fd` remains here.
         unsafe { libc::close(fd) };
-        return Err(error);
+        return Err(error.into());
     }
     let stream = DirStream(stream);
     let mut result = Vec::new();
@@ -362,13 +422,18 @@ pub fn list_names(directory: &File) -> io::Result<Vec<OsString>> {
         if entry.is_null() {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(0) {
-                return Err(error);
+                return Err(error.into());
             }
             break;
         }
         // SAFETY: `d_name` is NUL-terminated and is copied out before the next `readdir`.
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
+            if let Some(max) = max {
+                if result.len() == max {
+                    return Err(ListNamesError::LimitExceeded { max });
+                }
+            }
             result.push(OsString::from_vec(name.to_vec()));
         }
     }

@@ -1226,6 +1226,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server/disk_policy.rs",
     ),
     (
+        "khive-mcp/src/server.rs",
+        "server_core",
+        "khive-mcp/src/server/server_core.rs",
+    ),
+    (
         "khive-mcp/src/daemon.rs",
         "executable",
         "khive-mcp/src/daemon/executable.rs",
@@ -1254,6 +1259,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/daemon.rs",
         "liveness",
         "khive-mcp/src/daemon/liveness.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "forward_or_spawn",
+        "khive-mcp/src/daemon/forward_or_spawn.rs",
     ),
     (
         "khive-runtime/src/daemon.rs",
@@ -1289,6 +1299,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-runtime/src/daemon.rs",
         "lifecycle",
         "khive-runtime/src/daemon/lifecycle.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "wire_frames",
+        "khive-runtime/src/daemon/wire_frames.rs",
     ),
 ];
 
@@ -1444,7 +1459,7 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
                     && self.impl_type.as_deref() == Some("DaemonDispatchError"))
         }) {
             self.constructors_seen += 1;
-            let normalizer = self.source == "khive-runtime/src/daemon.rs"
+            let normalizer = self.source == "khive-runtime/src/daemon/wire_frames.rs"
                 && self.modules.is_empty()
                 && self.impl_type.as_deref() == Some("DaemonDispatchError")
                 && self.function == "new"

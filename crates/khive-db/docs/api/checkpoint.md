@@ -440,7 +440,8 @@ as unavailable rather than logging a zero-frame gap.
 
 ## `TxAgeSweepState` — identity tracking rationale
 
-See `crates/khive-db/src/checkpoint.rs` — `TxAgeSweepState`, `TxAgeSweepState::observe`.
+See `crates/khive-db/src/checkpoint/severity_state.rs` — `TxAgeSweepState`,
+`TxAgeSweepState::observe`. Public access remains through `khive_db::checkpoint`.
 
 `tx_registry::oldest()` can be pinned by any registered span regardless of
 which call site created it (`atomic_unit`, `WriterGuard::transaction`, a
