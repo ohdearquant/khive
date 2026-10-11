@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add explicit event sink declarations in `khive-types`. All existing event kinds
   retain `caller_event_store`; the closed metadata API requires each new kind to
   declare its sink. Event routing and storage behavior are unchanged.
+- A standalone session raw-value codec writes level-3 zstd frames with BLOB
+  prefix `0x01`, borrows legacy TEXT unchanged, and refuses unknown formats or
+  malformed data. Callers select the decoded BLOB size bound; mirror storage
+  paths and dictionaries remain unchanged.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
