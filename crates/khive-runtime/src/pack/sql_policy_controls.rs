@@ -484,6 +484,39 @@ const Q: &str = "SELECT production FROM notes";
     }
 
     #[test]
+    fn aliased_scalar_select_renderings_trip_the_inline_sql_control_without_matching_prose() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for (sql, detected) in [
+            ("SELECT last_insert_rowid()\nAS row_id", true),
+            ("SELECT changes()\nAS affected", true),
+            ("SELECT a source\nas the active option", false),
+            ("SELECT changes()\nto inspect the last write", false),
+            ("SELECT an empty argument list ()\nbefore submitting", false),
+            ("SELECT value\nAS alias", false),
+            ("select last_insert_rowid()\nAS row_id", false),
+        ] {
+            let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = if detected { vec![flat.clone()] } else { vec![] };
+            for rendered in [
+                format!("\"{flat}\""),
+                format!("\"{}\"", sql.replace('\n', "\\n")),
+                format!("\"{}\"", sql.replace('\n', " \\\n            ")),
+                format!("r#\"{sql}\"#"),
+            ] {
+                let source = format!("const Q: &str = {rendered};");
+                assert_eq!(sql_literals(&source), expected, "{source}");
+                let sources = BTreeMap::from([(path.clone(), source)]);
+                let errors = expected
+                    .iter()
+                    .map(|statement| format!("inline SQL: demo/src/lib.rs: {statement}"))
+                    .collect::<Vec<_>>();
+                assert_eq!(inline_errors(&sources, &root, &["demo"], &[]), errors);
+            }
+        }
+    }
+
+    #[test]
     fn with_materialization_renderings_trip_the_inline_sql_control() {
         let root = PathBuf::from("/crates");
         let path = root.join("demo/src/lib.rs");

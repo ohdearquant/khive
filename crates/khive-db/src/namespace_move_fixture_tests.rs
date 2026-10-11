@@ -116,6 +116,22 @@ fn every_current_namespace_table_has_a_move_disposition() {
             })
         );
     }
+    for (name, expected) in [
+        (
+            "atom_weights",
+            TableDisposition::SubjectKeyed {
+                subject_column: "atom_id",
+            },
+        ),
+        ("weight_events", TableDisposition::History),
+    ] {
+        let table = inventory
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .unwrap();
+        assert_eq!(disposition(table), Some(expected));
+    }
     for name in ["comm_sender_transport", "sessions", "session_messages"] {
         let table = inventory
             .tables
@@ -1147,4 +1163,203 @@ fn rolling_back_a_note_namespace_move_also_rolls_back_epoch_attribution() {
         text(&conn, "SELECT namespace FROM notes WHERE id = 'moving'"),
         "source"
     );
+}
+
+fn seed_weight_atom(conn: &Connection, id: &str, namespace: &str, mirror: bool) {
+    conn.execute(
+        "INSERT INTO knowledge_atoms (id, namespace, slug, name, created_at, updated_at) \
+         VALUES (?1, ?2, ?1, ?1, 1, 1)",
+        rusqlite::params![id, namespace],
+    )
+    .unwrap();
+    if mirror {
+        conn.execute(
+            "INSERT INTO knowledge_domains (id, namespace, slug, name, created_at, updated_at) \
+             VALUES (?1, ?2, ?1, ?1, 1, 1)",
+            rusqlite::params![id, namespace],
+        )
+        .unwrap();
+    }
+}
+
+fn weight_table_rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = conn
+        .prepare(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))
+        .unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|column| row.get(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn atom_weights_follow_source_atoms_and_domain_mirrors_while_history_stays() {
+    use rusqlite::types::Value;
+    for (partitioned, domain_first) in [(false, false), (true, false), (true, true)] {
+        let conn = migrated();
+        let atom_target = "atom-target";
+        let domain_target = if partitioned {
+            "domain-target"
+        } else {
+            atom_target
+        };
+        seed_weight_atom(&conn, "ordinary", "source", false);
+        seed_weight_atom(&conn, "mirror", "source", true);
+        seed_weight_atom(&conn, "resident", atom_target, false);
+        seed_weight_atom(&conn, "distant", "third", false);
+        conn.execute(
+            "UPDATE knowledge_atoms SET deleted_at = 11 WHERE id = 'ordinary'",
+            [],
+        )
+        .unwrap();
+        for (namespace, atom_id, weight) in [
+            ("source", "ordinary", 1.5),
+            ("source", "mirror", 2.5),
+            ("source", "resident", 3.5),
+            ("source", "distant", 4.5),
+            ("source", "missing", 5.5),
+            (atom_target, "resident", 6.5),
+            (atom_target, "missing", 7.5),
+        ] {
+            conn.execute(
+                "INSERT INTO atom_weights (namespace, atom_id, weight, updated_at, version) \
+                 VALUES (?1, ?2, ?3, 123456, 7)",
+                rusqlite::params![namespace, atom_id, weight],
+            )
+            .unwrap();
+        }
+        if partitioned {
+            for (namespace, atom_id) in [(domain_target, "ordinary"), (atom_target, "mirror")] {
+                conn.execute(
+                    "INSERT INTO atom_weights (namespace, atom_id, weight, updated_at, version) \
+                     VALUES (?1, ?2, -1.5, 654321, 9)",
+                    rusqlite::params![namespace, atom_id],
+                )
+                .unwrap();
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO weight_events \
+             (namespace, atom_id, delta, weight_after, channel, eta, event_id, context_id, ts) \
+             SELECT namespace, atom_id, 0.25, weight, 'feedback', 0.1, \
+                    'event-' || atom_id, 'context-' || atom_id, 1000001 FROM atom_weights",
+        )
+        .unwrap();
+        let mut expected_weights = weight_table_rows(&conn, "atom_weights");
+        for row in &mut expected_weights {
+            if row[1] == Value::Text("source".into()) {
+                let target = match &row[2] {
+                    Value::Text(id) if id == "ordinary" => Some(atom_target),
+                    Value::Text(id) if id == "mirror" => Some(domain_target),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    row[1] = Value::Text(target.into());
+                }
+            }
+        }
+        let events_before = weight_table_rows(&conn, "weight_events");
+        let mut routes = vec![
+            MoveRoute {
+                class: SubjectClass::Atom,
+                target: atom_target.into(),
+            },
+            MoveRoute {
+                class: SubjectClass::Domain,
+                target: domain_target.into(),
+            },
+        ];
+        if domain_first {
+            routes.reverse();
+        }
+        let counts = attempt(&conn, &MoveRequest::new("source", routes)).unwrap();
+        assert_eq!(counts.subjects.get("atom"), Some(&1));
+        assert_eq!(counts.subjects.get("domain"), Some(&1));
+        assert_eq!(counts.rows.get("atom_weights"), Some(&2));
+        assert_eq!(counts.left_behind.get("atom_weights"), Some(&3));
+        assert_eq!(counts.left_behind.get("weight_events"), Some(&5));
+        assert!(!counts.rows.contains_key("weight_events"));
+        assert_eq!(weight_table_rows(&conn, "atom_weights"), expected_weights);
+        assert_eq!(weight_table_rows(&conn, "weight_events"), events_before);
+        for (id, expected) in [("ordinary", atom_target), ("mirror", domain_target)] {
+            let namespace: String = conn
+                .query_row(
+                    "SELECT namespace FROM knowledge_atoms WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(namespace, expected);
+        }
+    }
+}
+
+#[test]
+fn atom_weight_collisions_name_only_the_routed_target_and_leave_every_row_unchanged() {
+    for (colliding_id, target) in [("ordinary", "atom-target"), ("mirror", "domain-target")] {
+        let conn = migrated();
+        seed_weight_atom(&conn, "ordinary", "source", false);
+        seed_weight_atom(&conn, "mirror", "source", true);
+        for (namespace, atom_id) in [
+            ("source", "ordinary"),
+            ("source", "mirror"),
+            (target, colliding_id),
+        ] {
+            conn.execute(
+                "INSERT INTO atom_weights (namespace, atom_id, weight, updated_at, version) \
+                 VALUES (?1, ?2, 1.5, 123456, 7)",
+                rusqlite::params![namespace, atom_id],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO weight_events \
+             (namespace, atom_id, delta, weight_after, channel, eta, ts) \
+             VALUES ('source', 'ordinary', 0.25, 1.5, 'feedback', 0.1, 1000001)",
+        )
+        .unwrap();
+        let weights_before = weight_table_rows(&conn, "atom_weights");
+        let events_before = weight_table_rows(&conn, "weight_events");
+        let request = MoveRequest::new(
+            "source",
+            vec![
+                MoveRoute {
+                    class: SubjectClass::Domain,
+                    target: "domain-target".into(),
+                },
+                MoveRoute {
+                    class: SubjectClass::Atom,
+                    target: "atom-target".into(),
+                },
+            ],
+        );
+        let found = collisions(attempt(&conn, &request));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].table, "atom_weights");
+        assert_eq!(found[0].constraint, "sqlite_autoindex_atom_weights_1");
+        assert_eq!(found[0].target, target);
+        assert_eq!(found[0].key, colliding_id);
+        assert_eq!(weight_table_rows(&conn, "atom_weights"), weights_before);
+        assert_eq!(weight_table_rows(&conn, "weight_events"), events_before);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = 'source'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = 'source'"
+            ),
+            1
+        );
+    }
 }
