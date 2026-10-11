@@ -428,24 +428,18 @@ arrive and has no way to tell that from a slow one. Ending the session is what
 turns that into an end-of-input the client can act on, so an interrupted
 response closes the session exactly as any other failed response does.
 
-**Known gap.** The response-delivery deadline covers responses this transport
-writes. It does not cover parse-error responses, which the underlying line
-transport writes directly through its own framed writer without passing through
-the deadline. A peer that sends malformed input and then stops reading can leave
-that one write pending.
+**The response-delivery deadline also covers replies emitted inside receive.**
+Invalid Request replies (-32600, without an id) from rmcp's line transport pass
+through the same `DeadlineWriter`, even though they bypass the outer transport's
+`send` method. If writing or flushing one of these replies stays pending until
+`KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS` expires, the writer cancels the root session
+and returns `TimedOut`. This bound does not depend on the idle timeout or the
+request-obligation TTL.
 
-What bounds that pending write depends on what else the session has
-outstanding, and the idle window alone is not the answer:
-
-- Idle timeout disabled: nothing bounds it.
-- Idle timeout enabled, nothing else outstanding: the idle window bounds it.
-- Idle timeout enabled with a request still awaiting its response: the idle
-  close defers while that obligation is fresh, so the bound is the request
-  obligation TTL rather than the idle window. A peer can reach this deliberately
-  by admitting a request and then sending malformed input.
-
-Closing the gap requires replacing or adapting the line transport and is tracked
-separately.
+With rmcp 2.2, syntactically invalid JSON is ignored without a reply. Valid JSON
+that is not a valid JSON-RPC message receives Invalid Request; the oversized-line
+sentinel uses that category. The limits and recovery behavior are documented in
+[the CLI usage guide](../crates/kkernel/docs/usage.md).
 
 ## Troubleshooting a connect failure
 
