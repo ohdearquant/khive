@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
+  cancellation fixes. MCP, mounted tools and CLI consumers keep their existing
+  feature configuration; MCP result tests use the renamed `ContentBlock` API.
+
 ## [0.12.0] - 2026-10-11
 
 ### Documentation
