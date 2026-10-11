@@ -196,7 +196,6 @@ pub struct AuditReport {
 
 const SCHEMA_VERSION: u32 = 1;
 
-const SQL_PROJECT_NAMES: &str = sql!("code_audit_projects_list");
 const SQL_INGEST_COVERAGE: &str = sql!("code_audit_projects_ingest_coverage");
 const SQL_MODULES_FOR_PROJECT: &str = sql!("code_audit_modules_for_project");
 const SQL_FAN_IN: &str = sql!("code_audit_module_edges_fan_in");
@@ -217,7 +216,6 @@ const SQL_DUPLICATE_CONTENT_HASH: &str = sql!("code_audit_modules_duplicate_cont
 /// into `query_bundle_sha256` so a report can be tied back to the exact
 /// derivation logic that produced it.
 const QUERY_BUNDLE: &[&str] = &[
-    SQL_PROJECT_NAMES,
     SQL_INGEST_COVERAGE,
     SQL_MODULES_FOR_PROJECT,
     SQL_FAN_IN,
@@ -1364,7 +1362,7 @@ mod tests {
     fn query_bundle_hash_is_stable() {
         assert_eq!(
             query_bundle_sha256(),
-            "50b550789f13d5408752582015650d1fb805e23c4acb1803e9a9df1cd404c9ee"
+            "f81a0ecdb297858ed0193e82ff6bfbd31da1d27793537691251c15df70784ad8"
         );
     }
 
