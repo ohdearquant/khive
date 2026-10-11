@@ -412,6 +412,7 @@ const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
 
 const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
 const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
+const V57_UP: &str = include_str!("../sql/057-retrieval-snapshots.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -772,6 +773,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 56,
         name: "atom_weight_tables",
         up: V56_UP,
+    },
+    VersionedMigration {
+        version: 57,
+        name: "retrieval_snapshot_tables",
+        up: V57_UP,
     },
 ];
 
