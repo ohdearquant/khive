@@ -217,17 +217,25 @@ and cardinality. Empty input returns empty. Nonfinite scores refuse; caller filt
 stays outside the helper. The ordinary mathematical transform is
 `floor + clamp((x-min)/(max-min), 0, 1) * (ceiling-floor)`.
 
-The policy supplies a finite nonnegative absolute span tolerance and either `Ceiling`
-or `ClampMaximum` as the fallback when `span <= tolerance`. `ClampMaximum` returns
-`clamp(max, floor, ceiling)`. There is no universal epsilon or automatic signal gate.
+The policy supplies a finite nonnegative absolute span tolerance and one of three
+fallbacks when `span <= tolerance`: `Ceiling` returns the supplied ceiling directly;
+`UpperEndpoint` evaluates `range = ceiling - floor` followed by `floor + range`;
+`ClampMaximum` returns `clamp(max, floor, ceiling)`. `UpperEndpoint` retains separately
+rounded subtraction and addition in the caller's precision. It must not be widened,
+reassociated or simplified to `Ceiling`. The ordinary affine transform likewise retains
+separate subtraction, division, multiplication and addition, without fused multiply-add.
+There is no universal epsilon or automatic signal gate.
 Implementation must report an unrepresentable intermediate rather than silently drop
 an item; any stable reformulation must be checked against each adopting caller.
 
 Memory keeps its finite/minimum-score filter, positive-maximum guard, configured floor
 and `0.82` ceiling. Both paths use `f32::EPSILON`; single-source calibration uses
 `ClampMaximum` and then applies its signal-strength factor, while RRF calibration uses
-`Ceiling` without that factor. Those are deliberate policies, not duplicate constants
-to erase. The shared operation only replaces the agreed arithmetic between those steps.
+`UpperEndpoint` without that factor. With the default `0.15f32` floor and `0.82f32`
+ceiling, the current RRF fallback produces bits `0x3f51eb84`; returning the ceiling
+directly produces `0x3f51eb85`. Even this default path is not bit-equivalent. Those are
+deliberate compatibility policies, not duplicate constants to erase. The shared
+operation only replaces the agreed arithmetic between those steps.
 
 Fixed-point fusion keeps a separate exact `DeterministicScore` entry point: i128
 differences/products, integer division, and equal/singleton inputs mapping to one for
@@ -294,7 +302,7 @@ or statistical efficacy claim is made by these algebraic contracts.
 | Unit and factors | Fractions/percent boundary `1`, endpoints, invalid/nonfinite refusal, half-step quantization; negative cosine and mass `1.5` remain nonunit; moving the terminal memory clamp earlier changes a fixture and must fail equivalence  |
 | Decay            | Each decaying variant at zero, negative time, `h`, extreme finite `h`; value `1.5`, rate zero, explicit per-note zero, None; invalid half-lives refuse; replacing rational PowerLaw with exponential fails a non-half-life fixture |
 | Weights          | Existing rerank tests for MAX/subnormal weights, huge features, unknown keys, zero-weight NaN and map insertion order; replacing scaled accumulation with a naive raw sum must fail                                                |
-| Bands            | Empty/singleton/equal/near-equal scores, both fallback policies, filtering and signal factor; fixed-point raw results unchanged; using the wrong memory fallback must fail                                                         |
+| Bands            | Empty/singleton/equal/near-equal scores, all three fallback policies, filtering and signal factor; default f32 RRF endpoint bits and fixed-point raw results unchanged; simplifying UpperEndpoint to Ceiling must fail             |
 | Ordering         | Antisymmetry/transitivity over finite values, infinities, both zeros, several NaN signs/payloads and ID ties; replacing NaN handling with unordered-equals must fail                                                               |
 | Vectors          | Current cosine mismatch/empty/clamp behavior, normalization boundary fixtures and nonfinite outcomes; blind `1e-12` to `1e-8` adoption must fail the legacy fixture until its migration is accepted                                |
 
