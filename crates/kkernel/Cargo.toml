@@ -64,6 +64,9 @@ sha2 = { workspace = true }
 
 lattice-embed = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+khive-fs = { version = "0.12.0", path = "../khive-fs" }
+
 [dev-dependencies]
 inventory = { workspace = true }
 khive-db = { version = "0.12.0", path = "../khive-db", features = ["test-support"] }
