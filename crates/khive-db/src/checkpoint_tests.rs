@@ -1908,7 +1908,17 @@ fn async_checkpoint_source_keeps_enumeration_behind_awaited_spawn_blocking() {
             .0
     }
 
-    let source = include_str!("checkpoint.rs");
+    // Reconstruct the original concern order so cross-concern end markers
+    // still bound the actual moved bodies, rather than their parent reexports.
+    let source = [
+        include_str!("checkpoint/task_loop.rs"),
+        include_str!("checkpoint/checkpoint_core.rs"),
+        include_str!("checkpoint/walpin_attribution.rs"),
+        include_str!("checkpoint/backfill_queries.rs"),
+        include_str!("checkpoint/walpin_sidecar.rs"),
+    ]
+    .join("\n");
+    let source = source.as_str();
     let checkpoint_core = section(
         source,
         "fn checkpoint_once_core(",
@@ -1917,7 +1927,7 @@ fn async_checkpoint_source_keeps_enumeration_behind_awaited_spawn_blocking() {
     let truncate_core = section(
         source,
         "fn maybe_truncate(",
-        "#[cfg(test)]\nmod truncate_report_test_sync",
+        "#[cfg(test)]\npub(super) mod truncate_report_test_sync",
     );
     let report_logger = section(
         source,
@@ -2730,6 +2740,12 @@ fn all_checkpoint_metrics_callers_are_serial_tagged() {
     let sources = [
         include_str!("checkpoint.rs"),
         include_str!("checkpoint/run_state.rs"),
+        include_str!("checkpoint/walpin_sidecar.rs"),
+        include_str!("checkpoint/walpin_attribution.rs"),
+        include_str!("checkpoint/lifecycle.rs"),
+        include_str!("checkpoint/task_loop.rs"),
+        include_str!("checkpoint/checkpoint_core.rs"),
+        include_str!("checkpoint/backfill_queries.rs"),
         include_str!("checkpoint_tests.rs"),
         include_str!("checkpoint/churn_tests.rs"),
         include_str!("checkpoint_owner_interval_tests.rs"),
