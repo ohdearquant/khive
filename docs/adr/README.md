@@ -226,6 +226,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 | [ADR-197](ADR-197-owns-relation.md)                                     | The `owns` Relation                                                                                        |
 | [ADR-198](ADR-198-shared-fs-ancestor-link-policy.md)                    | Shared Filesystem Ancestor Link Policy                                                                     |
+| [ADR-201](ADR-201-brain-module-boundaries.md)                           | Brain module boundaries and shared event readers                                                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
