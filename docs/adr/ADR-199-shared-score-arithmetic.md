@@ -44,7 +44,7 @@ Line references describe that revision; implementations must refresh the census.
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | Unit interval     | [memory scoring:584](../../crates/khive-pack-memory/src/scoring.rs#L584), `normalize_min_score`; `calculate_score`:771 clamps once after all adjustments                                                                                                                                                                                                                               | `khive-score`; memory, #4479/#4513                    |
 | Nonunit factors   | [memory scoring:828](../../crates/khive-pack-memory/src/scoring.rs#L828), posterior multiplier in `[0.85,1.15]`; absent posterior gives exactly `1`                                                                                                                                                                                                                                    | Arithmetic in `khive-score`; policy remains in memory |
-| Decay             | [memory config:463](../../crates/khive-pack-memory/src/config.rs#L463), `DecayModel::apply`; [runtime objectives:182](../../crates/khive-runtime/src/objectives.rs#L182) and :282; [fold builtin:170](../../crates/khive-fold/src/objective/builtin.rs#L170); [brain fold gate:36](../../crates/khive-pack-brain/src/fold_gate.rs#L36)                                                 | `khive-score`; #4480, then #4513/#4516/#4553          |
+| Decay             | [memory config:486](../../crates/khive-pack-memory/src/config.rs#L486), `DecayModel::apply`; [runtime objectives:219](../../crates/khive-runtime/src/objectives.rs#L219) and :300; [fold builtin:199](../../crates/khive-fold/src/objective/builtin.rs#L199); [brain fold gate:36](../../crates/khive-pack-brain/src/fold_gate.rs#L36)                                                 | `khive-score`; #4480, then #4513/#4516/#4553          |
 | Weights           | [memory rerank:27](../../crates/khive-pack-memory/src/rerank.rs#L27), scaled mean; [config:395](../../crates/khive-pack-memory/src/config.rs#L395), validation; [scoring:458](../../crates/khive-pack-memory/src/scoring.rs#L458), final-score weights                                                                                                                                 | `khive-score`; #4481/#4513                            |
 | Min–max           | [memory scoring:654](../../crates/khive-pack-memory/src/scoring.rs#L654) and :703, two distinct degeneracy rules; [fusion weighted:12](../../crates/khive-fusion/src/weighted.rs#L12), integer normalization                                                                                                                                                                           | `khive-score`; #4482/#4513, then fusion               |
 | Ordering          | [score comparator:66](../../crates/khive-score/src/comparator.rs#L66), fixed-point comparator; [fusion ordering:11](../../crates/khive-fusion/src/ordering.rs#L11), duplicate; raw float sorts in memory/knowledge/KG/runtime                                                                                                                                                          | `khive-score`; #4483, then #4513–#4515                |
@@ -140,6 +140,23 @@ Expose the bounded `factor(elapsed)` separately so raw callers can multiply a ma
 it. If a rate-to-half-life conversion is exposed, an unrepresentable positive result
 must refuse rather than construct zero or infinity as a valid `HalfLife`.
 
+Evaluation forms are fixed so that two conforming implementations return the same bits.
+The PowerLaw scalar application evaluates the existing left-to-right `value*h/(h+t)`
+whenever both `value*h` and `h+t` are finite, and `value/(1+t/h)` only when one of them
+overflows; `factor(t)` is `h/(h+t)` when `h+t` is finite and `1/(1+t/h)` otherwise. A
+single rewritten expression for all inputs does not conform: on ordinary finite inputs
+`value/(1+t/h)` and `value*(h/(h+t))` each differ from the existing expression in
+low-order bits for a large share of values, and those values feed a `powf` ranking term and a
+strict prune threshold. Multiplying a value by `factor(t)` is likewise a different
+expression from the scalar application; memory's PowerLaw adoption uses the scalar
+application. Rate-constructed exponential and hyperbolic evaluate the existing
+`value*exp(-r*t)` and `value/(1+r*t)`. Half-life forms equal the rate forms
+mathematically but not bit for bit, and the census already holds three different
+half-life exponential expressions (`2^(-t/h)` through `powf`, `0.5^(t/h)` and
+`exp(-(ln(2)/h)*t)`). Each adopter keeps its existing expression or reports the change
+under the differential-evidence rule below; no fixture asserts bit equality between a
+rate form and a half-life form, or between two half-life forms.
+
 The checked scalar application accepts finite values outside `[0,1]` and multiplies by
 the factor. A unit-score convenience preserves the invariant without a policy clamp.
 This keeps brain mass decay usable above one. Callers may not insert `UnitScore` around
@@ -163,7 +180,9 @@ Adoption must preserve these existing differences explicitly:
 - Stabilization is itself observable: at `salience=0.75, h=t=f64::MAX`, the legacy
   PowerLaw expression returns zero whereas the stable result is `0.375`; at zero time
   and the smallest positive `h`, multiplying `0.5*h` first can underflow. Adoption must
-  accept these changed cases explicitly rather than describe them as pure moves.
+  accept these changed cases explicitly rather than describe them as pure moves. For
+  valid inputs at positive time, the PowerLaw evaluation rule above confines changed bits
+  to inputs where a legacy intermediate overflows.
 
 ## Decision 3 — Validated and keyed weights
 
@@ -186,7 +205,11 @@ keys mean zero weight; duplicate keys in the declared sequence refuse.
 
 The recognized positive-weight subset determines the computation. If it is empty, the
 result is zero. Zero-weight features are not evaluated; a NaN in one must not contaminate
-the result. Active nonfinite feature values return an error. Pack configuration may
+the result. Active nonfinite feature values return an error. This changes a live path:
+today `weighted_rerank` returns NaN when a positively weighted feature is NaN. Whether
+memory recall can deliver such a feature is not established here; the adopting change
+determines it and reports it as a changed result under Acceptance and sequence. Pack
+configuration may
 continue to reject an invalid unknown-key weight before this arithmetic selection.
 
 For active finite values `x_i`, use weight scale `w_max` and feature scale
@@ -225,8 +248,10 @@ rounded subtraction and addition in the caller's precision. It must not be widen
 reassociated or simplified to `Ceiling`. The ordinary affine transform likewise retains
 separate subtraction, division, multiplication and addition, without fused multiply-add.
 There is no universal epsilon or automatic signal gate.
-Implementation must report an unrepresentable intermediate rather than silently drop
-an item; any stable reformulation must be checked against each adopting caller.
+Implementation must report an unrepresentable intermediate, including a span `max-min`
+or a range `ceiling-floor` that overflows, rather than silently drop an item or return a
+finite wrong value; any stable reformulation must be checked against each adopting
+caller.
 
 Memory keeps its finite/minimum-score filter, positive-maximum guard, configured floor
 and `0.82` ceiling. Both paths use `f32::EPSILON`; single-source calibration uses
@@ -264,7 +289,9 @@ new raw-float ranking at a boundary governed by ADR-006.
 ## Decision 6 — Vector arithmetic owner and epsilon migration
 
 `khive-score::vector` owns shared `f32` cosine and in-place L2 normalization. No new
-`khive-quant` dependency or vector storage responsibility is introduced. The proposed
+`khive-quant` dependency or vector storage responsibility is introduced. Adoption makes
+`khive-score` a new normal dependency of `khive-vamana`; `khive-pack-knowledge` already
+depends on it. The proposed
 canonical numeric cutoff is `1e-8`, with separate named tests for the two operations:
 cosine compares a product of norms; normalization compares one norm. Matching literals
 do not make those quantities dimensionally interchangeable.
@@ -297,14 +324,14 @@ Each implementation supplies the refreshed caller census, owning crate, removed 
 sites, and tests pinning the actual boundaries below. No new empirical quality, latency,
 or statistical efficacy claim is made by these algebraic contracts.
 
-| Family           | Required positive cases and meaningful negative controls                                                                                                                                                                           |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit and factors | Fractions/percent boundary `1`, endpoints, invalid/nonfinite refusal, half-step quantization; negative cosine and mass `1.5` remain nonunit; moving the terminal memory clamp earlier changes a fixture and must fail equivalence  |
-| Decay            | Each decaying variant at zero, negative time, `h`, extreme finite `h`; value `1.5`, rate zero, explicit per-note zero, None; invalid half-lives refuse; replacing rational PowerLaw with exponential fails a non-half-life fixture |
-| Weights          | Existing rerank tests for MAX/subnormal weights, huge features, unknown keys, zero-weight NaN and map insertion order; replacing scaled accumulation with a naive raw sum must fail                                                |
-| Bands            | Empty/singleton/equal/near-equal scores, all three fallback policies, filtering and signal factor; default f32 RRF endpoint bits and fixed-point raw results unchanged; simplifying UpperEndpoint to Ceiling must fail             |
-| Ordering         | Antisymmetry/transitivity over finite values, infinities, both zeros, several NaN signs/payloads and ID ties; replacing NaN handling with unordered-equals must fail                                                               |
-| Vectors          | Current cosine mismatch/empty/clamp behavior, normalization boundary fixtures and nonfinite outcomes; blind `1e-12` to `1e-8` adoption must fail the legacy fixture until its migration is accepted                                |
+| Family           | Required positive cases and meaningful negative controls                                                                                                                                                                                                                                                                                                    |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit and factors | Fractions/percent boundary `1`, endpoints, invalid/nonfinite refusal, half-step quantization; negative cosine and mass `1.5` remain nonunit; moving the terminal memory clamp earlier changes a fixture and must fail equivalence                                                                                                                           |
+| Decay            | Each decaying variant at zero, negative time, `h`, extreme finite `h`; value `1.5`, rate zero, explicit per-note zero, None; invalid half-lives refuse; replacing rational PowerLaw with exponential fails a non-half-life fixture; evaluating PowerLaw as `value/(1+t/h)` or `value*(h/(h+t))` on finite intermediates fails an ordinary-input bit fixture |
+| Weights          | Existing rerank tests for MAX/subnormal weights, huge features, unknown keys, zero-weight NaN and map insertion order; replacing scaled accumulation with a naive raw sum must fail                                                                                                                                                                         |
+| Bands            | Empty/singleton/equal/near-equal scores, all three fallback policies, filtering and signal factor; default f32 RRF endpoint bits and fixed-point raw results unchanged; simplifying UpperEndpoint to Ceiling must fail                                                                                                                                      |
+| Ordering         | Antisymmetry/transitivity over finite values, infinities, both zeros, several NaN signs/payloads and ID ties; replacing NaN handling with unordered-equals must fail                                                                                                                                                                                        |
+| Vectors          | Current cosine mismatch/empty/clamp behavior, normalization boundary fixtures and nonfinite outcomes; blind `1e-12` to `1e-8` adoption must fail the legacy fixture until its migration is accepted                                                                                                                                                         |
 
 Keep current caller tests unchanged for behavior-preserving moves. Add differential tests
 around the old implementation before removing it. A changed result is reported with its
