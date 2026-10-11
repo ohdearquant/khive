@@ -463,7 +463,7 @@ async fn kind_grouped_admission_matches_per_kind_counts_at_window_boundaries() {
     for kind in EventKind::ALL {
         let count = store
             .count_events(EventFilter {
-                kinds: vec![*kind],
+                kinds: vec![kind],
                 ..filter.clone()
             })
             .await
