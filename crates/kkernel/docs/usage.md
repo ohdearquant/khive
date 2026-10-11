@@ -98,8 +98,10 @@ Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 For stdio, `KHIVE_MCP_STDIO_MAX_LINE_BYTES` sets the maximum raw JSON-RPC
 line length, including its newline. It defaults to 8,454,144 bytes and accepts
 1 through 67,108,864; an invalid value fails startup. An oversized line gets
-a JSON-RPC parse error when it crosses the cap, then the reader discards its
-remainder and serves the next complete request.
+a JSON-RPC Invalid Request error (-32600, without an id) when it crosses the
+cap, then the reader discards its remainder and serves the next complete request.
+With rmcp 2.2 this replaces the previous Parse Error (-32700) response; the
+response deadline and line limits are unchanged.
 
 Every successful startup writes the resolved actor to stderr as
 `actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
