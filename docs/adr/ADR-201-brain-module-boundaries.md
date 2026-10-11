@@ -101,7 +101,11 @@ The stored-event projection includes profile, originating-verb, signal,
 work-class and cost fields already present in event payloads. It is read-only
 interpretation of the public event schema, not posterior training. Move that
 accumulator and its tests with the readers; do not retain a second accumulator
-in brain. Its implementation uses storage events, shared event kinds and JSON
+in brain. At the stated baseline `event_counts_grouping.rs` still imports
+`crate::handlers::{event_cost_unit, event_work_class}` and calls
+`BrainPack::truncatable_total_key`; E2 severs that coupling by moving those three
+helpers into runtime's private `event_plane_read` module with the accumulator, so
+the moved implementation uses only storage events, shared event kinds and JSON
 values. Runtime must not depend on `khive-pack-brain` or import its state,
 interpreter, fold or persistence types.
 
@@ -160,6 +164,10 @@ split. Any later retirement needs its own compatibility decision. Keep
 score/decay consolidation proceeds under its own numerical contract.
 
 ## Rollout and review units
+
+Rollout batches by crate: the B units land as one `khive-pack-brain` pull request
+(two only if B4 requires it), and E1 with E2 as one `khive-runtime` pull request;
+the table below remains the review map for those pull requests.
 
 The table below identifies review units and their dependencies, not a mandatory
 one-PR-per-unit schedule. Related units and issues may share one PR when their
