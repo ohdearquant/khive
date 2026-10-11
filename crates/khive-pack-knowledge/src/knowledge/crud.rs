@@ -1089,18 +1089,14 @@ impl KnowledgeHandlers {
                         "next_after": next_after,
                     }))
                 } else {
-                    let total_row = reader
-                        .query_scalar(SqlStatement {
+                    let total = reader
+                        .count(SqlStatement {
                             sql: khive_runtime::sql!("knowledge_domain_count").into(),
                             params: vec![SqlValue::Text(ns)],
                             label: None,
                         })
                         .await
                         .map_err(|e| sql_err("list domains count", e))?;
-                    let total = match total_row {
-                        Some(SqlValue::Integer(n)) => n,
-                        _ => 0,
-                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
@@ -1219,18 +1215,14 @@ impl KnowledgeHandlers {
                 } else {
                     let mut count_params = vec![SqlValue::Text(ns)];
                     count_params.extend(count_status_params);
-                    let total_row = reader
-                        .query_scalar(SqlStatement {
+                    let total = reader
+                        .count(SqlStatement {
                             sql: count_sql,
                             params: count_params,
                             label: Some("knowledge.list.atom_count".into()),
                         })
                         .await
                         .map_err(|e| sql_err("list atoms count", e))?;
-                    let total = match total_row {
-                        Some(SqlValue::Integer(n)) => n,
-                        _ => 0,
-                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
@@ -1377,8 +1369,8 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("stats atom aggregates", e))?;
 
-        let domain_count = reader
-            .query_scalar(SqlStatement {
+        let total_domains = reader
+            .count(SqlStatement {
                 sql: khive_runtime::sql!("knowledge_domain_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: None,
@@ -1386,8 +1378,8 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("stats domains", e))?;
 
-        let event_count = reader
-            .query_scalar(SqlStatement {
+        let total_events = reader
+            .count(SqlStatement {
                 sql: khive_runtime::sql!("knowledge_event_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.event_count".into()),
@@ -1396,7 +1388,7 @@ impl KnowledgeHandlers {
             .map_err(|e| sql_err("stats events", e))?;
 
         let retrieval_eval_run_count = reader
-            .query_scalar(SqlStatement {
+            .count(SqlStatement {
                 sql: khive_runtime::sql!("knowledge_eval_run_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.eval_run_count".into()),
@@ -1417,45 +1409,20 @@ impl KnowledgeHandlers {
             .as_ref()
             .and_then(|row| row_i64(row, "total_atoms"))
             .unwrap_or(0);
-        let total_domains = match domain_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
         let finalized = atom_stats
             .as_ref()
             .and_then(|row| row_i64(row, "finalized_atoms"))
             .unwrap_or(0);
-        let total_events = match event_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
-        let retrieval_eval_run_count = match retrieval_eval_run_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
         let retrieval_eval_coverage = latest_retrieval_eval
             .as_ref()
-            .and_then(|row| match row.get("precision_at_5") {
-                Some(SqlValue::Float(value)) => Some(*value),
-                Some(SqlValue::Integer(value)) => Some(*value as f64),
-                _ => None,
-            })
+            .and_then(|row| row.f64("precision_at_5").ok())
             .unwrap_or(0.0);
-        let retrieval_eval_last_run_at =
-            latest_retrieval_eval
-                .as_ref()
-                .and_then(|row| match row.get("run_at") {
-                    Some(SqlValue::Integer(value)) => Some(*value),
-                    _ => None,
-                });
-        let retrieval_eval_last_mrr =
-            latest_retrieval_eval
-                .as_ref()
-                .and_then(|row| match row.get("mrr") {
-                    Some(SqlValue::Float(value)) => Some(*value),
-                    Some(SqlValue::Integer(value)) => Some(*value as f64),
-                    _ => None,
-                });
+        let retrieval_eval_last_run_at = latest_retrieval_eval
+            .as_ref()
+            .and_then(|row| row.i64_or_none("run_at"));
+        let retrieval_eval_last_mrr = latest_retrieval_eval
+            .as_ref()
+            .and_then(|row| row.f64("mrr").ok());
 
         let eval_coverage = if total_atoms > 0 {
             finalized as f64 / total_atoms as f64

@@ -150,21 +150,15 @@ pub(super) fn has_domain_mirror_tag(tags: &str) -> bool {
 }
 
 pub(super) fn row_str(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
-    match row.get(col) {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
+    row.text_or_none(col).map(str::to_owned)
 }
 
 pub(super) fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
-    match row.get(col) {
-        Some(SqlValue::Integer(n)) => Some(*n),
-        _ => None,
-    }
+    row.i64_or_none(col)
 }
 
 pub(super) fn row_bool(row: &khive_storage::types::SqlRow, col: &str) -> bool {
-    matches!(row.get(col), Some(SqlValue::Integer(1)))
+    row.i64_or_none(col) == Some(1)
 }
 
 pub(crate) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
@@ -415,8 +409,8 @@ pub(super) async fn compute_embedding_coverage(
         .await
         .map_err(|e| sql_err("stats embedding coverage reader", e))?;
 
-    let count = reader
-        .query_scalar(SqlStatement {
+    let atoms_with_vector = reader
+        .count(SqlStatement {
             sql: format!(
                 "SELECT COUNT(DISTINCT a.id) \
                  FROM knowledge_atoms a \
@@ -435,16 +429,6 @@ pub(super) async fn compute_embedding_coverage(
         })
         .await
         .map_err(|e| sql_err("stats embedding coverage", e))?;
-
-    let atoms_with_vector = match count {
-        Some(SqlValue::Integer(n)) => n,
-        Some(other) => {
-            return Err(RuntimeError::Internal(format!(
-                "stats embedding coverage returned non-integer count: {other:?}"
-            )));
-        }
-        None => 0,
-    };
 
     Ok(atoms_with_vector as f64 / total_atoms as f64)
 }
