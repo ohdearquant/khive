@@ -16,7 +16,7 @@ const EVAL_RUNS_DDL: &str = "CREATE TABLE knowledge_eval_runs (\
     precision_at_5 REAL NOT NULL, recall_at_5 REAL NOT NULL, mrr REAL NOT NULL, \
     notes TEXT)";
 
-const SNAPSHOTS_DDL: &str = "CREATE TABLE retrieval_snapshots (\
+const SNAPSHOTS_DDL: &str = "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
     namespace TEXT NOT NULL, index_type TEXT NOT NULL, snapshot BLOB NOT NULL, \
     created_at INTEGER NOT NULL, PRIMARY KEY (namespace, index_type))";
 
@@ -573,6 +573,13 @@ fn snapshots_sharing_an_index_type_across_source_and_target_do_not_refuse_the_mo
 #[test]
 fn a_store_without_the_snapshot_table_moves_cleanly() {
     let conn = store(&[EVAL_RUNS_DDL]);
+    conn.execute_batch("DROP TABLE retrieval_snapshots")
+        .unwrap();
+    assert!(!namespace_census::census(&conn)
+        .unwrap()
+        .tables
+        .iter()
+        .any(|table| table.name == "retrieval_snapshots"));
     seed_note(&conn, "n1", "source", "observation");
     eval_run(&conn, "run-1", "source");
 
