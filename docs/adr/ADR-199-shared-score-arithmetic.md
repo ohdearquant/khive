@@ -141,9 +141,10 @@ it. If a rate-to-half-life conversion is exposed, an unrepresentable positive re
 must refuse rather than construct zero or infinity as a valid `HalfLife`.
 
 Evaluation forms are fixed so that two conforming implementations return the same bits.
-The PowerLaw scalar application evaluates the existing left-to-right `value*h/(h+t)`
-whenever both `value*h` and `h+t` are finite, and `value/(1+t/h)` only when one of them
-overflows; `factor(t)` is `h/(h+t)` when `h+t` is finite and `1/(1+t/h)` otherwise. A
+After the identity shortcuts above, so only at positive time, the PowerLaw scalar
+application evaluates the existing left-to-right `value*h/(h+t)` whenever both `value*h`
+and `h+t` are finite, and `value/(1+t/h)` only when one of them overflows; `factor(t)`
+is `h/(h+t)` when `h+t` is finite and `1/(1+t/h)` otherwise. A
 single rewritten expression for all inputs does not conform: on ordinary finite inputs
 `value/(1+t/h)` and `value*(h/(h+t))` each differ from the existing expression in
 low-order bits for a large share of values, and those values feed a `powf` ranking term and a
@@ -179,7 +180,9 @@ Adoption must preserve these existing differences explicitly:
   and checks downstream ranking, thresholds and adjustment order.
 - Stabilization is itself observable: at `salience=0.75, h=t=f64::MAX`, the legacy
   PowerLaw expression returns zero whereas the stable result is `0.375`; at zero time
-  and the smallest positive `h`, multiplying `0.5*h` first can underflow. Adoption must
+  and the smallest positive `h`, multiplying `0.5*h` first can underflow; at zero time
+  with ordinary `h`, the legacy `value*h/h` differs from the returned input in the last
+  bit for roughly one value in nine. Adoption must
   accept these changed cases explicitly rather than describe them as pure moves. For
   valid inputs at positive time, the PowerLaw evaluation rule above confines changed bits
   to inputs where a legacy intermediate overflows.
