@@ -682,11 +682,12 @@ pub(crate) async fn handle_ingest(
     // field is absent on an ingest (`subject`, `outbound_ref`,
     // `sent_by_process`), preventing adapter metadata from fabricating a
     // contract field or process provenance.
+    // `forwarded` is reserved for message provenance, not adapter metadata.
     if let Some(metadata) = p.metadata {
         if let Some(obj) = props.as_object_mut() {
             for (k, v) in metadata {
                 if COMM_STABLE_PROPERTY_KEYS.contains(&k.as_str())
-                    || matches!(k.as_str(), "channel_kind" | "channel_slug")
+                    || matches!(k.as_str(), "channel_kind" | "channel_slug" | "forwarded")
                 {
                     continue;
                 }
