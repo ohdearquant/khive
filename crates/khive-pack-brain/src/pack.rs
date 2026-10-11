@@ -500,6 +500,10 @@ impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for B
         self.0.kind_hook(kind)
     }
 
+    fn context_contributor(&self) -> Option<Arc<dyn khive_runtime::ContextContributor>> {
+        self.0.context_contributor()
+    }
+
     fn schema_plan(&self) -> khive_runtime::SchemaPlan {
         self.0.schema_plan()
     }

@@ -23,6 +23,7 @@ pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
+pub mod context;
 pub mod cost_unit;
 pub mod credentials;
 mod visibility_receipts;
@@ -32,6 +33,7 @@ pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
 pub mod embedding;
+pub mod embedding_reranker;
 pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
@@ -100,6 +102,8 @@ pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
 
+pub use context::{ContextContributor, ContextRequest, ContextSlice, ScoreSemantics};
+
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use agent_lifecycle::{
     apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
@@ -142,6 +146,7 @@ pub use daemon::{
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
+pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
     BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,

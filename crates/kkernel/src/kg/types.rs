@@ -24,6 +24,9 @@ pub enum KgCommand {
     #[command(visible_alias = "sync")]
     Fetch(FetchArgs),
 
+    /// Resolve a remote Git ref and update its commit in `.khive/kg/schema.yaml`.
+    Update(UpdateArgs),
+
     /// Export a namespace-scoped KG archive from a SQLite DB.
     Export(ExportArgs),
 
@@ -45,6 +48,21 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+/// CLI arguments for `kkernel kg update`.
+#[derive(clap::Parser, Debug)]
+pub struct UpdateArgs {
+    /// Remote name in `.khive/kg/schema.yaml`.
+    pub remote: String,
+
+    /// Repository containing `.khive/kg/schema.yaml`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Git ref to resolve; defaults to the remote's `ref`, then its HEAD.
+    #[arg(long = "ref")]
+    pub git_ref: Option<String>,
 }
 
 /// CLI arguments for the read-only `kkernel kg diff` renderer.

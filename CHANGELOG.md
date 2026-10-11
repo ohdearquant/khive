@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
   merging. Original-query fallback preserves its bytes, generated variants are validated
   as a whole, and admitted IDs retain variant and retrieval-source attribution.
+- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
+  and atomically updates that remote in an existing schema.yaml, reporting both old
+  and new commits while preserving archive-content pins and other YAML values.
+  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
+- Runtime packs may expose an optional `ContextContributor` capability with owned request
+  and slice types and explicit score semantics. Registry discovery preserves pack order;
+  context composition and execution remain separate.
+- `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
+  preserves missing vectors with their incoming scores and an explicit flag, and implements
+  the retrieval `Reranker` trait without a namespace-wide candidate cut.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
@@ -63,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Public brain posterior folds use the shared filter and map combinators, preserving
   reducer state, standalone section-feedback handling and offered-event counts.
+- Pool configuration, WAL ceiling policy and test-store guards move into an internal
+  configuration module while preserving public paths, defaults and refusal behavior.
 - Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
   verification uses the shared file identity type, preserving held handles and durability barriers.
 - Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
@@ -117,6 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments remain part of those tokens.
 - Pack-version regressions compare each linked pack with its factory's declared version and cover
   independent factory versions through the production JSON and human list formatter (#5086).
+- Finding create/update and findings-file ingestion mask credential-shaped rejected enum values
+  while retaining ordinary values, error kinds, and accepted-value lists (Refs #4585).
 
 ### Breaking (Rust crates)
 
