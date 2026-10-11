@@ -1218,7 +1218,7 @@ jobs:
       - name: Check workspace on the declared minimum Rust version
         run: cargo +1.95.0 check --workspace --locked
 
-  # Keep this job outside ci-gate until a week of successful main merges.
+  # Required by ci-gate after the successful main observation week.
   # Sequential feature checks reuse one Linux runner without hiding later failures.
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
@@ -1625,6 +1625,7 @@ jobs:
       - vamana-portability
       - minio-blob-compat
       - msrv-check
+      - core-only
     if: always()
     steps:
       - name: Check aggregated job results

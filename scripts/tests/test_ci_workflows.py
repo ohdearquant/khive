@@ -1894,12 +1894,12 @@ class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
                      "descriptions_are_written_for_callers"):
             self.assertTrue((REPO_ROOT / "crates/kkernel/tests" / f"{test}.rs").is_file(), test)
 
-    def test_core_only_job_stays_outside_the_required_gate(self):
+    def test_core_only_job_is_required_by_the_gate(self):
         workflow = workflow_text("ci.yml")
         gate_needs = indented_block(indented_block(workflow, "ci-gate", 2), "needs", 4)
         needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
         self.assertIn("msrv-check", needs, "the needs list was read")
-        self.assertNotIn("core-only", needs)
+        self.assertIn("core-only", needs)
 
 
 class HistoricalReplayWorkflowTests(unittest.TestCase):
