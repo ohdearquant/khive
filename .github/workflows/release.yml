@@ -202,14 +202,32 @@ jobs:
     #   gh api repos/<owner>/<repo>/environments/publish \
     #     --jq '{protection_rules, deployment_branch_policy}'
     environment: publish
+    # npm trusted publishing: each `npm publish` below authenticates with a
+    # short-lived OIDC token issued to this job, so no long-lived npm token is
+    # stored in the repository. Every published package (the six kernel
+    # subpackages, `khive` and `@khive-ai/cli`) must list this repository, the
+    # `release.yml` workflow and the `publish` environment as its trusted
+    # publisher in its npmjs.com settings; a package without that entry refuses
+    # the publish. npm generates provenance attestations automatically on this
+    # path. Job-level permissions replace the workflow-level `contents: write`
+    # for this job only; it needs to read the checkout and request the token.
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 bundles npm 10.
+      - name: Install npm with trusted publishing support
+        run: |
+          npm install -g npm@11.5.1
+          npm --version
 
       # Version comes from the required workflow_dispatch input (tag-push publishing
       # was removed in #222). Passed via env var to avoid shell-interpolation issues
@@ -283,38 +301,26 @@ jobs:
       - name: Publish @khive-ai/kernel-darwin-arm64
         working-directory: npm/kernel-darwin-arm64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @khive-ai/kernel-darwin-x64
         working-directory: npm/kernel-darwin-x64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @khive-ai/kernel-linux-x64-gnu
         working-directory: npm/kernel-linux-x64-gnu
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @khive-ai/kernel-linux-x64-musl
         working-directory: npm/kernel-linux-x64-musl
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @khive-ai/kernel-linux-arm64
         working-directory: npm/kernel-linux-arm64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @khive-ai/kernel-win32-x64
         working-directory: npm/kernel-win32-x64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Only reached if all six subpackage publishes succeeded.
       - name: Set umbrella version and pin subpackage versions
@@ -334,8 +340,6 @@ jobs:
       - name: Publish khive (umbrella)
         working-directory: npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # The alias carries an exact-version dependency on the umbrella, so it
       # must be rewritten and published only after khive@VERSION is available.
@@ -354,5 +358,3 @@ jobs:
       - name: Publish @khive-ai/cli (compatibility alias)
         working-directory: npm/cli-alias
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
