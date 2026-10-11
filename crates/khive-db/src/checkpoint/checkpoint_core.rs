@@ -430,6 +430,39 @@ pub(super) fn maybe_truncate(
     sidecar_attribution
 }
 
+/// ADR-091 Plank 2: track measured TRUNCATE outcomes that fail to bring
+/// `wal_pages` below `warn_pages`, firing a one-shot escalated WARN at the
+/// third such failure. An unmeasured attempt leaves the streak unchanged;
+/// only a measured result below `warn_pages` resets it.
+pub(super) fn note_truncate_outcome(
+    config: &CheckpointConfig,
+    wal_pages_after: Option<u64>,
+    state: &mut TruncateState,
+) {
+    // Metrics read-surface (load/perf harness): this function runs exactly
+    // once per genuine TRUNCATE attempt (both the `Ok` and `Err` outcome
+    // arms in `maybe_truncate` call it once each), so incrementing here
+    // counts total attempts without a separate call site.
+    TRUNCATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(wal_pages_after) = wal_pages_after {
+        if wal_pages_after >= config.warn_pages {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures == 3 {
+                tracing::warn!(
+                    wal_pages_after,
+                    warn_threshold = config.warn_pages,
+                    "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
+                );
+            }
+        } else {
+            state.consecutive_failures = 0;
+        }
+    }
+
+    TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 pub(super) mod truncate_report_test_sync {
     use std::path::{Path, PathBuf};
@@ -477,37 +510,4 @@ pub(super) mod truncate_report_test_sync {
         let _ = hook.reached_tx.send(());
         let _ = hook.proceed_rx.recv();
     }
-}
-
-/// ADR-091 Plank 2: track measured TRUNCATE outcomes that fail to bring
-/// `wal_pages` below `warn_pages`, firing a one-shot escalated WARN at the
-/// third such failure. An unmeasured attempt leaves the streak unchanged;
-/// only a measured result below `warn_pages` resets it.
-pub(super) fn note_truncate_outcome(
-    config: &CheckpointConfig,
-    wal_pages_after: Option<u64>,
-    state: &mut TruncateState,
-) {
-    // Metrics read-surface (load/perf harness): this function runs exactly
-    // once per genuine TRUNCATE attempt (both the `Ok` and `Err` outcome
-    // arms in `maybe_truncate` call it once each), so incrementing here
-    // counts total attempts without a separate call site.
-    TRUNCATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-
-    if let Some(wal_pages_after) = wal_pages_after {
-        if wal_pages_after >= config.warn_pages {
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            if state.consecutive_failures == 3 {
-                tracing::warn!(
-                    wal_pages_after,
-                    warn_threshold = config.warn_pages,
-                    "WAL TRUNCATE has failed to clear WAL pressure for 3 consecutive attempts"
-                );
-            }
-        } else {
-            state.consecutive_failures = 0;
-        }
-    }
-
-    TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }

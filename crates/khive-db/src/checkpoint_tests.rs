@@ -1927,7 +1927,7 @@ fn async_checkpoint_source_keeps_enumeration_behind_awaited_spawn_blocking() {
     let truncate_core = section(
         source,
         "fn maybe_truncate(",
-        "#[cfg(test)]\npub(super) mod truncate_report_test_sync",
+        "/// ADR-091 Plank 2: track measured TRUNCATE outcomes",
     );
     let report_logger = section(
         source,
