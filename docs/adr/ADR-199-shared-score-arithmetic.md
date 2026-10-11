@@ -77,9 +77,16 @@ and ordered adjustment chain, return zero for a nonfinite final result, otherwis
 once. Inserting a clamp after each multiplication is forbidden as an equivalent adoption.
 Likewise, the minimum-score parser must preserve its finite/range errors, not clamp them.
 
+`UnitScore::boost(self, weight, x)` is an explicitly terminal bounded operation:
+evaluate `self.value() * (1 + weight * x)`, then clamp the finite result to `[0,1]`.
+It satisfies #4479's bounded-boost contract, including saturation at one. It is not
+an equivalent replacement for an intermediate multiplication in a longer adjustment
+chain. Inputs and intermediates must be finite; overflow returns an error before
+clamping. Finite results below zero clamp to zero.
+
 Two scalar helpers belong beside the type rather than returning it:
 
-- `boost(weight, x)` computes `1 + weight * x`.
+- `boost_factor(weight, x)` computes `1 + weight * x` without a unit-interval clamp.
 - `affine_clamped(mean, weight, lo, hi)` computes
   `clamp(1 + weight * (mean - 0.5), lo, hi)`.
 
