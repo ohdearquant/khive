@@ -249,7 +249,7 @@ fn record_post_commit_degradation(
 /// Legacy methods cannot return both their original result and the new report.
 /// Give direct callers a typed, non-retryable error with the committed record
 /// handle and every failed stage instead of silently dropping the report.
-fn legacy_post_commit_result<T>(
+pub(crate) fn legacy_post_commit_result<T>(
     operation: &'static str,
     id: Uuid,
     value: T,
