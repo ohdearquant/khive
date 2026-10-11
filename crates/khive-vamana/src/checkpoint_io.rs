@@ -241,12 +241,9 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::{
-                ffi::CString,
-                os::fd::{AsRawFd as _, FromRawFd as _},
-            };
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             // SAFETY: the pinned directory descriptor and validated name live
             // through this call. O_NOFOLLOW rejects a planted final symlink.
             let fd = unsafe {
@@ -340,6 +337,42 @@ impl CheckpointDirectory {
         }
     }
 
+    /// Commit metadata before promoting the four segments already staged by
+    /// the caller. Callers hold `.checkpoint.lock` across staging and this
+    /// boundary. An interrupted promotion requires restaging all four segments
+    /// before retrying; this method does not resume a partial generation.
+    pub(crate) fn publish_v2(&self, metadata: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use khive_fs::atomic_publish::{publish_atomic_at_detailed, StaleTmp};
+            use std::io::Write as _;
+
+            publish_atomic_at_detailed(
+                &self.dir,
+                "metadata.bin.tmp",
+                "metadata.bin",
+                StaleTmp::Refuse,
+                |file| file.write_all(metadata),
+            )
+            .map_err(checkpoint_publication_error)?;
+        }
+        #[cfg(not(unix))]
+        {
+            self.stage("metadata.bin.tmp", metadata)?;
+            self.rename("metadata.bin.tmp", "metadata.bin")?;
+            self.sync()?;
+        }
+
+        // Metadata is durable before any segment promotion. A subsequent
+        // failure can leave mixed live segments; checksums refuse that state
+        // and load_or_build can rebuild it from the caller's corpus.
+        self.rename("vectors.bin.v2new", "vectors.bin")?;
+        self.rename("graph.bin.v2new", "graph.bin")?;
+        self.rename("lifecycle.bin.v2new", "lifecycle.bin")?;
+        self.rename("codes.bin.v2new", "codes.bin")?;
+        self.sync()
+    }
+
     pub(crate) fn sync(&self) -> io::Result<()> {
         #[cfg(any(unix, windows))]
         {
@@ -358,9 +391,9 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::{ffi::CString, os::fd::AsRawFd as _};
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            use std::os::fd::AsRawFd as _;
+            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             // SAFETY: the name and pinned directory descriptor are live. Unlinking
             // a planted link removes only that directory entry.
             if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
@@ -456,4 +489,133 @@ fn component_name(name: &str) -> io::Result<&str> {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     Ok(name)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::CheckpointDirectory;
+    use std::{collections::BTreeMap, fs, io, os::unix::fs::symlink, path::Path};
+
+    const SEGMENTS: [(&str, &str, &[u8]); 4] = [
+        ("vectors.bin.v2new", "vectors.bin", b"new vectors"),
+        ("graph.bin.v2new", "graph.bin", b"new graph"),
+        ("lifecycle.bin.v2new", "lifecycle.bin", b"new lifecycle"),
+        ("codes.bin.v2new", "codes.bin", b"new codes"),
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Entry {
+        File(Vec<u8>),
+        Directory,
+        Link(std::path::PathBuf),
+    }
+
+    // Capture every entry, its type, and all regular-file bytes. A refusal or
+    // partial promotion must not hide a change behind a count-only assertion.
+    fn snapshot(path: &Path) -> BTreeMap<std::path::PathBuf, Entry> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<std::path::PathBuf, Entry>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_owned();
+                let kind = entry.file_type().unwrap();
+                let value = if kind.is_symlink() {
+                    Entry::Link(fs::read_link(&path).unwrap())
+                } else if kind.is_dir() {
+                    visit(root, &path, entries);
+                    Entry::Directory
+                } else {
+                    assert!(kind.is_file());
+                    Entry::File(fs::read(&path).unwrap())
+                };
+                entries.insert(relative, value);
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(path, path, &mut entries);
+        entries
+    }
+
+    fn seed_and_stage(path: &Path, checkpoint: &CheckpointDirectory) {
+        fs::write(path.join("metadata.bin"), b"old metadata").unwrap();
+        for (staged, live, bytes) in SEGMENTS {
+            fs::write(path.join(live), format!("old {live}")).unwrap();
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+    }
+
+    fn committed_snapshot(
+        mut before: BTreeMap<std::path::PathBuf, Entry>,
+    ) -> BTreeMap<std::path::PathBuf, Entry> {
+        before.insert("metadata.bin".into(), Entry::File(b"new metadata".to_vec()));
+        for (staged, live, bytes) in SEGMENTS {
+            before.remove(Path::new(staged));
+            before.insert(live.into(), Entry::File(bytes.to_vec()));
+        }
+        before
+    }
+
+    #[test]
+    fn v2_partial_promotion_preserves_exact_state_and_retries_after_complete_restage() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = CheckpointDirectory::open(dir.path()).unwrap();
+        seed_and_stage(dir.path(), &checkpoint);
+        // A real rename obstruction after vectors have been promoted.
+        fs::remove_file(dir.path().join("graph.bin")).unwrap();
+        fs::create_dir(dir.path().join("graph.bin")).unwrap();
+        fs::write(dir.path().join("graph.bin/child"), b"precious graph entry").unwrap();
+        let mut expected = snapshot(dir.path());
+        expected.insert("metadata.bin".into(), Entry::File(b"new metadata".to_vec()));
+        expected.insert("vectors.bin".into(), Entry::File(b"new vectors".to_vec()));
+        expected.remove(Path::new("vectors.bin.v2new"));
+
+        let error = checkpoint.publish_v2(b"new metadata").unwrap_err();
+        assert!(
+            error.raw_os_error().is_some(),
+            "retain the rename's native cause"
+        );
+        assert_eq!(snapshot(dir.path()), expected);
+
+        fs::remove_file(dir.path().join("graph.bin/child")).unwrap();
+        fs::remove_dir(dir.path().join("graph.bin")).unwrap();
+        // The vectors staging entry was consumed. Production retries by
+        // staging all four segments again, never by resuming this boundary.
+        for (staged, _, bytes) in SEGMENTS {
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+        let expected = committed_snapshot(snapshot(dir.path()));
+        checkpoint.publish_v2(b"new metadata").unwrap();
+        assert_eq!(snapshot(dir.path()), expected);
+    }
+
+    #[test]
+    fn v2_metadata_refusal_preserves_all_live_and_staged_entries_before_any_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        fs::write(&target, b"outside bytes").unwrap();
+        let checkpoint = CheckpointDirectory::open(dir.path()).unwrap();
+        seed_and_stage(dir.path(), &checkpoint);
+        symlink(&target, dir.path().join("metadata.bin.tmp")).unwrap();
+        let before = snapshot(dir.path());
+        let outside_before = snapshot(outside.path());
+
+        let error = checkpoint.publish_v2(b"new metadata").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "checkpoint staging entry is not a regular file"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(snapshot(outside.path()), outside_before);
+
+        fs::remove_file(dir.path().join("metadata.bin.tmp")).unwrap();
+        for (staged, _, bytes) in SEGMENTS {
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+        let expected = committed_snapshot(snapshot(dir.path()));
+        checkpoint.publish_v2(b"new metadata").unwrap();
+        assert_eq!(snapshot(dir.path()), expected);
+        assert_eq!(snapshot(outside.path()), outside_before);
+    }
 }
