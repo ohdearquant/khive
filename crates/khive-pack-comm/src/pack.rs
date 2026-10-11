@@ -8,7 +8,7 @@ use khive_runtime::{
     EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, NoteEmbeddingPolicy,
     NoteEmbeddingPolicySpec, RuntimeError, VerbRegistry,
 };
-use khive_types::{HandlerDef, Pack};
+use khive_types::{HandlerDef, NotePropertyPolicySpec, Pack, PropertyPolicy};
 
 use crate::handlers;
 use crate::inbox_signal::InboxSignal;
@@ -41,6 +41,53 @@ impl Pack for CommPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &COMM_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const NOTE_PROPERTY_POLICIES: &'static [NotePropertyPolicySpec] = &[
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "quarantined",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "channel_kind",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "channel_slug",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "delivery_hold",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "delivery_hold_reason",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "delivery_hold_at",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "message",
+            key: "external_id_diagnostic_note_id",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "channel_health",
+            key: "channel_kind",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+        NotePropertyPolicySpec {
+            kind: "channel_health",
+            key: "channel_slug",
+            policy: PropertyPolicy::OwnerOnly,
+        },
+    ];
     const NOTE_EMBEDDING_POLICIES: &'static [NoteEmbeddingPolicySpec] =
         &[NoteEmbeddingPolicySpec {
             kind: "message",
@@ -338,6 +385,9 @@ inventory::submit! { khive_runtime::PackRegistration(&CommPackFactory) }
 #[async_trait]
 impl PackRuntime for CommPack {
     khive_runtime::pack_runtime_metadata!();
+    fn note_property_policies(&self) -> &'static [NotePropertyPolicySpec] {
+        <Self as Pack>::NOTE_PROPERTY_POLICIES
+    }
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
         match kind {
             "message" => Some(std::sync::Arc::new(MessageHook)),

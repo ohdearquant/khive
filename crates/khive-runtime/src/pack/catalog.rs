@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use khive_types::NotePropertyPolicySpec;
 use serde_json::Value;
 
 use crate::context::ContextContributor;
@@ -474,6 +475,13 @@ impl VerbRegistry {
     /// Used by the runtime for lifecycle introspection and future enforcement.
     pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
         self.collect_pack_items(|pack| pack.note_kind_specs().iter())
+    }
+
+    /// Copy the validated boot snapshot in topological pack/declaration order.
+    ///
+    /// This metadata-only accessor never calls packs or changes write enforcement.
+    pub fn all_note_property_policies(&self) -> Vec<NotePropertyPolicySpec> {
+        self.note_property_policies.as_ref().clone()
     }
 
     /// Collect pack-declared embedding policies for registered note kinds.
