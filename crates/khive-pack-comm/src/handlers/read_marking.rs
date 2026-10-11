@@ -293,8 +293,7 @@ pub(super) async fn validate_read_target(
     let store = runtime.notes(token)?;
     let note = store
         .get_note(id)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
+        .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("read: message {id} not found")))?;
 
     validate_read_note(token, id, note)
