@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
+  `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
+  constructors must supply it. Recall handlers supply zero pending graph gathering,
+  default weights remain empty, and rerank provenance records the recognized feature.
 - `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
   merging. Original-query fallback preserves its bytes, generated variants are validated
   as a whole, and admitted IDs retain variant and retrieval-source attribution.
