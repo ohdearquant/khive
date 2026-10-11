@@ -260,10 +260,9 @@ impl VerbRegistry {
     /// pipeline steps not surfaced on the MCP wire. Returned with `'static`
     /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name))
+        self.registered_handlers()
+            .map(|(_, handler)| handler)
+            .filter(|handler| self.is_enabled_verb(handler))
             .collect()
     }
 
@@ -274,12 +273,9 @@ impl VerbRegistry {
     /// Use `all_handlers_with_names` when internal handlers must
     /// also be enumerated (e.g. runtime introspection).
     pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
-            .filter(|(_, h)| {
-                matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name)
-            })
+        self.registered_handlers()
+            .map(|(pack, handler)| (pack.name(), handler))
+            .filter(|(_, handler)| self.is_enabled_verb(handler))
             .collect()
     }
 
@@ -289,10 +285,22 @@ impl VerbRegistry {
     /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
     /// the complete handler surface.
     pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
+        self.registered_handlers()
+            .map(|(pack, handler)| (pack.name(), handler))
             .collect()
+    }
+
+    fn registered_handlers(
+        &self,
+    ) -> impl Iterator<Item = (&dyn PackRuntime, &'static HandlerDef)> + '_ {
+        self.packs.iter().flat_map(|pack| {
+            let pack = pack.as_ref();
+            pack.handlers().iter().map(move |handler| (pack, handler))
+        })
+    }
+
+    fn is_enabled_verb(&self, handler: &HandlerDef) -> bool {
+        matches!(handler.visibility, Visibility::Verb) && !self.is_verb_disabled(handler.name)
     }
 
     /// Collect declared kinds once, retaining their first-seen registration order.
@@ -361,12 +369,7 @@ impl VerbRegistry {
     /// Borrow a registered pack's shared host state without reconstructing
     /// that pack. Missing packs, absent state, and type mismatches return None.
     pub fn pack_host_state<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
-        self.packs
-            .iter()
-            .find(|pack| pack.name() == name)?
-            .host_state()?
-            .downcast::<T>()
-            .ok()
+        self.find_pack(name)?.host_state()?.downcast::<T>().ok()
     }
 
     /// Factory-reported version for a registered pack.
@@ -379,10 +382,7 @@ impl VerbRegistry {
 
     /// Declared dependencies for a registered pack.
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.requires())
+        self.find_pack(name).map(|pack| pack.requires())
     }
 
     /// Note kinds owned by a specific registered pack.
@@ -390,10 +390,7 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. The slice is
     /// the pack's `NOTE_KINDS` constant — `'static` lifetime, no allocation.
     pub fn pack_note_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.note_kinds())
+        self.find_pack(name).map(|pack| pack.note_kinds())
     }
 
     /// Entity kinds owned by a specific registered pack.
@@ -401,10 +398,7 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. The slice is
     /// the pack's `ENTITY_KINDS` constant — `'static` lifetime, no allocation.
     pub fn pack_entity_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.entity_kinds())
+        self.find_pack(name).map(|pack| pack.entity_kinds())
     }
 
     /// Handlers declared by a specific registered pack.
@@ -412,10 +406,14 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
     /// carries name + description + visibility — sufficient for introspection clients.
     pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
+        self.find_pack(name).map(|pack| pack.handlers())
+    }
+
+    fn find_pack(&self, name: &str) -> Option<&dyn PackRuntime> {
         self.packs
             .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.handlers())
+            .find(|pack| pack.name() == name)
+            .map(|pack| pack.as_ref())
     }
 
     /// Collect pack items in registration order without filtering or deduplication.
