@@ -236,6 +236,31 @@ pub fn check_json_at(value: &serde_json::Value, record: &str, field: &str) -> Ru
     locate(check_json(value), record, field)
 }
 
+/// Scan the supplied note fields in content, name, then properties order.
+///
+/// Returns the first refusal unchanged, located under `record` (for example,
+/// `note[2].properties`). Optional fields are scanned only when present; JSON
+/// scanning uses the same structured-value rules as [`check_json_at`].
+///
+/// This is field scanning only. Callers retain responsibility for property
+/// derivation, reserved-key checks, embedding inputs, and write admission, in
+/// their existing order.
+pub fn check_note_fields_at(
+    content: &str,
+    name: Option<&str>,
+    properties: Option<&serde_json::Value>,
+    record: &str,
+) -> RuntimeResult<()> {
+    check_at(content, record, "content")?;
+    if let Some(name) = name {
+        check_at(name, record, "name")?;
+    }
+    if let Some(properties) = properties {
+        check_json_at(properties, record, "properties")?;
+    }
+    Ok(())
+}
+
 /// `check_tags` that names where it looked.
 pub fn check_tags_at(tags: &[String], record: &str, field: &str) -> RuntimeResult<()> {
     locate(check_tags(tags), record, field)
@@ -491,6 +516,10 @@ pub fn mask_for_redaction_surface(
 #[cfg(test)]
 #[path = "secret_gate/issue_2655_tests.rs"]
 mod issue_2655_tests;
+
+#[cfg(test)]
+#[path = "secret_gate/note_fields_tests.rs"]
+mod note_fields_tests;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

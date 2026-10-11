@@ -616,15 +616,13 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<Vec<EntityCandidateP
     }
     for (index, note) in batch.notes.iter().enumerate() {
         let record = format!("note[{index}]");
-        secret_gate::check_at(&note.content, &record, "content")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(name) = &note.name {
-            secret_gate::check_at(name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if let Some(properties) = &note.properties {
-            secret_gate::check_json_at(properties, &record, "properties")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        secret_gate::check_note_fields_at(
+            &note.content,
+            note.name.as_deref(),
+            note.properties.as_ref(),
+            &record,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -810,6 +808,10 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
 #[cfg(test)]
 #[path = "code_ingest/entity_admission_tests.rs"]
 mod entity_admission_tests;
+
+#[cfg(test)]
+#[path = "code_ingest/note_fields_tests.rs"]
+mod note_fields_tests;
 
 #[cfg(test)]
 mod tests {

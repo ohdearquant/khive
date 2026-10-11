@@ -3910,13 +3910,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check_at(content, "note", "content")?;
-        if let Some(n) = name {
-            crate::secret_gate::check_at(n, "note", "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, "note", "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(content, name, properties.as_ref(), "note")?;
         if let Some(ref attachment) = attachment {
             // The note and its owner row must share the main database. A
             // secondary pack backend cannot atomically root the reference.
@@ -4122,13 +4116,7 @@ impl KhiveRuntime {
             );
         }
         // Secret gate: scan content, optional name, and structured properties.
-        crate::secret_gate::check_at(content, "note", "content")?;
-        if let Some(n) = name {
-            crate::secret_gate::check_at(n, "note", "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, "note", "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(content, name, properties.as_ref(), "note")?;
         // `embedding_content` is a caller-supplied alternate vector-embedding
         // input: it must be a non-empty proper prefix of `content` (never a
         // superset, an unrelated string, or the full text) and passes the
