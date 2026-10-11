@@ -33,8 +33,9 @@ pub use text::{
 };
 pub use vector::{
     OrphanSweepConfig, OrphanSweepResult, PropertyFilter, PropertyOp, VectorIndexKind,
-    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo,
+    VectorMetadataFilter, VectorProvenance, VectorRecord, VectorScanEntry, VectorScanPage,
+    VectorScanRequest, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities,
+    VectorStoreInfo,
 };
 
 use serde::{Deserialize, Serialize};

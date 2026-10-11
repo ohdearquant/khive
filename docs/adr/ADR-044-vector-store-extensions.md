@@ -1277,3 +1277,83 @@ amendment.
 
 **Refs.** #2378 (and its corrections), #2878 (A4), #2307 (query-intent vector must not be
 substituted).
+
+---
+
+## Amendment 6 — paged enumeration of stored vectors (#3686)
+
+**Status: Proposed.** This additive interface proposal does not change the accepted
+status or decisions above. Source preparation is authorized by #3686; architectural
+acceptance and executed native verification remain pending.
+
+### Interface and compatibility
+
+Add an object-safe, defaulted `VectorStore::scan_vectors(VectorScanRequest)` method
+returning `StorageResult<VectorScanPage>`. The request has required exact string
+selectors `namespace`, `embedding_model` and `field`, optional `SubstrateKind`
+`kind`, optional UUID `after`, and a `NonZeroU32` `limit`. A page contains
+`items: Vec<VectorScanEntry>` and `next_after: Option<Uuid>`; each entry contains
+`subject_id: Uuid` and `vectors: Vec<Vec<f32>>`.
+
+The default returns Vectors/`Unsupported` with operation `scan_vectors`; it neither
+returns empty success nor falls back to similarity search. No capability flag is
+added or reinterpreted. The requested-ID `get_vectors` read remains separate.
+
+### Ordered interval contract
+
+All string selectors are literal, including empty or punctuation-bearing values;
+no trimming, implicit defaults or wildcard semantics apply. `kind=None` includes
+all kinds. The handle chooses the physical store; the model selector filters that
+store rather than constructing a different one. Supporting implementations return
+one complete vector record per matching subject in ascending UUID order, strictly
+after the supplied boundary. The boundary need not name an existing row. Reuse the
+same selectors when continuing; changed selectors describe a new interval.
+
+At most `limit` entries are returned. Only an observed extra matching record
+causes `next_after=Some(last emitted subject_id)`; otherwise it is `None`. Empty
+pages and exactly full terminal pages have no continuation. The nonzero limit
+bounds materialized records, not total scan work or vector byte volume. The result
+contains no count or hidden cross-request cursor state.
+
+Each call is an independent read observation, not a snapshot spanning pages. With
+unchanged data, continuation enumerates the scope once. Between calls, insertions
+above the cursor can appear, insertions at or below it cannot, and future rows can
+change or disappear. An advertised continuation can therefore return empty. No
+watermark, restart lease or multi-page transaction is implied.
+
+Rows are stored vectors, including those with missing or tombstoned owners. This
+operation makes no lifecycle, orphan-cleanup or authorization decision. Namespace
+is an exact metadata selector under the existing attribution contract.
+
+### SQLite representation and errors
+
+SQLite uses one admitted reader and one SELECT per page, binding selectors and
+fetching `limit + 1` rows after filtering and binary UUID-text ordering. Only the
+constructor-validated model-table identifier is interpolated. No MATCH, model
+loading, ANN access or write runs. Existing request stop and driver classifications
+are preserved under operation `vec_scan_vectors`.
+
+Typed writers persist canonical lowercase dashed UUID text. Any encountered
+malformed or noncanonical ID is a whole-page conversion error, so a normalized
+cursor cannot disagree with the stored ordering. The public typed cursor keeps
+the existing UUID serde grammar. Embeddings require the checked expected native
+f32 byte length and use the shared native decoder without scoring or normalization.
+SQLite returns one vector per subject; the capability keeps the multi-vector
+shape. All returned rows, including lookahead, must decode successfully before a
+page is returned. No nonfinite JSON round-trip guarantee is introduced.
+
+### Scope and verification gates
+
+Issue #3686 also permits making shared model-key derivation public instead of
+migrating builders. The public `khive_runtime::config::sanitize_key` already serves
+both memory and knowledge builders. Their existing corpus scans and same-statement
+ANN-log watermark reads remain unchanged; ordinary pages cannot substitute for
+that stronger contract.
+
+Required native verification covers file reopen and memory vec0 reads with exact
+float bits; every filter before LIMIT; boundary, lookahead and terminal cursors;
+trait-object Unsupported and wire refusal; deterministic inter-page mutations;
+raw owner/tombstone behavior; malformed ID/blob and overflow refusal; and request
+cancellation/deadline precedence with subsequent healthy reads. The source change
+and authored tests do not establish that those executions passed. Acceptance of
+this amendment and native results are separate gates before claiming completion.
