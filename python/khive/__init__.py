@@ -1,10 +1,11 @@
-"""khive-py — Python client for the khive knowledge-graph database.
+"""khive — Python client for the khive knowledge-graph database.
 
 Talks to the khived daemon over its native Unix-socket wire; never opens
 the database file. See `client.Khive` for the API and `transport` for the
 wire contract.
 """
 
+from .binary import find_kkernel
 from .client import Khive
 from .cloud import cloud
 from .errors import (
@@ -84,8 +85,9 @@ __all__ = [
     "TransportError",
     "cloud",
     "encode",
+    "find_kkernel",
     "http_op_error_code",
     "op",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.12.0"

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Python client is published to PyPI as `khive`, with the `kkernel` binary of the same
+  version inside its platform wheels (macOS arm64/x86_64, Linux glibc and musl x86_64, Linux
+  aarch64, Windows x86_64). `khive.find_kkernel()` locates the binary. The distribution was
+  named `khive-py`; its version now follows the workspace.
+- The Release workflow takes a `dry_run` input that builds and checks every artifact without
+  publishing.
 - Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
   `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
   constructors must supply it. Recall handlers supply zero pending graph gathering,
@@ -42,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The x86_64 Linux glibc binary in the npm package required glibc 2.39 and failed to start on
+  Ubuntu 22.04, Debian 12 and RHEL 9. It is now built with zig like the aarch64 binary, and
+  the release refuses a Linux binary that requires a glibc newer than 2.31.
 - Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
   File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
   (#5087).

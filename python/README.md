@@ -1,4 +1,4 @@
-# khive-py
+# khive (Python)
 
 Python client for the khive knowledge-graph database.
 
@@ -7,6 +7,19 @@ khive here is a database, used the way you use Postgres: the daemon
 package is the client library. It speaks the daemon's native Unix-socket
 wire (length-prefixed JSON frames, version-checked) and never opens the
 database file itself.
+
+## Install
+
+```sh
+pip install khive
+```
+
+On macOS (arm64, x86_64), Linux with glibc 2.31 or newer (x86_64, aarch64),
+musl Linux (x86_64) and Windows (x86_64), the wheel also carries the `kkernel`
+binary of the same version and installs it next to the interpreter, so
+`kkernel mcp --daemon` is available without a Rust or Node toolchain. On other
+platforms the package installs the client alone; point it at a daemon installed
+another way, or at a khive-cloud deployment.
 
 ```python
 from khive import Khive
@@ -70,7 +83,7 @@ the `khive-cloud` command, transport interfaces, and error handling.
 
 The same `Khive` facade works against a remote khive-cloud deployment over
 `HttpTransport` — install the `cloud` extra first (`pip install
-'khive-py[cloud]'`, or `uv pip install -e '.[cloud]'` from a checkout):
+'khive[cloud]'`, or `uv pip install -e '.[cloud]'` from a checkout):
 
 ```python
 import khive
