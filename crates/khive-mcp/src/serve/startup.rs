@@ -146,9 +146,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // held while the daemon serves, even when a second process uses another
     // HOME and therefore has a different socket/boot lock. Non-daemon callers
     // keep the existing best-effort boot lock only.
-    if args.daemon {
-        khive_runtime::daemon::mark_warm_index_host();
-    }
+    mark_mcp_host_role(&args);
     let (cli_ns_explicit, cli_ns) =
         resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;

@@ -61,7 +61,8 @@ mod server_build;
 pub use server_build::{
     build_server, build_server_from_multi_backend_registry, build_server_multi_backend,
     build_server_multi_backend_with_db_anchor, build_server_with_explicit_namespace,
-    checkpoint_pool_for, enforce_strict_actor_mode, mcp_max_readers, WiringSurface,
+    checkpoint_pool_for, enforce_strict_actor_mode, is_forwarding_client, mark_mcp_host_role,
+    mcp_max_readers, WiringSurface,
 };
 
 #[cfg(unix)]
@@ -793,8 +794,12 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .map(|(name, backend)| (name.as_str(), backend.as_ref()))
         .collect();
     quarantine_sources.sort_by(|left, right| left.0.cmp(right.0));
-    crate::legacy_quarantine::repair_legacy_quarantine(&default_runtime, &quarantine_sources)
-        .await?;
+    crate::legacy_quarantine::repair_legacy_quarantine_at_boot(
+        &default_runtime,
+        &quarantine_sources,
+        is_forwarding_client(),
+    )
+    .await?;
 
     // Wrap runtimes in Arc for the coordinator's BackendRegistry.
     let per_pack_runtimes_arc: HashMap<String, Arc<KhiveRuntime>> = per_pack_runtimes_local
