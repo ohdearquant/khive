@@ -361,9 +361,9 @@ fn normalize_suppression_value(kind: &str, value: &str) -> Result<String, Runtim
             Ok(normalized.to_ascii_lowercase())
         }
         "recipient_key" => {
-            if value.trim().is_empty() || value.trim() != value || value.contains('\0') {
+            if value.len() != 64 || !khive_types::is_lowercase_hex(value) {
                 return Err(RuntimeError::InvalidInput(
-                    "suppression_add: `value` for kind `recipient_key` must be non-empty and have no surrounding whitespace".into(),
+                    "suppression_add: `value` for kind `recipient_key` must be exactly 64 lowercase hex characters".into(),
                 ));
             }
             Ok(value.to_string())
@@ -769,7 +769,7 @@ mod tests {
             let value = match kind {
                 "address" => format!("kind{index}@example.com"),
                 "domain" => format!("kind{index}.example.com"),
-                _ => format!("key-{index}"),
+                _ => format!("{:064x}", index + 1),
             };
             add(&runtime, &token, "outbound", kind, &value, "operator")
                 .await
@@ -784,7 +784,7 @@ mod tests {
                 &token,
                 "outbound",
                 "recipient_key",
-                &format!("source-{index}"),
+                &format!("{:064x}", index + 1),
                 source,
             )
             .await
@@ -809,6 +809,41 @@ mod tests {
                     .unwrap_err(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recipient_key_suppression_requires_exactly_64_lowercase_hex_characters() {
+        let runtime = runtime();
+        let token = token(&runtime);
+        for value in [
+            "ab".repeat(31),                 // too short
+            format!("{}g", "ab".repeat(31)), // non-hex
+            "AB".repeat(32),                 // uppercase
+            String::new(),                   // empty
+        ] {
+            invalid(
+                add(
+                    &runtime,
+                    &token,
+                    "outbound",
+                    "recipient_key",
+                    &value,
+                    "operator",
+                )
+                .await
+                .unwrap_err(),
+            );
+        }
+        add(
+            &runtime,
+            &token,
+            "outbound",
+            "recipient_key",
+            &"ab".repeat(32),
+            "operator",
+        )
+        .await
+        .expect("exactly 64 lowercase hex characters is accepted");
     }
 
     #[tokio::test]
@@ -923,7 +958,7 @@ mod tests {
                 &token,
                 "outbound",
                 "recipient_key",
-                &format!("opt-out-{index}"),
+                &format!("{:064x}", index + 1),
                 source,
             )
             .await
@@ -974,7 +1009,7 @@ mod tests {
             &token,
             "outbound",
             "recipient_key",
-            "derived-key-1",
+            &"ab".repeat(32),
             "mailto_token",
         )
         .await
@@ -984,7 +1019,7 @@ mod tests {
             "person@example.com",
             timestamp(&keyed_opt_out) + 1,
             false,
-            Some("derived-key-1"),
+            Some(&"ab".repeat(32)),
         )
         .await;
         handle_suppression_remove(
