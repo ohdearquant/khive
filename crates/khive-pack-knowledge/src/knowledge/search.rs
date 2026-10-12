@@ -13,6 +13,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use khive_runtime::Namespace;
 use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_score::vector::cosine_similarity;
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
@@ -248,7 +249,7 @@ async fn embed_cosine_scores(
     Ok(Some(
         candidate_embeddings
             .iter()
-            .map(|emb| cosine_similarity(query_emb, emb))
+            .map(|emb| cosine_similarity(query_emb, emb, false))
             .collect(),
     ))
 }
@@ -427,7 +428,7 @@ async fn rerank_search_from_store(
         .max(1e-6);
     for (hit, vector) in hits.iter_mut().zip(candidate_vectors) {
         let vector = vector.expect("every rerank candidate has a stored or fallback vector");
-        let cosine = cosine_similarity(query_vector, &vector);
+        let cosine = cosine_similarity(query_vector, &vector, false);
         hit.score = alpha * (hit.score / max_score) + (1.0 - alpha) * cosine.max(0.0);
         hit.provenance.embedding_rerank = true;
     }
@@ -443,26 +444,6 @@ async fn rerank_search_from_store(
         "from_stored": from_stored,
         "embedded_fallback": fallback_indices.len(),
     })))
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-8 {
-        0.0
-    } else {
-        dot / denom
-    }
 }
 
 #[cfg(test)]
