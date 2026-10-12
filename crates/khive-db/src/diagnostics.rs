@@ -1038,6 +1038,14 @@ pub struct WriterContentionDiagnostics {
     pub audit_admission_refused_obligations_last_at_ms: Option<u64>,
     /// Why `audit_admission_refused_obligations` is unavailable to this caller.
     pub audit_admission_refused_obligations_unavailable_reason: Option<String>,
+    /// Successful admission-degrade-safe reads whose audit generation exhausted
+    /// bounded transient retries. Cumulative since process start; these rows
+    /// received no commit acknowledgement (ADR-154 Amendment 2).
+    pub audit_retry_exhausted_obligations: Option<u64>,
+    /// Last increment in wall-clock milliseconds, or `None` before the first.
+    pub audit_retry_exhausted_obligations_last_at_ms: Option<u64>,
+    /// Why the retry-exhausted obligation count is unavailable to this caller.
+    pub audit_retry_exhausted_obligations_unavailable_reason: Option<String>,
     /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
     /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
     /// **already enqueued but had not resolved when the caller's admission
@@ -1089,6 +1097,10 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_refused_obligations` last moved;
     /// `None` until it moves. A total cannot say when it was last earned.
     pub admission_refused_obligations_last_at_ms: Option<u64>,
+    /// Safe-read audit rows whose generation exhausted bounded transient retries.
+    pub retry_exhausted_obligations: u64,
+    /// Last increment in wall-clock milliseconds, or `None` before the first.
+    pub retry_exhausted_obligations_last_at_ms: Option<u64>,
     /// Admission-degrade-safe read verbs' audit rows that were already
     /// enqueued but had not resolved when the caller's admission wait
     /// deadline elapsed (ADR-103 Amendment 3, ADR-133 Amendment 1). Not a

@@ -81,7 +81,7 @@ fn assert_timeout(error: &LeaseRefusal) {
         matches!(
             error,
             LeaseRefusal::TimedOut(SqliteError::CapacityUnavailable {
-                phase: CapacityUnavailablePhase::Lock,
+                phase: CapacityUnavailablePhase::LockContended,
                 message,
             }) if message == "timed out waiting for in-process volume lease"
         ),

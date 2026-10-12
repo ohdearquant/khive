@@ -244,7 +244,7 @@ impl WriteAdmission {
 
     /// The lease is taken before the pool mutex, so ordinary same-volume
     /// writer contention ends here rather than at `checkout_timeout`. Count it
-    /// and write a `timeout` row with `phase=lock`, as the pool mutex stage
+    /// and write a `timeout` row with `phase=lock_contended`, as the pool mutex stage
     /// does for its own timeouts, so the contention stays visible.
     fn record_lease_timeout(&self, error: &SqliteError) {
         self.lease_timeouts.fetch_add(1, Ordering::Relaxed);

@@ -325,7 +325,7 @@ impl Site {
 ///
 /// `kind` distinguishes the durable row shapes this sink emits:
 /// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
-/// `error`; a volume-lease timeout also carries `phase` = `"lock"`),
+/// `error`; a volume-lease timeout also carries `phase` = `"lock_contended"`),
 /// `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
 /// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
 /// retirement, carries `error` as the retirement reason),
@@ -1059,7 +1059,7 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
 /// Record a writer timeout at the volume lease: the write waited out the guard
 /// deadline because another writer held the volume. The same `timeout` row as
 /// the pool mutex stage, with `site` naming the lease and `phase` the capacity
-/// phase the caller received (`CapacityUnavailable { phase: Lock }`).
+/// phase the caller received (`CapacityUnavailable { phase: LockContended }`).
 pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
     let Some(handle) = SINK.get() else {
         return;
@@ -1069,7 +1069,7 @@ pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
         kind: "timeout",
         db: db.to_string(),
         site: Some(Site::VolumeLease.as_str()),
-        phase: Some("lock"),
+        phase: Some(khive_storage::CapacityUnavailablePhase::LockContended.as_str()),
         error: Some(truncate_error(error, MAX_ERROR_BYTES)),
         timeout_ms: Some(timeout_ms),
         elapsed_ms: None,

@@ -108,6 +108,8 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
             degraded: true,
             admission_refused_obligations: 5,
             admission_refused_obligations_last_at_ms: Some(1_700_000_000_123),
+            retry_exhausted_obligations: 4,
+            retry_exhausted_obligations_last_at_ms: Some(1_700_000_000_789),
             admission_unresolved_obligations: 2,
             admission_unresolved_obligations_last_at_ms: Some(1_700_000_000_456),
         }),
@@ -163,6 +165,25 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
     assert!(without_control
         .writer_contention
         .audit_admission_unresolved_obligations_unavailable_reason
+        .is_some());
+
+    let wire = serde_json::to_value(&with_control.writer_contention).unwrap();
+    assert_eq!(wire["audit_retry_exhausted_obligations"], 4);
+    assert_eq!(
+        wire["audit_retry_exhausted_obligations_last_at_ms"],
+        1_700_000_000_789_u64
+    );
+    assert!(with_control
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
+        .is_none());
+    assert!(without_control
+        .writer_contention
+        .audit_retry_exhausted_obligations
+        .is_none());
+    assert!(without_control
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
         .is_some());
 
     // Existing fields must be unaffected by the new ones — additive, not

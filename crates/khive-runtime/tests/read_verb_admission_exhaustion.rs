@@ -34,12 +34,16 @@ use khive_runtime::audit_batch::{
 use khive_runtime::pack::{
     audit_admission_refused_obligation_count, audit_admission_refused_obligation_last_at_ms,
     audit_admission_unresolved_obligation_count, audit_admission_unresolved_obligation_last_at_ms,
+    audit_retry_exhausted_obligation_count, audit_retry_exhausted_obligation_last_at_ms,
     HandlerDef, PackRuntime, VerbRegistryBuilder,
 };
 use khive_runtime::runtime::NamespaceToken;
 use khive_runtime::{AuditObligationReason, KhiveRuntime, RuntimeError};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
-use khive_storage::{Event, EventFilter, EventStore, StorageResult};
+use khive_storage::{
+    CapacityUnavailablePhase, Event, EventFilter, EventStore, StorageCapability, StorageError,
+    StorageResult,
+};
 use khive_types::pack::{Pack, Visibility};
 use khive_types::{EventKind, EventOutcome, SubstrateKind, VerbCategory};
 use serial_test::serial;
@@ -66,6 +70,7 @@ struct MemoryEventStore {
     append_started: Option<Arc<tokio::sync::Notify>>,
     append_release: Option<Arc<tokio::sync::Notify>>,
     call_gates: Option<CallGates>,
+    retry_phase: Option<CapacityUnavailablePhase>,
 }
 
 #[async_trait]
@@ -109,6 +114,13 @@ impl EventStore for MemoryEventStore {
         &self,
         events: Vec<Event>,
     ) -> StorageResult<khive_storage::event::IdempotentEventBatchResult> {
+        if let Some(phase) = self.retry_phase {
+            return Err(StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase,
+                message: "lease admission remains contended".into(),
+            });
+        }
         if let Some(started) = &self.append_started {
             started.notify_one();
         }
@@ -140,6 +152,99 @@ impl EventStore for MemoryEventStore {
     fn supports_idempotent_audit_batch(&self) -> bool {
         true
     }
+}
+
+/// Exhausting transient retries degrades a successful safe read, with a
+/// dedicated diagnostic count; the same failure remains strict for a write.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn read_survives_lease_retry_exhaustion_but_write_stays_strict() {
+    let store = Arc::new(MemoryEventStore {
+        retry_phase: Some(CapacityUnavailablePhase::LockContended),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register_trusted(AlphaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_commit_attempts: std::num::NonZeroU8::new(3).unwrap(),
+        retry_backoff: std::time::Duration::ZERO,
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("trusted read/write registry");
+    let before_retry_exhausted = audit_retry_exhausted_obligation_count();
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    let result = registry
+        .dispatch_with_disposition("list", Value::Null, None)
+        .await
+        .expect("successful safe read survives exhausted lease retries");
+    assert_eq!(result, serde_json::json!({"pack": "kg", "verb": "list"}));
+    assert_eq!(
+        audit_retry_exhausted_obligation_count(),
+        before_retry_exhausted + 1
+    );
+    assert!(audit_retry_exhausted_obligation_last_at_ms().is_some());
+    assert_eq!(audit_admission_refused_obligation_count(), before_refused);
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved
+    );
+
+    let error = registry
+        .dispatch_with_disposition("create", Value::Null, None)
+        .await
+        .expect_err("a write retains its audit obligation after exhausted retries");
+    let RuntimeError::AuditObligation {
+        failure,
+        domain_result,
+    } = error
+    else {
+        panic!("write must surface its terminal audit obligation: {error}");
+    };
+    assert_eq!(
+        failure.reason,
+        AuditObligationReason::Terminal(AuditTerminalReason::RetryExhausted)
+    );
+    assert_eq!(
+        domain_result,
+        serde_json::json!({"pack": "kg", "verb": "create"})
+    );
+    assert_eq!(
+        audit_retry_exhausted_obligation_count(),
+        before_retry_exhausted + 1,
+        "strict writes must not increment the safe-read degradation counter"
+    );
+
+    let metrics = registry.audit_batch_metrics().expect("batch metrics");
+    assert_eq!(
+        metrics.retry_exhausted_obligations,
+        before_retry_exhausted + 1
+    );
+    assert_eq!(
+        metrics.retry_exhausted_obligations_last_at_ms,
+        audit_retry_exhausted_obligation_last_at_ms()
+    );
+    let runtime = KhiveRuntime::memory().expect("memory runtime");
+    let report = runtime
+        .db_diagnostics_with_audit_metrics(Some(metrics))
+        .await
+        .expect("diagnostics");
+    assert_eq!(
+        report.writer_contention.audit_retry_exhausted_obligations,
+        Some(before_retry_exhausted + 1)
+    );
+    assert_eq!(
+        report
+            .writer_contention
+            .audit_retry_exhausted_obligations_last_at_ms,
+        audit_retry_exhausted_obligation_last_at_ms()
+    );
+    assert!(report
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
+        .is_none());
 }
 
 /// Minimal pack exercising one allowlisted read (`get`, `Assertive`) whose

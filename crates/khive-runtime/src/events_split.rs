@@ -3027,6 +3027,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lease_contention_crosses_events_wire_as_retryable() {
+        assert_eq!(EVENTS_PROTOCOL_VERSION, 5);
+        for (phase, expected_retryable) in [
+            (khive_storage::CapacityUnavailablePhase::LockContended, true),
+            (khive_storage::CapacityUnavailablePhase::Lock, false),
+        ] {
+            let response = storage_error_response(&StorageError::CapacityUnavailable {
+                capability: khive_storage::StorageCapability::Sql,
+                phase,
+                message: "lease admission failed".into(),
+            });
+            let encoded = serde_json::to_vec(&response).expect("serialize server error");
+            let decoded: EventsResponse =
+                serde_json::from_slice(&encoded).expect("decode unchanged protocol");
+            let EventsResponse::Error { retryable, .. } = decoded else {
+                panic!("capacity failure must be an error frame");
+            };
+            assert_eq!(retryable, expected_retryable, "{phase:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn side_effects_unknown_state_crosses_the_wire_as_terminal_failure() {
         let response = storage_error_response(&StorageError::writer_task_terminated(
             khive_storage::WriterTaskRequestState::SideEffectsUnknown,
