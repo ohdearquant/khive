@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles refuse updates. Storage failures use `PersistError::Storage`.
   Core migrations now install `atom_weights` and `weight_events`; the standalone
   `init_weight_schema` bootstrap remains available for compatibility.
+- Lattice dependencies move from 0.9.0 to 0.11.1 (`lattice-embed`, `lattice-inference`,
+  `lattice-fann`). Moodboard descriptors now report inference version 0.11.1, so their
+  fingerprints and model keys change and existing moodboard vectors need reindexing;
+  preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
+  no longer runs with the `pure` backend: std members enable `blake3/std` directly.
 
 ### Fixed
 
@@ -126,11 +131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Lattice dependencies move from 0.9.0 to 0.11.1 (`lattice-embed`, `lattice-inference`,
-  `lattice-fann`). Moodboard descriptors now report inference version 0.11.1, so their
-  fingerprints and model keys change and existing moodboard vectors need reindexing;
-  preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
-  no longer runs with the `pure` backend: std members enable `blake3/std` directly.
 - Public brain posterior folds use the shared filter and map combinators, preserving
   reducer state, standalone section-feedback handling and offered-event counts.
 - Pool configuration, WAL ceiling policy and test-store guards move into an internal
@@ -180,9 +180,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `comm.read` preserves typed storage errors from its initial message lookup, including
   admission-timeout code, stage, and retry guidance. Bulk read and mark-read validation
   retain the same error source without marking messages after a failed lookup. (#4958)
-- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
-  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
-  (#5087).
 - GTD status and priority refusals now mask credential-shaped values with the existing secret
   masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
 - `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
