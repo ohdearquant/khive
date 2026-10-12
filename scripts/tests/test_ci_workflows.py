@@ -431,7 +431,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         ratchet = indented_block(workflow, "coverage-ratchet", 2)
         gate = indented_block(workflow, "ci-gate", 2)
 
-        self.assertIn("needs: [resolve-revision, coverage-measurement]", ratchet)
+        self.assertIn("needs: [resolve-revision, coverage-measurement, changed-paths]", ratchet)
         self.assertIn(
             "if: needs.resolve-revision.result == 'success' && "
             "needs.coverage-measurement.result == 'success' && "
@@ -494,10 +494,22 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # The push guard is the only remaining job with an eligibility predicate.
-    # always() admits a job after failed dependencies; it is not such a predicate.
+    # The push guard has its own eligibility predicate. The documentation-lane
+    # jobs carry exactly DOCS_LANE_PREDICATE and skip on a change that touches
+    # only Markdown no code names. always() admits a job after failed
+    # dependencies; it is not such a predicate.
     CONDITIONAL_JOBS = {"automerge-push-guard"}
     FORGIVEN_SKIPS = {"automerge-push-guard"}
+    DOCS_LANE_PREDICATE = "needs.changed-paths.outputs.docs_only != 'true'"
+    DOCS_LANE_JOBS = {
+        "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
+        "dependency-review", "coverage-measurement", "coverage-ratchet",
+        "wasm-parity", "vamana-portability", "minio-blob-compat",
+        "msrv-check", "core-only",
+    }
+    # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
+    # save the runner, like the gated lane jobs.
+    UNGATED_DOCS_LANE_JOBS = {"check-windows"}
 
     def setUp(self):
         self.workflow = workflow_text("ci.yml")
@@ -509,20 +521,85 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results):
+    def run_gate(self, results, docs_only="false", classifier=None):
+        needs = {job: {"result": result} for job, result in results.items()}
+        if "changed-paths" in needs:
+            if classifier is not None:
+                needs["changed-paths"]["result"] = classifier
+            needs["changed-paths"]["outputs"] = {"docs_only": docs_only}
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
-            env={**os.environ, "NEEDS": json.dumps({
-                job: {"result": result} for job, result in results.items()
-            })},
+            env={**os.environ, "NEEDS": json.dumps(needs)},
             capture_output=True, text=True, timeout=5, check=False,
         )
+
+    def job_conditions(self, job):
+        return re.findall(r"(?m)^    if: (.+)$", indented_block(self.workflow, job, 2))
+
+    def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
+        # Every job in the workflow, not only the gate's dependencies: a job that takes the predicate and is
+        # missing from the gate's needs would otherwise be invisible here.
+        jobs = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):$", self.workflow.split("jobs:\n", 1)[1])
+        self.assertIn("ci-gate", jobs)
+        carrying = {
+            job for job in jobs
+            if any(self.DOCS_LANE_PREDICATE in condition for condition in self.job_conditions(job))
+        }
+        self.assertEqual(carrying, self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS)
+        self.assertEqual(carrying & self.needs, self.DOCS_LANE_JOBS)
+        self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
+        listed = set(re.findall(r'"([a-z0-9-]+)"', self.script.split("then [", 1)[1].split("]", 1)[0]))
+        self.assertEqual(listed, self.DOCS_LANE_JOBS)
+        for job in sorted(self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS):
+            with self.subTest(job=job):
+                self.assertIn(self.job_conditions(job), [
+                    [self.DOCS_LANE_PREDICATE], [f"always() && {self.DOCS_LANE_PREDICATE}"],
+                ])
+                needs_line = re.search(r"(?m)^    needs: (.+)$", indented_block(self.workflow, job, 2))
+                self.assertIn("changed-paths", needs_line.group(1))
+        for job in ["changed-paths", "docs", "secret-scan", "data-leak-guard", "marketplace",
+                    "resolve-revision", "ci-gate"]:
+            with self.subTest(kept=job):
+                self.assertNotIn(self.DOCS_LANE_PREDICATE, indented_block(self.workflow, job, 2))
+        self.assertIn("- changed-paths", indented_block(self.gate, "needs", 4))
+
+    def test_failed_classifier_does_not_forgive_the_lane_skips(self):
+        # A failed classifier already fails the gate by itself; the rejected list shows
+        # that the lane skips are rejected too rather than hidden behind it.
+        results = dict.fromkeys(self.needs, "success")
+        results["ci"] = "skipped"
+        result = self.run_gate(results, docs_only="true", classifier="failure")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rejected = result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines()
+        self.assertEqual(sorted(rejected), ["changed-paths", "ci"])
+
+    def test_gate_forgives_docs_lane_skips_only_after_a_successful_docs_only_classification(self):
+        for job in sorted(self.needs):
+            for outcome in ("success", "skipped", "failure", "cancelled"):
+                for docs_only, classifier in (("true", "success"), ("false", "success"),
+                                              ("true", "failure"), ("true", "skipped"),
+                                              ("TRUE", "success"), ("", "success")):
+                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only, classifier=classifier):
+                        results = dict.fromkeys(self.needs, "success")
+                        results[job] = outcome
+                        classifier_result = outcome if job == "changed-paths" else classifier
+                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result)
+                        lane = docs_only == "true" and classifier_result == "success"
+                        accepted = classifier_result == "success" and (outcome == "success" or (
+                            outcome == "skipped" and (
+                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS))
+                        ))
+                        self.assertEqual(
+                            result.returncode, 0 if accepted else 1,
+                            f"DOCS_LANE_SKIP_POLICY: {job}={outcome}\n" + result.stdout + result.stderr,
+                        )
 
     def test_gate_forgives_skips_only_for_jobs_on_its_allow_list(self):
         conditional = {
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
             and "    if: always()" not in indented_block(self.workflow, job, 2)
+            and self.job_conditions(job) != [self.DOCS_LANE_PREDICATE]
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
@@ -1667,6 +1744,42 @@ class DocsFormatPhaseTests(unittest.TestCase):
         self.assertIn("run: scripts/ci.sh docs-fmt", docs_job)
         self.assertNotIn("deno fmt", docs_job)
         self.assertIn("denoland/setup-deno@v2", docs_job)
+        # The documentation lane skips every other job that reads Markdown by content, so the docs job runs
+        # those readers: the ADR lints and the repository-wide identifier ban, with the ripgrep it needs.
+        self.assertIn("run: scripts/ci.sh adr-lint", docs_job)
+        self.assertIn("astral-sh/setup-uv@v5", docs_job)
+        install = docs_job.index("run: scripts/ci-install-ripgrep.sh")
+        self.assertLess(install, docs_job.index("run: scripts/ci.sh content-sweeps"))
+
+    def test_ripgrep_install_has_one_copy(self):
+        workflow = workflow_text("ci.yml")
+        self.assertNotIn("apt-get install", workflow)
+        ci_job = indented_block(workflow, "ci", 2)
+        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", ci_job)
+        script = (REPO_ROOT / "scripts" / "ci-install-ripgrep.sh").read_text()
+        self.assertIn("apt-get install --yes ripgrep", script)
+        self.assertIn("set -euo pipefail", script)
+
+    def test_content_sweeps_phase_runs_the_identifier_ban_by_node_id(self):
+        # A node id, not a -k filter: a renamed test fails collection instead of selecting nothing.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        # The ban reads this file too; a line that names its test file is on its allow-list.
+        node = "tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo"
+        self.assertIn(node, body)
+        contract_file, function = node.split("::")
+        contract = REPO_ROOT / "tests" / "khive-contract" / contract_file
+        self.assertIn(f"def {function}(", contract.read_text())
+
+    def test_content_sweeps_phase_runs_the_pack_set_copy_check_by_name(self):
+        # This check reads Markdown by content and otherwise runs only in phase_lint, which the
+        # documentation lane skips.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('"$SCRIPT_DIR/tests/test_ci_workflows.py"', body)
+        self.assertIn("HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set", body)
+        self.assertTrue(callable(getattr(HarnessEnvironmentTests,
+                                         "test_no_new_hand_typed_copy_of_the_shipping_pack_set", None)))
 
     def test_docs_fmt_refuses_when_deno_is_absent(self):
         # The absence arm decides whether this gate can be emptied in silence: a
@@ -1699,6 +1812,21 @@ class DocsFormatPhaseTests(unittest.TestCase):
             present = self.run_docs_fmt(f"{stub_dir}:{minimal_path}")
             self.assertEqual(present.returncode, 0, present.stdout + present.stderr)
             self.assertEqual(argv_log.read_text().split(), ["fmt", "--check"])
+
+
+class CiPhaseListTests(unittest.TestCase):
+    def test_unknown_phase_message_lists_every_dispatched_phase(self):
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        dispatched = re.findall(r"(?m)^        ([a-z-]+)\) phase_", script)
+        self.assertIn("adr-lint", dispatched)
+        completed = subprocess.run(
+            ["sh", str(REPO_ROOT / "scripts" / "ci.sh"), "no-such-phase"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        listed = re.search(r"(?m)^Valid phases: (.+)$", completed.stderr)
+        self.assertIsNotNone(listed, completed.stderr)
+        self.assertEqual(listed.group(1).split(), dispatched)
 
 
 class NpmReleaseWorkflowTests(unittest.TestCase):
@@ -1922,6 +2050,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "core-only": "Core-only feature set build and tests",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
+        "changed-paths": "Classify changed paths",
     }
 
     def setUp(self):
@@ -2064,7 +2193,8 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                 self.assertIn("ref: ${{ github.sha }}\n          fetch-depth: 0", job)
                 self.assertNotIn("run: scripts/", job)
                 continue
-            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision, coverage-measurement\])$",
+            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision(?:, coverage-measurement)?"
+                                  r"(?:, changed-paths)?\])$",
                              "every source job must wait for validation")
             self.assertEqual(job.count("uses: actions/checkout@v7"), 1)
             self.assertIn("ref: ${{ needs.resolve-revision.outputs.checkout_sha }}", job,
@@ -2091,19 +2221,29 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
+        # One job-level predicate is admitted: the documentation lane. A job it
+        # skips is reported under its unevaluated name, which is neither a
+        # required check name nor an ordinary job name, so the replay
+        # distinction holds; CI gate and the secret scan never carry it, and
+        # the gate accepts those skips only on a successful docs_only=true
+        # classification (AggregateGateWorkflowTests). Gating the same jobs per
+        # step would still start every runner, the macOS one included.
+        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", job)
                 self.assertNotRegex(job, r"(?m)^    if: [>|]",
                                     "CHECK_NAME_ADMISSION: no folded eligibility predicate")
-                self.assertIn(conditions, [[], ["always()"]],
+                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"]],
                               "CHECK_NAME_ADMISSION: eligibility belongs on steps")
                 if name in {"dependency-review", "coverage-ratchet"}:
                     self.assertEqual(
-                        conditions, ["always()"],
+                        conditions, [f"always() && {docs_lane}"],
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
+                if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
+                    self.assertNotIn(docs_lane, job)
 
     def test_dependency_review_work_is_pr_only_after_revision_validation(self):
         job = indented_block(self.workflow, "dependency-review", 2)
@@ -2216,6 +2356,354 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.assertIn('range="${before}..${{ github.sha }}"', job)
         minio = indented_block(self.workflow, "minio-blob-compat", 2)
         self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
+
+
+class DocsOnlyClassifierTests(unittest.TestCase):
+    """scripts/ci-docs-only.sh on real temporary repositories, and the classifier job's event routing."""
+
+    CLASSIFIER = REPO_ROOT / "scripts" / "ci-docs-only.sh"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.git("init", "-q", "-b", "main")
+        self.write("src/lib.rs", "pub fn f() {}\n")
+        self.write("notes/guide.md", "# Guide\n")
+        self.write("notes/wire.md", "# Wire\n")
+        self.write("tests/wire.rs", 'const DOC: &str = include_str!("../notes/wire.md");\n')
+        self.write("docs/guide/counts.md", "# Counts\n")
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n")
+        self.base = self.commit("base")
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify(self, base, head):
+        completed = subprocess.run(
+            ["bash", str(self.CLASSIFIER), base, head], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
+        return completed.stdout.strip(), completed.stderr
+
+    def test_markdown_no_other_file_names_takes_the_documentation_lane(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(self.base, self.commit("guide"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: notes/guide.md", reasons)
+
+    def test_markdown_named_by_code_runs_the_full_suite(self):
+        self.write("notes/wire.md", "# Wire\n\nChanged.\n")
+        verdict, reasons = self.classify(self.base, self.commit("wire"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("notes/wire.md is named by a non-Markdown file", reasons)
+
+    def test_markdown_the_count_scanner_reads_runs_the_full_suite(self):
+        # No file names it, but the smoke tests check its verb and pack counts against the
+        # live registry, which only the full suite builds.
+        self.write("docs/guide/counts.md", "# Counts\n\nThe kg pack has twenty verbs.\n")
+        verdict, reasons = self.classify(self.base, self.commit("counts"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/guide/counts.md carries verb or pack counts", reasons)
+
+    def test_an_adr_takes_the_documentation_lane(self):
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
+        verdict, reasons = self.classify(self.base, self.commit("adr"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_a_failing_count_scanner_runs_the_full_suite(self):
+        # A copy of the classifier beside no scanner: the question cannot be answered, so the
+        # change takes the full suite rather than the documentation lane.
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
+        head = self.commit("adr")
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        completed = subprocess.run(
+            ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual((completed.returncode, completed.stdout), (0, "false\n"), completed.stderr)
+        self.assertIn("count scanner failed for docs/adr/ADR-001-guide.md", completed.stderr)
+
+    def test_code_that_starts_like_a_comment_still_names_markdown(self):
+        cases = [
+            ("src/attr.rs", '#![doc = include_str!("../notes/attr.md")]\n', "notes/attr.md"),
+            ("src/deref.rs", 'fn f(s: &mut &str) {\n    *s = include_str!("../notes/deref.md");\n}\n',
+             "notes/deref.md"),
+            ("scripts/build.sh", 'render \\\n    --input notes/flag.md\n', "notes/flag.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_doc_comments_are_code(self):
+        # rustdoc compiles and runs the examples in ///, //!, /** and /*! comments, so a Markdown file they
+        # name may be read by a doctest.
+        cases = [
+            ("src/outer.rs", '/// ```\n/// let s = include_str!("../notes/outer.md");\n/// ```\nfn o() {}\n',
+             "notes/outer.md"),
+            ("src/inner.rs", '//! let s = include_str!("../notes/inner.md");\n', "notes/inner.md"),
+            ("src/block.rs", '/** let s = include_str!("../notes/block.md"); */\nfn b() {}\n', "notes/block.md"),
+            ("src/iblock.rs", '/*! let s = include_str!("../notes/iblock.md"); */\n', "notes/iblock.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_a_dot_named_markdown_file_follows_the_same_rules(self):
+        # The count scanner's globs and its path predicate agree on dot-named paths, so a dot-named file
+        # needs no rule of its own: unnamed it takes the lane, named by code it runs the full suite.
+        self.write("notes/.hidden.md", "# Hidden\n")
+        base = self.commit("hidden")
+        self.write("notes/.hidden.md", "# Hidden\n\nChanged.\n")
+        verdict, reasons = self.classify(base, self.commit("change hidden"))
+        self.assertEqual(verdict, "true", reasons)
+        self.write("tests/hidden.rs", 'const H: &str = include_str!("../notes/.hidden.md");\n')
+        base = self.commit("name hidden")
+        self.write("notes/.hidden.md", "# Hidden\n\nAgain.\n")
+        verdict, reasons = self.classify(base, self.commit("change hidden again"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/.hidden.md is named by a non-Markdown file", reasons)
+
+    def test_the_scanner_predicate_and_its_globs_agree_on_dot_named_paths(self):
+        sys.path.insert(0, str(REPO_ROOT / "tests"))
+        try:
+            import documented_verb_counts as scanner
+        finally:
+            sys.path.remove(str(REPO_ROOT / "tests"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            paths = ["docs/.hidden.md", "docs/.d/a.md", "marketplace/.m.md", "scripts/.s.md"]
+            for rel in paths:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text("# x\n")
+            globbed = {p.relative_to(root).as_posix() for g in scanner.PUBLISHED_GLOBS for p in root.glob(g)}
+            for rel in paths:
+                with self.subTest(path=rel):
+                    self.assertTrue(scanner.is_published_markdown(rel))
+                    self.assertIn(rel, globbed)
+
+    def test_a_name_on_a_line_that_starts_like_a_comment_runs_the_full_suite(self):
+        # Plain comments with each marker, then lines that only look like comments: code after a closed
+        # /* */, a raw string line, a Python string line and a continued shell argument. A line read on its
+        # own cannot tell these apart, so every one of them counts.
+        cases = [
+            ("tools/check.py", "# see notes/hash.md\nprint(1)\n", "notes/hash.md"),
+            ("web/star.js", "/*\n * see notes/star.md\n */\nlet s = 1;\n", "notes/star.md"),
+            ("src/line.rs", "// see notes/line.md\nfn l() {}\n", "notes/line.md"),
+            ("src/open.rs", "/* see notes/open.md */\nfn p() {}\n", "notes/open.md"),
+            ("sql/q.sql", "-- see notes/dash.md\nSELECT 1;\n", "notes/dash.md"),
+            ("web/page.html", "<!-- see notes/html.md -->\n<p></p>\n", "notes/html.md"),
+            ("src/inline.rs", '/* a */ const D: &str = include_str!("../notes/inline.md");\n', "notes/inline.md"),
+            ("src/raw.rs", 'const T: &str = r#"\n// notes/raw.md\n"#;\n', "notes/raw.md"),
+            ("tools/doc.py", 'DOCS = """\n# notes/pystr.md\n"""\n', "notes/pystr.md"),
+            ("scripts/run.sh", "render \\\n    -- notes/dashdash.md\n", "notes/dashdash.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_a_binary_file_that_names_the_markdown_runs_the_full_suite(self):
+        fixture = self.repo / "fixtures" / "guide.bin"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_bytes(b"\x00\x01notes/guide.md\x00")
+        base = self.commit("binary fixture")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+
+    def test_a_symlink_whose_target_names_the_markdown_runs_the_full_suite(self):
+        link = self.repo / "fixtures" / "guide.json"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../notes/guide.md")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a symlink's target", reasons)
+
+    def test_a_symlink_to_another_file_leaves_the_documentation_lane(self):
+        link = self.repo / "fixtures" / "lib.rs"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../src/lib.rs")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_any_change_while_the_tree_has_a_submodule_runs_the_full_suite(self):
+        # The gitlink has no checkout here, so both commits stage by path: add -A would record its removal.
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},vendor/sub")
+        self.git("commit", "-q", "-m", "submodule")
+        base = self.git("rev-parse", "HEAD")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.git("add", "notes/guide.md")
+        self.git("commit", "-q", "-m", "guide")
+        verdict, reasons = self.classify(base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("has a submodule, whose files are not searched", reasons)
+
+    def test_any_non_markdown_path_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.write("src/lib.rs", "pub fn g() {}\n")
+        verdict, reasons = self.classify(self.base, self.commit("mixed"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("not Markdown: src/lib.rs", reasons)
+
+    def test_a_source_file_renamed_to_markdown_runs_the_full_suite(self):
+        self.git("mv", "tests/wire.rs", "tests/wire-notes.md")
+        verdict, reasons = self.classify(self.base, self.commit("rename"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("not Markdown: tests/wire.rs", reasons)
+
+    def test_deleting_an_unnamed_markdown_file_takes_the_documentation_lane(self):
+        self.git("rm", "-q", "notes/guide.md")
+        verdict, reasons = self.classify(self.base, self.commit("delete"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_no_change_and_an_unknown_revision_run_the_full_suite(self):
+        verdict, reasons = self.classify(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("no changed paths", reasons)
+        verdict, reasons = self.classify("0" * 40, self.base)
+        self.assertEqual(verdict, "false")
+        self.assertIn("git diff", reasons)
+
+    def test_many_code_references_are_still_found(self):
+        # Many matching lines make an early-exiting grep -q close its input while the
+        # writer is still writing; read through a pipe under pipefail, that would report
+        # "not named", the unsafe direction.
+        self.write("src/big.rs", 'const G: &str = "notes/guide.md";\n' * 20000)
+        base = self.commit("big")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+
+    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None):
+        workflow = workflow_text("ci.yml")
+        job = indented_block(workflow, "changed-paths", 2)
+        step = job.split("- name: Classify\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        script = textwrap.dedent(match.group(1))
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        (self.repo / "tests").mkdir(exist_ok=True)
+        shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
+                    self.repo / "tests" / "documented_verb_counts.py")
+        bin_dir = pathlib.Path(self.temp.name) / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        if gh_script is not None:
+            gh = bin_dir / "gh"
+            gh.write_text("#!/bin/bash\n" + gh_script)
+            gh.chmod(0o755)
+        output = pathlib.Path(self.temp.name) / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
+            env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                 "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x"},
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return output.read_text().strip(), completed.stdout + completed.stderr
+
+    def merge_ref(self, path, text):
+        self.git("checkout", "-q", "-b", "topic")
+        self.write(path, text)
+        topic = self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.write("other.md", "# Other\n")
+        self.commit("main moved")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", topic)
+        return self.git("rev-parse", "HEAD")
+
+    def test_job_pull_request_compares_the_merge_ref_with_its_base_parent(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=true")
+
+    def test_job_pull_request_with_code_runs_the_full_suite(self):
+        head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
+        self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    def gh_listing(self, run_sha, shard_conclusion):
+        return (
+            'case "$2" in\n'
+            '  */workflows/ci.yml/runs*) echo "101 ' + run_sha + '" ;;\n'
+            '  */runs/101/jobs*) [ "' + shard_conclusion + '" = success ] && echo 1 || echo 0 ;;\n'
+            '  *) exit 1 ;;\n'
+            'esac\n'
+        )
+
+    def test_job_main_push_compares_with_the_newest_fully_tested_main_commit(self):
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that replaced a waiting run")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        # Baseline before the untested code commit: the code is in the range, so the full suite runs.
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(self.base, "success"))
+        self.assertEqual(verdict, "docs_only=false", log)
+        # Baseline at the untested commit itself: only Markdown since then.
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertIn(f"Compared with {untested}", log)
+
+    def test_job_main_push_without_a_full_run_or_with_a_failing_api_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for gh_script in (self.gh_listing(self.base, "skipped"), "exit 1\n"):
+            with self.subTest(gh_script=gh_script):
+                verdict, log = self.classify_job("push", head, gh_script=gh_script)
+                self.assertEqual(verdict, "docs_only=false", log)
+                self.assertIn("no main commit with a completed full run", log)
+
+    def test_job_other_events_run_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for event_name, ref in (("schedule", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main"),
+                                ("push", "refs/heads/integration/train-1")):
+            with self.subTest(event_name=event_name, ref=ref):
+                self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
 
 
 if __name__ == "__main__":

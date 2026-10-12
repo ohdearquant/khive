@@ -110,6 +110,10 @@ pub struct ChannelEnvelope {
     /// the reply has a known parent Message-ID but no chain to extend, this is
     /// `None` and the SMTP layer falls back to `in_reply_to` alone.
     pub references: Option<String>,
+    /// RFC 822 `List-Unsubscribe` value to set on an outbound email (for example the
+    /// `<mailto:...>` form). `None` when the message carries no unsubscribe header.
+    #[serde(default)]
+    pub list_unsubscribe: Option<String>,
 }
 
 impl ChannelEnvelope {
@@ -131,6 +135,7 @@ impl ChannelEnvelope {
             wire_references: None,
             in_reply_to: None,
             references: None,
+            list_unsubscribe: None,
         }
     }
 
@@ -206,6 +211,12 @@ impl ChannelEnvelope {
     /// by the parent's Message-ID) this outbound reply should set as `References`.
     pub fn with_references(mut self, references: impl Into<String>) -> Self {
         self.references = Some(references.into());
+        self
+    }
+
+    /// Attach the `List-Unsubscribe` header value for an outbound email.
+    pub fn with_list_unsubscribe(mut self, list_unsubscribe: impl Into<String>) -> Self {
+        self.list_unsubscribe = Some(list_unsubscribe.into());
         self
     }
 }

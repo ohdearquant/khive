@@ -761,18 +761,14 @@ async fn external_sender_scope_keeps_policy_recipients_available_to_other_actors
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn external_admission_honors_address_domain_and_recipient_key_suppressions() {
-    for (kind, value, recipient_key) in [
-        ("address", "external@example.net", None),
-        ("domain", "example.net", None),
-        ("recipient_key", "recipient-key-1", Some("recipient-key-1")),
+    let policy = external_policy(&["actor:sender"], 5);
+    let derived_key = policy.recipient_key("external@example.net").unwrap();
+    for (kind, value) in [
+        ("address", "external@example.net".to_string()),
+        ("domain", "example.net".to_string()),
+        ("recipient_key", derived_key.clone()),
     ] {
-        let mut policy = external_policy(&["actor:sender"], 5);
-        if let Some(key) = recipient_key {
-            policy = policy
-                .with_recipient_key_for_tests("external@example.net", key)
-                .unwrap();
-        }
-        let runtime = runtime().with_outbound_email_policy(policy);
+        let runtime = runtime().with_outbound_email_policy(policy.clone());
         let token = runtime.authorize(Namespace::local()).unwrap();
         let signal = InboxSignal::new();
         handle_suppression_add(
@@ -820,6 +816,48 @@ async fn external_admission_honors_address_domain_and_recipient_key_suppressions
             assert!(control_result.is_ok(), "{kind} suppression must be exact");
             assert_eq!(signal.snapshot(), 1);
         }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn external_admission_refuses_while_the_footer_is_unavailable() {
+    for reason in [
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set",
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read",
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE does not contain {unsubscribe}",
+    ] {
+        let policy =
+            external_policy(&["actor:sender"], 5).with_external_footer_for_tests(Err(reason));
+        let runtime = runtime().with_outbound_email_policy(policy);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let signal = InboxSignal::new();
+        let before = snapshot(&runtime).await;
+        external_denied(
+            send(
+                &runtime,
+                &signal,
+                &token,
+                external_request("external@example.net", "footer-unavailable"),
+            )
+            .await
+            .unwrap_err(),
+            "comm.send",
+            "external email footer is unavailable",
+        );
+        assert_eq!(snapshot(&runtime).await, before);
+        assert_eq!(signal.snapshot(), 0);
+
+        // A policy-recipient send with the same bad footer is still admitted.
+        send(
+            &runtime,
+            &signal,
+            &token,
+            json!({"to":"email:allowed@example.com","content":"policy recipient"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(signal.snapshot(), 1);
     }
 }
 

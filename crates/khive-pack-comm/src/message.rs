@@ -468,7 +468,7 @@ pub(crate) async fn dual_write_message_with_identity(
             let recipient_key = policy.recipient_key(&normalized);
             if khive_runtime::outbound_email_is_suppressed(
                 &normalized,
-                recipient_key,
+                recipient_key.as_deref(),
                 &suppressions,
             ) {
                 return Err(external_email_denied(verb, "recipient is suppressed"));
@@ -483,6 +483,14 @@ pub(crate) async fn dual_write_message_with_identity(
                 })?;
             if recent_count >= cap {
                 return Err(external_email_denied(verb, "daily external cap reached"));
+            }
+            // ADR-200 §1 condition 4: the external footer must be configured before a fresh
+            // external message is admitted. A policy-recipient send never reaches this branch.
+            if let Some(Err(reason)) = policy.external_footer() {
+                return Err(external_email_denied(
+                    verb,
+                    &format!("external email footer is unavailable: {reason}"),
+                ));
             }
         }
     }
