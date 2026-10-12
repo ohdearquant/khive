@@ -430,6 +430,11 @@ phase_content_sweeps() {
     echo "=== Repository Identifier Ban (khive-contract) ==="
     (cd "$SCRIPT_DIR/../tests/khive-contract" &&
         uv run pytest -q tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo)
+    echo "=== Shipping Pack-Set Copy Check ==="
+    # Reads Markdown under docs/, crates/ and scripts/ by content, so the documentation lane must run it.
+    # Named by test id: a renamed test is an error, not an empty selection.
+    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py" \
+        HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set
 }
 
 phase_macos_pr_check() {

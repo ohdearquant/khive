@@ -1771,6 +1771,16 @@ class DocsFormatPhaseTests(unittest.TestCase):
         contract = REPO_ROOT / "tests" / "khive-contract" / contract_file
         self.assertIn(f"def {function}(", contract.read_text())
 
+    def test_content_sweeps_phase_runs_the_pack_set_copy_check_by_name(self):
+        # This check reads Markdown by content and otherwise runs only in phase_lint, which the
+        # documentation lane skips.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('"$SCRIPT_DIR/tests/test_ci_workflows.py"', body)
+        self.assertIn("HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set", body)
+        self.assertTrue(callable(getattr(HarnessEnvironmentTests,
+                                         "test_no_new_hand_typed_copy_of_the_shipping_pack_set", None)))
+
     def test_docs_fmt_refuses_when_deno_is_absent(self):
         # The absence arm decides whether this gate can be emptied in silence: a
         # skip would exit 0 and check nothing. The stub arm runs the identical
@@ -2363,7 +2373,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.git("init", "-q", "-b", "main")
-        self.write("src/lib.rs", "// see notes/guide.md for the design\npub fn f() {}\n")
+        self.write("src/lib.rs", "pub fn f() {}\n")
         self.write("notes/guide.md", "# Guide\n")
         self.write("notes/wire.md", "# Wire\n")
         self.write("tests/wire.rs", 'const DOC: &str = include_str!("../notes/wire.md");\n')
@@ -2396,7 +2406,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
         return completed.stdout.strip(), completed.stderr
 
-    def test_markdown_named_only_in_a_comment_takes_the_documentation_lane(self):
+    def test_markdown_no_other_file_names_takes_the_documentation_lane(self):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
         verdict, reasons = self.classify(self.base, self.commit("guide"))
         self.assertEqual(verdict, "true", reasons)
@@ -2472,21 +2482,54 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                 self.assertEqual(verdict, "false", reasons)
                 self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
 
-    def test_a_dot_named_markdown_file_runs_the_full_suite(self):
-        self.write("docs/.hidden.md", "# Hidden\n")
+    def test_a_dot_named_markdown_file_follows_the_same_rules(self):
+        # The count scanner's globs and its path predicate agree on dot-named paths, so a dot-named file
+        # needs no rule of its own: unnamed it takes the lane, named by code it runs the full suite.
+        self.write("notes/.hidden.md", "# Hidden\n")
         base = self.commit("hidden")
-        self.write("docs/.hidden.md", "# Hidden\n\nChanged.\n")
+        self.write("notes/.hidden.md", "# Hidden\n\nChanged.\n")
         verdict, reasons = self.classify(base, self.commit("change hidden"))
+        self.assertEqual(verdict, "true", reasons)
+        self.write("tests/hidden.rs", 'const H: &str = include_str!("../notes/.hidden.md");\n')
+        base = self.commit("name hidden")
+        self.write("notes/.hidden.md", "# Hidden\n\nAgain.\n")
+        verdict, reasons = self.classify(base, self.commit("change hidden again"))
         self.assertEqual(verdict, "false", reasons)
-        self.assertIn("docs/.hidden.md is dot-named", reasons)
+        self.assertIn("notes/.hidden.md is named by a non-Markdown file", reasons)
 
-    def test_comments_with_each_marker_still_take_the_documentation_lane(self):
+    def test_the_scanner_predicate_and_its_globs_agree_on_dot_named_paths(self):
+        sys.path.insert(0, str(REPO_ROOT / "tests"))
+        try:
+            import documented_verb_counts as scanner
+        finally:
+            sys.path.remove(str(REPO_ROOT / "tests"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            paths = ["docs/.hidden.md", "docs/.d/a.md", "marketplace/.m.md", "scripts/.s.md"]
+            for rel in paths:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text("# x\n")
+            globbed = {p.relative_to(root).as_posix() for g in scanner.PUBLISHED_GLOBS for p in root.glob(g)}
+            for rel in paths:
+                with self.subTest(path=rel):
+                    self.assertTrue(scanner.is_published_markdown(rel))
+                    self.assertIn(rel, globbed)
+
+    def test_a_name_on_a_line_that_starts_like_a_comment_runs_the_full_suite(self):
+        # Plain comments with each marker, then lines that only look like comments: code after a closed
+        # /* */, a raw string line, a Python string line and a continued shell argument. A line read on its
+        # own cannot tell these apart, so every one of them counts.
         cases = [
             ("tools/check.py", "# see notes/hash.md\nprint(1)\n", "notes/hash.md"),
-            ("src/star.rs", "/*\n * see notes/star.md\n */\nfn s() {}\n", "notes/star.md"),
+            ("web/star.js", "/*\n * see notes/star.md\n */\nlet s = 1;\n", "notes/star.md"),
             ("src/line.rs", "// see notes/line.md\nfn l() {}\n", "notes/line.md"),
             ("src/open.rs", "/* see notes/open.md */\nfn p() {}\n", "notes/open.md"),
             ("sql/q.sql", "-- see notes/dash.md\nSELECT 1;\n", "notes/dash.md"),
+            ("web/page.html", "<!-- see notes/html.md -->\n<p></p>\n", "notes/html.md"),
+            ("src/inline.rs", '/* a */ const D: &str = include_str!("../notes/inline.md");\n', "notes/inline.md"),
+            ("src/raw.rs", 'const T: &str = r#"\n// notes/raw.md\n"#;\n', "notes/raw.md"),
+            ("tools/doc.py", 'DOCS = """\n# notes/pystr.md\n"""\n', "notes/pystr.md"),
+            ("scripts/run.sh", "render \\\n    -- notes/dashdash.md\n", "notes/dashdash.md"),
         ]
         for code_path, code, markdown in cases:
             with self.subTest(code_path=code_path):
@@ -2495,11 +2538,53 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                 base = self.commit("base " + code_path)
                 self.write(markdown, "# Notes\n\nChanged.\n")
                 verdict, reasons = self.classify(base, self.commit("change " + markdown))
-                self.assertEqual(verdict, "true", reasons)
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_a_binary_file_that_names_the_markdown_runs_the_full_suite(self):
+        fixture = self.repo / "fixtures" / "guide.bin"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_bytes(b"\x00\x01notes/guide.md\x00")
+        base = self.commit("binary fixture")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+
+    def test_a_symlink_whose_target_names_the_markdown_runs_the_full_suite(self):
+        link = self.repo / "fixtures" / "guide.json"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../notes/guide.md")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a symlink's target", reasons)
+
+    def test_a_symlink_to_another_file_leaves_the_documentation_lane(self):
+        link = self.repo / "fixtures" / "lib.rs"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../src/lib.rs")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_any_change_while_the_tree_has_a_submodule_runs_the_full_suite(self):
+        # The gitlink has no checkout here, so both commits stage by path: add -A would record its removal.
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},vendor/sub")
+        self.git("commit", "-q", "-m", "submodule")
+        base = self.git("rev-parse", "HEAD")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.git("add", "notes/guide.md")
+        self.git("commit", "-q", "-m", "guide")
+        verdict, reasons = self.classify(base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("has a submodule, whose files are not searched", reasons)
 
     def test_any_non_markdown_path_runs_the_full_suite(self):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
-        self.write("src/lib.rs", "// see notes/guide.md for the design\npub fn g() {}\n")
+        self.write("src/lib.rs", "pub fn g() {}\n")
         verdict, reasons = self.classify(self.base, self.commit("mixed"))
         self.assertEqual(verdict, "false")
         self.assertIn("not Markdown: src/lib.rs", reasons)
