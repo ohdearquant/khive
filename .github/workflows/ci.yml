@@ -270,14 +270,23 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          # Only main writes caches. A pull request's cache is scoped to its
+          # own merge ref, so no other pull request can restore it, but it
+          # still counts against the repository's cache quota. Pull request
+          # saves pushed the total past the quota and evicted main's entries
+          # (the macOS entry first), which left later runs compiling every
+          # dependency from scratch. Pull requests restore main's cache and
+          # save nothing.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
-          # Deliberately NOT sharded into the key: both shards of the same OS
-          # build the same workspace, so sharing one key avoids doubling the
-          # cache footprint. The two shards' save-cache calls race at the end
-          # of the job; the first to finish wins and the second is a no-op
-          # (actions/cache skips saving over an existing key), which is fine.
-          key: line-tables
+          # Sharded into the key: the shards build different profiles and
+          # features (the release build runs on shard 1; Clippy, the
+          # forward-deployed checks and the channel feature tests run on
+          # shard 2). With one shared key the first shard to finish saved and
+          # the other's artifacts never reached the cache, so the release
+          # build recompiled every dependency on every run.
+          key: line-tables-shard${{ matrix.shard }}
       # EMBEDDING MODEL CACHE. The embedder fetches its weights from
       # huggingface.co the first time it is built. Fetching per run made this
       # workflow depend on a third-party CDN's rate limiter, which on
@@ -470,6 +479,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: line-tables
       - uses: actions/setup-python@v6
         with:
@@ -799,6 +809,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build docs (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
@@ -880,6 +891,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pinned exact version (same rationale as the cargo-deny/gitleaks pins
       # above): a wasm-parity gate's tooling must not silently drift.
       - name: Cache wasmtime
@@ -1026,6 +1038,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: wasm32 core compile check
         run: cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features
       - name: Native sequential and owned-storage tests
@@ -1100,6 +1113,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # MinIO no longer publishes prebuilt server images or binaries that an
       # anonymous CI job can fetch. quay.io answers 401 for minio/minio (its
       # tags and the digest this job used to pin), dl.min.io answers 410 Gone
@@ -1214,11 +1228,12 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv-1.95
       - name: Check workspace on the declared minimum Rust version
         run: cargo +1.95.0 check --workspace --locked
 
-  # Keep this job outside ci-gate until a week of successful main merges.
+  # Required by ci-gate after the successful main observation week.
   # Sequential feature checks reuse one Linux runner without hiding later failures.
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
@@ -1245,6 +1260,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The same embedding model cache the ci job restores, under the same key. With
       # LATTICE_OFFLINE set above, a library test that needs the model fails naming
       # the missing directory instead of fetching from huggingface.co.
@@ -1315,6 +1331,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
       # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
       # Not (yet) a required check in branch protection — plain `cargo check`
@@ -1411,6 +1428,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-targets: false
       # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
       # #215 cargo-deny installer pin): a required gate's tooling must not drift.
@@ -1625,6 +1643,7 @@ jobs:
       - vamana-portability
       - minio-blob-compat
       - msrv-check
+      - core-only
     if: always()
     steps:
       - name: Check aggregated job results

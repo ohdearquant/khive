@@ -140,7 +140,7 @@ async fn rpc(
         "each MCP call must cross the private daemon connection"
     );
     assert_eq!(response.content.len(), 1);
-    let text = &response.content[0].raw.as_text().unwrap().text;
+    let text = &response.content[0].as_text().unwrap().text;
     assert!(
         !text.contains(PRIVATE_PAYLOAD),
         "payload must not leak into a refusal"

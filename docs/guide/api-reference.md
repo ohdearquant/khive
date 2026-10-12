@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -1945,7 +1945,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 11 verbs
+## `comm` pack — 14 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2229,6 +2229,65 @@ No parameters.
 ```
 request(ops="comm.health()")
 ```
+
+### `comm.suppression_add` — Commissive
+
+Add an email suppression entry. Address values are normalized with the shared email
+recipient normalizer; domain values are ASCII-lowercased and match that exact domain only.
+An entry is unique per `(scope, kind, value, source)`; a duplicate refuses with a conflict.
+Only the configured caller actor or an actor allowed as an external sender may add entries.
+
+| Param    | Type   | Required | Notes                                                                   |
+| -------- | ------ | -------- | ----------------------------------------------------------------------- |
+| `scope`  | string | yes      | Suppression direction: `outbound` or `inbound`.                         |
+| `kind`   | string | yes      | Value type: `address`, `domain`, or `recipient_key`.                    |
+| `value`  | string | yes      | Address, exact domain, or opaque recipient key to suppress.             |
+| `source` | string | yes      | Entry source: `operator`, `mailto_token`, `one_click`, or `reply_stop`. |
+| `reason` | string | no       | Optional free-text reason recorded with the entry.                      |
+
+```
+request(ops="comm.suppression_add(scope=\"outbound\", kind=\"address\", value=\"person@example.com\", source=\"operator\")")
+```
+
+Returns the stored entry `{id, scope, kind, value, source, created_by, created_at, reason}`.
+
+### `comm.suppression_list` — Assertive
+
+List live email suppression entries, optionally filtered by scope and kind.
+
+| Param    | Type    | Required | Notes                                                          |
+| -------- | ------- | -------- | -------------------------------------------------------------- |
+| `scope`  | string  | no       | Optional scope filter: `outbound` or `inbound`.                |
+| `kind`   | string  | no       | Optional kind filter: `address`, `domain`, or `recipient_key`. |
+| `limit`  | integer | no       | Page size, default 100, maximum 500.                           |
+| `offset` | integer | no       | Number of matching entries to skip, default 0.                 |
+
+```
+request(ops="comm.suppression_list(scope=\"outbound\")")
+```
+
+Returns `{items, limit, offset}`, where each item carries the same fields as
+`comm.suppression_add`.
+
+### `comm.suppression_remove` — Commissive
+
+Remove one suppression entry by full UUID. Restricted to the configured maintainer actor.
+A non-empty `reason` is required and is recorded in the audit event. Entries whose source
+is an opt-out (`mailto_token`, `one_click`, `reply_stop`) also require
+`evidence_inbound_message_id`: a full UUID of an authenticated inbound email from the same
+address that arrived after the entry was created.
+
+| Param                         | Type   | Required | Notes                                                                                                        |
+| ----------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `id`                          | uuid   | yes      | Full UUID of the suppression entry.                                                                          |
+| `reason`                      | string | yes      | Non-empty reason for removing this entry; included in the audit event.                                       |
+| `evidence_inbound_message_id` | uuid   | no       | Full UUID of an authenticated later inbound email from the suppressed address; required for opt-out sources. |
+
+```
+request(ops="comm.suppression_remove(id=\"<entry-id>\", reason=\"operator request\")")
+```
+
+Returns `{id, removed, audit_event_id}`.
 
 ---
 

@@ -698,10 +698,12 @@ async fn apply_stream_member(
             }
             Err(AtomicOpFailure::NoteConflict(conflict)) => Err(conflict.into_error().into()),
             Err(AtomicOpFailure::GuardFailed { .. }) => {
-                let holder = writer.query_row(SqlStatement::new(
-                        "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
-                        vec![SqlValue::Text(namespace.into()), SqlValue::Text(kind), SqlValue::Text(key.clone())],
-                    ).labelled("stream")).await?;
+                let holder = writer
+                    .query_row(
+                        khive_db::statement_lists::live_holder_read(namespace, &kind, &key)
+                            .labelled("stream"),
+                    )
+                    .await?;
                 let Some(holder) = holder else {
                     return Err(missing_write(&key).into());
                 };

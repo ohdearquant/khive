@@ -1346,6 +1346,65 @@ mod demand_retirement_tests {
         );
     }
 
+    fn pool_has_open_transaction(pool: &ConnectionPool) -> bool {
+        let khive_storage::tx_registry::TxOrigin::Database(identity) = pool.origin() else {
+            panic!("the transaction-registry fixture must be file-backed");
+        };
+        khive_storage::tx_registry::oldest_for(
+            &khive_storage::tx_registry::TxOriginFilter::Secondary(identity),
+        )
+        .is_some()
+    }
+
+    #[test]
+    #[serial(background_tasks, tx_registry)]
+    fn pool_transaction_probe_detects_own_and_ignores_foreign_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("own.db")),
+            write_queue_enabled: Some(false),
+            write_routing_strict: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let foreign = ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("foreign.db")),
+            write_queue_enabled: Some(false),
+            write_routing_strict: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(own.origin(), foreign.origin());
+
+        let own_writer = own.writer().unwrap();
+        own_writer
+            .transaction(|_| {
+                assert!(
+                    pool_has_open_transaction(&own),
+                    "the probe must detect a live transaction on its own database"
+                );
+                assert!(!pool_has_open_transaction(&foreign));
+                Ok(())
+            })
+            .unwrap();
+        drop(own_writer);
+        assert!(!pool_has_open_transaction(&own));
+
+        let foreign_writer = foreign.writer().unwrap();
+        foreign_writer
+            .transaction(|_| {
+                assert!(pool_has_open_transaction(&foreign));
+                assert!(
+                    !pool_has_open_transaction(&own),
+                    "the probe must ignore a live transaction on a foreign database"
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(foreign_writer);
+        assert!(!pool_has_open_transaction(&foreign));
+    }
+
     #[tokio::test(start_paused = true)]
     #[serial(background_tasks, tx_registry)]
     async fn retained_raw_sql_writer_blocks_actual_idle_wait_and_persistent_stays() {
@@ -1362,7 +1421,7 @@ mod demand_retirement_tests {
         let bridge = khive_db::SqlBridge::new(Arc::clone(&pool), true);
         let writer = bridge.writer().await.unwrap();
         assert!(
-            khive_storage::tx_registry::snapshot().is_empty(),
+            !pool_has_open_transaction(&pool),
             "this hold must be autocommit, not an open transaction"
         );
         let d = dispatcher(Some(Arc::clone(&pool)));

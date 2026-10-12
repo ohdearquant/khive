@@ -65,16 +65,7 @@ pub enum AuditProducer {
     /// A drained process-lifetime `OnceLock` config-lock row.
     ConfigLocked,
     /// A `memory.recall` execution's pure-observability audit row.
-    ///
-    /// Classified and ready for routing, but not yet wired to a live call
-    /// site in this slice: `khive-pack-memory`'s recall handler reaches only
-    /// `KhiveRuntime` (`crates/khive-runtime/src/runtime.rs`), which does not
-    /// hold this batch seam and is outside this change's file ownership
-    /// (`final_file_ownership_r2.md` assigns `runtime.rs` to the D8 author).
-    /// Wiring this variant to `emit_recall_executed_event` needs either an
-    /// ownership-map amendment granting `runtime.rs` a narrow accessor, or
-    /// threading a second seam onto `KhiveRuntime` — both out of scope here.
-    #[allow(dead_code)]
+    /// Submitted by the recall handler through its owning registry's batch.
     RecallExecuted,
 }
 

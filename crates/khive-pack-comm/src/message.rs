@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{note::Note, StorageError, WriterTaskRequestState};
 use khive_types::{Details, KhiveError};
 
@@ -289,6 +290,50 @@ pub(crate) struct MessageWrite {
     pub replayed: bool,
 }
 
+async fn recent_external_outbound_count(
+    runtime: &KhiveRuntime,
+    policy: &khive_runtime::OutboundEmailPolicy,
+) -> Result<u64, RuntimeError> {
+    const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+    let now = chrono::Utc::now().timestamp_micros();
+    let since = now.saturating_sub(DAY_MICROS);
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: khive_runtime::sql!("comm_external_outbound_email_recipients_since").into(),
+            params: vec![SqlValue::Integer(since), SqlValue::Integer(now)],
+            label: Some("comm_external_outbound_email_recipients_since".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    rows.iter().try_fold(0u64, |count, row| {
+        let to_actor = row.text("to_actor").map_err(|_| {
+            RuntimeError::Internal("external email cap query returned a malformed recipient".into())
+        })?;
+        let recipient = to_actor.strip_prefix("email:").ok_or_else(|| {
+            RuntimeError::Internal("external email cap query returned a non-email recipient".into())
+        })?;
+        if policy.allows(recipient) {
+            Ok(count)
+        } else {
+            count
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::Internal("external email cap count overflowed".into()))
+        }
+    })
+}
+
+fn external_email_denied(verb: &str, condition: &str) -> RuntimeError {
+    RuntimeError::permission_denied(
+        verb,
+        format!("external email admission refused: {condition}; no message was committed by this request"),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dual_write_message_with_identity(
     runtime: &KhiveRuntime,
@@ -348,6 +393,7 @@ pub(crate) async fn dual_write_message_with_identity(
         }
     }
 
+    let mut external_admission_guard: Option<tokio::sync::OwnedMutexGuard<()>> = None;
     if let Some(recipient) = to_actor.and_then(|actor| actor.strip_prefix("email:")) {
         if let Some(identity) = identity {
             #[cfg(test)]
@@ -378,15 +424,66 @@ pub(crate) async fn dual_write_message_with_identity(
         }
         // For a denied keyed request, the lookup above is the final no-holder
         // observation. A later competing commit is available to the next retry.
-        if !runtime.outbound_email_policy().allows(recipient) {
+        let policy = runtime.outbound_email_policy();
+        if !policy.allows(recipient) {
             // A recipient that does not parse has no normalized form; name it as requested.
             let named = khive_types::email_address::normalize_email_recipient(recipient)
                 .unwrap_or_else(|| recipient.to_string());
-            let reason = format!(
-                "email recipient '{named}' is not permitted by the configured outbound policy; \
-                 no message was committed by this request"
-            );
-            return Err(RuntimeError::permission_denied(verb, reason));
+            if !policy.has_external_senders() {
+                let reason = format!(
+                    "email recipient '{named}' is not permitted by the configured outbound policy; \
+                     no message was committed by this request"
+                );
+                return Err(RuntimeError::permission_denied(verb, reason));
+            }
+            if !policy.allows_external_sender(&caller_token.actor().id) {
+                return Err(external_email_denied(
+                    verb,
+                    "caller is not an external sender",
+                ));
+            }
+            external_admission_guard = Some(policy.lock_external_admission().await);
+            if let Some(identity) = identity {
+                let holder = khive_runtime::keyed_message::find_keyed_message_holder(
+                    runtime,
+                    caller_token.namespace().as_str(),
+                    &identity.physical_key(caller_token),
+                )
+                .await?;
+                if let Some(holder) = holder {
+                    return Ok(MessageWrite {
+                        outbound: identity
+                            .replay(runtime, caller_token, holder, attachments)
+                            .await?,
+                        embedding_truncation: Default::default(),
+                        replayed: true,
+                    });
+                }
+            }
+            let normalized = khive_types::email_address::normalize_email_recipient(recipient)
+                .ok_or_else(|| external_email_denied(verb, "recipient address is invalid"))?;
+            let suppressions = crate::handlers::load_outbound_email_suppressions(runtime)
+                .await
+                .map_err(|_| external_email_denied(verb, "suppression check is unavailable"))?;
+            let recipient_key = policy.recipient_key(&normalized);
+            if khive_runtime::outbound_email_is_suppressed(
+                &normalized,
+                recipient_key,
+                &suppressions,
+            ) {
+                return Err(external_email_denied(verb, "recipient is suppressed"));
+            }
+            let cap = policy
+                .external_daily_cap()
+                .ok_or_else(|| external_email_denied(verb, "daily external cap is unavailable"))?;
+            let recent_count = recent_external_outbound_count(runtime, policy)
+                .await
+                .map_err(|_| {
+                    external_email_denied(verb, "daily external cap check is unavailable")
+                })?;
+            if recent_count >= cap {
+                return Err(external_email_denied(verb, "daily external cap reached"));
+            }
         }
     }
 
@@ -539,6 +636,7 @@ pub(crate) async fn dual_write_message_with_identity(
         .await
         .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
     };
+    drop(external_admission_guard);
     Ok(MessageWrite {
         outbound: notes.remove(0),
         embedding_truncation,

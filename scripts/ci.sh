@@ -268,7 +268,7 @@ phase_tests_doc() {
 }
 
 phase_channel_email() {
-    echo "=== Channel Feature Tests (email + Telegram features) ==="
+    echo "=== Feature Tests (email + Telegram channels, retrieval executor) ==="
     # `--workspace` alone never runs any of the several `#[cfg(feature =
     # "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
     # sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
@@ -281,6 +281,10 @@ phase_channel_email() {
     # external side effects and must execute tests, not merely type-check in
     # the all-features clippy pass.
     cargo test -p khive-mcp --features channel-email,channel-telegram
+    # The shared retrieval executor is opt-in and has no caller in the
+    # workspace yet, so no build enables its feature and `--workspace` compiles
+    # neither the executor nor its tests. Run them under the feature here.
+    cargo test -p khive-retrieval --features executor
 }
 
 run_daemon_recovery_repeats() {

@@ -65,7 +65,14 @@ impl Channel for ScriptedChannel {
 }
 
 async fn fixture(recipient: &str) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) {
-    let runtime = KhiveRuntime::new(RuntimeConfig {
+    fixture_with_policy(recipient, None).await
+}
+
+async fn fixture_with_policy(
+    recipient: &str,
+    email_policy: Option<khive_runtime::OutboundEmailPolicy>,
+) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) {
+    let mut runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         actor_id: Some("actor:outbox-supervision".into()),
         brain_profile: None,
@@ -73,6 +80,9 @@ async fn fixture(recipient: &str) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) 
         ..RuntimeConfig::no_embeddings()
     })
     .unwrap();
+    if let Some(policy) = email_policy {
+        runtime = runtime.with_outbound_email_policy(policy);
+    }
     let server = KhiveMcpServer::new(runtime.clone()).unwrap();
     let sent = server
         .verb_registry_clone()
@@ -131,6 +141,14 @@ fn email_registration(
         khive_runtime::OutboundEmailPolicy::configured(vec!["recipient@example.com".into()])
             .unwrap(),
     );
+    email_registration_with_policy(runtime, channel)
+}
+
+#[cfg(feature = "channel-email")]
+fn email_registration_with_policy(
+    runtime: KhiveRuntime,
+    channel: Arc<ScriptedChannel>,
+) -> ComponentRegistration {
     let mut registration = channel_component_registration(
         "email-outbound",
         Arc::new(move |ctx| {
@@ -347,6 +365,64 @@ async fn email_outbound_allowlist_refusal_is_visible_in_sender_sent_mail() {
         .await
         .unwrap()
         .is_empty());
+    cancellation.cancel();
+    task.await.unwrap();
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_email_suppressed_after_admission_fails_before_smtp() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_policy("email:external@example.net", Some(policy)).await;
+    server
+        .verb_registry_clone()
+        .dispatch(
+            "comm.suppression_add",
+            json!({
+                "scope":"outbound",
+                "kind":"address",
+                "value":"external@example.net",
+                "source":"operator"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let props = properties(&runtime, id).await;
+            if props["delivery"] == "failed" {
+                assert!(props["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("suppression"));
+                assert!(!props["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("external@example.net"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("suppressed external message should reach a permanent failure");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
     cancellation.cancel();
     task.await.unwrap();
 }
