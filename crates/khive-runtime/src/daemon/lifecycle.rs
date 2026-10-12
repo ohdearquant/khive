@@ -397,16 +397,7 @@ pub const SUPERVISOR_CLAIM_ENV: &str = "KHIVE_SUPERVISOR_CLAIM";
 #[cfg(unix)]
 pub(super) fn read_supervisor_marker_claim() -> Option<(u32, String)> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(supervisor_marker_path())
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
+    let file = khive_fs::opened_file::open_regular_file_nofollow(&supervisor_marker_path()).ok()?;
     let mut marker = String::new();
     file.take(4097).read_to_string(&mut marker).ok()?;
     if marker.len() > 4096 {

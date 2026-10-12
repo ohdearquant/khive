@@ -806,18 +806,19 @@ fn acquire_events_daemon_guard_outcome(socket_path: &Path) -> EventsDaemonGuardA
             return OpenFailed(error);
         }
     }
-    use std::os::unix::fs::OpenOptionsExt;
     // `O_NOFOLLOW` pins the open to the final component: a symlink planted
     // at the lock name is refused instead of redirecting the open (and the
     // chmod below) to an attacker-selected target.
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lock_path)
-    {
+    let opened = khive_fs::opened_file::open_writable_file_nofollow(
+        &lock_path,
+        khive_fs::fd_relative::OpenFileOptions {
+            read_write: false,
+            create: khive_fs::fd_relative::Create::IfMissing,
+            nonblock: false,
+            mode: 0o600,
+        },
+    );
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
             return HardeningRefused(error);
@@ -976,7 +977,8 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 /// post-open check that opens nothing is `verify_events_db_owner_only_unopened`.
 #[cfg(unix)]
 fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<EventsDbIdentities> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use khive_fs::opened_file::ContainedOpenError;
+    use std::os::unix::fs::PermissionsExt;
     let mut identities = [None; 3];
     for (index, path) in events_db_targets(db_path).into_iter().enumerate() {
         // Pin the inode before touching it: `O_NOFOLLOW` makes the open
@@ -985,23 +987,26 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<EventsDbIdentitie
         // exists between validation and the permission change for a swapped
         // entry to exploit. A path-based lstat-then-chmod pair here would
         // re-open the exact race it is defending against.
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
+        let file = match khive_fs::opened_file::open_regular_file_nofollow(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                anyhow::bail!(
-                    "refusing to serve events: cannot open {} without following symlinks: \
-                     {e}. The events database and its sidecars must be regular files.",
-                    path.display()
-                )
+            Err(ContainedOpenError::Open(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
             }
+            Err(ContainedOpenError::Open(e)) => anyhow::bail!(
+                "refusing to serve events: cannot open {} without following symlinks: \
+                 {e}. The events database and its sidecars must be regular files.",
+                path.display()
+            ),
+            Err(ContainedOpenError::Metadata(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!(
+                "refusing to serve events: {} is not a regular file. The events \
+                 database and its sidecars must be regular files.",
+                path.display()
+            ),
         };
-        // The open succeeds on a directory too; fstat the handle (no path
-        // re-lookup) so a directory at the path is refused, never chmod'ed.
+        // The shared helper has checked the opened file's regular type.
+        // Read this same descriptor's metadata for the pre-open identity
+        // snapshot; no pathname is reopened before the chmod.
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
             anyhow::bail!(
@@ -2860,6 +2865,7 @@ mod tests {
     }
 
     include!("events_sidecar_hardening_tests.rs");
+    include!("events_lock_search_parent_tests.rs");
 
     #[cfg(unix)]
     fn write_owner_only_test_file(path: &Path) {
