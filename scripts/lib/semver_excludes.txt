@@ -7,6 +7,7 @@
 khive-channel-telegram
 khive-fs
 khive-graph-diff
+khive-lion-core
 khive-mounts
 khive-pack-agent
 khive-pack-blob

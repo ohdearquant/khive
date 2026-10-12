@@ -47,6 +47,7 @@ cd "$SCRIPT_DIR/../crates"
 
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
+    khive-lion-core      # copied kernel; no khive-* dependencies
     khive-types
     khive-score
     khive-quant
