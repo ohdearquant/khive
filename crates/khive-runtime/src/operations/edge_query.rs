@@ -189,30 +189,7 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
-        let mut reader = self.sql().reader().await?;
-        let record_ns = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT namespace FROM graph_edges \
-                      WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
-                params: vec![SqlValue::Text(edge_id.to_string())],
-                label: Some("get_edge_namespace".into()),
-            })
-            .await?;
-
-        let Some(SqlValue::Text(record_ns)) = record_ns else {
-            return Ok(None);
-        };
-        // Route the storage fetch through the record's own namespace — the token is
-        // just the caller context; by-ID ops cross namespace boundaries.
-        let record_tok = NamespaceToken::for_namespace(
-            khive_types::Namespace::parse(&record_ns)
-                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
-        );
-        Ok(self
-            .graph(&record_tok)?
-            .get_edge(LinkId::from(edge_id))
-            .await?)
+        self.get_edge_by_id_inner(edge_id, false).await
     }
 
     /// Read live edges by ID in input order, without a visibility predicate.
@@ -377,12 +354,32 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
+        self.get_edge_by_id_inner(edge_id, true).await
+    }
+
+    async fn get_edge_by_id_inner(
+        &self,
+        edge_id: Uuid,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Edge>> {
+        let (sql, label) = if include_deleted {
+            (
+                "SELECT namespace FROM graph_edges WHERE id = ?1 LIMIT 1",
+                "get_edge_including_deleted_namespace",
+            )
+        } else {
+            (
+                "SELECT namespace FROM graph_edges \
+                 WHERE id = ?1 AND deleted_at IS NULL LIMIT 1",
+                "get_edge_namespace",
+            )
+        };
         let mut reader = self.sql().reader().await?;
         let record_ns = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT namespace FROM graph_edges WHERE id = ?1 LIMIT 1".into(),
+                sql: sql.into(),
                 params: vec![SqlValue::Text(edge_id.to_string())],
-                label: Some("get_edge_including_deleted_namespace".into()),
+                label: Some(label.into()),
             })
             .await?;
 
@@ -394,10 +391,14 @@ impl KhiveRuntime {
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
-        Ok(self
-            .graph(&record_tok)?
-            .get_edge_including_deleted(LinkId::from(edge_id))
-            .await?)
+        let graph = self.graph(&record_tok)?;
+        Ok(if include_deleted {
+            graph
+                .get_edge_including_deleted(LinkId::from(edge_id))
+                .await?
+        } else {
+            graph.get_edge(LinkId::from(edge_id)).await?
+        })
     }
 
     /// Fetch an edge by natural key (namespace, canonical source/target, relation)
