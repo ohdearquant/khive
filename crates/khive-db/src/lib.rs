@@ -54,6 +54,8 @@ pub mod pool;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
+/// Pure statement-list builders for caller-owned SQL execution.
+pub mod statement_lists;
 #[cfg(any(test, feature = "test-support"))]
 mod statement_observer;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).

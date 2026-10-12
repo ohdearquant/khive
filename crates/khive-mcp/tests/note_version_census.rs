@@ -34,6 +34,7 @@ const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
 ];
 
 const DB: &str = "khive-db/src/stores/note.rs";
+const PROPERTY_CAS: &str = "khive-db/src/statement_lists.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
 const RECLAIM: &str = "khive-mcp/src/pending_events/reclaim.rs";
 const RECEIPTS: &str = "khive-mcp/src/pending_events/receipt.rs";
@@ -1006,11 +1007,12 @@ fn census() -> BTreeMap<(String, String), String> {
         })
         .collect::<Vec<_>>();
     let sql_sources = live_sql_sources();
-    let (found, loaded, markerless) = scan_sources_with_routes(&sources, &sql_sources);
+    let (mut found, loaded, markerless) = scan_sources_with_routes(&sources, &sql_sources);
     assert_markerless_callers(&markerless, MARKERLESS_CALLERS);
     assert_sql_ownership(&sql_sources, &loaded);
     let expected = [
         (DB, "NOTE_UPSERT_SQL"),
+        (PROPERTY_CAS, "property_cas_statements"),
         (DB, "note_replace_if_unchanged_statement"),
         (DB, "note_metadata_replace_if_unchanged_statement"),
         (DB, "note_update_properties_statement"),
@@ -1049,6 +1051,16 @@ fn census() -> BTreeMap<(String, String), String> {
         "production writer enumeration must not be vacuous"
     );
     assert_eq!(found.keys().cloned().collect::<BTreeSet<_>>(), expected);
+    // The closed notes prefix is inventoried by the ordinary visitor. Native
+    // checks must use the actual completed builder output, not this partial seed.
+    let key = (
+        PROPERTY_CAS.to_owned(),
+        "property_cas_statements".to_owned(),
+    );
+    let statement = property_cas_probe_statement();
+    assert!(statement.sql.starts_with(&found[&key]));
+    assert!(note_writer(&statement.sql));
+    found.insert(key, statement.sql);
     found
 }
 
@@ -1137,6 +1149,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
     let writers = census();
     let cases = [
         (DB, "note_update_properties_statement", "memory", "{}"),
+        (
+            PROPERTY_CAS,
+            "property_cas_statements",
+            "memory",
+            r#"{"checked":"before"}"#,
+        ),
         (MIGRATIONS, "migrate_outbound_due_key", "memory", "{}"),
         (
             RECLAIM,
@@ -1213,6 +1231,14 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     rusqlite::types::Null
                 ],
             ),
+            PROPERTY_CAS => {
+                let statement = property_cas_probe_statement();
+                assert_eq!(statement.sql, *sql);
+                conn.execute(
+                    sql,
+                    rusqlite::params_from_iter(property_cas_probe_params(&statement)),
+                )
+            }
             MIGRATIONS => conn.execute(sql, params![vec![0_u8; 12], "2020-01-01T00:00:00Z", ID]),
             RECLAIM => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
             RECEIPTS => conn.execute(
@@ -2004,4 +2030,188 @@ fn markerless_route_census_rejects_empty_and_unlisted_production_callers() {
         std::panic::catch_unwind(|| assert_markerless_callers(&scan(transport), &inventory))
             .is_err()
     );
+}
+
+// These probes call the real public builder. Only its chosen Uuid/Text fixture
+// values are rendered here; all other native SQL variants keep the DB controls.
+fn property_cas_probe_statement() -> khive_storage::SqlStatement {
+    let statements = khive_db::statement_lists::property_cas_statements(
+        "notes",
+        uuid::Uuid::parse_str(ID).unwrap(),
+        &[("$.checked", khive_storage::SqlValue::Text("before".into()))],
+        &[("$.checked", khive_storage::SqlValue::Text("after".into()))],
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0].label.is_none());
+    statements.into_iter().next().unwrap()
+}
+
+fn property_cas_probe_params(
+    statement: &khive_storage::SqlStatement,
+) -> Vec<rusqlite::types::Value> {
+    statement
+        .params
+        .iter()
+        .map(|value| match value {
+            khive_storage::SqlValue::Uuid(value) => rusqlite::types::Value::Text(value.to_string()),
+            khive_storage::SqlValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+            other => panic!("unexpected real builder probe binding: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn closed_property_builder_is_a_named_writer_and_dynamic_seed_still_refuses() {
+    let source = include_str!("../../khive-db/src/statement_lists.rs");
+    let assets = StaticSqlSources::from([(
+        "khive-db/sql/live-holder-read.sql".into(),
+        include_str!("../../khive-db/sql/live-holder-read.sql").into(),
+    )]);
+    let (writers, loaded) = scan_sources_with_sql(&[(PROPERTY_CAS.into(), source.into())], &assets);
+    assert!(loaded.is_empty());
+    assert_eq!(
+        writers.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([(PROPERTY_CAS.into(), "property_cas_statements".into())])
+    );
+    let completed = property_cas_probe_statement();
+    assert!(completed
+        .sql
+        .starts_with(&writers[&(PROPERTY_CAS.into(), "property_cas_statements".into())]));
+
+    let old_seed = "UPDATE notes SET properties";
+    assert_eq!(source.matches(old_seed).count(), 1);
+    let opaque = source.replacen(old_seed, "UPDATE {table} SET properties", 1);
+    assert!(
+        std::panic::catch_unwind(|| scan_sources_with_sql(
+            &[(PROPERTY_CAS.into(), opaque)],
+            &assets
+        ))
+        .is_err(),
+        "actual builder source with a dynamic incomplete seed must still refuse"
+    );
+}
+
+#[test]
+fn actual_property_builder_keeps_notes_version_authority_and_mismatch_noop() {
+    let conn = fixture("memory", r#"{"checked":"before"}"#);
+    let statement = property_cas_probe_statement();
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(version(&conn), 2);
+    let properties: String = conn
+        .query_row("SELECT properties FROM notes WHERE id=?1", [ID], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&properties).unwrap(),
+        serde_json::json!({"checked":"after"})
+    );
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(version(&conn), 2);
+    let unchanged: String = conn
+        .query_row("SELECT properties FROM notes WHERE id=?1", [ID], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unchanged, properties);
+
+    let explicit = statement
+        .sql
+        .replacen(" WHERE ", ", version = version + 1 WHERE ", 1);
+    assert_ne!(explicit, statement.sql);
+    assert!(
+        conn.prepare(&explicit).is_err(),
+        "the notes authorizer still refuses a direct version assignment"
+    );
+    let deleted = deleted_fixture("memory", r#"{"checked":"before"}"#);
+    assert_eq!(
+        deleted
+            .execute(
+                &statement.sql,
+                rusqlite::params_from_iter(property_cas_probe_params(&statement))
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(version(&deleted), 1);
+}
+
+#[test]
+fn actual_property_builder_keeps_entity_version_guard_and_closed_table_refusal() {
+    let conn = fixture("memory", "{}");
+    conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES (?1,'local','concept','fixture','{\"checked\":\"before\"}',100,100)", [ID]).unwrap();
+    let mut statements = khive_db::statement_lists::property_cas_statements(
+        "entities",
+        uuid::Uuid::parse_str(ID).unwrap(),
+        &[("$.checked", khive_storage::SqlValue::Text("before".into()))],
+        &[("$.checked", khive_storage::SqlValue::Text("after".into()))],
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 1);
+    let statement = statements.remove(0);
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        1
+    );
+    let after: (i64, String) = conn
+        .query_row(
+            "SELECT version,properties FROM entities WHERE id=?1",
+            [ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after.0, 2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.1).unwrap(),
+        serde_json::json!({"checked":"after"})
+    );
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        0
+    );
+    let unchanged: (i64, String) = conn
+        .query_row(
+            "SELECT version,properties FROM entities WHERE id=?1",
+            [ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(unchanged, after);
+    for table in [
+        "graph_edges",
+        "NOTES",
+        "main.notes",
+        "notes; DELETE FROM entities",
+    ] {
+        assert!(khive_db::statement_lists::property_cas_statements(
+            table,
+            uuid::Uuid::parse_str(ID).unwrap(),
+            &[],
+            &[]
+        )
+        .is_err());
+    }
 }

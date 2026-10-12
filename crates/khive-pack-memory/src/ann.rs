@@ -124,19 +124,10 @@ pub(crate) struct AnnBridge {
     drop_probe: Option<Arc<()>>,
 }
 
-impl std::ops::Deref for AnnBridge {
-    type Target = AnnBridgeCore;
-
-    fn deref(&self) -> &AnnBridgeCore {
-        &self.core
-    }
-}
-
-impl std::ops::DerefMut for AnnBridge {
-    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
-        &mut self.core
-    }
-}
+khive_vamana::impl_ann_bridge_helpers!(
+    AnnBridge,
+    /// Stamps the build with the write generation represented by its corpus snapshot.
+);
 
 #[derive(Clone, Copy)]
 pub(crate) enum AnnScoreRoute {
@@ -672,12 +663,6 @@ impl AnnBridge {
             #[cfg(test)]
             drop_probe: None,
         })
-    }
-
-    /// Stamps the build with the write generation represented by its corpus snapshot.
-    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
-        self.generation = generation;
-        self
     }
 
     /// Stamps the build with the independently durable corpus epoch it observed.

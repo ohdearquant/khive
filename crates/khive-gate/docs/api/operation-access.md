@@ -43,6 +43,10 @@ event rows inside the caller's visible namespaces and writes nothing.
 Revision `domain-effects-v12` classifies `knowledge.export` as `Read`: it renders the
 selected namespace's live corpus rows as JSONL in the response and writes no file and no row.
 
+Revision `domain-effects-v13` classifies `comm.suppression_add` and `comm.suppression_remove` as
+`Write`: they insert or delete suppression rows that change future email admission.
+`comm.suppression_list` is `Read`: it returns the stored suppression rows and writes none.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -95,6 +99,9 @@ selected namespace's live corpus rows as JSONL in the response and writes no fil
 | `comm.read`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L249)            |
 | `comm.reply`                 | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L300)            |
 | `comm.send`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L47)             |
+| `comm.suppression_add`       | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L22)             |
+| `comm.suppression_list`      | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L65)             |
+| `comm.suppression_remove`    | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L101)            |
 | `comm.thread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L336)            |
 | `comm.transport_status` | Read | Verb | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L139) |
 | `comm.unread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L293)            |
@@ -258,7 +265,8 @@ See [runtime token minting](../../../khive-runtime/src/runtime.rs#L1086).
   classification presumes the supported one-store-per-tenant deployment shape
   in [ADR-007 Rule 9](../../../../docs/adr/ADR-007-namespace.md). `db_diagnostics`
   is Read, including its existing PASSIVE checkpoint I/O; `comm.cursor_get` may
-  lazily initialize its cursor schema. Search/recall may persist normal telemetry.
+  lazily initialize its cursor schema, and `comm.suppression_list` its suppression
+  table. Search/recall may persist normal telemetry.
 - `memory.recall` is Read, but its nested `brain.record_serve` dispatch keeps the
   same actor and is Write. For a restricted actor the ledger call is denied and
   warned; recall results still return, and its direct RecallExecuted telemetry

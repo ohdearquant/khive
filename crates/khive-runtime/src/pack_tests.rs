@@ -89,6 +89,7 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
 /// reintroducing one of them: a category-only census would stay green if
 /// any name were re-added to the allowlist.
 const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
+    "comm.suppression_list",
     "db_diagnostics",
     "git.checkout",
     "git.diff",

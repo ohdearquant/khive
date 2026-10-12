@@ -233,3 +233,74 @@ fn checkpoint_config_warn_sustained_cycles_env_override() {
         DEFAULT_WARN_SUSTAINED_CYCLES
     );
 }
+
+#[test]
+fn session_sweep_environment_preserves_interval_and_threshold_defaults() {
+    const INTERVAL: &str = "KHIVE_SESSION_SWEEP_INTERVAL_MS";
+    const WARN: &str = "KHIVE_TX_WARN_SECS";
+    const MAX_AGE: &str = "KHIVE_TX_MAX_AGE_SECS";
+    const CYCLES: &str = "KHIVE_WAL_WARN_SUSTAINED_CYCLES";
+    if crate::test_process::run_in_child(|command| {
+        for key in [INTERVAL, WARN, MAX_AGE, CYCLES] {
+            command.env_remove(key);
+        }
+    }) {
+        return;
+    }
+    assert_eq!(
+        SessionSweepConfig::from_env().interval,
+        Duration::from_secs(5)
+    );
+    for value in ["0", "invalid", " 25 ", "18446744073709551616"] {
+        crate::test_process::set_var(INTERVAL, value);
+        assert_eq!(
+            SessionSweepConfig::from_env().interval,
+            Duration::from_secs(5)
+        );
+    }
+    crate::test_process::set_var(INTERVAL, "25");
+    assert_eq!(
+        SessionSweepConfig::from_env().interval,
+        Duration::from_millis(25)
+    );
+    crate::test_process::remove_var(INTERVAL);
+    assert_eq!(
+        SessionSweepConfig::from_env().interval,
+        Duration::from_secs(5)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::test_process::set_var(INTERVAL, std::ffi::OsStr::from_bytes(b"\xff"));
+        assert_eq!(
+            SessionSweepConfig::from_env().interval,
+            Duration::from_secs(5)
+        );
+        crate::test_process::remove_var(INTERVAL);
+    }
+    crate::test_process::set_var(CYCLES, "255");
+    assert_eq!(CheckpointConfig::from_env().warn_sustained_cycles, 255);
+    crate::test_process::set_var(CYCLES, "256");
+    assert_eq!(CheckpointConfig::from_env().warn_sustained_cycles, 3);
+    crate::test_process::remove_var(CYCLES);
+
+    let defaults = (
+        Duration::from_millis(30_001),
+        Duration::from_millis(120_001),
+    );
+    assert_eq!(tx_age_thresholds_from_env(defaults.0, defaults.1), defaults);
+    crate::test_process::set_var(WARN, "0");
+    crate::test_process::set_var(MAX_AGE, "invalid");
+    assert_eq!(tx_age_thresholds_from_env(defaults.0, defaults.1), defaults);
+    crate::test_process::set_var(WARN, "300");
+    crate::test_process::set_var(MAX_AGE, "1");
+    assert_eq!(tx_age_thresholds_from_env(defaults.0, defaults.1), defaults);
+    crate::test_process::set_var(WARN, "15");
+    crate::test_process::set_var(MAX_AGE, "90");
+    assert_eq!(
+        tx_age_thresholds_from_env(defaults.0, defaults.1),
+        (Duration::from_secs(15), Duration::from_secs(90))
+    );
+    crate::test_process::remove_var(WARN);
+    crate::test_process::remove_var(MAX_AGE);
+}
