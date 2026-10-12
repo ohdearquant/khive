@@ -58,6 +58,8 @@ persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
 # The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
 storage-adapters = ["khive-storage"]
+# Shared candidate execution with the existing request-scoped storage context.
+executor = ["khive-storage"]
 # Native cross-encoder reranking (deferred until khive-inference is ported)
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
@@ -69,6 +71,7 @@ ann = ["khive-storage", "tracing"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 khive-score = { version = "0.12.0", path = "../khive-score" }
 khive-fusion = { version = "0.12.0", path = "../khive-fusion" }
 # Only the storage-adapters and ann registry tests use khive-db; `vectors` loads sqlite-vec.
