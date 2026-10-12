@@ -335,7 +335,8 @@ impl Site {
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
 /// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
 /// send-to-reply span met [`SLOW_WRITE_THRESHOLD`], carries `elapsed_ms` +
-/// `queue_depth` plus the four decomposed writer-stage durations).
+/// `queue_depth` plus the four decomposed writer-stage durations, and a
+/// `labels` array naming the statements the writer ran).
 struct QueuedEvent {
     ts_utc: String,
     kind: &'static str,
@@ -347,6 +348,17 @@ struct QueuedEvent {
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
+    labels: Option<SlowWriteLabels>,
+}
+
+/// Bounded labels carried on a `"slow_write"` row: at most
+/// [`crate::writer_task::MAX_WRITE_LABELS`] distinct labels in first-seen
+/// order, plus the count of further distinct labels that were dropped.
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct SlowWriteLabels {
+    pub(crate) labels: Box<[String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) labels_truncated: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -403,6 +415,8 @@ struct EventRecord<'a> {
     queue_depth: Option<u64>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     writer_stages: Option<WriterStageFields>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    labels: Option<SlowWriteLabels>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -421,6 +435,7 @@ fn build_line(
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
+    labels: Option<SlowWriteLabels>,
     pid: Option<u32>,
     version: Option<&str>,
 ) -> String {
@@ -435,6 +450,7 @@ fn build_line(
         elapsed_ms,
         queue_depth,
         writer_stages,
+        labels,
         pid,
         version,
     };
@@ -464,6 +480,7 @@ fn build_line_now(
         None,
         error,
         timeout_ms,
+        None,
         None,
         None,
         None,
@@ -703,6 +720,7 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.elapsed_ms,
         event.queue_depth,
         event.writer_stages,
+        event.labels,
         None,
         None,
     );
@@ -1033,6 +1051,7 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1056,6 +1075,7 @@ pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1106,6 +1126,7 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     }
 }
 
@@ -1129,6 +1150,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1152,6 +1174,7 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1174,6 +1197,7 @@ pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1183,6 +1207,81 @@ thread_local! {
     static DIRECT_ROUTE_CAPTURE: std::cell::RefCell<Option<Vec<(String, Site)>>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+/// `slow_write` rows [`db`, labels] captured by [`SlowWriteCapture`]. The
+/// drain loop runs a request's telemetry on a blocking-pool thread the test
+/// cannot itself run on, so the capture is process-global rather than
+/// thread-local; the capture tests hold [`SLOW_WRITE_CAPTURE_LOCK`] and run
+/// `#[serial]` so that at most one arming test is active at a time. Each
+/// captured row carries its db label so a test can select its own row even if
+/// a concurrent unrelated writer task (which could inherit the arming test's
+/// threshold override at spawn) contributes one.
+#[cfg(test)]
+static SLOW_WRITE_CAPTURE: std::sync::Mutex<Option<Vec<(String, SlowWriteLabels)>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes [`SlowWriteCapture`] arms within the test binary; a slow-write
+/// test must also carry `#[serial_test::serial]` so no other test is
+/// mid-write while the capture is armed. An async lock, because a capture
+/// test holds it across the awaited write.
+#[cfg(test)]
+pub(crate) static SLOW_WRITE_CAPTURE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// An armed [`SLOW_WRITE_CAPTURE`], disarmed on drop (including on unwind).
+/// The caller must hold [`SLOW_WRITE_CAPTURE_LOCK`] for the guard's whole
+/// life; [`Self::drain`] consumes it and returns the captured rows in
+/// emission order.
+#[cfg(test)]
+pub(crate) struct SlowWriteCapture {
+    _private: (),
+}
+
+#[cfg(test)]
+impl SlowWriteCapture {
+    /// Arm the capture; panics if one is already armed.
+    pub(crate) fn arm() -> Self {
+        let mut slot = SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(slot.is_none(), "nested slow-write capture");
+        *slot = Some(Vec::new());
+        Self { _private: () }
+    }
+
+    /// Return the `(db, labels)` rows captured so far and disarm.
+    pub(crate) fn drain(self) -> Vec<(String, SlowWriteLabels)> {
+        let rows = SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        std::mem::forget(self);
+        rows
+    }
+}
+
+#[cfg(test)]
+impl Drop for SlowWriteCapture {
+    fn drop(&mut self) {
+        *SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Record a `(db, labels)` row into the capture when one is armed (test
+/// helper).
+#[cfg(test)]
+fn record_slow_write_capture(db: &str, labels: SlowWriteLabels) {
+    if let Some(rows) = SLOW_WRITE_CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        rows.push((db.to_owned(), labels));
+    }
 }
 
 #[cfg(test)]
@@ -1231,6 +1330,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1241,6 +1341,8 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
 /// fields remain, while the microsecond stage fields distinguish admission,
 /// SQLite write-lock acquisition, operation body, and COMMIT (#1849).
 pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStageObservation) {
+    #[cfg(test)]
+    record_slow_write_capture(db, slow_write_labels_from(stages));
     let Some(handle) = SINK.get() else {
         return;
     };
@@ -1261,8 +1363,30 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
             commit_micros: stages.commit_micros,
             total_micros: stages.total_micros,
         }),
+        labels: Some(slow_write_labels_from(stages)),
     };
     enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// The bounded labels the sink would write for `stages`, for tests that
+/// assert the `slow_write` row shape without reading the NDJSON file.
+#[cfg(test)]
+pub(crate) fn slow_write_labels_for_test(
+    stages: &crate::writer_task::WriterStageObservation,
+) -> SlowWriteLabels {
+    slow_write_labels_from(stages)
+}
+
+/// Project the writer-stage observation's bounded, first-seen-ordered label
+/// list onto the row's shape. The observation already carries at most
+/// [`crate::writer_task::MAX_WRITE_LABELS`] distinct labels plus its dropped
+/// count, so this is a move, not a re-bound. An observation with no labels
+/// yields an empty array and no `labels_truncated` key.
+fn slow_write_labels_from(stages: &crate::writer_task::WriterStageObservation) -> SlowWriteLabels {
+    SlowWriteLabels {
+        labels: stages.labels.iter().cloned().collect(),
+        labels_truncated: stages.labels_truncated,
+    }
 }
 
 /// `true` for the two rusqlite error codes a standalone writer connection
@@ -1472,6 +1596,10 @@ mod tests {
             Some(1234),
             Some(7),
             Some(stages),
+            Some(SlowWriteLabels {
+                labels: vec!["resolve_prefix".to_string()].into_boxed_slice(),
+                labels_truncated: Some(2),
+            }),
             None,
             None,
         );
@@ -1488,6 +1616,9 @@ mod tests {
         assert!(parsed.get("site").is_none());
         assert!(parsed.get("error").is_none());
         assert!(parsed.get("timeout_ms").is_none());
+        // A slow-write row names the labels the writer ran.
+        assert_eq!(parsed["labels"], serde_json::json!(["resolve_prefix"]));
+        assert_eq!(parsed["labels_truncated"], 2);
     }
 
     #[test]
@@ -1535,6 +1666,7 @@ mod tests {
             elapsed_ms: None,
             queue_depth: None,
             writer_stages: None,
+            labels: None,
         };
 
         enqueue(&sender, &dropped, make_event());
@@ -1716,6 +1848,7 @@ mod tests {
                         elapsed_ms: None,
                         queue_depth: None,
                         writer_stages: None,
+                        labels: None,
                     };
                     enqueue(&sender, &dropped, event);
                 })
@@ -1741,6 +1874,7 @@ mod tests {
                 event.elapsed_ms,
                 event.queue_depth,
                 event.writer_stages,
+                event.labels,
                 None,
                 None,
             );

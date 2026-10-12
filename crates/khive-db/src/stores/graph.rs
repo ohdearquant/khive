@@ -878,15 +878,18 @@ where
     let pool = backend.pool_arc();
     if let Some(writer_task) = pool.writer_task_for_write(None, GRAPH_MUTATION_EVENTS_OP)? {
         return writer_task
-            .send_bounded(move |conn| {
-                graph_mutation_events_enlisted(
-                    conn,
-                    mutation,
-                    preconditions,
-                    retirements,
-                    make_events,
-                )
-            })
+            .send_bounded_at(
+                move |conn| {
+                    graph_mutation_events_enlisted(
+                        conn,
+                        mutation,
+                        preconditions,
+                        retirements,
+                        make_events,
+                    )
+                },
+                GRAPH_MUTATION_EVENTS_OP,
+            )
             .await
             .inspect(count_graph_mutation_events)
             .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)));
@@ -1202,7 +1205,7 @@ impl SqlGraphStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -1239,10 +1242,13 @@ impl SqlGraphStore {
     ) -> Result<GuardedEdgeUpsertOutcome, StorageError> {
         if let Some(writer_task) = self.current_writer_task(operation)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    observed_edge_upsert(conn, &request, guard_endpoints)
-                        .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        observed_edge_upsert(conn, &request, guard_endpoints)
+                            .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
@@ -1260,10 +1266,13 @@ impl SqlGraphStore {
     ) -> Result<GuardedEdgeBatchUpsertOutcome, StorageError> {
         if let Some(writer_task) = self.current_writer_task(operation)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    observed_edge_batch_upsert(conn, &requests, guard_endpoints)
-                        .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        observed_edge_batch_upsert(conn, &requests, guard_endpoints)
+                            .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
@@ -2467,10 +2476,13 @@ impl GraphStore for SqlGraphStore {
         }
         if let Some(writer_task) = self.current_writer_task(OP)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    conditional_commit_annotation_insert(conn, edge, &guard)
-                        .map_err(|error| map_err(error, OP))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        conditional_commit_annotation_insert(conn, edge, &guard)
+                            .map_err(|error| map_err(error, OP))
+                    },
+                    OP,
+                )
                 .await;
         }
         let origin = self.pool.origin();

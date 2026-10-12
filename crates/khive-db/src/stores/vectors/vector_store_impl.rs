@@ -99,18 +99,21 @@ impl VectorStore for SqliteVecStore {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_insert_vectors_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        &store_embedding_model2,
-                        &records,
-                        attempted,
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_insert_batch"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_insert_vectors_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            &store_embedding_model2,
+                            &records,
+                            attempted,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_insert_batch"))
+                    },
+                    "vec_insert_batch",
+                )
                 .await;
         }
 
@@ -248,23 +251,26 @@ impl VectorStore for SqliteVecStore {
             let embedding_model2 = embedding_model.clone();
             let embedding2 = embedding.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    vec_upsert_atomic_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        subject_id,
-                        &kind_str2,
-                        &namespace2,
-                        &field2,
-                        &embedding_model2,
-                        &embedding2,
-                        "vec_update_atomic",
-                        true,
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_update"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        vec_upsert_atomic_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            subject_id,
+                            &kind_str2,
+                            &namespace2,
+                            &field2,
+                            &embedding_model2,
+                            &embedding2,
+                            "vec_update_atomic",
+                            true,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_update"))
+                    },
+                    "vec_update",
+                )
                 .await;
         }
 
@@ -530,10 +536,13 @@ impl VectorStore for SqliteVecStore {
         if let Some(writer_task) = self.current_writer_task("vec_delete_subjects")? {
             let table_for_error = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    delete_vector_subjects_dml(conn, &table, &id_strings)
-                        .map_err(|e| map_err(e, "vec_delete_subjects"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        delete_vector_subjects_dml(conn, &table, &id_strings)
+                            .map_err(|e| map_err(e, "vec_delete_subjects"))
+                    },
+                    "vec_delete_subjects",
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!(target: "khive_db::stores::vectors", error = %e, table = %table_for_error, "delete_subjects failed");
@@ -798,18 +807,21 @@ impl VectorStore for SqliteVecStore {
             let kind_json2 = kind_json.clone();
             let allow_json2 = allow_json.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    orphan_sweep_dml(
-                        conn,
-                        &table2,
-                        ns_json2.as_deref(),
-                        kind_json2.as_deref(),
-                        allow_json2.as_deref(),
-                        max_delete,
-                        dry_run,
-                    )
-                    .map_err(|e| map_err(e, "orphan_sweep"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        orphan_sweep_dml(
+                            conn,
+                            &table2,
+                            ns_json2.as_deref(),
+                            kind_json2.as_deref(),
+                            allow_json2.as_deref(),
+                            max_delete,
+                            dry_run,
+                        )
+                        .map_err(|e| map_err(e, "orphan_sweep"))
+                    },
+                    "orphan_sweep",
+                )
                 .await;
         }
 

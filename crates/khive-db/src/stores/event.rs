@@ -120,7 +120,7 @@ impl SqlEventStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -1309,10 +1309,13 @@ impl EventStore for SqlEventStore {
         // only after the usage snapshot is frozen, so it never counts itself.
         if let Some(writer_task) = self.current_writer_task("append_event")? {
             let result = writer_task
-                .send_bounded(move |conn| {
-                    insert_event_with_observations(conn, &event)
-                        .map_err(|e| map_err(e, "append_event"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        insert_event_with_observations(conn, &event)
+                            .map_err(|e| map_err(e, "append_event"))
+                    },
+                    "append_event",
+                )
                 .await;
             khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
             return result;
@@ -1339,10 +1342,13 @@ impl EventStore for SqlEventStore {
         // and issues the ROLLBACK on `Err`.
         if let Some(writer_task) = self.current_writer_task("append_events")? {
             let result = writer_task
-                .send_bounded(move |conn| {
-                    batch_append_events_dml(conn, &events, attempted)
-                        .map_err(|e| map_err(e, "append_events"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_append_events_dml(conn, &events, attempted)
+                            .map_err(|e| map_err(e, "append_events"))
+                    },
+                    "append_events",
+                )
                 .await;
             khive_storage::usage::account_event_write(
                 result.as_ref().map(|summary| summary.affected),
@@ -1512,10 +1518,13 @@ impl EventStore for SqlEventStore {
     ) -> Result<IdempotentEventBatchResult, StorageError> {
         if let Some(writer_task) = self.current_writer_task("append_events_idempotent")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    idempotent_batch_dml(conn, &events)
-                        .map_err(|e| map_err(e, "append_events_idempotent"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        idempotent_batch_dml(conn, &events)
+                            .map_err(|e| map_err(e, "append_events_idempotent"))
+                    },
+                    "append_events_idempotent",
+                )
                 .await;
         }
 

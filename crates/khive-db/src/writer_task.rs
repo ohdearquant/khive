@@ -60,6 +60,12 @@ use khive_storage::error::{StorageError, WriterTaskRequestState};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 
+#[path = "writer_task_labels.rs"]
+mod labels;
+
+pub(crate) use labels::{collect_statement_labels, MAX_WRITE_LABELS};
+use labels::{dedup_labels, SubmitLabels};
+
 /// Retry delays after a busy/locked `BEGIN IMMEDIATE` refusal. The operation
 /// closure remains owned by the request until one BEGIN succeeds, so these
 /// are the only retries this path may perform. Persistent contention is
@@ -93,6 +99,16 @@ pub struct WriterStageObservation {
     pub total_micros: u64,
     pub queue_depth_at_entry: u64,
     pub observed_at_unix_ms: u64,
+    /// Distinct labels the drained request ran, in first-seen order,
+    /// deduplicated and bounded at [`MAX_WRITE_LABELS`]. Resolved only for a
+    /// write that crossed the slow-write threshold, so empty for every write
+    /// below it; also empty when no statement in the request carried a label
+    /// and the submit site had no name in hand — e.g. an opaque closure from
+    /// a caller with no `&'static str` operation.
+    pub labels: Vec<String>,
+    /// Distinct labels dropped past [`MAX_WRITE_LABELS`], when the request
+    /// named more; `None` when nothing was dropped.
+    pub labels_truncated: Option<u64>,
 }
 
 static WRITER_STAGE_OBSERVATIONS: OnceLock<
@@ -138,6 +154,7 @@ struct WriteTelemetry {
     submitted_at: Instant,
     queue_depth_at_entry: usize,
     slow_write_threshold: Option<Duration>,
+    labels: SubmitLabels,
 }
 
 impl WriteTelemetry {
@@ -146,6 +163,7 @@ impl WriteTelemetry {
         db: String,
         queue_depth_at_entry: usize,
         slow_write_threshold: Option<Duration>,
+        labels: SubmitLabels,
     ) -> Self {
         Self {
             backend_key,
@@ -153,11 +171,31 @@ impl WriteTelemetry {
             submitted_at: Instant::now(),
             queue_depth_at_entry,
             slow_write_threshold,
+            labels,
         }
     }
 
     fn queue_wait(&self) -> Duration {
         self.submitted_at.elapsed()
+    }
+
+    /// The labels named on this request, bounded to [`MAX_WRITE_LABELS`]
+    /// plus the count of distinct labels dropped. Computed only on the slow
+    /// path, since only [`Self::finish`] calls it: the fast path never turns
+    /// a [`SubmitLabels::Site`] name into an allocation.
+    fn resolve_labels(&self) -> (Vec<String>, Option<u64>) {
+        match &self.labels {
+            SubmitLabels::None => (Vec::new(), None),
+            SubmitLabels::Site(site) => (vec![(*site).to_owned()], None),
+            SubmitLabels::Statements(labels) => {
+                if labels.len() <= MAX_WRITE_LABELS {
+                    (labels.clone(), None)
+                } else {
+                    let dropped = (labels.len() - MAX_WRITE_LABELS) as u64;
+                    (labels[..MAX_WRITE_LABELS].to_vec(), Some(dropped))
+                }
+            }
+        }
     }
 
     fn finish(
@@ -168,6 +206,17 @@ impl WriteTelemetry {
         commit: Duration,
     ) {
         let total = self.submitted_at.elapsed();
+        let slow = self
+            .slow_write_threshold
+            .is_some_and(|threshold| total >= threshold);
+        // Labels are resolved only for a write that crossed the slow
+        // threshold, so a fast write never turns a site name into an
+        // allocation; its observation carries no labels.
+        let (labels, labels_truncated) = if slow {
+            self.resolve_labels()
+        } else {
+            (Vec::new(), None)
+        };
         let observation = WriterStageObservation {
             queue_wait_micros: duration_micros(queue_wait),
             transaction_acquire_micros: duration_micros(transaction_acquire),
@@ -176,16 +225,15 @@ impl WriteTelemetry {
             total_micros: duration_micros(total),
             queue_depth_at_entry: self.queue_depth_at_entry as u64,
             observed_at_unix_ms: observed_at_unix_ms(),
+            labels,
+            labels_truncated,
         };
         writer_stage_observations()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(self.backend_key, observation.clone());
 
-        if self
-            .slow_write_threshold
-            .is_some_and(|threshold| total >= threshold)
-        {
+        if slow {
             crate::timeout_sink::emit_slow_write(&self.db, &observation);
         }
     }
@@ -767,29 +815,44 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        self.enqueue_inner(op, false, false, false).await
+        self.enqueue_inner(op, false, false, false, SubmitLabels::None)
+            .await
     }
 
     /// Shared enqueue path for both transaction-wrapped ([`Self::enqueue`])
     /// and top-level ([`Self::send_top_level`]) requests — `top_level`
     /// controls which [`AnyWriteRequest`] method the drain loop invokes.
+    /// `labels` is what the submit site knows about this request's
+    /// statements; see [`SubmitLabels`].
     async fn enqueue_inner<R, F>(
         &self,
         op: F,
         top_level: bool,
         checkpoint_bypass: bool,
         vacuum_copy_headroom: bool,
+        labels: SubmitLabels,
     ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        // Normalize here (once per request) so every submit path — including
+        // the public `send_labelled` entry points a caller can hand a raw
+        // list — records distinct labels in first-seen order. Bounding stays
+        // in `resolve_labels`, which runs only on the slow path.
+        let labels = match labels {
+            SubmitLabels::Statements(labels) => {
+                SubmitLabels::Statements(dedup_labels(labels.iter().map(String::as_str)))
+            }
+            other => other,
+        };
         let telemetry = WriteTelemetry::new(
             self.backend_key.clone(),
             self.db.clone(),
             self.queue_depth(),
             self.slow_write_threshold,
+            labels,
         );
         let request = WriteRequest {
             op: Box::new(op),
@@ -848,7 +911,29 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
+        self.send_with_timeout_labelled(op, timeout, SubmitLabels::None)
+            .await
+    }
+
+    /// Shared body of [`Self::send_with_timeout`] and its labelled variants.
+    /// `labels` is carried onto the request's writer-stage observation and
+    /// `slow_write` row; see [`SubmitLabels`].
+    async fn send_with_timeout_labelled<R, F>(
+        &self,
+        op: F,
+        timeout: std::time::Duration,
+        labels: SubmitLabels,
+    ) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let reply_rx = match tokio::time::timeout(
+            timeout,
+            self.enqueue_inner(op, false, false, false, labels),
+        )
+        .await
+        {
             Ok(Ok(reply_rx)) => reply_rx,
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
@@ -897,7 +982,9 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let reply_rx = self.enqueue_inner(op, true, false, false).await?;
+        let reply_rx = self
+            .enqueue_inner(op, true, false, false, SubmitLabels::None)
+            .await?;
         reply_rx
             .await
             .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
@@ -912,7 +999,8 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        self.send_top_level_bounded_inner(op, false, false).await
+        self.send_top_level_bounded_inner(op, false, false, SubmitLabels::None)
+            .await
     }
 
     /// Checkpoint-only top-level dispatch. It remains serialized by the
@@ -922,7 +1010,8 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        self.send_top_level_bounded_inner(op, true, false).await
+        self.send_top_level_bounded_inner(op, true, false, SubmitLabels::Site("wal_checkpoint"))
+            .await
     }
 
     /// Typed VACUUM dispatch with a copy-sized metadata estimate at dequeue.
@@ -931,7 +1020,8 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        self.send_top_level_bounded_inner(op, false, true).await
+        self.send_top_level_bounded_inner(op, false, true, SubmitLabels::Site("vacuum"))
+            .await
     }
 
     async fn send_top_level_bounded_inner<R, F>(
@@ -939,6 +1029,7 @@ impl WriterTaskHandle {
         op: F,
         checkpoint_bypass: bool,
         vacuum_copy_headroom: bool,
+        labels: SubmitLabels,
     ) -> Result<R, StorageError>
     where
         R: Send + 'static,
@@ -946,7 +1037,7 @@ impl WriterTaskHandle {
     {
         let reply_rx = match tokio::time::timeout(
             self.enqueue_timeout,
-            self.enqueue_inner(op, true, checkpoint_bypass, vacuum_copy_headroom),
+            self.enqueue_inner(op, true, checkpoint_bypass, vacuum_copy_headroom, labels),
         )
         .await
         {
@@ -2256,7 +2347,7 @@ mod tests {
             top_level: true,
             checkpoint_bypass: false,
             vacuum_copy_headroom: false,
-            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
@@ -2306,7 +2397,7 @@ mod tests {
             top_level: false,
             checkpoint_bypass: false,
             vacuum_copy_headroom: false,
-            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -2399,6 +2490,7 @@ mod tests {
                 true,
                 false,
                 false,
+                SubmitLabels::None,
             )
             .await
             .expect("top-level request must queue behind active request");
@@ -2459,7 +2551,7 @@ mod tests {
             top_level: false,
             checkpoint_bypass: false,
             vacuum_copy_headroom: false,
-            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -2507,7 +2599,7 @@ mod tests {
             top_level: false,
             checkpoint_bypass: false,
             vacuum_copy_headroom: false,
-            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -3094,6 +3186,10 @@ mod tests {
 #[cfg(test)]
 #[path = "writer_task_lease_close_tests.rs"]
 mod volume_lease_close_tests;
+
+#[cfg(test)]
+#[path = "writer_task_slow_write_label_tests.rs"]
+mod slow_write_label_tests;
 
 #[cfg(all(test, any(unix, windows)))]
 #[path = "writer_task_identity_tests.rs"]
