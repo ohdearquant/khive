@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Each pooled SQLite connection now keeps an 8 MiB page cache instead of 64 MiB. The
+  cache is per connection and on the heap, so a process with many connections paid the
+  old size many times over. `KHIVE_SQLITE_CACHE_KIB` (512 to 1048576) and
+  `KHIVE_SQLITE_MMAP_BYTES` (0 to 2^40, `0` disables memory-mapped reads; default 1 GiB)
+  override the two settings; a value outside its range is logged and ignored.
+
 - Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
   cancellation fixes. MCP, mounted tools and CLI consumers keep their existing
   feature configuration; MCP result tests use the renamed `ContentBlock` API.

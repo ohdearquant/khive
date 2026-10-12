@@ -13,8 +13,8 @@ use crate::error::SqliteError;
 use super::ReaderGuard;
 use super::{
     claimed_file_identity, code_map, mint_db_identity, register_read_functions,
-    register_writer_clock, PoolConfig, CACHE_SIZE_KIB, FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
-    MMAP_SIZE_BYTES,
+    register_writer_clock, sqlite_cache_size_pragma, sqlite_mmap_size_pragma, PoolConfig,
+    FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
 };
 
 pub(super) fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
@@ -279,8 +279,8 @@ pub(super) fn configure_writer_connection(
         // change) and lock the connection down with query_only instead.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(config.busy_timeout)?;
-        conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
-        conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+        conn.pragma_update(None, "cache_size", sqlite_cache_size_pragma())?;
+        conn.pragma_update(None, "mmap_size", sqlite_mmap_size_pragma())?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "query_only", "ON")?;
 
@@ -299,8 +299,8 @@ pub(super) fn configure_writer_connection(
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
-    conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
-    conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "cache_size", sqlite_cache_size_pragma())?;
+    conn.pragma_update(None, "mmap_size", sqlite_mmap_size_pragma())?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     // The pool's startup writer always opens before any checkpoint owner can
     // claim the pool, so it starts on the bounded fallback;
@@ -332,8 +332,8 @@ pub(super) fn configure_reader_connection(
     register_read_functions(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
-    conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
-    conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "cache_size", sqlite_cache_size_pragma())?;
+    conn.pragma_update(None, "mmap_size", sqlite_mmap_size_pragma())?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
@@ -432,7 +432,7 @@ fn reader_connection_settings_match_baseline(
 ) -> bool {
     let expected_busy_timeout_ms =
         i64::try_from(config.busy_timeout.as_millis()).unwrap_or(i64::MAX);
-    let expected_cache_size: i64 = CACHE_SIZE_KIB.parse().unwrap_or(-65536);
+    let expected_cache_size: i64 = sqlite_cache_size_pragma();
     let checks: [(&str, i64); 8] = [
         ("query_only", expected_query_only),
         ("writable_schema", 0),
@@ -541,7 +541,7 @@ fn reset_observable_settings(
     conn.pragma_update(None, "writable_schema", 0)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
-    conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "cache_size", sqlite_cache_size_pragma())?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "read_uncommitted", 0)?;
     conn.pragma_update(None, "defer_foreign_keys", 0)?;

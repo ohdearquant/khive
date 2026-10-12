@@ -108,9 +108,91 @@ pub use claimed_file_observer::initialize as initialize_claimed_file_observer;
 #[path = "pool/claimed_file_identity_tests.rs"]
 mod claimed_file_identity_tests;
 
-pub(crate) const CACHE_SIZE_KIB: &str = "-65536";
-const MMAP_SIZE_BYTES: &str = "1073741824";
+/// Default SQLite page cache per pooled connection, in KiB.
+///
+/// Every connection keeps its own page cache on the process heap, so a
+/// process's ceiling is this value times its open connections, and a daemon
+/// serving several databases holds dozens of them. Pages the cache drops are
+/// re-read from the operating system's file cache, which the kernel reclaims
+/// on its own. `KHIVE_SQLITE_CACHE_KIB` overrides it within
+/// `SQLITE_CACHE_KIB_RANGE`.
+pub(crate) const DEFAULT_SQLITE_CACHE_KIB: i64 = 8 * 1024;
+pub(crate) const SQLITE_CACHE_KIB_RANGE: std::ops::RangeInclusive<i64> = 512..=1_048_576;
+const SQLITE_CACHE_KIB_ENV: &str = "KHIVE_SQLITE_CACHE_KIB";
+
+/// Default SQLite memory-map window per pooled connection, in bytes.
+///
+/// Mapped pages are clean and file-backed: the kernel drops them under memory
+/// pressure without writing them anywhere. Reads past the window go through
+/// the page cache above instead. `KHIVE_SQLITE_MMAP_BYTES` overrides it
+/// within `SQLITE_MMAP_BYTES_RANGE`; `0` turns memory-mapped reads off.
+pub(crate) const DEFAULT_SQLITE_MMAP_BYTES: i64 = 1 << 30;
+pub(crate) const SQLITE_MMAP_BYTES_RANGE: std::ops::RangeInclusive<i64> = 0..=(1 << 40);
+const SQLITE_MMAP_BYTES_ENV: &str = "KHIVE_SQLITE_MMAP_BYTES";
 const DEFAULT_READER_CAP: usize = 8;
+
+/// The `cache_size` pragma value every pooled connection is configured with
+/// (negative, so SQLite reads it as KiB), resolved once per process.
+pub(crate) fn sqlite_cache_size_pragma() -> i64 {
+    static KIB: OnceLock<i64> = OnceLock::new();
+    -*KIB.get_or_init(|| {
+        sqlite_size_setting(
+            SQLITE_CACHE_KIB_ENV,
+            sqlite_size_env(SQLITE_CACHE_KIB_ENV).as_deref(),
+            DEFAULT_SQLITE_CACHE_KIB,
+            &SQLITE_CACHE_KIB_RANGE,
+        )
+    })
+}
+
+/// The `mmap_size` pragma value every pooled connection is configured with,
+/// resolved once per process.
+pub(crate) fn sqlite_mmap_size_pragma() -> i64 {
+    static BYTES: OnceLock<i64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        sqlite_size_setting(
+            SQLITE_MMAP_BYTES_ENV,
+            sqlite_size_env(SQLITE_MMAP_BYTES_ENV).as_deref(),
+            DEFAULT_SQLITE_MMAP_BYTES,
+            &SQLITE_MMAP_BYTES_RANGE,
+        )
+    })
+}
+
+/// Reads a size setting with `var_os`, not `var`: a set value that is not valid
+/// Unicode still counts as set, so it reaches the range check and is logged
+/// rather than silently taking the default.
+fn sqlite_size_env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|raw| raw.to_string_lossy().into_owned())
+}
+
+/// An unset setting takes the default. A set value that is not an integer
+/// inside `range` also takes the default, and says so in the log, because a
+/// typo in a memory setting must not stop the store from opening.
+pub(crate) fn sqlite_size_setting(
+    name: &str,
+    raw: Option<&str>,
+    default: i64,
+    range: &std::ops::RangeInclusive<i64>,
+) -> i64 {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.parse::<i64>() {
+        Ok(value) if range.contains(&value) => value,
+        _ => {
+            tracing::warn!(
+                setting = name,
+                value = raw,
+                default,
+                min = *range.start(),
+                max = *range.end(),
+                "ignoring a SQLite size setting outside its range; using the default"
+            );
+            default
+        }
+    }
+}
 
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
