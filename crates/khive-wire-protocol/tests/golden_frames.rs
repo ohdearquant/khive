@@ -14,7 +14,7 @@
 //! additively across the workspace, so a `preserve_order` enabled by any
 //! other crate would silently change key order and break these fixtures.
 //! The `serde_json_feature_posture_is_default_keys_serialize_sorted` probe
-//! in `src/codec.rs` pins that posture at test time.
+//! in `src/codec_tests.rs` pins that posture at test time.
 
 use khive_wire_protocol::frame::OperationId;
 use khive_wire_protocol::{
