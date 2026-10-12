@@ -477,7 +477,7 @@ impl SqlNoteStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -523,7 +523,7 @@ impl SqlNoteStore {
         R: Send + 'static,
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
-            return writer_task.send_bounded(f).await;
+            return writer_task.send_bounded_at(f, op).await;
         }
 
         self.pool

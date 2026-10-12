@@ -408,25 +408,28 @@ impl khive_storage::SqlAccess for SqlBridge {
                     // does not) issue its own transaction control.
                     let pending_event_rows = Arc::clone(&event_rows);
                     return writer_task
-                        .send_bounded(move |conn| {
-                            let mut inline = InlineWriter {
-                                event_rows: Some(Arc::clone(&pending_event_rows)),
-                                conn: conn as *const rusqlite::Connection,
-                            };
-                            // Flatten: `block_on_sync` now returns `Result<F::Output,
-                            // StorageError>` (outer = "did the future actually
-                            // resolve on first poll", inner = the op's own
-                            // `StorageResult`) instead of panicking on `Pending`
-                            // (ADR-067 Component A). Either
-                            // error flows through this closure's ordinary `Err`
-                            // return, which `WriteRequest::execute_and_reply`
-                            // already turns into a normal ROLLBACK + error reply —
-                            // no panic, so the writer task survives.
-                            match block_on_sync(op(&mut inline)) {
-                                Ok(inner) => inner,
-                                Err(e) => Err(e),
-                            }
-                        })
+                        .send_bounded_at(
+                            move |conn| {
+                                let mut inline = InlineWriter {
+                                    event_rows: Some(Arc::clone(&pending_event_rows)),
+                                    conn: conn as *const rusqlite::Connection,
+                                };
+                                // Flatten: `block_on_sync` now returns `Result<F::Output,
+                                // StorageError>` (outer = "did the future actually
+                                // resolve on first poll", inner = the op's own
+                                // `StorageResult`) instead of panicking on `Pending`
+                                // (ADR-067 Component A). Either
+                                // error flows through this closure's ordinary `Err`
+                                // return, which `WriteRequest::execute_and_reply`
+                                // already turns into a normal ROLLBACK + error reply —
+                                // no panic, so the writer task survives.
+                                match block_on_sync(op(&mut inline)) {
+                                    Ok(inner) => inner,
+                                    Err(e) => Err(e),
+                                }
+                            },
+                            "atomic_unit",
+                        )
                         .await;
                 }
                 // Flag-off (or no writer task available): manual

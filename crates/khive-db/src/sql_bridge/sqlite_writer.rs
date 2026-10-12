@@ -386,20 +386,25 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
             let event_rows = self.event_rows.clone();
+            let labels =
+                crate::writer_task::collect_statement_labels(std::slice::from_ref(&statement));
             return writer_task
-                .send_bounded(move |conn| {
-                    let mut stmt = prepare_cached_sql_statement(conn, &statement.sql)
-                        .map_err(|e| map_write_err(e, "execute"))?;
-                    bind_params(&mut stmt, &statement.params)
-                        .map_err(|e| map_write_err(e, "execute"))?;
-                    let affected = stmt
-                        .raw_execute()
-                        .map_err(|e| map_write_err(e, "execute"))?;
-                    if let Some(event_rows) = event_rows.as_deref() {
-                        event_rows.observe(&statement, affected as u64);
-                    }
-                    Ok(affected as u64)
-                })
+                .send_bounded_labelled(
+                    move |conn| {
+                        let mut stmt = prepare_cached_sql_statement(conn, &statement.sql)
+                            .map_err(|e| map_write_err(e, "execute"))?;
+                        bind_params(&mut stmt, &statement.params)
+                            .map_err(|e| map_write_err(e, "execute"))?;
+                        let affected = stmt
+                            .raw_execute()
+                            .map_err(|e| map_write_err(e, "execute"))?;
+                        if let Some(event_rows) = event_rows.as_deref() {
+                            event_rows.observe(&statement, affected as u64);
+                        }
+                        Ok(affected as u64)
+                    },
+                    labels,
+                )
                 .await;
         }
 
@@ -469,13 +474,17 @@ impl khive_storage::SqlWriter for SqliteWriter {
         reject_transaction_control_statements(&statements, "execute_batch")?;
         if let Some(writer_task) = self.writer_task.clone() {
             let event_rows = self.event_rows.clone();
+            let labels = crate::writer_task::collect_statement_labels(&statements);
             return writer_task
-                .send_bounded(move |conn| {
-                    let prepared = prepare_batch_statements(conn, &statements)
-                        .map_err(|e| map_write_err(e, "execute_batch"))?;
-                    execute_prepared_batch(conn, prepared, &statements, event_rows.as_deref())
-                        .map_err(|e| map_write_err(e, "execute_batch"))
-                })
+                .send_bounded_labelled(
+                    move |conn| {
+                        let prepared = prepare_batch_statements(conn, &statements)
+                            .map_err(|e| map_write_err(e, "execute_batch"))?;
+                        execute_prepared_batch(conn, prepared, &statements, event_rows.as_deref())
+                            .map_err(|e| map_write_err(e, "execute_batch"))
+                    },
+                    labels,
+                )
                 .await;
         }
 
@@ -522,10 +531,13 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // runs inside the writer task's transaction.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
-                .send_bounded(move |conn| {
-                    conn.execute_batch(&script)
-                        .map_err(|e| map_write_err(e, "execute_script"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        conn.execute_batch(&script)
+                            .map_err(|e| map_write_err(e, "execute_script"))
+                    },
+                    "execute_script",
+                )
                 .await;
         }
 
