@@ -11,9 +11,10 @@
 //! See `crates/khive-pack-brain/docs/api/fold-gate.md` for the full mass
 //! invariant, concurrency proof, why the decay math runs in Rust not SQL, and
 //! the scorer-dedup atomicity argument.
-use crate::sql::sql;
+use crate::sql::{sql, sql_err};
 
 use khive_runtime::{EventAttribution, RuntimeError};
+use khive_score::{Decay, HalfLife};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
@@ -25,10 +26,6 @@ pub const IMPLICIT_MASS_CAP: f64 = 1.5;
 /// window (ADR-081 §2, §4): 7 days, expressed in microseconds.
 pub const IMPLICIT_MASS_HALF_LIFE_US: f64 = 7.0 * 24.0 * 3600.0 * 1_000_000.0;
 
-fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::internal_with_context(format!("fold gate {context}"), e)
-}
-
 /// Decay `old_mass` forward by `delta_us` microseconds under the shared half-life.
 ///
 /// `delta_us <= 0` (clock skew, or the very first event) is treated as zero
@@ -37,7 +34,12 @@ pub fn decayed_mass(old_mass: f64, delta_us: i64) -> f64 {
     if delta_us <= 0 || old_mass == 0.0 {
         return old_mass;
     }
-    old_mass * 2f64.powf(-(delta_us as f64) / IMPLICIT_MASS_HALF_LIFE_US)
+    let half_life = HalfLife::try_new(IMPLICIT_MASS_HALF_LIFE_US)
+        .expect("implicit mass half-life is finite and positive");
+    let factor = Decay::exponential_with_half_life(half_life)
+        .factor(delta_us as f64)
+        .expect("positive i64 microseconds are finite");
+    old_mass * factor
 }
 
 /// Decide whether an incoming implicit event of weight `w` folds at full weight.
@@ -292,7 +294,7 @@ where
 
     khive_db::stores::event::append_event_on_writer(writer, &event)
         .await
-        .map_err(|e| sql_err("append feedback event", e))?;
+        .map_err(|e| sql_err("fold gate append feedback event", e))?;
 
     if let (Some((scorer_run_id, serve_ledger_id)), Some(grade)) = (dedup_key, grade) {
         crate::serve_ledger::backfill_grade_on_writer(
@@ -359,7 +361,7 @@ pub(crate) async fn claim_dedup_within_tx(
             label: Some("brain_scorer_dedup_claim".into()),
         })
         .await
-        .map_err(|e| sql_err("claim scorer dedup", e))?;
+        .map_err(|e| sql_err("fold gate claim scorer dedup", e))?;
     Ok(rows_affected > 0)
 }
 
@@ -385,19 +387,22 @@ async fn fold_within_tx(
             label: Some("brain_implicit_mass_read".into()),
         })
         .await
-        .map_err(|e| sql_err("read mass", e))?;
+        .map_err(|e| sql_err("fold gate read mass", e))?;
 
     let (old_mass, last_event_at) = match row {
         None => (0.0, now_us),
         Some(r) => {
-            let mass = match r.get("mass") {
-                Some(SqlValue::Float(v)) => *v,
-                Some(SqlValue::Integer(v)) => *v as f64,
-                _ => return Err(sql_err("read mass", "missing mass column")),
-            };
+            let mass = r
+                .f64("mass")
+                .map_err(|_| sql_err("fold gate read mass", "missing mass column"))?;
             let last = match r.get("last_event_at") {
                 Some(SqlValue::Integer(v)) => *v,
-                _ => return Err(sql_err("read mass", "missing last_event_at column")),
+                _ => {
+                    return Err(sql_err(
+                        "fold gate read mass",
+                        "missing last_event_at column",
+                    ))
+                }
             };
             (mass, last)
         }
@@ -432,7 +437,7 @@ async fn fold_within_tx(
             label: Some("brain_implicit_mass_upsert".into()),
         })
         .await
-        .map_err(|e| sql_err("write mass", e))?;
+        .map_err(|e| sql_err("fold gate write mass", e))?;
 
     Ok(FoldGateOutcome {
         effective_weight,
@@ -456,7 +461,7 @@ mod tests {
 
     #[test]
     fn fold_gate_sql_err_message_is_prefixed_context_and_error() {
-        match sql_err("insert", "boom") {
+        match sql_err("fold gate insert", "boom") {
             RuntimeError::Internal(message) => {
                 assert_eq!(message, "fold gate insert: boom");
             }
@@ -485,6 +490,25 @@ mod tests {
     fn decayed_mass_two_half_lives_quarters() {
         let m = decayed_mass(1.0, 2 * IMPLICIT_MASS_HALF_LIFE_US as i64);
         assert!((m - 0.25).abs() < 1e-9, "expected ~0.25, got {m}");
+    }
+
+    #[test]
+    fn decayed_mass_preserves_scalar_boundaries() {
+        for mass in [0.0, -0.0, 1.5, -1.5, f64::MAX, f64::INFINITY, f64::NAN] {
+            for delta in [i64::MIN, 0, 1, IMPLICIT_MASS_HALF_LIFE_US as i64, i64::MAX] {
+                let expected = if delta <= 0 || mass == 0.0 {
+                    mass
+                } else {
+                    mass * 2f64.powf(-(delta as f64) / IMPLICIT_MASS_HALF_LIFE_US)
+                };
+                let actual = decayed_mass(mass, delta);
+                if expected.is_nan() {
+                    assert!(actual.is_nan());
+                } else {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
     }
 
     #[test]

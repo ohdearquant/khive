@@ -8,7 +8,7 @@
 //! `brain.auto_feedback` when a caller supplies `serve_ledger_id` (ADR-081 §6):
 //! dedup by `(scorer_run_id, id)`, the `accounting_profile_id` zero-weight
 //! fail-safe, and grade backfill.
-use crate::sql::sql;
+use crate::sql::{sql, sql_err};
 
 use khive_runtime::RuntimeError;
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -16,10 +16,6 @@ use khive_storage::{SqlAccess, SqlWriter};
 
 pub use khive_brain_core::compute_query_class;
 use khive_brain_core::ServeAttribution;
-
-fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::internal_with_context(format!("serve ledger {context}"), e)
-}
 
 /// One row of `brain_serve_ledger` (ADR-081 §4 normative schema).
 pub struct ServeLedgerRow {
@@ -153,16 +149,23 @@ pub(crate) async fn record_serves(
             )
         })
         .collect();
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    let mut writer = sql
+        .writer()
+        .await
+        .map_err(|e| sql_err("serve ledger writer", e))?;
     let affected = writer
         .execute_batch(statements)
         .await
-        .map_err(|e| sql_err("insert serve batch", e))?;
-    let written = usize::try_from(affected)
-        .map_err(|_| sql_err("insert serve batch", "affected row count exceeds usize"))?;
+        .map_err(|e| sql_err("serve ledger insert serve batch", e))?;
+    let written = usize::try_from(affected).map_err(|_| {
+        sql_err(
+            "serve ledger insert serve batch",
+            "affected row count exceeds usize",
+        )
+    })?;
     let skipped = rows.len().checked_sub(written).ok_or_else(|| {
         sql_err(
-            "insert serve batch",
+            "serve ledger insert serve batch",
             format!(
                 "affected row count {written} exceeds input count {}",
                 rows.len()
@@ -218,7 +221,10 @@ pub async fn get_serve_row(
     sql: &dyn SqlAccess,
     id: &str,
 ) -> Result<Option<ServeLedgerRow>, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("serve ledger reader", e))?;
     let row = reader
         .query_row(SqlStatement {
             sql: sql!("brain_serve_ledger_row").into(),
@@ -226,7 +232,7 @@ pub async fn get_serve_row(
             label: Some("brain_serve_ledger_get".into()),
         })
         .await
-        .map_err(|e| sql_err("read row", e))?;
+        .map_err(|e| sql_err("serve ledger read row", e))?;
 
     let Some(row) = row else {
         return Ok(None);
@@ -236,15 +242,15 @@ pub async fn get_serve_row(
         id: row
             .text("id")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing id column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing id column"))?,
         namespace: row
             .text("namespace")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing namespace column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing namespace column"))?,
         consumer_kind: row
             .text("consumer_kind")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing consumer_kind column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing consumer_kind column"))?,
         served_by_profile_id: row_opt_text(&row, "served_by_profile_id"),
         resolved_profile_id: row_opt_text(&row, "resolved_profile_id"),
         resolved_at: row_opt_int(&row, "resolved_at"),
@@ -255,18 +261,18 @@ pub async fn get_serve_row(
         target_id: row
             .text("target_id")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing target_id column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing target_id column"))?,
         query_class: row
             .text("query_class")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing query_class column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing query_class column"))?,
         query_raw: row
             .text("query_raw")
             .map(str::to_owned)
-            .map_err(|_| sql_err("read row", "missing query_raw column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing query_raw column"))?,
         served_at: row
             .i64("served_at")
-            .map_err(|_| sql_err("read row", "missing served_at column"))?,
+            .map_err(|_| sql_err("serve ledger read row", "missing served_at column"))?,
         grade: row_opt_text(&row, "grade"),
         graded_at: row_opt_int(&row, "graded_at"),
         scorer_run_id: row_opt_text(&row, "scorer_run_id"),
@@ -294,7 +300,7 @@ pub(crate) async fn backfill_grade_on_writer(
             label: Some("brain_serve_ledger_backfill_grade".into()),
         })
         .await
-        .map_err(|e| sql_err("backfill grade", e))?;
+        .map_err(|e| sql_err("serve ledger backfill grade", e))?;
     if affected != 1 {
         return Err(RuntimeError::Internal(format!(
             "serve ledger backfill grade: expected one row for {id:?}, updated {affected}"
@@ -763,7 +769,7 @@ mod tests {
 
     #[test]
     fn serve_ledger_sql_err_message_is_prefixed_context_and_error() {
-        match sql_err("insert", "boom") {
+        match sql_err("serve ledger insert", "boom") {
             RuntimeError::Internal(message) => {
                 assert_eq!(message, "serve ledger insert: boom");
             }

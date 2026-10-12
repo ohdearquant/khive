@@ -2158,7 +2158,7 @@ impl BrainPack {
         {
             Ok(summary) => summary,
             Err(e) => {
-                eprintln!("[brain] serve ledger batch write failed (non-fatal): {e}");
+                tracing::warn!("[brain] serve ledger batch write failed (non-fatal): {e}");
                 crate::serve_ledger::ServeLedgerBatchSummary::default()
             }
         };
@@ -3155,14 +3155,14 @@ fn route_via_fann(context: &[f32]) -> Vec<f32> {
     {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("[brain] lattice-router: network build failed (non-fatal): {e}");
+            tracing::warn!("[brain] lattice-router: network build failed (non-fatal): {e}");
             return Vec::new();
         }
     };
     match network.forward(context) {
         Ok(weights) => weights.to_vec(),
         Err(e) => {
-            eprintln!("[brain] lattice-router: forward failed (non-fatal): {e}");
+            tracing::warn!("[brain] lattice-router: forward failed (non-fatal): {e}");
             Vec::new()
         }
     }

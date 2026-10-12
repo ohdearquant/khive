@@ -2323,6 +2323,7 @@ dependencies = [
  "khive-pack-kg",
  "khive-pack-memory",
  "khive-runtime",
+ "khive-score",
  "khive-storage",
  "khive-types",
  "lattice-embed",
