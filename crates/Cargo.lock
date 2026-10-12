@@ -3041,6 +3041,7 @@ dependencies = [
  "inventory",
  "khive-changeset",
  "khive-db",
+ "khive-fs",
  "khive-gate-rego",
  "khive-mcp",
  "khive-mounts",
