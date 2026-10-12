@@ -1,0 +1,687 @@
+use super::*;
+use khive_storage::note::Note;
+use serde_json::json;
+
+// Issue #460 / atomic follow-up: dual_write_message must not leave a live
+// outbound note behind when the inbound copy's write fails. Since the
+// send-single-txn change, both copies commit under ONE atomic unit, so a
+// failure on the inbound copy's FTS statement (armed via
+// `arm_fts_fail_scoped(&recipient_ns)`, now consumed by
+// `create_notes_atomic` through `consume_fts_fail_fault`) rolls back the
+// WHOLE unit — including the outbound copy's already-applied statements
+// in sender_ns. Assert absence positively in BOTH namespaces rather than
+// inspecting the error string.
+#[tokio::test]
+async fn dual_write_inbound_failure_rolls_back_whole_unit_including_outbound() {
+    use khive_runtime::{arm_fts_fail_scoped, AllowAllGate, BackendId, RuntimeConfig};
+
+    let sender_ns = format!("t460-sender-{}", Uuid::new_v4().simple());
+    let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
+        web: Default::default(),
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::parse(&sender_ns).unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
+        actor_id: None,
+        exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+
+    let caller_token = runtime
+        .authorize(Namespace::parse(&sender_ns).unwrap())
+        .expect("authorize sender");
+    let recipient_token = runtime
+        .authorize(Namespace::parse(&recipient_ns).unwrap())
+        .expect("authorize recipient");
+
+    // Outbound copy targets sender_ns; inbound copy targets recipient_ns
+    // and its FTS statement is armed to fail inside the atomic unit.
+    let _fts_arm = arm_fts_fail_scoped(&recipient_ns);
+
+    let result = dual_write_message(
+        &runtime,
+        &caller_token,
+        &sender_ns,
+        &recipient_ns,
+        None,
+        "F1 regression content",
+        None,
+        "2026-07-03T00:00:00Z",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "dual_write_message must fail when the inbound copy's write fails; got {result:?}"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("rolled back"),
+        "error must report the atomic unit rolled back; got: {err_msg}"
+    );
+    for (token, ns) in [(&caller_token, "sender"), (&recipient_token, "recipient")] {
+        let alive = runtime
+            .list_notes(token, Some("message"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count();
+        assert_eq!(
+            alive, 0,
+            "no live note may remain in {ns}_ns after the whole unit rolled back; got {alive}"
+        );
+    }
+}
+
+/// Build a minimal same-namespace runtime + authorized token for the two
+/// tests below. The namespace is still generated fresh per call so
+/// `arm_vector_fail_scoped`/`arm_fts_fail_scoped` — process-wide,
+/// namespace-keyed statics — never race a concurrently-running test.
+fn scratch_runtime_and_token(ns: &str) -> (KhiveRuntime, NamespaceToken) {
+    use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
+        web: Default::default(),
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::parse(ns).unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+        exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+    let token = runtime
+        .authorize(Namespace::parse(ns).unwrap())
+        .expect("authorize");
+    (runtime, token)
+}
+
+/// A root send (no `thread_id`) must store the SAME canonical thread_id —
+/// the outbound note's own id — on BOTH copies from their first write,
+/// not patched in afterward. `created_at == updated_at` on both is the
+/// positive signal that no later UPDATE ever touched either row
+/// post-creation.
+#[tokio::test]
+async fn send_root_thread_id_is_canonical_without_patch_write() {
+    let ns = format!("thread-id-canonical-{}", Uuid::new_v4().simple());
+    let (runtime, token) = scratch_runtime_and_token(&ns);
+
+    let (outbound_note, _) = dual_write_message(
+        &runtime,
+        &token,
+        &ns,
+        &ns,
+        None,
+        "root send thread id",
+        None,
+        "2026-08-01T00:00:00Z",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("dual_write_message succeeds");
+    let outbound_full_id = outbound_note.id.as_hyphenated().to_string();
+
+    let alive: Vec<_> = runtime
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes")
+        .into_iter()
+        .filter(|n| n.deleted_at.is_none())
+        .collect();
+    assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+
+    for note in &alive {
+        let thread_id = note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("thread_id"))
+            .and_then(|v| v.as_str())
+            .expect("thread_id property present");
+        assert_eq!(
+            thread_id, outbound_full_id,
+            "both copies must carry the outbound id as canonical thread_id from \
+                 their first write; note {} had {thread_id}",
+            note.id
+        );
+        assert_eq!(
+            note.created_at, note.updated_at,
+            "no post-creation patch write may have touched note {} \
+                 (created_at must equal updated_at)",
+            note.id
+        );
+    }
+}
+
+/// Failure injection mid-unit, proven across a CROSS-namespace send: the
+/// outbound plan (sender namespace) applies its statements before the
+/// inbound plan (recipient namespace) runs, so arming the fault on the
+/// recipient namespace only is what actually exercises "an
+/// already-applied first plan unwinds" — arming the SAME namespace for
+/// both copies (as same-namespace sends do) lets the one-shot fault be
+/// consumed by the outbound plan instead, proving nothing about rollback
+/// of prior work. Absence is asserted positively — `list_notes`,
+/// `fts_notes` row counts, `VectorStore::count`, and `ann_write_log` row
+/// counts — in BOTH namespaces, not by inspecting the error.
+#[tokio::test]
+async fn send_vector_failure_mid_unit_rolls_back_both_notes_and_their_vectors() {
+    use async_trait::async_trait;
+    use khive_runtime::{
+        arm_vector_fail_scoped, AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig,
+    };
+    use khive_storage::types::SqlValue;
+    use khive_storage::SqlStatement;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    const MODEL: &str = "message-vecfail-model";
+    const DIMS: usize = 4;
+
+    struct StubService;
+    #[async_trait]
+    impl EmbeddingService for StubService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![0.5_f32; DIMS]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            MODEL
+        }
+    }
+    struct StubProvider;
+    #[async_trait]
+    impl EmbedderProvider for StubProvider {
+        fn name(&self) -> &str {
+            MODEL
+        }
+        fn dimensions(&self) -> usize {
+            DIMS
+        }
+        async fn build(
+            &self,
+        ) -> khive_runtime::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(StubService))
+        }
+    }
+
+    let sender_ns = format!("vecfail-sender-{}", Uuid::new_v4().simple());
+    let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
+        web: Default::default(),
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::parse(&sender_ns).unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
+        actor_id: None,
+        exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+    runtime.register_embedder(StubProvider);
+
+    let sender_token = runtime
+        .authorize(Namespace::parse(&sender_ns).unwrap())
+        .expect("authorize sender");
+    let recipient_token = runtime
+        .authorize(Namespace::parse(&recipient_ns).unwrap())
+        .expect("authorize recipient");
+
+    // No from_actor: this is a cross-namespace send, so the inbound copy
+    // lands in recipient_ns (not the caller's namespace). Arm the fault
+    // on recipient_ns — the SECOND plan in send order — so the outbound
+    // plan's statements are already applied when the failure hits.
+    let _vec_arm = arm_vector_fail_scoped(&recipient_ns);
+
+    let result = dual_write_message(
+        &runtime,
+        &sender_token,
+        &sender_ns,
+        &recipient_ns,
+        None,
+        "vector fail mid-unit",
+        None,
+        "2026-08-01T00:00:00Z",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "dual_write_message must fail when the vector-insert statement is injected \
+             to fail; got {result:?}"
+    );
+
+    for (token, ns, label) in [
+        (&sender_token, &sender_ns, "sender"),
+        (&recipient_token, &recipient_ns, "recipient"),
+    ] {
+        let alive = runtime
+            .list_notes(token, Some("message"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count();
+        assert_eq!(
+            alive, 0,
+            "no note may survive a mid-unit vector failure in {label}_ns; got {alive}"
+        );
+
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        let fts_count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1".to_string(),
+                params: vec![SqlValue::Text(ns.clone())],
+                label: Some("test-fts-count".to_string()),
+            })
+            .await
+            .expect("fts count query");
+        assert!(
+                matches!(fts_count, Some(SqlValue::Integer(0))),
+                "no FTS document may survive a mid-unit vector failure in {label}_ns; got {fts_count:?}"
+            );
+
+        let vs = runtime.vectors_for_model(token, MODEL).expect("vec store");
+        assert_eq!(
+            vs.count().await.expect("count"),
+            0,
+            "no vector row may survive a mid-unit vector failure in {label}_ns"
+        );
+
+        let ann_count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                          WHERE namespace = ?1 AND embedding_model = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Text(MODEL.to_string()),
+                ],
+                label: Some("test-ann-log-count".to_string()),
+            })
+            .await
+            .expect("ann_write_log count query");
+        assert!(
+                matches!(ann_count, Some(SqlValue::Integer(0))),
+                "no ann_write_log row may survive a mid-unit vector failure in {label}_ns; got {ann_count:?}"
+            );
+    }
+}
+
+#[test]
+fn side_effects_unknown_surfaces_outbound_confirmation_id() {
+    for with_evidence in [false, true] {
+        let outbound_id = Uuid::new_v4();
+        let error =
+            StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown);
+        let error = if with_evidence {
+            error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
+                stage: khive_storage::error::SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            })
+        } else {
+            error
+        };
+        let error = RuntimeError::Storage(error);
+
+        let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
+        let RuntimeError::Khive(khive_error) = &annotated else {
+            panic!("expected RuntimeError::Khive, got {annotated:?}");
+        };
+        assert_eq!(khive_error.kind(), khive_types::ErrorKind::Conflict);
+        assert_eq!(khive_error.retry_hint(), khive_types::RetryHint::NoRetry);
+        assert_eq!(
+            khive_error
+                .details()
+                .and_then(|d| d.get("outbound_id"))
+                .map(str::to_string),
+            Some(outbound_id.to_string())
+        );
+        assert!(khive_error.message().contains("side_effects_unknown"));
+        assert!(khive_error
+            .message()
+            .contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+    }
+}
+
+#[test]
+fn known_atomic_rollback_is_not_mislabeled_ambiguous() {
+    let error = RuntimeError::Internal("atomic multi-note write rolled back at op 1".into());
+    let annotated = attach_outbound_id_to_ambiguous_write(Uuid::new_v4(), error);
+
+    assert!(matches!(&annotated, RuntimeError::Internal(_)));
+    assert!(!annotated.to_string().contains("outbound_id="));
+}
+
+#[test]
+fn writer_begin_contention_is_retryable_without_delivery_probe() {
+    let error = RuntimeError::Storage(StorageError::WriterTaskBusy { timeout_ms: 175 });
+    let annotated = attach_outbound_id_to_ambiguous_write(Uuid::new_v4(), error);
+
+    assert!(matches!(
+        annotated,
+        RuntimeError::Storage(StorageError::WriterTaskBusy { timeout_ms: 175 })
+    ));
+}
+
+#[tokio::test]
+async fn dual_write_versions_both_copies_and_stamps_optional_process_provenance() {
+    use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
+        web: Default::default(),
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+        exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+    let caller_token = runtime
+        .authorize(Namespace::local())
+        .expect("authorize local");
+
+    dual_write_message(
+        &runtime,
+        &caller_token,
+        "local",
+        "local",
+        None,
+        "with process provenance",
+        None,
+        "2026-07-31T00:00:00Z",
+        Some("worker/run:42"),
+        Some("local"),
+        Some("local"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("dual write with provenance");
+    dual_write_message(
+        &runtime,
+        &caller_token,
+        "local",
+        "local",
+        None,
+        "without process provenance",
+        None,
+        "2026-07-31T00:00:01Z",
+        None,
+        Some("local"),
+        Some("local"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("dual write without provenance");
+
+    let notes = runtime
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .expect("list messages");
+    for (content, expected_process) in [
+        ("with process provenance", Some("worker/run:42")),
+        ("without process provenance", None),
+    ] {
+        let matching: Vec<_> = notes
+            .iter()
+            .filter(|note| note.content == content)
+            .collect();
+        assert_eq!(matching.len(), 2, "one outbound and one inbound copy");
+
+        let mut directions = Vec::new();
+        for note in matching {
+            let props = note.properties.as_ref().expect("message properties");
+            assert_eq!(
+                props.get("comm_schema_version").and_then(Value::as_u64),
+                Some(COMM_SCHEMA_VERSION)
+            );
+            assert_eq!(
+                props.get("sent_by_process").and_then(Value::as_str),
+                expected_process
+            );
+            directions.push(
+                props
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .expect("direction"),
+            );
+        }
+        directions.sort_unstable();
+        assert_eq!(directions, ["inbound", "outbound"]);
+    }
+}
+
+fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
+    let mut n = Note::new(namespace, "message", content);
+    n.properties = props;
+    n
+}
+
+#[test]
+fn promotes_from_to_subject_when_present() {
+    let note = make_note(
+        "local",
+        "hello",
+        Some(json!({
+            "from_actor": "lambda:khive",
+            "to_actor": "lambda:leo",
+            "subject": "Status update",
+            "direction": "inbound",
+            "read": false,
+        })),
+    );
+    let v = note_to_message_json(&note);
+    assert_eq!(v["from"], json!("lambda:khive"));
+    assert_eq!(v["to"], json!("lambda:leo"));
+    assert_eq!(v["subject"], json!("Status update"));
+    assert_eq!(v["direction"], json!("inbound"));
+    assert_eq!(v["read"], json!(false));
+    assert!(v["content"].is_string());
+    assert!(v["properties"].is_object());
+}
+
+#[test]
+fn message_ids_are_round_trippable_with_separate_compact_display_id() {
+    let note = make_note("local", "hello", None);
+    let full_id = note.id.as_hyphenated().to_string();
+    let v = note_to_message_json(&note);
+
+    assert_eq!(v["id"], json!(full_id));
+    assert_eq!(v["full_id"], v["id"]);
+    assert_eq!(v["short_id"], json!(short_id(note.id)));
+}
+
+#[test]
+fn from_falls_back_to_namespace_when_from_actor_absent() {
+    let note = make_note(
+        "legacy-ns",
+        "old message",
+        Some(json!({ "to_actor": "lambda:leo" })),
+    );
+    let v = note_to_message_json(&note);
+    assert_eq!(v["from"], json!("legacy-ns"));
+}
+
+#[test]
+fn preview_is_single_line_and_truncated_for_long_content() {
+    let long_body = "word ".repeat(40);
+    let note = make_note("local", long_body.trim(), None);
+    let v = note_to_message_json(&note);
+    let preview = v["preview"].as_str().expect("preview is a string");
+    assert!(!preview.contains('\n'), "preview must be single-line");
+    assert!(
+        preview.ends_with('\u{2026}'),
+        "long preview must end with ellipsis"
+    );
+    let without_ellipsis: &str = &preview[..preview.len() - '\u{2026}'.len_utf8()];
+    assert!(
+        without_ellipsis.chars().count() <= 80,
+        "preview body must not exceed 80 chars before ellipsis"
+    );
+}
+
+#[test]
+fn preview_not_truncated_for_short_content() {
+    let note = make_note("local", "short message", None);
+    let v = note_to_message_json(&note);
+    let preview = v["preview"].as_str().expect("preview is a string");
+    assert_eq!(preview, "short message");
+    assert!(!preview.ends_with('\u{2026}'));
+}
+
+#[test]
+fn preview_collapses_whitespace_and_newlines() {
+    let note = make_note("local", "line one\n  line two\n\nline three", None);
+    let v = note_to_message_json(&note);
+    let preview = v["preview"].as_str().expect("preview is a string");
+    assert_eq!(preview, "line one line two line three");
+}
+
+#[test]
+fn properties_and_content_still_present() {
+    let note = make_note(
+        "local",
+        "body text",
+        Some(json!({ "from_actor": "x", "custom": 42 })),
+    );
+    let v = note_to_message_json(&note);
+    assert_eq!(v["content"], json!("body text"));
+    assert_eq!(v["properties"]["custom"], json!(42));
+}
+
+#[test]
+fn projection_derives_id_aliases_from_id_field() {
+    let note = make_note("local", "projection fixture", None);
+    let view = note_to_message_json(&note);
+    let mut bare = view.clone();
+    bare.as_object_mut()
+        .expect("message view is an object")
+        .retain(|key, _| key != "short_id" && key != "full_id");
+    assert!(
+        bare.get("short_id").is_none() && bare.get("full_id").is_none(),
+        "fixture must actually drop the alias keys"
+    );
+
+    let fields = vec![
+        "id".to_string(),
+        "short_id".to_string(),
+        "full_id".to_string(),
+    ];
+    let projected = project_message_json(bare, Some(&fields));
+    let id = view["id"].as_str().expect("id is a string");
+    assert_eq!(projected["id"], view["id"]);
+    assert_eq!(projected["full_id"], json!(id));
+    assert_eq!(projected["short_id"], json!(&id[..8]));
+}
+
+#[test]
+fn null_defaults_when_no_properties() {
+    let note = make_note("local", "no props", None);
+    let v = note_to_message_json(&note);
+    assert_eq!(v["to"], Value::Null);
+    assert_eq!(v["subject"], Value::Null);
+    assert_eq!(v["direction"], Value::Null);
+    assert_eq!(v["read"], json!(false));
+    assert_eq!(v["from"], json!("local"));
+}
