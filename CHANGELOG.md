@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   temporary instead of replacing it, keeps the original filename bytes, creates the file with
   mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
   staging policies keep mode 0644 and their behavior (#5068).
+### Fixed
+
+- Named-vector and memory session exact search select equal-distance boundary hits by
+  subject UUID before limiting candidates, keeping their order stable across database reopen.
 
 ## [0.12.0] - 2026-10-11
 
