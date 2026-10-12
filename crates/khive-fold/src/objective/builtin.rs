@@ -1,6 +1,7 @@
 //! Built-in objective functions
 
 use crate::{Objective, ObjectiveContext, Selection};
+use khive_score::{Decay, HalfLife};
 
 /// Selects candidate with highest score.
 pub struct MaxScoreObjective<T, F>
@@ -165,7 +166,7 @@ pub trait HasSalience {
 
 /// Scores by recency (newer = higher score).
 pub struct RecencyObjective {
-    half_life_seconds: f64,
+    decay: Decay,
 }
 
 impl RecencyObjective {
@@ -178,7 +179,10 @@ impl RecencyObjective {
             "half_life_seconds must be positive and finite, got {half_life_seconds}"
         );
         Self {
-            half_life_seconds: half_life_seconds.max(Self::MIN_HALF_LIFE),
+            decay: Decay::exponential_with_half_life(
+                HalfLife::try_new(half_life_seconds.max(Self::MIN_HALF_LIFE))
+                    .expect("half-life is positive and finite"),
+            ),
         }
     }
 
@@ -196,7 +200,9 @@ impl RecencyObjective {
 impl<T: HasTimestamp + Send + Sync> Objective<T> for RecencyObjective {
     fn score(&self, candidate: &T, context: &ObjectiveContext) -> f64 {
         let age_seconds = (context.as_of - candidate.timestamp()).num_seconds().max(0) as f64;
-        0.5f64.powf(age_seconds / self.half_life_seconds)
+        self.decay
+            .factor(age_seconds)
+            .expect("timestamp age is finite")
     }
 
     fn name(&self) -> &str {
@@ -417,6 +423,24 @@ mod tests {
 
         assert!(new_score > old_score);
         assert!((new_score - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn recency_preserves_future_clamp_minimum_half_life_and_decay() {
+        let now = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let context = ObjectiveContext::at(now);
+        for half_life in [0.25_f64, 1.0, 3_600.0, f64::MAX] {
+            let objective = RecencyObjective::new(half_life);
+            for age in [-1_i64, 0, 1, 3_600, 7_200] {
+                let item = TestItem {
+                    _value: 1,
+                    timestamp: now - chrono::Duration::seconds(age),
+                    salience: 0.5,
+                };
+                let expected = 0.5_f64.powf(age.max(0) as f64 / half_life.max(1.0));
+                assert!((objective.score(&item, &context) - expected).abs() <= f64::EPSILON);
+            }
+        }
     }
 
     #[test]
