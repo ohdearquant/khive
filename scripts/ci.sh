@@ -32,17 +32,7 @@ phase_lint() {
     sh "$SCRIPT_DIR/lint-sql.sh"
     python3 "$SCRIPT_DIR/tests/test_lint_sql.py"
 
-    echo "=== ADR Reference Lint ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh"
-
-    echo "=== ADR Reference Lint Self-Test ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
-
-    echo "=== ADR Status Lint ==="
-    python3 "$SCRIPT_DIR/lint-adr-status.py"
-
-    echo "=== ADR Status Lint Self-Test ==="
-    python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
+    phase_adr_lint
 
     echo "=== Local Build Artifact Verification Tests ==="
     python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
@@ -63,6 +53,22 @@ phase_lint() {
 
     echo "=== Contract Harness Tests ==="
     uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
+}
+
+# The hosted docs job runs this phase too, so a change that touches only Markdown, which skips the Rust
+# jobs, still has its ADR references and status lines checked.
+phase_adr_lint() {
+    echo "=== ADR Reference Lint ==="
+    sh "$SCRIPT_DIR/lint-adr-refs.sh"
+
+    echo "=== ADR Reference Lint Self-Test ==="
+    sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
+
+    echo "=== ADR Status Lint ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py"
+
+    echo "=== ADR Status Lint Self-Test ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
 }
 
 phase_docs_fmt() {
@@ -417,6 +423,15 @@ phase_contract_suite() {
     (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
 }
 
+# The documentation lane skips the contract suite, but one of its tests reads every file in the repository,
+# Markdown included, so the hosted docs job runs that test here. It needs ripgrep: under CI it fails rather
+# than skips when rg is absent, and a renamed test fails collection rather than selecting nothing.
+phase_content_sweeps() {
+    echo "=== Repository Identifier Ban (khive-contract) ==="
+    (cd "$SCRIPT_DIR/../tests/khive-contract" &&
+        uv run pytest -q tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo)
+}
+
 phase_macos_pr_check() {
     echo "=== macOS PR Compile Check ==="
     # PRs keep cross-platform compile coverage without paying for the full lint,
@@ -484,6 +499,7 @@ run_phase() {
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
+        adr-lint) phase_adr_lint ;;
         no-stubs) phase_no_stubs ;;
         clippy) phase_clippy ;;
         docs) phase_docs ;;
@@ -498,11 +514,12 @@ run_phase() {
         smoke-tests) phase_smoke_tests ;;
         vector-smoke) phase_vector_smoke ;;
         contract-suite) phase_contract_suite ;;
+        content-sweeps) phase_content_sweeps ;;
         macos-pr-check) phase_macos_pr_check ;;
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint adr-lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite content-sweeps macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac

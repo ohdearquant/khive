@@ -102,6 +102,71 @@ jobs:
             printf 'Main tip: `%s`\n' "$(git rev-parse refs/remotes/origin/main)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # A change that touches only Markdown files no code names runs the documentation lane: docs formatting,
+  # the ADR lints, the marketplace validator, the data-leak guard and the secret scan. The Rust, Python,
+  # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
+  # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
+  # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
+  # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
+  # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  changed-paths:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+      - name: Classify
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docs_only=false
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1")
+            docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
+            base=""
+            runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            while read -r run_id run_sha; do
+              [[ -n "$run_id" ]] || continue
+              shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
+                --jq '[.jobs[] | select(.name == "CI (ubuntu-latest, shard 1/2)" and .conclusion == "success")] | length') || shard=0
+              if [[ "$shard" -ge 1 ]] && git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
+                base=$run_sha
+                break
+              fi
+            done <<< "$runs"
+            if [[ -n "$base" ]]; then
+              echo "Compared with $base, the newest main commit with a completed full run"
+              docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+            else
+              echo "full suite: no main commit with a completed full run was found"
+            fi
+          else
+            echo "full suite: $EVENT_NAME runs on ${REF} always run every job"
+          fi
+          if [[ "$docs_only" != "true" ]]; then
+            docs_only=false
+          fi
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
   automerge-push-guard:
@@ -183,7 +248,8 @@ jobs:
 
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -336,27 +402,7 @@ jobs:
       # that runs khive-contract.
       - name: Install khive-contract scan dependency (Linux)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
-        run: |
-          # The runner image carries third-party apt lists this job needs
-          # nothing from, and `apt-get update` exits 100 when any one of them
-          # serves a bad index. Google's chrome list did exactly that on
-          # 2026-09-09 (Hash Sum mismatch) and reddened every full-suite
-          # shard. ripgrep comes from the Ubuntu archive, so disable that list
-          # instead of retrying into the same mismatch. apt reads only .list
-          # and .sources files, so a renamed copy is inert, and the Ubuntu
-          # archive itself lives in ubuntu.sources and is untouched. A different
-          # third-party list failing this way needs its own line here, by
-          # name: this is deliberately not a blanket sweep of the directory.
-          for f in /etc/apt/sources.list.d/google-chrome.list \
-                   /etc/apt/sources.list.d/google-chrome.sources; do
-            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
-          done
-          # Print what still points at the chrome repo: empty is the pass, a
-          # non-empty line says the rename missed a filename this does not know.
-          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
-          rg --version
+        run: ../scripts/ci-install-ripgrep.sh
       - name: Install khive-contract scan dependency (macOS)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'macOS'
         run: |
@@ -458,7 +504,8 @@ jobs:
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -533,7 +580,8 @@ jobs:
 
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -618,7 +666,8 @@ jobs:
 
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -776,6 +825,15 @@ jobs:
           deno-version: v2.x
       - name: Check markdown formatting
         run: scripts/ci.sh docs-fmt
+      - name: ADR reference and status lints
+        run: scripts/ci.sh adr-lint
+      # The repository-wide identifier ban reads Markdown too, and the documentation lane skips the
+      # contract suite that holds it, so it runs here on every change.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install repository scan dependency
+        run: scripts/ci-install-ripgrep.sh
+      - name: Repository identifier ban
+        run: scripts/ci.sh content-sweeps
 
   marketplace:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Marketplace example validator
@@ -794,7 +852,8 @@ jobs:
 
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -815,9 +874,9 @@ jobs:
 
   dependency-review:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -872,7 +931,8 @@ jobs:
 
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -1021,7 +1081,8 @@ jobs:
 
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -1046,7 +1107,8 @@ jobs:
 
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1213,7 +1275,8 @@ jobs:
 
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1237,7 +1300,8 @@ jobs:
   # Sequential feature checks reuse one Linux runner without hiding later failures.
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -1316,7 +1380,8 @@ jobs:
 
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1390,7 +1455,8 @@ jobs:
 
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1575,9 +1641,9 @@ jobs:
 
   coverage-ratchet:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
-    needs: [resolve-revision, coverage-measurement]
+    needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1626,6 +1692,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - resolve-revision
+      - changed-paths
       - automerge-push-guard
       - ci
       - khive-py
@@ -1651,14 +1718,25 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # Only the push guard may skip on run shape. Dependency review now
+          # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
-          # inputs fail the ratchet. An unexpected skip must not pass the gate.
+          # inputs fail the ratchet. The documentation-lane jobs may skip only
+          # when the classifier succeeded and reported docs_only=true. Any
+          # other skip fails the gate.
+          echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
+            | (if .["changed-paths"].result == "success"
+                  and .["changed-paths"].outputs.docs_only == "true"
+               then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
+                     "dependency-review", "coverage-measurement", "coverage-ratchet",
+                     "wasm-parity", "vamana-portability", "minio-blob-compat",
+                     "msrv-check", "core-only"]
+               else [] end) as $docs_lane_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
-                (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
+                (.value.result != "skipped"
+                  or (($allowed_skips + $docs_lane_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"
