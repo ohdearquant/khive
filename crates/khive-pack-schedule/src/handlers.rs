@@ -21,23 +21,8 @@ use khive_types::{EventKind, SubstrateKind};
 use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 
 #[cfg(test)]
-mod activation_seam {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
-    tokio::task_local! {
-        pub(super) static AFTER_CREATE: (Arc<Barrier>, Arc<Barrier>);
-    }
-
-    pub(super) async fn pause_after_create() {
-        if let Ok((arrived, resume)) = AFTER_CREATE.try_with(Clone::clone) {
-            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
-                .await
-                .expect("public verb did not reach post-create seam");
-            resume.wait().await;
-        }
-    }
-}
+#[path = "handlers_activation_seam.rs"]
+mod activation_seam;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
