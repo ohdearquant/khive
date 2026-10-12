@@ -147,6 +147,10 @@ mod channel_ingest;
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 use channel_ingest::*;
 
+#[cfg(feature = "channel-email")]
+#[path = "serve/email_host.rs"]
+mod email_host;
+
 /// Apply the same independent daemon/runtime admission as the email adapter:
 /// both Telegram polling and outbound delivery follow the comm runtime, which
 /// holds the message notes and durably marks delivery outcomes.

@@ -73,27 +73,21 @@ pub(crate) async fn handle_suppression_add(
     let id = Uuid::new_v4();
     let created_at = Utc::now().timestamp_micros();
 
-    let sql = runtime.sql();
-    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-    ensure_suppression_schema(&mut *writer).await?;
-    let inserted = writer
-        .execute(SqlStatement {
-            sql: khive_runtime::sql!("comm_suppression_insert").into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(scope.to_string()),
-                SqlValue::Text(kind.to_string()),
-                SqlValue::Text(value.clone()),
-                SqlValue::Text(source.to_string()),
-                SqlValue::Text(token.actor().id.clone()),
-                SqlValue::Integer(created_at),
-                SqlValue::Text(reason.clone()),
-            ],
-            label: Some("comm_suppression_add".into()),
-        })
-        .await
-        .map_err(RuntimeError::Storage)?;
-    if inserted != 1 {
+    let inserted = insert_suppression(
+        runtime,
+        SuppressionInsert {
+            id,
+            scope,
+            kind,
+            value: &value,
+            source,
+            created_by: token.actor().id.as_str(),
+            created_at,
+            reason: &reason,
+        },
+    )
+    .await?;
+    if !inserted {
         return Err(RuntimeError::Khive(KhiveError::conflict(
             "suppression_add: an entry already exists for this scope, kind, value, and source",
         )));
@@ -321,6 +315,123 @@ pub async fn load_outbound_email_suppressions(
             })
         })
         .collect()
+}
+
+/// Read inbound suppression entries through the comm store for the inbound disposition gate.
+///
+/// Only `address` and `domain` kinds can match an inbound sender; a `recipient_key` entry is an
+/// outbound identity form and is never returned here.
+pub async fn load_inbound_email_suppressions(
+    runtime: &KhiveRuntime,
+) -> Result<Vec<khive_runtime::EmailSuppression>, RuntimeError> {
+    let sql = runtime.sql();
+    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+    ensure_suppression_schema(&mut *writer).await?;
+    let rows = writer
+        .query_all(SqlStatement {
+            sql: khive_runtime::sql!("comm_suppression_inbound_list").into(),
+            params: vec![],
+            label: Some("comm_suppression_inbound_list".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    rows.iter()
+        .map(|row| {
+            let record = parse_record(row, "inbound_suppression_read")?;
+            if record.scope != "inbound" {
+                return Err(RuntimeError::Internal(
+                    "inbound suppression query returned a non-inbound entry".into(),
+                ));
+            }
+            let kind = match record.kind.as_str() {
+                "address" => khive_runtime::EmailSuppressionKind::Address,
+                "domain" => khive_runtime::EmailSuppressionKind::Domain,
+                _ => {
+                    return Err(RuntimeError::Internal(
+                        "inbound suppression query returned an invalid kind".into(),
+                    ));
+                }
+            };
+            Ok(khive_runtime::EmailSuppression {
+                scope: khive_runtime::EmailSuppressionScope::Inbound,
+                kind,
+                value: record.value,
+            })
+        })
+        .collect()
+}
+
+/// The fields of one suppression entry to write, borrowed so both the verb and the channel-side
+/// opt-out recording reach the same store function.
+struct SuppressionInsert<'a> {
+    id: Uuid,
+    scope: &'a str,
+    kind: &'a str,
+    value: &'a str,
+    source: &'a str,
+    created_by: &'a str,
+    created_at: i64,
+    reason: &'a str,
+}
+
+/// The one SQL path every suppression entry takes: the three verbs' add path and the channel's
+/// mailto opt-out recording both funnel here, so there is a single insert statement for the list.
+/// Uniqueness is `(scope, kind, value, source)`, so a repeated entry inserts nothing and reports
+/// `Ok(false)` rather than failing.
+async fn insert_suppression(
+    runtime: &KhiveRuntime,
+    entry: SuppressionInsert<'_>,
+) -> Result<bool, RuntimeError> {
+    let sql = runtime.sql();
+    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+    ensure_suppression_schema(&mut *writer).await?;
+    let inserted = writer
+        .execute(SqlStatement {
+            sql: khive_runtime::sql!("comm_suppression_insert").into(),
+            params: vec![
+                SqlValue::Text(entry.id.to_string()),
+                SqlValue::Text(entry.scope.to_string()),
+                SqlValue::Text(entry.kind.to_string()),
+                SqlValue::Text(entry.value.to_string()),
+                SqlValue::Text(entry.source.to_string()),
+                SqlValue::Text(entry.created_by.to_string()),
+                SqlValue::Integer(entry.created_at),
+                SqlValue::Text(entry.reason.to_string()),
+            ],
+            label: Some("comm_suppression_add".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    Ok(inserted == 1)
+}
+
+/// Record the suppression entry for a verified mailto unsubscribe (ADR-200 §5.4 entry point 1).
+///
+/// The token is the authority, so this runs before sender authentication. `recipient_key` is the
+/// 64-lowercase-hex key text the caller's [`khive_runtime::OutboundEmailPolicy`] verified from the
+/// token, and `created_by` attributes the write to the poller's actor. The same store function the
+/// suppression verbs use performs the insert, so an entry this path and an operator entry with the
+/// same `(scope, kind, value, source)` do not duplicate. The `reason` names no address, because the
+/// token identifies the recipient without the opt-out ever holding it.
+pub async fn record_mailto_unsubscribe_suppression(
+    runtime: &KhiveRuntime,
+    recipient_key: &str,
+    created_by: &str,
+) -> Result<bool, RuntimeError> {
+    insert_suppression(
+        runtime,
+        SuppressionInsert {
+            id: Uuid::new_v4(),
+            scope: "outbound",
+            kind: "recipient_key",
+            value: recipient_key,
+            source: "mailto_token",
+            created_by,
+            created_at: Utc::now().timestamp_micros(),
+            reason: "mailto unsubscribe token",
+        },
+    )
+    .await
 }
 
 fn validate_closed_set<'a>(
@@ -1086,5 +1197,41 @@ mod tests {
         );
         assert!(ensure_suppression_caller_allowed(&external, "actor:external").is_ok());
         assert!(ensure_suppression_caller_allowed(&external, "actor:other").is_err());
+    }
+
+    #[tokio::test]
+    async fn inbound_load_skips_recipient_key_entries() {
+        let runtime = runtime();
+        let token = token(&runtime);
+        let key = "a".repeat(64);
+        add(
+            &runtime,
+            &token,
+            "inbound",
+            "recipient_key",
+            &key,
+            "operator",
+        )
+        .await
+        .expect("an inbound recipient_key entry is accepted");
+        add(
+            &runtime,
+            &token,
+            "inbound",
+            "address",
+            "blocked@example.com",
+            "operator",
+        )
+        .await
+        .expect("an inbound address entry");
+        let entries = load_inbound_email_suppressions(&runtime)
+            .await
+            .expect("an inbound recipient_key entry does not fail the load");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(matches!(
+            entries[0].kind,
+            khive_runtime::EmailSuppressionKind::Address
+        ));
+        assert_eq!(entries[0].value, "blocked@example.com");
     }
 }

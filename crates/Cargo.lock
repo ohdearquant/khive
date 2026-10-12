@@ -2038,6 +2038,7 @@ dependencies = [
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",
+ "khive-storage",
  "khive-types",
  "lettre",
  "mail-parser",

@@ -128,6 +128,28 @@ pub fn outbound_email_is_suppressed(
     })
 }
 
+/// Check one already-normalized inbound sender address against the suppression rows supplied by
+/// the caller. Only `inbound` entries can match, and only `address` and `domain` kinds can: an
+/// inbound sender has no recipient key. Address comparison is exact after normalization, and
+/// domain comparison is exact with no subdomain wildcard, so a `domain` entry for `example.com`
+/// never blocks `user@sub.example.com`.
+///
+/// Callers must normalize the sender address with
+/// `khive_types::email_address::normalize_email_recipient` before calling this function.
+pub fn inbound_email_is_suppressed(normalized_sender: &str, entries: &[EmailSuppression]) -> bool {
+    let sender_domain = normalized_sender.rsplit_once('@').map(|(_, domain)| domain);
+    entries.iter().any(|entry| {
+        if entry.scope != EmailSuppressionScope::Inbound {
+            return false;
+        }
+        match entry.kind {
+            EmailSuppressionKind::Address => entry.value == normalized_sender,
+            EmailSuppressionKind::Domain => sender_domain == Some(entry.value.as_str()),
+            EmailSuppressionKind::RecipientKey => false,
+        }
+    })
+}
+
 impl OutboundEmailPolicy {
     /// Install a normalized recipient set; an explicitly empty set denies all recipients.
     pub fn configured(recipients: Vec<String>) -> Result<Self, String> {
@@ -749,6 +771,40 @@ mod tests {
             None,
             &entries
         ));
+    }
+
+    #[test]
+    fn inbound_matching_checks_exact_address_and_domain_and_ignores_recipient_keys() {
+        let entries = [
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::Address,
+                value: "a@example.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::Domain,
+                value: "blocked.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::RecipientKey,
+                value: "key-1".into(),
+            },
+            // An outbound-only entry never blocks an inbound sender.
+            EmailSuppression {
+                scope: EmailSuppressionScope::Outbound,
+                kind: EmailSuppressionKind::Address,
+                value: "c@example.com".into(),
+            },
+        ];
+
+        assert!(inbound_email_is_suppressed("a@example.com", &entries));
+        assert!(!inbound_email_is_suppressed("b@example.com", &entries));
+        assert!(inbound_email_is_suppressed("z@blocked.com", &entries));
+        assert!(!inbound_email_is_suppressed("z@sub.blocked.com", &entries));
+        assert!(!inbound_email_is_suppressed("c@example.com", &entries));
+        assert!(!inbound_email_is_suppressed("key-1", &entries));
     }
 
     #[test]
