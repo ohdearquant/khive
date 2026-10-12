@@ -65,7 +65,7 @@
 
 ### Lexical candidate fetch and stage budget (issue #1930 Amendment 2, issue #2396)
 
-- `fetch_fts_candidates` (`knowledge/search.rs`) runs each FTS5 term in two phases instead of one
+- `fetch_fts_candidates` (`knowledge/search/lexical.rs`) runs each FTS5 term in two phases instead of one
   joined query. Phase A enumerates bare rowids off the `fts_knowledge` index, carrying no namespace
   predicate because
   `namespace` is UNINDEXED on that external-content table and filtering on it there would force a
@@ -230,7 +230,11 @@
 ## Module Boundaries
 
 `knowledge/search/ann_search.rs` holds private ANN candidate acquisition, score provenance,
-RRF fusion, and post-hydration filters. The handlers remain in `knowledge/search.rs`.
+RRF fusion, and post-hydration filters. The search parent retains reranking and shared
+record types. `search/lexical.rs` owns lexical candidate selection and budgets;
+`search/search_core.rs` combines searches; `search/hydration.rs` joins candidates
+with stored records; `search/compose_helpers.rs` loads compose inputs and scores
+entity additions; `search/handlers.rs` implements search, suggest, and compose.
 
 | Module                  | Responsibility                                                                           |
 | ----------------------- | ---------------------------------------------------------------------------------------- |
