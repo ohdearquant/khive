@@ -476,7 +476,14 @@ async fn prepare_email(
         }
     }
     let normalized_recipient = khive_types::email_address::normalize_email_recipient(&recipient);
-    if !runtime.outbound_email_policy().allows(&recipient) {
+    let email_policy = runtime.outbound_email_policy();
+    let policy_recipient = email_policy.allows(&recipient);
+    let external_sender = props
+        .get("from_actor")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|actor| email_policy.allows_external_sender(actor));
+    let external_recipient = !policy_recipient && external_sender && normalized_recipient.is_some();
+    if !policy_recipient && !external_recipient {
         // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
         // must be recorded — skipping with only a log line leaves the row
         // pending forever while the sender saw `ok: true`.
@@ -507,6 +514,34 @@ async fn prepare_email(
             ),
         }
         return Ok(None);
+    }
+
+    if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
+        let suppressions = khive_pack_comm::handlers::load_outbound_email_suppressions(runtime)
+            .await
+            .map_err(|error| {
+                crate::components::ComponentError::Retryable(format!(
+                    "outbound email suppression check is unavailable: {error}"
+                ))
+            })?;
+        let recipient_key = email_policy.recipient_key(normalized);
+        if khive_runtime::outbound_email_is_suppressed(normalized, recipient_key, &suppressions) {
+            let failed_at = Utc::now().to_rfc3339();
+            let last_error = "external recipient suppressed by outbound email suppression policy";
+            runtime
+                .mark_outbound_message_failed(token, note.id, failed_at, last_error.to_string())
+                .await
+                .map_err(|error| {
+                    crate::components::ComponentError::Retryable(format!(
+                        "suppressed outbound email could not be marked failed: {error}"
+                    ))
+                })?;
+            tracing::warn!(target: "khive_mcp::serve", note_id = %note_id,
+                recipient = %normalized,
+                "outbox loop: external recipient is suppressed; recorded permanent failure"
+            );
+            return Ok(None);
+        }
     }
 
     let subject = props
