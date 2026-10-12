@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
+  `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
+  constructors must supply it. Recall handlers supply zero pending graph gathering,
+  default weights remain empty, and rerank provenance records the recognized feature.
+- `khive-brain-core` exposes evidence-only posteriors with explicit event/read clocks,
+  checked half-lives, decay-before-add and a fixed read-time prior. Regressed writes
+  preserve the entry; invalid or overflowing updates refuse atomically. Existing
+  posterior storage, folds and serving paths remain unchanged.
+- Packs can declare note property policies and discover the validated registry boot snapshot.
+  Comm declares its nine existing kind-specific protected properties; writer enforcement is unchanged.
+
 ### Changed
 
 - Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
@@ -15,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An oversized stdio line now receives Invalid Request (-32600, no id) instead of
   Parse Error (-32700): rmcp 2.2 ignores syntactically invalid JSON without
   replying. The line cap, drain and next-request recovery are unchanged.
+
+### Fixed
+
+- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
+  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
+  (#5087).
+- `kkernel kg export` checks file sync and removes its own temporary after a write, sync or
+  rename failure. On Unix it publishes through shared atomic publication: it refuses an existing
+  temporary instead of replacing it, keeps the original filename bytes, creates the file with
+  mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
+  staging policies keep mode 0644 and their behavior (#5068).
 
 ## [0.12.0] - 2026-10-11
 
@@ -35,10 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
-  `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
-  constructors must supply it. Recall handlers supply zero pending graph gathering,
-  default weights remain empty, and rerank provenance records the recognized feature.
 - `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
   merging. Original-query fallback preserves its bytes, generated variants are validated
   as a whole, and admitted IDs retain variant and retrieval-source attribution.
@@ -64,12 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `VectorStore::scan_vectors` enumerates persisted vectors in UUID-ordered pages
   with exact metadata filters and an explicit row limit. SQLite reads stored bytes
   through reader admission; pages do not form a cross-request snapshot.
-- `khive-brain-core` exposes evidence-only posteriors with explicit event/read clocks,
-  checked half-lives, decay-before-add and a fixed read-time prior. Regressed writes
-  preserve the entry; invalid or overflowing updates refuse atomically. Existing
-  posterior storage, folds and serving paths remain unchanged.
-- Packs can declare note property policies and discover the validated registry boot snapshot.
-  Comm declares its nine existing kind-specific protected properties; writer enforcement is unchanged.
 - The opt-in `charter` pack installs the seven recording tables from ADR-193 and
   provides revision-and-state checked transaction helpers. This schema foundation
   exposes no verbs, grants no action admission, and does not enforce merges.
