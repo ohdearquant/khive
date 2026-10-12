@@ -36,7 +36,7 @@ use khive_runtime::{
 use khive_storage::types::{Direction, NeighborHit, NeighborQuery, PageRequest};
 use khive_storage::{EdgeRelation, Entity, EntityFilter};
 
-use super::common::{deser, parse_direction, parse_relation, ContextParams};
+use super::common::{deser, parse_direction, parse_relation, ContextParams, DoublingWindowIter};
 use super::message_scope::{message_neighbor_permitted, resolve_mailbox_graph_id};
 use crate::KgPack;
 
@@ -109,6 +109,31 @@ struct NeighborRecord {
     weight: f64,
     hop: u8,
     via: Option<Uuid>,
+}
+
+struct NeighborCandidate {
+    id: Uuid,
+    edge_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    direction: &'static str,
+}
+
+struct AnchorEdgeRecord {
+    edge_id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+}
+
+fn context_edge_endpoints(parent_id: Uuid, neighbor_id: Uuid, direction: &str) -> (Uuid, Uuid) {
+    // Incoming preserves neighbor -> parent; outgoing and symmetric both use parent -> neighbor.
+    if direction == "incoming" {
+        (neighbor_id, parent_id)
+    } else {
+        (parent_id, neighbor_id)
+    }
 }
 
 /// True iff every relation in the filter is symmetric. See `docs/api/context-verb.md`.
@@ -208,13 +233,13 @@ async fn fetch_mailbox_neighbors(
     node_id: Uuid,
     options: &ContextNeighborRead<'_>,
     permitted: &mut HashMap<Uuid, bool>,
-) -> Result<(Vec<(Uuid, EdgeRelation, f64, &'static str)>, bool), RuntimeError> {
+) -> Result<(Vec<NeighborCandidate>, bool), RuntimeError> {
     const SCAN_CAP: u32 = 10_000;
     let mut merged: Vec<(NeighborHit, &'static str)> = Vec::new();
     let mut scan_incomplete = false;
     for namespace in token.visible_namespaces() {
-        let mut window = options.fanout;
-        loop {
+        let mut windows = DoublingWindowIter::new(options.fanout, SCAN_CAP);
+        while let Some(window) = windows.next() {
             let raw = missing_neighbor_anchor_as_empty(
                 fetch_directed_neighbors(
                     runtime,
@@ -257,7 +282,7 @@ async fn fetch_mailbox_neighbors(
                 scan_incomplete = true;
                 break;
             }
-            window = window.saturating_mul(2).min(SCAN_CAP);
+            windows.advance(window, 0, true);
         }
     }
     let direction_rank = |tag: &str| match tag {
@@ -277,7 +302,13 @@ async fn fetch_mailbox_neighbors(
     Ok((
         merged
             .into_iter()
-            .map(|(hit, tag)| (hit.node_id, hit.relation, hit.weight, tag))
+            .map(|(hit, direction)| NeighborCandidate {
+                id: hit.node_id,
+                edge_id: hit.edge_id,
+                relation: hit.relation,
+                weight: hit.weight,
+                direction,
+            })
             .collect(),
         scan_incomplete,
     ))
@@ -566,6 +597,9 @@ impl KgPack {
         // Anchors seed the visited set so an anchor already shown at the top
         // level never also appears inside another anchor's neighbor list.
         let mut visited: HashSet<Uuid> = anchor_ids.iter().copied().collect();
+        let anchor_id_set: HashSet<Uuid> = anchor_ids.iter().copied().collect();
+        let mut seen_anchor_edge_ids = HashSet::new();
+        let mut anchor_edge_records = Vec::new();
         let mut per_anchor_neighbors: Vec<Vec<NeighborRecord>> =
             Vec::with_capacity(anchor_ids.len());
         let mut permitted = HashMap::new();
@@ -594,15 +628,30 @@ impl KgPack {
                 .await?;
                 scan_incomplete |= incomplete;
 
-                for (id, relation, weight, dir) in hop1_raw {
+                for hit in hop1_raw {
+                    let id = hit.id;
+                    if anchor_id_set.contains(&id) {
+                        if seen_anchor_edge_ids.insert(hit.edge_id) {
+                            let (source_id, target_id) =
+                                context_edge_endpoints(anchor, id, hit.direction);
+                            anchor_edge_records.push(AnchorEdgeRecord {
+                                edge_id: hit.edge_id,
+                                source_id,
+                                target_id,
+                                relation: hit.relation,
+                                weight: hit.weight,
+                            });
+                        }
+                        continue;
+                    }
                     if !visited.insert(id) {
                         continue;
                     }
                     recs.push(NeighborRecord {
                         id,
-                        relation,
-                        direction: dir,
-                        weight,
+                        relation: hit.relation,
+                        direction: hit.direction,
+                        weight: hit.weight,
                         hop: 1,
                         via: None,
                     });
@@ -624,8 +673,8 @@ impl KgPack {
                     )
                     .await?;
                     scan_incomplete |= incomplete;
-                    for (id, relation, weight, dir) in hop2_raw {
-                        hop2_pool.push((*parent, id, relation, weight, dir));
+                    for hit in hop2_raw {
+                        hop2_pool.push((*parent, hit.id, hit.relation, hit.weight, hit.direction));
                     }
                 }
                 // Deterministic hop-1 stratum ordering; see docs/api/context-verb.md.
@@ -804,23 +853,18 @@ impl KgPack {
                     "via": rec.via.map(|v| v.to_string()),
                     "description": ne.description,
                 });
-                let (source_id, source_name, target_id, target_name) =
-                    if rec.direction == "incoming" {
-                        (
-                            rec.id,
-                            ne.name.as_deref(),
-                            parent_id,
-                            parent.name.as_deref(),
-                        )
-                    } else {
-                        // Symmetric "both" uses deterministic parent-first endpoints.
-                        (
-                            parent_id,
-                            parent.name.as_deref(),
-                            rec.id,
-                            ne.name.as_deref(),
-                        )
-                    };
+                let (source_id, target_id) =
+                    context_edge_endpoints(parent_id, rec.id, rec.direction);
+                let source_name = if source_id == parent_id {
+                    parent.name.as_deref()
+                } else {
+                    ne.name.as_deref()
+                };
+                let target_name = if target_id == parent_id {
+                    parent.name.as_deref()
+                } else {
+                    ne.name.as_deref()
+                };
                 let edge = json!({
                     "source_id": source_id.to_string(),
                     "source_name": source_name,
@@ -844,6 +888,23 @@ impl KgPack {
         let (out_anchors, out_edges, truncated, dropped_anchors, dropped_neighbors) =
             assemble_within_budget(&blocks, budget);
 
+        anchor_edge_records.sort_by_key(|edge| edge.edge_id);
+        let anchor_edges: Vec<Value> = anchor_edge_records
+            .into_iter()
+            .filter_map(|edge| {
+                let source = entity_meta.get(&edge.source_id)?;
+                let target = entity_meta.get(&edge.target_id)?;
+                Some(json!({
+                    "source_id": edge.source_id.to_string(),
+                    "source_name": source.name,
+                    "target_id": edge.target_id.to_string(),
+                    "target_name": target.name,
+                    "relation": edge.relation.as_str(),
+                    "weight": edge.weight,
+                }))
+            })
+            .collect();
+
         if let Some(t) = t4 {
             plog(call_id, "assembly", t.elapsed().as_micros());
         }
@@ -851,6 +912,7 @@ impl KgPack {
         let mut response = json!({
             "anchors": out_anchors,
             "edges": out_edges,
+            "anchor_edges": anchor_edges,
             "truncated": truncated,
             // `stage` is additive: every drop this handler produces originates in the
             // Stage-4 budget walk — `fanout`/`hops` bound the neighbor candidate pool

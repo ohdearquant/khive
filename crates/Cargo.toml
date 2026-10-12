@@ -135,7 +135,7 @@ blake3 = { version = "1", default-features = false }
 # matrix's win32-x64 target.
 fs4 = "1.1"
 regorus = "0.10"
-rmcp = "1.7"
+rmcp = "2.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"

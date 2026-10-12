@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
+  cancellation fixes. MCP, mounted tools and CLI consumers keep their existing
+  feature configuration; MCP result tests use the renamed `ContentBlock` API.
+- An oversized stdio line now receives Invalid Request (-32600, no id) instead of
+  Parse Error (-32700): rmcp 2.2 ignores syntactically invalid JSON without
+  replying. The line cap, drain and next-request recovery are unchanged.
+
 ## [0.12.0] - 2026-10-11
 
 ### Documentation

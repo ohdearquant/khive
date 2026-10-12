@@ -28,6 +28,33 @@ pub(crate) use super::params::{
     UpdateParams, WhoamiParams, WithdrawParams, HARD_CAP,
 };
 
+pub(super) struct DoublingWindowIter {
+    next: Option<u32>,
+    cap: u32,
+}
+
+impl DoublingWindowIter {
+    pub(super) fn new(first: u32, cap: u32) -> Self {
+        Self {
+            next: Some(first.min(cap)),
+            cap,
+        }
+    }
+
+    pub(super) fn advance(&mut self, current: u32, minimum: u32, double: bool) {
+        let doubled = if double { current.saturating_mul(2) } else { 0 };
+        self.next = Some(minimum.max(doubled).clamp(1, self.cap));
+    }
+}
+
+impl Iterator for DoublingWindowIter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next.take()
+    }
+}
+
 // ---- Kind canonicalization ----
 
 pub(crate) fn validate_graph_read_kind(
@@ -610,21 +637,7 @@ pub async fn resolve_uuid_unfiltered(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = Uuid::from_str(s) {
-        return Ok(uuid);
-    }
-    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered(s).await {
-            Ok(Some(uuid)) => return Ok(uuid),
-            Ok(None) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "no record matches prefix: {s:?}"
-                )))
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    resolve_name_async(s, runtime, token).await
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, false).await
 }
 
 /// Same as [`resolve_uuid_unfiltered`], but the prefix-resolution branch also matches
@@ -639,11 +652,25 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, true).await
+}
+
+async fn resolve_uuid_unfiltered_with_deleted(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    include_deleted: bool,
+) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered_including_deleted(s).await {
+        let resolved = if include_deleted {
+            runtime.resolve_prefix_unfiltered_including_deleted(s).await
+        } else {
+            runtime.resolve_prefix_unfiltered(s).await
+        };
+        match resolved {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(
