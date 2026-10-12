@@ -53,6 +53,81 @@ fn markdown(title: &str) -> String {
     )
 }
 
+#[tokio::test]
+async fn import_walk_preserves_hidden_files_case_filter_and_nested_provenance() {
+    let f = fixture();
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    for (path, name) in [
+        (".hidden.md", "Hidden"),
+        ("visible.md", "Visible"),
+        ("nested/source.md", "Nested"),
+    ] {
+        std::fs::write(root.path().join(path), markdown(name)).unwrap();
+    }
+    std::fs::write(root.path().join("ignored.MD"), markdown("Ignored")).unwrap();
+    std::fs::write(root.path().join("plain.txt"), "ignored").unwrap();
+    let result = f
+        .dispatch(
+            "knowledge.import",
+            json!({"path": root.path().to_str().unwrap(), "chunk_strategy": "atom"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["files_discovered"], 3);
+    assert_eq!(result["entries_visited"], 6);
+    assert_eq!(result["files_skipped"], 2);
+    assert_eq!(result["imported_atoms"], 3);
+    for (slug, path) in [
+        ("hidden", ".hidden.md"),
+        ("visible", "visible.md"),
+        ("nested--source", "nested/source.md"),
+    ] {
+        let atom = f
+            .dispatch("knowledge.get", json!({"id": slug}))
+            .await
+            .unwrap();
+        assert_eq!(atom["properties"]["source_path"], path);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn import_checks_all_filename_identities_before_reading_the_first_content() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let f = fixture();
+    let root = TempDir::new().unwrap();
+    // This first file would fail content decoding if preparation ran before
+    // the later filename had passed the identity preflight.
+    std::fs::write(root.path().join("a.md"), [0xff]).unwrap();
+    let later = OsString::from_vec(b"b\xff.md".to_vec());
+    std::fs::write(root.path().join(later), markdown("Later")).unwrap();
+    let error = f
+        .dispatch(
+            "knowledge.import",
+            json!({"path": root.path().to_str().unwrap(), "chunk_strategy": "atom"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("import source path is not valid UTF-8"),
+        "{error}"
+    );
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_sections")
+            .await,
+        0
+    );
+}
+
 #[cfg(unix)]
 async fn assert_directory_symlink_root_rejected(trailing_slash: bool) {
     use std::os::unix::fs::symlink;

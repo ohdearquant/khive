@@ -3,10 +3,9 @@
 #[cfg(test)]
 use super::{atom_from_row, Atom};
 use super::{
-    domain_from_row, embed_cosine_scores, estimate_compose_item_tokens, hex_prefix_to_uuid_pattern,
-    is_timeout, row_i64, row_str, sql_err, Domain, EntityFilter, HashMap, HashSet, KhiveRuntime,
-    NamespaceToken, PageRequest, QueryEmbeddingCache, RuntimeError, SqlStatement, SqlValue, Uuid,
-    SERVABLE_SECTION,
+    domain_from_row, embed_cosine_scores, estimate_compose_item_tokens, is_timeout, row_i64,
+    row_str, sql_err, Domain, EntityFilter, HashMap, HashSet, KhiveRuntime, NamespaceToken,
+    PageRequest, QueryEmbeddingCache, RuntimeError, SqlStatement, SqlValue, Uuid, SERVABLE_SECTION,
 };
 
 // ─── compose helpers ──────────────────────────────────────────────────────────
@@ -55,21 +54,46 @@ pub(super) async fn load_domain_by_id_or_slug(
                 && id.len() <= 36
                 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             if is_hex {
-                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
-                let rows = reader
-                    .query_all(SqlStatement {
-                        sql: khive_runtime::sql!("knowledge_compose_domain_prefix").into(),
-                        params: vec![SqlValue::Text(pattern), SqlValue::Text(ns.to_owned())],
-                        label: None,
-                    })
+                drop(reader);
+                let resolved = match runtime
+                    .resolve_prefix_in(
+                        "knowledge_domains",
+                        "id",
+                        khive_runtime::PrefixScope {
+                            namespace: Some(ns),
+                            live_only: true,
+                        },
+                        &id,
+                    )
                     .await
-                    .map_err(|e| sql_err("compose domain by prefix", e))?;
-                if rows.len() > 1 {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "ambiguous domain prefix {id:?} matches multiple domains"
-                    )));
+                {
+                    Ok(id) => id,
+                    Err(RuntimeError::AmbiguousPrefix { .. }) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "ambiguous domain prefix {id:?} matches multiple domains"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(resolved) = resolved {
+                    let mut reader = sql
+                        .reader()
+                        .await
+                        .map_err(|e| sql_err("compose domain reader", e))?;
+                    reader
+                        .query_row(SqlStatement {
+                            sql: khive_runtime::sql!("knowledge_compose_domain_id").into(),
+                            params: vec![
+                                SqlValue::Text(resolved.to_string()),
+                                SqlValue::Text(ns.to_owned()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("compose domain by prefix", e))?
+                } else {
+                    None
                 }
-                rows.into_iter().next()
             } else {
                 None
             }
@@ -116,21 +140,46 @@ pub(super) async fn load_atom_by_id_or_slug(
                 && id.len() <= 36
                 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             if is_hex {
-                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
-                let rows = reader
-                    .query_all(SqlStatement {
-                        sql: khive_runtime::sql!("knowledge_compose_atom_prefix").into(),
-                        params: vec![SqlValue::Text(pattern), SqlValue::Text(ns.to_owned())],
-                        label: None,
-                    })
+                drop(reader);
+                let resolved = match runtime
+                    .resolve_prefix_in(
+                        "knowledge_atoms",
+                        "id",
+                        khive_runtime::PrefixScope {
+                            namespace: Some(ns),
+                            live_only: true,
+                        },
+                        &id,
+                    )
                     .await
-                    .map_err(|e| sql_err("compose atom by prefix", e))?;
-                if rows.len() > 1 {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "ambiguous atom prefix {id:?} matches multiple atoms"
-                    )));
+                {
+                    Ok(id) => id,
+                    Err(RuntimeError::AmbiguousPrefix { .. }) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "ambiguous atom prefix {id:?} matches multiple atoms"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(resolved) = resolved {
+                    let mut reader = sql
+                        .reader()
+                        .await
+                        .map_err(|e| sql_err("compose atom reader", e))?;
+                    reader
+                        .query_row(SqlStatement {
+                            sql: khive_runtime::sql!("knowledge_compose_atom_id").into(),
+                            params: vec![
+                                SqlValue::Text(resolved.to_string()),
+                                SqlValue::Text(ns.to_owned()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("compose atom by prefix", e))?
+                } else {
+                    None
                 }
-                rows.into_iter().next()
             } else {
                 None
             }

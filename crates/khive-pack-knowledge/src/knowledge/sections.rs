@@ -1,7 +1,9 @@
 //! Section handlers: edit, import, challenge, adjudicate; markdown parsing helpers.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+
+use khive_fs::tree_discovery::{walk_tree_reported, ReportedWalkLimits, WalkFailureKind, WalkFile};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -130,6 +132,7 @@ const IMPORT_TRAVERSAL_LIMITS: ImportTraversalLimits = ImportTraversalLimits {
 #[derive(Debug)]
 struct ImportDiscovery {
     files: Vec<PathBuf>,
+    walk_files: Vec<WalkFile>,
     entries_visited: usize,
     files_skipped: usize,
 }
@@ -172,80 +175,53 @@ fn collect_md_files_with_limits(
     root: &Path,
     limits: ImportTraversalLimits,
 ) -> Result<ImportDiscovery, RuntimeError> {
-    let mut directories = VecDeque::from([(root.to_path_buf(), 0usize)]);
-    let mut files = Vec::new();
-    let mut entries_visited = 0usize;
-    let mut files_skipped = 0usize;
-
-    while let Some((directory, depth)) = directories.pop_front() {
-        let read_dir = std::fs::read_dir(&directory)
-            .map_err(|error| traversal_error(&directory, entries_visited, error))?;
-        let mut entries = Vec::new();
-        for entry in read_dir {
-            let entry =
-                entry.map_err(|error| traversal_error(&directory, entries_visited, error))?;
-            let next_entries_visited = entries_visited.saturating_add(1);
-            if next_entries_visited > limits.max_entries {
-                return Err(traversal_limit_error(
-                    "entry",
-                    &entry.path(),
-                    depth,
-                    next_entries_visited,
-                    files.len(),
-                    limits,
-                ));
-            }
-            entries_visited = next_entries_visited;
-            entries.push(entry);
+    let report = walk_tree_reported(
+        root,
+        ReportedWalkLimits {
+            max_depth: limits.max_depth,
+            max_entries: limits.max_entries,
+            max_files: limits.max_files,
+        },
+        |path| path.extension().and_then(|extension| extension.to_str()) == Some("md"),
+    )
+    .map_err(|failure| {
+        let path = if failure.path.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&failure.path)
+        };
+        let progress = failure.progress;
+        let limit = |kind| {
+            traversal_limit_error(
+                kind,
+                &path,
+                failure.depth,
+                progress.entries_visited,
+                progress.files_discovered,
+                limits,
+            )
+        };
+        match failure.kind {
+            WalkFailureKind::Io(error) => traversal_error(&path, progress.entries_visited, error),
+            WalkFailureKind::EntryLimit => limit("entry"),
+            WalkFailureKind::DepthLimit => limit("depth"),
+            WalkFailureKind::FileLimit => limit("markdown file"),
+            WalkFailureKind::EntryChanged => traversal_error(
+                &path,
+                progress.entries_visited,
+                "directory entry changed during admission",
+            ),
         }
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-
-        for entry in entries {
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|error| traversal_error(&path, entries_visited, error))?;
-            if file_type.is_symlink() {
-                files_skipped = files_skipped.saturating_add(1);
-            } else if file_type.is_dir() {
-                let child_depth = depth.saturating_add(1);
-                if child_depth > limits.max_depth {
-                    return Err(traversal_limit_error(
-                        "depth",
-                        &path,
-                        child_depth,
-                        entries_visited,
-                        files.len(),
-                        limits,
-                    ));
-                }
-                directories.push_back((path, child_depth));
-            } else if file_type.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
-            {
-                let files_discovered = files.len().saturating_add(1);
-                if files_discovered > limits.max_files {
-                    return Err(traversal_limit_error(
-                        "markdown file",
-                        &path,
-                        depth,
-                        entries_visited,
-                        files_discovered,
-                        limits,
-                    ));
-                }
-                files.push(path);
-            } else {
-                files_skipped = files_skipped.saturating_add(1);
-            }
-        }
-    }
-
-    files.sort();
+    })?;
     Ok(ImportDiscovery {
-        files,
-        entries_visited,
-        files_skipped,
+        files: report
+            .files
+            .iter()
+            .map(|file| root.join(file.relative_path()))
+            .collect(),
+        walk_files: report.files,
+        entries_visited: report.progress.entries_visited,
+        files_skipped: report.progress.files_skipped,
     })
 }
 
@@ -528,30 +504,40 @@ fn split_import_frontmatter<'a>(
     ))
 }
 
-/// Open `file` for reading without following a symlink at its final
-/// component. Closes the gap between [`collect_md_files_with_limits`]'s
-/// traversal-time `file_type()` check (or the root-file `symlink_metadata`
-/// check in [`import`](super::KnowledgeHandlers::import)) and the later
-/// content read: without `O_NOFOLLOW` an attacker who swaps the path for a
-/// symlink or special file in that window would have their read followed
-/// transparently. The subsequent [`read_import_file`] call `fstat`s this
-/// same handle rather than the path, so the type check and the read
-/// observe the same inode.
-#[cfg(unix)]
-fn open_import_file_handle(file: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(file)
+fn import_open_error(source_path: &str, error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "failed to open import source {source_path:?}: {error}"
+    ))
 }
 
-/// Best-effort fallback where `O_NOFOLLOW` isn't available: the opened
-/// handle is still `fstat`-checked in [`read_import_file`], just without
-/// the open-time symlink refusal.
+fn import_nonregular_error(source_path: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "import source {source_path:?} is not a regular file on the opened handle \
+         (symlink or special-file swap after validation)"
+    ))
+}
+
+#[cfg(unix)]
+fn open_import_file_handle(file: &Path, source_path: &str) -> Result<std::fs::File, RuntimeError> {
+    use khive_fs::opened_file::{open_regular_file_nofollow, ContainedOpenError};
+    open_regular_file_nofollow(file).map_err(|error| match error {
+        ContainedOpenError::Open(error) => import_open_error(source_path, error),
+        ContainedOpenError::Metadata(error) => RuntimeError::InvalidInput(format!(
+            "failed to inspect opened import source {source_path:?}: {error}"
+        )),
+        ContainedOpenError::NotRegular => import_nonregular_error(source_path),
+        ContainedOpenError::Resolve(error) => RuntimeError::InvalidInput(format!(
+            "failed to resolve opened import source {source_path:?}: {error}"
+        )),
+        ContainedOpenError::Escapes { opened } => RuntimeError::InvalidInput(format!(
+            "opened import source {source_path:?} escaped its root: {opened:?}"
+        )),
+    })
+}
+
 #[cfg(not(unix))]
-fn open_import_file_handle(file: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().read(true).open(file)
+fn open_import_file_handle(file: &Path, source_path: &str) -> Result<std::fs::File, RuntimeError> {
+    std::fs::File::open(file).map_err(|error| import_open_error(source_path, error))
 }
 
 /// Read one import source through an opened, `fstat`-checked handle and
@@ -564,23 +550,26 @@ fn read_import_file(
     source_path: &str,
     total_bytes: &mut u64,
 ) -> Result<String, RuntimeError> {
-    use std::io::Read;
+    read_opened_import_file(
+        open_import_file_handle(file, source_path)?,
+        source_path,
+        total_bytes,
+    )
+}
 
-    let mut handle = open_import_file_handle(file).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "failed to open import source {source_path:?}: {error}"
-        ))
-    })?;
+fn read_opened_import_file(
+    mut handle: std::fs::File,
+    source_path: &str,
+    total_bytes: &mut u64,
+) -> Result<String, RuntimeError> {
+    use std::io::Read;
     let metadata = handle.metadata().map_err(|error| {
         RuntimeError::InvalidInput(format!(
             "failed to inspect opened import source {source_path:?}: {error}"
         ))
     })?;
     if !metadata.is_file() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "import source {source_path:?} is not a regular file on the opened handle \
-             (symlink or special-file swap after validation)"
-        )));
+        return Err(import_nonregular_error(source_path));
     }
     if metadata.len() > MAX_IMPORT_FILE_BYTES {
         return Err(RuntimeError::InvalidInput(format!(
@@ -620,13 +609,28 @@ fn read_import_file(
     })
 }
 
+enum ImportReadSource<'a> {
+    RootFile(&'a Path),
+    Discovered(&'a WalkFile),
+}
+
 fn prepare_import_file(
-    file: &Path,
+    source: ImportReadSource<'_>,
     identity: ImportSourceIdentity,
     chunk_strategy: &str,
     total_bytes: &mut u64,
 ) -> Result<PreparedImportFile, RuntimeError> {
-    let content = read_import_file(file, &identity.source_path, total_bytes)?;
+    let content = match source {
+        ImportReadSource::RootFile(file) => {
+            read_import_file(file, &identity.source_path, total_bytes)?
+        }
+        ImportReadSource::Discovered(file) => {
+            let handle = file
+                .open_read()
+                .map_err(|error| import_open_error(&identity.source_path, error))?;
+            read_opened_import_file(handle, &identity.source_path, total_bytes)?
+        }
+    };
     let (frontmatter, markdown_body) = split_import_frontmatter(&content, &identity.source_path)?;
     let (atom_name, atom_body, parsed_sections) = parse_atlas_md(markdown_body);
     let canonical_id = frontmatter.canonical_id;
@@ -1252,6 +1256,7 @@ impl KnowledgeHandlers {
             }
             ImportDiscovery {
                 files: vec![md_path.to_path_buf()],
+                walk_files: Vec::new(),
                 entries_visited: 1,
                 files_skipped: 0,
             }
@@ -1271,14 +1276,20 @@ impl KnowledgeHandlers {
 
         let mut prepared_files = Vec::with_capacity(identities.len());
         let mut total_bytes = 0u64;
-        for (file, identity) in identities {
+        for (index, (file, identity)) in identities.into_iter().enumerate() {
+            let source = if root_is_file {
+                ImportReadSource::RootFile(&file)
+            } else {
+                ImportReadSource::Discovered(&discovery.walk_files[index])
+            };
             prepared_files.push(prepare_import_file(
-                &file,
+                source,
                 identity,
                 &chunk_strategy,
                 &mut total_bytes,
             )?);
         }
+        drop(discovery.walk_files);
 
         // Canonical frontmatter identity takes precedence over the path fallback,
         // so collision validation must run after every file has been parsed.
@@ -1767,6 +1778,10 @@ mod import_traversal_tests {
         assert_eq!(discovery.files_skipped, 1);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "import_fs_tests.rs"]
+mod import_fs_tests;
 
 #[cfg(test)]
 mod import_read_tests {
