@@ -152,7 +152,12 @@ pub(super) fn resolve_prefix_statement(
         let placeholders: Vec<String> = (0..namespaces.len())
             .map(|index| format!("?{}", index + 3))
             .collect();
-        format!(" AND namespace IN ({})", placeholders.join(", "))
+        // The unary `+` keeps the namespace predicate as a row filter but out of
+        // index selection: SQLite will not use `idx_*_namespace` for it, so the
+        // plan seeks the primary-key range instead of scanning every row of the
+        // caller's namespaces. khive-db does not run `ANALYZE`, so the planner
+        // has no statistics showing that a namespace is usually not selective.
+        format!(" AND +namespace IN ({})", placeholders.join(", "))
     });
     let deleted_filter = if has_deleted_at && !include_deleted {
         " AND deleted_at IS NULL"
