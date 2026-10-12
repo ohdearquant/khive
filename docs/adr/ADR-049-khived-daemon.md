@@ -1690,3 +1690,112 @@ is harmless: the next boot recreates it.
 The HOME boot/recovery lock still serializes startup and client recovery for
 one rendezvous. This amendment adds a separate store claim; it does not
 replace that lock or extend daemon ownership to non-daemon writers.
+
+## Amendment 14 (2026-10-12): a forwarding client opens no store until it serves locally
+
+**Status**: Proposed.
+
+### Context
+
+A stdio host that forwards to the daemon (Decision §2) builds the same store-backed registry the
+daemon builds, before it reads its first request: it opens every configured SQLite backend, applies
+migrations and pack schema plans, and runs the boot repairs. Every pooled connection maps its store
+(a 1 GiB memory-map window by default) and carries its own page cache. The client then forwards
+every request, so on a host with a running daemon that work serves nothing. Measured before the
+legacy quarantine repair was skipped in forwarding clients, a client start took about 8 seconds
+and pulled the comm and main stores through the page cache; the repair skip removes the scan, not
+the opens, migrations and maps.
+
+A forwarding client serves a request itself in exactly these cases today
+(`crates/khive-mcp/src/server/bridge.rs`, `request_with_forward`):
+
+- the request carries `save_to`, which the daemon frame cannot carry, so it is always local;
+- the main backend is in memory, so no daemon can own it;
+- forwarding returned no response and Amendment 2's policy admitted local dispatch: a `no_socket`
+  outcome outside strict mode.
+
+`bridge.diagnostics` (Amendment 12) and request planning read process memory and the pack verb
+catalog, not a store.
+
+Separately, two client outcomes that mean "the daemon is alive but did not answer in time" carry no
+stable reason today. The boot-fence identity probe that times out after cold-boot quiescence
+returns a prose-only error. A response read that times out after the frame was fully written is
+classified internally as a parse failure (`crates/khive-mcp/src/daemon/forward.rs`) and returns the
+same error as a dropped connection ("daemon response lost after request was sent"). A caller cannot
+tell a slow daemon from a dead one, or count either.
+
+### Decision
+
+**1. Lazy store-backed registry.** A forwarding client (Unix, not `--daemon`, `KHIVE_NO_DAEMON`
+unset) whose main backend is file-backed opens no SQLite backend at boot. Boot builds the pack
+registry, verb catalog and tool description from pack metadata, and the bridge state. The
+store-backed registry (backend opens, migrations, pack schema plans, boot repairs) is built once,
+on the first request the client serves locally under the cases listed above, and reused after
+that. Concurrent first requests share one build. A build failure fails that request with the
+build error and is retried by the next local request; it never becomes a fallback to anything
+else. A daemon, a `KHIVE_NO_DAEMON` host and an in-memory client keep the eager build.
+
+**2. Strict by default when a rendezvous is present.** `KHIVE_DAEMON_STRICT` becomes a tri-state:
+a truthy value is strict, an explicit false value (`0`, `false`, `no`, `off`) is not strict, and
+unset means strict exactly when a daemon rendezvous is present at the fallback decision. A
+rendezvous is present when the client's resolved socket path or PID file
+(`khive_runtime::daemon::socket_path`, `pid_path`) exists on disk. Under strict mode a request
+that would fall back is rejected with its reason code, as Amendment 2 already specifies for
+`KHIVE_DAEMON_STRICT=1`. With no rendezvous on disk, the quiet `no_socket` fallback of
+Amendment 2 is unchanged. The sanctioned way to run without a daemon stays `KHIVE_NO_DAEMON=1`.
+
+**3. A named slow-daemon reason.** Both "alive but not in time" outcomes carry
+`reason: "daemon_slow"` in the error data, with a `phase` field and the elapsed wait in
+milliseconds:
+
+- `phase: "before_dispatch"`: the boot-fence identity probe timed out. Nothing was written;
+  `domain_disposition` is `not_committed`, and a retry is safe.
+- `phase: "after_write"`: the response read timed out after the frame was fully written. The
+  request may have been applied; `domain_disposition` is `unknown`. The no-retry rule of
+  Amendment 3 is unchanged: a caller settles by reading state before any re-send.
+
+The other post-write outcomes keep the existing error and gain a reason: a connection closed,
+reset, aborted or broken after the write carries `reason: "daemon_connection_lost"`, and any other
+read error or an undecodable response carries `reason: "parse_failure"`. The three post-write
+outcomes become distinguishable, and all three stay terminal.
+`daemon_slow` is a refusal, not a fallback: it never enters the Amendment 2 fallback set and is
+not counted in `fallback_total`. `bridge.diagnostics` (Amendment 12) gains one field,
+`daemon_slow`, an object with `before_dispatch` and `after_write` counts for this bridge process;
+every existing field keeps its meaning.
+
+### Acceptance
+
+1. A forwarding client booted on a file-backed configuration whose store files do not exist
+   creates none of them, and answers a tool listing and a planning request without creating them.
+   The probe on the built binary reads physical footprint and boot time, not RSS.
+2. The first `save_to` request builds the registry once, including under concurrent first
+   requests; a second local request reuses it.
+3. With a socket file present but refusing, a request is rejected with `no_socket` when
+   `KHIVE_DAEMON_STRICT` is unset, falls back when it is `0`, and falls back quietly when neither
+   socket nor PID file exists.
+4. A boot-fence probe timeout returns `daemon_slow` with `phase: "before_dispatch"` and
+   `not_committed`; a post-write read timeout returns `daemon_slow` with `phase: "after_write"`
+   and `unknown`; a post-write connection reset returns `daemon_connection_lost`.
+5. `bridge.diagnostics` reports the two `daemon_slow` counts, and `fallback_total` is unchanged by
+   them.
+
+Each acceptance item names a test whose mutation (eager build restored, strict default removed,
+reason dropped) turns it red.
+
+### Alternatives considered
+
+- **Strict for every forwarding client, unconditionally.** Simpler, but a client that has never
+  had a daemon on the host, with spawning unavailable, would refuse instead of serving. The
+  rendezvous predicate keeps that case on Amendment 2's quiet fallback.
+- **Keep the eager build with smaller maps and caches in clients.** Lowers the resident numbers
+  but still opens every store, runs migrations and schema plans, and races the daemon's boot on
+  each client start.
+- **Forward `save_to` requests and write the sink in the client.** Removes the most common local
+  case, but changes the daemon frame; it is compatible with this amendment and left to its own
+  change.
+
+### Out of scope
+
+Daemon and client timeouts keep their current values; this amendment names outcomes, it does not
+tune them. Daemon ownership of stores (Amendment 13) and the reconnect rules (Amendments 9 and 10)
+are unchanged.
