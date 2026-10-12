@@ -4,7 +4,7 @@
 **Date**: 2026-08-11\
 **Authors**: khive maintainers\
 **Tracking**: Refs #1844 (first slice, PR #3423); #3551 (remaining ADR contract)\
-**Implementation**: partial; PR #3423 shipped a local floor and SQLITE_FULL escalation. See Amendment 1 for remaining obligations.
+**Implementation**: partial; PR #3423 shipped a local floor and SQLITE_FULL escalation. See Amendment 1 for remaining obligations. Amendment 2 (proposed) separates lease contention from lease refusal.
 
 ## Context
 
@@ -72,6 +72,31 @@ ADR-154 was accepted as a target contract before the disk-floor code landed. PR 
 The existing `crates/khive-db/docs/api/pool.md` documents the **shipped** first slice. The `writer-task.md` section headed “Proposed disk-reserve admission” describes the **target**, not current behavior; its #1844/not-implemented label needs updating so it does not imply that no disk-floor code exists. Neither source document should imply that the first slice conforms to all of ADR-154.
 
 The accepted behavior in §§2–7 and the Acceptance section remains normative. In particular, this amendment does not accept pre-`BEGIN` sampling or a floor-refused caller checkpoint as the final contract. Full implementation requires the acceptance controls already listed in this ADR, including the cross-process lease, post-`BEGIN` refusal, bootstrap, and bypass cases. A dedicated open implementation issue must carry the remaining obligations before #3523 is closed; the closed #1844 alone is not a live tracking reference.
+
+#### Amendment 2 — Lease contention is admission pressure, not a probe failure (2026-10-12)
+
+Status: Proposed (2026-10-12).
+
+**Trigger.** On a loaded host a write that holds the volume lease runs slowly, so every other writer on the volume waits out `disk_guard_deadline_ms` and receives `sqlite_capacity_unavailable` with `phase=lock`. §6 treats that outcome like a failed probe: it fails closed and is never retried automatically. Measured on one daemon over four hours at load averages between 20 and 38: 328 lease timeouts, 234 of them in audit-row generations. The events store reports the error as non-retryable, so each such generation ends `StoreFailure`, and ADR-133 folds that into the dispatch: 314 dispatches failed, 209 of them reads that wrote nothing (`comm.inbox`, `comm.health`, `gtd.tasks`, `get`, `comm.thread`), all on the admission-degrade list that exists for this kind of pressure.
+
+**Decision.**
+
+1. The lock phase splits in two. `lock` keeps its meaning for a lease that could not be attempted or was refused outright: no lock directory, an unopenable lock file, a lock error, same-thread re-entry. A new phase, `lock_contended`, names the one case where the guard deadline elapsed while another holder had the lease, in this process or another. Both remain `sqlite_capacity_unavailable`.
+2. `lock_contended` is transient. `StorageError::is_retryable()` reports it as retryable, and the events store carries that across its socket. Floor refusal and the `identity`, `probe` and `lock` outcomes keep §6's no-automatic-retry rule. Every retry stays bounded by its caller's own budget (for audit generations, `max_commit_attempts` and its backoff), and `disk_guard_deadline_ms` still bounds each attempt.
+3. For ADR-133: an audit generation that meets `lock_contended` on every attempt ends `RetryExhausted`, not `StoreFailure`. For a successful dispatch of an admission-degrade-safe verb, `RetryExhausted` degrades the way `QueueAdmissionExhausted` does: the read returns its result, and the lost row is counted on its own counter beside `audit_admission_refused_obligations`. Writes, denials, unknown verbs and `git.digest` receipts stay strictly obligation-bearing.
+4. Unchanged: the 2,000 ms default and its [100, 10,000] range, the lock order of §3, the floor sample after the lease is taken, and the boundary in §7.
+
+**Why this does not weaken the guard.** §6 forbids automatic retry because a retry cannot create disk space. Contention is not a space condition: the holder releases the lease when its transaction settles, and the floor is still sampled after a retried attempt takes the lease, so a retried write is admitted only if the reserve allows it.
+
+**Effects on other callers.** Every caller of `is_retryable()` sees the new retryable case. The implementation lists each caller and states the bound it retries under; a caller with no bound does not get the new case.
+
+**Acceptance.**
+
+- A lease held by another thread past the deadline yields `phase=lock_contended`; a missing lock directory, a lock error and same-thread re-entry yield `phase=lock`. MUST-FAIL control: folding both into one phase.
+- `is_retryable()` is true for `lock_contended` and false for every other capacity outcome.
+- An audit generation whose store returns `lock_contended` on every attempt resolves `RetryExhausted`. MUST-FAIL control: today's classification, which yields `StoreFailure`.
+- A degrade-safe read returns its result when its audit row ends `RetryExhausted`; a write verb's dispatch still fails on the same reason.
+- Through the events-daemon socket the outcome keeps both its phase and its retryability.
 
 ### 2. Reserve configuration and daemon coherence
 
