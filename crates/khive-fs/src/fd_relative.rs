@@ -404,39 +404,141 @@ pub(crate) fn list_names_raw_bounded(
 }
 
 fn read_names(directory: &File, max: Option<usize>) -> Result<Vec<OsString>, ListNamesError> {
-    let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
+    read_names_detailed(directory, max).map_err(|error| match error.kind {
+        DetailedListErrorKind::Io(source) => ListNamesError::Io(source),
+        DetailedListErrorKind::LimitExceeded { max, .. } => ListNamesError::LimitExceeded { max },
+    })
+}
+
+/// Private progress needed by reported discovery, without changing the old listing errors.
+#[derive(Debug)]
+pub(crate) struct DetailedListError {
+    pub(crate) observed: usize,
+    pub(crate) kind: DetailedListErrorKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum DetailedListErrorKind {
+    Io(io::Error),
+    LimitExceeded { max: usize, excess: OsString },
+}
+
+pub(crate) fn read_names_detailed(
+    directory: &File,
+    max: Option<usize>,
+) -> Result<Vec<OsString>, DetailedListError> {
+    let setup_error = |source| DetailedListError {
+        observed: 0,
+        kind: DetailedListErrorKind::Io(source),
+    };
+    let fd = open_at(directory, OsStr::new("."), true)
+        .map_err(setup_error)?
+        .into_raw_fd();
     // SAFETY: `fd` is uniquely owned and `fdopendir` takes ownership of it on success.
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
         // SAFETY: `fdopendir` failed, so ownership of `fd` remains here.
         unsafe { libc::close(fd) };
-        return Err(error.into());
+        return Err(setup_error(error));
     }
     let stream = DirStream(stream);
+    collect_names_detailed(
+        || {
+            clear_errno();
+            // SAFETY: `stream` holds a live `DIR*` until collection returns.
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() != Some(0) {
+                    Err(error)
+                } else {
+                    Ok(None)
+                };
+            }
+            // SAFETY: `d_name` is NUL-terminated and copied before the next readdir.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            Ok(Some(OsString::from_vec(name.to_vec())))
+        },
+        max,
+    )
+}
+
+// Keep accounting on the production collection path. A supplied next observation also
+// lets tests deterministically cover a read error after progress, without a second reader.
+fn collect_names_detailed(
+    mut next: impl FnMut() -> io::Result<Option<OsString>>,
+    max: Option<usize>,
+) -> Result<Vec<OsString>, DetailedListError> {
     let mut result = Vec::new();
-    loop {
-        clear_errno();
-        // SAFETY: `stream` holds a live `DIR*` until this function returns.
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(0) {
-                return Err(error.into());
-            }
-            break;
+    while let Some(name) = next().map_err(|source| DetailedListError {
+        observed: result.len(),
+        kind: DetailedListErrorKind::Io(source),
+    })? {
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
         }
-        // SAFETY: `d_name` is NUL-terminated and is copied out before the next `readdir`.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            if let Some(max) = max {
-                if result.len() == max {
-                    return Err(ListNamesError::LimitExceeded { max });
-                }
+        if let Some(max) = max {
+            if result.len() == max {
+                return Err(DetailedListError {
+                    observed: result.len().saturating_add(1),
+                    kind: DetailedListErrorKind::LimitExceeded { max, excess: name },
+                });
             }
-            result.push(OsString::from_vec(name.to_vec()));
         }
+        result.push(name);
     }
     result.sort();
     Ok(result)
+}
+
+#[cfg(test)]
+mod detailed_listing_tests {
+    use super::*;
+
+    #[test]
+    fn partial_native_error_retains_raw_progress_and_stops_reading() {
+        let mut observations = [
+            Ok(OsString::from(".")),
+            Ok(OsString::from(".hidden")),
+            Ok(OsString::from_vec(b"raw-\xff".to_vec())),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            Ok(OsString::from("must-not-read")),
+        ]
+        .into_iter();
+        let error = collect_names_detailed(|| observations.next().transpose(), None).unwrap_err();
+        assert_eq!(error.observed, 2);
+        let DetailedListErrorKind::Io(source) = error.kind else {
+            panic!("partial native read failure must remain an I/O error");
+        };
+        assert_eq!(source.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            observations.next().unwrap().unwrap(),
+            OsStr::new("must-not-read")
+        );
+    }
+
+    #[test]
+    fn excess_witness_is_the_native_observation_and_stops_before_sorting() {
+        let mut observations = ["z", "a", "b", "must-not-read"].into_iter();
+        let error = collect_names_detailed(|| Ok(observations.next().map(OsString::from)), Some(2))
+            .unwrap_err();
+        assert_eq!(error.observed, 3);
+        assert!(
+            matches!(error.kind, DetailedListErrorKind::LimitExceeded { max: 2, excess }
+            if excess == OsStr::new("b"))
+        );
+        assert_eq!(observations.next(), Some("must-not-read"));
+    }
+
+    #[test]
+    fn exact_cap_sorts_only_a_complete_listing_and_dot_names_do_not_count() {
+        let mut observations = ["z", ".", "..", "a"].into_iter();
+        let names = collect_names_detailed(|| Ok(observations.next().map(OsString::from)), Some(2))
+            .unwrap();
+        assert_eq!(names, [OsString::from("a"), OsString::from("z")]);
+        assert!(collect_names_detailed(|| Ok(None), Some(0))
+            .unwrap()
+            .is_empty());
+    }
 }
