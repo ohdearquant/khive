@@ -272,7 +272,7 @@ impl SqliteVecStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -373,23 +373,26 @@ impl SqliteVecStore {
             let model_for_write = embedding_model.clone();
             let embedding_for_write = embedding.clone();
             return writer_task
-                .send_bounded(move |connection| {
-                    vec_upsert_atomic_dml(
-                        connection,
-                        &table_for_write,
-                        dims,
-                        subject_id,
-                        &kind_for_write,
-                        &namespace_for_write,
-                        &field_for_write,
-                        &model_for_write,
-                        &embedding_for_write,
-                        savepoint_name,
-                        record_ann_delta,
-                        failpoint_flag,
-                    )
-                    .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |connection| {
+                        vec_upsert_atomic_dml(
+                            connection,
+                            &table_for_write,
+                            dims,
+                            subject_id,
+                            &kind_for_write,
+                            &namespace_for_write,
+                            &field_for_write,
+                            &model_for_write,
+                            &embedding_for_write,
+                            savepoint_name,
+                            record_ann_delta,
+                            failpoint_flag,
+                        )
+                        .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
