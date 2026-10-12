@@ -96,7 +96,7 @@ Status: Proposed (2026-10-12).
 - `is_retryable()` is true for `lock_contended` and false for every other capacity outcome.
 - An audit generation whose store returns `lock_contended` on every attempt resolves `RetryExhausted`. MUST-FAIL control: today's classification, which yields `StoreFailure`.
 - A degrade-safe read returns its result when its audit row ends `RetryExhausted`; a write verb's dispatch still fails on the same reason.
-- Through the events-daemon socket the outcome keeps both its phase and its retryability.
+- Through the events-daemon socket the outcome stays retryable and its message names the phase; the socket protocol does not change.
 
 ### 2. Reserve configuration and daemon coherence
 
