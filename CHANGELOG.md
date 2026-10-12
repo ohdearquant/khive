@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An oversized stdio line now receives Invalid Request (-32600, no id) instead of
   Parse Error (-32700): rmcp 2.2 ignores syntactically invalid JSON without
   replying. The line cap, drain and next-request recovery are unchanged.
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
 
 ### Fixed
 

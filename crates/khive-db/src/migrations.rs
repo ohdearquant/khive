@@ -411,6 +411,7 @@ const MEMORY_VISIBILITY_CUTOVER_VERSION: u32 = 54;
 const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
 
 const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
+const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -766,6 +767,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 55,
         name: "knowledge_atom_cursor_all_live_tags",
         up: V55_UP,
+    },
+    VersionedMigration {
+        version: 56,
+        name: "atom_weight_tables",
+        up: V56_UP,
     },
 ];
 

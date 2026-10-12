@@ -226,6 +226,8 @@ fn filter_atoms_by_namespace(
 // TODO(port-engine): replay, diff, regression_check, load_brain_event, and
 // jaccard_stability_7d require EmbeddedEngine which is not yet ported to
 // khive-retrieval scope. Gated behind "engine" feature until ported.
+// The port must supply the shared SqlAccess handle to batch_load_weights; the
+// restored raw engine connection is not a routed storage capability.
 #[cfg(feature = "engine")]
 /// When `weight_override` is `Some(map)`, each atom's raw similarity score is
 /// multiplied by the weight from the map (absent atoms default to 1.0).  When
