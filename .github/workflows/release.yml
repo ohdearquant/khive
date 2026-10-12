@@ -11,7 +11,9 @@ name: Release
 #
 # Builds Rust binaries per-platform, publishes each khive-kernel-{platform}
 # npm subpackage, publishes the umbrella khive package, then publishes its
-# exact-version @khive-ai/cli compatibility alias.
+# exact-version @khive-ai/cli compatibility alias. The same binaries are packaged
+# as platform wheels of the khive Python package and published to PyPI
+# (ADR-026 Amendment 5).
 #
 # Per ADR-026 §"Atomic release semantics": all subpackage publishes must
 # succeed before the umbrella publishes. This is enforced by separating the
@@ -39,6 +41,11 @@ on:
         description: "Version to release (without v prefix, e.g. 0.2.4)"
         required: true
         type: string
+      dry_run:
+        description: "Build and check every artifact, publish nothing"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -66,10 +73,13 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
 
+          # Built with zig, like linux-arm64, so the binary links against an
+          # older glibc than the runner's; a native build on ubuntu-latest
+          # requires the runner's glibc and fails to start on older systems.
           - platform: linux-x64-gnu
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cross: false
+            cross: true
 
           - platform: linux-x64-musl
             os: ubuntu-latest
@@ -113,9 +123,18 @@ jobs:
         # the typedefs via CFLAGS so the C build succeeds under zig+musl.
         env:
           CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+          CFLAGS_x86_64_unknown_linux_gnu: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
           CFLAGS_aarch64_unknown_linux_gnu: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} -p kkernel
+
+      # The npm package and the PyPI wheel ship this binary to any Linux with
+      # the glibc it requires. Refuse a build whose glibc floor is newer than the
+      # ceiling in scripts/python-wheels.py, or that links a library outside
+      # the manylinux set.
+      - name: Check the glibc floor (Linux gnu)
+        if: ${{ endsWith(matrix.target, '-linux-gnu') }}
+        run: python3 scripts/python-wheels.py check-glibc "crates/target/${{ matrix.target }}/release/kkernel"
 
       - name: Stage binaries into subpackage bin/
         shell: bash
@@ -189,6 +208,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   publish-all:
     needs: [build-platform, semver-gate]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     # ADR-066 release gate: in the autonomous-merge model the human approval
     # moves from per-PR to per-release. This job publishes to npm through the
@@ -358,3 +378,83 @@ jobs:
       - name: Publish @khive-ai/cli (compatibility alias)
         working-directory: npm/cli-alias
         run: npm publish --access public
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 2b: PyPI. Packages the same six binaries as platform wheels of the
+  # khive Python package (python/), beside a pure wheel for platforms without a
+  # binary, and publishes them through PyPI trusted publishing: the khive
+  # project on pypi.org lists this repository, release.yml and the `publish`
+  # environment as a trusted publisher, and the upload authenticates with a
+  # short-lived OIDC token issued to this job. Independent of the npm job, so
+  # either registry's refusal leaves the other's publish intact.
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-pypi:
+    needs: [build-platform, semver-gate]
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Guard - dispatch version must match the Python package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          CARGO_VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/version = |"/,""); print; exit}' crates/Cargo.toml)
+          PY_VERSION=$(awk '/^\[project\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/version = |"/,""); print; exit}' python/pyproject.toml)
+          PY_MODULE_VERSION=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/khive/__init__.py)
+          echo "inputs.version=${VERSION} crates/Cargo.toml=${CARGO_VERSION} python/pyproject.toml=${PY_VERSION} khive.__version__=${PY_MODULE_VERSION}"
+          for found in "$CARGO_VERSION" "$PY_VERSION" "$PY_MODULE_VERSION"; do
+            if [ "$VERSION" != "$found" ]; then
+              echo "::error::Dispatch version ${VERSION} does not match a checked-in version (${found})"
+              exit 1
+            fi
+          done
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: kernel-*
+
+      - name: Build the pure wheel
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/pure" python/
+
+      - name: Build the platform wheels
+        run: |
+          python3 scripts/python-wheels.py build \
+            --pure-wheel "$RUNNER_TEMP/pure/khive-${{ inputs.version }}-py3-none-any.whl" \
+            --artifacts artifacts \
+            --out dist
+          ls -l dist
+
+      # Install the wheel this runner selects into a fresh environment and run
+      # the installed binary: proves the binary lands on the environment's PATH
+      # with its executable bit, and that client and binary carry one version.
+      - name: Install and run the wheel
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" --find-links dist "khive==${VERSION}"
+          "$RUNNER_TEMP/smoke/bin/kkernel" --version | tee "$RUNNER_TEMP/kkernel-version.txt"
+          grep -q "^kkernel ${VERSION} " "$RUNNER_TEMP/kkernel-version.txt"
+          "$RUNNER_TEMP/smoke/bin/python" - "$VERSION" <<'PY'
+          import pathlib, sys
+          import khive
+          found = khive.find_kkernel()
+          print(f"khive {khive.__version__}, kkernel at {found}")
+          assert khive.__version__ == sys.argv[1], khive.__version__
+          assert found.parent.parent == pathlib.Path(sys.prefix), found
+          PY
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/

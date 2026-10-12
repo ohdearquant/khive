@@ -1,6 +1,6 @@
 # HTTP and MCP clients
 
-Install `khive-py[cloud]` for HTTP and MCP support.
+Install `khive[cloud]` for HTTP and MCP support.
 
 `khive.HttpTransport` is synchronous and implements the `Transport` interface
 (`round_trip(frame, timeout)`). Pass it to `khive.Khive`, or use `khive.cloud()`.

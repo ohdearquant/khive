@@ -445,3 +445,49 @@ executable payload at all.
 
 Nothing in this amendment authorizes implementation, and none of ADR-026's original
 performance figures were re-measured for it.
+
+## Amendment 5 (2026-10-12): Python wheels on PyPI
+
+**Status**: proposed
+
+The Python client in `python/` is published to PyPI as `khive`, and the same per-platform
+`kkernel` binaries the npm subpackages carry ship inside its wheels. A Python user installs
+the client and a matching binary with `pip install khive`, with no Rust or Node toolchain.
+
+Layout. One wheel per release platform, plus one pure `py3-none-any` wheel. Each platform
+wheel is the pure wheel with the platform's binary added under the wheel's scripts
+directory, so installers place `kkernel` (`kkernel.exe` on Windows) in the environment's
+`bin/` (`Scripts\` on Windows) beside the interpreter. Installers prefer a matching
+platform wheel; the pure wheel serves platforms without a binary and clients that only
+reach a remote deployment. The database stays under `~/.khive`, shared by every
+environment, as it is for the npm and cargo installs. `khive.find_kkernel()` resolves the
+binary in the order `KKERNEL`, the environment's scripts directories, then `PATH`.
+
+Platform tags are read from each binary, never from a table:
+`scripts/python-wheels.py` reads the minimum macOS version from the Mach-O load commands
+and the glibc floor and shared-library list from the ELF dynamic section. The static musl
+build is tagged `musllinux_1_2_x86_64`.
+
+glibc floor. The `x86_64-unknown-linux-gnu` build moves from a native build on the
+runner to a zig build, the way `aarch64-unknown-linux-gnu` was already built. A native
+build requires the runner's glibc (2.39 on the current image), which Ubuntu 22.04,
+Debian 12 and RHEL 9 do not have; the npm launcher selects that binary on every glibc
+system, so it failed to start there. Every Linux gnu build now runs
+`python-wheels.py check-glibc`, which fails the release when the binary requires a glibc
+newer than 2.31 or links a library outside the manylinux set. The npm subpackage and the
+wheel ship the same checked binary.
+
+Versions. The Python package version equals the workspace version, like the npm packages;
+a contract test holds them equal, and the release refuses a dispatch version that differs
+from `python/pyproject.toml` or `khive.__version__`.
+
+Release. A `publish-pypi` job in `release.yml` builds the wheels from the build-platform
+artifacts, installs the wheel the runner selects into a fresh environment, runs the
+installed `kkernel --version`, and uploads through PyPI trusted publishing (the `khive`
+project lists this repository, `release.yml` and the `publish` environment). It depends on
+the builds and the SemVer gate only, not on the npm job, so one registry's refusal leaves
+the other's publish intact. A `dry_run` input builds and checks every artifact, including
+the wheel install, without publishing to either registry.
+
+Out of scope. A smaller binary with fewer packs compiled in, and starting the daemon from
+Python; both are separate decisions.

@@ -1,7 +1,7 @@
 [project]
-name = "khive-py"
-version = "0.2.0"
-description = "Python client for the khive knowledge-graph database (khived daemon) and khive-cloud"
+name = "khive"
+version = "0.12.0"
+description = "Python client for the khive knowledge-graph runtime, with the kkernel binary bundled on supported platforms"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
