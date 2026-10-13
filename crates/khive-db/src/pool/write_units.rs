@@ -105,11 +105,11 @@ impl WriteAdmission {
         let current = self.current_volume_override.lock().clone();
         #[cfg(not(test))]
         let current: Option<VolumeIdentity> = None;
-        let current = match current {
-            Some(identity) => identity,
-            None => VolumeIdentity::resolve(path)?,
+        let unchanged = match current {
+            Some(identity) => &identity == expected,
+            None => expected.still_identifies(path)?,
         };
-        if &current != expected {
+        if !unchanged {
             return Err(SqliteError::CapacityUnavailable {
                 phase: CapacityUnavailablePhase::Identity,
                 message: "database volume changed after admission identity was captured"

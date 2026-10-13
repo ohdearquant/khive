@@ -48,8 +48,21 @@ impl Hash for VolumeIdentity {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESOLVES_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`VolumeIdentity::resolve`] has run on the calling thread.
+#[cfg(test)]
+pub(crate) fn resolves_on_this_thread() -> usize {
+    RESOLVES_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 impl VolumeIdentity {
     pub(crate) fn resolve(db_path: &Path) -> Result<Self, SqliteError> {
+        #[cfg(test)]
+        RESOLVES_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
         let probe_path = nearest_existing_canonical_ancestor(db_path)
             .map_err(|error| identity_error(format!("cannot resolve database volume: {error}")))?;
         let (key, volume_root) = volume_key(&probe_path)
@@ -63,6 +76,28 @@ impl VolumeIdentity {
             probe_path,
             volume_root,
         })
+    }
+
+    /// Whether `db_path` is still on this volume, answered as
+    /// `VolumeIdentity::resolve(db_path)? == *self` would answer it.
+    ///
+    /// Equality reads only the volume key. On Unix the key of a path that
+    /// exists is the device id one `stat` returns, and `stat` follows symlinks
+    /// as canonicalization does. `resolve` also canonicalizes the path and
+    /// stats every ancestor to find the volume root, which this comparison
+    /// never reads, and the write path asks it several times per write unit.
+    /// A path that cannot be stat'ed, such as a database file not created yet
+    /// or a dangling symlink, takes the full `resolve`, so those cases and
+    /// every error keep their existing outcome.
+    pub(crate) fn still_identifies(&self, db_path: &Path) -> Result<bool, SqliteError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(metadata) = fs::metadata(db_path) {
+                return Ok(VolumeKey::UnixDevice(metadata.dev()) == self.key);
+            }
+        }
+        Ok(Self::resolve(db_path)? == *self)
     }
 
     pub(crate) fn diagnostic_key(&self) -> String {
@@ -902,6 +937,54 @@ mod tests {
         let aliased = VolumeIdentity::resolve(&source.join("alias.db")).unwrap();
         let direct = VolumeIdentity::resolve(&target.join("new.db")).unwrap();
         assert_eq!(aliased.probe_path(), direct.probe_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn still_identifies_answers_as_a_fresh_resolve_and_resolves_only_unstatable_paths() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let database = fixture.path().join("existing.db");
+        fs::write(&database, []).unwrap();
+        let alias = fixture.path().join("alias.db");
+        symlink(&database, &alias).unwrap();
+        let dangling = fixture.path().join("dangling.db");
+        symlink(fixture.path().join("absent/target.db"), &dangling).unwrap();
+        let missing = fixture.path().join("missing/new.db");
+
+        // (path, the path can be stat'ed)
+        for (path, statable) in [
+            (&database, true),
+            (&alias, true),
+            (&dangling, false),
+            (&missing, false),
+        ] {
+            let identity = VolumeIdentity::resolve(path).unwrap();
+            let other = identity.different_volume_for_test();
+            for (expected, same) in [(&identity, true), (&other, false)] {
+                let before = super::resolves_on_this_thread();
+                let answer = expected.still_identifies(path).unwrap();
+                let resolves = super::resolves_on_this_thread() - before;
+                assert_eq!(answer, same, "{}", path.display());
+                assert_eq!(
+                    answer,
+                    VolumeIdentity::resolve(path).unwrap() == *expected,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(resolves, usize::from(!statable), "{}", path.display());
+            }
+        }
+
+        // An identity captured before the database file existed still
+        // identifies the file once it is created.
+        let fresh = fixture.path().join("fresh.db");
+        let captured = VolumeIdentity::resolve(&fresh).unwrap();
+        fs::write(&fresh, []).unwrap();
+        let before = super::resolves_on_this_thread();
+        assert!(captured.still_identifies(&fresh).unwrap());
+        assert_eq!(super::resolves_on_this_thread(), before);
     }
 }
 
