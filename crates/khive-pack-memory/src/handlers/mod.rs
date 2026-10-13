@@ -1,5 +1,7 @@
 //! Memory verb handlers — split by concern.
 
+#[cfg(test)]
+mod cjk_model_weighting_tests;
 mod common;
 mod feedback;
 #[cfg(test)]

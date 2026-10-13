@@ -247,12 +247,14 @@ class _Daemon:
 
 
 @pytest.fixture
-def upload_daemon_factory():
+def upload_daemon_factory(request):
     selected = os.environ.get("KKERNEL")
     assert selected, "set KKERNEL to this checkout's gate-built candidate; no installed fallback"
     binary = Path(selected).resolve()
     assert binary.is_file() and os.access(binary, os.X_OK), binary
     daemons = []
+    # conftest.py attaches each root's daemon stderr to the report of a failed test.
+    request.node.scratch_daemon_roots = []
 
     def create(*, idle=3600, sweep=NO_SWEEP_SECS, max_active=None, max_per_actor=None):
         # /tmp keeps both the main and derived events AF_UNIX paths below macOS's cap.
@@ -263,6 +265,7 @@ def upload_daemon_factory():
         if max_per_actor is not None:
             daemon.env["KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR"] = str(max_per_actor)
         daemons.append(daemon)
+        request.node.scratch_daemon_roots.append(root)
         return daemon.start()
 
     yield create
