@@ -113,5 +113,41 @@ if [[ ! -f "$SEMVER_HELPER" ]] ||
 fi
 echo "PASS"
 
+echo "--- case 7: NO_VERIFY knob defaults to verify and refuses unknown values ---"
+for value in "" 0; do
+    mode=$(publish_verify_mode "$value")
+    if [[ "$mode" != verify ]]; then
+        echo "FAIL: NO_VERIFY='$value' must resolve to verify, got '$mode'" >&2
+        exit 1
+    fi
+done
+mode=$(unset NO_VERIFY; publish_verify_mode "${NO_VERIFY-}")
+if [[ "$mode" != verify ]]; then
+    echo "FAIL: an unset NO_VERIFY must resolve to verify, got '$mode'" >&2
+    exit 1
+fi
+mode=$(publish_verify_mode 1)
+if [[ "$mode" != no-verify ]]; then
+    echo "FAIL: NO_VERIFY=1 must resolve to no-verify, got '$mode'" >&2
+    exit 1
+fi
+for value in true yes 2 " 1" "1 "; do
+    if publish_verify_mode "$value" >/dev/null 2>"$STDERR_CAPTURE"; then
+        echo "FAIL: NO_VERIFY='$value' must be refused" >&2
+        exit 1
+    fi
+    if ! grep -q "NO_VERIFY must be unset, 0 or 1" "$STDERR_CAPTURE"; then
+        echo "FAIL: refusal of NO_VERIFY='$value' must name the accepted values" >&2
+        exit 1
+    fi
+done
+if [[ "$(grep -c -- '--no-verify' "$PUBLISH_SCRIPT" | tr -d ' ')" -lt 1 ]] ||
+    [[ "$(grep -c -- 'cargo publish -p "\$crate" --no-verify' "$PUBLISH_SCRIPT" | tr -d ' ')" != 1 ]] ||
+    ! grep -B1 -- 'cargo publish -p "\$crate" --no-verify' "$PUBLISH_SCRIPT" | grep -q 'VERIFY_MODE" == no-verify'; then
+    echo "FAIL: publish.sh must pass --no-verify only on the branch selected by NO_VERIFY=1" >&2
+    exit 1
+fi
+echo "PASS"
+
 echo ""
 echo "=== publish-guard-test: all cases passed ==="

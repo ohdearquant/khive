@@ -63,3 +63,22 @@ check_crates_ladder() {
     fi
     return 0
 }
+
+# publish_verify_mode <value of NO_VERIFY>
+# Resolves the NO_VERIFY knob for the live ladder: prints `verify` (unset or
+# "0", the default) or `no-verify` ("1"), and fails on any other value so a
+# typo cannot silently choose a mode. `no-verify` makes each live
+# `cargo publish` skip its verification build; use it only when
+# `cargo publish --dry-run --locked --workspace` has already verified every
+# crate at the same commit, so the publishing machine only packages and
+# uploads.
+publish_verify_mode() {
+    case "${1-}" in
+        "" | 0) echo verify ;;
+        1) echo no-verify ;;
+        *)
+            echo "ERROR: NO_VERIFY must be unset, 0 or 1 (got '$1')" >&2
+            return 1
+            ;;
+    esac
+}

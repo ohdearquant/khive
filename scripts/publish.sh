@@ -7,6 +7,11 @@ set -euo pipefail
 # Usage:
 #   ./publish.sh          # preflight (default) — see scope below
 #   ./publish.sh --live   # actual publish
+#   NO_VERIFY=1 ./publish.sh --live
+#                         # actual publish with `cargo publish --no-verify` per
+#                         # crate, for a machine that only packages and uploads
+#                         # after `cargo publish --dry-run --locked --workspace`
+#                         # verified every crate at the same commit elsewhere
 #
 # Preflight scope (default mode):
 #   `cargo package --list --allow-dirty` is run per crate, then
@@ -42,6 +47,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/publish_guard.sh
 source "$SCRIPT_DIR/lib/publish_guard.sh"
+VERIFY_MODE=$(publish_verify_mode "${NO_VERIFY-}")
+if $LIVE_MODE && [[ "$VERIFY_MODE" == no-verify ]]; then
+    echo "    NO_VERIFY=1: each crate is published with --no-verify (no verification build on this machine)"
+fi
 
 cd "$SCRIPT_DIR/../crates"
 
@@ -198,7 +207,11 @@ for crate in "${CRATES[@]}"; do
     fi
 
     if $LIVE_MODE; then
-        cargo publish -p "$crate"
+        if [[ "$VERIFY_MODE" == no-verify ]]; then
+            cargo publish -p "$crate" --no-verify
+        else
+            cargo publish -p "$crate"
+        fi
         echo "    Waiting ${DELAY}s for crates.io index propagation..."
         sleep "$DELAY"
     else
