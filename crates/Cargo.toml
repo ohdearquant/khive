@@ -139,6 +139,9 @@ rmcp = "2.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"
+# SA_SIGINFO actions registered beside tokio's own signal handlers (the
+# daemon exit record names the sender of its shutdown signal).
+signal-hook-registry = "1.4"
 proptest = "1"
 crossbeam-queue = "0.3"
 sqlite-vec = { version = "0.1.9" }

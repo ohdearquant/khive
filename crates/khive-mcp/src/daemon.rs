@@ -701,6 +701,80 @@ fn untrusted_pid_file_directory_error(message: String) -> McpError {
     daemon_mcp_error(format!("daemon recovery refused: {message}"), Some(data))
 }
 
+/// ADR-185 Amendment 5: exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set, so
+/// the socket this client probed and the PID file recovery would act on belong
+/// to different rendezvous. Refused before any marker read, signal or spawn.
+fn rendezvous_split_error(split: &khive_runtime::daemon::RendezvousSplit) -> McpError {
+    tracing::error!(
+        reason = "rendezvous_split",
+        set = split.set,
+        unset = split.unset,
+        socket = ?split.socket,
+        pid_file = ?split.pid_file,
+        "daemon recovery refused because the socket and the PID file name different rendezvous"
+    );
+    let mut data = serde_json::json!({
+        "reason": "rendezvous_split",
+        "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        "set": split.set,
+        "unset": split.unset,
+        "socket": split.socket.display().to_string(),
+        "pid_file": split.pid_file.display().to_string(),
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    daemon_mcp_error(
+        format!(
+            "daemon recovery refused (rendezvous_split): {} is set and {} is not, so the socket {} \
+             and the PID file {} belong to different daemons; set both to one private \
+             rendezvous or neither",
+            split.set,
+            split.unset,
+            split.socket.display(),
+            split.pid_file.display()
+        ),
+        Some(data),
+    )
+}
+
+/// ADR-185 Amendment 5: the PID file names a live daemon on a rendezvous a
+/// supervisor claims, and it did not answer. The client does not signal it.
+fn supervised_daemon_unresponsive_error(pid: u32, marker: &SupervisorMarker) -> McpError {
+    let marker_path = khive_runtime::daemon::supervisor_marker_path();
+    tracing::error!(
+        reason = "supervised_daemon_unresponsive",
+        pid,
+        job = %marker.job,
+        marker_pid = marker.pid,
+        marker = ?marker_path,
+        "daemon recovery refused because the unresponsive daemon belongs to a supervisor"
+    );
+    let mut data = serde_json::json!({
+        "reason": "supervised_daemon_unresponsive",
+        "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        "pid": pid,
+        "job": marker.job,
+        "marker_pid": marker.pid,
+        "marker": marker_path.display().to_string(),
+    });
+    if is_daemon_strict_mode() {
+        data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
+    }
+    daemon_mcp_error(
+        format!(
+            "daemon recovery refused (supervised_daemon_unresponsive): pid {pid} holds the PID \
+             file and did not answer, and supervisor job \"{}\" (pid {}) claims this rendezvous \
+             in {}; a client never signals a supervised daemon. Restart it through the \
+             supervisor, or remove the marker if the supervisor is gone",
+            marker.job,
+            marker.pid,
+            marker_path.display()
+        ),
+        Some(data),
+    )
+}
+
 /// A socket-less rendezvous claimed by a supervisor returns a retryable error
 /// when the caller's startup budget ends. It never falls through to local
 /// dispatch or spawns a competing daemon while the claim is held.
@@ -1122,6 +1196,9 @@ mod strict_default_tests;
 
 #[cfg(all(test, unix))]
 mod daemon_slow_tests;
+
+#[cfg(all(test, unix))]
+mod rendezvous_recovery_tests;
 
 #[cfg(test)]
 #[path = "daemon_tests.rs"]

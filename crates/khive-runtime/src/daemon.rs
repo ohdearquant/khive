@@ -63,6 +63,9 @@ use crate::pack::RequestIdentity;
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
+// Unix-only: gated inside the file, because the error-constructor census
+// admits only attribute-free submodule declarations.
+mod exit_record;
 mod lifecycle;
 #[cfg(unix)]
 use lifecycle::khive_dir;
@@ -78,7 +81,10 @@ pub use lifecycle::{
     DaemonOptions, DaemonShutdownReason, DaemonStartupReport, DEFAULT_DEMAND_IDLE_SECS,
 };
 #[cfg(unix)]
-pub use lifecycle::{pid_path, recoverer_lock_path, socket_path, SUPERVISOR_CLAIM_ENV};
+pub use lifecycle::{
+    pid_path, recoverer_lock_path, rendezvous_split, socket_path, RendezvousSplit,
+    SUPERVISOR_CLAIM_ENV,
+};
 
 mod load_limits;
 #[cfg(unix)]
@@ -1817,6 +1823,9 @@ where
     // alive so a signal during the rest of startup reaches normal cleanup.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    if let Err(error) = exit_record::capture_signal_senders() {
+        tracing::warn!(target: "khive.boot", error = %error, "signal sender capture unavailable; the exit record will say sender_pid=unknown");
+    }
 
     let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
         Ok(guard) => guard,
@@ -1843,10 +1852,13 @@ where
         }
         Err(e) => return Err(e.into()),
     };
+    // After the claim, never before: only the PID file's owner writes the record.
+    let exit_record = exit_record::ExitRecord::claim(&pid_file);
 
     let listener = match UnixListener::bind(&sock) {
         Ok(listener) => listener,
         Err(e) => {
+            exit_record.exiting(exit_record::ExitReason::Error);
             remove_pid_file_if_owned(&pid_file, &pid_file_guard);
             return Err(e.into());
         }
@@ -1857,6 +1869,7 @@ where
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         drop(listener);
         let _ = std::fs::remove_file(&sock);
+        exit_record.exiting(exit_record::ExitReason::Error);
         remove_pid_file_if_owned(&pid_file, &pid_file_guard);
         return Err(anyhow::anyhow!(
             "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
@@ -1933,10 +1946,11 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
-            _ = sigint.recv() => tracing::info!("received SIGINT"),
-        }
+        let signal = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        tracing::info!("received {signal}");
         // Tokio retains its process-wide handlers after the streams are dropped.
         // This daemon cannot restart without exec; a repeat signal must terminate
         // even if shutdown is blocked in synchronous recovery-lock acquisition.
@@ -1947,7 +1961,7 @@ where
                 return Err(std::io::Error::last_os_error());
             }
         }
-        Ok::<(), std::io::Error>(())
+        Ok::<&'static str, std::io::Error>(signal)
     };
     tokio::pin!(shutdown);
     lifecycle.ready();
@@ -2061,8 +2075,14 @@ where
                 }
             }
         } => DaemonShutdownReason::Signal,
-        result = &mut shutdown => { result?; DaemonShutdownReason::Signal },
-        _ = wait_for_idle(&dispatcher, &lifecycle) => DaemonShutdownReason::Idle,
+        result = &mut shutdown => {
+            exit_record.exiting(exit_record::ExitReason::Signal(result?));
+            DaemonShutdownReason::Signal
+        },
+        _ = wait_for_idle(&dispatcher, &lifecycle) => {
+            exit_record.exiting(exit_record::ExitReason::Idle);
+            DaemonShutdownReason::Idle
+        },
     };
 
     lifecycle.draining(reason);
@@ -2091,7 +2111,7 @@ where
         tokio::select! {
             _ = drain_for_idle(&active, drain_timeout()) => true,
             result = &mut shutdown => {
-                result?;
+                exit_record.exiting(exit_record::ExitReason::Signal(result?));
                 lifecycle.draining(DaemonShutdownReason::Signal);
                 let _ = request_shutdown_tx.send(true);
                 drain(&active).await

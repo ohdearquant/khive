@@ -2,6 +2,10 @@ include!("daemon/plan_tests.rs");
 mod shutdown_signals {
     include!("daemon/shutdown_signal_tests.rs");
 }
+#[cfg(unix)]
+mod exit_records {
+    include!("daemon/exit_record_tests.rs");
+}
 #[path = "daemon/tests/connection_limit_tests.rs"]
 mod connection_limit_tests;
 use super::*;

@@ -1330,6 +1330,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
     ),
     (
         "khive-runtime/src/daemon.rs",
+        "exit_record",
+        "khive-runtime/src/daemon/exit_record.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
         "lifecycle",
         "khive-runtime/src/daemon/lifecycle.rs",
     ),

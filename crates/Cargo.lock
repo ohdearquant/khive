@@ -2894,6 +2894,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2",
+ "signal-hook-registry",
  "syn",
  "tempfile",
  "thiserror 2.0.18",

@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A connection lost after the request was sent returns `daemon_connection_lost`, and an
   unreadable response `parse_failure`; all three post-write outcomes stay terminal.
   `bridge.diagnostics` reports `daemon_slow` counts per phase, outside `fallback_total`.
+- Client daemon recovery acts on one rendezvous. With exactly one of `KHIVE_SOCKET` /
+  `KHIVE_PID` set and a socket that does not answer, a request is refused with
+  `reason: "rendezvous_split"` (`not_committed`) instead of reading the other half's PID
+  file and signalling the daemon it names. A client also never signals a live daemon on a
+  rendezvous a supervisor marker claims: it returns `supervised_daemon_unresponsive`
+  (`not_committed`) naming the pid, the marker's job and the marker path.
+- The daemon writes `<pid file>.exit` (`running` after it claims the PID file, `exited`
+  with the reason and the pid that sent the shutdown signal), logs the previous record and
+  the effective `RLIMIT_NOFILE` at WARN on every boot, and logs its shutdown at WARN.
 - Each pooled SQLite connection now keeps an 8 MiB page cache instead of 64 MiB. The
   cache is per connection and on the heap, so a process with many connections paid the
   old size many times over. `KHIVE_SQLITE_CACHE_KIB` (512 to 1048576) and

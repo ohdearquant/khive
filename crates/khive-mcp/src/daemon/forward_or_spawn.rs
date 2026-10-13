@@ -8,8 +8,9 @@ use super::{
     daemon_unreachable_error, env_truthy, fallback_or_reject, incumbent_still_alive_error,
     kill_and_respawn, map_response, opaque_config_id, post_write_error, probe_daemon_identity,
     protocol_mismatch_error, protocol_mismatch_message, read_supervisor_marker,
-    recorded_daemon_is_alive, request_too_large_error, respawn_failed_error, sleep_until_retry,
-    spawn_daemon, spawn_daemon_with_exe_and_config, supervisor_marker_lock_wait_error,
+    recorded_daemon_is_alive, rendezvous_split_error, request_too_large_error,
+    respawn_failed_error, sleep_until_retry, spawn_daemon, spawn_daemon_with_exe_and_config,
+    supervised_daemon_unresponsive_error, supervisor_marker_lock_wait_error,
     trigger_bridge_self_heal, try_forward_with_read_replay, untrusted_pid_file_directory_error,
     wait_for_supervisor, with_rendezvous_admission_snapshot, DaemonRequestFrame, FallbackReason,
     ForwardOutcome, McpError, PostWriteFailure, ProbeOutcome, ReadReplayBudget, RecoveryError,
@@ -339,6 +340,14 @@ where
         replay_read_only && crate::request_policy::read_replay_safe(&frame.ops),
     );
     let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
+    // ADR-185 Amendment 5: recovery reads the marker beside the socket and
+    // signals the process the PID file names, so it runs only when both belong
+    // to one rendezvous. Forwarding to a socket that answers is unaffected.
+    if matches!(first, ForwardOutcome::NoSocket) {
+        if let Some(split) = khive_runtime::daemon::rendezvous_split() {
+            return Some(Err(rendezvous_split_error(&split)));
+        }
+    }
     let mut initial_supervisor_marker: Option<SupervisorMarker> = None;
     let mut degraded_bootstrap = false;
     if matches!(first, ForwardOutcome::NoSocket) {
@@ -545,6 +554,9 @@ where
         }
         Err(RecoveryError::PidFileDirectoryUntrusted(message)) => {
             return Some(Err(untrusted_pid_file_directory_error(message)));
+        }
+        Err(RecoveryError::SupervisedDaemonUnresponsive { pid, marker }) => {
+            return Some(Err(supervised_daemon_unresponsive_error(pid, &marker)));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
