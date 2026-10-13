@@ -56,6 +56,8 @@ Retrieval sources are labeled `text`, `vector`, or `both`. How per-model vector 
 - `weighted` first unions all per-model vector hits into one combined vector source by UUID (retaining the best score per duplicate), then fuses `[combined_vector, text]` under the configured vector/keyword weights.
 - `vector_only` and `keyword_only` union per-model vector hits the same way as `weighted` and route only the relevant arm; the unused arm is passed as an explicit empty source so the two-arm `[vector, keyword]` positions stay stable rather than being rebound.
 
+A strategy that discards an arm never runs it. `keyword_only` does not embed the query and does not enter ANN, the fresh-tail leg, or sqlite-vec, so it never degrades; `vector_only` does not run FTS. The handler-level widening loop re-runs only the kept arm and judges corpus exhaustion on that arm alone, so a `keyword_only` query whose text arm comes back short stops after one round however many vector rows the corpus holds. `rrf`, `weighted`, and `union` run both arms as before. The diagnostic subhandlers always run both arms.
+
 Supported strategies are:
 
 | Request value  | Behavior                                                            |
@@ -111,6 +113,22 @@ the maximum ANN and fresh-tail duration. Sequential handler-level widening
 rounds and their hydration passes are accumulated. The opt-in
 `KHIVE_RECALL_PROFILE` stream remains available for higher-volume local
 profiling and is not required for this production warning.
+
+## Per-call stage timings
+
+`include_timings = true` returns the same stage attribution for one call, in
+microseconds, without any environment variable. The response gains a `timings`
+object: an array response becomes `{results, timings}` and an object response
+(truncated, degraded, or verbose multi-model) keeps its fields and gains
+`timings`. The object carries `total_us` (handler time up to the response),
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us`, and `hydrate_us` accumulated
+over all rounds with the same concurrency rules as the slow-request warning,
+`retrieval_rounds`, and `rounds[]`. Each round reports its `candidate_limit`,
+`text_hits`, `vector_hits` (summed over models, as gathered before hydration),
+`hydrated` (visible memory rows after hydration), `eligible` (rows the strategy
+and creation window can keep, the widening stop count), and its own stage
+times. A stage that did not run is `null`, never zero. Under a session fence
+the round reports the attempt that produced the candidates.
 
 ## Subhandlers
 

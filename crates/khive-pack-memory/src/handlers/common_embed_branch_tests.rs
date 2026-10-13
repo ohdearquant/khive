@@ -84,6 +84,7 @@ async fn embedded_models(rt: &KhiveRuntime) -> Result<Vec<String>, RuntimeError>
             &token,
             RecallCandidateParams {
                 candidate_limit: 10,
+                legs: super::RecallLegs::BOTH,
                 embedding_model: None,
                 session_fence: None,
                 cjk_fts_bypass: false,
