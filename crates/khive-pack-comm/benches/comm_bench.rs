@@ -182,11 +182,9 @@ fn bench_reply(c: &mut Criterion) {
 
 // ── thread ────────────────────────────────────────────────────────────────────
 
-fn bench_thread(c: &mut Criterion) {
-    let fixture = build_fixture();
-
-    // Build a thread with 5 messages: 1 root + 4 replies.
-    let thread_root_id = fixture.rt.block_on(async {
+/// Build a thread with 5 messages: 1 root + 4 replies. Returns the root's full id.
+fn seed_thread(fixture: &Fixture) -> String {
+    fixture.rt.block_on(async {
         let root = fixture
             .registry
             .dispatch(
@@ -212,30 +210,51 @@ fn bench_thread(c: &mut Criterion) {
                 .expect("seed reply");
         }
         root_full_id
-    });
+    })
+}
 
+fn bench_thread_case(c: &mut Criterion, id: BenchmarkId, fixture: &Fixture, root_id: &str) {
     let mut group = c.benchmark_group("comm");
     group.sample_size(50);
 
-    group.bench_with_input(
-        BenchmarkId::new("thread", 5),
-        &thread_root_id,
-        |b, root_id| {
-            b.to_async(&fixture.rt).iter(|| {
-                let registry = &fixture.registry;
-                let id = root_id.clone();
-                async move {
-                    let result = registry
-                        .dispatch("comm.thread", black_box(json!({ "id": id })))
-                        .await
-                        .expect("thread ok");
-                    black_box(result)
-                }
-            });
-        },
-    );
+    group.bench_with_input(id, root_id, |b, root_id| {
+        b.to_async(&fixture.rt).iter(|| {
+            let registry = &fixture.registry;
+            let id = root_id.to_string();
+            async move {
+                let result = registry
+                    .dispatch("comm.thread", black_box(json!({ "id": id })))
+                    .await
+                    .expect("thread ok");
+                black_box(result)
+            }
+        });
+    });
 
     group.finish();
+}
+
+fn bench_thread(c: &mut Criterion) {
+    let fixture = build_fixture();
+    let root_id = seed_thread(&fixture);
+    bench_thread_case(c, BenchmarkId::new("thread", 5), &fixture, &root_id);
+}
+
+/// The same 5-message thread in a mailbox that also holds `BUSY_MAILBOX` unrelated
+/// messages. A thread read should cost the same here as in an empty mailbox; if it
+/// grows with the mailbox, the read is walking messages outside the thread.
+const BUSY_MAILBOX: usize = 2_000;
+
+fn bench_thread_busy_mailbox(c: &mut Criterion) {
+    let fixture = build_fixture();
+    seed_messages(&fixture, BUSY_MAILBOX);
+    let root_id = seed_thread(&fixture);
+    bench_thread_case(
+        c,
+        BenchmarkId::new("thread_in_busy_mailbox", BUSY_MAILBOX),
+        &fixture,
+        &root_id,
+    );
 }
 
 // ── criterion entry points ────────────────────────────────────────────────────
@@ -246,6 +265,7 @@ criterion_group!(
     bench_inbox,
     bench_read,
     bench_reply,
-    bench_thread
+    bench_thread,
+    bench_thread_busy_mailbox
 );
 criterion_main!(comm_benches);
