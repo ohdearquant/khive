@@ -76,6 +76,14 @@ pub struct EntityStatsCounts {
     pub entities_by_type: Option<EntityTypeCounts>,
 }
 
+/// The live edge total and its two breakdowns consumed together by `stats`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EdgeStatsCounts {
+    pub edges: u64,
+    pub edges_by_relation: HashMap<String, u64>,
+    pub edges_by_endpoint_base: khive_storage::types::EdgeEndpointBaseCounts,
+}
+
 /// Count caller-visible live entities through one store. A supported breakdown
 /// supplies its own scalar total; only an unavailable report uses legacy counting.
 pub async fn entity_stats_counts(

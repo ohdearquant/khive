@@ -3411,6 +3411,64 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader(
+            "count_edges_by_relation_and_endpoint_base_in_namespaces",
+            move |conn| {
+                let source_case = endpoint_base_case("source_id");
+                let target_case = endpoint_base_case("target_id");
+                let mut totals: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = HashMap::new();
+                for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                    let (where_clause, params) =
+                        build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                    let sql = format!(
+                        "SELECT relation, {source_case} AS source_base, \
+                         {target_case} AS target_base, COUNT(*) \
+                         FROM graph_edges{} GROUP BY relation, source_base, target_base",
+                        with_live_endpoints(&where_clause)
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                        let relation: String = row.get(0)?;
+                        let source: String = row.get(1)?;
+                        let target: String = row.get(2)?;
+                        let count: i64 = row.get(3)?;
+                        Ok((relation, source, target, count))
+                    })?;
+                    for row in rows {
+                        let (relation_str, source, target, count) = row?;
+                        let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        fold_endpoint_base_row(
+                            totals.entry(relation).or_default(),
+                            &source,
+                            &target,
+                            count as u64,
+                        );
+                    }
+                }
+                Ok(totals.into_iter().collect())
+            },
+        )
+        .await
+    }
+
     async fn query_edges_after(
         &self,
         filter: EdgeFilter,
