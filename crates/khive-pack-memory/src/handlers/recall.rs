@@ -582,9 +582,9 @@ impl MemoryPack {
             if eligible_count >= limit {
                 break;
             }
-            // Exhaustion is judged on the arms this strategy runs only: a
-            // skipped arm returned nothing because it never searched, which
-            // proves nothing about the corpus.
+            // Exhaustion is judged on the arms this strategy runs. A skipped
+            // arm returns no hits and so already reads as exhausted; the
+            // `legs` terms state the intent and change no outcome.
             let text_exhausted = candidates.text_hits.len() < current_candidate_limit as usize;
             let vector_exhausted = candidates
                 .vector_hits_per_model

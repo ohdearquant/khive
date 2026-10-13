@@ -34,12 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `memory.recall` with `fusion_strategy="keyword_only"` no longer embeds the query or searches
   the vector index, and `fusion_strategy="vector_only"` no longer runs the full-text search.
-  Their result sets are unchanged, because fusion already discarded the other arm's hits; the
-  saved work was most of the cost of a `keyword_only` recall that finds no text match.
-  Widening re-runs only the arm the strategy keeps and stops when that arm is exhausted. A
-  `keyword_only` recall therefore never reports `degraded`, and a verbose `keyword_only`
-  request on a multi-model store returns the ordinary shapes instead of the
-  `vector_candidates_per_model` envelope, since no vector recall ran.
+  The saved work was most of the cost of a `keyword_only` recall that finds no text match.
+  `keyword_only` no longer applies the vector `min_raw_relevance` floor; its hits carry
+  `raw_score: null` and `score` is the composite; rank order is unchanged. Widening re-runs
+  only the arm the strategy keeps and stops when that arm is exhausted. A `keyword_only`
+  recall therefore never reports `degraded`, and a verbose `keyword_only` request on a
+  multi-model store returns the ordinary shapes instead of the `vector_candidates_per_model`
+  envelope, since no vector recall ran.
+
+- A `keyword_only` recall whose query the embedder cannot embed now returns its text hits
+  instead of failing with `recall: all embedding engines failed`, and a `vector_only` recall
+  whose full-text table is unreadable now returns its vector hits instead of failing.
 
 - `db_diagnostics` no longer fails as a whole when the request's read deadline arrives. The
   backends already inspected are returned, every remaining backend's `error` starts with

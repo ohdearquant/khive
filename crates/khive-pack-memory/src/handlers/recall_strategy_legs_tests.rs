@@ -420,3 +420,189 @@ async fn include_timings_extends_an_object_envelope() {
     assert!(response["timings"]["ann_us"].is_u64(), "{response}");
     assert!(response["timings"]["embed_us"].is_u64(), "{response}");
 }
+
+/// Unit vectors chosen by content: text containing `orthogonal_marker` gets
+/// one axis and every other text the other, so a query's cosine to such a
+/// note is exactly zero. Embedding `fail_on` fails, so a query can be made
+/// unembeddable while note writes still embed.
+struct ScriptedVecService {
+    orthogonal_marker: Option<&'static str>,
+    fail_on: Option<&'static str>,
+}
+
+#[async_trait]
+impl EmbeddingService for ScriptedVecService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.iter().any(|text| Some(text.as_str()) == self.fail_on) {
+            return Err(EmbedError::InferenceFailed(
+                "scripted query embedding failure".into(),
+            ));
+        }
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut v = vec![0.0_f32; DIMS];
+                let orthogonal = self
+                    .orthogonal_marker
+                    .is_some_and(|marker| text.contains(marker));
+                v[usize::from(orthogonal)] = 1.0;
+                v
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "scripted-vec"
+    }
+}
+
+struct ScriptedVecProvider {
+    model: &'static str,
+    orthogonal_marker: Option<&'static str>,
+    fail_on: Option<&'static str>,
+}
+
+#[async_trait]
+impl EmbedderProvider for ScriptedVecProvider {
+    fn name(&self) -> &str {
+        self.model
+    }
+
+    fn dimensions(&self) -> usize {
+        DIMS
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(ScriptedVecService {
+            orthogonal_marker: self.orthogonal_marker,
+            fail_on: self.fail_on,
+        }))
+    }
+}
+
+fn scripted_fixture(provider: ScriptedVecProvider) -> VerbRegistry {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(provider);
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    builder.build().expect("registry")
+}
+
+fn hits(response: &Value) -> &Vec<Value> {
+    response
+        .as_array()
+        .or_else(|| response.get("results").and_then(Value::as_array))
+        .expect("recall response carries a results array")
+}
+
+/// `keyword_only` runs no vector search, so the vector relevance floor
+/// (`min_raw_relevance`) has no raw cosine to apply to: a text hit whose
+/// vector is orthogonal to the query is returned, every hit carries
+/// `raw_score: null`, and `score` is the composite. A fused strategy on the
+/// same store still drops that note at the floor.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn keyword_only_applies_no_vector_floor_and_reports_no_raw_score() {
+    let registry = scripted_fixture(ScriptedVecProvider {
+        model: "legs-keyword-only-floor-model",
+        orthogonal_marker: Some("romeo"),
+        fail_on: None,
+    });
+    let orthogonal = remember(&registry, "papa quebec romeo").await;
+    let aligned = remember(&registry, "papa quebec sierra").await;
+
+    let keyword = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "papa quebec", "fusion_strategy": "keyword_only" }),
+        )
+        .await
+        .expect("keyword_only recall");
+    let mut ids = result_ids(&keyword);
+    ids.sort();
+    let mut expected = vec![orthogonal.clone(), aligned.clone()];
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "keyword_only returns every text hit, including the note whose vector is \
+         orthogonal to the query: {keyword}"
+    );
+    for hit in hits(&keyword) {
+        assert!(
+            hit["raw_score"].is_null(),
+            "keyword_only ran no vector search, so raw_score is null: {hit}"
+        );
+        let score = hit["score"].as_f64().expect("score is a number");
+        assert!(score > 0.0 && score <= 1.0, "score is the composite: {hit}");
+    }
+
+    // Control on the same store: rrf runs the vector arm, the orthogonal
+    // note's raw cosine is 0, below the floor, and the note is dropped.
+    let fused = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "papa quebec", "fusion_strategy": "rrf" }),
+        )
+        .await
+        .expect("rrf recall");
+    let fused_ids = result_ids(&fused);
+    assert!(
+        fused_ids.contains(&aligned) && !fused_ids.contains(&orthogonal),
+        "control: rrf applies the floor and drops the orthogonal note: {fused}"
+    );
+    let aligned_hit = hits(&fused)
+        .iter()
+        .find(|hit| hit["id"].as_str() == Some(aligned.as_str()))
+        .expect("aligned hit");
+    assert!(
+        aligned_hit["raw_score"].as_f64().is_some(),
+        "control: a fused hit carries its raw cosine: {aligned_hit}"
+    );
+}
+
+/// `keyword_only` never embeds the query, so a query the embedder cannot
+/// embed still returns its text hits; a strategy that embeds fails.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn keyword_only_serves_text_hits_when_the_query_embedder_fails() {
+    const QUERY: &str = "tango uniform";
+    let registry = scripted_fixture(ScriptedVecProvider {
+        model: "legs-keyword-only-embed-failure-model",
+        orthogonal_marker: None,
+        fail_on: Some(QUERY),
+    });
+    let id = remember(&registry, "tango uniform victor").await;
+
+    let keyword = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": QUERY, "fusion_strategy": "keyword_only" }),
+        )
+        .await
+        .expect("keyword_only must not embed the query");
+    assert_eq!(result_ids(&keyword), vec![id], "{keyword}");
+
+    // Control: rrf embeds the query and fails on the same request.
+    let fused = registry
+        .dispatch("memory.recall", json!({ "query": QUERY }))
+        .await;
+    let error = fused.expect_err("control: rrf must fail when the query cannot be embedded");
+    assert!(
+        error
+            .to_string()
+            .contains("recall: all embedding engines failed"),
+        "control: {error}"
+    );
+}

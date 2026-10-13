@@ -266,7 +266,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "fusion_strategy",
                 param_type: "string",
                 required: false,
-                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config. keyword_only runs only the text search (no query embedding, no vector search, so it never reports degraded); vector_only runs only the vector search.",
+                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config. keyword_only runs only the text search (no query embedding, no vector search, so it never reports degraded; under a session fence it still waits for the fence's ANN watermark); vector_only runs only the vector search.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
