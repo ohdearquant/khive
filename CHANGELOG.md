@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-13
+
+### Documentation
+
+- Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
+  reports and statistics, and guarded fix receipts. The verb remains unimplemented.
+- Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
+  proposals using an archive marker while retaining their identity and event history.
+  Retention follows last projection activity. The handler remains unimplemented.
+- Accept ADR-037 configuration-bound namespace and project-root rules for remote
+  cached-entity reads, preserving origin and refusing remote mutations. The read
+  remains unimplemented.
+- Accept ADR-035 embedding pipeline configuration, legacy-key compatibility and
+  import strictness rules, with an ADR-001 companion distinguishing explicit import
+  from VCS snapshot degradation; edge relations remain closed. The configuration
+  remains unimplemented.
+
 ### Added
 
 - Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
@@ -23,6 +40,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, and `size_composition=false` to skip the `dbstat` walk, which reads every page of
   each file. Every file-backed report now carries `page_accounting` (`page_size_bytes`,
   `page_count`, `freelist_pages`), three pragma reads that are reported either way.
+
+- `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
+  merging. Original-query fallback preserves its bytes, generated variants are validated
+  as a whole, and admitted IDs retain variant and retrieval-source attribution.
+- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
+  and atomically updates that remote in an existing schema.yaml, reporting both old
+  and new commits while preserving archive-content pins and other YAML values.
+  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
+- Runtime packs may expose an optional `ContextContributor` capability with owned request
+  and slice types and explicit score semantics. Registry discovery preserves pack order;
+  context composition and execution remain separate.
+- `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
+  preserves missing vectors with their incoming scores and an explicit flag, and implements
+  the retrieval `Reranker` trait without a namespace-wide candidate cut.
+- `khive-graph-diff` compares in-memory entity, edge and note NDJSON states with
+  deterministic additions, removals and field changes, preserving missing versus null.
+- Add explicit event sink declarations in `khive-types`. All existing event kinds
+  retain `caller_event_store`; the closed metadata API requires each new kind to
+  declare its sink. Event routing and storage behavior are unchanged.
+- A standalone session raw-value codec writes level-3 zstd frames with BLOB
+  prefix `0x01`, borrows legacy TEXT unchanged, and refuses unknown formats or
+  malformed data. Callers select the decoded BLOB size bound; mirror storage
+  paths and dictionaries remain unchanged.
+- `VectorStore::scan_vectors` enumerates persisted vectors in UUID-ordered pages
+  with exact metadata filters and an explicit row limit. SQLite reads stored bytes
+  through reader admission; pages do not form a cross-request snapshot.
+- The opt-in `charter` pack installs the seven recording tables from ADR-193 and
+  provides revision-and-state checked transaction helpers. This schema foundation
+  exposes no verbs, grants no action admission, and does not enforce merges.
+- `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
+  Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
+  writer while retaining their update and proposal guards.
+- `KhiveRuntime::resolve_prefix_in` resolves UUID prefixes in a named pack-owned table,
+  reporting distinct-ID ambiguity and storage failures. A `PrefixScope` argument states which
+  rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
+  outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
+  with the caller.
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
+- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
+  caller filters, explicit depth and entry caps, and optional within-root symlink following.
+  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
 
 ### Changed
 
@@ -104,105 +178,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distance; the exact f32 re-score of the final list still decides the returned top-k. An
   index built after this change can differ from one built before it where SQ8 distances tie.
 
-### Fixed
-
-- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
-  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
-  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
-  logged on `khive.boot`.
-- On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
-  store's check of each new audit batch against the legacy store) and the schedule
-  creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
-  Before, both walked every event of the namespace in `created_at` order.
-- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
-  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
-  (#5087).
-- `kkernel kg export` checks file sync and removes its own temporary after a write, sync or
-  rename failure. On Unix it publishes through shared atomic publication: it refuses an existing
-  temporary instead of replacing it, keeps the original filename bytes, creates the file with
-  mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
-  staging policies keep mode 0644 and their behavior (#5068).
-- Named-vector and memory session exact search select equal-distance boundary hits by
-  subject UUID before limiting candidates, keeping their order stable across database reopen.
-
-## [0.12.0] - 2026-10-11
-
-### Documentation
-
-- Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
-  reports and statistics, and guarded fix receipts. The verb remains unimplemented.
-- Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
-  proposals using an archive marker while retaining their identity and event history.
-  Retention follows last projection activity. The handler remains unimplemented.
-- Accept ADR-037 configuration-bound namespace and project-root rules for remote
-  cached-entity reads, preserving origin and refusing remote mutations. The read
-  remains unimplemented.
-- Accept ADR-035 embedding pipeline configuration, legacy-key compatibility and
-  import strictness rules, with an ADR-001 companion distinguishing explicit import
-  from VCS snapshot degradation; edge relations remain closed. The configuration
-  remains unimplemented.
-
-### Added
-
-- `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
-  merging. Original-query fallback preserves its bytes, generated variants are validated
-  as a whole, and admitted IDs retain variant and retrieval-source attribution.
-- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
-  and atomically updates that remote in an existing schema.yaml, reporting both old
-  and new commits while preserving archive-content pins and other YAML values.
-  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
-- Runtime packs may expose an optional `ContextContributor` capability with owned request
-  and slice types and explicit score semantics. Registry discovery preserves pack order;
-  context composition and execution remain separate.
-- `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
-  preserves missing vectors with their incoming scores and an explicit flag, and implements
-  the retrieval `Reranker` trait without a namespace-wide candidate cut.
-- `khive-graph-diff` compares in-memory entity, edge and note NDJSON states with
-  deterministic additions, removals and field changes, preserving missing versus null.
-- Add explicit event sink declarations in `khive-types`. All existing event kinds
-  retain `caller_event_store`; the closed metadata API requires each new kind to
-  declare its sink. Event routing and storage behavior are unchanged.
-- A standalone session raw-value codec writes level-3 zstd frames with BLOB
-  prefix `0x01`, borrows legacy TEXT unchanged, and refuses unknown formats or
-  malformed data. Callers select the decoded BLOB size bound; mirror storage
-  paths and dictionaries remain unchanged.
-- `VectorStore::scan_vectors` enumerates persisted vectors in UUID-ordered pages
-  with exact metadata filters and an explicit row limit. SQLite reads stored bytes
-  through reader admission; pages do not form a cross-request snapshot.
-- The opt-in `charter` pack installs the seven recording tables from ADR-193 and
-  provides revision-and-state checked transaction helpers. This schema foundation
-  exposes no verbs, grants no action admission, and does not enforce merges.
-- `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
-  Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
-  writer while retaining their update and proposal guards.
-- `KhiveRuntime::resolve_prefix_in` resolves UUID prefixes in a named pack-owned table,
-  reporting distinct-ID ambiguity and storage failures. A `PrefixScope` argument states which
-  rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
-  outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
-  with the caller.
-- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
-  checks both strategies even on empty input, preserves the candidate union without a final
-  limit, and accepts an async custom-executor adapter without a runtime dependency.
-- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
-  checking its dimensions and finite coordinates even for empty requests. Existing methods
-  remain single-engine compatibility delegates to the configured first/default engine.
-- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
-  caller filters, explicit depth and entry caps, and optional within-root symlink following.
-  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
-- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
-  entries into document/paper records with authors properties, `@string` expansion
-  and crossref edges. Malformed entries report skip counts and optional warnings;
-  fatal source errors refuse the import before the target database opens.
-- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
-  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
-  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
-- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
-  without training or consuming a serve-ledger grade. Later caller-judged
-  auto-feedback with the same scorer/serve pair commits its grade and posterior
-  update exactly once; manual feedback behavior is unchanged.
-
-### Changed
-
 - Public brain posterior folds use the shared filter and map combinators, preserving
   reducer state, standalone section-feedback handling and offered-event counts.
 - Pool configuration, WAL ceiling policy and test-store guards move into an internal
@@ -241,6 +216,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
 
 ### Fixed
+
+- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
+  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
+  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
+  logged on `khive.boot`.
+- On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
+  store's check of each new audit batch against the legacy store) and the schedule
+  creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
+  Before, both walked every event of the namespace in `created_at` order.
+- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
+  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
+  (#5087).
+- `kkernel kg export` checks file sync and removes its own temporary after a write, sync or
+  rename failure. On Unix it publishes through shared atomic publication: it refuses an existing
+  temporary instead of replacing it, keeps the original filename bytes, creates the file with
+  mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
+  staging policies keep mode 0644 and their behavior (#5068).
+- Named-vector and memory session exact search select equal-distance boundary hits by
+  subject UUID before limiting candidates, keeping their order stable across database reopen.
 
 - `kkernel kg init` now creates the canonical `.khive/config.toml` with valid engine settings,
   preserves existing project configurations, and refuses the obsolete config path before writing
