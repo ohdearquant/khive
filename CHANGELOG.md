@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
+  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
+  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
+  logged on `khive.boot`.
 - On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
   store's check of each new audit batch against the legacy store) and the schedule
   creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
