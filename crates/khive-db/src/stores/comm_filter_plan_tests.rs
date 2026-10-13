@@ -1057,3 +1057,116 @@ fn missing_pinned_comm_indexes_are_errors_without_fallback() {
         assert!(error.to_string().contains(index), "{error}");
     }
 }
+
+const THREAD_ID: &str = "0193a5b2-7c41-7d2e-8f00-1a2b3c4d5e6f";
+
+/// The base mailbox fixture plus one five-message thread, optionally analyzed.
+fn thread_fixture(foreign_count: usize, analyzed: bool) -> Connection {
+    let conn = fixture(foreign_count, 0);
+    for i in 0..5 {
+        let direction = if i % 2 == 0 { "outbound" } else { "inbound" };
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at)
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            rusqlite::params![
+                format!("thread-row-{i}"),
+                json!({"direction":direction, "thread_id":THREAD_ID,
+                       "from_actor":"test:sender"})
+                .to_string(),
+                (500 + i) as i64
+            ],
+        )
+        .unwrap();
+    }
+    if analyzed {
+        conn.execute_batch("ANALYZE").unwrap();
+    }
+    conn
+}
+
+/// The `comm.thread` read: every accepted spelling of the thread id in one IN.
+fn thread_filter() -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::In(vec![
+                SqlValue::Text(THREAD_ID.to_string()),
+                SqlValue::Text(THREAD_ID.to_uppercase()),
+                SqlValue::Text(format!("{{{THREAD_ID}}}")),
+            ]),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    }
+}
+
+/// The inbound-mail correlation probe: one spelling, outbound copies only.
+fn thread_outbound_probe_filter() -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.thread_id".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(THREAD_ID.to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".to_string()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// A thread read seeks the thread index, so the thread's own rows decide the
+/// work: 10,000 unrelated messages in the namespace leave the page and the VM
+/// step count unchanged, with and without planner statistics.
+#[test]
+fn thread_read_work_is_bounded_by_the_threads_own_rows() {
+    for (name, filter, rows) in [
+        ("thread", thread_filter(), 5),
+        ("outbound probe", thread_outbound_probe_filter(), 3),
+    ] {
+        for analyzed in [false, true] {
+            let small = measure(&thread_fixture(0, analyzed), &filter);
+            let large = measure(&thread_fixture(10_000, analyzed), &filter);
+            let plan = large["plan"].to_string();
+            assert!(
+                plan.contains("idx_comm_message_thread"),
+                "{name} (analyzed {analyzed}) must seek the thread index, got plan: {plan}"
+            );
+            assert_eq!(large["ids"], small["ids"], "{name} (analyzed {analyzed})");
+            assert_eq!(large["ids"].as_array().unwrap().len(), rows, "{name}");
+            let small_steps = small["vm_steps"].as_i64().unwrap();
+            let large_steps = large["vm_steps"].as_i64().unwrap();
+            assert!(
+                large_steps <= small_steps + 128,
+                "{name} (analyzed {analyzed}): unrelated messages must not add \
+                 row-proportional work: {small_steps} -> {large_steps}"
+            );
+        }
+    }
+}
+
+/// A recipient-pinned read that also names a thread keeps its plain order, so
+/// the pinned index still supplies it.
+#[test]
+fn recipient_pinned_thread_read_keeps_its_order_clause() {
+    let mut filter = inbox_filter("all", false);
+    filter.property_filters.push(PropertyFilter {
+        json_path: "$.thread_id".to_string(),
+        op: FilterOp::Eq,
+        value: SqlValue::Text(THREAD_ID.to_string()),
+    });
+    assert_eq!(
+        note_filter_page_order_clause(&filter),
+        " ORDER BY created_at DESC, id ASC"
+    );
+    assert_eq!(
+        note_filter_page_order_clause(&thread_filter()),
+        " ORDER BY +created_at DESC, id ASC"
+    );
+}
