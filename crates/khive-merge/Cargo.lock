@@ -1415,6 +1415,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook-registry",
  "thiserror",
  "tokio",
  "tokio-util",

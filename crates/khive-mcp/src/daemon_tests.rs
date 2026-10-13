@@ -4548,7 +4548,8 @@ async fn recovery_requires_incumbent_exit_before_spawning() {
         | Err(
             RecoveryError::Spawn(_)
             | RecoveryError::RequestExpired
-            | RecoveryError::PidFileDirectoryUntrusted(_),
+            | RecoveryError::PidFileDirectoryUntrusted(_)
+            | RecoveryError::SupervisedDaemonUnresponsive { .. },
         ) => None,
     };
     let live_pid_file_preserved = pid_file.exists();

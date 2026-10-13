@@ -57,6 +57,29 @@ a responsive incumbent, bypass configuration checks, or replay an ambiguous
 mutation. No permanent “not yours to start” refusal remains on this path. An
 unreadable marker is still a claim; it is not treated as absent.
 
+Degraded bootstrap starts a daemon only where none is alive. If the PID file
+names a live daemon that does not answer and a marker (readable or not) claims
+the rendezvous, the client sends no signal and returns
+`supervised_daemon_unresponsive` (`not_committed`) naming the PID-file pid, the
+marker's job and pid, and the marker path. Restarting that daemon is the
+supervisor's job; a marker left behind by a removed supervisor must be removed
+by hand before clients recover the rendezvous again.
+
+Recovery also requires the socket and the PID file to belong to one
+rendezvous. When exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set and the
+socket does not answer, the request is refused with `rendezvous_split`
+(`not_committed`) before any marker read, signal or spawn; the data names both
+variables and both resolved paths. A socket that answers is forwarded to as
+before. Set both variables for a private rendezvous, or neither.
+
+The daemon records how each incarnation ended in `<pid file>.exit`:
+`running pid=<p> started=<time>` after it claims the PID file, then
+`exited pid=<p> reason=<signal SIGTERM|signal SIGINT|idle|error>
+sender_pid=<n|unknown> at=<time>` when shutdown begins. The next boot logs the
+previous line at WARN on `khive.boot`, or `recorded no exit (killed or crashed)`
+when the record still says running, together with the effective descriptor
+limit (`RLIMIT_NOFILE`).
+
 The launcher probes the socket while holding the lock. If a same-uid
 client-started khive daemon answers, the launcher asks for handover on the same
 credential-bound socket connection. The daemon acknowledges and sends SIGTERM
