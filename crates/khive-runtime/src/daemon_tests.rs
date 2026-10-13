@@ -1100,11 +1100,11 @@ async fn track_background_task_count_returns_to_baseline_after_panic() {
 
 // ── active background phase names (ADR-103) ──────────────────────────
 
-// `#[serial(active_phases)]`: these tests read/assert on the process-wide
-// `ACTIVE_PHASES` static. No other test in this crate touches it today,
-// but the group mirrors the `background_tasks` precedent above so a
-// future addition does not silently reintroduce the same interleaving
-// hazard that motivated it there.
+// `#[serial(active_phases)]`: these tests write the process-wide
+// `ACTIVE_PHASES` static. The demand-retirement tests below read it through
+// `idle_retirement_blockers`, where any registered phase is an idle blocker,
+// so the demand-retirement tests that call it also take `active_phases`.
+// A phase held here while one of them expects retirement turns it red.
 #[test]
 #[serial(active_phases)]
 fn register_active_phase_appears_and_disappears_with_the_guard() {
@@ -1410,7 +1410,7 @@ mod demand_retirement_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn retained_raw_sql_writer_blocks_actual_idle_wait_and_persistent_stays() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1450,9 +1450,16 @@ mod demand_retirement_tests {
         .is_err());
         drop(writer);
         assert_eq!(pool.retirement_writer_holds(), 0);
-        tokio::time::timeout(std::time::Duration::from_secs(2), idle)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), idle)
             .await
-            .unwrap();
+            .is_err()
+        {
+            panic!(
+                "released writer must let the idle wait finish; snapshot {:?}, blockers now {:?}",
+                demand.snapshot(),
+                idle_retirement_blockers(&d)
+            );
+        }
         assert_eq!(demand.snapshot().phase, DaemonLifecyclePhase::Draining);
         assert_eq!(persistent.snapshot().phase, DaemonLifecyclePhase::Serving);
         let pooled = lifecycle(DaemonLifetime::Demand);
@@ -1464,11 +1471,16 @@ mod demand_retirement_tests {
             "pooled writer hold must block retirement"
         );
         drop(pooled_guard);
-        assert!(pooled.try_idle(|| idle_retirement_blockers(&d)));
+        assert!(
+            pooled.try_idle(|| idle_retirement_blockers(&d)),
+            "released pooled writer must allow retirement; snapshot {:?}, blockers now {:?}",
+            pooled.snapshot(),
+            idle_retirement_blockers(&d)
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn persistent_idle_wait_never_retires_after_writer_release() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1502,7 +1514,7 @@ mod demand_retirement_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn explicit_sql_reader_transaction_blocks_retirement_without_writer_hold() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1535,11 +1547,16 @@ mod demand_retirement_tests {
             .idle_blockers
             .contains(&"open_sql_transaction".to_owned()));
         drop(reader);
-        assert!(state.try_idle(|| idle_retirement_blockers(&d)));
+        assert!(
+            state.try_idle(|| idle_retirement_blockers(&d)),
+            "ended reader transaction must allow retirement; snapshot {:?}, blockers now {:?}",
+            state.snapshot(),
+            idle_retirement_blockers(&d)
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn unsettled_named_worker_blocks_idle_without_resetting_clock() {
         let (release, pending) = tokio::sync::oneshot::channel::<()>();
         let task = spawn_named_tracked_task("idle-test-worker", async move {
@@ -1558,7 +1575,9 @@ mod demand_retirement_tests {
         task.await.unwrap();
         assert!(
             state.try_idle(|| idle_retirement_blockers(&d)),
-            "maintenance completion must not reset ordinary activity"
+            "maintenance completion must not reset ordinary activity; snapshot {:?}, blockers now {:?}",
+            state.snapshot(),
+            idle_retirement_blockers(&d)
         );
     }
 
