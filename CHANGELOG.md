@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
+  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
+  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
+  logged on `khive.boot`.
 - Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
   File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
   (#5087).
