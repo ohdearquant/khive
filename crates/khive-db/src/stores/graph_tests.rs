@@ -5522,11 +5522,21 @@ async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() 
         insert_live_entity(&pool, id);
     }
     soft_delete_entity(&pool, e_dead);
-    let (n1, n2, n3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    for id in [n1, n2, n3] {
+    let (n1, n2, n3, n_dead) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [n1, n2, n3, n_dead] {
         insert_note(&pool, id, false);
     }
+    soft_delete_note(&pool, n_dead);
     let (ghost_a, ghost_b) = (Uuid::new_v4(), Uuid::new_v4());
+    // An id held in both tables: the entity base wins, as in the single-purpose count.
+    let both = Uuid::new_v4();
+    insert_live_entity(&pool, both);
+    insert_note(&pool, both, false);
 
     for edge in [
         make_edge(e1, e2, EdgeRelation::Contains, 1.0),
@@ -5535,9 +5545,11 @@ async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() 
         make_edge(n1, e1, EdgeRelation::Annotates, 1.0),
         make_edge(e2, n2, EdgeRelation::Annotates, 1.0),
         make_edge(n2, n3, EdgeRelation::Supports, 1.0),
+        make_edge(both, e3, EdgeRelation::Supports, 1.0),
         make_edge(ghost_a, ghost_b, EdgeRelation::DependsOn, 1.0),
-        // Tombstoned endpoint: out of every count.
+        // Tombstoned endpoints, entity and note: out of every count.
         make_edge(e1, e_dead, EdgeRelation::Contains, 1.0),
+        make_edge(n_dead, e1, EdgeRelation::Annotates, 1.0),
     ] {
         store_a.upsert_edge(edge).await.unwrap();
     }
@@ -5606,6 +5618,7 @@ async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() 
         (
             EdgeRelation::Supports,
             EdgeEndpointBaseCounts {
+                entity_entity: 1,
                 note_note: 1,
                 ..Default::default()
             },
@@ -5651,7 +5664,7 @@ async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() 
         .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
         .await
         .unwrap();
-    assert_eq!(total, 10);
+    assert_eq!(total, 11);
     assert_eq!(
         by_base.total(),
         total,

@@ -3424,17 +3424,35 @@ impl GraphStore for SqlGraphStore {
         self.with_reader(
             "count_edges_by_relation_and_endpoint_base_in_namespaces",
             move |conn| {
-                let source_case = endpoint_base_case("source_id");
-                let target_case = endpoint_base_case("target_id");
                 let mut totals: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = HashMap::new();
                 for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
                     let (where_clause, params) =
                         build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                    // One lookup per endpoint per table answers both questions the
+                    // single-purpose counts ask with separate correlated subqueries:
+                    // liveness as in [`LIVE_ENDPOINTS_CONDITION`] (an endpoint is
+                    // excluded only when present and tombstoned) and the base as in
+                    // [`endpoint_base_case`] (entity first, then note, else none). `id`
+                    // is the primary key of both tables, so each LEFT JOIN matches at
+                    // most one row and never multiplies an edge. The edge filter runs
+                    // in the inner select, where its unqualified columns resolve
+                    // against graph_edges alone.
                     let sql = format!(
-                        "SELECT relation, {source_case} AS source_base, \
-                         {target_case} AS target_base, COUNT(*) \
-                         FROM graph_edges{} GROUP BY relation, source_base, target_base",
-                        with_live_endpoints(&where_clause)
+                        "SELECT e.relation, \
+                         CASE WHEN se.id IS NOT NULL THEN 'entity' \
+                         WHEN sn.id IS NOT NULL THEN 'note' ELSE 'none' END AS source_base, \
+                         CASE WHEN te.id IS NOT NULL THEN 'entity' \
+                         WHEN tn.id IS NOT NULL THEN 'note' ELSE 'none' END AS target_base, \
+                         COUNT(*) \
+                         FROM (SELECT relation, source_id, target_id \
+                         FROM graph_edges{where_clause}) e \
+                         LEFT JOIN entities se ON se.id = e.source_id \
+                         LEFT JOIN notes sn ON sn.id = e.source_id \
+                         LEFT JOIN entities te ON te.id = e.target_id \
+                         LEFT JOIN notes tn ON tn.id = e.target_id \
+                         WHERE se.deleted_at IS NULL AND sn.deleted_at IS NULL \
+                         AND te.deleted_at IS NULL AND tn.deleted_at IS NULL \
+                         GROUP BY e.relation, source_base, target_base"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
