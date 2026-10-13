@@ -1764,7 +1764,10 @@ Every checkpoint publication, after its key's commit record and HEAD are durable
 holds the key's cross-process checkpoint lock, advances one process-wide publication sequence record in
 the memory ANN root, written atomically with the same write-then-rename discipline as the key's commit
 record. The watcher reads that one record each tick and checks per-key identities only when the
-sequence has moved since its last walk. A full per-key walk still runs every 60 ticks (5 minutes) as a
+sequence has moved since its last walk. Two keys publishing at once can read the same value and both
+write its successor, losing one increment. No publication is missed: each publisher reads the sequence
+only after its own commit is durable, so the walk that the first write triggers already sees both
+commits. A full per-key walk still runs every 60 ticks (5 minutes) as a
 backstop for a publisher that stopped between its key's commit and the sequence write. Such a miss
 delays this process's reload of that key by at most the backstop interval. Searches stay correct in
 the meantime, because the fresh tail serves log rows above the installed watermark (ADR-118); the
