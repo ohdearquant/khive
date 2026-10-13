@@ -79,6 +79,7 @@ impl fmt::Display for WriterTaskRequestState {
 pub enum CapacityUnavailablePhase {
     Identity,
     Lock,
+    LockContended,
     Probe,
 }
 
@@ -87,6 +88,7 @@ impl CapacityUnavailablePhase {
         match self {
             Self::Identity => "identity",
             Self::Lock => "lock",
+            Self::LockContended => "lock_contended",
             Self::Probe => "probe",
         }
     }
@@ -449,6 +451,10 @@ impl StorageError {
                 | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }
+                | Self::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::LockContended,
+                    ..
+                }
         )
     }
 
@@ -580,6 +586,46 @@ mod tests {
             "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
         );
         assert_eq!(error.capability(), None);
+    }
+
+    #[test]
+    fn capacity_retryability_distinguishes_contention_from_refusal() {
+        for (phase, label, retryable) in [
+            (None, "floor", false),
+            (Some(CapacityUnavailablePhase::Identity), "identity", false),
+            (Some(CapacityUnavailablePhase::Lock), "lock", false),
+            (
+                Some(CapacityUnavailablePhase::LockContended),
+                "lock_contended",
+                true,
+            ),
+            (Some(CapacityUnavailablePhase::Probe), "probe", false),
+        ] {
+            let error = match phase {
+                Some(phase) => {
+                    assert_eq!(phase.as_str(), label);
+                    assert_eq!(phase.to_string(), label);
+                    StorageError::CapacityUnavailable {
+                        capability: StorageCapability::Sql,
+                        phase,
+                        message: "capacity admission unavailable".into(),
+                    }
+                }
+                None => StorageError::CapacityFloor {
+                    capability: StorageCapability::Sql,
+                    volume: "volume".into(),
+                    available_bytes: 99,
+                    floor_bytes: 100,
+                    required_headroom_bytes: 0,
+                },
+            };
+            assert_eq!(error.is_retryable(), retryable, "{label}");
+            let wrapped = StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source: Box::new(error),
+            };
+            assert_eq!(wrapped.is_retryable(), retryable, "wrapped {label}");
+        }
     }
 
     #[test]

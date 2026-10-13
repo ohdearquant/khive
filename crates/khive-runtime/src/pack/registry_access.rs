@@ -12,8 +12,9 @@ use crate::KhiveRuntime;
 use super::{
     append_audit_event_best_effort, audit_admission_refused_obligation_count,
     audit_admission_refused_obligation_last_at_ms, audit_admission_unresolved_obligation_count,
-    audit_admission_unresolved_obligation_last_at_ms, build_audit_storage_event,
-    fold_audit_obligation, masked_audit_event, VerbRegistry, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    audit_admission_unresolved_obligation_last_at_ms, audit_retry_exhausted_obligation_count,
+    audit_retry_exhausted_obligation_last_at_ms, build_audit_storage_event, fold_audit_obligation,
+    masked_audit_event, VerbRegistry, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 #[cfg(doc)]
 use super::{PackRegistry, RequestIdentity, VerbCategory, VerbRegistryBuilder};
@@ -240,9 +241,11 @@ impl VerbRegistry {
     /// see flush failures and pure-observability degradation instead of the
     /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
     ///
-    /// `admission_refused_obligations` and `admission_unresolved_obligations`
-    /// are sourced separately from [`audit_admission_refused_obligation_count`]
-    /// and [`audit_admission_unresolved_obligation_count`] rather than from
+    /// `admission_refused_obligations`, `retry_exhausted_obligations`,
+    /// and `admission_unresolved_obligations`
+    /// are sourced separately from [`audit_admission_refused_obligation_count`],
+    /// [`audit_retry_exhausted_obligation_count`], and
+    /// [`audit_admission_unresolved_obligation_count`] rather than from
     /// `batch.health_metrics()`: they count a decision made in
     /// `append_audit_event_best_effort` (ADR-103 Amendment 3 / ADR-133
     /// Amendment 1), not a property of the batch itself, so they are
@@ -258,6 +261,9 @@ impl VerbRegistry {
                 admission_refused_obligations: audit_admission_refused_obligation_count(),
                 admission_refused_obligations_last_at_ms:
                     audit_admission_refused_obligation_last_at_ms(),
+                retry_exhausted_obligations: audit_retry_exhausted_obligation_count(),
+                retry_exhausted_obligations_last_at_ms: audit_retry_exhausted_obligation_last_at_ms(
+                ),
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
                 admission_unresolved_obligations_last_at_ms:
                     audit_admission_unresolved_obligation_last_at_ms(),

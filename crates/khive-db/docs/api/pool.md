@@ -106,8 +106,10 @@ owned-connection settlement.
 Admission compares available space with the reserve plus required headroom. If
 that sum is nonzero, space at or below it returns `CapacityFloor` before the
 logical write runs; addition overflow also refuses. `CapacityUnavailable` distinguishes
-`identity`, `lock` and `probe` failures; neither capacity outcome requests an
-automatic retry. A thread that already holds the same volume lease is refused
+`identity`, `lock`, `lock_contended` and `probe` phases. Only `lock_contended`,
+where the guard deadline elapsed waiting for the lease, is retryable within the
+caller's bounded retry budget. Floor refusal and the other unavailable phases
+remain non-retryable. A thread that already holds the same volume lease is refused
 immediately with `VolumeLeaseReentry`, naming the holder and requester sites.
 Cross-thread contention instead waits within the guard deadline. A manual atomic
 unit's lease is detached from the thread that took it, so a later request from
