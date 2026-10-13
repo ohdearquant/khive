@@ -6754,6 +6754,96 @@ mod channel_ingest_disposition_tests {
             "permanent failures bypass the unknown budget"
         );
     }
+
+    /// The classification names only the error variant ("InvalidInput"); the
+    /// operator needs the refusal itself to tell one cause from another. Both
+    /// warn lines a failed ingest can produce must carry it.
+    #[tokio::test]
+    async fn ingest_failure_warnings_carry_the_ingest_error_text() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let log = CapturedLog::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish(),
+        );
+        // An empty registry has no blob or comm verbs, so the quarantine
+        // attempt on the last call fails and reaches the second warn line.
+        let registry = khive_runtime::VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+        let envelope = khive_channel::ChannelEnvelope::new(
+            "email:sender@example.com",
+            "email:owner@example.com",
+            "body",
+        )
+        .with_external_id("imap:h:1:11");
+        let error =
+            khive_runtime::RuntimeError::InvalidInput("ingest refusal marker 5f2c".to_string());
+        assert!(matches!(
+            error.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Unknown { .. }
+        ));
+
+        let mut attempts = HashMap::new();
+        for _ in 0..UNKNOWN_INGEST_QUARANTINE_THRESHOLD {
+            let handled = handle_channel_ingest_failure(
+                &registry,
+                "local",
+                ("email", "owner@example.com"),
+                None,
+                &envelope,
+                &error,
+                &mut attempts,
+                None,
+            )
+            .await;
+            assert!(!handled, "no call may report the message handled");
+        }
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let holds: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("comm.ingest failed; holding channel progress"))
+            .collect();
+        let quarantine_failed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("channel quarantine failed; holding progress for retry"))
+            .collect();
+        assert_eq!(
+            holds.len(),
+            usize::from(UNKNOWN_INGEST_QUARANTINE_THRESHOLD - 1),
+            "{text}"
+        );
+        assert_eq!(quarantine_failed.len(), 1, "{text}");
+        for line in holds.iter().chain(&quarantine_failed) {
+            assert!(
+                line.contains("ingest_error=invalid input: ingest refusal marker 5f2c"),
+                "{line}"
+            );
+        }
+    }
 }
 
 // --- log_eligible_poll_failure: edge-triggered warn ---
