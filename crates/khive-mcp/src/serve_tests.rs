@@ -1708,9 +1708,21 @@ async fn db_diagnostics_lists_main_and_routed_secondary() {
     assert_eq!(databases.len(), 1, "{result}");
     assert_eq!(databases[0]["backend_names"], serde_json::json!(["second"]));
     assert_eq!(
-        result["db_path"],
-        serde_json::json!(second_path.canonicalize().unwrap().display().to_string()),
+        databases[0]["path"],
+        serde_json::json!(second_path.canonicalize().unwrap().display().to_string())
+    );
+    // The root fields are the first inspected report's own, which carries the
+    // path the database was opened with (not canonicalized: on macOS the temp
+    // dir is reached through the /var -> /private/var link).
+    assert_eq!(
+        result["db_path"], databases[0]["diagnostics"]["db_path"],
         "the root fields describe the selected backend"
+    );
+    assert!(
+        result["db_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("second.db")),
+        "the root fields describe the selected backend: {result}"
     );
     assert!(result["size_composition"].is_null(), "{result}");
     assert_eq!(
