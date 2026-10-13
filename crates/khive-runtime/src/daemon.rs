@@ -1817,15 +1817,19 @@ where
         Incumbent::Stale => {}
     }
 
+    // Register the sender recorder before the shutdown streams below. The
+    // signal registry runs a signal's actions in registration order, so the
+    // recorder stores the sender before tokio's action wakes the shutdown
+    // path; registered after it, the exit record can say sender_pid=unknown.
+    if let Err(error) = exit_record::capture_signal_senders() {
+        tracing::warn!(target: "khive.boot", error = %error, "signal sender capture unavailable; the exit record will say sender_pid=unknown");
+    }
     // Install signal streams before publishing either rendezvous file. A
     // supervisor may stop us as soon as connect/pid checks succeed, before
     // the accept loop or shutdown future has been polled. Keep these streams
     // alive so a signal during the rest of startup reaches normal cleanup.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    if let Err(error) = exit_record::capture_signal_senders() {
-        tracing::warn!(target: "khive.boot", error = %error, "signal sender capture unavailable; the exit record will say sender_pid=unknown");
-    }
 
     let pid_file_guard = match write_pid_file_exclusive(&pid_file) {
         Ok(guard) => guard,

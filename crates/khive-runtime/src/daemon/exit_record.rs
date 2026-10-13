@@ -50,12 +50,20 @@ pub(super) fn exit_record_path(pid_file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Logged on `khive.boot` when the sender recorder is registered for a signal
+/// that already has a handler.
+pub(super) const SENDER_CAPTURE_LATE: &str = "signal sender capture registered after another handler for this signal; a shutdown it starts can be recorded with sender_pid=unknown";
+
 /// Record the sender of the first SIGTERM/SIGINT this process receives.
 ///
 /// The action is registered through `signal-hook-registry`, the same registry
 /// tokio's signal streams use, which runs every action registered for a
-/// signal; the daemon's shutdown streams are unaffected. Registered at most
-/// once per process.
+/// signal in registration order; the daemon's shutdown streams are
+/// unaffected. Call it before the shutdown streams are created: an action
+/// registered after tokio's runs after tokio has woken the shutdown path,
+/// which can then write the exit record before the sender is stored. A signal
+/// that already has a handler at registration is logged with
+/// [`SENDER_CAPTURE_LATE`]. Registered at most once per process.
 pub(super) fn capture_signal_senders() -> std::io::Result<()> {
     static INSTALLED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
     let mut installed = INSTALLED
@@ -64,7 +72,19 @@ pub(super) fn capture_signal_senders() -> std::io::Result<()> {
     if *installed {
         return Ok(());
     }
-    for signal in [libc::SIGTERM, libc::SIGINT] {
+    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
+        match has_handler(signal) {
+            Ok(true) => {
+                tracing::warn!(target: "khive.boot", signal = name, "{SENDER_CAPTURE_LATE}")
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                target: "khive.boot",
+                signal = name,
+                error = %error,
+                "could not read the signal disposition before registering the sender recorder"
+            ),
+        }
         // SAFETY: the action performs one atomic compare-exchange on a static
         // and reads one field of the kernel-supplied siginfo; it allocates
         // nothing and takes no lock, so it is async-signal-safe.
@@ -72,6 +92,20 @@ pub(super) fn capture_signal_senders() -> std::io::Result<()> {
     }
     *installed = true;
     Ok(())
+}
+
+/// Whether `signal` already has a handler function installed. `SIG_DFL` and
+/// `SIG_IGN` are not handlers: a parent shell may start the daemon with
+/// SIGINT ignored.
+fn has_handler(signal: libc::c_int) -> std::io::Result<bool> {
+    // SAFETY: an all-zero `sigaction` is a valid value of this plain C struct.
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: with a null new action, sigaction only writes the current
+    // disposition into `current`, which this frame owns.
+    if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(current.sa_sigaction != libc::SIG_DFL && current.sa_sigaction != libc::SIG_IGN)
 }
 
 fn record_signal_sender(info: &libc::siginfo_t) {

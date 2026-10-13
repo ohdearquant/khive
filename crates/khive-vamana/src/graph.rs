@@ -56,6 +56,9 @@ use crate::{
     error::{Result, VamanaError},
 };
 
+mod frontier;
+use frontier::Frontier;
+
 const BUILD_BATCH_SIZE: usize = 1024;
 const MEDOID_SAMPLE_K: usize = 1000;
 const BUILD_SEED: u64 = 0x5641_4d41_4e41;
@@ -693,13 +696,6 @@ impl VamanaGraph {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Candidate {
-    id: u32,
-    distance: f32,
-    expanded: bool,
-}
-
 // REASON: greedy_search_inner requires nine parameters to avoid bundling them into
 // a struct that would add allocation overhead on the hot search path. The extra
 // `tombstones` parameter is `None` during build (no tombstones exist) and
@@ -734,26 +730,11 @@ pub(crate) fn greedy_search_inner(
     let start_dist = l2_squared(query, row(vectors, dimensions, start));
     visited.mark_if_new(start as usize);
 
-    let mut frontier = vec![Candidate {
-        id: start,
-        distance: start_dist,
-        expanded: false,
-    }];
+    let mut frontier = Frontier::new(effective_l);
+    frontier.insert(start, start_dist);
     let mut expanded: Vec<(u32, f32)> = Vec::new();
 
-    while let Some((best_idx, _)) = frontier
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !c.expanded)
-        .min_by(|(_, a), (_, b)| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        })
-    {
-        let current_id = frontier[best_idx].id;
-        let current_dist = frontier[best_idx].distance;
-        frontier[best_idx].expanded = true;
+    while let Some((current_id, current_dist)) = frontier.take_next() {
         expanded.push((current_id, current_dist));
 
         for &neighbor in &adjacency[current_id as usize] {
@@ -770,33 +751,15 @@ pub(crate) fn greedy_search_inner(
                 continue;
             }
             let d = l2_squared(query, row(vectors, dimensions, neighbor));
-            frontier.push(Candidate {
-                id: neighbor,
-                distance: d,
-                expanded: false,
-            });
-        }
-
-        frontier.sort_unstable_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        frontier.dedup_by_key(|c| c.id);
-        if frontier.len() > effective_l {
-            frontier.truncate(effective_l);
+            frontier.insert(neighbor, d);
         }
     }
 
-    frontier.sort_unstable_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-
     // Filter tombstoned nodes from the result set (defense-in-depth for the no-repair
-    // control path and crash-truncated repair windows pre-PR4).
+    // control path and crash-truncated repair windows pre-PR4). The frontier is already
+    // sorted by (distance, id).
     let results = frontier
+        .candidates()
         .iter()
         .filter(|c| {
             tombstones
@@ -904,30 +867,14 @@ pub(crate) fn greedy_search_inner_sq8(
     let start_dist = codec.l2_sq_codes(query_enc, encoded.code(start as usize));
     visited.mark_if_new(start as usize);
 
-    let mut frontier = vec![Candidate {
-        id: start,
-        distance: start_dist,
-        expanded: false,
-    }];
+    let mut frontier = Frontier::new(effective_l);
+    frontier.insert(start, start_dist);
     let mut expanded: Vec<(u32, f32)> = Vec::new();
 
-    while let Some((best_idx, _)) = frontier
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !c.expanded)
-        .min_by(|(_, a), (_, b)| {
-            // Tiebreak equal SQ8 codes with exact f32; different f32 vectors can
-            // map to the same u8 code (clamped or low-resolution dimensions).
-            a.distance.total_cmp(&b.distance).then_with(|| {
-                let fa = l2_squared(query, row(vectors, dimensions, a.id));
-                let fb = l2_squared(query, row(vectors, dimensions, b.id));
-                fa.total_cmp(&fb).then_with(|| a.id.cmp(&b.id))
-            })
-        })
-    {
-        let current_id = frontier[best_idx].id;
-        let current_dist = frontier[best_idx].distance;
-        frontier[best_idx].expanded = true;
+    // The frontier orders candidates by SQ8 distance, equal codes by node id. Distinct
+    // f32 vectors can map to the same u8 code, but the exact f32 re-score below decides
+    // the returned top-k, so ties are not resolved with f32 distances inside the loop.
+    while let Some((current_id, current_dist)) = frontier.take_next() {
         expanded.push((current_id, current_dist));
 
         for &neighbor in &adjacency[current_id as usize] {
@@ -940,27 +887,7 @@ pub(crate) fn greedy_search_inner_sq8(
                 continue;
             }
             let d = codec.l2_sq_codes(query_enc, encoded.code(neighbor as usize));
-            frontier.push(Candidate {
-                id: neighbor,
-                distance: d,
-                expanded: false,
-            });
-        }
-
-        // Sort by SQ8 distance; tiebreak with exact f32 to correctly order
-        // vectors that map to the same u8 code (e.g., out-of-range queries).
-        // f32 tiebreaking fires only when SQ8 distances are exactly equal —
-        // negligible cost in production (384-d embeddings, distinct codes).
-        frontier.sort_unstable_by(|a, b| {
-            a.distance.total_cmp(&b.distance).then_with(|| {
-                let fa = l2_squared(query, row(vectors, dimensions, a.id));
-                let fb = l2_squared(query, row(vectors, dimensions, b.id));
-                fa.total_cmp(&fb).then_with(|| a.id.cmp(&b.id))
-            })
-        });
-        frontier.dedup_by_key(|c| c.id);
-        if frontier.len() > effective_l {
-            frontier.truncate(effective_l);
+            frontier.insert(neighbor, d);
         }
     }
 
@@ -968,6 +895,7 @@ pub(crate) fn greedy_search_inner_sq8(
     // for acquisition, exact f32 for final selection). Re-scoring before sorting
     // ensures that frontier candidates are ranked by exact f32 before top-k selection.
     let mut rescored: Vec<(u32, f32)> = frontier
+        .candidates()
         .iter()
         .filter(|c| {
             tombstones
@@ -1021,7 +949,7 @@ pub(crate) fn robust_prune_inner_sq8(
         pool.push((candidate, d2));
     }
 
-    // Tiebreak equal SQ8 codes with exact f32 to match greedy_search_inner_sq8 ordering.
+    // Tiebreak equal SQ8 codes with exact f32: distinct f32 vectors can map to the same u8 code.
     let node_vec = row(vectors, dimensions, node);
     pool.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
         a_d.total_cmp(b_d).then_with(|| {
@@ -1227,6 +1155,10 @@ mod build_parity_tests;
 #[cfg(test)]
 #[path = "graph_build_scratch_tests.rs"]
 mod build_scratch_tests;
+
+#[cfg(test)]
+#[path = "graph_frontier_search_tests.rs"]
+mod frontier_search_tests;
 
 #[cfg(test)]
 mod tests {
