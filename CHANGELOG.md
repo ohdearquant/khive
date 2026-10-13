@@ -23,8 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, and `size_composition=false` to skip the `dbstat` walk, which reads every page of
   each file. Every file-backed report now carries `page_accounting` (`page_size_bytes`,
   `page_count`, `freelist_pages`), three pragma reads that are reported either way.
+- `memory.recall` accepts `include_timings=true`, which returns this call's retrieval stage
+  wall times (`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us`, `hydrate_us`, `null` for a
+  stage that did not run), `total_us`, `retrieval_rounds`, and per-round `candidate_limit`,
+  `text_hits`, `vector_hits`, `hydrated` and `eligible` counts. An array response becomes
+  `{results, timings}`; an object response gains `timings`. No environment variable or
+  restart is needed; `KHIVE_RECALL_PROFILE` keeps working as before.
 
 ### Changed
+
+- `memory.recall` with `fusion_strategy="keyword_only"` no longer embeds the query or searches
+  the vector index, and `fusion_strategy="vector_only"` no longer runs the full-text search.
+  The saved work was most of the cost of a `keyword_only` recall that finds no text match.
+  `keyword_only` no longer applies the vector `min_raw_relevance` floor; its hits carry
+  `raw_score: null` and `score` is the composite; rank order is unchanged. Widening re-runs
+  only the arm the strategy keeps and stops when that arm is exhausted. A `keyword_only`
+  recall therefore never reports `degraded`, and a verbose `keyword_only` request on a
+  multi-model store returns the ordinary shapes instead of the `vector_candidates_per_model`
+  envelope, since no vector recall ran.
+
+- A `keyword_only` recall whose query the embedder cannot embed now returns its text hits
+  instead of failing with `recall: all embedding engines failed`, and a `vector_only` recall
+  whose full-text table is unreadable now returns its vector hits instead of failing.
 
 - `memory.recall` leaves an English-only embedding model's vector list out of fusion when the
   query is CJK-dominant (its CJK characters outnumber its other letters). Today that model is

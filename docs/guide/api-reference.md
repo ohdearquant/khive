@@ -1544,6 +1544,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
 | `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
 | `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
 | `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
@@ -1559,6 +1560,18 @@ Each result also carries canonical `full_id`; pass it directly to
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
+
+`keyword_only` runs only the full-text search: the query is not embedded and the
+vector index is not searched, so such a recall never reports `degraded`.
+`vector_only` runs only the vector search.
+
+`include_timings=true` adds a `timings` object: `total_us`, the stage wall times
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
+stage did not run; the text and vector searches run concurrently, so the stages do
+not add up), `retrieval_rounds`, and `rounds[]` with each round's
+`candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
+and stage times. An array response becomes `{results, timings}`; an object
+response keeps its fields and gains `timings`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
