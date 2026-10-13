@@ -216,7 +216,7 @@ impl VolumeIdentity {
         #[cfg(any(unix, windows))]
         loop {
             if Instant::now() >= deadline {
-                return Err(LeaseRefusal::TimedOut(lock_error(format!(
+                return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
                     "timed out after {} ms waiting for volume lease",
                     timeout.as_millis()
                 ))));
@@ -234,7 +234,7 @@ impl VolumeIdentity {
                 Err(fs4::TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Err(LeaseRefusal::TimedOut(lock_error(format!(
+                        return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
                             "timed out after {} ms waiting for volume lease",
                             timeout.as_millis()
                         ))));
@@ -474,7 +474,7 @@ fn acquire_process_slot(
     let current = std::thread::current().id();
     let mut slots = registry.slots.lock();
     if Instant::now() >= deadline {
-        return Err(LeaseRefusal::TimedOut(lock_error(
+        return Err(LeaseRefusal::TimedOut(lock_contended_error(
             "timed out waiting for in-process volume lease",
         )));
     }
@@ -514,7 +514,7 @@ fn acquire_process_slot(
             }
             drop(slots);
             registry.available.notify_all();
-            return Err(LeaseRefusal::TimedOut(lock_error(
+            return Err(LeaseRefusal::TimedOut(lock_contended_error(
                 "timed out waiting for in-process volume lease",
             )));
         }
@@ -629,6 +629,13 @@ fn lock_error(message: impl Into<String>) -> SqliteError {
     }
 }
 
+fn lock_contended_error(message: impl Into<String>) -> SqliteError {
+    SqliteError::CapacityUnavailable {
+        phase: CapacityUnavailablePhase::LockContended,
+        message: message.into(),
+    }
+}
+
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
@@ -712,7 +719,7 @@ mod tests {
         assert!(matches!(
             error,
             SqliteError::CapacityUnavailable {
-                phase: CapacityUnavailablePhase::Lock,
+                phase: CapacityUnavailablePhase::LockContended,
                 ..
             }
         ));
@@ -720,6 +727,26 @@ mod tests {
         second
             .acquire_in(Duration::from_millis(100), &lock_dir)
             .expect("dropping the first lease releases both lock layers");
+    }
+
+    #[test]
+    fn missing_lock_directory_is_refused_without_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = VolumeIdentity::resolve(&dir.path().join("a.db")).unwrap();
+        let error = identity
+            .acquire(Duration::from_millis(100), None)
+            .err()
+            .expect("a missing configured lock directory cannot attempt a lease");
+        assert!(
+            matches!(
+                &error,
+                LeaseRefusal::Refused(SqliteError::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::Lock,
+                    message,
+                }) if message == "writable SQLite pool has no configured volume-lock directory"
+            ),
+            "{error:?}"
+        );
     }
 
     // MUST-FAIL: keying the in-process slot by the volume alone under the test
@@ -781,7 +808,7 @@ mod tests {
             matches!(
                 &error,
                 SqliteError::CapacityUnavailable {
-                    phase: CapacityUnavailablePhase::Lock,
+                    phase: CapacityUnavailablePhase::LockContended,
                     message,
                 } if message.contains("in-process")
             ),
@@ -854,7 +881,7 @@ mod tests {
             "timeout" => assert!(matches!(
                 result,
                 Err(SqliteError::CapacityUnavailable {
-                    phase: CapacityUnavailablePhase::Lock,
+                    phase: CapacityUnavailablePhase::LockContended,
                     ..
                 })
             )),
