@@ -329,7 +329,7 @@ pub struct RendezvousSplit {
 /// `Some` when exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set.
 ///
 /// The one predicate for a split rendezvous: the daemon refuses to boot on it
-/// ([`ensure_rendezvous_overrides_paired`], #2656) and a client refuses
+/// (`ensure_rendezvous_overrides_paired`, #2656) and a client refuses
 /// lifecycle recovery on it (ADR-185 Amendment 5), because recovery reads a
 /// supervisor marker derived from the socket and signals the process named by
 /// the PID file, and with a split rendezvous those belong to different daemons.
