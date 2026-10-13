@@ -468,6 +468,68 @@ fn bench_stats(c: &mut Criterion) {
     group.finish();
 }
 
+// ── note pages across visible namespaces ──────────────────────────────────────
+
+fn bench_list_notes_visible(c: &mut Criterion) {
+    use khive_runtime::Namespace;
+    use khive_storage::note::NoteFilter;
+
+    let rt = tokio_rt();
+    let (runtime, _) = build_registry();
+    let ns_a = Namespace::parse("bench-list-a").expect("namespace");
+    let ns_b = Namespace::parse("bench-list-b").expect("namespace");
+    // A token that reads its own namespace and one more, as an actor configured
+    // with a second visible namespace does, and a token that reads one.
+    let both = runtime
+        .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+        .expect("token");
+    let only_b = runtime.authorize(ns_b).expect("token");
+
+    rt.block_on(async {
+        let only_a = runtime.authorize(ns_a).expect("token");
+        for i in 0..5000 {
+            for token in [&only_a, &only_b] {
+                runtime
+                    .create_note(
+                        token,
+                        "observation",
+                        None,
+                        &format!("bench listed note {i}"),
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                    .expect("seed note");
+            }
+        }
+    });
+
+    let mut group = c.benchmark_group("kg_list_notes");
+    group.sample_size(50);
+
+    for (label, token) in [
+        ("two_namespaces_10000_limit20", &both),
+        ("one_namespace_5000_limit20", &only_b),
+    ] {
+        group.bench_function(label, |b| {
+            b.to_async(&rt).iter(|| {
+                let runtime = &runtime;
+                async move {
+                    let page = runtime
+                        .list_notes_filtered(token, black_box(NoteFilter::default()), 20, 0)
+                        .await
+                        .expect("list notes");
+                    assert_eq!(page.len(), 20);
+                    black_box(page)
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // ── criterion entry points ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -480,5 +542,6 @@ criterion_group!(
     bench_neighbors,
     bench_traverse,
     bench_stats,
+    bench_list_notes_visible,
 );
 criterion_main!(kg_benches);
