@@ -9,6 +9,7 @@ pub(crate) mod pack;
 pub(crate) mod params;
 pub(crate) mod vocab;
 
+pub use handlers::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
 pub use pack::CommPack;
 
 #[cfg(test)]

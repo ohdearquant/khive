@@ -47,6 +47,7 @@ mod inbox;
 mod ingest;
 #[cfg(test)]
 mod ingest_degradation_tests;
+mod outbox_scan;
 mod parameter_aliases;
 mod probe_cursor;
 mod quarantine_heartbeat;
@@ -63,6 +64,7 @@ pub(crate) use thread::handle_thread;
 #[cfg(test)]
 use health::channel_stalled;
 pub(crate) use health::handle_health;
+pub use outbox_scan::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
 
 #[cfg(test)]
 use inbox::wait_for_inbox_response;

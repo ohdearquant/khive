@@ -342,6 +342,15 @@ pub(crate) async fn handle_heartbeat(
     let p: HeartbeatParams = serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("heartbeat: bad params: {e}")))?;
 
+    persist_heartbeat(runtime, token, p, None).await
+}
+
+pub(super) async fn persist_heartbeat(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    p: HeartbeatParams,
+    outbox_scan: Option<super::outbox_scan::OutboxScan>,
+) -> Result<Value, RuntimeError> {
     if p.channel_kind.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "heartbeat: `channel_kind` must not be empty".into(),
@@ -387,6 +396,10 @@ pub(crate) async fn handle_heartbeat(
     // every dispatch (subhandlers included) is the sole authorization
     // boundary here (ADR-018) — this handler must not layer a second,
     // handler-local namespace check on top of it.
+    // The Rust-only outbox writer instead supplies the token its comm-backend
+    // runtime authorized for the scanned message namespace. It shares this
+    // guarded persistence helper, never dispatches a wire verb, and cannot
+    // redirect a write through a JSON namespace field.
     //
     // The local single-tenant poll loop (`khive-mcp`'s
     // `record_channel_heartbeat`) is unaffected: it always passes
@@ -434,31 +447,35 @@ pub(crate) async fn handle_heartbeat(
 
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
-    props["last_poll_attempt_at"] = json!(at);
-    if let Some(poll_interval_secs) = p.poll_interval_secs {
-        props["poll_interval_secs"] = json!(poll_interval_secs);
-    }
+    if let Some(scan) = outbox_scan {
+        super::outbox_scan::update_properties(&mut props, scan)?;
+    } else {
+        props["last_poll_attempt_at"] = json!(at);
+        if let Some(poll_interval_secs) = p.poll_interval_secs {
+            props["poll_interval_secs"] = json!(poll_interval_secs);
+        }
 
-    match outcome {
-        "success" => {
-            props["last_success_at"] = json!(at);
-            props["consecutive_failures"] = json!(0);
-            // last_error is intentionally left untouched — design review amendment 3.
+        match outcome {
+            "success" => {
+                props["last_success_at"] = json!(at);
+                props["consecutive_failures"] = json!(0);
+                // last_error is intentionally left untouched — design review amendment 3.
+            }
+            "failure" => {
+                props["last_failure_at"] = json!(at);
+                let prev_failures = props
+                    .get("consecutive_failures")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                props["consecutive_failures"] = json!(prev_failures + 1);
+                props["last_error"] = json!({
+                    "class": p.error_class.clone().unwrap_or_default(),
+                    "message": p.error_message.clone().unwrap_or_default(),
+                    "at": at,
+                });
+            }
+            _ => unreachable!("outcome already validated above"),
         }
-        "failure" => {
-            props["last_failure_at"] = json!(at);
-            let prev_failures = props
-                .get("consecutive_failures")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            props["consecutive_failures"] = json!(prev_failures + 1);
-            props["last_error"] = json!({
-                "class": p.error_class.clone().unwrap_or_default(),
-                "message": p.error_message.clone().unwrap_or_default(),
-                "at": at,
-            });
-        }
-        _ => unreachable!("outcome already validated above"),
     }
 
     khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;

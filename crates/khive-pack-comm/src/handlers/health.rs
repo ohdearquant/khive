@@ -49,6 +49,15 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
         .and_then(Value::as_u64)
         .filter(|interval| *interval > 0);
     let stalled = channel_stalled(&props, as_of);
+    let outbox = outbox_health_to_json(&props, as_of);
+    let inbound_failures = if outbox.is_some() && props.get("last_poll_attempt_at").is_none() {
+        Value::Null
+    } else {
+        props
+            .get("consecutive_failures")
+            .cloned()
+            .unwrap_or(json!(0))
+    };
     json!({
         "channel_kind": props.get("channel_kind").cloned().unwrap_or(Value::Null),
         "channel_slug": props.get("channel_slug").cloned().unwrap_or(Value::Null),
@@ -58,9 +67,67 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
         "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
-        "consecutive_failures": props.get("consecutive_failures").cloned().unwrap_or(json!(0)),
+        "consecutive_failures": inbound_failures,
+        "outbox": outbox,
         "quarantined_count": quarantined_count,
     })
+}
+
+fn outbox_health_to_json(props: &Value, as_of: &DateTime<Utc>) -> Option<Value> {
+    let outbox = props.get("outbox")?.as_object()?;
+    let interval = outbox
+        .get("scan_interval_secs")
+        .and_then(Value::as_u64)
+        .filter(|interval| *interval > 0);
+    let completed_at = outbox
+        .get("last_scan_completed_at")
+        .and_then(Value::as_str)
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .filter(|at| at <= as_of);
+    let stalled = interval.and_then(|interval| {
+        let threshold = interval
+            .checked_mul(STALLED_AFTER_INTERVALS)?
+            .checked_mul(1_000)?;
+        let elapsed = u64::try_from(
+            as_of
+                .signed_duration_since(completed_at?)
+                .num_milliseconds(),
+        )
+        .ok()?;
+        Some(elapsed > threshold)
+    });
+    let oldest_pending_age_secs = outbox
+        .get("oldest_pending_created_at")
+        .and_then(Value::as_str)
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .filter(|at| at <= as_of)
+        .and_then(|at| u64::try_from(as_of.signed_duration_since(at).num_seconds()).ok());
+    let mut projected = serde_json::Map::new();
+    for field in [
+        "last_scan_completed_at",
+        "last_scan_succeeded",
+        "last_success_at",
+        "last_failure_at",
+        "consecutive_failures",
+        "last_error",
+        "pending_rows_seen",
+        "pending_rows_limit",
+        "oldest_pending_created_at",
+    ] {
+        projected.insert(
+            field.into(),
+            outbox.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    projected.insert("scan_interval_secs".into(), json!(interval));
+    projected.insert("stalled".into(), json!(stalled));
+    projected.insert(
+        "oldest_pending_age_secs".into(),
+        json!(oldest_pending_age_secs),
+    );
+    Some(Value::Object(projected))
 }
 
 #[derive(Default)]
@@ -145,9 +212,14 @@ fn quarantine_only_channel_to_json(
         "last_failure_at": Value::Null,
         "last_error": Value::Null,
         "consecutive_failures": Value::Null,
+        "outbox": Value::Null,
         "quarantined_count": quarantined_count,
     })
 }
+
+#[cfg(test)]
+#[path = "outbox_health_tests.rs"]
+mod outbox_health_tests;
 
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
