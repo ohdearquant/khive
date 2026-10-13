@@ -653,6 +653,9 @@ pub(super) async fn probe_daemon_identity(
             | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::RequestTooLarge { .. }) => ProbeOutcome::Timeout,
+        // The probe frame was written and no answer came before the probe
+        // deadline: a slow peer, never evidence that it is dead.
+        Ok(ForwardOutcome::ResponseTimeout { .. }) => ProbeOutcome::Timeout,
         Ok(ForwardOutcome::Unreachable {
             kind,
             os_error_code,

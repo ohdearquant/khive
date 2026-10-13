@@ -1691,9 +1691,10 @@ The HOME boot/recovery lock still serializes startup and client recovery for
 one rendezvous. This amendment adds a separate store claim; it does not
 replace that lock or extend daemon ownership to non-daemon writers.
 
-## Amendment 14 (2026-10-12): a forwarding client opens no store until it serves locally
+## Amendment 14 (2026-10-12): strict forwarding by default and a named slow-daemon outcome
 
-**Status**: Proposed.
+**Status**: Accepted 2026-10-12. Decisions 2 and 3 are accepted; Decision 1 is withdrawn (see
+Decision 1).
 
 ### Context
 
@@ -1726,20 +1727,32 @@ tell a slow daemon from a dead one, or count either.
 
 ### Decision
 
-**1. Lazy store-backed registry.** A forwarding client (Unix, not `--daemon`, `KHIVE_NO_DAEMON`
-unset) whose main backend is file-backed opens no SQLite backend at boot. Boot builds the pack
-registry, verb catalog and tool description from pack metadata, and the bridge state. The
-store-backed registry (backend opens, migrations, pack schema plans, boot repairs) is built once,
-on the first request the client serves locally under the cases listed above, and reused after
-that. Concurrent first requests share one build. A build failure fails that request with the
-build error and is retried by the next local request; it never becomes a fallback to anything
-else. A daemon, a `KHIVE_NO_DAEMON` host and an in-memory client keep the eager build.
+**1. Lazy store-backed registry: withdrawn.** As proposed, a forwarding client whose main backend
+is file-backed would have opened no SQLite backend at boot, built its catalog from pack metadata,
+and built the store-backed registry once, on its first local request. Measured after the per-
+connection page cache was capped at 8 MiB and the legacy quarantine repair was skipped in
+forwarding clients, a forwarding client boots in about 90 ms (warm, process start to its last boot
+line) and holds 17 MB physical footprint idle and 17 to 18 MB after serving requests, against
+303 MB before those two changes. At that cost the lazy build saves too little to justify building a
+verb catalog without pack runtimes and keeping the client's daemon identity equal to the eager
+path's.
+
+What the decision would still have bought is a client that never creates a store the daemon owns
+and never runs migrations beside the daemon. A narrower form that keeps only that property needs a
+no-create open mode through the pool and backend open for every configured store; migrations and
+pack schema plans skipped in forwarding clients; a client that starts the daemon first when a store
+is absent, so that the first run on a fresh host still works; and an audit of the other boot-time
+file writers (vector segment directories, the events sidecar, the attachment cutover). It is left
+to its own change. Forwarding clients keep the eager build.
 
 **2. Strict by default when a rendezvous is present.** `KHIVE_DAEMON_STRICT` becomes a tri-state:
 a truthy value is strict, an explicit false value (`0`, `false`, `no`, `off`) is not strict, and
-unset means strict exactly when a daemon rendezvous is present at the fallback decision. A
-rendezvous is present when the client's resolved socket path or PID file
-(`khive_runtime::daemon::socket_path`, `pid_path`) exists on disk. Under strict mode a request
+unset means strict exactly when a daemon rendezvous was present when the request entered the
+forward path, or is present at the fallback decision. A rendezvous is present when the client's
+resolved socket path or PID file (`khive_runtime::daemon::socket_path`, `pid_path`) exists on disk.
+The entry reading matters because recovery removes a dead daemon's socket and PID file before it
+respawns: read only at the decision, a host whose daemon just died would look like a host that never
+ran one. Under strict mode a request
 that would fall back is rejected with its reason code, as Amendment 2 already specifies for
 `KHIVE_DAEMON_STRICT=1`. With no rendezvous on disk, the quiet `no_socket` fallback of
 Amendment 2 is unchanged. The sanctioned way to run without a daemon stays `KHIVE_NO_DAEMON=1`.
@@ -1765,22 +1778,23 @@ every existing field keeps its meaning.
 
 ### Acceptance
 
-1. A forwarding client booted on a file-backed configuration whose store files do not exist
-   creates none of them, and answers a tool listing and a planning request without creating them.
-   The probe on the built binary reads physical footprint and boot time, not RSS.
-2. The first `save_to` request builds the registry once, including under concurrent first
-   requests; a second local request reuses it.
+1. Withdrawn with Decision 1.
+2. Withdrawn with Decision 1.
 3. With a socket file present but refusing, a request is rejected with `no_socket` when
    `KHIVE_DAEMON_STRICT` is unset, falls back when it is `0`, and falls back quietly when neither
-   socket nor PID file exists.
+   socket nor PID file exists. With a PID file naming a process that has exited and no socket, a
+   request is rejected with `no_socket` when `KHIVE_DAEMON_STRICT` is unset, although recovery
+   removes that PID file before the decision.
 4. A boot-fence probe timeout returns `daemon_slow` with `phase: "before_dispatch"` and
    `not_committed`; a post-write read timeout returns `daemon_slow` with `phase: "after_write"`
    and `unknown`; a post-write connection reset returns `daemon_connection_lost`.
 5. `bridge.diagnostics` reports the two `daemon_slow` counts, and `fallback_total` is unchanged by
    them.
 
-Each acceptance item names a test whose mutation (eager build restored, strict default removed,
-reason dropped) turns it red.
+Each acceptance item names a test whose mutation (strict default removed, entry reading removed,
+reason dropped) turns it red: `daemon/strict_default_tests.rs` for item 3 and
+`daemon/daemon_slow_tests.rs` for items 4 and 5, which include a real in-process daemon whose
+write is blocked by a held store lock.
 
 ### Alternatives considered
 
@@ -1789,7 +1803,8 @@ reason dropped) turns it red.
   rendezvous predicate keeps that case on Amendment 2's quiet fallback.
 - **Keep the eager build with smaller maps and caches in clients.** Lowers the resident numbers
   but still opens every store, runs migrations and schema plans, and races the daemon's boot on
-  each client start.
+  each client start. This is where forwarding clients stand after Decision 1 was withdrawn; the
+  measured numbers are in Decision 1.
 - **Forward `save_to` requests and write the sink in the client.** Removes the most common local
   case, but changes the daemon frame; it is compatible with this amendment and left to its own
   change.

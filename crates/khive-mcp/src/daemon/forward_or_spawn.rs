@@ -3,16 +3,17 @@
 #[cfg(test)]
 use super::spawn_daemon_with_exe;
 use super::{
-    acquire_supervisor_marker_lock, ambiguous_forward_error, bounded_retry_deadline,
-    daemon_mcp_error, daemon_reconnect_expired_before_dispatch_error, daemon_unreachable_error,
-    env_truthy, fallback_or_reject, incumbent_still_alive_error, kill_and_respawn, map_response,
-    opaque_config_id, probe_daemon_identity, protocol_mismatch_error, protocol_mismatch_message,
-    read_supervisor_marker, recorded_daemon_is_alive, request_too_large_error,
-    respawn_failed_error, sleep_until_retry, spawn_daemon, spawn_daemon_with_exe_and_config,
-    supervisor_marker_lock_wait_error, trigger_bridge_self_heal, try_forward_with_read_replay,
-    untrusted_pid_file_directory_error, wait_for_supervisor, DaemonRequestFrame, FallbackReason,
-    ForwardOutcome, McpError, ProbeOutcome, ReadReplayBudget, RecoveryError, RecoveryOutcome,
-    RespawnFailure, SupervisorMarker,
+    acquire_supervisor_marker_lock, bounded_retry_deadline, daemon_mcp_error,
+    daemon_reconnect_expired_before_dispatch_error, daemon_slow_before_dispatch_error,
+    daemon_unreachable_error, env_truthy, fallback_or_reject, incumbent_still_alive_error,
+    kill_and_respawn, map_response, opaque_config_id, post_write_error, probe_daemon_identity,
+    protocol_mismatch_error, protocol_mismatch_message, read_supervisor_marker,
+    recorded_daemon_is_alive, request_too_large_error, respawn_failed_error, sleep_until_retry,
+    spawn_daemon, spawn_daemon_with_exe_and_config, supervisor_marker_lock_wait_error,
+    trigger_bridge_self_heal, try_forward_with_read_replay, untrusted_pid_file_directory_error,
+    wait_for_supervisor, with_rendezvous_admission_snapshot, DaemonRequestFrame, FallbackReason,
+    ForwardOutcome, McpError, PostWriteFailure, ProbeOutcome, ReadReplayBudget, RecoveryError,
+    RecoveryOutcome, RespawnFailure, SupervisorMarker,
 };
 
 /// Bounded probe timeout used by [`wait_for_boot_quiescence_then_reprobe`],
@@ -76,6 +77,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
         }
     }
 
+    let probe_started = tokio::time::Instant::now();
     match probe_daemon_identity(
         &frame.config_id,
         &frame.namespace,
@@ -85,11 +87,10 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
     {
         ProbeOutcome::Alive => BootFenceOutcome::DaemonReady,
         ProbeOutcome::Dead => BootFenceOutcome::SafeLocalFallback,
-        ProbeOutcome::Timeout => BootFenceOutcome::HardError(daemon_mcp_error(
-            "daemon state uncertain after cold-boot quiescence; not falling back to \
-             local dispatch to avoid racing a possibly still-initializing index",
-            None,
-        )),
+        ProbeOutcome::Timeout => {
+            let elapsed_ms = u64::try_from(probe_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            BootFenceOutcome::HardError(daemon_slow_before_dispatch_error(elapsed_ms))
+        }
         // `probe_daemon_identity` (unlike `quiesce_then_probe_identity`) never
         // constructs `LockContended` — it has no lock-acquisition step of its
         // own. Handled here only for match exhaustiveness over the shared
@@ -317,6 +318,18 @@ pub(super) async fn forward_or_spawn_with_policy<F>(
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
+    with_rendezvous_admission_snapshot(forward_or_spawn_admitted(frame, spawn, replay_read_only))
+        .await
+}
+
+async fn forward_or_spawn_admitted<F>(
+    frame: &DaemonRequestFrame,
+    spawn: &F,
+    replay_read_only: bool,
+) -> Option<Result<String, McpError>>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
     }
@@ -410,7 +423,9 @@ where
                 kind,
                 os_error_code,
             } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
-            ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
+            outcome @ (ForwardOutcome::ParseFailure
+            | ForwardOutcome::ResponseLost
+            | ForwardOutcome::ResponseTimeout { .. }) => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(target: "khive_mcp::daemon",
                     config_id = %config_id,
@@ -419,7 +434,9 @@ where
                     "daemon connection lost after the request was fully written — \
                      not retrying or falling back locally to avoid duplicate dispatch"
                 );
-                return Some(Err(ambiguous_forward_error()));
+                let failure =
+                    PostWriteFailure::from_outcome(&outcome).expect("matched a post-write outcome");
+                return Some(Err(post_write_error(failure)));
             }
             ForwardOutcome::ProtocolMismatch {
                 daemon_protocol_version,
@@ -639,7 +656,9 @@ where
             ForwardOutcome::RequestTooLarge { bytes } => {
                 return Some(Err(request_too_large_error(bytes)));
             }
-            ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
+            outcome @ (ForwardOutcome::ParseFailure
+            | ForwardOutcome::ResponseLost
+            | ForwardOutcome::ResponseTimeout { .. }) => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(target: "khive_mcp::daemon",
                     config_id = %config_id,
@@ -648,7 +667,9 @@ where
                     "freshly-established daemon connection lost after the request \
                      was fully written — not retrying or falling back locally"
                 );
-                return Some(Err(ambiguous_forward_error()));
+                let failure =
+                    PostWriteFailure::from_outcome(&outcome).expect("matched a post-write outcome");
+                return Some(Err(post_write_error(failure)));
             }
             ForwardOutcome::ProtocolMismatch {
                 daemon_protocol_version,

@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A stdio MCP host that forwards to the daemon is now strict by default whenever a daemon
+  socket or PID file exists, or existed when the request arrived: a request that would
+  have fallen back to local dispatch is refused with its reason code (`no_socket`,
+  `config_mismatch` and the rest), as under `KHIVE_DAEMON_STRICT=1`. `KHIVE_DAEMON_STRICT=0`
+  (or `false`, `no`, `off`) restores the fallback; with neither file on disk the quiet
+  fallback is unchanged; `KHIVE_NO_DAEMON=1` remains the way to run without a daemon.
+- A daemon that is alive but does not answer in time now returns `reason: "daemon_slow"`
+  with `phase: "before_dispatch"` (nothing sent, `not_committed`, retry is safe) or
+  `phase: "after_write"` (`unknown`; read state before any re-send) and the elapsed wait.
+  A connection lost after the request was sent returns `daemon_connection_lost`, and an
+  unreadable response `parse_failure`; all three post-write outcomes stay terminal.
+  `bridge.diagnostics` reports `daemon_slow` counts per phase, outside `fallback_total`.
 - Each pooled SQLite connection now keeps an 8 MiB page cache instead of 64 MiB. The
   cache is per connection and on the heap, so a process with many connections paid the
   old size many times over. `KHIVE_SQLITE_CACHE_KIB` (512 to 1048576) and
