@@ -1679,7 +1679,49 @@ async fn db_diagnostics_lists_main_and_routed_secondary() {
             database["diagnostics"]["writer_contention"].is_object(),
             "{database}"
         );
+        assert!(
+            database["diagnostics"]["size_composition"].is_object(),
+            "{database}"
+        );
+        assert!(
+            database["diagnostics"]["page_accounting"]["page_count"].as_u64() > Some(0),
+            "{database}"
+        );
     }
+    assert_eq!(result["complete"], serde_json::json!(true), "{result}");
+
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"db_diagnostics(backend="second", size_composition=false)"#.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("scoped diagnostics dispatch");
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["results"][0]["ok"],
+        serde_json::json!(true),
+        "{response}"
+    );
+    let result = &response["results"][0]["result"];
+    let databases = result["databases"].as_array().expect("database entries");
+    assert_eq!(databases.len(), 1, "{result}");
+    assert_eq!(databases[0]["backend_names"], serde_json::json!(["second"]));
+    assert_eq!(
+        result["db_path"],
+        serde_json::json!(second_path.canonicalize().unwrap().display().to_string()),
+        "the root fields describe the selected backend"
+    );
+    assert!(result["size_composition"].is_null(), "{result}");
+    assert_eq!(
+        result["size_composition_error"],
+        serde_json::json!(khive_db::diagnostics::SIZE_COMPOSITION_NOT_REQUESTED)
+    );
+    assert!(
+        result["page_accounting"]["page_count"].as_u64() > Some(0),
+        "{result}"
+    );
+    assert_eq!(result["complete"], serde_json::json!(true), "{result}");
 }
 
 #[tokio::test]
