@@ -52,7 +52,7 @@ Explicit caller `entity_names` take precedence over derived candidates.
 
 ## Query language routing
 
-`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters; it gates only the FTS CJK-bypass tokenizer path (see recall-pipeline.md), not vector engine selection.
+`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters; it sets only the FTS CJK bypass, which skips term selection in FTS gather mode (see recall-pipeline.md), and does not affect vector engine selection. `is_cjk_dominant_query` is stricter: it returns true when CJK characters outnumber all other letters (digits, whitespace, and punctuation count for neither side; a tie is false). Recall uses it to leave English-only embedding models out of fusion.
 
 ## `normalize_min_score`
 
