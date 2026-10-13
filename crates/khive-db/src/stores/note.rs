@@ -937,31 +937,10 @@ fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
         {
             " ORDER BY +created_at DESC, id ASC".to_string()
         }
-        None if is_thread_seek(filter) => " ORDER BY +created_at DESC, id ASC".to_string(),
         // `id ASC` over the primary key is already the stable tiebreak for
         // notes sharing a creation timestamp.
         None => " ORDER BY created_at DESC, id ASC".to_string(),
     }
-}
-
-/// A message read keyed by `$.thread_id` equality or IN selects a handful of
-/// rows through `idx_comm_message_thread`. Under a plain `created_at` order
-/// SQLite prefers the creation-order index to fill `LIMIT` and evaluates
-/// `json_extract($.thread_id)` on every message in the namespace, so the read
-/// grows with the mailbox rather than the thread. The unary plus keeps the
-/// order and leaves the planner the thread seek; only the thread's rows are
-/// sorted. Reads with a recipient term are left alone, because
-/// `comm_filter_index_clause` pins those to a recipient index.
-fn is_thread_seek(filter: &NoteFilter) -> bool {
-    filter.kind.as_deref() == Some("message")
-        && filter.property_filters.iter().any(|property| {
-            property.json_path == "$.thread_id"
-                && matches!(property.op, FilterOp::Eq | FilterOp::In(_))
-        })
-        && !filter
-            .property_filters
-            .iter()
-            .any(|property| property.json_path == "$.to_actor")
 }
 
 /// Validate a value destined for inline comparison against `json_type()`.
@@ -1439,13 +1418,26 @@ fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static st
                 .and_then(|term| term.strip_suffix(", '')"))
                 .is_some_and(numbered_param)
         });
-    if !namespace
-        || !terms.contains(&"deleted_at IS NULL")
-        || !equality("kind = ")
-        || !equality("json_extract(properties, '$.direction') = ")
-        || !recipient
-    {
+    if !namespace || !terms.contains(&"deleted_at IS NULL") || !equality("kind = ") {
         return "";
+    }
+    if !equality("json_extract(properties, '$.direction') = ") || !recipient {
+        // A thread-keyed read selects the thread's own rows. Left to the
+        // planner, `LIMIT` under a `created_at` order picks the creation-order
+        // index and evaluates `$.thread_id` on every message in the namespace,
+        // and a direction term ties the thread index with
+        // `idx_comm_message_outbound_ref`, which walks every outbound message.
+        let thread = equality("json_extract(properties, '$.thread_id') = ")
+            || terms.iter().any(|term| {
+                term.strip_prefix("json_extract(properties, '$.thread_id') IN (")
+                    .and_then(|term| term.strip_suffix(')'))
+                    .is_some_and(|values| values.split(", ").all(numbered_param))
+            });
+        return if thread {
+            " INDEXED BY idx_comm_message_thread"
+        } else {
+            ""
+        };
     }
     if terms.contains(
         &"(json_type(properties, '$.read') IS NULL OR json_type(properties, '$.read') != 'true')",
@@ -1580,14 +1572,9 @@ fn fetch_notes_after(
         let ts_idx = params.len();
         params.push(Box::new(remaining));
         let limit_idx = params.len();
-        let order_key = if is_thread_seek(base_filter) {
-            "+created_at"
-        } else {
-            "created_at"
-        };
         let sql = format!(
             "SELECT {NOTE_COLUMNS} FROM notes{where_sql} AND created_at < ?{ts_idx} \
-             ORDER BY {order_key} DESC, id ASC LIMIT ?{limit_idx}"
+             ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =

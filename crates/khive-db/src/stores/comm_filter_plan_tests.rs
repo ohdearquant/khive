@@ -4,7 +4,7 @@ use super::{
     build_note_filter_read_clause, build_note_filter_where, comm_filter_index_clause,
     note_filter_page_order_clause, NOTE_COLUMNS,
 };
-use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::SqlValue;
 use rusqlite::{Connection, StatementStatus};
 use serde_json::{json, Value};
@@ -1071,7 +1071,8 @@ fn thread_fixture(foreign_count: usize, analyzed: bool) -> Connection {
             rusqlite::params![
                 format!("thread-row-{i}"),
                 json!({"direction":direction, "thread_id":THREAD_ID,
-                       "from_actor":"test:sender"})
+                       "from_actor":"test:sender",
+                       "sent_at":format!("2026-10-12T00:00:0{i}Z")})
                 .to_string(),
                 (500 + i) as i64
             ],
@@ -1121,25 +1122,75 @@ fn thread_outbound_probe_filter() -> NoteFilter {
     }
 }
 
-/// A thread read seeks the thread index, so the thread's own rows decide the
-/// work: 10,000 unrelated messages in the namespace leave the page and the VM
-/// step count unchanged, with and without planner statistics.
-#[test]
-fn thread_read_work_is_bounded_by_the_threads_own_rows() {
-    for (name, filter, rows) in [
+/// The `comm.reply` root lookup: every spelling, a text `sent_at`, earliest first.
+fn thread_root_filter() -> NoteFilter {
+    let mut filter = thread_filter();
+    filter.property_filters.push(PropertyFilter {
+        json_path: "$.sent_at".to_string(),
+        op: FilterOp::JsonTypeEq,
+        value: SqlValue::Text("text".to_string()),
+    });
+    filter.order_by = Some(("$.sent_at".to_string(), SortDir::Asc));
+    filter
+}
+
+/// Every thread-keyed read shape the comm pack compiles, with its row count in
+/// `thread_fixture`.
+fn thread_filters() -> [(&'static str, NoteFilter, usize); 3] {
+    [
         ("thread", thread_filter(), 5),
         ("outbound probe", thread_outbound_probe_filter(), 3),
-    ] {
+        ("reply root", thread_root_filter(), 5),
+    ]
+}
+
+fn thread_pin(filter: &NoteFilter) -> &'static str {
+    let (predicate, _) = build_note_filter_where("default", filter).unwrap();
+    comm_filter_index_clause(filter, &predicate)
+}
+
+/// The pin is matched against the predicate the compiler emits, for one
+/// namespace and for a namespace set.
+#[test]
+fn thread_reads_pin_the_thread_index() {
+    for (name, filter, _) in thread_filters() {
+        for namespaces in [vec![], vec!["default".to_owned(), "other".to_owned()]] {
+            let mut filter = filter.clone();
+            filter.namespaces = namespaces;
+            assert_eq!(
+                thread_pin(&filter),
+                " INDEXED BY idx_comm_message_thread",
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A thread read seeks the thread index, so the thread's own rows decide the
+/// work: 10,000 unrelated conversations in the namespace leave the page and the
+/// VM step count unchanged, with and without planner statistics, and with the
+/// creation-order listing index present to compete for the plan. The pinned
+/// page equals the unpinned one.
+#[test]
+fn thread_read_work_is_bounded_by_the_threads_own_rows() {
+    for (name, filter, rows) in thread_filters() {
         for analyzed in [false, true] {
             let small = measure(&thread_fixture(0, analyzed), &filter);
-            let large = measure(&thread_fixture(10_000, analyzed), &filter);
+            let conn = thread_fixture(10_000, analyzed);
+            assert_listing_index_present(&conn);
+            let large = measure(&conn, &filter);
             let plan = large["plan"].to_string();
             assert!(
-                plan.contains("idx_comm_message_thread"),
+                plan.contains("USING INDEX idx_comm_message_thread"),
                 "{name} (analyzed {analyzed}) must seek the thread index, got plan: {plan}"
             );
             assert_eq!(large["ids"], small["ids"], "{name} (analyzed {analyzed})");
             assert_eq!(large["ids"].as_array().unwrap().len(), rows, "{name}");
+            assert_eq!(
+                large["ids"],
+                measure_unpinned(&conn, &filter)["ids"],
+                "{name} (analyzed {analyzed}): the pin must not change the page"
+            );
             let small_steps = small["vm_steps"].as_i64().unwrap();
             let large_steps = large["vm_steps"].as_i64().unwrap();
             assert!(
@@ -1151,22 +1202,62 @@ fn thread_read_work_is_bounded_by_the_threads_own_rows() {
     }
 }
 
-/// A recipient-pinned read that also names a thread keeps its plain order, so
-/// the pinned index still supplies it.
+/// Shapes the thread index cannot serve, or that another pin owns, emit no
+/// thread pin and return the same rows as the planner's own choice.
 #[test]
-fn recipient_pinned_thread_read_keeps_its_order_clause() {
-    let mut filter = inbox_filter("all", false);
-    filter.property_filters.push(PropertyFilter {
+fn thread_reads_outside_the_index_shape_keep_their_plan() {
+    let conn = thread_fixture(30, false);
+    let mut recipient = inbox_filter("all", false);
+    recipient.property_filters.push(PropertyFilter {
         json_path: "$.thread_id".to_string(),
         op: FilterOp::Eq,
         value: SqlValue::Text(THREAD_ID.to_string()),
     });
     assert_eq!(
-        note_filter_page_order_clause(&filter),
-        " ORDER BY created_at DESC, id ASC"
+        thread_pin(&recipient),
+        " INDEXED BY idx_notes_message_recipient_direction"
     );
-    assert_eq!(
-        note_filter_page_order_clause(&thread_filter()),
-        " ORDER BY +created_at DESC, id ASC"
+
+    let mut deleted = thread_filter();
+    deleted.include_deleted = true;
+    let mut other_kind = thread_filter();
+    other_kind.kind = Some("task".into());
+    let mut no_kind = thread_filter();
+    no_kind.kind = None;
+    let mut empty_set = thread_filter();
+    empty_set.property_filters[0].op = FilterOp::In(vec![]);
+    let mut not_equal = thread_outbound_probe_filter();
+    not_equal.property_filters[0].op = FilterOp::Ne;
+    for (name, filter) in [
+        ("include_deleted", deleted),
+        ("other kind", other_kind),
+        ("no kind", no_kind),
+        ("empty set", empty_set),
+        ("not equal", not_equal),
+    ] {
+        assert_eq!(thread_pin(&filter), "", "{name}");
+        let result = measure(&conn, &filter);
+        assert!(
+            !result["sql"].as_str().unwrap().contains("INDEXED BY"),
+            "{name}"
+        );
+        assert_eq!(
+            result["ids"],
+            measure_unpinned(&conn, &filter)["ids"],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn missing_thread_index_is_an_error_without_fallback() {
+    let conn = thread_fixture(0, false);
+    let result = measure(&conn, &thread_filter());
+    conn.execute_batch("DROP INDEX idx_comm_message_thread")
+        .unwrap();
+    let error = conn.prepare(result["sql"].as_str().unwrap()).err().unwrap();
+    assert!(
+        error.to_string().contains("idx_comm_message_thread"),
+        "{error}"
     );
 }
