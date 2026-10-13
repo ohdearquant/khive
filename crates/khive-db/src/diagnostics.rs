@@ -1223,6 +1223,28 @@ fn nonnegative_sqlite_integer(column: usize, value: i64) -> rusqlite::Result<u64
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
+/// The file's page size, page count and free-list length: one pragma each, so
+/// the cost does not grow with the file. Reported for every file-backed
+/// database whether or not the `dbstat` size composition was collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DatabasePageAccounting {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    /// Pages later writes can reuse that stay in the file until a `VACUUM`.
+    pub freelist_pages: u64,
+}
+
+fn database_page_accounting(conn: &Connection) -> rusqlite::Result<DatabasePageAccounting> {
+    let read = |pragma: &str| -> rusqlite::Result<u64> {
+        nonnegative_sqlite_integer(0, conn.query_row(pragma, [], |row| row.get::<_, i64>(0))?)
+    };
+    Ok(DatabasePageAccounting {
+        page_size_bytes: read("PRAGMA page_size")?,
+        page_count: read("PRAGMA page_count")?,
+        freelist_pages: read("PRAGMA freelist_count")?,
+    })
+}
+
 fn declares_embedding_blob(sql: Option<&str>) -> bool {
     let Some(sql) = sql else {
         return false;
@@ -1268,18 +1290,11 @@ fn classify_database_object(
 }
 
 fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSizeComposition> {
-    let page_size = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?,
-    )?;
-    let page_count = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?,
-    )?;
-    let freelist_pages = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
-    )?;
+    let DatabasePageAccounting {
+        page_size_bytes: page_size,
+        page_count,
+        freelist_pages,
+    } = database_page_accounting(conn)?;
 
     let mut statement = conn.prepare(
         "SELECT d.name, COALESCE(s.type, 'internal'), s.tbl_name, s.sql, d.pageno, d.pgsize
@@ -1507,6 +1522,10 @@ pub struct DbDiagnostics {
     pub writer_contention: WriterContentionDiagnostics,
     pub size_composition: Option<DatabaseSizeComposition>,
     pub size_composition_error: Option<String>,
+    /// Page size, page count and free-list length from three pragmas, present
+    /// whether or not `size_composition` was collected.
+    pub page_accounting: Option<DatabasePageAccounting>,
+    pub page_accounting_error: Option<String>,
     pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
     pub graph_edge_integrity_error: Option<String>,
     /// Current FTS5 segment structure, decoded from each index's documented
@@ -1740,6 +1759,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         sweep_interval,
         audit_append_failures,
         runtime_audit_batch_metrics,
+        true,
     )
     .await
 }
@@ -1747,6 +1767,11 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
 /// Collect one already-open pool while retaining the main pool's process and
 /// generation identity. A secondary pool must not claim or advance the main
 /// pool generation when its pool-scoped counters are inspected.
+///
+/// `collect_size_composition = false` skips the `dbstat` walk, whose cost
+/// grows with the file because it reads every page; the report then carries
+/// [`SIZE_COMPOSITION_NOT_REQUESTED`] in `size_composition_error`, and
+/// `page_accounting` still reports the page counts.
 pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     pool: Arc<ConnectionPool>,
     build: BuildIdentity,
@@ -1754,6 +1779,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     sweep_interval: Duration,
     audit_append_failures: u64,
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
+    collect_size_composition: bool,
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let started = Instant::now();
@@ -1794,6 +1820,10 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             size_composition_error: Some(
                 "in-memory database: no file-backed page composition to inspect".to_string(),
             ),
+            page_accounting: None,
+            page_accounting_error: Some(
+                "in-memory database: no file-backed pages to count".to_string(),
+            ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
@@ -1815,7 +1845,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let inspection = crate::read_cancellation::run_interruptible_read(
         StorageCapability::Sql,
         "db_diagnostics.sqlite",
-        move |scope| inspect_pool_interruptibly(&inspection_pool, scope),
+        move |scope| inspect_pool_interruptibly(&inspection_pool, scope, collect_size_composition),
     )
     .await?;
     let sqlite_ms = elapsed_ms(sqlite_started);
@@ -1844,6 +1874,8 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         writer_contention,
         size_composition: inspection.size_composition,
         size_composition_error: inspection.size_composition_error,
+        page_accounting: inspection.page_accounting,
+        page_accounting_error: inspection.page_accounting_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
@@ -1924,6 +1956,10 @@ fn collect_inner(
             size_composition_error: Some(
                 "in-memory database: no file-backed page composition to inspect".to_string(),
             ),
+            page_accounting: None,
+            page_accounting_error: Some(
+                "in-memory database: no file-backed pages to count".to_string(),
+            ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
@@ -1969,6 +2005,8 @@ fn collect_inner(
         writer_contention,
         size_composition: inspection.size_composition,
         size_composition_error: inspection.size_composition_error,
+        page_accounting: inspection.page_accounting,
+        page_accounting_error: inspection.page_accounting_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
@@ -1998,6 +2036,8 @@ struct PoolInspection {
     checkpoint_pin: CheckpointPinDiagnostics,
     size_composition: Option<DatabaseSizeComposition>,
     size_composition_error: Option<String>,
+    page_accounting: Option<DatabasePageAccounting>,
+    page_accounting_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
     graph_edge_integrity_error: Option<String>,
     fts_segments: Option<crate::FtsSegmentDiagnostics>,
@@ -2016,6 +2056,21 @@ fn split_fts_segments_result(
     }
 }
 
+fn split_page_accounting_result(
+    result: rusqlite::Result<DatabasePageAccounting>,
+) -> (Option<DatabasePageAccounting>, Option<String>) {
+    match result {
+        Ok(pages) => (Some(pages), None),
+        Err(error) => (None, Some(format!("page accounting query failed: {error}"))),
+    }
+}
+
+/// The `size_composition_error` of a report whose caller skipped the `dbstat`
+/// walk. The walk reads every page of the file; `page_accounting` still
+/// carries the page counts.
+pub const SIZE_COMPOSITION_NOT_REQUESTED: &str =
+    "not collected: size_composition=false skips the dbstat walk, which reads every page";
+
 fn record_diagnostic_checkpoint_probe(
     pool: &ConnectionPool,
     result: &rusqlite::Result<CheckpointProbe>,
@@ -2033,6 +2088,7 @@ fn record_diagnostic_checkpoint_probe(
 fn inspect_pool_interruptibly(
     pool: &ConnectionPool,
     scope: &crate::read_cancellation::InterruptibleReadScope,
+    collect_size_composition: bool,
 ) -> StorageResult<PoolInspection> {
     scope.ensure_active()?;
     let conn = match pool.open_standalone_writer_untracked() {
@@ -2046,6 +2102,8 @@ fn inspect_pool_interruptibly(
                 checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
+                page_accounting: None,
+                page_accounting_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -2088,10 +2146,11 @@ fn inspect_pool_interruptibly(
     // connection. The scope deliberately refuses double registration, so
     // keep each query's ordinary SQLite result nested inside one guarded
     // execution while allowing the outer cancellation cause to remain typed.
-    let (integrity, size_composition, fts_segments) = scope.run(&conn, || {
+    let (integrity, page_accounting, size_composition, fts_segments) = scope.run(&conn, || {
         Ok((
             graph_edge_integrity(&conn),
-            database_size_composition(&conn),
+            database_page_accounting(&conn),
+            collect_size_composition.then(|| database_size_composition(&conn)),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))
     })?;
@@ -2103,13 +2162,15 @@ fn inspect_pool_interruptibly(
         ),
     };
     let (fts_segments, fts_segments_error) = split_fts_segments_result(fts_segments);
+    let (page_accounting, page_accounting_error) = split_page_accounting_result(page_accounting);
 
     let (size_composition, size_composition_error) = match size_composition {
-        Ok(composition) => (Some(composition), None),
-        Err(error) => (
+        Some(Ok(composition)) => (Some(composition), None),
+        Some(Err(error)) => (
             None,
             Some(format!("database size composition query failed: {error}")),
         ),
+        None => (None, Some(SIZE_COMPOSITION_NOT_REQUESTED.to_string())),
     };
 
     Ok(PoolInspection {
@@ -2118,6 +2179,8 @@ fn inspect_pool_interruptibly(
         checkpoint_pin,
         size_composition,
         size_composition_error,
+        page_accounting,
+        page_accounting_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,
@@ -2286,6 +2349,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
                 checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
+                page_accounting: None,
+                page_accounting_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -2316,6 +2381,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
+    let (page_accounting, page_accounting_error) =
+        split_page_accounting_result(database_page_accounting(&conn));
     let (size_composition, size_composition_error) = match database_size_composition(&conn) {
         Ok(composition) => (Some(composition), None),
         Err(error) => (
@@ -2332,6 +2399,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         checkpoint_pin,
         size_composition,
         size_composition_error,
+        page_accounting,
+        page_accounting_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,

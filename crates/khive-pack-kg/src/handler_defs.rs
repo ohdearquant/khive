@@ -1540,9 +1540,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 27] = [
     HandlerDef {
         name: "db_diagnostics",
         description: "Report reader- and writer-contention, graph-edge integrity, and WAL/checkpoint \
-                      diagnostics for every already-open database. Existing root fields \
-                      describe main; `databases` has one canonical-file entry with backend_names, \
-                      path, diagnostics, and error for each opened backend: reader admission \
+                      diagnostics for every already-open database, or for the one serving \
+                      backend=<name>. Root fields describe the first inspected file (main unless \
+                      backend selects another); `databases` has one canonical-file entry with \
+                      backend_names, path, diagnostics, and error for each inspected backend. \
+                      All backends share the request's read deadline, which the daemon sets \
+                      from its own configuration: when it arrives, the backends already \
+                      inspected are returned, each remaining backend's error starts with \
+                      `not inspected: request deadline`, and `complete` is false; `complete` is \
+                      true when every selected backend was reached. Per backend: reader admission \
                       capacity/availability, pooled reader checkouts, \
                       separately attributed request/infrastructure standalone reader opens, \
                       reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
@@ -1565,7 +1571,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 27] = [
                       merge provenance, the state an earlier restore left behind; restore names \
                       such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
-                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
+                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals; \
+                      it reads every page, so size_composition=false skips it and \
+                      size_composition_error says so. page_accounting (page_size_bytes, \
+                      page_count, freelist_pages) is three pragma reads and is always reported. \
                       WAL checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
@@ -1575,7 +1584,25 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 27] = [
                       creates a missing database file or perturbs the reported counters.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "backend",
+                param_type: "string",
+                required: false,
+                description: "Inspect only the opened database serving this backend name. An \
+                              unknown or not-yet-opened name is invalid_input listing the opened \
+                              backends.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "size_composition",
+                param_type: "boolean",
+                required: false,
+                description: "Defaults true. false skips the dbstat walk, whose time grows with \
+                              each file; page_accounting is still reported.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
     // Assertive: verb discovery (ue-help-introspection H5)
     HandlerDef {
