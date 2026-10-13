@@ -1513,3 +1513,344 @@ are marked `#[doc(hidden)]`. #3901, #3902, #3906 and #3907 each mark the items t
   and "Global-scope consumers"; sections 3 and 4 of this ADR
 - [ADR-118](ADR-118-fresh-tail-recall-visibility.md) section 2, which accepts near-tie misordering
   and points to item 6
+
+## Amendment 5 (2026-10-13): the memory note index is per namespace and note class
+
+**Status**: Proposed (2026-10-13)
+
+### Context
+
+Line numbers in this amendment are at revision 2afffb61. A path without a crate prefix is under
+`crates/khive-pack-memory/src`. Every number is labeled MEASURED (with the instrument) or DERIVED
+(with the arithmetic and the lines it comes from).
+
+**One graph per model over every namespace and every note kind.** The memory pack's key is
+`AnnKey { model }` (ann.rs:75-79). Its corpus is `memory_corpus()`: `namespace: None`,
+`record_kind: Some("note")`, `field: "note.content"`, joined to live notes (ann.rs:2253-2264,
+join at `crates/khive-retrieval/src/ann/corpus.rs:94-102`). Every live note vector of every
+namespace and every note kind is in the graph. The segment directory is the hex encoding of
+`global::memory_vamana::{model}` (ann.rs:1004-1009, 2061-2065).
+
+**Wildcard registry rows.** Two consumers register on that one graph, `memory-notes:note.content`
+and `note_search`, each at namespace `'*'` (ann.rs:2095-2103, registration at ann.rs:2113-2129).
+Every pair's compaction minimum includes `'*'` rows (`min_watermark_subquery`,
+`crates/khive-retrieval/src/ann/registry.rs:317-323`; the compaction statements
+`crates/khive-retrieval/sql/ann_write_log_compact_namespace.sql` and `..._model.sql`). Active rows
+never age out (registry.rs:25-28). So the global graph's two rows bound write-log compaction in
+every namespace, including namespaces whose own consumers have checkpointed further.
+
+**Recall over-fetches, then widens.** Recall asks the global graph for
+`max(4C, C + 32)` candidates (handlers/common.rs:1216-1222). With the default `C = 150`
+(config.rs:373; capped by `max_recall_candidates = 200`, scoring.rs:547, applied at
+handlers/recall.rs:364-365) that is 600. When the index may hold non-visible namespaces
+(handlers/common.rs:1977-1986), each widening round first re-hydrates every current candidate to
+count visible memories (handlers/common.rs:2001-2011) and then doubles the fetch
+(handlers/common.rs:2016). The default round count is 3 (handlers/common.rs:177-190) and the loop
+runs `1..rounds` (handlers/common.rs:1994), so:
+
+- DERIVED: fetch 600 -> 1,200 -> 2,400 per model, and up to 600 + 1,200 = 1,800 note rows
+  hydrated inside the loop, from handlers/common.rs:1219-1222, 1994, 2002, 2016 and config.rs:373.
+- The final list then goes through the fresh-tail merge at the widened fetch size
+  (handlers/common.rs:2046-2055) and is hydrated a second time by `load_memory_candidate_notes`,
+  which only then drops rows that are not live, visible, unexpired memories
+  (handlers/common.rs:1558-1608).
+- The recall-level loop (handlers/recall.rs:522-564) can repeat the whole collection with
+  `C = min(4C, 200)`. DERIVED: a second collection at `C = 200` fetches 800 -> 1,600 -> 3,200.
+
+**Note search post-filters.** Note search searches the same global graph with
+`max(4k, k + 32)`, keeps only live notes of the token's one namespace (note_search.rs:30-46), and
+doubles the fetch each round up to the same round count (note_search.rs:101-155).
+
+**Per-vector cost.** MEASURED with `ls -l` and `du -sk` on the two global memory segment
+directories of a store holding 122,478 and 120,488 vectors for the two models (2026-10-13):
+
+| File                      | all-minilm-l6-v2 | paraphrase-multilingual-minilm-l12-v2 |
+| ------------------------- | ---------------- | ------------------------------------- |
+| `vectors.bin`             | 188,126,208 B    | 185,069,568 B                         |
+| `codes.bin`               | 47,033,120 B     | 46,268,960 B                          |
+| `graph.bin`               | 28,724,748 B     | 27,778,064 B                          |
+| `lifecycle.bin`           | 28,740,084 B     | 27,793,152 B                          |
+| `external_ids.bin`        | 1,959,728 B      | 1,927,888 B                           |
+| `du -sk` of the directory | 290,972 kB       | 285,352 kB                            |
+| delta chunk files         | 116              | 114                                   |
+
+- DERIVED: vectors = `vectors.bin` / 1,536 (384 f32) = 122,478 and 120,488. The same counts follow
+  from (`external_ids.bin` - 80) / 16, using the 80-byte header at
+  `crates/khive-vamana/src/external_ids.rs:38`.
+- DERIVED: base segment bytes per vector = 294,583,888 / 122,478 = 2,405 B and
+  288,837,632 / 120,488 = 2,397 B, about 2.4 kB per vector per model.
+- DERIVED: while a delta chain that contains an upsert exists, every process that loaded the segment
+  holds an owned copy of the vectors and codes (`crates/khive-pack-memory/docs/ann.md:171-179`):
+  188,126,208 + 47,033,120 = 235,159,328 B for the first model. That cost follows the whole
+  database's index, whichever namespace is queried.
+
+### Decision
+
+#### 1. The key is (namespace, note class, model)
+
+`AnnKey` becomes `{ namespace, class, model }`. `class` has two values: `memory` (notes of kind
+`memory`) and `other` (every other live note kind). Each live note vector is in exactly one graph
+per model; no vector is indexed twice. Each key has its own segment directory, commit record, delta
+chain, registry rows, watermark, single-flight lock and checkpoint timer. Every lifecycle rule of
+Amendment 1, Amendment 3 and ADR-118 applies per key unchanged, including the checkpoint lock of
+"Global-scope consumers" step 4, which is now taken in the key's own directory.
+
+#### 2. Segment directories are named by a fixed-length digest; the key is kept beside the segment
+
+The directory name is `memory-` followed by the 64 lowercase hex digits of the BLAKE3-256 digest
+(already a dependency of the pack: `Cargo.toml:26`, used at ann/delta.rs:70) of a versioned,
+length-prefixed encoding of `(namespace, class, model)`. The name is 71 bytes for every key. The key
+itself is written to a small file in the directory before any segment file. Adoption reads that file
+and requires it to equal the requested key; a missing or different file is decision rule 1 (Cold),
+and a build never writes segment files into a directory whose recorded key names another key.
+
+This supersedes, for memory only, the sentence of Amendment 4 item 8 "The key formats of memory and
+knowledge do not change". Item 8's rule stands: the knowledge parser `decode_ann_dir_name`
+(`crates/khive-pack-knowledge/src/knowledge/vamana/segment_key.rs:39-58`) rejects every memory
+directory name, because `m`, `o`, `r`, `y` and `-` are not hex digits (segment_key.rs:47-49), and
+the memory key file is never a directory name, so no parser decodes it. The change that lands this
+item adds the test item 8 requires: a memory directory name is rejected by `decode_ann_dir_name`, a
+knowledge directory name is rejected by memory's key-file check, and each is accepted only by its
+own. The existing test `snapshot_key_does_not_collide_with_knowledge_vamana` (ann_tests.rs:435)
+stays until the global directory is removed (item 10).
+
+The rotation watcher already iterates installed keys and derives each directory from its key
+(ann.rs:1361-1371), so it needs no reverse mapping from names.
+
+#### 3. Registration is per namespace and class, at the pending fence
+
+Each key registers one row `(consumer, namespace, model)` at its real namespace. The consumer
+identity encodes the class, because both classes of a namespace share the registry's
+`(consumer, namespace, embedding_model)` key: `memory-notes:note.content:memory` and
+`memory-notes:note.content:other`. Recall and note search read the same graphs, so one consumer per
+graph protects both readers and the separate `note_search` consumer retires (item 10). This
+supersedes the "Global-scope consumers" addendum of Amendment 1 for the memory corpus; the addendum
+stays the contract for any other global-scope consumer.
+
+The fence stays pending (`-2`, retired after the grace period) for memory's per-namespace rows. This
+amends Amendment 4 item 1, whose rule ties the fence to the row shape ("A corpus whose consumer rows
+are per namespace MUST use the durable fence"). Item 1 states its own purpose as changing no
+behaviour in either pack; memory's ensure path accepts only an active or pending row and refuses
+every other negative value (ann.rs:1526-1556 and 1580-1600). The fence is therefore a parameter
+named by the corpus, memory pending and knowledge durable, whatever the row shape. Amendment 4's
+parameter table reads, for memory: consumer scope "one namespace and one note class per index",
+segment key "digest of (namespace, class, model), item 2 of Amendment 5".
+
+#### 4. A key with no live rows does not pin its namespace
+
+Many keys are empty: a namespace holding only memories has an empty `other` key, and one holding no
+memories has an empty `memory` key. Today an absent row is registered pending on every ensure
+(ann.rs:1543-1549) and an Empty classification returns without activating it (ann.rs:1815-1817,
+1904-1905). Per key, that would hold `-2` on the namespace's compaction minimum until the grace
+period retires it, and an active row whose class later empties would hold its last watermark
+forever. Rule: when a key classifies Empty (decision rule 5), it raises its own row to the watermark
+`S` captured in the same read snapshot as the zero live count. No segment is written. A later write
+in that class leaves a tail above `S` with no commit record, which is decision rule 1 (Cold), and the
+next search rebuilds the key from the corpus.
+
+#### 5. Corpus and tail predicates
+
+The key's `CorpusScope` sets `namespace: Some(ns)` (already supported, corpus.rs:48-61, with
+`CompactionScope::Namespace`, corpus.rs:177-182) and gains a class predicate on the live-note join:
+`n.kind = 'memory'` or `n.kind <> 'memory'`. The corpus scan, `scope_counts`, the restart
+classifier, `fetch_final_tail_on`, `fetch_protected_tail_on` (ann.rs:2351-2428, which today reads
+every namespace and binds `'*'` at ann.rs:2397) and the session fence (ann.rs:2619-2637, binding
+`ANN_CONSUMER` and `'*'` at ann.rs:2676-2677 and ann/session_exact.rs:45-46) gain `namespace = ?`
+on the write log and bind the key's own consumer row. The class is filtered only at the notes join:
+the write log's `kind` column holds the vector row's record kind (`note`), not the note kind
+(`crates/khive-db/sql/011-ann-write-log.sql`; ann.rs:2630). Both class graphs of a namespace therefore
+read the same log rows. A final upsert whose subject is a live note of the other class replays as a
+delete, as Amendment 1's soft-delete paragraph already requires for any subject outside the
+predicate. Namespace-scoped log reads use `idx_ann_write_log_ns_model_seq`
+(011-ann-write-log.sql).
+
+#### 6. Recall searches the memory graph of each visible namespace
+
+For each model, recall searches the `memory` key of each namespace in the caller's visible set with
+`k = C + 32`, runs each key's fresh-tail leg against that key's own watermark, merges the
+per-namespace lists by descending score and then ascending subject id (the order of Amendment 4
+item 6, implemented in `crates/khive-retrieval/src/ann.rs:60-64`), and keeps the first `C + 32`.
+The top `C + 32` of the union is contained in the union of the per-namespace top `C + 32` lists, so
+the truncation drops nothing a single graph over the visible memories would have returned. Every hit
+is already a visible memory, so the `4C` factor, `index_namespace_set` and the widening rounds
+(handlers/common.rs:1977-2037) are removed. Hydration still re-checks namespace, kind, deletion and
+expiry (handlers/common.rs:1596-1607). The bounded readiness wait (default 8,000 ms,
+handlers/common.rs:192-208) is one wait per model shared by that model's keys, so latency does not
+grow with the number of visible namespaces. The recall-level loop (handlers/recall.rs:522-564)
+stays: it also serves the text leg and the creation-time window. The sqlite-vec fallback is already
+per namespace (handlers/common.rs:2093-2141) and is unchanged.
+
+#### 7. Note search searches the token namespace's two graphs
+
+Note search searches the `memory` and `other` keys of the token's namespace with `k` candidates
+each, merges them by the same order and keeps `k`. The post-filter (note_search.rs:30-46) stays as a
+check; the widening rounds are removed.
+
+#### 8. Maintenance per write touches one graph
+
+A write appends the same `ann_write_log` rows as today. The note-mutation hook carries the note's
+namespace, so a write bumps, probes and replays only its own key. Today the hook receives
+`(kind, id)` only (`crates/khive-runtime/src/runtime.rs:118-132`) and returns early for every kind
+except `memory` (pack.rs:526-546); under this amendment a non-memory write bumps its namespace's
+`other` key. Remember (handlers/remember.rs:199) and prune (handlers/prune.rs:240) build the key from
+the token's namespace. Checkpoint thresholds are computed from the key's own live count:
+`max(1, min(1000, floor(0.2 L / 4)))` dirty operations (ann/incremental.rs:22, 31-37) and delta
+compaction at `max(ceil(base / 10), 5000)` raw operations (ann/delta.rs:25, 76-81).
+
+#### 9. Namespace moves and kind changes
+
+A namespace move appends a `delete` under the source namespace and an `upsert` under the target for
+every moved vector (`crates/khive-db/src/namespace_move.rs:1265-1288`), and visibility fences follow
+their note (namespace_move.rs:1147). Each per-namespace key replays its own half: one tombstone in
+the source key and one insert in the target key.
+
+No note update path changes a note's kind at this revision: the update patch has no kind field
+(`crates/khive-runtime/src/curation/types_and_guards.rs:547-557`). The note store's upsert statement
+does assign `kind` on conflict (`crates/khive-db/src/stores/note.rs:77-94`). Rule: a writer that
+changes a note's kind across the `memory` / `other` boundary MUST append an `upsert` log row for each
+of that note's vectors in the same transaction. The two class keys of the namespace then replay it as
+a delete in one and an insert in the other (item 5). Without that row the old key keeps a candidate
+that hydration drops, and the new key misses the note until its next rebuild.
+
+#### 10. Migration, wildcard retirement and the global directory
+
+- Serving is lazy: the first search of a key registers it pending, builds it from a
+  namespace-filtered corpus scan and activates it.
+- A background backfill builds, one key at a time, every key of every namespace that holds live note
+  vectors and has no active row. Without it, a namespace that is never searched would never activate
+  and the wildcard rows would never retire. The backfill may read many namespaces in one scan ordered
+  by namespace, provided every key it builds registered pending before that scan's read snapshot.
+- For each model, once every namespace holding live note vectors has an active row for both class
+  keys (empty keys raised by item 4), the `'*'` rows of `memory-notes:note.content` and
+  `note_search` for that model are deleted in one writer transaction that re-checks the condition
+  inside the transaction. This needs a registry primitive that deletes an active row; the registry
+  today deletes only expired pending rows (registry.rs:652-669).
+- After retirement, the global segment directory is removed under its checkpoint lock.
+
+#### 11. Startup
+
+Startup builds and adopts nothing eagerly beyond the keys of the namespaces visible to the token
+the warm pass already uses (`Namespace::local()`, ann.rs:1291-1308). Every other key is adopted on
+its first search; adoption of a Hot segment maps it with no corpus read (decision rule 6).
+
+#### 12. Mixed binaries and rollback
+
+A process running a binary without this amendment finds its wildcard row absent, registers it
+pending and rebuilds the global graph (ann.rs:1543-1549), which pins compaction in every namespace
+again. All processes on one database therefore upgrade together. A rollback costs one global rebuild
+plus removal of the per-namespace memory rows (`memory-notes:note.content:memory` and `:other`) and
+their directories. Until those rows are removed they keep bounding each namespace's compaction at
+their last watermarks, because active rows never age out.
+
+### Alternatives considered
+
+- **Keep the global graph and filter inside the search (filtered ANN).** The graph would visit
+  namespace and kind labels during traversal. This removes the hydration rounds but keeps the
+  global segment, the owned-copy cost of the whole index in every process
+  (`crates/khive-pack-memory/docs/ann.md:171-179`), maintenance on the global graph for every write,
+  and the wildcard rows that pin compaction everywhere. It also needs a label store and a filtered
+  traversal in the graph crate, which does not exist. Not chosen.
+- **One graph per namespace without the class split.** Note search needs every kind and recall needs
+  only memories, so a mixed graph keeps recall's over-fetch and widening whenever a namespace holds
+  more non-memory notes than memories. The share of non-memory vectors per namespace was not
+  measured. The split costs one more key per namespace and adds no vector twice. Not chosen.
+- **Hex-encoded key names like knowledge's.** A namespace can be 256 bytes
+  (`crates/khive-types/src/namespace.rs:45-67`), and hex doubles every byte, so any hex name that
+  contains the namespace is at least 512 bytes. MEASURED: a 255-byte file name is accepted and a
+  256-byte name is refused with "File name too long" on the filesystem that holds the store. DERIVED
+  from knowledge's form `hex("{ns}::vamana::{model}")` (segment_key.rs:4-32): the name fits only
+  when `ns + 10 + model <= 127` bytes, so namespaces up to 101 bytes for the 16-byte model name
+  `all-minilm-l6-v2` and up to 80 bytes for the 37-byte name
+  `paraphrase-multilingual-minilm-l12-v2`. Not chosen.
+- **Adopt the durable fence for per-namespace memory rows, as Amendment 4 item 1 reads.** This is a
+  behaviour change bundled into a re-key: memory refuses `-1` today (ann.rs:1532-1542). Knowledge's
+  rule keeps `-1` durable after an Empty recovery, which for an empty class key would pin its
+  namespace's compaction indefinitely. Not chosen; item 3 amends item 1 instead.
+- **Eager migration at startup.** Building every key at boot is a filtered full vec0 scan per
+  namespace before the first request is served. Not chosen; item 10 builds on demand and in the
+  background.
+
+### Consequences
+
+Positive:
+
+- A tenant's on-disk cost is about 2.4 kB per vector per model for its own notes (DERIVED above), and
+  an overlay's owned copy is the size of its own key's vectors and codes, whatever other tenants hold.
+- Recall makes one ANN search per visible namespace per model with `k = C + 32` and no widening rounds;
+  the vector leg hydrates at most `C + 32` rows per model where today it can fetch 2,400 and hydrate
+  1,800 inside the loop (DERIVED above).
+- After the wildcard rows retire, a namespace's compaction is bounded only by consumers registered for
+  that namespace.
+- A write's maintenance work follows its own key's size.
+
+Negative:
+
+- Many small graphs. Per-key fixed costs (a registry row, a directory, a single-flight lock, a
+  checkpoint timer, one publication-digest read per installed key every 5 seconds: ann.rs:485,
+  1361-1371) scale with namespaces x 2 x models.
+- Small graphs checkpoint often: DERIVED from ann/incremental.rs:31-37, a key below 20 live vectors
+  checkpoints at every write, and below 20,000 every `floor(L / 20)` writes. The delta compaction floor
+  of 5,000 operations (ann/delta.rs:25) exceeds 10% of any base below 50,000 vectors, so small keys
+  carry long delta chains relative to their size.
+- A per-namespace corpus scan is a filtered full scan of the model's vec0 table. The table declares
+  `namespace` as a plain column (`crates/khive-db/src/backend.rs:1125-1133`), and sqlite-vec 0.1.9
+  plans any query without a KNN or rowid constraint as a full scan (`sqlite-vec.c:5836-5840`).
+  Backfilling T namespaces costs T scans unless they share one ordered scan (item 10).
+- The tail of each class key includes the other class's log rows of its namespace (item 5).
+- The recall vector leg passes at most `C + 32` candidates per model to fusion. Today, on a store whose
+  first `4C` hits are mostly visible memories, it passes up to `4C`. Fused rankings can differ in the
+  tail of the candidate window; the step 3 gate reports any difference.
+- Mixed binaries on one database are not supported (item 12).
+
+Neutral:
+
+- Schemas are unchanged: `ann_write_log`, the vector tables, notes and the registry tables.
+- Response shapes of recall and note search are unchanged. Scoring, fusion and the session exact arm's
+  candidate SQL are unchanged; the session fence binds the key's own row (item 5).
+- The knowledge pack is untouched.
+
+### Implementation plan
+
+1. Thread `&AnnKey` through every lifecycle function with only the global scope constructed; consumer,
+   registry namespace, segment directory and corpus are derived from the key. Zero behaviour change.
+   Gate: the memory crate suite and clippy, unchanged expectations. Implemented by: to be filed.
+2. Build, maintain, checkpoint and compact per-namespace keys with the class predicate, the digest
+   directory and key file, and the Empty raise; no reader switches. Gate: tests for build, replay and
+   compaction per key; kind change and namespace move; compaction bounded by per-namespace rows; the
+   item 8 parser test; an Empty key leaves no `-2` row. Implemented by: to be filed.
+3. Recall switches to per-namespace memory keys. Gate: on a fixture of three namespaces, two visible,
+   each holding memories and other notes with visible memories at most 25% of all vectors, recall's
+   vector leg equals the exact cosine top `C + 32` over visible memories, the ANN search count per model
+   equals the number of visible namespaces (the test counter at ann.rs:243-246, incremented at
+   ann.rs:1082-1083), no candidate is a non-memory or non-visible id, and the difference from the
+   unpatched result on the same fixture is reported. Implemented by: to be filed.
+4. Note search switches; backfill; wildcard retirement; global directory removal; documentation.
+   Gate: note search equals the unpatched result and searches two keys; after every namespace
+   activates, both `'*'` rows are gone and compaction for a namespace deletes rows up to that
+   namespace's minimum, with a control showing that before retirement the same call deletes nothing
+   above the `'*'` watermark. Implemented by: to be filed.
+
+### Stated limits
+
+1. Idle eviction of installed graphs is not designed. It is the next lever for tenants per process.
+2. A checkpoint floor for tiny graphs (for example a minimum dirty count) is not chosen.
+3. Not measured: the resident and on-disk cost of a per-namespace key, and the share of non-memory
+   vectors per namespace. The per-tenant cost claim is falsified if a key's base segment bytes per
+   vector exceed the global segment's 2.4 kB by more than its fixed file overhead, or if a process
+   that searched only one namespace holds resident memory that grows with other namespaces' vectors.
+4. Not measured: the latency of `|V|` searches against one wider search for callers with many
+   visible namespaces.
+
+### References (Amendment 5)
+
+- Amendment 1: "Scope rule", decision rules 1, 4, 5 and 6, compaction step 3, the operational note on
+  active rows, "Global-scope consumers" and "Soft-delete visibility"
+- Amendment 4: the parameter table, item 1 (amended by item 3), item 6 (merge order), item 8 (one
+  sentence superseded for memory by item 2)
+- [ADR-118](ADR-118-fresh-tail-recall-visibility.md): section 1 (compaction linearization and the
+  registration precondition, applied per key) and section 4 (the memory and note-search consumers are
+  per key)
+- `crates/khive-pack-memory/src/ann.rs`, `handlers/common.rs`, `handlers/recall.rs`, `note_search.rs`,
+  `pack.rs`; `crates/khive-retrieval/src/ann/corpus.rs`, `ann/registry.rs`;
+  `crates/khive-runtime/src/runtime.rs`; `crates/khive-db/src/namespace_move.rs`;
+  `crates/khive-types/src/namespace.rs`; `crates/khive-pack-knowledge/src/knowledge/vamana/segment_key.rs`
