@@ -166,8 +166,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles refuse updates. Storage failures use `PersistError::Storage`.
   Core migrations now install `atom_weights` and `weight_events`; the standalone
   `init_weight_schema` bootstrap remains available for compatibility.
-- Lattice dependencies move from 0.9.0 to 0.11.1 (`lattice-embed`, `lattice-inference`,
-  `lattice-fann`). Moodboard descriptors now report inference version 0.11.1, so their
+- Lattice dependencies move from 0.9.0 to 0.12.0 (`lattice-embed`, `lattice-inference`,
+  `lattice-fann`). Moodboard descriptors now report inference version 0.12.0, so their
   fingerprints and model keys change and existing moodboard vectors need reindexing;
   preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
   no longer runs with the `pure` backend: std members enable `blake3/std` directly.
