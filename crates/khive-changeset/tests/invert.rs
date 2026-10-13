@@ -6,7 +6,7 @@ use khive_changeset::{
     from_ndjson, to_ndjson, ChangeSet, ChangeSetError, CreateOp, CreateTarget, CurrentState,
     DeleteOp, DeletePreimage, EdgePatch, EdgePreimage, EntityCreateFields, EntityPatch,
     EntityPreimage, Envelope, InvertError, LinkOp, MergeOp, MergePreimage, NoteCreateFields,
-    NotePatch, NotePreimage, Op, UpdateOp, UpdatePatch, UpdatePreimage,
+    NotePatch, NotePreimage, Op, RestoreOp, UpdateOp, UpdatePatch, UpdatePreimage,
 };
 use khive_types::{
     EdgeRelation, Entity, EntityKind, Header, Id128, Link, Namespace, Note, NoteStatus,
@@ -585,7 +585,7 @@ fn inputs_remain_unchanged_after_success_and_failure_after_a_reverse_update() {
         vec![
             Op::Delete(DeleteOp {
                 target_id: id(9),
-                hard: false,
+                hard: true,
                 preimage: DeletePreimage::Entity(Box::new(entity(id(9), "not invertible"))),
             }),
             rename(id(1), "after", "before"),
@@ -969,4 +969,295 @@ fn absent_preimage_is_a_decode_error_and_retains_ndjson_line_context() {
         "preimage": {"target": "entity"},
     });
     assert!(serde_json::from_value::<UpdateOp>(incongruent).is_err());
+}
+
+#[test]
+fn soft_deletes_restore_full_records_and_reinvert_without_content_loss() {
+    let e = entity(id(1), "original");
+    let mut n = note(id(2), "original note");
+    n.expires_at = Some(Timestamp::from_secs(100));
+    let l = edge(id(3));
+    let records = vec![
+        DeletePreimage::Entity(Box::new(e.clone())),
+        DeletePreimage::Note(Box::new(n.clone())),
+        DeletePreimage::Edge(Box::new(l.clone())),
+    ];
+    let forward = ChangeSet::new(
+        envelope(1),
+        records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                Op::Delete(DeleteOp {
+                    target_id: id(i as u128 + 1),
+                    hard: false,
+                    preimage: record.clone(),
+                })
+            })
+            .collect(),
+    );
+    let mut deleted = CurrentState {
+        entities: BTreeMap::from([(id(1), e.clone())]),
+        notes: BTreeMap::from([(id(2), n.clone())]),
+        edges: BTreeMap::from([(id(3), l.clone())]),
+    };
+    deleted.entities.get_mut(&id(1)).unwrap().deleted_at = Some(Timestamp::from_secs(80));
+    let dead_note = deleted.notes.get_mut(&id(2)).unwrap();
+    dead_note.deleted_at = Some(Timestamp::from_secs(80));
+    dead_note.status = NoteStatus::Deleted;
+    let dead_edge = deleted.edges.get_mut(&id(3)).unwrap();
+    dead_edge.deleted_at = Some(Timestamp::from_secs(80));
+    dead_edge.updated_at = Timestamp::from_secs(80);
+    let before = snapshot(&deleted);
+    let inverse = assert_inverse(
+        &forward,
+        &deleted,
+        records
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, record)| {
+                Op::Restore(RestoreOp::new(id(i as u128 + 1), record.clone()).unwrap())
+            })
+            .collect(),
+    );
+    assert_eq!(snapshot(&deleted), before);
+    let mut restored = CurrentState {
+        entities: BTreeMap::from([(id(1), e)]),
+        notes: BTreeMap::from([(id(2), n)]),
+        edges: BTreeMap::from([(id(3), l)]),
+    };
+    restored.entities.get_mut(&id(1)).unwrap().header.updated_at = Timestamp::from_secs(90);
+    restored.notes.get_mut(&id(2)).unwrap().header.updated_at = Timestamp::from_secs(90);
+    restored.edges.get_mut(&id(3)).unwrap().updated_at = Timestamp::from_secs(90);
+    let reinverted = inverse.invert(envelope(3), &restored).unwrap();
+    let expected = vec![
+        DeletePreimage::Entity(Box::new(restored.entities[&id(1)].clone())),
+        DeletePreimage::Note(Box::new(restored.notes[&id(2)].clone())),
+        DeletePreimage::Edge(Box::new(restored.edges[&id(3)].clone())),
+    ];
+    for (op, record) in reinverted.ops.iter().zip(expected) {
+        let Op::Delete(delete) = op else {
+            panic!("restore must invert to delete")
+        };
+        assert!(!delete.hard);
+        assert_eq!(
+            serde_json::to_value(&delete.preimage).unwrap(),
+            serde_json::to_value(record).unwrap()
+        );
+    }
+    // Lifecycle timestamps change on live restoration; content and all other fields do not.
+    for (op, original) in reinverted.ops.iter().zip(records) {
+        let Op::Delete(delete) = op else {
+            unreachable!()
+        };
+        let mut actual = serde_json::to_value(&delete.preimage).unwrap();
+        let original = serde_json::to_value(original).unwrap();
+        actual["updated_at"] = original["updated_at"].clone();
+        assert_eq!(actual, original);
+    }
+}
+
+#[test]
+fn mixed_delete_restore_history_rewinds_liveness_without_an_invented_timestamp() {
+    let original = entity(id(1), "before");
+    let restored_record = DeletePreimage::Entity(Box::new(entity(id(1), "after")));
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![
+            rename(id(1), "after", "before"),
+            Op::Delete(DeleteOp {
+                target_id: id(1),
+                hard: false,
+                preimage: restored_record.clone(),
+            }),
+            Op::Restore(RestoreOp::new(id(1), restored_record.clone()).unwrap()),
+        ],
+    );
+    let mut live = entity(id(1), "after");
+    live.header.updated_at = Timestamp::from_secs(90);
+    let current = CurrentState {
+        entities: BTreeMap::from([(id(1), live.clone())]),
+        ..Default::default()
+    };
+    assert_inverse(
+        &forward,
+        &current,
+        vec![
+            Op::Delete(DeleteOp {
+                target_id: id(1),
+                hard: false,
+                preimage: DeletePreimage::Entity(Box::new(live)),
+            }),
+            Op::Restore(RestoreOp::new(id(1), restored_record).unwrap()),
+            rename(original.header.id, "before", "after"),
+        ],
+    );
+}
+
+#[test]
+fn restore_and_soft_delete_refuse_changed_content_or_wrong_lifecycle() {
+    let original = entity(id(1), "original");
+    let restore = Op::Restore(
+        RestoreOp::new(id(1), DeletePreimage::Entity(Box::new(original.clone()))).unwrap(),
+    );
+    let delete = Op::Delete(DeleteOp {
+        target_id: id(1),
+        hard: false,
+        preimage: DeletePreimage::Entity(Box::new(original.clone())),
+    });
+    for (op, dead) in [(restore.clone(), false), (delete.clone(), true)] {
+        let mut changed = original.clone();
+        changed.name = "intervening edit".into();
+        changed.deleted_at = dead.then(|| Timestamp::from_secs(80));
+        let current = CurrentState {
+            entities: BTreeMap::from([(id(1), changed)]),
+            ..Default::default()
+        };
+        let before = snapshot(&current);
+        assert_invalidated(
+            ChangeSet::new(envelope(1), vec![op])
+                .invert(envelope(2), &current)
+                .unwrap_err(),
+            0,
+            id(1),
+            "name",
+        );
+        assert_eq!(snapshot(&current), before);
+    }
+    let live = CurrentState {
+        entities: BTreeMap::from([(id(1), original.clone())]),
+        ..Default::default()
+    };
+    assert_invalidated(
+        ChangeSet::new(envelope(1), vec![delete])
+            .invert(envelope(2), &live)
+            .unwrap_err(),
+        0,
+        id(1),
+        "deleted_at",
+    );
+    let mut dead = original;
+    dead.deleted_at = Some(Timestamp::from_secs(80));
+    let tombstoned = CurrentState {
+        entities: BTreeMap::from([(id(1), dead)]),
+        ..Default::default()
+    };
+    assert_invalidated(
+        ChangeSet::new(envelope(1), vec![restore])
+            .invert(envelope(2), &tombstoned)
+            .unwrap_err(),
+        0,
+        id(1),
+        "deleted_at",
+    );
+}
+
+#[test]
+fn soft_delete_refuses_changed_entity_timestamp_and_unrestorable_note_status() {
+    let original = entity(id(1), "original");
+    let mut dead = original.clone();
+    dead.deleted_at = Some(Timestamp::from_secs(80));
+    dead.header.updated_at = Timestamp::from_secs(80);
+    let current = CurrentState {
+        entities: BTreeMap::from([(id(1), dead)]),
+        ..Default::default()
+    };
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(1),
+            hard: false,
+            preimage: DeletePreimage::Entity(Box::new(original)),
+        })],
+    );
+    assert_invalidated(
+        forward.invert(envelope(2), &current).unwrap_err(),
+        0,
+        id(1),
+        "updated_at",
+    );
+    let mut archived = note(id(2), "archived");
+    archived.status = NoteStatus::Archived;
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(2),
+            hard: false,
+            preimage: DeletePreimage::Note(Box::new(archived)),
+        })],
+    );
+    assert!(
+        matches!(forward.invert(envelope(2), &CurrentState::default()), Err(InvertError::InverseRestore { index: 0, reason }) if reason.contains("must be active"))
+    );
+}
+
+#[test]
+fn note_and_edge_content_changes_and_unknown_current_rows_refuse_restore() {
+    let n = note(id(2), "original");
+    let l = edge(id(3));
+    for (record, mut current, identifier, field) in [
+        (
+            DeletePreimage::Note(Box::new(n.clone())),
+            CurrentState {
+                notes: BTreeMap::from([(id(2), n)]),
+                ..Default::default()
+            },
+            id(2),
+            "expires_at",
+        ),
+        (
+            DeletePreimage::Edge(Box::new(l.clone())),
+            CurrentState {
+                edges: BTreeMap::from([(id(3), l)]),
+                ..Default::default()
+            },
+            id(3),
+            "weight",
+        ),
+    ] {
+        let forward = ChangeSet::new(
+            envelope(1),
+            vec![Op::Restore(RestoreOp::new(identifier, record).unwrap())],
+        );
+        assert!(
+            matches!(forward.invert(envelope(2), &CurrentState::default()), Err(InvertError::MissingCurrent { index: 0, id }) if id == identifier)
+        );
+        if let Some(row) = current.notes.get_mut(&identifier) {
+            row.expires_at = Some(Timestamp::from_secs(100));
+        }
+        if let Some(row) = current.edges.get_mut(&identifier) {
+            row.weight = 0.5;
+        }
+        assert_invalidated(
+            forward.invert(envelope(2), &current).unwrap_err(),
+            0,
+            identifier,
+            field,
+        );
+    }
+}
+
+#[test]
+fn reverse_restore_does_not_allow_an_earlier_create_of_a_tombstoned_record() {
+    let row = entity(id(1), "original");
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![
+            create_entity(&row),
+            Op::Restore(
+                RestoreOp::new(id(1), DeletePreimage::Entity(Box::new(row.clone()))).unwrap(),
+            ),
+        ],
+    );
+    let current = CurrentState {
+        entities: BTreeMap::from([(id(1), row)]),
+        ..Default::default()
+    };
+    assert_invalidated(
+        forward.invert(envelope(2), &current).unwrap_err(),
+        0,
+        id(1),
+        "deleted_at",
+    );
 }

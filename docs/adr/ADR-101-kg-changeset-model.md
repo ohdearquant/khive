@@ -128,6 +128,29 @@ op-list itself stays producer-agnostic.
 > producer-internal tracking — a producer without its own batching model should not be forced
 > to invent one, and the fallback keeps the trailer's round-trip contract intact either way.
 
+### Proposed amendment (2026-10-13): restore and schema version 2
+
+**Status: Proposed; requires approval before adoption.** This amendment extends D1
+with a sixth operation, `restore`, for an existing soft-deleted entity, note or
+edge. It carries the target identifier and the full record expected once live,
+including content, status, expiry, namespace and timestamps. Decoding uses the
+same strict record mirrors as delete preimages, rejects mismatched identifiers,
+and requires no deletion tombstone in the expected record. It cannot insert a
+hard-deleted row or reverse a merge.
+
+The expected record is complete review evidence. Its timestamps do not authorize
+rewriting storage clocks: current content is checked under the substrate-specific
+lifecycle rules in [the restore API](../../crates/khive-changeset/docs/api/restore.md).
+The live note restore always returns status `active`; an expected archived or
+deleted note is therefore refused, rather than silently changing its status.
+The live applier remains responsible for merge-provenance and other restore
+guards; the domain record alone does not prove that a tombstone is not a merge.
+
+The added operation advances the NDJSON schema to version 2 under the crate's
+single-version, fail-loud policy. Version-1 readers reject a version-2 envelope
+before decoding operations. Version-2 readers and writers reject version-1
+envelopes. No silent schema migration is implied.
+
 ### D2 — Serialization: NDJSON-delta
 
 A change-set serializes as **NDJSON-delta**: one JSON object per line, one line per operation,

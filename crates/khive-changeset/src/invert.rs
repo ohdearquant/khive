@@ -1,16 +1,16 @@
 //! Pure, stage-time inversion against caller-supplied current records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use khive_types::{Entity, Id128, Link, Note, NoteStatus};
 
 use crate::{
     ChangeSet, CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage,
-    EntityPatch, EntityPreimage, Envelope, LinkOp, NotePatch, NotePreimage, Op, UpdateOp,
-    UpdatePatch, UpdatePreimage,
+    EntityPatch, EntityPreimage, Envelope, LinkOp, NotePatch, NotePreimage, Op, RestoreOp,
+    UpdateOp, UpdatePatch, UpdatePreimage,
 };
 
-/// Live records read by the caller when staging a revert.
+/// Current records, including soft-deleted records, read when staging a revert.
 ///
 /// Each key must equal its record's identifier. The caller supplies records in
 /// the same field representation as the staged operations; inversion does not
@@ -62,6 +62,14 @@ pub enum InvertError {
         /// Mismatched field name; `id` also names map-key/record-ID mismatches.
         field: &'static str,
     },
+    /// The captured delete preimage cannot describe a valid live restored record.
+    #[error("operation {index} inverse restore is invalid: {reason}")]
+    InverseRestore {
+        /// Original forward operation index.
+        index: usize,
+        /// The checked restore constructor's diagnostic.
+        reason: String,
+    },
     /// The existing checked update constructor refused the swapped patch/preimage.
     #[error("operation {index} inverse update is invalid: {reason}")]
     InverseUpdate {
@@ -87,8 +95,8 @@ impl ChangeSet {
     ///
     /// # Errors
     ///
-    /// Refuses a reused envelope, delete/merge operations, missing or invalidated
-    /// current records, or a swapped update rejected by [`UpdateOp::new`].
+    /// Refuses a reused envelope, hard deletes/merges, missing or invalidated
+    /// current records, an unrestorable delete preimage, or an invalid swapped update.
     pub fn invert(
         &self,
         envelope: Envelope,
@@ -98,17 +106,44 @@ impl ChangeSet {
             return Err(InvertError::ReusedEnvelope);
         }
         let mut working = current.clone();
+        // Restore records do not capture the earlier tombstone timestamp. Track
+        // rewound lifecycle state separately instead of fabricating a timestamp.
+        let mut tombstones = BTreeSet::new();
         let mut ops = Vec::with_capacity(self.ops.len());
         for (index, op) in self.ops.iter().enumerate().rev() {
             let inverse = match op {
-                Op::Create(create) => invert_create(index, create, &mut working)?,
-                Op::Link(link) => invert_link(index, link, &mut working)?,
+                Op::Create(create) => {
+                    let substrate = match &create.target {
+                        CreateTarget::Entity(_) => 0,
+                        CreateTarget::Note(_) => 1,
+                    };
+                    check(
+                        index,
+                        create.id,
+                        "deleted_at",
+                        !tombstones.contains(&(substrate, create.id)),
+                    )?;
+                    invert_create(index, create, &mut working)?
+                }
+                Op::Link(link) => {
+                    check(
+                        index,
+                        link.id,
+                        "deleted_at",
+                        !tombstones.contains(&(2, link.id)),
+                    )?;
+                    invert_link(index, link, &mut working)?
+                }
                 Op::Update(update) => invert_update(index, update, &mut working)?,
-                Op::Delete(_) => {
+                Op::Delete(delete) if delete.hard => {
                     return Err(InvertError::NotInvertible {
                         index,
                         op: "delete",
                     });
+                }
+                Op::Delete(delete) => invert_delete(index, delete, &mut working, &mut tombstones)?,
+                Op::Restore(restore) => {
+                    invert_restore(index, restore, &mut working, &mut tombstones)?
                 }
                 Op::Merge(_) => {
                     return Err(InvertError::NotInvertible { index, op: "merge" });
@@ -126,6 +161,211 @@ fn check(index: usize, id: Id128, field: &'static str, matches: bool) -> Result<
     } else {
         Err(InvertError::Invalidated { index, id, field })
     }
+}
+
+type RecordKey = (u8, Id128);
+
+fn record_key(record: &DeletePreimage) -> RecordKey {
+    match record {
+        DeletePreimage::Entity(row) => (0, row.header.id),
+        DeletePreimage::Note(row) => (1, row.header.id),
+        DeletePreimage::Edge(row) => (2, row.id),
+    }
+}
+
+fn is_deleted(record: &DeletePreimage) -> bool {
+    match record {
+        DeletePreimage::Entity(row) => row.deleted_at.is_some(),
+        DeletePreimage::Note(row) => row.deleted_at.is_some(),
+        DeletePreimage::Edge(row) => row.deleted_at.is_some(),
+    }
+}
+
+fn current_record(
+    index: usize,
+    id: Id128,
+    expected: &DeletePreimage,
+    working: &CurrentState,
+) -> Result<DeletePreimage, InvertError> {
+    let record = match expected {
+        DeletePreimage::Entity(_) => working
+            .entities
+            .get(&id)
+            .cloned()
+            .map(Box::new)
+            .map(DeletePreimage::Entity),
+        DeletePreimage::Note(_) => working
+            .notes
+            .get(&id)
+            .cloned()
+            .map(Box::new)
+            .map(DeletePreimage::Note),
+        DeletePreimage::Edge(_) => working
+            .edges
+            .get(&id)
+            .cloned()
+            .map(Box::new)
+            .map(DeletePreimage::Edge),
+    }
+    .ok_or(InvertError::MissingCurrent { index, id })?;
+    check(index, id, "id", record_key(&record).1 == id)?;
+    Ok(record)
+}
+
+fn rewind_record(record: &DeletePreimage, working: &mut CurrentState) {
+    match record {
+        DeletePreimage::Entity(row) => {
+            working.entities.insert(row.header.id, *row.clone());
+        }
+        DeletePreimage::Note(row) => {
+            working.notes.insert(row.header.id, *row.clone());
+        }
+        DeletePreimage::Edge(row) => {
+            working.edges.insert(row.id, *row.clone());
+        }
+    }
+}
+
+fn check_record_content(
+    index: usize,
+    id: Id128,
+    current: &DeletePreimage,
+    expected: &DeletePreimage,
+) -> Result<(), InvertError> {
+    macro_rules! fields {
+        ($current:ident, $expected:ident, $($field:ident),+ $(,)?) => {
+            $(check(index, id, stringify!($field), $current.$field == $expected.$field)?;)+
+        };
+    }
+    match (current, expected) {
+        (DeletePreimage::Entity(row), DeletePreimage::Entity(prior)) => {
+            fields!(
+                row,
+                prior,
+                kind,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags
+            );
+            check(
+                index,
+                id,
+                "namespace",
+                row.header.namespace == prior.header.namespace,
+            )?;
+            check(
+                index,
+                id,
+                "created_at",
+                row.header.created_at == prior.header.created_at,
+            )?;
+        }
+        (DeletePreimage::Note(row), DeletePreimage::Note(prior)) => {
+            fields!(
+                row,
+                prior,
+                kind,
+                status,
+                content,
+                properties,
+                tags,
+                salience,
+                decay_factor,
+                expires_at
+            );
+            check(
+                index,
+                id,
+                "namespace",
+                row.header.namespace == prior.header.namespace,
+            )?;
+            check(
+                index,
+                id,
+                "created_at",
+                row.header.created_at == prior.header.created_at,
+            )?;
+        }
+        (DeletePreimage::Edge(row), DeletePreimage::Edge(prior)) => {
+            fields!(
+                row, prior, namespace, source, target, relation, weight, properties, created_at
+            );
+        }
+        _ => check(index, id, "substrate", false)?,
+    }
+    Ok(())
+}
+
+fn invert_delete(
+    index: usize,
+    delete: &DeleteOp,
+    working: &mut CurrentState,
+    tombstones: &mut BTreeSet<RecordKey>,
+) -> Result<Op, InvertError> {
+    let id = delete.target_id;
+    let restore = RestoreOp::new(id, delete.preimage.clone())
+        .map_err(|reason| InvertError::InverseRestore { index, reason })?;
+    let mut current = current_record(index, id, &delete.preimage, working)?;
+    let key = record_key(&delete.preimage);
+    check(
+        index,
+        id,
+        "deleted_at",
+        is_deleted(&current) || tombstones.contains(&key),
+    )?;
+    if !tombstones.contains(&key) {
+        match (&mut current, &delete.preimage) {
+            (DeletePreimage::Entity(row), DeletePreimage::Entity(prior)) => {
+                check(
+                    index,
+                    id,
+                    "updated_at",
+                    row.header.updated_at == prior.header.updated_at,
+                )?;
+            }
+            (DeletePreimage::Note(row), DeletePreimage::Note(prior)) => {
+                check(
+                    index,
+                    id,
+                    "updated_at",
+                    row.header.updated_at == prior.header.updated_at,
+                )?;
+                check(index, id, "status", row.status == NoteStatus::Deleted)?;
+                row.status = prior.status;
+            }
+            _ => {}
+        }
+    }
+    check_record_content(index, id, &current, &delete.preimage)?;
+    rewind_record(&delete.preimage, working);
+    tombstones.remove(&key);
+    Ok(Op::Restore(restore))
+}
+
+fn invert_restore(
+    index: usize,
+    restore: &RestoreOp,
+    working: &mut CurrentState,
+    tombstones: &mut BTreeSet<RecordKey>,
+) -> Result<Op, InvertError> {
+    let id = restore.target_id();
+    let key = record_key(restore.record());
+    let current = current_record(index, id, restore.record(), working)?;
+    check(
+        index,
+        id,
+        "deleted_at",
+        !is_deleted(&current) && !tombstones.contains(&key),
+    )?;
+    check_record_content(index, id, &current, restore.record())?;
+    tombstones.insert(key);
+    Ok(Op::Delete(DeleteOp {
+        target_id: id,
+        hard: false,
+        preimage: current,
+    }))
 }
 
 fn invert_create(

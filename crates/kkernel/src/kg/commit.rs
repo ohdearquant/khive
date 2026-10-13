@@ -214,7 +214,7 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
             }
             // `update`/`delete`/`merge` are out of scope for commit-time
             // re-validation — see the module-level doc comment.
-            Op::Update(_) | Op::Delete(_) | Op::Merge(_) => {}
+            Op::Update(_) | Op::Delete(_) | Op::Restore(_) | Op::Merge(_) => {}
         }
     }
 
