@@ -81,7 +81,7 @@ use dispatch::{
     stored_action_is_non_single, verified_creator_for_event, DispatchLeaseTarget,
 };
 #[cfg(test)]
-use dispatch::{action_failures, dispatch_action};
+use dispatch::{action_failures, creator_provenance_statement, dispatch_action};
 
 #[cfg(test)]
 use drain::run_pending_events_on_with_lease;

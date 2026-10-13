@@ -1124,7 +1124,19 @@ fn build_event_filter_sql(
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     params.push(Box::new(default_namespace.to_string()));
-    conditions.push(format!("namespace = ?{}", params.len()));
+    // An ID-filtered read is bounded by the caller's IDs. Without
+    // sqlite_stat1 the planner otherwise lets the namespace equality drive
+    // through the index that also serves `ORDER BY created_at DESC, id DESC`,
+    // and walks every row of the namespace whenever fewer than `LIMIT` of
+    // the IDs exist, which is the normal case for the split store's probe of a
+    // new audit batch. Unary `+` keeps the namespace term as a filter only, so
+    // the primary key drives.
+    let namespace_term = if filter.ids.is_empty() {
+        "namespace"
+    } else {
+        "+namespace"
+    };
+    conditions.push(format!("{namespace_term} = ?{}", params.len()));
 
     push_in_clause(
         &mut conditions,
@@ -1206,6 +1218,15 @@ fn build_event_filter_sql(
 
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     Ok((clause, params))
+}
+
+fn query_events_sql(where_clause: &str, limit_idx: usize, offset_idx: usize) -> String {
+    format!(
+        "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                payload_schema_version, profile_state_version, duration_us, target_id, \
+                session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
+         FROM events{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
 }
 
 fn push_in_clause<I>(
@@ -1438,13 +1459,7 @@ impl EventStore for SqlEventStore {
             let limit_idx = all_params.len() - 1;
             let offset_idx = all_params.len();
 
-            let data_sql = format!(
-                "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                        payload_schema_version, profile_state_version, duration_us, target_id, \
-                        session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
-                 FROM events{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
-                where_clause, limit_idx, offset_idx,
-            );
+            let data_sql = query_events_sql(&where_clause, limit_idx, offset_idx);
 
             let mut stmt = conn.prepare(&data_sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1604,3 +1619,7 @@ mod direct_busy_tests;
 #[cfg(test)]
 #[path = "event_fallback_usage_tests.rs"]
 mod fallback_usage_tests;
+
+#[cfg(test)]
+#[path = "event_plan_tests.rs"]
+mod plan_tests;
