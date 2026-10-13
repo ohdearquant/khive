@@ -117,9 +117,9 @@ fn configure_standalone_writer(
     let config = pool.config();
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
-    conn.pragma_update(None, "cache_size", "-65536")
+    conn.pragma_update(None, "cache_size", crate::pool::sqlite_cache_size_pragma())
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
-    conn.pragma_update(None, "mmap_size", "1073741824")
+    conn.pragma_update(None, "mmap_size", crate::pool::sqlite_mmap_size_pragma())
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
 
     Ok(conn)

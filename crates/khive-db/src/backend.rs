@@ -55,8 +55,10 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 ///
 /// `StorageBackend::text()`/`text_with_tokenizer()` is called uncached on
 /// essentially every text-store access (`khive-runtime` builds a fresh
-/// `Fts5TextSearch` per call, never caching the `Arc`), so the already-done
-/// check runs on the hot path — it must stay O(1), not scale with either
+/// `Fts5TextSearch` per call, never caching the `Arc`). The backend skips this
+/// check once a table's marker is durable, but a table with no rows yet is
+/// re-checked on every fetch, so the check stays on the hot path — it must
+/// stay O(1), not scale with either
 /// table's row count, or it reintroduces the exact class of cost this
 /// migration exists to remove. `SELECT EXISTS(... LIMIT 1)` is an index probe
 /// that stops at the first row, unlike `COUNT(*)` which SQLite satisfies by
@@ -100,7 +102,9 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 ///    mirroring migration 024's own first sweep, so no live row is left
 ///    without a map entry.
 ///
-/// The marker is then written in the same transaction. This function never
+/// The marker is then written in the same transaction. Returns whether the
+/// marker is durable when this returns: `false` only for a table with no rows
+/// yet. This function never
 /// checks `entities`/`notes` for orphaned subjects — that sweep is specific
 /// to those two backing tables and stays in migration 024's SQL; a generic
 /// `table_key` here has no fixed backing table to check against.
@@ -108,7 +112,7 @@ fn ensure_fts_rowid_map_backfilled(
     conn: &rusqlite::Connection,
     table: &str,
     admission: &crate::pool::WriteAdmission,
-) -> Result<(), SqliteError> {
+) -> Result<bool, SqliteError> {
     let map = text::rowid_map_table(table);
     let state = text::rowid_map_state_table(table);
     let already_backfilled: bool = conn.query_row(
@@ -117,7 +121,7 @@ fn ensure_fts_rowid_map_backfilled(
         |row| row.get(0),
     )?;
     if already_backfilled {
-        return Ok(());
+        return Ok(true);
     }
     let fts_has_a_row: bool = conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
@@ -125,7 +129,7 @@ fn ensure_fts_rowid_map_backfilled(
         |row| row.get(0),
     )?;
     if !fts_has_a_row {
-        return Ok(());
+        return Ok(false);
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -167,7 +171,7 @@ fn ensure_fts_rowid_map_backfilled(
     match result {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
-            Ok(())
+            Ok(true)
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -302,6 +306,14 @@ pub struct StorageBackend {
     /// use; one that is replaced after its model was recorded is not
     /// re-checked until the backend reopens.
     vector_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// FTS tables whose schema, rowid-map sidecar and durable backfill marker
+    /// this backend has already proven under the writer. A table is recorded
+    /// only once its marker exists, so a table with no rows yet is re-checked
+    /// by the next fetch, and a warm fetch never takes the writer or the
+    /// volume lease: a search opens its text store on every call. As with
+    /// `vector_tables_ready`, a table dropped behind a live backend is not
+    /// recreated until the backend is reopened.
+    text_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// How many times the lazy `notes_seq` anti-join repair has actually
     /// executed against this backend's pool. Gates `notes_for_namespace` so
     /// the repair (a full `notes` scan) runs at most once per backend for
@@ -433,6 +445,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             vector_tables_ready: Default::default(),
+            text_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -510,6 +523,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             vector_tables_ready: Default::default(),
+            text_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -532,6 +546,7 @@ impl StorageBackend {
             is_file_backed: false,
             path: None,
             vector_tables_ready: Default::default(),
+            text_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -1369,11 +1384,24 @@ impl StorageBackend {
                     table_key.to_string(),
                 )));
             }
-        } else {
+        } else if !self.text_tables_ready.lock().contains(&table) {
             let writer = self.pool.autocommit_write_unit()?;
-            writer.conn().execute_batch(&ddl)?;
-            writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
-            ensure_fts_rowid_map_backfilled(writer.conn(), &table, &self.pool.write_admission())?;
+            // A concurrent caller may have proven this table while this one
+            // waited for the writer.
+            if !self.text_tables_ready.lock().contains(&table) {
+                writer.conn().execute_batch(&ddl)?;
+                writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
+                let marker_durable = ensure_fts_rowid_map_backfilled(
+                    writer.conn(),
+                    &table,
+                    &self.pool.write_admission(),
+                )?;
+                // Record the table only now that every step succeeded, while
+                // the writer is still held.
+                if marker_durable {
+                    self.text_tables_ready.lock().insert(table.clone());
+                }
+            }
         }
 
         Ok(Arc::new(text::Fts5TextSearch::new(

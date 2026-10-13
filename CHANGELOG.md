@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Each pooled SQLite connection now keeps an 8 MiB page cache instead of 64 MiB. The
+  cache is per connection and on the heap, so a process with many connections paid the
+  old size many times over. `KHIVE_SQLITE_CACHE_KIB` (512 to 1048576) and
+  `KHIVE_SQLITE_MMAP_BYTES` (0 to 2^40, `0` disables memory-mapped reads; default 1 GiB)
+  override the two settings; a value outside its range is logged and ignored.
+
+- A stdio MCP host that forwards to the daemon no longer runs the legacy quarantine
+  original repair at boot, whether it serves one store or several. The daemon runs
+  it before it serves; the census read every message row on every backend, so each
+  client start spent seconds pulling the stores through the page cache. The repair
+  itself now stops after its first census when nothing is unowned, instead of
+  reading the roster twice more to change nothing, and reports how many passes it
+  made.
 - Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
   cancellation fixes. MCP, mounted tools and CLI consumers keep their existing
   feature configuration; MCP result tests use the renamed `ContentBlock` API.

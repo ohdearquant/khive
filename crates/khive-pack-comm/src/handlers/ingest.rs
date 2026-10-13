@@ -378,6 +378,33 @@ pub(crate) async fn handle_ingest(
     } else {
         None
     };
+    // A quarantine original is owned by a main-backend attachment on its
+    // quarantine message (ADR-121 item 7), and the runtime refuses that write
+    // when the message lives on a secondary backend. Refusing the ingest held
+    // the channel cursor on that message for every later poll. Record the
+    // quarantine without its original instead, disclosed the same way as the
+    // retention limit: the reference is not persisted, so the uploaded object
+    // stays unowned, and the transport still holds the original message.
+    let quarantine_attachment = match quarantine_attachment {
+        Some(attachment) if runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN => {
+            tracing::warn!(
+                external_id = ?p.external_id,
+                backend = runtime.backend_id().as_str(),
+                content_ref = %attachment.content_ref,
+                "comm.ingest: dropping quarantine original reference on a secondary backend"
+            );
+            if let Some(metadata) = p.metadata.as_mut() {
+                metadata.remove("quarantine_content_ref");
+                metadata.insert("quarantine_original_retained".to_string(), json!("false"));
+                metadata.insert(
+                    "quarantine_original_not_retained_reason".to_string(),
+                    json!("secondary-backend"),
+                );
+            }
+            None
+        }
+        other => other,
+    };
 
     // One-release IMAP migration: read the pre-account key and keep its stored
     // external_id; a quarantine replay may only repair ownership and retention
