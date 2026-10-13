@@ -530,6 +530,87 @@ fn bench_list_notes_visible(c: &mut Criterion) {
     group.finish();
 }
 
+// ── delete ────────────────────────────────────────────────────────────────────
+
+fn bench_delete(c: &mut Criterion) {
+    let rt = tokio_rt();
+    let (_, registry) = build_registry();
+
+    // About 9,000 edges that do not touch the deleted entity: the chain from
+    // `seed_graph` and eight structural edges out of every entity.
+    let ids = rt.block_on(async {
+        let ids = seed_graph(&registry, 1000).await;
+        for stride in 1..=8 {
+            for (i, id) in ids.iter().enumerate() {
+                let target = (i * (2 * stride + 1) + stride) % ids.len();
+                if target == i {
+                    continue;
+                }
+                registry
+                    .dispatch(
+                        "link",
+                        json!({
+                            "source_id": id,
+                            "target_id": ids[target],
+                            "relation": "enables",
+                        }),
+                    )
+                    .await
+                    .expect("seed structural edge");
+            }
+        }
+        ids
+    });
+
+    let mut group = c.benchmark_group("kg_delete");
+    group.sample_size(30);
+
+    // One iteration creates an entity, links it to the graph and deletes it.
+    // A hard delete also removes its incident edges and records lineage
+    // warnings; a soft delete only tombstones the row.
+    for (label, hard) in [
+        ("hard_entity_one_edge_edges_9000", true),
+        ("soft_entity_one_edge_edges_9000", false),
+    ] {
+        group.bench_function(label, |b| {
+            let mut seq: u64 = 0;
+            b.to_async(&rt).iter(|| {
+                seq += 1;
+                let registry = &registry;
+                let anchor = ids[(seq as usize) % ids.len()].clone();
+                async move {
+                    let created = registry
+                        .dispatch(
+                            "create",
+                            json!({
+                                "kind": "entity",
+                                "name": format!("BenchDelete{label}{seq}"),
+                                "entity_kind": "concept",
+                            }),
+                        )
+                        .await
+                        .expect("create entity");
+                    let id = created["id"].as_str().expect("id").to_string();
+                    registry
+                        .dispatch(
+                            "link",
+                            json!({"source_id": id, "target_id": anchor, "relation": "enables"}),
+                        )
+                        .await
+                        .expect("link entity");
+                    let resp = registry
+                        .dispatch("delete", black_box(json!({"id": id, "hard": hard})))
+                        .await
+                        .expect("delete entity");
+                    black_box(resp)
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // ── criterion entry points ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -543,5 +624,6 @@ criterion_group!(
     bench_traverse,
     bench_stats,
     bench_list_notes_visible,
+    bench_delete,
 );
 criterion_main!(kg_benches);
