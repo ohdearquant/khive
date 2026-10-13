@@ -1418,13 +1418,26 @@ fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static st
                 .and_then(|term| term.strip_suffix(", '')"))
                 .is_some_and(numbered_param)
         });
-    if !namespace
-        || !terms.contains(&"deleted_at IS NULL")
-        || !equality("kind = ")
-        || !equality("json_extract(properties, '$.direction') = ")
-        || !recipient
-    {
+    if !namespace || !terms.contains(&"deleted_at IS NULL") || !equality("kind = ") {
         return "";
+    }
+    if !equality("json_extract(properties, '$.direction') = ") || !recipient {
+        // A thread-keyed read selects the thread's own rows. Left to the
+        // planner, `LIMIT` under a `created_at` order picks the creation-order
+        // index and evaluates `$.thread_id` on every message in the namespace,
+        // and a direction term ties the thread index with
+        // `idx_comm_message_outbound_ref`, which walks every outbound message.
+        let thread = equality("json_extract(properties, '$.thread_id') = ")
+            || terms.iter().any(|term| {
+                term.strip_prefix("json_extract(properties, '$.thread_id') IN (")
+                    .and_then(|term| term.strip_suffix(')'))
+                    .is_some_and(|values| values.split(", ").all(numbered_param))
+            });
+        return if thread {
+            " INDEXED BY idx_comm_message_thread"
+        } else {
+            ""
+        };
     }
     if terms.contains(
         &"(json_type(properties, '$.read') IS NULL OR json_type(properties, '$.read') != 'true')",
