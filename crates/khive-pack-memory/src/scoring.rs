@@ -521,9 +521,13 @@ pub struct ScoringConfig {
     /// When true, suppress memories whose `properties.supersedes` value matches
     /// the ID of another memory in the result set. Default: true.
     pub enable_supersedes_suppression: bool,
-    /// When true, a CJK-majority query bypasses the FTS5 leg (whose trigram
-    /// tokenizer does not segment CJK well) and relies on the vector leg
-    /// instead. Default: true.
+    /// When true, a query with more than 15% CJK characters (`contains_cjk`) skips
+    /// document-frequency term selection in the FTS gather path and sends its first
+    /// `term_k` terms in query order to the ranked FTS search. The flag is read only
+    /// when FTS gather is enabled (`fts_gather.enabled`, off by default) and
+    /// `cjk_bypass_ranked` is true. Otherwise the plain FTS search runs unchanged. It
+    /// never removes the FTS leg and does not affect vector retrieval or fusion.
+    /// Default: true.
     #[serde(alias = "enable_multilingual_routing")]
     pub enable_cjk_fts_bypass: bool,
 
@@ -636,6 +640,25 @@ pub fn is_meaningful_query(query: &str) -> bool {
     }
 
     true
+}
+
+/// Returns `true` when CJK characters (`is_cjk_char`) outnumber every other letter in `text`.
+///
+/// Other letters are the alphabetic characters that are not CJK. Digits, whitespace, and
+/// punctuation count for neither side, so a tie, a text with no letters, and a text with no CJK
+/// characters are all `false`. Recall uses this to decide when an English-only embedding model's
+/// vector list is left out of fusion; it is stricter than the 15% share `contains_cjk` tests.
+pub(crate) fn is_cjk_dominant_query(text: &str) -> bool {
+    let (cjk, other) = text.chars().fold((0usize, 0usize), |(cjk, other), c| {
+        if is_cjk_char(c) {
+            (cjk + 1, other)
+        } else if c.is_alphabetic() {
+            (cjk, other + 1)
+        } else {
+            (cjk, other)
+        }
+    });
+    cjk > other
 }
 
 // ── Score normalization ────────────────────────────────────────────────────────

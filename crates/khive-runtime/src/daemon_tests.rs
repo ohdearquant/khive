@@ -1455,9 +1455,10 @@ mod demand_retirement_tests {
             .is_err()
         {
             panic!(
-                "released writer must let the idle wait finish; snapshot {:?}, blockers now {:?}",
+                "released writer must let the idle wait finish; snapshot {:?}, blockers now {:?}, open spans {:?}",
                 demand.snapshot(),
-                idle_retirement_blockers(&d)
+                idle_retirement_blockers(&d),
+                khive_storage::tx_registry::snapshot()
             );
         }
         assert_eq!(demand.snapshot().phase, DaemonLifecyclePhase::Draining);
@@ -1473,9 +1474,10 @@ mod demand_retirement_tests {
         drop(pooled_guard);
         assert!(
             pooled.try_idle(|| idle_retirement_blockers(&d)),
-            "released pooled writer must allow retirement; snapshot {:?}, blockers now {:?}",
+            "released pooled writer must allow retirement; snapshot {:?}, blockers now {:?}, open spans {:?}",
             pooled.snapshot(),
-            idle_retirement_blockers(&d)
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
         );
     }
 
@@ -1549,9 +1551,10 @@ mod demand_retirement_tests {
         drop(reader);
         assert!(
             state.try_idle(|| idle_retirement_blockers(&d)),
-            "ended reader transaction must allow retirement; snapshot {:?}, blockers now {:?}",
+            "ended reader transaction must allow retirement; snapshot {:?}, blockers now {:?}, open spans {:?}",
             state.snapshot(),
-            idle_retirement_blockers(&d)
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
         );
     }
 
@@ -1575,9 +1578,10 @@ mod demand_retirement_tests {
         task.await.unwrap();
         assert!(
             state.try_idle(|| idle_retirement_blockers(&d)),
-            "maintenance completion must not reset ordinary activity; snapshot {:?}, blockers now {:?}",
+            "maintenance completion must not reset ordinary activity; snapshot {:?}, blockers now {:?}, open spans {:?}",
             state.snapshot(),
-            idle_retirement_blockers(&d)
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
         );
     }
 
