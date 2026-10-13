@@ -333,13 +333,19 @@ struct DbCheckArgs {
     #[arg(long)]
     backend: Option<String>,
 
-    /// Exit nonzero if any backend is behind the current schema version.
+    /// Exit nonzero if any backend is behind the current schema version, or, with
+    /// `--integrity`, if any integrity check reports a problem.
     #[arg(long)]
     strict: bool,
 
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     human: bool,
+
+    /// Also run `PRAGMA integrity_check` on every existing database file. It
+    /// reads every page, so it takes time proportional to the file size.
+    #[arg(long)]
+    integrity: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -953,6 +959,7 @@ async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
             backend: args.backend,
             strict: args.check,
             human: args.human,
+            integrity: false,
         })
         .await;
     }
@@ -1060,9 +1067,27 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
         }
     }
 
+    struct BackendReport {
+        backend: String,
+        current_version: u32,
+        is_current: bool,
+        ahead: bool,
+        validation_error: Option<String>,
+        pages: Option<khive_db::PageAccounting>,
+        integrity: Option<Vec<String>>,
+    }
+
+    impl BackendReport {
+        fn integrity_failed(&self) -> bool {
+            self.integrity
+                .as_ref()
+                .is_some_and(|rows| rows.len() != 1 || rows[0] != "ok")
+        }
+    }
+
     let mut reports = Vec::with_capacity(targets.len());
     for (backend, path) in targets {
-        let (current_version, validation_error) = match path.as_deref() {
+        let (current_version, validation_error, pages, integrity) = match path.as_deref() {
             Some(path) if path.exists() => {
                 let version = khive_db::inspect_schema_version(path)
                     .map_err(|error| anyhow::anyhow!("backend {backend}: {error}"))?;
@@ -1073,55 +1098,93 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
                 } else {
                     None
                 };
-                (version, validation_error)
+                let pages = khive_db::inspect_page_accounting(path)
+                    .map_err(|error| anyhow::anyhow!("backend {backend}: {error}"))?;
+                let integrity = if args.integrity {
+                    Some(
+                        khive_db::inspect_integrity(path)
+                            .map_err(|error| anyhow::anyhow!("backend {backend}: {error}"))?,
+                    )
+                } else {
+                    None
+                };
+                (version, validation_error, Some(pages), integrity)
             }
-            _ => (0, None),
+            _ => (0, None, None, None),
         };
         let ahead = current_version > latest;
         let is_current = current_version == latest && validation_error.is_none();
-        reports.push((
+        reports.push(BackendReport {
             backend,
             current_version,
             is_current,
             ahead,
             validation_error,
-        ));
+            pages,
+            integrity,
+        });
     }
 
     if args.human {
-        for (backend, current_version, is_current, ahead, validation_error) in &reports {
-            let state = if let Some(error) = validation_error {
+        for report in &reports {
+            let state = if let Some(error) = &report.validation_error {
                 format!("invalid current-schema state — {error}")
-            } else if *ahead {
+            } else if report.ahead {
                 "ahead — incompatible with this build".to_string()
-            } else if *is_current {
+            } else if report.is_current {
                 "current".to_string()
             } else {
                 "behind — run: kkernel db migrate".to_string()
             };
-            println!("{backend}: V{current_version} ({state})");
+            let mut line = format!("{}: V{} ({state})", report.backend, report.current_version);
+            if let Some(pages) = report.pages {
+                let free_percent = if pages.page_count == 0 {
+                    0.0
+                } else {
+                    pages.freelist_count as f64 * 100.0 / pages.page_count as f64
+                };
+                line.push_str(&format!(
+                    ", {} pages of {} bytes, {} free ({free_percent:.1}%)",
+                    pages.page_count, pages.page_size, pages.freelist_count
+                ));
+            }
+            if let Some(rows) = &report.integrity {
+                if report.integrity_failed() {
+                    line.push_str(&format!(", integrity: {} problem(s)", rows.len()));
+                } else {
+                    line.push_str(", integrity: ok");
+                }
+            }
+            println!("{line}");
+            if report.integrity_failed() {
+                for row in report.integrity.iter().flatten() {
+                    println!("  {row}");
+                }
+            }
         }
     } else {
         let backends = reports
             .iter()
-            .map(
-                |(backend, current_version, is_current, ahead, validation_error)| {
-                    serde_json::json!({
-                        "backend": backend,
-                        "current_version": current_version,
-                        "latest_version": latest,
-                        "current": is_current,
-                        "ahead": ahead,
-                        "pending": latest.saturating_sub(*current_version),
-                        "validation_error": validation_error,
-                    })
-                },
-            )
+            .map(|report| {
+                serde_json::json!({
+                    "backend": report.backend,
+                    "current_version": report.current_version,
+                    "latest_version": latest,
+                    "current": report.is_current,
+                    "ahead": report.ahead,
+                    "pending": latest.saturating_sub(report.current_version),
+                    "validation_error": report.validation_error,
+                    "page_size": report.pages.map(|pages| pages.page_size),
+                    "page_count": report.pages.map(|pages| pages.page_count),
+                    "freelist_count": report.pages.map(|pages| pages.freelist_count),
+                    "integrity": report.integrity,
+                })
+            })
             .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "current": reports.iter().all(|(_, _, current, _, _)| *current),
+                "current": reports.iter().all(|report| report.is_current),
                 "latest_version": latest,
                 "backends": backends,
             }))
@@ -1129,15 +1192,18 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
         );
     }
 
-    if args.strict && reports.iter().any(|(_, _, current, _, _)| !current) {
+    if args.strict && reports.iter().any(|report| !report.is_current) {
         let summary = reports
             .iter()
-            .filter(|(_, _, current, _, _)| !current)
-            .map(|(backend, version, _, _, validation_error)| {
-                validation_error
+            .filter(|report| !report.is_current)
+            .map(|report| {
+                report
+                    .validation_error
                     .as_ref()
-                    .map(|error| format!("{backend}: V{version}, {error}"))
-                    .unwrap_or_else(|| format!("{backend}: V{version}"))
+                    .map(|error| {
+                        format!("{}: V{}, {error}", report.backend, report.current_version)
+                    })
+                    .unwrap_or_else(|| format!("{}: V{}", report.backend, report.current_version))
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -1145,6 +1211,21 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
             "schema topology is not current ({summary}); V{latest} with a complete canonical \
              attachment cutover is required"
         );
+    }
+    if args.strict && reports.iter().any(BackendReport::integrity_failed) {
+        let summary = reports
+            .iter()
+            .filter(|report| report.integrity_failed())
+            .map(|report| {
+                format!(
+                    "{}: {} problem(s)",
+                    report.backend,
+                    report.integrity.as_ref().map_or(0, Vec::len)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("integrity check failed ({summary})");
     }
     Ok(())
 }
@@ -1494,6 +1575,7 @@ mod tests {
             backend: None,
             strict: false,
             human: false,
+            integrity: false,
         })
         .await
         .expect("db check succeeds on a missing file");
@@ -1619,6 +1701,7 @@ mod tests {
             backend: None,
             strict: true,
             human: false,
+            integrity: false,
         })
         .await
         .expect("db check passes on a current db");
@@ -1670,6 +1753,7 @@ mod tests {
             backend: None,
             strict: true,
             human: false,
+            integrity: false,
         })
         .await
         .expect_err("MAX(version)=21 cannot hide missing physical cutover state");
@@ -1681,6 +1765,75 @@ mod tests {
             before,
             std::fs::read(&path).expect("read fixture after check"),
             "strict validation must remain read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_check_strict_integrity_rejects_a_corrupt_index_without_mutating_it() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("corrupt-index.db");
+        let config = write_empty_config(tmp.path());
+        let backend =
+            khive_db::StorageBackend::sqlite_for_test(&path).expect("open fixture backend");
+        backend
+            .prepare_core_schema()
+            .expect("prepare current schema");
+        drop(backend);
+        {
+            // Point index `i` at the empty index tree of `e`, so every row of `t`
+            // is missing from its index while the schema itself stays current.
+            let conn = rusqlite::Connection::open(&path).expect("reopen fixture");
+            conn.execute_batch(
+                "CREATE TABLE t (a INTEGER); CREATE INDEX i ON t (a); \
+                 CREATE TABLE e (a INTEGER); CREATE INDEX ie ON e (a); \
+                 INSERT INTO t (a) VALUES (1), (2), (3);",
+            )
+            .expect("fixture tables");
+            let empty_root: i64 = conn
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'ie'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("root page of ie");
+            conn.execute_batch("PRAGMA writable_schema = ON;")
+                .expect("writable schema");
+            conn.execute("DELETE FROM sqlite_schema WHERE name = 'ie'", [])
+                .expect("drop ie from the schema");
+            conn.execute(
+                "UPDATE sqlite_schema SET rootpage = ?1 WHERE name = 'i'",
+                [empty_root],
+            )
+            .expect("repoint i");
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint fixture");
+        }
+        let before = std::fs::read(&path).expect("read corrupt fixture");
+        let check = |integrity| DbCheckArgs {
+            db: Some(path.display().to_string()),
+            config: Some(config.clone()),
+            backend: None,
+            strict: true,
+            human: false,
+            integrity,
+        };
+
+        // Control: the schema check alone passes, so the refusal below is the
+        // integrity check's and not the schema's.
+        cmd_db_check(check(false))
+            .await
+            .expect("the schema is current; only an index is corrupt");
+        let error = cmd_db_check(check(true))
+            .await
+            .expect_err("--strict --integrity must refuse a corrupt index");
+        assert!(
+            error.to_string().contains("integrity check failed"),
+            "unexpected strict-check error: {error:#}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read fixture after check"),
+            "an integrity check must remain read-only"
         );
     }
 
@@ -1722,6 +1875,7 @@ mod tests {
             backend: Some(BackendId::MAIN.to_string()),
             strict: true,
             human: false,
+            integrity: false,
         })
         .await
         .expect_err("a current main cannot hide a behind secondary prerequisite");
