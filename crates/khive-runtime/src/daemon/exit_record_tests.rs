@@ -2,7 +2,7 @@
 
 use super::*;
 use super::super::exit_record::{
-    exit_record_path, read_previous, ExitReason, ExitRecord, PreviousExit,
+    exit_record_path, read_previous, ExitReason, ExitRecord, PreviousExit, SENDER_CAPTURE_LATE,
 };
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -225,6 +225,12 @@ fn the_exit_record_names_the_signal_and_its_sender_and_the_next_boot_reports_it(
     assert!(
         log.contains("descriptor limit") && log.contains("nofile_soft=256"),
         "boot must log the effective descriptor limit:\n{log}"
+    );
+    // The recorder must run before tokio's wakeup, or the exit line below can
+    // name no sender; the registry runs actions in registration order.
+    assert!(
+        !log.contains(SENDER_CAPTURE_LATE),
+        "the sender recorder must be registered before the shutdown streams:\n{log}"
     );
 
     // A known process sends SIGTERM.
