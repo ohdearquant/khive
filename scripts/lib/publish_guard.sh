@@ -82,3 +82,19 @@ publish_verify_mode() {
             ;;
     esac
 }
+
+# semver_gate_mode <value of KHIVE_PUBLISH_SEMVER_CHECKED_AT> <HEAD sha> <clean|dirty>
+# Decides whether publish.sh runs the SemVer gate. Prints `skip` only when the
+# value is a full 40-character commit sha equal to HEAD and the working tree is
+# clean: the gate already ran at exactly this commit on another machine, so this
+# machine need not rebuild every crate's rustdoc to repeat it. Prints `run` for an
+# unset or empty value, an abbreviated or different sha, or a dirty tree, so a
+# stale or mistyped value runs the gate as before.
+semver_gate_mode() {
+    local checked_at="${1-}" head="${2-}" tree="${3-}"
+    if [[ "$checked_at" =~ ^[0-9a-f]{40}$ && "$checked_at" == "$head" && "$tree" == clean ]]; then
+        echo skip
+    else
+        echo run
+    fi
+}
