@@ -268,6 +268,14 @@ A value above 86400 is clamped to 86400, and zero or a non-integer uses the
 set. Record this operator setting with run evidence; it is not a wire-limit
 bypass.
 
+The deadline that bounds the work is read by the process that runs it. When
+`kkernel exec` forwards to a daemon that is already running, the daemon applies
+the value from its own environment, and the request carries no deadline; setting
+the variable on the `kkernel exec` command changes only how long the client
+waits for the answer. The example above therefore applies to local dispatch or
+to a daemon that this command starts. For a daemon that is already running, set
+the variable in the daemon's environment.
+
 ### Stable refusal reasons
 
 Refused invocations retain their existing human-readable error and exit-code

@@ -19,9 +19,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   posterior storage, folds and serving paths remain unchanged.
 - Packs can declare note property policies and discover the validated registry boot snapshot.
   Comm declares its nine existing kind-specific protected properties; writer enforcement is unchanged.
+- `db_diagnostics` accepts `backend=<name>` to inspect only the opened database serving that
+  backend, and `size_composition=false` to skip the `dbstat` walk, which reads every page of
+  each file. Every file-backed report now carries `page_accounting` (`page_size_bytes`,
+  `page_count`, `freelist_pages`), three pragma reads that are reported either way.
 
 ### Changed
 
+- `db_diagnostics` no longer fails as a whole when the request's read deadline arrives. The
+  backends already inspected are returned, every remaining backend's `error` starts with
+  `not inspected: request deadline`, and the new root field `complete` is `false`. Backend
+  inspections stop slightly before the deadline (a tenth of the remaining time, at most two
+  seconds) so the partial report reaches a client whose own deadline started first. A
+  cancelled request still fails. When `backend` selects a database, the root fields describe
+  that database rather than main.
+- `khive_db::diagnostics::collect_with_runtime_audit_metrics_for_process_interruptibly` and
+  `KhiveRuntime::db_diagnostics_for_opened_backend_with_audit_metrics` take a trailing
+  `collect_size_composition: bool`; pass `true` for the previous behavior.
+  `khive_db::diagnostics::DbDiagnostics` gains the public fields `page_accounting` and
+  `page_accounting_error`; direct struct constructors must supply them.
 - A stdio MCP host that forwards to the daemon is now strict by default whenever a daemon
   socket or PID file exists, or existed when the request arrived: a request that would
   have fallen back to local dispatch is refused with its reason code (`no_socket`,
@@ -81,6 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is refused the way one assigned to `token` is. Pagination and sync cursors (`next_token`,
   `next_page_token`, `page_token`, `pagination_token`, `continuation_token`, `resume_token`,
   `sync_token` and a few others, matched as the whole label) stay allowed.
+- On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
+  store's check of each new audit batch against the legacy store) and the schedule
+  creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
+  Before, both walked every event of the namespace in `created_at` order.
 - Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
   File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
   (#5087).

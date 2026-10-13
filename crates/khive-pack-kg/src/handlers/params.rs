@@ -137,7 +137,12 @@ pub(crate) struct WhoamiParams {}
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DbDiagnosticsParams {}
+pub(crate) struct DbDiagnosticsParams {
+    /// Inspect only the opened database that serves this backend name.
+    pub(crate) backend: Option<String>,
+    /// `false` skips the `dbstat` walk, which reads every page of each file.
+    pub(crate) size_composition: Option<bool>,
+}
 
 /// ADR-099 B3: `pub` so kkernel's `--atomic` seam can deserialize through this same
 /// canonical struct, reproducing `deny_unknown_fields` rejection. Fields stay
