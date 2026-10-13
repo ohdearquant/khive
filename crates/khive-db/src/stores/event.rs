@@ -645,7 +645,9 @@ fn profile_state_version_to_sql(event: &Event) -> Result<Option<i64>, rusqlite::
 /// intentionally not a prepare-time edge query: a guarded edge write that
 /// commits immediately before the delete must be represented in the warning
 /// payload before the subsequent cascade statement removes it. Relations
-/// with no matching incident edge insert no event.
+/// with no matching incident edge insert no event. Incident edges are found
+/// in every namespace through the graph store's namespace walk, so each
+/// statement seeks per namespace instead of reading every edge.
 pub fn hard_delete_lineage_warning_statements(
     namespace: &str,
     actor: &str,
@@ -666,7 +668,8 @@ pub fn hard_delete_lineage_warning_statements(
     WARNINGS
         .into_iter()
         .map(|(relation, warning)| SqlStatement {
-            sql: "INSERT INTO events \
+            sql: format!(
+                "INSERT INTO events \
                   (id, namespace, verb, substrate, actor, kind, outcome, payload, \
                    payload_schema_version, profile_state_version, duration_us, target_id, \
                    session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution) \
@@ -685,14 +688,22 @@ pub fn hard_delete_lineage_warning_statements(
                              'deleted_at', incident.deleted_at)) \
                          ), \
                          1, NULL, 0, ?8, NULL, NULL, NULL, ?10, ?11, ?12 \
-                  FROM ( \
-                    SELECT id, namespace, source_id, target_id, deleted_at \
-                    FROM graph_edges \
-                    WHERE (source_id = ?8 OR target_id = ?8) AND relation = ?9 \
+                  FROM ( {cte} \
+                    SELECT e.id AS id, e.namespace AS namespace, e.source_id AS source_id, \
+                           e.target_id AS target_id, e.deleted_at AS deleted_at \
+                    FROM edge_ns CROSS JOIN graph_edges AS e \
+                      ON e.namespace = edge_ns.namespace AND e.source_id = ?8 AND e.relation = ?9 \
+                    UNION ALL \
+                    SELECT e.id AS id, e.namespace AS namespace, e.source_id AS source_id, \
+                           e.target_id AS target_id, e.deleted_at AS deleted_at \
+                    FROM edge_ns CROSS JOIN graph_edges AS e \
+                      ON e.namespace = edge_ns.namespace AND e.target_id = ?8 AND e.relation = ?9 \
+                    WHERE e.source_id <> ?8 \
                     ORDER BY namespace, id \
                   ) AS incident \
-                  HAVING count(*) > 0"
-                .into(),
+                  HAVING count(*) > 0",
+                cte = super::graph::EDGE_NAMESPACES_CTE
+            ),
             params: vec![
                 SqlValue::Text(Uuid::new_v4().to_string()),
                 SqlValue::Text(namespace.to_string()),
