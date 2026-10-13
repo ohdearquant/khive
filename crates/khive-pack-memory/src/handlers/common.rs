@@ -29,7 +29,9 @@ use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
 use crate::ann::{self, AnnKey};
-use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
+use crate::config::{
+    is_english_only_embedding_model, RecallConfig, ScoreBreakdown, WeightedContributions,
+};
 use crate::query_cache::QueryEmbeddingCache;
 use crate::MemoryPack;
 
@@ -879,7 +881,8 @@ pub(super) struct RecallCandidateParams<'a> {
     pub(super) legs: RecallLegs,
     pub(super) embedding_model: Option<&'a str>,
     pub(super) session_fence: Option<&'a crate::visibility::VisibilityFence>,
-    /// Route the FTS path through the CJK-bypass tokenizer. Keyed on `contains_cjk`.
+    /// Skip FTS gather term selection. Keyed on `contains_cjk`; read only when FTS gather is
+    /// enabled.
     pub(super) cjk_fts_bypass: bool,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
@@ -952,11 +955,33 @@ fn vector_labelled(
         .collect()
 }
 
+/// Fuse the candidates with every model's vector list, as `fuse_for_query` does for a query that
+/// is not CJK-dominant.
+#[cfg(test)]
 pub(super) fn fuse_candidates(
     candidates: &RecallCandidateSet,
     memory_ids: &HashSet<Uuid>,
     cfg: &RecallConfig,
     limit: usize,
+) -> Result<Vec<SearchHit>, RuntimeError> {
+    fuse_for_query(candidates, memory_ids, cfg, limit, "", None)
+}
+
+/// Fuse the candidates of one recall.
+///
+/// When `query` is CJK-dominant (`is_cjk_dominant_query`), the vector lists of English-only
+/// embedding models (`is_english_only_embedding_model`) take part with no candidates, so they
+/// carry weight zero under every strategy that fuses per-model vector lists. The list keeps its
+/// slot, which keeps the per-source weights of a weighted strategy aligned. The lists stay
+/// whole when no other model contributed a candidate, and when `requested_model` names an
+/// embedding model explicitly.
+pub(super) fn fuse_for_query(
+    candidates: &RecallCandidateSet,
+    memory_ids: &HashSet<Uuid>,
+    cfg: &RecallConfig,
+    limit: usize,
+    query: &str,
+    requested_model: Option<&str>,
 ) -> Result<Vec<SearchHit>, RuntimeError> {
     let text_source: Vec<_> = candidates
         .text_hits
@@ -975,15 +1000,33 @@ pub(super) fn fuse_candidates(
         })
         .collect();
 
-    let vector_sources: Vec<Vec<_>> = candidates
+    let mut named_vector_sources: Vec<(&str, Vec<(Uuid, DeterministicScore)>)> = candidates
         .vector_hits_per_model
         .iter()
-        .map(|(_, hits)| {
-            hits.iter()
+        .map(|(model, hits)| {
+            let list: Vec<(Uuid, DeterministicScore)> = hits
+                .iter()
                 .filter(|h| memory_ids.contains(&h.subject_id))
                 .map(|h| (h.subject_id, h.score))
-                .collect()
+                .collect();
+            (model.as_str(), list)
         })
+        .collect();
+    if requested_model.is_none()
+        && crate::scoring::is_cjk_dominant_query(query)
+        && named_vector_sources
+            .iter()
+            .any(|(model, list)| !list.is_empty() && !is_english_only_embedding_model(model))
+    {
+        for (model, list) in named_vector_sources.iter_mut() {
+            if is_english_only_embedding_model(model) {
+                list.clear();
+            }
+        }
+    }
+    let vector_sources: Vec<Vec<_>> = named_vector_sources
+        .into_iter()
+        .map(|(_, list)| list)
         .collect();
 
     let vector_only = matches!(&cfg.fuse_strategy, FusionStrategy::VectorOnly);

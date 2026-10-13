@@ -47,6 +47,78 @@ fn contains_cjk_ignores_latin() {
 }
 
 #[test]
+fn is_cjk_dominant_query_accepts_pure_cjk() {
+    assert!(is_cjk_dominant_query("你好世界"));
+    assert!(is_cjk_dominant_query("重做嵌入索引之前必须做什么准备？"));
+    // A single character is dominant: nothing outnumbers it.
+    assert!(is_cjk_dominant_query("你"));
+    // Hiragana, Katakana, and Hangul count as CJK.
+    assert!(is_cjk_dominant_query("これはペンです"));
+    assert!(is_cjk_dominant_query("안녕하세요"));
+}
+
+#[test]
+fn is_cjk_dominant_query_rejects_pure_english() {
+    assert!(!is_cjk_dominant_query("hello world"));
+    assert!(!is_cjk_dominant_query(
+        "what must be prepared before rebuilding the embedding index"
+    ));
+    assert!(!is_cjk_dominant_query("café naïve"));
+    // Other scripts are letters that outnumber a short CJK run.
+    assert!(!is_cjk_dominant_query("привет мир 你好"));
+}
+
+#[test]
+fn is_cjk_dominant_query_mixed_follows_the_letter_majority() {
+    // 7 CJK characters against 11 Latin letters.
+    assert!(!is_cjk_dominant_query("KHIVE 的 recall 为什么返回空"));
+    // 2 CJK characters against 10 Latin letters.
+    assert!(!is_cjk_dominant_query("hello 世界 world"));
+    // 7 CJK characters against 5 Latin letters.
+    assert!(is_cjk_dominant_query("重建嵌入索引 khive 的"));
+    // 4 CJK characters against 2 Latin letters.
+    assert!(is_cjk_dominant_query("世界你好 hi"));
+}
+
+#[test]
+fn is_cjk_dominant_query_ignores_digits_whitespace_and_punctuation() {
+    assert!(!is_cjk_dominant_query(""));
+    assert!(!is_cjk_dominant_query("   "));
+    assert!(!is_cjk_dominant_query("2026-10-13 12345"));
+    assert!(!is_cjk_dominant_query("。。。，，，！？"));
+    assert!(!is_cjk_dominant_query("hello 12345 !!!"));
+    // Digits and punctuation do not offset CJK: 2 CJK characters against no other letter.
+    assert!(is_cjk_dominant_query("你好 2026 12345 ,.;"));
+    assert!(is_cjk_dominant_query("（你好）"));
+}
+
+#[test]
+fn is_cjk_dominant_query_tie_is_not_dominant() {
+    // 2 CJK characters against 2 Latin letters: a tie, and strictly more CJK is required.
+    assert!(!is_cjk_dominant_query("世界 hi"));
+    assert!(!is_cjk_dominant_query("你 a"));
+    // One more CJK character than Latin letters tips it.
+    assert!(is_cjk_dominant_query("世界 h"));
+    assert!(is_cjk_dominant_query("你好 a"));
+    for n in 1..=6usize {
+        let tie = format!("{} {}", "字".repeat(n), "a".repeat(n));
+        let one_more = format!("{} {}", "字".repeat(n + 1), "a".repeat(n));
+        assert!(!is_cjk_dominant_query(&tie), "tie at n={n}: {tie:?}");
+        assert!(
+            is_cjk_dominant_query(&one_more),
+            "n+1 CJK at n={n}: {one_more:?}"
+        );
+    }
+}
+
+#[test]
+fn is_cjk_dominant_query_is_stricter_than_contains_cjk() {
+    // 2 of 5 characters are CJK: above the 15% share, but not more than the other letters.
+    assert!(contains_cjk("世界 hi"));
+    assert!(!is_cjk_dominant_query("世界 hi"));
+}
+
+#[test]
 fn scoring_config_old_multilingual_routing_key_still_disables_cjk_bypass() {
     let cfg: ScoringConfig =
         serde_json::from_value(serde_json::json!({ "enable_multilingual_routing": false }))

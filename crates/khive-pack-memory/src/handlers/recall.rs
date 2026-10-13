@@ -29,8 +29,8 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
-    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    compute_score, deser, fuse_for_query, make_pipeline, note_has_any_tag, note_matches_tags, plog,
+    plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
     RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings, TextSnippetPolicy,
     DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
@@ -700,7 +700,14 @@ impl MemoryPack {
             map
         };
 
-        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize)?;
+        let fused = fuse_for_query(
+            &candidates,
+            &memory_ids,
+            &cfg,
+            candidate_limit as usize,
+            query_trimmed,
+            p.embedding_model.as_deref(),
+        )?;
         // Needed on both the empty and non-empty completion paths.
         let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 

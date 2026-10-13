@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of failing with `recall: all embedding engines failed`, and a `vector_only` recall
   whose full-text table is unreadable now returns its vector hits instead of failing.
 
+- `memory.recall` leaves an English-only embedding model's vector list out of fusion when the
+  query is CJK-dominant (its CJK characters outnumber its other letters). Today that model is
+  `all-minilm-l6-v2`, which maps most CJK characters to `[UNK]`, so its candidates for such
+  queries carry no signal. The list gets weight zero under every strategy that fuses
+  per-model vector lists, but only when another model contributed a candidate and the request
+  does not name `embedding_model`. English and mixed queries fuse as before. The
+  `enable_cjk_fts_bypass` documentation now states what the flag does: it skips term selection
+  in the FTS gather path and is read only when FTS gather is enabled.
 - `db_diagnostics` no longer fails as a whole when the request's read deadline arrives. The
   backends already inspected are returned, every remaining backend's `error` starts with
   `not inspected: request deadline`, and the new root field `complete` is `false`. Backend
@@ -109,9 +117,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprints and model keys change and existing moodboard vectors need reindexing;
   preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
   no longer runs with the `pure` backend: std members enable `blake3/std` directly.
+- `khive-vamana` greedy search keeps its candidate list sorted and bounded: each neighbor is
+  placed by binary search and the next candidate to expand is read from a cursor, instead of
+  re-sorting the whole list and scanning it for the nearest unexpanded entry after every
+  expansion. Candidates with equal SQ8 distance now order by node id rather than by exact f32
+  distance; the exact f32 re-score of the final list still decides the returned top-k. An
+  index built after this change can differ from one built before it where SQ8 distances tie.
 
 ### Fixed
 
+- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
+  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
+  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
+  logged on `khive.boot`.
 - On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
   store's check of each new audit batch against the legacy store) and the schedule
   creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.

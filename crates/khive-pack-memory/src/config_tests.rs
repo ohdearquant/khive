@@ -581,3 +581,20 @@ fn recall_config_roundtrip_with_fts_gather() {
     );
     assert_eq!(back.fts_gather.gather_limit, Some(600));
 }
+
+#[test]
+fn english_only_embedding_models_name_all_minilm_and_no_multilingual_model() {
+    assert!(is_english_only_embedding_model("all-minilm-l6-v2"));
+    // Registered names compare ASCII case-insensitively.
+    assert!(is_english_only_embedding_model("All-MiniLM-L6-v2"));
+    for model in [
+        "paraphrase-multilingual-minilm-l12-v2",
+        "multilingual-e5-small",
+        "multilingual-e5-base",
+        "my-custom-encoder",
+        "all-minilm-l6-v2-extra",
+        "",
+    ] {
+        assert!(!is_english_only_embedding_model(model), "{model:?}");
+    }
+}

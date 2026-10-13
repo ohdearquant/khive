@@ -549,6 +549,25 @@ pub struct WeightedContributions {
     pub temporal_contribution: f64,
 }
 
+// ── English-only embedding models ─────────────────────────────────────────────
+
+/// Canonical names of registered embedding models that cannot read CJK text.
+///
+/// Neither lattice's `EmbeddingModel` nor the runtime's embedder registry records which
+/// languages a model covers, so the models recall must not fuse for a CJK-dominant query are
+/// named here. `all-minilm-l6-v2` uses an English WordPiece vocabulary in which most CJK
+/// characters map to `[UNK]`, so its similarity scores for CJK text carry no signal. Add the
+/// canonical name of any other model with the same limitation.
+pub(crate) const ENGLISH_ONLY_EMBEDDING_MODELS: &[&str] = &["all-minilm-l6-v2"];
+
+/// Whether `model` is listed in [`ENGLISH_ONLY_EMBEDDING_MODELS`], compared ASCII
+/// case-insensitively.
+pub(crate) fn is_english_only_embedding_model(model: &str) -> bool {
+    ENGLISH_ONLY_EMBEDDING_MODELS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(model))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 // INLINE TEST JUSTIFICATION: tests exercise private validation methods and
