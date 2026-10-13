@@ -577,8 +577,8 @@ pub(crate) const EDGE_NAMESPACES_CTE: &str = "WITH RECURSIVE edge_ns(namespace) 
 /// The exact cascade `DELETE` this store's `purge_incident_edges` issues.
 ///
 /// Removes every edge whose source or target is `node_id`, in any namespace,
-/// found through [`EDGE_NAMESPACES_CTE`]. A self-loop matches both arms and is
-/// deleted once.
+/// found by walking the namespaces present in `graph_edges` and seeking each
+/// one. A self-loop matches both arms and is deleted once.
 pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
     SqlStatement {
         sql: format!(
