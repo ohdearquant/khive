@@ -558,10 +558,37 @@ pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     }
 }
 
+/// A common table expression `edge_ns(namespace)` holding every namespace
+/// present in `graph_edges`, read with one index seek per namespace
+/// (`min(namespace)` above the previous one), followed by a final NULL row.
+///
+/// Every `graph_edges` index leads with `namespace`, so a lookup by endpoint
+/// alone (`source_id = ? OR target_id = ?`) cannot seek and reads every edge.
+/// Joined to this walk (`edge_ns CROSS JOIN graph_edges`, which keeps the walk
+/// as the outer loop) the same lookup seeks `(namespace, source_id, ...)` and
+/// `(namespace, target_id, ...)` once per namespace, so its cost follows the
+/// number of namespaces and incident edges instead of the size of the table.
+pub(crate) const EDGE_NAMESPACES_CTE: &str = "WITH RECURSIVE edge_ns(namespace) AS ( \
+     SELECT (SELECT min(namespace) FROM graph_edges) \
+     UNION ALL \
+     SELECT (SELECT min(namespace) FROM graph_edges WHERE namespace > edge_ns.namespace) \
+     FROM edge_ns WHERE edge_ns.namespace IS NOT NULL)";
+
 /// The exact cascade `DELETE` this store's `purge_incident_edges` issues.
+///
+/// Removes every edge whose source or target is `node_id`, in any namespace,
+/// found through [`EDGE_NAMESPACES_CTE`]. A self-loop matches both arms and is
+/// deleted once.
 pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
     SqlStatement {
-        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1".to_string(),
+        sql: format!(
+            "DELETE FROM graph_edges WHERE id IN ({EDGE_NAMESPACES_CTE} \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.source_id = ?1 \
+             UNION ALL \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.target_id = ?1)"
+        ),
         params: vec![SqlValue::Text(node_id.to_string())],
         label: Some("edge-purge-incident".to_string()),
     }
@@ -3902,6 +3929,10 @@ mod annotation_tests;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "incident_edge_plan_tests.rs"]
+mod incident_edge_plan_tests;
 
 #[cfg(test)]
 #[path = "graph_index_repair_tests.rs"]
