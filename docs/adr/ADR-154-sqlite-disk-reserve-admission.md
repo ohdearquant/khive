@@ -4,7 +4,7 @@
 **Date**: 2026-08-11\
 **Authors**: khive maintainers\
 **Tracking**: Refs #1844 (first slice, PR #3423); #3551 (remaining ADR contract)\
-**Implementation**: partial; PR #3423 shipped a local floor and SQLITE_FULL escalation. See Amendment 1 for remaining obligations. Amendment 2 (proposed) separates lease contention from lease refusal.
+**Implementation**: partial; PR #3423 shipped a local floor and SQLITE_FULL escalation. See Amendment 1 for remaining obligations. Amendment 2 (accepted; implemented in #5308) separates lease contention from lease refusal.
 
 ## Context
 
@@ -75,7 +75,7 @@ The accepted behavior in §§2–7 and the Acceptance section remains normative.
 
 #### Amendment 2 — Lease contention is admission pressure, not a probe failure (2026-10-12)
 
-Status: Proposed (2026-10-12).
+Status: Accepted (2026-10-13). Implemented in #5308.
 
 **Trigger.** On a loaded host a write that holds the volume lease runs slowly, so every other writer on the volume waits out `disk_guard_deadline_ms` and receives `sqlite_capacity_unavailable` with `phase=lock`. §6 treats that outcome like a failed probe: it fails closed and is never retried automatically. Measured on one daemon over four hours at load averages between 20 and 38: 328 lease timeouts, 234 of them in audit-row generations. The events store reports the error as non-retryable, so each such generation ends `StoreFailure`, and ADR-133 folds that into the dispatch: 314 dispatches failed, 209 of them reads that wrote nothing (`comm.inbox`, `comm.health`, `gtd.tasks`, `get`, `comm.thread`), all on the admission-degrade list that exists for this kind of pressure.
 
