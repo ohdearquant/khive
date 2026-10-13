@@ -24,7 +24,7 @@ This deadline differs from `ann_ready_timeout_ms`: the former returns a typed `D
 
 Noise-only queries are rejected before expensive embedding work. `is_meaningful_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish.
 
-FTS CJK bypass uses `contains_cjk` to route the text leg through the CJK-bypass tokenizer. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine and fuses the results (issue #1115), whether or not the query contains CJK.
+`contains_cjk` (more than 15% CJK characters) sets the FTS CJK bypass, which skips document-frequency term selection in FTS gather mode and sends the first `term_k` query terms, in query order, to the ranked FTS search. The flag is read only when FTS gather is enabled, which it is not by default, and it never removes the FTS leg. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine (issue #1115), whether or not the query contains CJK. The query's script matters at fusion; see "Script-aware model weighting" below.
 
 `embed_query_model` checks the pack-local LRU by `(model, query)` and awaits query embedding on a miss. Dropping the request cancels a built-in model's query embedding only while its job is still queued for the embedding worker; once the worker has started it, inference runs to completion and its result is discarded. A pack-registered provider's embedding runs inline and is dropped with the request. Shared cold model initialization and its initialization event continue independently. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
 
@@ -67,6 +67,20 @@ Supported strategies are:
 | `keyword_only` | Ignore vector candidates.                                           |
 
 Unknown strategy names return `InvalidInput`. Candidate count defaults to `max(limit * candidate_multiplier, 40)` unless `candidate_limit` is explicit.
+
+### Script-aware model weighting
+
+A query is CJK-dominant when its CJK characters (`is_cjk_char`) outnumber its other letters. Digits, whitespace, and punctuation count for neither side, and a tie is not dominant, so `世界 hi` is not dominant while `世界你好 hi` is.
+
+For a CJK-dominant query, recall fuses no candidates from an English-only embedding model (`ENGLISH_ONLY_EMBEDDING_MODELS` in `config.rs`, currently `all-minilm-l6-v2`). The model is searched as usual, but its list enters fusion empty, so its weight is zero under `rrf`, `weighted`, `union`, `vector_only`, and weighted-RRF configurations. The empty list keeps its source slot, so the per-source weights of a weighted strategy stay aligned. An English WordPiece vocabulary maps most CJK characters to the unknown token and scores unrelated CJK texts as near-duplicates, so its candidates otherwise outrank correct hits from a model that can read the query.
+
+Three conditions keep the list:
+
+- No other embedding model contributed a candidate. A store whose only model is English-only keeps its vector leg.
+- The request names `embedding_model`. An explicit model choice is never overridden.
+- The query is not CJK-dominant. English and mixed queries fuse exactly as before.
+
+The rule changes fusion only. A result's reported raw `score` still takes the best similarity over every model searched, and the per-model candidate diagnostics still list each model's own hits.
 
 ## Serving-profile projection
 
