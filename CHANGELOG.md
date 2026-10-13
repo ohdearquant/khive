@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
+  store's check of each new audit batch against the legacy store) and the schedule
+  creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
+  Before, both walked every event of the namespace in `created_at` order.
 - Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
   File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
   (#5087).
