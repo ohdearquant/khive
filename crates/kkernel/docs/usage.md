@@ -523,6 +523,7 @@ is reachable only through `kkernel reindex --rebuild-fts` above.
 ```bash
 kkernel db check --config ~/.khive/khive.toml --human # report configured topology
 kkernel db check --backend archive --strict           # inspect one configured backend
+kkernel db check --integrity --strict                # also run PRAGMA integrity_check per file
 kkernel db migrate --config ~/.khive/khive.toml       # secondaries, then main
 kkernel db migrate --backend archive                  # migrate one named secondary
 kkernel db migrate --dry-run                          # read-only topology check
@@ -546,6 +547,20 @@ authenticated. `db check` and migrate's `--dry-run`/`--check` modes never open a
 runtime or mutate the database; absent files report V0. They reuse migration's
 target planner, so selecting `main` or its SQLite alias includes every secondary
 prerequisite, while an independent secondary remains a single target.
+
+For every database file that exists, `db check` also reports `page_size`,
+`page_count` and `freelist_count`. Each is one pragma read through the same
+read-only open, so committed frames not yet checkpointed from the `-wal` are
+counted and the cost does not grow with the file. `freelist_count` is the number
+of pages that later writes can reuse but that stay in the file until a `VACUUM`.
+`--integrity` additionally runs `PRAGMA integrity_check` on each file and reports
+every row it returns, with no row limit (`["ok"]` for a sound file); it reads
+every page, so its time grows with the file. With `--strict`, an integrity
+problem fails the command the same way a behind schema does. These fields are
+`null` for an absent file or a memory backend. The read-only open refuses a WAL
+database whose `-shm` is writable, which is the case whenever a daemon or any
+other writer holds it open, so `db check` reads a stopped database or a frozen
+copy that includes its read-only `-wal` and `-shm`.
 
 Before either command opens a database, the planner rejects physical SQLite
 aliases that disagree on `read_only`; a named target cannot bypass that topology
