@@ -67,11 +67,11 @@ use bridge_fragments::{
 use credential_triggers::{
     assignment_credential_trigger, build_match, extract_token, find_trigger,
     inline_credential_trigger, is_assignment_label_gap, is_base64_content_hash,
-    is_lookup_key_label, is_pure_hex, is_structured_identifier, is_uuid_canonical, shannon_entropy,
-    strip_delimiters, value_candidates, wrapper_strip_repeated,
+    is_credential_token_label, is_lookup_key_label, is_pure_hex, is_structured_identifier,
+    is_uuid_canonical, shannon_entropy, strip_delimiters, value_candidates, wrapper_strip_repeated,
 };
 #[cfg(test)]
-use credential_triggers::{LOOKUP_KEY_LABELS, POSITION_TOKEN_LABELS};
+use credential_triggers::{LOOKUP_KEY_LABELS, POSITION_TOKEN_LABELS, RECEIPT_TOKEN_LABELS};
 #[cfg(test)]
 use entropy::TRIGGER_WINDOW;
 use entropy::{

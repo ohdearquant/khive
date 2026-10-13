@@ -621,8 +621,18 @@ For each token, in order:
    `{"refresh_token": "<value>"}` and `github_token=<value>` get the checks `token: <value>` gets.
    The exception is the closed vocabulary `POSITION_TOKEN_LABELS` (`next_token`, `next_page_token`,
    `page_token`, `pagination_token`, `continuation_token`, `resume_token`, `sync_token`, ...), whose
-   values are cursors into a paged, resumable or synced listing. As with lookup keys the match is the
-   whole label, so a qualified spelling such as `stale_next_token` stays a credential label.
+   values are cursors into a paged, resumable or synced listing, and `RECEIPT_TOKEN_LABELS`
+   (`visibility_token`), whose value is a sealed receipt the server returns to its own caller: opening
+   it only narrows a scope the caller is already authorized for, so a quoted `memory.remember`
+   response passes. As with lookup keys the match is the whole label, so a qualified spelling such as
+   `stale_next_token` stays a credential label. The same predicate decides whether the label directly
+   before a value is a credential label (`has_immediate_credential_label`), so `access_token:` and
+   `github_token:` also withhold the repository-revision and LaTeX exemptions that `token:` withholds.
+   The rule fails closed: any unlisted `*_token` label is a credential label, including
+   non-secret names such as `skip_token`, `delta_token`, `idempotency_token`, `lease_token` and
+   `cancel_token`, and a `*_token` label that sits within the trigger window but labels a different
+   value still counts (`chars_per_token: 4 for profile <uuid>` is refused). A new non-credential
+   `*_token` name is added to one of the two lists, with a test.
 
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a

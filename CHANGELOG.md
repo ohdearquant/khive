@@ -96,7 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value assigned to `access_token`, `refresh_token`, `session_token` or any other `*_token` label
   is refused the way one assigned to `token` is. Pagination and sync cursors (`next_token`,
   `next_page_token`, `page_token`, `pagination_token`, `continuation_token`, `resume_token`,
-  `sync_token` and a few others, matched as the whole label) stay allowed.
+  `sync_token` and a few others, matched as the whole label) stay allowed, as does the sealed
+  `visibility_token` receipt in a quoted `memory.remember` response. The label directly before a
+  repository revision URL or a LaTeX fragment follows the same rule.
 - On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
   store's check of each new audit batch against the legacy store) and the schedule
   creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
