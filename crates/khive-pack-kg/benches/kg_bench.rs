@@ -402,6 +402,72 @@ fn bench_traverse(c: &mut Criterion) {
     group.finish();
 }
 
+// ── stats ─────────────────────────────────────────────────────────────────────
+
+fn bench_stats(c: &mut Criterion) {
+    let rt = tokio_rt();
+    let (_, registry) = build_registry();
+
+    // Shaped like a working store: a structural chain between entities, one
+    // more structural edge per entity, and provenance notes annotating them,
+    // which is where most edges on a real store come from.
+    rt.block_on(async {
+        let ids = seed_graph(&registry, 1000).await;
+        for (i, id) in ids.iter().enumerate() {
+            registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": id,
+                        "target_id": ids[(i * 7 + 3) % ids.len()],
+                        "relation": "enables",
+                    }),
+                )
+                .await
+                .expect("seed structural edge");
+        }
+        for i in 0..2000 {
+            let note = registry
+                .dispatch(
+                    "create",
+                    json!({"kind": "observation", "content": format!("bench provenance note {i}")}),
+                )
+                .await
+                .expect("seed note");
+            let note_id = note["id"].as_str().expect("id").to_string();
+            registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": note_id,
+                        "target_id": ids[i % ids.len()],
+                        "relation": "annotates",
+                    }),
+                )
+                .await
+                .expect("seed annotates edge");
+        }
+    });
+
+    let mut group = c.benchmark_group("kg_stats");
+    group.sample_size(30);
+
+    group.bench_function("entities_1000_edges_3999", |b| {
+        b.to_async(&rt).iter(|| {
+            let registry = &registry;
+            async move {
+                let resp = registry
+                    .dispatch("stats", black_box(json!({})))
+                    .await
+                    .expect("stats");
+                black_box(resp)
+            }
+        });
+    });
+
+    group.finish();
+}
+
 // ── criterion entry points ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -413,5 +479,6 @@ criterion_group!(
     bench_link,
     bench_neighbors,
     bench_traverse,
+    bench_stats,
 );
 criterion_main!(kg_benches);

@@ -7,10 +7,8 @@ use khive_storage::EventFilter;
 use serde::Deserialize;
 use serde_json::Value;
 
-use khive_runtime::operations::EntityStatsCounts;
+use khive_runtime::operations::{EdgeStatsCounts, EntityStatsCounts};
 use khive_runtime::{NamespaceToken, RuntimeError};
-
-use khive_runtime::EdgeListFilter;
 
 use super::common::{
     deser, parse_event_kind, parse_event_outcome, parse_event_substrate, StatsParams,
@@ -112,12 +110,11 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let _p: StatsParams = deser(params)?;
         let entity_counts = self.runtime.entity_stats_counts(token).await?;
-        let edges = self
-            .runtime
-            .count_edges(token, EdgeListFilter::default())
-            .await?;
-        let edges_by_relation = self.runtime.count_edges_by_relation(token).await?;
-        let by_base = self.runtime.count_edges_by_endpoint_base(token).await?;
+        let EdgeStatsCounts {
+            edges,
+            edges_by_relation,
+            edges_by_endpoint_base: by_base,
+        } = self.runtime.edge_stats_counts(token).await?;
         let notes = self.runtime.count_notes(token, None).await?;
         // `edges` is every live edge and is left alone. What it cannot be is a
         // density denominator: on a real store most edges are provenance, so
