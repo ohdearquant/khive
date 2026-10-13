@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprints and model keys change and existing moodboard vectors need reindexing;
   preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
   no longer runs with the `pure` backend: std members enable `blake3/std` directly.
+- `khive-vamana` greedy search keeps its candidate list sorted and bounded: each neighbor is
+  placed by binary search and the next candidate to expand is read from a cursor, instead of
+  re-sorting the whole list and scanning it for the nearest unexpanded entry after every
+  expansion. Candidates with equal SQ8 distance now order by node id rather than by exact f32
+  distance; the exact f32 re-score of the final list still decides the returned top-k. An
+  index built after this change can differ from one built before it where SQ8 distances tie.
 
 ### Fixed
 
