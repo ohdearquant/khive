@@ -285,7 +285,7 @@ impl OutboundEmailPolicy {
 
     /// Build a fully enabled policy for debug-build tests: recipients, the external sender
     /// set, the daily cap, fixed test key material and a footer carrying `{unsubscribe}`.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn configured_for_tests(
         recipients: Vec<String>,
@@ -305,7 +305,7 @@ impl OutboundEmailPolicy {
 
     /// Build an enabled policy with explicit key material and footer state for tests that need
     /// to exercise configuration or footer unavailability.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn configured_for_tests_with(
@@ -334,7 +334,7 @@ impl OutboundEmailPolicy {
     }
 
     /// Replace the footer state on a test policy (available/unavailable) without touching keys.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn with_external_footer_for_tests(mut self, footer: Result<&str, &str>) -> Self {
         self.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
