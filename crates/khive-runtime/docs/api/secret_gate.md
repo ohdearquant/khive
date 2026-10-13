@@ -501,7 +501,8 @@ own word (`auth header`, `auth:`) still triggers exactly as before.
 The bare substring `token` is NOT in this list because it fires on benign terms like `tokenizer`,
 `token_count`, and `next_token`. Instead the dedicated boundary-aware helpers `has_standalone_token`
 (standalone word) and `has_token_assignment` (`token=` / `token:` with word boundary before) are
-used.
+used. Assignment labels are read whole instead: a label ending in `_token` before its `:`/`=` is a
+credential label unless it names a position (see the credential token label rule below).
 
 ## is_base64_content_hash
 
@@ -615,6 +616,13 @@ For each token, in order:
    stems such as `hmac` are not trigger words. A corpus replay that is identical across such a change
    certifies preservation on the corpus population only; the opened shape class carries its own
    before/after arms.
+   **Credential token labels** (`is_credential_token_label`): the assignment-label path treats a
+   label as a credential label when it is `token` or ends in `_token`, so `access_token: <uuid>`,
+   `{"refresh_token": "<value>"}` and `github_token=<value>` get the checks `token: <value>` gets.
+   The exception is the closed vocabulary `POSITION_TOKEN_LABELS` (`next_token`, `next_page_token`,
+   `page_token`, `pagination_token`, `continuation_token`, `resume_token`, `sync_token`, ...), whose
+   values are cursors into a paged, resumable or synced listing. As with lookup keys the match is the
+   whole label, so a qualified spelling such as `stale_next_token` stays a credential label.
 
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a

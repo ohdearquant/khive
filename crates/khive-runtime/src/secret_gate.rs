@@ -64,14 +64,14 @@ use bridge_fragments::{
     bridge_fragment_chain, contains_bounded_word, contains_word, is_bridge_fragment_shape,
     trailing_bridge_fragment_cut,
 };
-#[cfg(test)]
-use credential_triggers::LOOKUP_KEY_LABELS;
 use credential_triggers::{
     assignment_credential_trigger, build_match, extract_token, find_trigger,
     inline_credential_trigger, is_assignment_label_gap, is_base64_content_hash,
     is_lookup_key_label, is_pure_hex, is_structured_identifier, is_uuid_canonical, shannon_entropy,
     strip_delimiters, value_candidates, wrapper_strip_repeated,
 };
+#[cfg(test)]
+use credential_triggers::{LOOKUP_KEY_LABELS, POSITION_TOKEN_LABELS};
 #[cfg(test)]
 use entropy::TRIGGER_WINDOW;
 use entropy::{

@@ -1369,6 +1369,71 @@ fn allows_token_count_high_entropy() {
     );
 }
 
+// ── `*_token` credential labels (issue: access_token-labelled UUIDs passed) ──
+// A label ending in `_token` is a credential label unless it is one of the
+// position labels in POSITION_TOKEN_LABELS, matched as the whole label.
+
+#[test]
+fn blocks_uuid_under_access_token_label_in_both_forms() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    for content in [
+        format!("access_token: {uuid}"),
+        format!("{{\"access_token\":\"{uuid}\"}}"),
+    ] {
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("uuid-near-trigger"),
+            "a UUID assigned to access_token must be blocked like one assigned to token: {content:?}"
+        );
+    }
+}
+
+#[test]
+fn blocks_values_under_credential_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in [
+        "access_token",
+        "refresh_token",
+        "session_token",
+        "github_token",
+        "stale_next_token",
+    ] {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{label}={value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_some(),
+                    "a value assigned to credential label {label} must be blocked: {content:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn allows_values_under_position_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in POSITION_TOKEN_LABELS {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_none(),
+                    "position label {label} must not make its value a credential; fired: {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+}
+
 // ── Hex allowlist is not applied when trigger context is present ────────
 // Pure hex tops out at log2(16) = 4.0 bits/char, below ENTROPY_THRESHOLD (4.5), so
 // the entropy heuristic alone never flags it. The hex allowlist must only apply
