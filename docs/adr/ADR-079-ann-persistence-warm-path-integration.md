@@ -1518,6 +1518,15 @@ are marked `#[doc(hidden)]`. #3901, #3902, #3906 and #3907 each mark the items t
 
 **Status**: Proposed (2026-10-13)
 
+### Requirements
+
+The memory pack has to serve many tenants on one machine. Two properties follow, and every decision
+item below serves at least one of them:
+
+- **R1.** A recall's cost scales with the querying tenant's own memories and visible namespaces, never
+  with the whole store.
+- **R2.** No tenant's rows pin another tenant's write-log compaction.
+
 ### Context
 
 Line numbers in this amendment are at revision 2afffb61. A path without a crate prefix is under
@@ -1742,6 +1751,29 @@ plus removal of the per-namespace memory rows (`memory-notes:note.content:memory
 their directories. Until those rows are removed they keep bounding each namespace's compaction at
 their last watermarks, because active rows never age out.
 
+#### 13. One publication check per process per tick
+
+Today the rotation watcher checks every installed key's publication identity every 5 seconds
+(`ROTATION_WATCH_INTERVAL`, ann.rs:485; the loop at ann.rs:1361-1371). One check opens the key's
+directory and reads its commit record, commit info and HEAD (`publication_digest`,
+ann/delta.rs:174-188). With per-namespace keys this becomes a steady cost per tenant. DERIVED: T
+namespaces, 2 classes and M models give `T x 2 x M / 5` checks per second, which is 40 at T = 100 and
+M = 1 (one embedding model), 400 at T = 1,000 and M = 1, and twice those with two models.
+
+Every checkpoint publication, after its key's commit record and HEAD are durable and while it still
+holds the key's cross-process checkpoint lock, advances one process-wide publication sequence record in
+the memory ANN root, written atomically with the same write-then-rename discipline as the key's commit
+record. The watcher reads that one record each tick and checks per-key identities only when the
+sequence has moved since its last walk. A full per-key walk still runs every 60 ticks (5 minutes) as a
+backstop for a publisher that stopped between its key's commit and the sequence write. Such a miss
+delays this process's reload of that key by at most the backstop interval. Searches stay correct in
+the meantime, because the fresh tail serves log rows above the installed watermark (ADR-118); the
+cost of the miss is that the predecessor's unlinked segment files stay mapped, and their disk space is
+not returned, until the reload.
+
+DERIVED steady state per process: 0.2 sequence reads per second plus `T x 2 x M / 300` per-key checks
+per second from the backstop, which is 0.67 at T = 100 and M = 1 and 6.7 at T = 1,000 and M = 1.
+
 ### Alternatives considered
 
 - **Keep the global graph and filter inside the search (filtered ANN).** The graph would visit
@@ -1786,8 +1818,9 @@ Positive:
 Negative:
 
 - Many small graphs. Per-key fixed costs (a registry row, a directory, a single-flight lock, a
-  checkpoint timer, one publication-digest read per installed key every 5 seconds: ann.rs:485,
-  1361-1371) scale with namespaces x 2 x models.
+  checkpoint timer) scale with namespaces x 2 x models. The publication check scales with them only
+  through its 5-minute backstop walk (item 13).
+- Every checkpoint publication writes one more small record (the process-wide sequence, item 13).
 - Small graphs checkpoint often: DERIVED from ann/incremental.rs:31-37, a key below 20 live vectors
   checkpoints at every write, and below 20,000 every `floor(L / 20)` writes. The delta compaction floor
   of 5,000 operations (ann/delta.rs:25) exceeds 10% of any base below 50,000 vectors, so small keys
@@ -1817,7 +1850,9 @@ Neutral:
 2. Build, maintain, checkpoint and compact per-namespace keys with the class predicate, the digest
    directory and key file, and the Empty raise; no reader switches. Gate: tests for build, replay and
    compaction per key; kind change and namespace move; compaction bounded by per-namespace rows; the
-   item 8 parser test; an Empty key leaves no `-2` row. Implemented by: to be filed.
+   item 8 parser test; an Empty key leaves no `-2` row; on an unchanged tick the watcher reads the
+   sequence record and no key's identity, and a key published without the sequence write (the control)
+   is reloaded by the backstop walk. Implemented by: to be filed.
 3. Recall switches to per-namespace memory keys. Gate: on a fixture of three namespaces, two visible,
    each holding memories and other notes with visible memories at most 25% of all vectors, recall's
    vector leg equals the exact cosine top `C + 32` over visible memories, the ANN search count per model
@@ -1840,6 +1875,8 @@ Neutral:
    that searched only one namespace holds resident memory that grows with other namespaces' vectors.
 4. Not measured: the latency of `|V|` searches against one wider search for callers with many
    visible namespaces.
+5. The backstop interval of item 13 (60 ticks) is chosen, not measured; it bounds how long a missed
+   sequence write keeps a predecessor's unlinked files mapped.
 
 ### References (Amendment 5)
 
