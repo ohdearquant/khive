@@ -75,6 +75,11 @@ harness = false
 path = "benches/db_hot_path.rs"
 required-features = ["vectors"]
 
+[[bench]]
+name = "db_concurrency"
+harness = false
+path = "benches/db_concurrency.rs"
+
 [features]
 # Exposes the task-scoped SQLite progress probe for dependent-crate tests.
 test-support = []
