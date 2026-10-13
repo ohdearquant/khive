@@ -126,6 +126,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The secret gate treats a label ending in `_token` as a credential label, so a UUID or opaque
+  value assigned to `access_token`, `refresh_token`, `session_token` or any other `*_token` label
+  is refused the way one assigned to `token` is. Pagination and sync cursors (`next_token`,
+  `next_page_token`, `page_token`, `pagination_token`, `continuation_token`, `resume_token`,
+  `sync_token` and a few others, matched as the whole label) stay allowed, as does the sealed
+  `visibility_token` receipt in a quoted `memory.remember` response. The label directly before a
+  repository revision URL or a LaTeX fragment follows the same rule.
 - The daemon registers its signal-sender recorder before its shutdown signal streams, so the
   exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
   `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
