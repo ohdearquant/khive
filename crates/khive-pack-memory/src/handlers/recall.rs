@@ -388,7 +388,7 @@ impl MemoryPack {
         if query_trimmed.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
-        if !crate::scoring::is_meaningful_query(query_trimmed) {
+        if !crate::scoring::is_meaningful_recall_query(query_trimmed) {
             return Err(RuntimeError::InvalidInput(format!(
                 "query {query_trimmed:?} does not contain enough meaningful content \
                  (must have at least 2 alphabetic or CJK characters and not consist \
