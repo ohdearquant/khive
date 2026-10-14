@@ -127,8 +127,8 @@ impl Channel for ReplayChannel {
     fn kind(&self) -> &'static str {
         "email"
     }
-    fn slug(&self) -> &str {
-        "adr200"
+    fn slug(&self) -> String {
+        "adr200".to_string()
     }
     fn quarantine_retention_limit(&self) -> Option<usize> {
         Some(0)

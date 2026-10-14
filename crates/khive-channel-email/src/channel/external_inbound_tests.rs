@@ -505,6 +505,7 @@ fn external_ingest_registry() -> (khive_runtime::VerbRegistry, KhiveRuntime) {
     use khive_pack_comm as _;
     use khive_pack_kg as _;
     let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
         actor_id: Some("lambda:recipient".into()),
         ..khive_runtime::RuntimeConfig::no_embeddings()
     })
