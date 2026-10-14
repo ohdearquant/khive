@@ -838,7 +838,14 @@ fn recover_rolled_back_merge_refusal(
     })
 }
 
-pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+fn map_merge_storage_error(
+    error: khive_storage::StorageError,
+    map_sqlite: impl FnOnce(
+        khive_storage::StorageCapability,
+        std::borrow::Cow<'static, str>,
+        SqliteError,
+    ) -> RuntimeError,
+) -> RuntimeError {
     let error = match recover_rolled_back_merge_refusal(error) {
         Ok(refusal) => return refusal,
         Err(error) => error,
@@ -850,7 +857,7 @@ pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError)
             source,
         } => match source.downcast::<MergeSqlError>() {
             Ok(error) => match *error {
-                MergeSqlError::Sqlite(error) => RuntimeError::from(error),
+                MergeSqlError::Sqlite(error) => map_sqlite(capability, operation, error),
                 MergeSqlError::Refusal(error) => error,
             },
             Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
@@ -863,30 +870,15 @@ pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError)
     }
 }
 
+pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    map_merge_storage_error(error, |_, _, error| RuntimeError::from(error))
+}
+
 pub(super) fn map_merge_note_storage_error(error: khive_storage::StorageError) -> RuntimeError {
-    let error = match recover_rolled_back_merge_refusal(error) {
-        Ok(refusal) => return refusal,
-        Err(error) => error,
-    };
-    match error {
-        khive_storage::StorageError::Driver {
-            capability,
-            operation,
-            source,
-        } => match source.downcast::<MergeSqlError>() {
-            Ok(error) => match *error {
-                MergeSqlError::Refusal(error) => error,
-                // Preserve the existing note route's storage error envelope.
-                MergeSqlError::Sqlite(error) => RuntimeError::Storage(
-                    khive_storage::StorageError::driver(capability, operation, error),
-                ),
-            },
-            Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
-                capability,
-                operation,
-                source,
-            }),
-        },
-        error => RuntimeError::Storage(error),
-    }
+    // Preserve the existing note route's storage error envelope.
+    map_merge_storage_error(error, |capability, operation, error| {
+        RuntimeError::Storage(khive_storage::StorageError::driver(
+            capability, operation, error,
+        ))
+    })
 }
