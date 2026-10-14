@@ -1020,7 +1020,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
         (MIGRATIONS, "migrate_outbound_due_key"),
-        (RECEIPTS, "claim_pending_event"),
+        (RECEIPTS, "claim_pending_event_inner"),
         (RECEIPTS, "mark_dispatch_invoking"),
         (RECEIPTS, "renew_dispatch_lease"),
         (RECEIPTS, "persist_dispatch_outcome"),

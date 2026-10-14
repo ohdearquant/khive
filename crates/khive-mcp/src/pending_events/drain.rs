@@ -347,19 +347,55 @@ pub(super) async fn run_pending_events_on_with_lease(
                 // borrowed or moved in between.
                 let snapshot_trigger_at = trigger_at_str.to_string();
 
+                let policy = khive_pack_schedule::misfire::parse_misfire_policy(
+                    properties.as_ref().unwrap_or(&Value::Null),
+                );
+                // Catch-up decisions are made per row at the persisted receipt
+                // precision. Skip rows retain the original pass-wide clock.
+                let now = if matches!(
+                    policy,
+                    Ok(khive_pack_schedule::misfire::MisfirePolicy::CatchUpOnce { .. })
+                ) {
+                    let micros = misfire_now().timestamp_micros();
+                    DateTime::<Utc>::from_timestamp_micros(micros)
+                        .expect("current time is representable")
+                } else {
+                    now
+                };
                 if trigger_at > now {
                     summary.skipped_not_due += 1;
                     continue;
                 }
+                let (catch_up, mut admission_error) = match policy {
+                    Ok(khive_pack_schedule::misfire::MisfirePolicy::Skip) => (None, None),
+                    Ok(khive_pack_schedule::misfire::MisfirePolicy::CatchUpOnce {
+                        max_lateness,
+                    }) => {
+                        match select_catch_up_occurrence(
+                            properties.as_ref().unwrap_or(&Value::Null),
+                            &snapshot_trigger_at,
+                            now,
+                            max_lateness,
+                        ) {
+                            Ok(Some(selected)) => (Some(selected), None),
+                            Ok(None) => {
+                                summary.skipped_not_due += 1;
+                                continue;
+                            }
+                            Err(error) => (None, Some(error)),
+                        }
+                    }
+                    Err(error) => (None, Some(error)),
+                };
 
                 // ── Missed-event grace policy (ADR-106 amendment) ─────────
-                // An event overdue by more than `grace` is never dispatched:
-                // agent-facing side effects (outbound mail, spawned actions)
-                // must not fire late en masse after a daemon outage or a
-                // first boot against a large stale backlog. See the
-                // module-level "Missed-event policy" docs.
+                // Default skip retains the global grace window. Explicit
+                // catch-up instead applies its stored bound to the single
+                // selected latest occurrence; it never dispatches a backlog.
                 let overdue = now.signed_duration_since(trigger_at);
-                let is_missed = overdue > grace;
+                let is_missed = catch_up
+                    .as_ref()
+                    .map_or(overdue > grace, CatchUpOccurrence::is_missed);
 
                 // ── Determine what to dispatch ───────────────────────────
                 let event_type = properties
@@ -408,17 +444,17 @@ pub(super) async fn run_pending_events_on_with_lease(
                         .map(|actor| reminder_delivery_action(actor, &content))
                 };
 
-                // ── Determine repeat (read before claim) ──
-                // This value gates ADMISSION only — which finalize branch is
-                // eligible. It must never reach anything WRITTEN: the value the
-                // finalizer schedules from is re-derived at the write, from the
-                // same fresh read the CAS is guarded on. See the re-derivation
-                // just before `final_properties_after_dispatch`.
-                let repeat = properties
-                    .as_ref()
-                    .and_then(|p| p.get("repeat"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                // Validate recurrence before invocation. Finalization still
+                // re-derives its scheduling inputs from the fresh properties
+                // snapshot guarded by the terminal CAS.
+                if admission_error.is_none() {
+                    admission_error = match properties.as_ref().and_then(|p| p.get("repeat")) {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(text)) if khive_pack_schedule::repeat::parse_repeat(text).is_ok() => None,
+                        Some(Value::String(_)) => Some("scheduled event uses an unsupported repeat expression; it is not one the executor can advance".to_string()),
+                        Some(_) => Some("stored repeat must be a string".to_string()),
+                    };
+                }
 
                 // `properties` above is a page-query snapshot; CAS-claim
                 // pending -> firing now so a concurrent `schedule.cancel`
@@ -436,17 +472,30 @@ pub(super) async fn run_pending_events_on_with_lease(
                     .unwrap_or_else(|| "anonymous:local".to_string());
                 #[cfg(test)]
                 race_seam::pause_before_claim().await;
-                let claim = match claim_pending_event(
-                    rt,
-                    ns_str,
-                    id,
-                    occurrence_id,
-                    &snapshot_trigger_at,
-                    &receipt_actor,
-                    lease,
-                )
-                .await
-                {
+                let claim_result = if let Some(selected) = catch_up {
+                    claim_pending_catch_up_event(
+                        rt,
+                        ns_str,
+                        id,
+                        selected,
+                        &snapshot_trigger_at,
+                        &receipt_actor,
+                        lease,
+                    )
+                    .await
+                } else {
+                    claim_pending_event(
+                        rt,
+                        ns_str,
+                        id,
+                        occurrence_id,
+                        &snapshot_trigger_at,
+                        &receipt_actor,
+                        lease,
+                    )
+                    .await
+                };
+                let claim = match claim_result {
                     Ok(c) => c,
                     Err(e) => {
                         if verbose {
@@ -467,10 +516,7 @@ pub(super) async fn run_pending_events_on_with_lease(
                     continue;
                 };
 
-                if repeat.as_deref().is_some_and(|repeat| {
-                    khive_pack_schedule::repeat::parse_repeat(repeat).is_err()
-                }) {
-                    let error = "scheduled event uses an unsupported repeat expression; it is not one the executor can advance";
+                if let Some(error) = admission_error.as_deref() {
                     summary.failed += 1;
                     let Some(expected_properties) =
                         current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
@@ -596,6 +642,19 @@ pub(super) async fn run_pending_events_on_with_lease(
                         continue;
                     };
                     props["missed_at"] = json!(now.timestamp_micros());
+                    if claim.catch_up.is_some() {
+                        if let Err(error) = validate_dispatch_receipt(
+                            id,
+                            claim.firing_at,
+                            &props,
+                            claim.claimed_receipt(),
+                        ) {
+                            tracing::error!(scheduled_event_id = %id, error = %error,
+                                "pending-events: catch-up source changed before missed finalization");
+                            summary.failed += 1;
+                            continue;
+                        }
+                    }
                     let repeat_for_finalize = props
                         .get("repeat")
                         .and_then(Value::as_str)
@@ -605,7 +664,11 @@ pub(super) async fn run_pending_events_on_with_lease(
                         &mut props,
                         &repeat_for_finalize,
                         trigger_at,
-                        now,
+                        if claim.catch_up.is_some() {
+                            misfire_now()
+                        } else {
+                            now
+                        },
                     ) {
                         Ok(Some(next_at)) => {
                             // Repeating event: skip this occurrence, re-arm
@@ -957,7 +1020,13 @@ pub(super) async fn run_pending_events_on_with_lease(
                 // that leaves the row `firing` for the receipt validator to
                 // adjudicate once the lease expires.
                 let fresh_occurrence_id = dispatch_occurrence_id(id, trigger_at);
-                if fresh_occurrence_id != claim.occurrence_id {
+                let occurrence_matches = if claim.catch_up.is_some() {
+                    validate_dispatch_receipt(id, claim.firing_at, &expected_value, receipt.clone())
+                        .is_ok()
+                } else {
+                    fresh_occurrence_id == claim.occurrence_id
+                };
+                if !occurrence_matches {
                     tracing::error!(
                         scheduled_event_id = %id,
                         trigger_at = %trigger_at_fresh_str,

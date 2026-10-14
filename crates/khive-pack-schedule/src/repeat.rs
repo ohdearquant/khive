@@ -4,7 +4,7 @@
 //! time that the pending-events drain cannot advance, and a stored recurrence
 //! never degrades silently to one-shot delivery.
 
-use chrono::{DateTime, Duration, Months, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Utc};
 use std::str::FromStr;
 
 /// A recurrence the executor can advance.
@@ -138,6 +138,61 @@ fn parse_every(spec: &str) -> Result<Duration, String> {
 }
 
 impl Repeat {
+    /// Latest occurrence at or before `now`, with the stored trigger included.
+    /// Monthly series use their original anchor; cron preserves an off-pattern
+    /// initial trigger. This does not change the legacy advancement methods.
+    pub fn latest_at_or_before(
+        &self,
+        current: DateTime<Utc>,
+        now: DateTime<Utc>,
+        monthly_anchor: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        if now < current {
+            return None;
+        }
+        match self {
+            Repeat::Daily | Repeat::Weekly | Repeat::Every(_) => {
+                let seconds = match self {
+                    Repeat::Daily => 86_400,
+                    Repeat::Weekly => 604_800,
+                    Repeat::Every(interval) => {
+                        let seconds = interval.num_seconds();
+                        if Duration::try_seconds(seconds) != Some(*interval) {
+                            return None;
+                        }
+                        seconds
+                    }
+                    _ => unreachable!(),
+                };
+                if seconds <= 0 {
+                    return None;
+                }
+                let steps = now.signed_duration_since(current).num_seconds() / seconds;
+                current.checked_add_signed(Duration::try_seconds(seconds.checked_mul(steps)?)?)
+            }
+            Repeat::Monthly => {
+                let anchor = monthly_anchor.unwrap_or(current);
+                if anchor > current {
+                    return None;
+                }
+                let months = i64::from(now.year() - anchor.year()) * 12 + i64::from(now.month())
+                    - i64::from(anchor.month());
+                let months = u32::try_from(months).ok()?;
+                let candidate = anchor.checked_add_months(Months::new(months))?;
+                let latest = if candidate > now {
+                    anchor.checked_add_months(Months::new(months.checked_sub(1)?))?
+                } else {
+                    candidate
+                };
+                Some(latest.max(current))
+            }
+            Repeat::Cron(cron) => {
+                let previous = cron.find_previous_occurrence(&now, true).ok()?;
+                Some(previous.max(current))
+            }
+        }
+    }
+
     /// The occurrence after `current`. For a stored monthly series, use
     /// `first_after` with its fixed anchor once the first month has clamped.
     pub fn next_after(&self, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
