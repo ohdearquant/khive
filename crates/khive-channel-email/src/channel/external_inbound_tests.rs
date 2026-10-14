@@ -675,10 +675,10 @@ async fn a15_fourteen_recorded_rule_pairs_poll_then_real_comm_sinks() {
             let duplicate = registry.dispatch("comm.ingest", params).await.unwrap();
             assert_eq!(duplicate["deduplicated"], true, "{rule}: {name}");
             assert_eq!(first["thread_id"], duplicate["thread_id"]);
-            if env.inbound_delivery.is_some() {
+            if let Some(delivery) = &env.inbound_delivery {
                 for (verb, args) in [
                     ("comm.inbox", serde_json::json!({})),
-                    ("comm.thread", serde_json::json!({"id": first["thread_id"]})),
+                    ("comm.thread", serde_json::json!({"id": first["full_id"]})),
                     ("comm.read", serde_json::json!({"id": first["full_id"]})),
                 ] {
                     let read = registry.dispatch(verb, args).await.unwrap();
@@ -699,7 +699,7 @@ async fn a15_fourteen_recorded_rule_pairs_poll_then_real_comm_sinks() {
                         text.contains(rule) || !expected,
                         "{verb}: {rule} labels lost"
                     );
-                    if env.inbound_delivery.as_ref().unwrap().body_withheld {
+                    if delivery.body_withheld {
                         assert!(
                             !text.contains("HIDDEN_PAIR_TEXT"),
                             "{verb}: raw hidden body leaked"
@@ -742,7 +742,7 @@ async fn a14_raw_external_marking_survives_real_comm_read_surfaces() {
     let ack = registry.dispatch("comm.ingest", params).await.unwrap();
     for (verb, args) in [
         ("comm.inbox", serde_json::json!({})),
-        ("comm.thread", serde_json::json!({"id": ack["thread_id"]})),
+        ("comm.thread", serde_json::json!({"id": ack["full_id"]})),
         ("comm.read", serde_json::json!({"id": ack["full_id"]})),
     ] {
         let text = registry.dispatch(verb, args).await.unwrap().to_string();
@@ -775,7 +775,7 @@ async fn a15_withheld_original_operator_blob_read_is_byte_exact_and_comm_reads_a
     let ack = registry.dispatch("comm.ingest", params).await.unwrap();
     for (verb, args) in [
         ("comm.inbox", serde_json::json!({})),
-        ("comm.thread", serde_json::json!({"id":ack["thread_id"]})),
+        ("comm.thread", serde_json::json!({"id":ack["full_id"]})),
         ("comm.read", serde_json::json!({"id":ack["full_id"]})),
     ] {
         let result = registry.dispatch(verb, args).await.unwrap();
@@ -838,5 +838,5 @@ async fn a15_raw_two_withholding_families_quarantine_as_screened() {
         .unwrap();
     let duplicate = registry.dispatch("comm.ingest", params).await.unwrap();
     assert_eq!(duplicate["deduplicated"], true);
-    assert_eq!(first["full_id"], duplicate["full_id"]);
+    assert_eq!(first["thread_id"], duplicate["thread_id"]);
 }

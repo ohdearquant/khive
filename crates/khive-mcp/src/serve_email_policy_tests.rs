@@ -12,6 +12,7 @@ fn startup_external_enabled_requires_actor_in_both_host_entrypoints() {
             let footer = tempfile::NamedTempFile::new().unwrap();
             std::fs::write(footer.path(), "Reply to unsubscribe: {unsubscribe}").unwrap();
             std::env::set_var("KHIVE_EMAIL_EXTERNAL_SENDERS", "actor:sender");
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_DAILY_CAP", "5");
             std::env::set_var("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY", "cc".repeat(32));
             std::env::set_var(
                 "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
