@@ -47,6 +47,7 @@ khive-graph-diff = 1
 khive-query = 1
 khive-repo-showcase = 1
 khive-request = 1
+khive-rule-evaluator = 1
 khive-score = 1
 khive-vamana = 1
 khive-vcs-adapters = 1
