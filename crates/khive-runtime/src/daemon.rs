@@ -224,6 +224,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         .map_err(|message| DaemonDispatchError::new(message, None))
     }
 
+    /// The startup gate for the events daemon this daemon supervises, if any
+    /// ([`crate::events_split::EventsReadiness`]). A request that dispatches
+    /// verbs waits at it before dispatch and is refused, with nothing
+    /// committed, when it does not open; probe, plan, metrics and handover
+    /// frames never wait. `None`, the default, dispatches without waiting.
+    fn events_readiness(&self) -> Option<crate::events_split::EventsReadiness> {
+        None
+    }
+
     /// Warm every pack's in-memory state (ANN indexes, etc.).
     async fn warm_all(&self);
 
@@ -1067,6 +1076,49 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                     error: Some("daemon is draining; request was not admitted".to_owned()),
                     error_detail: Some(serde_json::json!({
                         "kind": "runtime", "code": "daemon_draining",
+                        "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                    })),
+                    request_id: frame.request_id,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(dispatcher.config_id().to_owned()),
+                    version_mismatch: false,
+                    metrics: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&refusal) {
+                    let _ = write_response_frame(&mut peer_write, &payload).await;
+                }
+                return;
+            }
+        }
+        // A supervised events daemon that has not answered yet would fail
+        // this request's audit commit after its domain write committed, so
+        // the request waits for it here, before anything runs, and is
+        // refused with nothing committed when it does not answer in time.
+        if let Some(readiness) = dispatcher.events_readiness() {
+            let not_ready = tokio::select! {
+                outcome = readiness.wait() => outcome.err(),
+                _ = wait_for_peer_disconnect(&mut peer_read) => return,
+            };
+            if let Some(not_ready) = not_ready {
+                let message = not_ready.to_string();
+                tracing::warn!(
+                    socket = %not_ready.socket.display(),
+                    reason = ?not_ready.reason,
+                    request_id = frame.request_id,
+                    "request refused: the supervised events daemon is not answering"
+                );
+                let refusal = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(message.clone()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "runtime",
+                        "code": "events_daemon_unavailable",
+                        "message": message,
+                        "retryable": true,
+                        "socket": not_ready.socket.display().to_string(),
                         "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
                     })),
                     request_id: frame.request_id,

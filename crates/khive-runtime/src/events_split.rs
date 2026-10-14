@@ -1092,6 +1092,179 @@ fn verify_events_db_owner_only_unopened(
     Ok(())
 }
 
+/// How long a daemon holds requests at startup for the events daemon it
+/// supervises to answer before it refuses them ([`EventsReadiness`]).
+#[cfg(unix)]
+pub const EVENTS_READINESS_WINDOW: Duration = Duration::from_secs(10);
+
+/// Startup readiness of the events daemon this process supervises (ADR-170),
+/// as seen by the request path.
+///
+/// A daemon with events forwarding enabled commits every write's audit batch
+/// through the supervised events daemon. That child is spawned in the
+/// background after the main socket is bound, and until it binds its own
+/// socket every audit commit fails: a write verb then reports a refusal
+/// while its domain write is already committed. The daemon therefore holds
+/// each request at this gate until the events socket has answered once.
+///
+/// The window is measured from the moment supervision starts, not per
+/// request: once it has elapsed without an answer, requests are refused at
+/// once instead of each waiting again, and a later answer (a respawned child
+/// binding) admits them again. The gate is a startup barrier only; it stays
+/// open after the first answer.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct EventsReadiness {
+    socket: PathBuf,
+    deadline: tokio::time::Instant,
+    ready: tokio::sync::watch::Receiver<bool>,
+}
+
+/// The supervisor's side of an [`EventsReadiness`] gate.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct EventsReadinessSignal {
+    deadline: tokio::time::Instant,
+    ready: tokio::sync::watch::Sender<bool>,
+}
+
+/// Why an [`EventsReadiness`] gate refused a request.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventsNotReadyReason {
+    /// The startup window elapsed without the events socket answering.
+    WindowElapsed,
+    /// The supervisor stopped before the events socket answered.
+    SupervisorStopped,
+}
+
+/// A request refused by an [`EventsReadiness`] gate; names the socket that
+/// did not answer.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventsNotReady {
+    pub socket: PathBuf,
+    pub reason: EventsNotReadyReason,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for EventsNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            EventsNotReadyReason::WindowElapsed => write!(
+                f,
+                "events daemon at {} has not answered since this daemon started; \
+                 the request was refused before dispatch",
+                self.socket.display()
+            ),
+            EventsNotReadyReason::SupervisorStopped => write!(
+                f,
+                "events daemon supervision for {} stopped before the socket answered; \
+                 the request was refused before dispatch",
+                self.socket.display()
+            ),
+        }
+    }
+}
+
+/// Create a readiness gate for the events daemon at `socket`, whose startup
+/// window of `window` starts now.
+#[cfg(unix)]
+pub fn events_readiness(
+    socket: PathBuf,
+    window: Duration,
+) -> (EventsReadinessSignal, EventsReadiness) {
+    let deadline = tokio::time::Instant::now() + window;
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    (
+        EventsReadinessSignal {
+            deadline,
+            ready: sender,
+        },
+        EventsReadiness {
+            socket,
+            deadline,
+            ready: receiver,
+        },
+    )
+}
+
+#[cfg(unix)]
+impl EventsReadinessSignal {
+    /// Record that the events socket answered; opens the gate for good.
+    pub fn mark_ready(&self) {
+        self.ready
+            .send_if_modified(|ready| !std::mem::replace(ready, true));
+    }
+
+    /// Whether requests may still be waiting on this gate: not yet ready and
+    /// the startup window still open.
+    pub fn awaiting(&self) -> bool {
+        !*self.ready.borrow() && tokio::time::Instant::now() < self.deadline
+    }
+
+    /// Whether the events socket has answered.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+}
+
+#[cfg(unix)]
+impl EventsReadiness {
+    /// The events socket this gate waits on.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Whether the events socket has answered.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Wait until the events socket has answered, or refuse once the startup
+    /// window has elapsed or the supervisor has stopped.
+    pub async fn wait(&self) -> Result<(), EventsNotReady> {
+        let mut ready = self.ready.clone();
+        let outcome = tokio::time::timeout_at(self.deadline, ready.wait_for(|ready| *ready))
+            .await
+            .map(|answered| answered.map(|_| ()));
+        let refused = |reason| EventsNotReady {
+            socket: self.socket.clone(),
+            reason,
+        };
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(refused(EventsNotReadyReason::SupervisorStopped)),
+            Err(_) if self.is_ready() => Ok(()),
+            Err(_) => Err(refused(EventsNotReadyReason::WindowElapsed)),
+        }
+    }
+}
+
+/// The startup window for a new [`EventsReadiness`] gate:
+/// [`EVENTS_READINESS_WINDOW`], or `KHIVE_TEST_EVENTS_READY_WINDOW_MS` under
+/// `KHIVE_TEST_HARNESS=1` so integration tests can reach the refusal quickly.
+#[cfg(unix)]
+pub fn events_readiness_window() -> Duration {
+    harness_duration_ms("KHIVE_TEST_EVENTS_READY_WINDOW_MS").unwrap_or(EVENTS_READINESS_WINDOW)
+}
+
+/// A test-only duration in milliseconds read from the variable `name`,
+/// honoured only under `KHIVE_TEST_HARNESS=1`. Unset, malformed or outside
+/// the harness it is `None`.
+#[cfg(unix)]
+pub(crate) fn harness_duration_ms(name: &str) -> Option<Duration> {
+    if std::env::var("KHIVE_TEST_HARNESS").as_deref() != Ok("1") {
+        return None;
+    }
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
 /// Supervise the events daemon from the main daemon process: probe the
 /// socket periodically and (re)spawn the daemon subcommand when unreachable.
 ///
@@ -1145,6 +1318,39 @@ pub async fn supervise_events_daemon_with_policies(
     disk_guard: khive_db::EffectiveDiskGuardConfig,
     volume_lock_dir: PathBuf,
 ) {
+    let (readiness, _unobserved) = events_readiness(socket_path.clone(), EVENTS_READINESS_WINDOW);
+    supervise_events_daemon_with_readiness(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        volume_lock_dir,
+        readiness,
+    )
+    .await;
+}
+
+/// [`supervise_events_daemon_with_policies`], reporting the first answer of
+/// the events socket through `readiness` so the host can hold requests until
+/// then ([`EventsReadiness`]).
+///
+/// While the gate is waiting, the socket is probed every
+/// `FAST_PROBE_INTERVAL` instead of every `PROBE_INTERVAL`, so a request is
+/// admitted within milliseconds of the child binding. Once the startup window
+/// has elapsed without an answer, it is probed every
+/// `UNANSWERED_PROBE_INTERVAL`, so a late bind reopens the gate within a
+/// second instead of up to `PROBE_INTERVAL` later. A spawn still happens at
+/// most once per `PROBE_INTERVAL`, so a child that keeps failing at startup
+/// is respawned no faster than before.
+#[cfg(unix)]
+pub async fn supervise_events_daemon_with_readiness(
+    db_path: PathBuf,
+    socket_path: PathBuf,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+    readiness: EventsReadinessSignal,
+) {
     if let Err(error) = disk_guard.validate() {
         tracing::warn!(%error, "invalid disk policy; events supervisor not started");
         return;
@@ -1154,9 +1360,12 @@ pub async fn supervise_events_daemon_with_policies(
         return;
     }
     const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+    const FAST_PROBE_INTERVAL: Duration = Duration::from_millis(20);
+    const UNANSWERED_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     let shutdown = crate::daemon::daemon_shutdown_token();
     let mut child: Option<std::process::Child> = None;
     let mut respawns: u64 = 0;
+    let mut last_spawn: Option<std::time::Instant> = None;
     loop {
         // Reap first: a child that exited (crashed, lost the advisory lock
         // race, refused an untrusted directory) must not linger as a zombie,
@@ -1187,7 +1396,12 @@ pub async fn supervise_events_daemon_with_policies(
             }
             Err(_) => false,
         };
-        if !reachable && child.is_none() {
+        if reachable {
+            readiness.mark_ready();
+        }
+        let spawn_due = last_spawn.is_none_or(|at| at.elapsed() >= PROBE_INTERVAL);
+        if !reachable && child.is_none() && spawn_due {
+            last_spawn = Some(std::time::Instant::now());
             match std::env::current_exe() {
                 Ok(exe) => {
                     let spawned = events_daemon_command(
@@ -1220,9 +1434,16 @@ pub async fn supervise_events_daemon_with_policies(
                 }
             }
         }
+        let pause = if readiness.awaiting() {
+            FAST_PROBE_INTERVAL
+        } else if readiness.is_ready() {
+            PROBE_INTERVAL
+        } else {
+            UNANSWERED_PROBE_INTERVAL
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
     }
     if let Some(mut c) = child.take() {
@@ -1373,6 +1594,15 @@ pub async fn run_events_daemon_with_policies(
     backend.events()?;
     verify_events_db_owner_only_unopened(db_path, &before_open)?;
 
+    // Integration tests widen the window between the main daemon accepting
+    // requests and this socket answering, which a slow host produces.
+    if let Some(delay) = harness_duration_ms("KHIVE_TEST_EVENTS_DAEMON_BIND_DELAY_MS") {
+        tracing::info!(
+            delay_ms = delay.as_millis() as u64,
+            "test harness: delaying events socket bind"
+        );
+        tokio::time::sleep(delay).await;
+    }
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -3666,6 +3896,7 @@ mod tests {
     }
 
     include!("events_split_shutdown_tests.rs");
+    include!("events_split_readiness_tests.rs");
 
     #[cfg(unix)]
     #[tokio::test]
