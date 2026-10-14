@@ -49,7 +49,9 @@ impl ExternalEmailHost for CommExternalEmailHost {
             tracing::warn!(
                 "mailto unsubscribe: no comm store is wired to this channel; suppression entry not recorded"
             );
-            return Ok(false);
+            return Err(ChannelError::Transport(
+                "mailto unsubscribe: no comm store is wired to this channel".to_string(),
+            ));
         };
         // Attribute the write to the serving actor, or to the channel's own identity when the
         // process has none configured, so a verified opt-out is never dropped for want of an actor.
@@ -93,15 +95,26 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_comm_store_nothing_is_suppressed_or_recorded() {
-        let host = CommExternalEmailHost::new(policy(), None);
+        let policy = policy();
+        let token = policy
+            .mint_unsubscribe_token("allowed@example.com")
+            .expect("token for a configured recipient");
+        let host = CommExternalEmailHost::new(policy, None);
         assert!(host.external_senders_configured());
         let check = host.inbound_suppression().await.expect("inbound check");
         assert!(!check("stranger@example.com"));
-        let recorded = host
-            .record_mailto_unsubscribe("allowed@example.com")
+        let key = host
+            .verify_unsubscribe_token(&token)
+            .expect("token verifies");
+        let error = host
+            .record_mailto_unsubscribe(&key)
             .await
-            .expect("record without a store");
-        assert!(!recorded, "no entry is written without a comm store");
+            .expect_err("a missing comm store must hold the opt-out for retry");
+        assert!(
+            matches!(&error, ChannelError::Transport(message)
+                if message == "mailto unsubscribe: no comm store is wired to this channel"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

@@ -2858,6 +2858,7 @@ mod tests {
     /// One page holding a single parsed message, with the IMAP progress advanced to its UID.
     struct SingleEmailPageImap {
         email: RawEmail,
+        seen_progress: Arc<Mutex<Vec<ImapProgress>>>,
     }
 
     #[async_trait]
@@ -2866,8 +2867,9 @@ mod tests {
             &self,
             _since: DateTime<Utc>,
             _limit: usize,
-            _progress: ImapProgress,
+            progress: ImapProgress,
         ) -> Result<ImapFetchPage, ChannelError> {
+            self.seen_progress.lock().unwrap().push(progress);
             Ok(ImapFetchPage {
                 emails: vec![SelectedMessage::Email(Box::new(self.email.clone()))],
                 next_progress: ImapProgress {
@@ -2881,6 +2883,7 @@ mod tests {
     /// A host whose token verifier works and whose suppression store refuses every write.
     struct WriteFailingHost {
         policy: Arc<OutboundEmailPolicy>,
+        attempts: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -2899,8 +2902,12 @@ mod tests {
 
         async fn record_mailto_unsubscribe(
             &self,
-            _recipient_key: &str,
+            recipient_key: &str,
         ) -> Result<bool, ChannelError> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(recipient_key.to_string());
             Err(ChannelError::Transport(
                 "suppression store unavailable".into(),
             ))
@@ -2987,7 +2994,10 @@ mod tests {
         let smtp = SmtpSender::with_connector(RecordingSmtp {
             calls: Arc::new(Mutex::new(Vec::new())),
         });
-        let imap = ImapFetcher::with_connector(SingleEmailPageImap { email });
+        let imap = ImapFetcher::with_connector(SingleEmailPageImap {
+            email,
+            seen_progress: Arc::new(Mutex::new(Vec::new())),
+        });
         let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
             .with_external_host(Arc::new(TestExternalHost::over_runtime(
                 Some(Arc::clone(&policy)),
@@ -3002,30 +3012,69 @@ mod tests {
         assert_eq!(rows[0].0, policy.recipient_key("gone@example.net").unwrap());
     }
 
-    // A failed suppression write fails the poll, so the coordinator never persists a checkpoint
-    // past the message and the opt-out is retried on the next poll instead of being lost.
+    // A failed suppression write returns no checkpoint candidate. Retrying with the same stored
+    // checkpoint fetches and attempts to record the same verified opt-out again.
     #[tokio::test]
     async fn failed_unsubscribe_write_fails_the_poll() {
         let policy = enabled_policy();
         let token = policy
             .mint_unsubscribe_token("gone@example.net")
             .expect("mint token");
-        let mut email = make_email("maintainer@example.com", "imap:test:3:8");
-        email.uid = 8;
-        email.subject = format!("unsubscribe {token}");
-        let smtp = SmtpSender::with_connector(RecordingSmtp {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        });
-        let imap = ImapFetcher::with_connector(SingleEmailPageImap { email });
-        let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
-            .with_external_host(Arc::new(WriteFailingHost { policy }));
-
-        let error = ch.poll_page(Utc::now(), None).await.unwrap_err();
-        assert!(
-            matches!(&error, ChannelError::Transport(message)
-                if message.contains("mailto unsubscribe suppression write failed")),
-            "{error:?}"
+        let key = policy.recipient_key("gone@example.net").unwrap();
+        let raw = format!(
+            "From: maintainer@example.com\r\n\
+             To: user@example.com\r\n\
+             Subject: unsubscribe {token}\r\n\
+             Message-ID: <missing-store@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             unsubscribe\r\n"
         );
+        let email = parse_raw_bytes(8, raw.as_bytes(), "imap.example.com", 3)
+            .expect("valid synthetic unsubscribe MIME");
+        assert_eq!(email.subject, format!("unsubscribe {token}"));
+        let smtp_calls = Arc::new(Mutex::new(Vec::new()));
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::clone(&smtp_calls),
+        });
+        let seen_progress = Arc::new(Mutex::new(Vec::new()));
+        let imap = ImapFetcher::with_connector(SingleEmailPageImap {
+            email,
+            seen_progress: Arc::clone(&seen_progress),
+        });
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
+            .with_external_host(Arc::new(WriteFailingHost {
+                policy,
+                attempts: Arc::clone(&attempts),
+            }));
+        let since = Utc::now();
+        let progress = ImapProgress {
+            uid_validity: NonZeroU32::new(3),
+            last_seen_uid: NonZeroU32::new(7),
+        };
+        let checkpoint = StoredChannelCheckpoint {
+            checkpoint: ch.encode_checkpoint(progress),
+            committed_at: since,
+        };
+
+        for _ in 0..2 {
+            let error = ch.poll_page(since, Some(&checkpoint)).await.unwrap_err();
+            assert!(
+                matches!(&error, ChannelError::Transport(message)
+                    if message.contains("mailto unsubscribe suppression write failed")
+                        && message.contains("suppression store unavailable")),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            *seen_progress.lock().unwrap(),
+            vec![progress, progress],
+            "both fetches start at the same committed UID"
+        );
+        assert_eq!(*attempts.lock().unwrap(), vec![key.clone(), key]);
+        assert!(smtp_calls.lock().unwrap().is_empty());
     }
 
     // A §7 step-2 message is a machine record only: no actor-visible envelope, no quarantine row,
