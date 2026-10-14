@@ -2043,7 +2043,13 @@ async fn dispatch_events_request(
             }
         }
         EventsRequest::CountEvents { filter, .. } => {
-            let seconds = count_budget_secs.expect("validated count attribution");
+            let Some(seconds) = count_budget_secs else {
+                return storage_error_response(&StorageError::InvalidInput {
+                    capability: khive_storage::StorageCapability::Events,
+                    operation: "events count".into(),
+                    message: "missing operator_read_budget_secs attribution".into(),
+                });
+            };
             match store.count_events(filter).await {
                 Ok(count) => match khive_storage::ensure_request_read_active("events count") {
                     Ok(()) => EventsResponse::Count { count },
@@ -2055,7 +2061,13 @@ async fn dispatch_events_request(
         EventsRequest::CountEventsGrouped {
             filter, group_by, ..
         } => {
-            let seconds = count_budget_secs.expect("validated count attribution");
+            let Some(seconds) = count_budget_secs else {
+                return storage_error_response(&StorageError::InvalidInput {
+                    capability: khive_storage::StorageCapability::Events,
+                    operation: "events count".into(),
+                    message: "missing operator_read_budget_secs attribution".into(),
+                });
+            };
             match store.count_events_grouped(filter, group_by).await {
                 Ok(counts) => match khive_storage::ensure_request_read_active("events count") {
                     Ok(()) => EventsResponse::GroupedCount { counts },
