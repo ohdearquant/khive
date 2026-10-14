@@ -197,6 +197,18 @@ fn session_attempt_deadline(
     }
 }
 
+// Own the completion record so early returns and cancelled futures cannot skip it.
+struct RecallProfileTotal {
+    call_id: u64,
+    started: Instant,
+}
+
+impl Drop for RecallProfileTotal {
+    fn drop(&mut self) {
+        plog(self.call_id, "total", self.started.elapsed().as_micros());
+    }
+}
+
 impl MemoryPack {
     async fn collect_recall_candidates_with_session(
         &self,
@@ -261,6 +273,38 @@ impl MemoryPack {
         }
     }
 
+    /// Run one recall under its own profiler call ID. With profiling disabled no
+    /// ID is taken and no record is written; otherwise every exit, cancellation
+    /// included, writes exactly one `total` record.
+    pub(crate) async fn handle_recall_profiled(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+        hard_deadline: Option<Instant>,
+    ) -> Result<Value, RuntimeError> {
+        if !super::common::recall_profile_enabled() {
+            return self
+                .handle_recall(token, params, registry, hard_deadline)
+                .await;
+        }
+
+        let call_id = RECALL_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _total = RecallProfileTotal {
+            call_id,
+            started: Instant::now(),
+        };
+        PROF_CID
+            .scope(
+                call_id,
+                self.handle_recall(token, params, registry, hard_deadline),
+            )
+            .await
+    }
+
+    /// The recall pipeline. Requests reach it through
+    /// [`Self::handle_recall_profiled`], which scopes the profiler call ID; a
+    /// direct call records its stages under ID 0 and writes no `total`.
     pub(crate) async fn handle_recall(
         &self,
         token: &NamespaceToken,
@@ -268,8 +312,6 @@ impl MemoryPack {
         registry: &VerbRegistry,
         hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
-        use std::sync::atomic::Ordering;
-
         let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
 
@@ -339,14 +381,7 @@ impl MemoryPack {
         }
 
         let prof = super::common::recall_profile_enabled();
-        let call_id = if prof {
-            let id = RECALL_CALL_ID.fetch_add(1, Ordering::Relaxed);
-            PROF_CID.with(|c| c.set(id));
-            id
-        } else {
-            0
-        };
-        let t_total = if prof { Some(Instant::now()) } else { None };
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let mut t_stage = if prof { Some(Instant::now()) } else { None };
 
         let query_trimmed = p.query.trim();
@@ -1308,9 +1343,6 @@ impl MemoryPack {
             if let Some(ref t) = t_stage {
                 plog_n(call_id, "serialize", t.elapsed().as_micros(), results.len());
             }
-            if let Some(ref t) = t_total {
-                plog(call_id, "total", t.elapsed().as_micros());
-            }
         }
 
         if budget_capped && results.is_empty() {
@@ -1619,3 +1651,7 @@ mod audit_batch_tests;
 #[cfg(test)]
 #[path = "recall_strategy_legs_tests.rs"]
 mod strategy_legs_tests;
+
+#[cfg(test)]
+#[path = "recall_profile_tests.rs"]
+mod profile_tests;
