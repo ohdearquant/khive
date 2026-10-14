@@ -262,6 +262,14 @@ pub(crate) struct HeartbeatParams {
     pub error_message: Option<String>,
     #[serde(default)]
     pub at: Option<String>,
+    /// Messages that held the page on this poll, reported with a success
+    /// outcome by a writer that bounds its holds. Absent from older writers.
+    #[serde(default)]
+    pub held_messages: Option<u64>,
+    /// Messages given a terminal disposition on this poll because their
+    /// failed polls reached the writer's bound. Absent from older writers.
+    #[serde(default)]
+    pub quarantined_after_hold: Option<u64>,
 }
 
 /// Parameters for `comm.probe` — read-only poll for new inbound message
