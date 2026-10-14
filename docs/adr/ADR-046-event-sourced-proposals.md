@@ -7,7 +7,7 @@
 (accepted 2026-10-09) defines the deferred operator command. Its implementation
 lands on its own gates.
 **Amendment**: [canonical change-set proposals](#amendment-2026-10-14-canonical-change-set-proposals)
-(proposed 2026-10-14) adds the `Canonical` changeset arm, landed through ADR-102's tier-1 verb.
+(accepted 2026-10-14) adds the `Canonical` changeset arm, landed through ADR-102's tier-1 verb.
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
@@ -1332,7 +1332,7 @@ the accepted base and earlier amendments.
 
 ## Amendment (2026-10-14): canonical change-set proposals
 
-**Status**: Proposed (2026-10-14). Adds one `ProposalChangeset` arm; every existing arm and its
+**Status**: Accepted (2026-10-14). Adds one `ProposalChangeset` arm; every existing arm and its
 apply behavior are unchanged. Acceptance of this text is not implementation acceptance: the arm
 lands with the apply path as its caller, on its own gates.
 

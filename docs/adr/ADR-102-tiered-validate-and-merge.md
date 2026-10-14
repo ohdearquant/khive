@@ -2,7 +2,7 @@
 
 **Status**: Accepted
 **Date**: 2026-07-08
-**Amendment**: [tier-1 landing wire](#amendment-2026-10-14-the-tier-1-landing-wire) (proposed
+**Amendment**: [tier-1 landing wire](#amendment-2026-10-14-the-tier-1-landing-wire) (accepted
 2026-10-14) replaces D1's tier-1 wire with one atomic change-set verb.
 **Amends**: [ADR-020](ADR-020-git-native-kg-implementation.md) (restores the `kg commit` CLI
 primitive to the `kkernel kg` subcommand surface; see "Amendment to ADR-020" below)
@@ -227,7 +227,7 @@ failure into a duplicate live mutation.
 
 ### Amendment (2026-10-14): the tier-1 landing wire
 
-**Status**: Proposed (2026-10-14). Amends D1 only; D2 to D6 and the earlier amendments are
+**Status**: Accepted (2026-10-14). Amends D1 only; D2 to D6 and the earlier amendments are
 unchanged. Acceptance of this text is not implementation acceptance: the verb lands together with
 its first caller ([#4887](https://github.com/ohdearquant/khive/issues/4887)) on its own gates.
 
