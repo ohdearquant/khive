@@ -54,20 +54,6 @@ pub struct ServeLedgerRow {
     pub scorer_run_id: Option<String>,
 }
 
-fn row_opt_text(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
-    match row.get(col) {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-fn row_opt_int(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
-    match row.get(col) {
-        Some(SqlValue::Integer(n)) => Some(*n),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServeLedgerInsert {
     pub id: String,
@@ -245,13 +231,11 @@ pub async fn get_serve_row(
             .text("consumer_kind")
             .map(str::to_owned)
             .map_err(|_| sql_err("read row", "missing consumer_kind column"))?,
-        served_by_profile_id: row_opt_text(&row, "served_by_profile_id"),
-        resolved_profile_id: row_opt_text(&row, "resolved_profile_id"),
-        resolved_at: row_opt_int(&row, "resolved_at"),
-        accounting_profile_id: row_opt_text(&row, "accounting_profile_id"),
-        serve_attribution: ServeAttribution::from_column(
-            row_opt_text(&row, "serve_attribution").as_deref(),
-        ),
+        served_by_profile_id: row.text_or_none("served_by_profile_id").map(str::to_owned),
+        resolved_profile_id: row.text_or_none("resolved_profile_id").map(str::to_owned),
+        resolved_at: row.i64_or_none("resolved_at"),
+        accounting_profile_id: row.text_or_none("accounting_profile_id").map(str::to_owned),
+        serve_attribution: ServeAttribution::from_column(row.text_or_none("serve_attribution")),
         target_id: row
             .text("target_id")
             .map(str::to_owned)
@@ -267,9 +251,9 @@ pub async fn get_serve_row(
         served_at: row
             .i64("served_at")
             .map_err(|_| sql_err("read row", "missing served_at column"))?,
-        grade: row_opt_text(&row, "grade"),
-        graded_at: row_opt_int(&row, "graded_at"),
-        scorer_run_id: row_opt_text(&row, "scorer_run_id"),
+        grade: row.text_or_none("grade").map(str::to_owned),
+        graded_at: row.i64_or_none("graded_at"),
+        scorer_run_id: row.text_or_none("scorer_run_id").map(str::to_owned),
     }))
 }
 
