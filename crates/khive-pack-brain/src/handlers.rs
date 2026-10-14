@@ -19,6 +19,10 @@ use khive_types::{HandlerDef, IdResolutionMode};
 mod auto_feedback;
 mod event_page;
 
+#[cfg(test)]
+#[path = "handlers/event_counts_read_budget_tests.rs"]
+mod event_counts_read_budget_tests;
+
 use crate::event::interpret;
 pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
 use crate::event_read_scope::event_actor_read_scope;
@@ -126,7 +130,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             allowlist. The window covers exactly one namespace: the caller's own, or the one named \
             by an explicit `namespace=` argument. The result's `scope` states which namespace the \
             answer covered and which others this caller may ask for the same way; rows written to \
-            any other namespace are absent from these counts rather than counted as zero.",
+            any other namespace are absent from these counts rather than counted as zero. \
+            Counts consume KHIVE_REQUEST_READ_TIMEOUT_SECS (default 30s, maximum 86400s), \
+            retaining any earlier request deadline across both stores and events-daemon IPC. \
+            The daemon stops and settles the count when the caller's budget expires and the \
+            connection closes; it does not enforce an independent deadline. A typed storage \
+            timeout names the budget; no partial successful window_event_total is returned.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -964,6 +973,40 @@ impl BrainPack {
     }
 
     pub(crate) async fn handle_event_counts(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let allowance = khive_storage::request_read_timeout_from_env();
+        let deadline = khive_storage::effective_request_read_deadline(
+            khive_storage::RequestReadDeadline::after(allowance),
+        );
+        khive_storage::scope_request_read_deadline_at(deadline, async {
+            let operation = format!(
+                "brain.event_counts (operator read budget {}s; earlier caller deadline retained)",
+                allowance.as_secs()
+            );
+            if khive_storage::request_read_is_cancelled() {
+                return Err(RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout {
+                        operation: operation.into(),
+                    },
+                ));
+            }
+            let result = self.handle_event_counts_in_read_scope(token, params).await;
+            if result.is_ok() && khive_storage::request_read_is_cancelled() {
+                return Err(RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout {
+                        operation: operation.into(),
+                    },
+                ));
+            }
+            result
+        })
+        .await
+    }
+
+    async fn handle_event_counts_in_read_scope(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -2756,6 +2799,14 @@ impl BrainPack {
 /// at most this many rows at `offset: 0`, never by one wide request.
 pub(crate) const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
 
+fn event_counts_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        error @ (khive_storage::StorageError::Timeout { .. }
+        | khive_storage::StorageError::AdmissionTimeout { .. }) => RuntimeError::Storage(error),
+        other => RuntimeError::InvalidInput(other.to_string()),
+    }
+}
+
 /// Read one grouped total; row walks and boundary completeness reads remain
 /// independent live observations. Unsupported grouped stores refuse directly.
 async fn grouped_window_total(
@@ -2765,7 +2816,7 @@ async fn grouped_window_total(
     Ok(store
         .count_events_grouped(filter.clone(), khive_storage::event::EventGroupBy::Kind)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        .map_err(event_counts_storage_error)?
         .values()
         .copied()
         .sum())
@@ -2815,7 +2866,7 @@ pub(crate) async fn fetch_event_counts_window(
             khive_storage::event::EventGroupBy::Kind,
         )
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(event_counts_storage_error)?;
     let audit_total = totals
         .get(khive_types::EventKind::Audit.name())
         .copied()
