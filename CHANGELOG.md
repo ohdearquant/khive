@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `khive_pack_memory::scoring::is_meaningful_recall_query`, preserving their
   existing behavior. Both `is_meaningful_query` functions remain as deprecated
   compatibility wrappers for one release; callers should use the replacement names.
+### Added
+
+- `EntityPosteriors::fold_evidence` applies weighted `supports` and `refutes` evidence
+  to a claim's posterior, rejecting invalid relations and weights before changing values
+  or eviction order. Either signed zero is a mutation-free no-op.
 
 ### Fixed
 
