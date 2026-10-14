@@ -52,7 +52,8 @@ phase_lint() {
     python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
 
     echo "=== Contract Harness Tests ==="
-    uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_contract_harness.py"
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" python "$SCRIPT_DIR/tests/test_contract_harness.py"
 }
 
 # The hosted docs job runs this phase too, so a change that touches only Markdown, which skips the Rust
@@ -420,7 +421,7 @@ phase_vector_smoke() {
 
 phase_contract_suite() {
     echo "=== Contract Suite (khive-contract) ==="
-    (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" pytest -q
 }
 
 # The documentation lane skips the contract suite, but one of its tests reads every file in the repository,
@@ -428,8 +429,8 @@ phase_contract_suite() {
 # than skips when rg is absent, and a renamed test fails collection rather than selecting nothing.
 phase_content_sweeps() {
     echo "=== Repository Identifier Ban (khive-contract) ==="
-    (cd "$SCRIPT_DIR/../tests/khive-contract" &&
-        uv run pytest -q tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo)
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" pytest -q \
+        tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo
     echo "=== Shipping Pack-Set Copy Check ==="
     # Reads Markdown under docs/, crates/ and scripts/ by content, so the documentation lane must run it.
     # Named by test id: a renamed test is an error, not an empty selection.
