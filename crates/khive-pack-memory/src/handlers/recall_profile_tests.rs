@@ -211,6 +211,7 @@ async fn exercise(mode: &str) {
 }
 
 #[test]
+#[serial_test::serial(config_ledger)]
 fn profile_fixture_child() {
     let Ok(mode) = std::env::var(CHILD) else {
         return;
