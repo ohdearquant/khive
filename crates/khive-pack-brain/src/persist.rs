@@ -1199,31 +1199,31 @@ pub async fn ensure_loaded(
 // ── BRAIN-007: event-log replay quarantine diagnostics ────────────────────────
 
 #[cfg(test)]
-#[path = "persist/brain_007_replay_quarantine.rs"]
+#[path = "persist/brain_007_replay_quarantine_tests.rs"]
 mod brain_007_replay_quarantine;
 
 // ── PR #1630 remediation: replay-time policy exclusion of the miscalibrated
 //    implicit-positive window ─────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "persist/replay_policy_exclusion.rs"]
+#[path = "persist/replay_policy_exclusion_tests.rs"]
 mod replay_policy_exclusion;
 
 // ── BRAINCORE-AUD-001: entity-posterior cache-capacity enforcement on load ────
 
 #[cfg(test)]
-#[path = "persist/braincore_aud_001_capacity.rs"]
+#[path = "persist/braincore_aud_001_capacity_tests.rs"]
 mod braincore_aud_001_capacity;
 
 #[cfg(test)]
-#[path = "persist/snapshot_copy_regression.rs"]
+#[path = "persist/snapshot_copy_regression_tests.rs"]
 mod snapshot_copy_regression;
 
 // ── ADR-067 Fork C slice 2: persist_brain_state_mutation
 // write-queue routing ──────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "persist/persist_write_queue_routing.rs"]
+#[path = "persist/persist_write_queue_routing_tests.rs"]
 mod persist_write_queue_routing;
 
 #[cfg(test)]
