@@ -298,30 +298,31 @@ caller receives the server-generated UUID.
 | `schedule.agenda`   | List upcoming events and ticker liveness      | "What's on the calendar, and is its ticker running?"          |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
-### Knowledge pack — 20 verbs (`knowledge.` prefix)
+### Knowledge pack — 21 verbs (`knowledge.` prefix)
 
-| Verb                       | What it does                                            | When to use                                  |
-| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
-| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
-| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix  | Read a specific knowledge entry              |
-| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
-| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
-| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
-| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
-| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
-| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
-| `knowledge.export`         | Deterministic JSONL snapshot of one namespace's corpus  | Back up or hand off a corpus                 |
-| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
-| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
-| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
-| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
-| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
-| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
-| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
-| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
+| Verb                       | What it does                                              | When to use                                  |
+| -------------------------- | --------------------------------------------------------- | -------------------------------------------- |
+| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                          | Ingesting knowledge corpus                   |
+| `knowledge.upsert_domains` | Bulk insert/update domain groupings                       | Organizing atoms into domains                |
+| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix    | Read a specific knowledge entry              |
+| `knowledge.list`           | Paginated listing of atoms or domains                     | Browse the corpus                            |
+| `knowledge.search`         | TF-IDF search with embedding rerank (default on)          | Finding relevant knowledge                   |
+| `knowledge.suggest`        | Orient query against domains for composition              | "Which domains cover topic X?"               |
+| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains   | Build a context briefing for an agent        |
+| `knowledge.edit`           | Upsert sections for an atom                               | Update part of an atom without wiping others |
+| `knowledge.import`         | Ingest markdown files as atoms                            | Batch import from filesystem                 |
+| `knowledge.export`         | Deterministic JSONL snapshot of one namespace's corpus    | Back up or hand off a corpus                 |
+| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                           | Retire stale knowledge                       |
+| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts            | Health check                                 |
+| `knowledge.lint`           | Visible graph hygiene rules, statistics and guarded fixes | Inspect graph health and prepare repairs     |
+| `knowledge.index`          | Backfill embeddings + FTS                                 | After bulk import or reindex                 |
+| `knowledge.fold`           | Budget-constrained knapsack selection                     | Token-aware subset picking                   |
+| `knowledge.challenge`      | Mark a section as disputed                                | Flag incorrect content                       |
+| `knowledge.adjudicate`     | Resolve a disputed section                                | Accept or reject a challenge                 |
+| `knowledge.learn`          | Register a concept entity with domain/tags                | Quick concept creation                       |
+| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)      | Attribution                                  |
+| `knowledge.topic`          | List concepts by domain or free-text                      | Explore the concept graph                    |
+| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning       | Signal useful/not_useful on compose results  |
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
