@@ -49,13 +49,13 @@ pub(crate) mod unsubscribe;
 
 pub use backoff::{is_backoff_eligible, BackoffTick, ImapBackoff, ImapSingleFlight};
 pub use channel::EmailChannel;
-pub use config::EmailChannelConfig;
+pub use config::{EmailChannelConfig, ExternalInboundConfig};
 pub use external_host::{ExternalEmailHost, InboundSuppression};
 pub use external_inbound::{
     external_delivery_marking, route_inbound, ExternalDeliveryMarking, ExternalMarkingError,
     InboundRoute, InboundRoutes, InboundRoutesError, ThreadOwner, ORIGIN_EXTERNAL, TRUST_UNTRUSTED,
 };
 pub use screening::{
-    screen, AttachmentInput, Disposition, Family, Rule, RuleSet, ScreeningError, ScreeningInput,
-    ScreeningOutcome,
+    screen, screen_message, AttachmentInput, Disposition, Family, Rule, RuleSet, ScreeningError,
+    ScreeningInput, ScreeningOutcome,
 };

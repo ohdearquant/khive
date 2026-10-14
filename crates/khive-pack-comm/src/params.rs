@@ -206,6 +206,12 @@ pub(crate) struct IngestParams {
     /// back to `p.to.trim()` when absent and no correlation match is found.
     #[serde(default)]
     pub default_inbound_actor: Option<String>,
+    /// Authenticated deterministic reply-stop result from the internal channel consumer.
+    #[serde(default)]
+    pub reply_opt_out: bool,
+    /// Ordered candidates whose host lookup failed before a route was verified.
+    #[serde(default)]
+    pub pending_owner_candidates: Option<Vec<String>>,
     /// This message's own RFC 822 Message-ID (angle brackets included), distinct
     /// from `external_id` (the transport dedup key). Persisted for In-Reply-To/
     /// References on a later reply.

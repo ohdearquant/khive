@@ -20,7 +20,12 @@ async fn configured_channels_and_schedule_are_skipped_by_real_startup() {
     let server = KhiveMcpServer::new(runtime.clone()).unwrap();
     let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
     let before = khive_runtime::daemon::background_task_count();
-    let report = start_host_background_tasks(&demand, &server, Some(runtime));
+    let report = start_host_background_tasks(
+        &demand,
+        &server,
+        Some(runtime),
+        PreparedHostBackgroundTasks::default(),
+    );
     assert_eq!(
         khive_runtime::daemon::background_task_count(),
         before,

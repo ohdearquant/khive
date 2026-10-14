@@ -2036,6 +2036,7 @@ dependencies = [
  "chrono",
  "futures",
  "khive-channel",
+ "khive-pack-blob",
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",

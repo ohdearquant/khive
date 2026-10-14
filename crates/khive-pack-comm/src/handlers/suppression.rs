@@ -434,6 +434,29 @@ pub async fn record_mailto_unsubscribe_suppression(
     .await
 }
 
+/// Record an authenticated delivered reply's opt-out (ADR-200 §5.4 entry point 3).
+pub async fn record_reply_opt_out_suppression(
+    runtime: &KhiveRuntime,
+    from_address: &str,
+    created_by: &str,
+) -> Result<bool, RuntimeError> {
+    let address = normalize_suppression_value("address", from_address)?;
+    insert_suppression(
+        runtime,
+        SuppressionInsert {
+            id: Uuid::new_v4(),
+            scope: "outbound",
+            kind: "address",
+            value: &address,
+            source: "reply_stop",
+            created_by,
+            created_at: Utc::now().timestamp_micros(),
+            reason: "authenticated reply opt-out",
+        },
+    )
+    .await
+}
+
 fn validate_closed_set<'a>(
     verb: &str,
     field: &str,
