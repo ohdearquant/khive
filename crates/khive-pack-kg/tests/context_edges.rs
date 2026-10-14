@@ -188,6 +188,111 @@ fn assert_paired(response: &Value) {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn anchor_edges_report_links_between_selected_anchors_without_relisting_them() {
+    let f = fixture();
+    let source = f.create("Anchor edge source", None).await;
+    let target = f.create("Anchor edge target", None).await;
+    f.link(source, target, "extends", 0.75).await;
+
+    let response = f
+        .context(json!({
+            "entity_ids": [source, target],
+            "hops": 1,
+            "direction": "outgoing",
+            "budget": 65536,
+        }))
+        .await;
+
+    assert_paired(&response);
+    assert_eq!(response["anchors"].as_array().unwrap().len(), 2);
+    assert!(response["anchors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|anchor| anchor["neighbors"] == json!([])));
+    assert_eq!(response["edges"], json!([]));
+    assert_eq!(
+        response["anchor_edges"],
+        json!([{
+            "source_id": source,
+            "source_name": "Anchor edge source",
+            "target_id": target,
+            "target_name": "Anchor edge target",
+            "relation": "extends",
+            "weight": 0.75,
+        }])
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn anchor_edges_are_empty_when_the_other_endpoint_is_a_neighbor() {
+    let f = fixture();
+    let source = f.create("Single anchor source", None).await;
+    let target = f.create("Single anchor target", None).await;
+    f.link(source, target, "extends", 0.65).await;
+
+    let response = f
+        .context(json!({
+            "entity_ids": [source],
+            "hops": 1,
+            "direction": "outgoing",
+            "budget": 65536,
+        }))
+        .await;
+
+    assert_paired(&response);
+    assert_eq!(
+        response["anchors"][0]["neighbors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(response["anchors"][0]["neighbors"][0]["id"], json!(target));
+    assert_eq!(response["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(response["anchor_edges"], json!([]));
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn anchor_edges_keep_incoming_assertion_orientation_and_deduplicate() {
+    let f = fixture();
+    let first_anchor = f.create("First incoming anchor", None).await;
+    let second_anchor = f.create("Second incoming anchor", None).await;
+    f.link(second_anchor, first_anchor, "extends", 0.55).await;
+
+    let response = f
+        .context(json!({
+            "entity_ids": [first_anchor, second_anchor],
+            "hops": 1,
+            "direction": "both",
+            "budget": 65536,
+        }))
+        .await;
+
+    assert_paired(&response);
+    assert!(response["anchors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|anchor| anchor["neighbors"] == json!([])));
+    assert_eq!(response["edges"], json!([]));
+    assert_eq!(
+        response["anchor_edges"],
+        json!([{
+            "source_id": second_anchor,
+            "source_name": "Second incoming anchor",
+            "target_id": first_anchor,
+            "target_name": "First incoming anchor",
+            "relation": "extends",
+            "weight": 0.55,
+        }])
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn directed_edges_at_both_hops_preserve_assertion_orientation_and_names() {
     for direction in ["outgoing", "incoming"] {
         let f = fixture();

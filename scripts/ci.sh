@@ -32,17 +32,7 @@ phase_lint() {
     sh "$SCRIPT_DIR/lint-sql.sh"
     python3 "$SCRIPT_DIR/tests/test_lint_sql.py"
 
-    echo "=== ADR Reference Lint ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh"
-
-    echo "=== ADR Reference Lint Self-Test ==="
-    sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
-
-    echo "=== ADR Status Lint ==="
-    python3 "$SCRIPT_DIR/lint-adr-status.py"
-
-    echo "=== ADR Status Lint Self-Test ==="
-    python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
+    phase_adr_lint
 
     echo "=== Local Build Artifact Verification Tests ==="
     python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
@@ -63,6 +53,22 @@ phase_lint() {
 
     echo "=== Contract Harness Tests ==="
     uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
+}
+
+# The hosted docs job runs this phase too, so a change that touches only Markdown, which skips the Rust
+# jobs, still has its ADR references and status lines checked.
+phase_adr_lint() {
+    echo "=== ADR Reference Lint ==="
+    sh "$SCRIPT_DIR/lint-adr-refs.sh"
+
+    echo "=== ADR Reference Lint Self-Test ==="
+    sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
+
+    echo "=== ADR Status Lint ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py"
+
+    echo "=== ADR Status Lint Self-Test ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
 }
 
 phase_docs_fmt() {
@@ -268,7 +274,7 @@ phase_tests_doc() {
 }
 
 phase_channel_email() {
-    echo "=== Channel Feature Tests (email + Telegram features) ==="
+    echo "=== Feature Tests (email + Telegram channels, retrieval executor) ==="
     # `--workspace` alone never runs any of the several `#[cfg(feature =
     # "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
     # sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
@@ -281,6 +287,10 @@ phase_channel_email() {
     # external side effects and must execute tests, not merely type-check in
     # the all-features clippy pass.
     cargo test -p khive-mcp --features channel-email,channel-telegram
+    # The shared retrieval executor is opt-in and has no caller in the
+    # workspace yet, so no build enables its feature and `--workspace` compiles
+    # neither the executor nor its tests. Run them under the feature here.
+    cargo test -p khive-retrieval --features executor
 }
 
 run_daemon_recovery_repeats() {
@@ -413,6 +423,20 @@ phase_contract_suite() {
     (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
 }
 
+# The documentation lane skips the contract suite, but one of its tests reads every file in the repository,
+# Markdown included, so the hosted docs job runs that test here. It needs ripgrep: under CI it fails rather
+# than skips when rg is absent, and a renamed test fails collection rather than selecting nothing.
+phase_content_sweeps() {
+    echo "=== Repository Identifier Ban (khive-contract) ==="
+    (cd "$SCRIPT_DIR/../tests/khive-contract" &&
+        uv run pytest -q tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo)
+    echo "=== Shipping Pack-Set Copy Check ==="
+    # Reads Markdown under docs/, crates/ and scripts/ by content, so the documentation lane must run it.
+    # Named by test id: a renamed test is an error, not an empty selection.
+    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py" \
+        HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set
+}
+
 phase_macos_pr_check() {
     echo "=== macOS PR Compile Check ==="
     # PRs keep cross-platform compile coverage without paying for the full lint,
@@ -480,6 +504,7 @@ run_phase() {
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
+        adr-lint) phase_adr_lint ;;
         no-stubs) phase_no_stubs ;;
         clippy) phase_clippy ;;
         docs) phase_docs ;;
@@ -494,11 +519,12 @@ run_phase() {
         smoke-tests) phase_smoke_tests ;;
         vector-smoke) phase_vector_smoke ;;
         contract-suite) phase_contract_suite ;;
+        content-sweeps) phase_content_sweeps ;;
         macos-pr-check) phase_macos_pr_check ;;
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint adr-lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite content-sweeps macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac

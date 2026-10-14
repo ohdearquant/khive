@@ -71,6 +71,9 @@ pub mod objectives;
 pub mod operations;
 mod outbound_email_policy;
 pub use outbound_email_policy::OutboundEmailPolicy;
+pub use outbound_email_policy::{
+    outbound_email_is_suppressed, EmailSuppression, EmailSuppressionKind, EmailSuppressionScope,
+};
 pub mod pack;
 pub mod pack_metadata;
 mod params;

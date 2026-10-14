@@ -1,10 +1,131 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
+
+/// The unsubscribe token format version carried as the first token byte.
+const UNSUBSCRIBE_TOKEN_VERSION: u8 = 0x01;
+/// A raw recipient key is one SHA-256 digest.
+const RECIPIENT_KEY_BYTES: usize = 32;
+/// The truncated HMAC tag length carried by a token.
+const UNSUBSCRIBE_TAG_BYTES: usize = 16;
+/// A token is `0x01 || key_id || recipient_key || tag`, base64url (no padding).
+const UNSUBSCRIBE_TOKEN_BYTES: usize = 1 + 1 + RECIPIENT_KEY_BYTES + UNSUBSCRIBE_TAG_BYTES;
+/// The placeholder the operator's footer must carry for the mailto instruction.
+const UNSUBSCRIBE_PLACEHOLDER: &str = "{unsubscribe}";
+/// A recipient-key secret and every token key must decode to at least this many bytes.
+const MIN_KEY_BYTES: usize = 32;
 
 /// Boot-resolved recipient policy shared by comm admission and email delivery.
 /// An absent policy permits queuing without claiming that delivery is configured.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct OutboundEmailPolicy {
     recipients: Option<Arc<[String]>>,
+    external_senders: Option<Arc<[String]>>,
+    external_daily_cap: Option<u64>,
+    /// The recipient-key secret. Present only when external senders are configured; the derived
+    /// key for an address is `HMAC-SHA256(K_rk, normalized address)` in lowercase hex.
+    recipient_key_secret: Option<Arc<[u8]>>,
+    /// Token keys by key id, ascending. Every retired id stays present so a link in an old
+    /// message keeps verifying; the highest id mints new tokens.
+    token_keys: Arc<BTreeMap<u8, Arc<[u8]>>>,
+    /// The operator's external footer text, or the reason it is unavailable. `None` while
+    /// external senders are unset, in which case no footer is ever consulted.
+    external_footer: Option<Result<Arc<str>, Arc<str>>>,
+    external_admission: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for OutboundEmailPolicy {
+    fn default() -> Self {
+        Self {
+            recipients: None,
+            external_senders: None,
+            external_daily_cap: None,
+            recipient_key_secret: None,
+            token_keys: Arc::default(),
+            external_footer: None,
+            external_admission: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+/// HMAC-SHA256 (RFC 2104) over `sha2::Sha256`.
+///
+/// The 64-byte block is fixed for SHA-256. A key longer than the block is hashed first; a
+/// shorter one is zero-padded to the block. Returns the full 32-byte MAC.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= block[index];
+        outer_pad[index] ^= block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(data);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&outer.finalize());
+    mac
+}
+
+/// The direction stored on one email suppression entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailSuppressionScope {
+    Outbound,
+    Inbound,
+}
+
+/// The identity form stored on one email suppression entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailSuppressionKind {
+    Address,
+    Domain,
+    RecipientKey,
+}
+
+/// The matching fields needed by outbound admission and delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmailSuppression {
+    pub scope: EmailSuppressionScope,
+    pub kind: EmailSuppressionKind,
+    pub value: String,
+}
+
+/// Check one already-normalized recipient against the suppression rows supplied by the caller.
+///
+/// Address normalization is shared with [`OutboundEmailPolicy`]; callers must use
+/// `khive_types::email_address::normalize_email_recipient` before calling this function.
+/// Domain comparison is exact, and recipient keys compare byte-for-byte.
+pub fn outbound_email_is_suppressed(
+    normalized_recipient: &str,
+    recipient_key: Option<&str>,
+    entries: &[EmailSuppression],
+) -> bool {
+    let recipient_domain = normalized_recipient
+        .rsplit_once('@')
+        .map(|(_, domain)| domain);
+    entries.iter().any(|entry| {
+        if entry.scope != EmailSuppressionScope::Outbound {
+            return false;
+        }
+        match entry.kind {
+            EmailSuppressionKind::Address => entry.value == normalized_recipient,
+            EmailSuppressionKind::Domain => recipient_domain == Some(entry.value.as_str()),
+            EmailSuppressionKind::RecipientKey => recipient_key == Some(entry.value.as_str()),
+        }
+    })
 }
 
 impl OutboundEmailPolicy {
@@ -19,6 +140,7 @@ impl OutboundEmailPolicy {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             recipients: Some(recipients.into()),
+            ..Self::default()
         })
     }
 
@@ -33,7 +155,91 @@ impl OutboundEmailPolicy {
         })
     }
 
+    pub fn allows_external_sender(&self, actor_id: &str) -> bool {
+        self.external_senders
+            .as_ref()
+            .is_some_and(|senders| senders.iter().any(|sender| sender == actor_id))
+    }
+
+    pub fn has_external_senders(&self) -> bool {
+        self.external_senders.is_some()
+    }
+
+    pub fn external_daily_cap(&self) -> Option<u64> {
+        self.external_daily_cap
+    }
+
+    pub async fn lock_external_admission(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.external_admission).lock_owned().await
+    }
+
+    /// The recipient key a `recipient_key` suppression entry matches, derived on demand as
+    /// `HMAC-SHA256(K_rk, normalized address)` in lowercase hex; the raw bytes are never stored.
+    /// `None` when no recipient-key secret is configured (external senders unset).
+    pub fn recipient_key(&self, normalized_recipient: &str) -> Option<String> {
+        self.recipient_key_secret
+            .as_deref()
+            .map(|secret| hex_lower(&hmac_sha256(secret, normalized_recipient.as_bytes())))
+    }
+
+    /// The recipient key's raw 32 bytes, used as the token body.
+    fn recipient_key_bytes(&self, normalized_recipient: &str) -> Option<[u8; RECIPIENT_KEY_BYTES]> {
+        self.recipient_key_secret
+            .as_deref()
+            .map(|secret| hmac_sha256(secret, normalized_recipient.as_bytes()))
+    }
+
+    /// The footer text for external messages, or the reason it is unavailable. `None` while
+    /// external senders are unset.
+    pub fn external_footer(&self) -> Option<Result<&str, &str>> {
+        self.external_footer.as_ref().map(|value| {
+            value
+                .as_ref()
+                .map(|text| &**text)
+                .map_err(|reason| &**reason)
+        })
+    }
+
+    /// Mint the unsubscribe token for a normalized external recipient, or `None` when the
+    /// recipient-key secret or any token key is unavailable. The highest configured key id mints.
+    pub fn mint_unsubscribe_token(&self, normalized_recipient: &str) -> Option<String> {
+        let recipient_key = self.recipient_key_bytes(normalized_recipient)?;
+        let (&key_id, key) = self.token_keys.iter().next_back()?;
+        let mut body = Vec::with_capacity(2 + RECIPIENT_KEY_BYTES);
+        body.push(UNSUBSCRIBE_TOKEN_VERSION);
+        body.push(key_id);
+        body.extend_from_slice(&recipient_key);
+        let tag = hmac_sha256(key, &body);
+        let mut token = body;
+        token.extend_from_slice(&tag[..UNSUBSCRIBE_TAG_BYTES]);
+        Some(URL_SAFE_NO_PAD.encode(token))
+    }
+
+    /// Verify an unsubscribe token and return the recipient key text it identifies, or `None`
+    /// on any malformed input or tag mismatch. Retired key ids keep verifying.
+    pub fn verify_unsubscribe_token(&self, token: &str) -> Option<String> {
+        let decoded = URL_SAFE_NO_PAD.decode(token).ok()?;
+        if decoded.len() != UNSUBSCRIBE_TOKEN_BYTES {
+            return None;
+        }
+        if decoded[0] != UNSUBSCRIBE_TOKEN_VERSION {
+            return None;
+        }
+        let key_id = decoded[1];
+        let key = self.token_keys.get(&key_id)?;
+        let (body, tag) = decoded.split_at(decoded.len() - UNSUBSCRIBE_TAG_BYTES);
+        let expected = hmac_sha256(key, body);
+        if !constant_time_eq(&expected[..UNSUBSCRIBE_TAG_BYTES], tag) {
+            return None;
+        }
+        let recipient_key = &body[2..];
+        Some(hex_lower(recipient_key))
+    }
+
     /// Read only public policy inputs, without loading a connector or credentials.
+    ///
+    /// The unsubscribe key variables and the footer file are read only when external senders
+    /// are configured; while the senders variable is unset none of them is consulted.
     pub fn from_env() -> Result<Self, String> {
         fn read(name: &str) -> Result<Option<String>, String> {
             match std::env::var(name) {
@@ -44,12 +250,147 @@ impl OutboundEmailPolicy {
                 }
             }
         }
+        let external_senders = read("KHIVE_EMAIL_EXTERNAL_SENDERS")?;
+        let external_daily_cap = read("KHIVE_EMAIL_EXTERNAL_DAILY_CAP")?;
         let explicit = read("KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS")?;
         let maintainer = read("KHIVE_EMAIL_MAINTAINER_ADDRESS")?;
-        Self::resolve(explicit.as_deref(), maintainer.as_deref())
+        let (recipient_key_secret, token_keys) = if external_senders.is_some() {
+            (
+                read("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY")?,
+                read("KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS")?,
+            )
+        } else {
+            (None, None)
+        };
+        let footer_file = if external_senders.is_some() {
+            read("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE")?
+        } else {
+            None
+        };
+        Self::resolve_with_external(
+            explicit.as_deref(),
+            maintainer.as_deref(),
+            external_senders.as_deref(),
+            external_daily_cap.as_deref(),
+            recipient_key_secret.as_deref(),
+            token_keys.as_deref(),
+            footer_file.as_deref(),
+        )
     }
 
+    #[cfg(test)]
     fn resolve(explicit: Option<&str>, maintainer: Option<&str>) -> Result<Self, String> {
+        Self::resolve_with_external(explicit, maintainer, None, None, None, None, None)
+    }
+
+    /// Build a fully enabled policy for debug-build tests: recipients, the external sender
+    /// set, the daily cap, fixed test key material and a footer carrying `{unsubscribe}`.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn configured_for_tests(
+        recipients: Vec<String>,
+        external_senders: Vec<String>,
+        daily_cap: u64,
+    ) -> Result<Self, String> {
+        let token_keys = format!("0:{},1:{}", "11".repeat(32), "22".repeat(32));
+        Self::configured_for_tests_with(
+            recipients,
+            external_senders,
+            daily_cap,
+            &"cc".repeat(32),
+            &token_keys,
+            Ok("Reply to unsubscribe: {unsubscribe}"),
+        )
+    }
+
+    /// Build an enabled policy with explicit key material and footer state for tests that need
+    /// to exercise configuration or footer unavailability.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn configured_for_tests_with(
+        recipients: Vec<String>,
+        external_senders: Vec<String>,
+        daily_cap: u64,
+        recipient_key_secret_hex: &str,
+        token_keys: &str,
+        footer: Result<&str, &str>,
+    ) -> Result<Self, String> {
+        if daily_cap == 0 {
+            return Err("KHIVE_EMAIL_EXTERNAL_DAILY_CAP must be a positive integer".into());
+        }
+        let external_senders = parse_external_senders(&external_senders.join(","))?;
+        if external_senders.is_empty() {
+            return Err("KHIVE_EMAIL_EXTERNAL_SENDERS must contain at least one actor id".into());
+        }
+        let mut policy = Self::configured(recipients)?;
+        policy.external_senders = Some(external_senders.into());
+        policy.external_daily_cap = Some(daily_cap);
+        let secret = parse_hex_key("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY", recipient_key_secret_hex)?;
+        policy.recipient_key_secret = Some(Arc::from(secret.as_slice()));
+        policy.token_keys = Arc::new(parse_token_keys(token_keys)?);
+        policy.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
+        Ok(policy)
+    }
+
+    /// Replace the footer state on a test policy (available/unavailable) without touching keys.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn with_external_footer_for_tests(mut self, footer: Result<&str, &str>) -> Self {
+        self.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_external(
+        explicit: Option<&str>,
+        maintainer: Option<&str>,
+        external_senders: Option<&str>,
+        external_daily_cap: Option<&str>,
+        recipient_key_secret: Option<&str>,
+        token_keys: Option<&str>,
+        footer_file: Option<&str>,
+    ) -> Result<Self, String> {
+        let senders = external_senders.map(parse_external_senders).transpose()?;
+        let cap = match external_daily_cap {
+            Some(value) => {
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    "KHIVE_EMAIL_EXTERNAL_DAILY_CAP must be a positive integer".to_string()
+                })?;
+                if parsed == 0 {
+                    return Err("KHIVE_EMAIL_EXTERNAL_DAILY_CAP must be a positive integer".into());
+                }
+                Some(parsed)
+            }
+            None if senders.is_some() => {
+                return Err("KHIVE_EMAIL_EXTERNAL_DAILY_CAP is required when KHIVE_EMAIL_EXTERNAL_SENDERS is set".into());
+            }
+            None => None,
+        };
+        let mut policy = Self::resolve_recipients(explicit, maintainer)?;
+        policy.external_daily_cap = cap;
+        if let Some(senders) = senders {
+            policy.external_senders = Some(senders.into());
+            let recipient_key_secret = parse_hex_key(
+                "KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY",
+                recipient_key_secret.ok_or_else(|| {
+                    "KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY is required when KHIVE_EMAIL_EXTERNAL_SENDERS is set".to_string()
+                })?,
+            )?;
+            let token_keys = parse_token_keys(token_keys.ok_or_else(|| {
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS is required when KHIVE_EMAIL_EXTERNAL_SENDERS is set".to_string()
+            })?)?;
+            policy.recipient_key_secret = Some(Arc::from(recipient_key_secret.as_slice()));
+            policy.token_keys = Arc::new(token_keys);
+            policy.external_footer = Some(read_external_footer(footer_file));
+        }
+        Ok(policy)
+    }
+
+    fn resolve_recipients(
+        explicit: Option<&str>,
+        maintainer: Option<&str>,
+    ) -> Result<Self, String> {
         if let Some(policy) = Self::explicit(explicit)? {
             // A present maintainer value is read the way the email connector reads it at
             // start, so a value the connector would refuse is refused here too, even
@@ -109,6 +450,120 @@ impl OutboundEmailPolicy {
         };
         Ok(primary)
     }
+}
+
+fn parse_external_senders(raw: &str) -> Result<Vec<String>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .map(|actor_id| {
+            if actor_id.is_empty() {
+                return Err("KHIVE_EMAIL_EXTERNAL_SENDERS contains an empty actor id".to_string());
+            }
+            khive_types::Namespace::parse(actor_id).map_err(|_| {
+                format!("KHIVE_EMAIL_EXTERNAL_SENDERS contains an invalid actor id {actor_id:?}")
+            })?;
+            Ok(actor_id.to_string())
+        })
+        .collect()
+}
+
+/// Decode a hex key for `name`, requiring at least [`MIN_KEY_BYTES`] bytes. The value is never
+/// echoed in the error.
+fn parse_hex_key(name: &str, raw: &str) -> Result<Vec<u8>, String> {
+    let value = raw.trim().to_ascii_lowercase();
+    if !value.len().is_multiple_of(2) || !khive_types::is_lowercase_hex(&value) {
+        return Err(format!(
+            "{name} must be hex-encoded key material of at least {MIN_KEY_BYTES} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .expect("validated lowercase hex");
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .expect("validated lowercase hex");
+        bytes.push((high * 16 + low) as u8);
+    }
+    if bytes.len() < MIN_KEY_BYTES {
+        return Err(format!(
+            "{name} must be hex-encoded key material of at least {MIN_KEY_BYTES} bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Parse `KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS`: comma-separated `id:key` pairs, `id` a decimal
+/// integer 0-255, no duplicate ids, key material hex of at least [`MIN_KEY_BYTES`] bytes.
+fn parse_token_keys(raw: &str) -> Result<BTreeMap<u8, Arc<[u8]>>, String> {
+    const NAME: &str = "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS";
+    let mut keys = BTreeMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            return Err(format!("{NAME} contains an empty `id:key` pair"));
+        }
+        let Some((id_text, key_text)) = pair.split_once(':') else {
+            return Err(format!("{NAME} entries must be `id:key` pairs"));
+        };
+        let id = id_text
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|id| *id <= u8::MAX as u16)
+            .ok_or_else(|| format!("{NAME} key ids must be decimal integers 0-255"))?
+            as u8;
+        if keys.contains_key(&id) {
+            return Err(format!("{NAME} contains a duplicate key id"));
+        }
+        let key = parse_hex_key(NAME, key_text)?;
+        keys.insert(id, Arc::from(key.as_slice()));
+    }
+    if keys.is_empty() {
+        return Err(format!("{NAME} must contain at least one `id:key` pair"));
+    }
+    Ok(keys)
+}
+
+/// Read the operator's external footer once at start-up. A missing, unreadable or
+/// placeholder-less footer is not a start-up error; it is recorded as an unavailability reason
+/// that refuses external admission.
+fn read_external_footer(path: Option<&str>) -> Result<Arc<str>, Arc<str>> {
+    let Some(path) = path else {
+        return Err(Arc::from("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"));
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|_| Arc::from("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read"))?;
+    if !text.contains(UNSUBSCRIBE_PLACEHOLDER) {
+        return Err(Arc::from(
+            "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE does not contain {unsubscribe}",
+        ));
+    }
+    Ok(Arc::from(text))
+}
+
+/// Lowercase hex of a byte slice (no `hex` crate dependency).
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Constant-time comparison over two equal-length byte slices (XOR-fold, no early return).
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -232,6 +687,71 @@ mod tests {
     }
 
     #[test]
+    fn suppression_matching_checks_exact_address_domain_and_recipient_key() {
+        let address = [EmailSuppression {
+            scope: EmailSuppressionScope::Outbound,
+            kind: EmailSuppressionKind::Address,
+            value: "a@example.com".into(),
+        }];
+        assert!(outbound_email_is_suppressed(
+            "a@example.com",
+            None,
+            &address
+        ));
+        assert!(!outbound_email_is_suppressed(
+            "b@example.com",
+            None,
+            &address
+        ));
+
+        let entries = [
+            EmailSuppression {
+                scope: EmailSuppressionScope::Outbound,
+                kind: EmailSuppressionKind::Address,
+                value: "a@example.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Outbound,
+                kind: EmailSuppressionKind::Domain,
+                value: "x.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Outbound,
+                kind: EmailSuppressionKind::RecipientKey,
+                value: "key-1".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::Address,
+                value: "b@example.com".into(),
+            },
+        ];
+
+        assert!(outbound_email_is_suppressed(
+            "a@example.com",
+            None,
+            &entries
+        ));
+        assert!(outbound_email_is_suppressed("b@x.com", None, &entries));
+        assert!(!outbound_email_is_suppressed("b@sub.x.com", None, &entries));
+        assert!(outbound_email_is_suppressed(
+            "c@example.com",
+            Some("key-1"),
+            &entries
+        ));
+        assert!(!outbound_email_is_suppressed(
+            "c@example.com",
+            Some("key-2"),
+            &entries
+        ));
+        assert!(!outbound_email_is_suppressed(
+            "b@example.com",
+            None,
+            &entries
+        ));
+    }
+
+    #[test]
     fn cloned_policy_keeps_the_same_immutable_recipient_set() {
         let policy = OutboundEmailPolicy::configured(vec!["allowed@example.com".into()]).unwrap();
         let clone = policy.clone();
@@ -239,5 +759,296 @@ mod tests {
             policy.recipients.as_ref().unwrap(),
             clone.recipients.as_ref().unwrap()
         ));
+    }
+
+    fn rk() -> String {
+        "cc".repeat(32) // 32 bytes of 0xcc
+    }
+
+    fn token_keys_hex() -> String {
+        format!("0:{},1:{}", "11".repeat(32), "22".repeat(32))
+    }
+
+    fn enabled() -> OutboundEmailPolicy {
+        OutboundEmailPolicy::configured_for_tests_with(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+            &rk(),
+            &token_keys_hex(),
+            Ok("Reply to unsubscribe: {unsubscribe}"),
+        )
+        .unwrap()
+    }
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap();
+                let low = (pair[1] as char).to_digit(16).unwrap();
+                (high * 16 + low) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_vectors() {
+        let case1 = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hex_lower(&case1),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        let case2 = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex_lower(&case2),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let case6 = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex_lower(&case6),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn key_configuration_refuses_malformed_values_when_senders_are_set() {
+        // Missing recipient-key secret.
+        let missing_rk = OutboundEmailPolicy::resolve_with_external(
+            None,
+            Some("maintainer@example.com"),
+            Some("actor:sender"),
+            Some("5"),
+            None,
+            Some(&token_keys_hex()),
+            None,
+        )
+        .err()
+        .expect("start-up policy is refused");
+        assert!(
+            missing_rk.contains("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY"),
+            "{missing_rk}"
+        );
+
+        // Missing token keys.
+        let missing_tokens = OutboundEmailPolicy::resolve_with_external(
+            None,
+            Some("maintainer@example.com"),
+            Some("actor:sender"),
+            Some("5"),
+            Some(&rk()),
+            None,
+            None,
+        )
+        .err()
+        .expect("start-up policy is refused");
+        assert!(
+            missing_tokens.contains("KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS"),
+            "{missing_tokens}"
+        );
+
+        for (rk, tokens, needle) in [
+            (
+                rk(),
+                "0:nothex".to_string(),
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+            ),
+            (rk(), "0".to_string(), "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS"),
+            (
+                rk(),
+                "0:abcd".to_string(),
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+            ),
+            (
+                rk(),
+                format!("0:{},0:{}", "11".repeat(32), "22".repeat(32)),
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+            ),
+            (
+                rk(),
+                format!("256:{}", "11".repeat(32)),
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+            ),
+        ] {
+            let error = OutboundEmailPolicy::resolve_with_external(
+                None,
+                Some("maintainer@example.com"),
+                Some("actor:sender"),
+                Some("5"),
+                Some(rk.as_str()),
+                Some(tokens.as_str()),
+                None,
+            )
+            .err()
+            .expect("start-up policy is refused");
+            assert!(error.contains(needle), "{error}");
+            assert!(
+                !error.contains(&"11".repeat(32)),
+                "key material leaked: {error}"
+            );
+        }
+
+        // Short recipient-key secret (31 bytes) and non-hex secret.
+        for rk in ["cc".repeat(31), "cc".repeat(16), "zz".repeat(32)] {
+            let error = OutboundEmailPolicy::resolve_with_external(
+                None,
+                Some("maintainer@example.com"),
+                Some("actor:sender"),
+                Some("5"),
+                Some(&rk),
+                Some(&token_keys_hex()),
+                None,
+            )
+            .err()
+            .expect("start-up policy is refused");
+            assert!(error.contains("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY"), "{error}");
+            assert!(!error.contains(&rk), "key material leaked: {error}");
+        }
+    }
+
+    #[test]
+    fn key_variables_are_ignored_when_senders_are_unset() {
+        // A malformed key value is never read while the senders variable is unset.
+        let policy = OutboundEmailPolicy::resolve_with_external(
+            None,
+            Some("maintainer@example.com"),
+            None,
+            None,
+            Some("not hex"),
+            Some("garbage"),
+            Some("/nonexistent/footer"),
+        )
+        .unwrap();
+        assert!(!policy.has_external_senders());
+        assert!(policy.recipient_key("a@example.com").is_none());
+        assert!(policy.mint_unsubscribe_token("a@example.com").is_none());
+        assert!(policy.external_footer().is_none());
+    }
+
+    #[test]
+    fn recipient_key_is_normalized_hex_and_stable_across_case() {
+        let policy = enabled();
+        let key = policy.recipient_key("person@example.com").unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(khive_types::is_lowercase_hex(&key));
+        // Callers pass a normalized address (ADR-200 §5.1); normalization folds ASCII case.
+        let other_case =
+            khive_types::email_address::normalize_email_recipient("Person@Example.COM").unwrap();
+        assert_eq!(key, policy.recipient_key(&other_case).unwrap());
+        let secret = unhex(&rk());
+        assert_eq!(key, hex_lower(&hmac_sha256(&secret, b"person@example.com")));
+    }
+
+    #[test]
+    fn token_round_trips_and_rejects_tampering() {
+        let policy = enabled();
+        let token = policy.mint_unsubscribe_token("person@example.com").unwrap();
+        let recipient_key = policy.recipient_key("person@example.com").unwrap();
+        assert_eq!(
+            policy.verify_unsubscribe_token(&token).as_deref(),
+            Some(recipient_key.as_str())
+        );
+
+        // A flipped tag byte fails.
+        let mut bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        assert!(policy
+            .verify_unsubscribe_token(&URL_SAFE_NO_PAD.encode(&bytes))
+            .is_none());
+
+        // A wrong version byte fails.
+        let mut bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        bytes[0] = 0x02;
+        assert!(policy
+            .verify_unsubscribe_token(&URL_SAFE_NO_PAD.encode(&bytes))
+            .is_none());
+
+        // An unknown key id fails.
+        let mut bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        bytes[1] = 9;
+        assert!(policy
+            .verify_unsubscribe_token(&URL_SAFE_NO_PAD.encode(&bytes))
+            .is_none());
+
+        // A truncated token fails.
+        assert!(policy.verify_unsubscribe_token("AAAA").is_none());
+    }
+
+    #[test]
+    fn retired_key_ids_keep_verifying_and_the_highest_id_mints() {
+        let policy = enabled();
+        // A token minted under the higher id (1) verifies.
+        let token_high = policy.mint_unsubscribe_token("person@example.com").unwrap();
+        let decoded = URL_SAFE_NO_PAD.decode(&token_high).unwrap();
+        assert_eq!(decoded[1], 1, "minting must use the highest configured id");
+        assert!(policy.verify_unsubscribe_token(&token_high).is_some());
+
+        // Rebuild with a retired id 0 kept alongside the higher id 1.
+        let retired = OutboundEmailPolicy::configured_for_tests_with(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+            &rk(),
+            &token_keys_hex(),
+            Ok("footer {unsubscribe}"),
+        )
+        .unwrap();
+        // A token that was minted under id 0 before rotation still verifies after id 1 exists.
+        let mut body = Vec::new();
+        body.push(0x01u8);
+        body.push(0u8);
+        body.extend_from_slice(&unhex(
+            &retired.recipient_key("person@example.com").unwrap(),
+        ));
+        let tag = hmac_sha256(&unhex(&"11".repeat(32)), &body);
+        body.extend_from_slice(&tag[..16]);
+        let old_token = URL_SAFE_NO_PAD.encode(&body);
+        assert_eq!(
+            retired.verify_unsubscribe_token(&old_token).as_deref(),
+            Some(
+                retired
+                    .recipient_key("person@example.com")
+                    .unwrap()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn footer_state_is_recorded_without_a_start_up_error() {
+        let policy = OutboundEmailPolicy::configured_for_tests_with(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+            &rk(),
+            &token_keys_hex(),
+            Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.external_footer(),
+            Some(Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"))
+        );
+    }
+
+    #[test]
+    fn footer_file_must_exist_be_readable_and_carry_the_placeholder() {
+        let missing = read_external_footer(Some("/nonexistent/khive-footer"));
+        assert!(missing.is_err());
+        let dir = std::env::temp_dir();
+        let without = dir.join("khive-footer-without-placeholder.txt");
+        std::fs::write(&without, "no placeholder here").unwrap();
+        assert!(read_external_footer(without.to_str()).is_err());
+        let with = dir.join("khive-footer-with-placeholder.txt");
+        std::fs::write(&with, "Contact us.\n{unsubscribe}\n").unwrap();
+        assert_eq!(
+            read_external_footer(with.to_str()).unwrap().as_ref(),
+            "Contact us.\n{unsubscribe}\n"
+        );
+        assert!(read_external_footer(None).is_err());
     }
 }

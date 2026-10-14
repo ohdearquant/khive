@@ -8,7 +8,8 @@ Accepted and unchanged.
 
 ## Response and endpoint metadata
 
-Every successful response includes `anchors`, `edges`, `truncated`, and `dropped`.
+Every successful response includes `anchors`, `edges`, `anchor_edges`, `truncated`, and
+`dropped`. `anchor_edges` is always an array, including when no edges connect selected anchors.
 `edges` is an array, including for zero-hop, isolated-anchor, empty-search, and wholly
 budget-cut results. `dropped.edges` is always present and equals `dropped.neighbors`;
 `dropped.stage` remains `"budget"`.
@@ -25,6 +26,22 @@ Selected symmetric hits use `"both"` and deterministic parent → neighbor endpo
 which carries no stored assertion direction. Endpoint names come from the existing scoped
 metadata maps. An unnamed note or message has a JSON `null` name on either side; content,
 subject, UUID, and empty strings are not substitutes.
+
+`anchor_edges` contains one entry per stored edge found by the hop-1 walk whose two endpoints
+are selected anchors. Each entry has exactly `source_id`, `source_name`, `target_id`,
+`target_name`, `relation`, and `weight`. It deduplicates by the stored edge ID, even when both
+anchors' walks find the same edge. It reuses the endpoint orientation above: incoming hits put
+the neighbor before the anchor, while outgoing hits and symmetric `"both"` hits put the anchor
+first. These entries come from the same filtered hop-1 results as neighbor expansion, so the
+relation, direction, namespace, and mailbox permission filters are unchanged. Anchor-to-anchor
+hits remain excluded from neighbor lists and hop-2 parents, and their edges appear only here.
+Edges from a hop-1 neighbor to an anchor are not included.
+
+`anchor_edges` does not count against the response `budget`; it is bounded by the hop-1 fan-out
+of selected anchors: at most `selected_anchor_count × fanout × visible_namespace_count` hits.
+It does not change the nested `neighbors` arrays, the top-level `edges` array, or the budget-cut
+`dropped.edges` count. Because it sits outside the budget, an entry can name an anchor that the
+budget walk dropped from `anchors`.
 
 If either endpoint lacks scoped metadata at assembly time, omit the whole pair before
 budget accounting. Preserve the visited decision: no rediscovery, metadata refetch, extra

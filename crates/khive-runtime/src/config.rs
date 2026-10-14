@@ -492,11 +492,15 @@ const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
 /// unset, non-Unicode, malformed and out-of-range values use `0.20`.
 /// This reader deliberately does not trim or cache the value.
 pub fn ann_rebuild_threshold_from_env() -> f64 {
-    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v <= 1.0)
-        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
+    let value = khive_types::env::env_parse_or(
+        "KHIVE_ANN_REBUILD_THRESHOLD",
+        ANN_REBUILD_THRESHOLD_DEFAULT,
+    );
+    if value > 0.0 && value <= 1.0 {
+        value
+    } else {
+        ANN_REBUILD_THRESHOLD_DEFAULT
+    }
 }
 
 #[cfg(test)]
@@ -538,10 +542,10 @@ impl Default for RuntimeConfig {
         let db_path = std::env::var("HOME")
             .ok()
             .map(|h| std::path::PathBuf::from(h).join(".khive/khive.db"));
-        let embedding_model = std::env::var("KHIVE_EMBEDDING_MODEL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        let embedding_model = Some(khive_types::env::env_parse_or(
+            "KHIVE_EMBEDDING_MODEL",
+            EmbeddingModel::AllMiniLmL6V2,
+        ));
         // Ships single-engine. A second engine is embedded on every write and
         // searched on every read, which is cost a deployment should opt into
         // rather than inherit: set KHIVE_ADDITIONAL_EMBEDDING_MODELS to add one.
@@ -1407,6 +1411,52 @@ mod resolve_project_actor_id_tests {
 mod no_embeddings_tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn default_embedding_model_environment_keeps_typed_fallbacks() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        const PRIMARY: &str = "KHIVE_EMBEDDING_MODEL";
+        const ADDITIONAL: &str = "KHIVE_ADDITIONAL_EMBEDDING_MODELS";
+        assert_eq!(
+            RuntimeConfig::default().embedding_model,
+            Some(EmbeddingModel::AllMiniLmL6V2)
+        );
+        std::env::set_var(ADDITIONAL, "paraphrase-multilingual-minilm-l12-v2");
+        for (value, expected) in [
+            ("invalid", EmbeddingModel::AllMiniLmL6V2),
+            ("", EmbeddingModel::AllMiniLmL6V2),
+            ("bge-small-en-v1.5", EmbeddingModel::BgeSmallEnV15),
+            (" BAAI/BGE_SMALL_EN_V1.5 ", EmbeddingModel::BgeSmallEnV15),
+            ("all-minilm", EmbeddingModel::AllMiniLmL6V2),
+        ] {
+            std::env::set_var(PRIMARY, value);
+            let config = RuntimeConfig::default();
+            assert_eq!(config.embedding_model, Some(expected), "{value:?}");
+            assert_eq!(
+                config.additional_embedding_models,
+                vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::env::set_var(PRIMARY, std::ffi::OsStr::from_bytes(b"\xff"));
+            assert_eq!(
+                RuntimeConfig::default().embedding_model,
+                Some(EmbeddingModel::AllMiniLmL6V2)
+            );
+        }
+        std::env::remove_var(PRIMARY);
+        let config = RuntimeConfig::default();
+        assert_eq!(config.embedding_model, Some(EmbeddingModel::AllMiniLmL6V2));
+        assert_eq!(
+            config.additional_embedding_models,
+            vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
+        );
+        std::env::remove_var(ADDITIONAL);
+    }
 
     #[test]
     fn no_embeddings_clears_both_fields() {

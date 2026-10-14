@@ -63,6 +63,9 @@ use crate::pack::RequestIdentity;
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
+// Unix-only: gated inside the file, because the error-constructor census
+// admits only attribute-free submodule declarations.
+mod exit_record;
 mod lifecycle;
 #[cfg(unix)]
 use lifecycle::khive_dir;
@@ -78,7 +81,10 @@ pub use lifecycle::{
     DaemonOptions, DaemonShutdownReason, DaemonStartupReport, DEFAULT_DEMAND_IDLE_SECS,
 };
 #[cfg(unix)]
-pub use lifecycle::{pid_path, recoverer_lock_path, socket_path, SUPERVISOR_CLAIM_ENV};
+pub use lifecycle::{
+    pid_path, recoverer_lock_path, rendezvous_split, socket_path, RendezvousSplit,
+    SUPERVISOR_CLAIM_ENV,
+};
 
 mod load_limits;
 #[cfg(unix)]
@@ -216,6 +222,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         )
         .await
         .map_err(|message| DaemonDispatchError::new(message, None))
+    }
+
+    /// The startup gate for the events daemon this daemon supervises, if any
+    /// ([`crate::events_split::EventsReadiness`]). A request that dispatches
+    /// verbs waits at it before dispatch and is refused, with nothing
+    /// committed, when it does not open; probe, plan, metrics and handover
+    /// frames never wait. `None`, the default, dispatches without waiting.
+    fn events_readiness(&self) -> Option<crate::events_split::EventsReadiness> {
+        None
     }
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
@@ -1077,6 +1092,49 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                 return;
             }
         }
+        // A supervised events daemon that has not answered yet would fail
+        // this request's audit commit after its domain write committed, so
+        // the request waits for it here, before anything runs, and is
+        // refused with nothing committed when it does not answer in time.
+        if let Some(readiness) = dispatcher.events_readiness() {
+            let not_ready = tokio::select! {
+                outcome = readiness.wait() => outcome.err(),
+                _ = wait_for_peer_disconnect(&mut peer_read) => return,
+            };
+            if let Some(not_ready) = not_ready {
+                let message = not_ready.to_string();
+                tracing::warn!(
+                    socket = %not_ready.socket.display(),
+                    reason = ?not_ready.reason,
+                    request_id = frame.request_id,
+                    "request refused: the supervised events daemon is not answering"
+                );
+                let refusal = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(message.clone()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "runtime",
+                        "code": "events_daemon_unavailable",
+                        "message": message,
+                        "retryable": true,
+                        "socket": not_ready.socket.display().to_string(),
+                        "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                    })),
+                    request_id: frame.request_id,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(dispatcher.config_id().to_owned()),
+                    version_mismatch: false,
+                    metrics: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&refusal) {
+                    let _ = write_response_frame(&mut peer_write, &payload).await;
+                }
+                return;
+            }
+        }
         // Build the per-request identity context from the frame so the
         // implementor mints the storage/gate token from the CALLER's
         // identity, not the dispatcher's own construction-baked scalars.
@@ -1811,6 +1869,13 @@ where
         Incumbent::Stale => {}
     }
 
+    // Register the sender recorder before the shutdown streams below. The
+    // signal registry runs a signal's actions in registration order, so the
+    // recorder stores the sender before tokio's action wakes the shutdown
+    // path; registered after it, the exit record can say sender_pid=unknown.
+    if let Err(error) = exit_record::capture_signal_senders() {
+        tracing::warn!(target: "khive.boot", error = %error, "signal sender capture unavailable; the exit record will say sender_pid=unknown");
+    }
     // Install signal streams before publishing either rendezvous file. A
     // supervisor may stop us as soon as connect/pid checks succeed, before
     // the accept loop or shutdown future has been polled. Keep these streams
@@ -1843,10 +1908,13 @@ where
         }
         Err(e) => return Err(e.into()),
     };
+    // After the claim, never before: only the PID file's owner writes the record.
+    let exit_record = exit_record::ExitRecord::claim(&pid_file);
 
     let listener = match UnixListener::bind(&sock) {
         Ok(listener) => listener,
         Err(e) => {
+            exit_record.exiting(exit_record::ExitReason::Error);
             remove_pid_file_if_owned(&pid_file, &pid_file_guard);
             return Err(e.into());
         }
@@ -1857,6 +1925,7 @@ where
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         drop(listener);
         let _ = std::fs::remove_file(&sock);
+        exit_record.exiting(exit_record::ExitReason::Error);
         remove_pid_file_if_owned(&pid_file, &pid_file_guard);
         return Err(anyhow::anyhow!(
             "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
@@ -1933,10 +2002,11 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
-            _ = sigint.recv() => tracing::info!("received SIGINT"),
-        }
+        let signal = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        tracing::info!("received {signal}");
         // Tokio retains its process-wide handlers after the streams are dropped.
         // This daemon cannot restart without exec; a repeat signal must terminate
         // even if shutdown is blocked in synchronous recovery-lock acquisition.
@@ -1947,7 +2017,7 @@ where
                 return Err(std::io::Error::last_os_error());
             }
         }
-        Ok::<(), std::io::Error>(())
+        Ok::<&'static str, std::io::Error>(signal)
     };
     tokio::pin!(shutdown);
     lifecycle.ready();
@@ -2061,8 +2131,14 @@ where
                 }
             }
         } => DaemonShutdownReason::Signal,
-        result = &mut shutdown => { result?; DaemonShutdownReason::Signal },
-        _ = wait_for_idle(&dispatcher, &lifecycle) => DaemonShutdownReason::Idle,
+        result = &mut shutdown => {
+            exit_record.exiting(exit_record::ExitReason::Signal(result?));
+            DaemonShutdownReason::Signal
+        },
+        _ = wait_for_idle(&dispatcher, &lifecycle) => {
+            exit_record.exiting(exit_record::ExitReason::Idle);
+            DaemonShutdownReason::Idle
+        },
     };
 
     lifecycle.draining(reason);
@@ -2091,7 +2167,7 @@ where
         tokio::select! {
             _ = drain_for_idle(&active, drain_timeout()) => true,
             result = &mut shutdown => {
-                result?;
+                exit_record.exiting(exit_record::ExitReason::Signal(result?));
                 lifecycle.draining(DaemonShutdownReason::Signal);
                 let _ = request_shutdown_tx.send(true);
                 drain(&active).await

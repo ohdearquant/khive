@@ -492,6 +492,10 @@ impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for B
         self.0.entity_types()
     }
 
+    fn note_property_policies(&self) -> &'static [khive_types::NotePropertyPolicySpec] {
+        self.0.note_property_policies()
+    }
+
     fn note_embedding_policies(&self) -> &'static [khive_types::NoteEmbeddingPolicySpec] {
         self.0.note_embedding_policies()
     }

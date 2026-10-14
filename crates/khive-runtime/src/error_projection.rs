@@ -308,7 +308,7 @@ impl SqliteCapacityFailure {
                 "code": "sqlite_capacity_unavailable",
                 "stage": "sqlite_capacity_unavailable",
                 "message": message,
-                "retryable": false,
+                "retryable": phase == khive_storage::CapacityUnavailablePhase::LockContended,
                 "capability": "sql",
                 "phase": phase.as_str(),
             }),
@@ -457,11 +457,22 @@ mod tests {
 
     #[test]
     fn capacity_phase_projection_preserves_writer_request_settlement() {
-        for phase in [
-            CapacityUnavailablePhase::Identity,
-            CapacityUnavailablePhase::Lock,
-            CapacityUnavailablePhase::Probe,
+        for (phase, retryable) in [
+            (CapacityUnavailablePhase::Identity, false),
+            (CapacityUnavailablePhase::Lock, false),
+            (CapacityUnavailablePhase::LockContended, true),
+            (CapacityUnavailablePhase::Probe, false),
         ] {
+            let direct = runtime_error_value(
+                RuntimeError::Storage(StorageError::CapacityUnavailable {
+                    capability: StorageCapability::Sql,
+                    phase,
+                    message: "unavailable".into(),
+                }),
+                DomainDisposition::Unknown,
+            );
+            assert_eq!(direct["phase"], phase.as_str());
+            assert_eq!(direct["retryable"], retryable);
             let value = runtime_error_value(
                 RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
                     request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
@@ -477,7 +488,7 @@ mod tests {
             assert_eq!(value["phase"], phase.as_str());
             assert_eq!(value["request_state"], "transaction_rolled_back");
             assert_eq!(value["task_terminated"], false);
-            assert_eq!(value["retryable"], false);
+            assert_eq!(value["retryable"], retryable);
         }
     }
 
@@ -503,7 +514,7 @@ mod tests {
             RuntimeError::Storage(StorageError::CapacityUnavailable {
                 capability: StorageCapability::Sql,
                 phase: CapacityUnavailablePhase::Lock,
-                message: "bounded lease timed out".to_string(),
+                message: "lock directory missing".to_string(),
             }),
             DomainDisposition::Unknown,
         );

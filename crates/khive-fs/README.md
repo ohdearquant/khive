@@ -42,12 +42,18 @@ callback, then syncs and closes that file. `publish_atomic_at` additionally rena
 file over its destination and syncs the directory. Use the staged operation when a multi-file
 checkpoint has separate metadata and segment publication boundaries.
 
-Both use mode 0644 filtered by umask, no-follow and close-on-exec. `StaleTmp::Refuse` replaces a
-stale regular file but refuses nonregular entries, including symlinks. `StaleTmp::Unlink` removes
-the stale file or symlink entry without following it; directories refuse. Both names are checked
-before publication has any filesystem effect: empty, slash-containing, NUL-containing and dot
-names refuse, as do equal staging and destination names. Backslash is an ordinary Unix name;
-callers can impose stricter naming policy.
+Passing a `StaleTmp` retains mode 0644 filtered by umask; `AtomicPublishOptions`
+selects a creation mode explicitly. Both operations use no-follow and close-on-exec.
+`StaleTmp::Refuse` replaces a stale regular file but refuses nonregular entries, including
+symlinks. `StaleTmp::Unlink` removes a stale file or symlink without following it; directories
+refuse. `StaleTmp::RefuseExisting` instead refuses every existing entry through exclusive
+creation, without inspecting or unlinking an incumbent. This additive enum variant must be
+handled by exhaustive downstream matches. Existing policies retain their behavior.
+
+Names accept `AsRef<OsStr>` without lossy UTF-8 conversion, including `open_file_at`.
+Both names are checked before publication has any filesystem effect: empty, slash-containing,
+NUL-containing and dot names refuse, as do equal staging and destination names. Backslash is an
+ordinary Unix name; callers can impose stricter naming policy.
 
 The `_detailed` variants retain the failing phase and original `io::Error`; the convenience
 functions return that original error directly, preserving native errno. No error automatically
@@ -121,3 +127,38 @@ before the open:
 - `open_regular_file_within`: opens a path read-only and returns the file only if it is a regular
   file whose resolved path is inside a canonical root. A refusal is a `ContainedOpenError`
   variant, and the variants that come from a failing call carry its raw `std::io::Error`.
+
+## `tree_discovery`
+
+`walk_tree_reported(root, ReportedWalkLimits, accept_file)` discovers regular files in breadth-first
+order and returns a sorted `WalkReport`. The filter receives relative regular-file paths; links
+are skipped and directories are always traversed. Hidden names, extensions and non-UTF-8 names
+remain caller policy. An empty root, a final root symlink or a non-directory root refuses.
+
+The root is depth zero and is excluded from progress. Every directory's raw names count toward
+`max_entries` before any of its entries are classified or filtered. Rejected files and special
+entries increment `files_skipped`; links increment both `links_skipped` and `files_skipped`.
+Accepted files increment `files_discovered` before the `max_files` check. Child directory depth is
+checked before opening or enqueueing. Zero limits permit zero entries or selected files, and
+depth zero permits root files but refuses child directories. Counters use saturating arithmetic.
+
+`WalkFailure` carries the relative path, depth, progress and either an I/O error or a
+typed limit/identity refusal. An incomplete directory listing invokes no filter callbacks and
+retains the count already observed. Entry overflow reports the first excess native name without
+sorting or rescanning it. Failure returns no partial file collection. Successful files are sorted
+by relative path; concurrent mutation can still change what a walk observes.
+
+Each `WalkFile` exposes its relative path and `open_read()`. On Unix it retains the exact parent
+directory and leaf name. Descendant directories are opened without following links, checked
+against their observed identity and pinned when enqueued. Reads continue through the held parent
+after a rename and refuse a final leaf symlink. A replacement regular leaf is allowed; neither
+leaf identity nor content is frozen, and the held parent need not retain its original pathname.
+The open is nonblocking so a replaced FIFO cannot block admission. Callers must inspect the
+returned handle and reject nonregular files before reading, then enforce their own byte limits.
+
+Parent pinning can surface directory-open errors earlier than a pathname walk that opens only
+when dequeuing. Handles remain live for queued directories and selected-file parents; descriptor
+exhaustion remains a native error. On non-Unix, discovery retains the same counts and ordering
+through ordinary directory entries, while `open_read()` opens the saved path. Link observation is
+best effort on those platforms; it provides neither parent pinning nor open-time link refusal.
+The existing Unix `tree_walk` API and its configurable link policy are unchanged.

@@ -2,6 +2,10 @@ include!("daemon/plan_tests.rs");
 mod shutdown_signals {
     include!("daemon/shutdown_signal_tests.rs");
 }
+#[cfg(unix)]
+mod exit_records {
+    include!("daemon/exit_record_tests.rs");
+}
 #[path = "daemon/tests/connection_limit_tests.rs"]
 mod connection_limit_tests;
 use super::*;
@@ -1096,11 +1100,11 @@ async fn track_background_task_count_returns_to_baseline_after_panic() {
 
 // ── active background phase names (ADR-103) ──────────────────────────
 
-// `#[serial(active_phases)]`: these tests read/assert on the process-wide
-// `ACTIVE_PHASES` static. No other test in this crate touches it today,
-// but the group mirrors the `background_tasks` precedent above so a
-// future addition does not silently reintroduce the same interleaving
-// hazard that motivated it there.
+// `#[serial(active_phases)]`: these tests write the process-wide
+// `ACTIVE_PHASES` static. The demand-retirement tests below read it through
+// `idle_retirement_blockers`, where any registered phase is an idle blocker,
+// so the demand-retirement tests that call it also take `active_phases`.
+// A phase held here while one of them expects retirement turns it red.
 #[test]
 #[serial(active_phases)]
 fn register_active_phase_appears_and_disappears_with_the_guard() {
@@ -1346,8 +1350,67 @@ mod demand_retirement_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    fn pool_has_open_transaction(pool: &ConnectionPool) -> bool {
+        let khive_storage::tx_registry::TxOrigin::Database(identity) = pool.origin() else {
+            panic!("the transaction-registry fixture must be file-backed");
+        };
+        khive_storage::tx_registry::oldest_for(
+            &khive_storage::tx_registry::TxOriginFilter::Secondary(identity),
+        )
+        .is_some()
+    }
+
+    #[test]
     #[serial(background_tasks, tx_registry)]
+    fn pool_transaction_probe_detects_own_and_ignores_foreign_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("own.db")),
+            write_queue_enabled: Some(false),
+            write_routing_strict: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let foreign = ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("foreign.db")),
+            write_queue_enabled: Some(false),
+            write_routing_strict: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(own.origin(), foreign.origin());
+
+        let own_writer = own.writer().unwrap();
+        own_writer
+            .transaction(|_| {
+                assert!(
+                    pool_has_open_transaction(&own),
+                    "the probe must detect a live transaction on its own database"
+                );
+                assert!(!pool_has_open_transaction(&foreign));
+                Ok(())
+            })
+            .unwrap();
+        drop(own_writer);
+        assert!(!pool_has_open_transaction(&own));
+
+        let foreign_writer = foreign.writer().unwrap();
+        foreign_writer
+            .transaction(|_| {
+                assert!(pool_has_open_transaction(&foreign));
+                assert!(
+                    !pool_has_open_transaction(&own),
+                    "the probe must ignore a live transaction on a foreign database"
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(foreign_writer);
+        assert!(!pool_has_open_transaction(&foreign));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn retained_raw_sql_writer_blocks_actual_idle_wait_and_persistent_stays() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1362,7 +1425,7 @@ mod demand_retirement_tests {
         let bridge = khive_db::SqlBridge::new(Arc::clone(&pool), true);
         let writer = bridge.writer().await.unwrap();
         assert!(
-            khive_storage::tx_registry::snapshot().is_empty(),
+            !pool_has_open_transaction(&pool),
             "this hold must be autocommit, not an open transaction"
         );
         let d = dispatcher(Some(Arc::clone(&pool)));
@@ -1387,9 +1450,17 @@ mod demand_retirement_tests {
         .is_err());
         drop(writer);
         assert_eq!(pool.retirement_writer_holds(), 0);
-        tokio::time::timeout(std::time::Duration::from_secs(2), idle)
+        if tokio::time::timeout(std::time::Duration::from_secs(2), idle)
             .await
-            .unwrap();
+            .is_err()
+        {
+            panic!(
+                "released writer must let the idle wait finish; snapshot {:?}, blockers now {:?}, open spans {:?}",
+                demand.snapshot(),
+                idle_retirement_blockers(&d),
+                khive_storage::tx_registry::snapshot()
+            );
+        }
         assert_eq!(demand.snapshot().phase, DaemonLifecyclePhase::Draining);
         assert_eq!(persistent.snapshot().phase, DaemonLifecyclePhase::Serving);
         let pooled = lifecycle(DaemonLifetime::Demand);
@@ -1401,11 +1472,17 @@ mod demand_retirement_tests {
             "pooled writer hold must block retirement"
         );
         drop(pooled_guard);
-        assert!(pooled.try_idle(|| idle_retirement_blockers(&d)));
+        assert!(
+            pooled.try_idle(|| idle_retirement_blockers(&d)),
+            "released pooled writer must allow retirement; snapshot {:?}, blockers now {:?}, open spans {:?}",
+            pooled.snapshot(),
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn persistent_idle_wait_never_retires_after_writer_release() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1439,7 +1516,7 @@ mod demand_retirement_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn explicit_sql_reader_transaction_blocks_retirement_without_writer_hold() {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(
@@ -1472,11 +1549,17 @@ mod demand_retirement_tests {
             .idle_blockers
             .contains(&"open_sql_transaction".to_owned()));
         drop(reader);
-        assert!(state.try_idle(|| idle_retirement_blockers(&d)));
+        assert!(
+            state.try_idle(|| idle_retirement_blockers(&d)),
+            "ended reader transaction must allow retirement; snapshot {:?}, blockers now {:?}, open spans {:?}",
+            state.snapshot(),
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial(background_tasks, tx_registry)]
+    #[serial(background_tasks, tx_registry, active_phases)]
     async fn unsettled_named_worker_blocks_idle_without_resetting_clock() {
         let (release, pending) = tokio::sync::oneshot::channel::<()>();
         let task = spawn_named_tracked_task("idle-test-worker", async move {
@@ -1495,7 +1578,10 @@ mod demand_retirement_tests {
         task.await.unwrap();
         assert!(
             state.try_idle(|| idle_retirement_blockers(&d)),
-            "maintenance completion must not reset ordinary activity"
+            "maintenance completion must not reset ordinary activity; snapshot {:?}, blockers now {:?}, open spans {:?}",
+            state.snapshot(),
+            idle_retirement_blockers(&d),
+            khive_storage::tx_registry::snapshot()
         );
     }
 
@@ -3674,3 +3760,162 @@ async fn the_unnamed_entry_point_still_registers_and_releases() {
 }
 
 include!("daemon_config_id_tests.rs");
+
+/// A dispatcher that carries an events-daemon startup gate
+/// ([`crate::events_split::EventsReadiness`]) in front of a [`MockDispatch`].
+#[derive(Clone)]
+struct GatedDispatch {
+    inner: MockDispatch,
+    readiness: crate::events_split::EventsReadiness,
+}
+
+#[async_trait]
+impl DaemonDispatch for GatedDispatch {
+    fn plan(&self, ops: &str) -> String {
+        self.inner.plan(ops)
+    }
+
+    async fn dispatch(
+        &self,
+        ops: String,
+        presentation: Option<String>,
+        presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
+        identity: Option<RequestIdentity>,
+    ) -> Result<String, String> {
+        self.inner
+            .dispatch(
+                ops,
+                presentation,
+                presentation_per_op,
+                format,
+                format_per_op,
+                from_wire,
+                identity,
+            )
+            .await
+    }
+
+    fn events_readiness(&self) -> Option<crate::events_split::EventsReadiness> {
+        Some(self.readiness.clone())
+    }
+
+    async fn warm_all(&self) {}
+
+    fn namespace(&self) -> &str {
+        self.inner.namespace()
+    }
+
+    fn config_id(&self) -> &str {
+        self.inner.config_id()
+    }
+}
+
+mod events_readiness_gate {
+    use super::*;
+
+    fn gated(
+        window: std::time::Duration,
+    ) -> (
+        GatedDispatch,
+        crate::events_split::EventsReadinessSignal,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let inner = demand_retirement_tests::dispatcher(None);
+        let calls = Arc::clone(&inner.dispatch_calls);
+        let (signal, readiness) = crate::events_split::events_readiness(
+            PathBuf::from("/tmp/gate-test.db.events.sock"),
+            window,
+        );
+        (GatedDispatch { inner, readiness }, signal, calls)
+    }
+
+    async fn send(
+        dispatcher: GatedDispatch,
+        frame: DaemonRequestFrame,
+    ) -> (UnixStream, tokio::task::JoinHandle<()>) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = tokio::spawn(handle_conn_with_lifecycle(
+            server,
+            dispatcher,
+            None,
+            tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+            None,
+        ));
+        write_frame(&mut client, &serde_json::to_vec(&frame).unwrap())
+            .await
+            .unwrap();
+        (client, handle)
+    }
+
+    #[tokio::test]
+    async fn request_waits_for_the_events_daemon_then_dispatches() {
+        let (dispatcher, signal, calls) = gated(std::time::Duration::from_secs(30));
+        let mut frame = base_request_frame("idle-test");
+        frame.ops = "stats()".to_owned();
+        let (mut client, handle) = send(dispatcher, frame).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing may dispatch before the events daemon answers"
+        );
+        assert!(!handle.is_finished());
+        signal.mark_ready();
+        let response: DaemonResponseFrame =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_is_refused_uncommitted_when_the_window_elapses() {
+        let (dispatcher, _signal, calls) = gated(std::time::Duration::from_millis(100));
+        let mut frame = base_request_frame("idle-test");
+        frame.ops = "create(kind=\"note\", content=\"x\")".to_owned();
+        frame.request_id = Some(7);
+        let (mut client, handle) = send(dispatcher, frame).await;
+        let refusal: DaemonResponseFrame =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert!(!refusal.ok);
+        assert_eq!(refusal.request_id, Some(7));
+        let detail = refusal.error_detail.expect("refusal carries detail");
+        assert_eq!(detail["code"], "events_daemon_unavailable");
+        assert_eq!(detail["retryable"], true);
+        assert_eq!(detail["socket"], "/tmp/gate-test.db.events.sock");
+        assert_eq!(
+            detail["domain_disposition"],
+            crate::DomainDisposition::NotCommitted.as_str()
+        );
+        assert!(refusal
+            .error
+            .expect("refusal carries a message")
+            .contains("/tmp/gate-test.db.events.sock"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused request must not reach dispatch"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_frames_do_not_wait_at_the_gate() {
+        let (dispatcher, _signal, calls) = gated(std::time::Duration::from_secs(30));
+        let mut frame = base_request_frame("idle-test");
+        frame.probe_only = true;
+        let (mut client, handle) = send(dispatcher, frame).await;
+        let response: DaemonResponseFrame =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut client))
+                .await
+                .expect("a probe must be answered while the gate is closed")
+                .map(|raw| serde_json::from_slice(&raw).unwrap())
+                .unwrap();
+        assert!(response.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        handle.await.unwrap();
+    }
+}

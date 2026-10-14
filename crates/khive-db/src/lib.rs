@@ -54,6 +54,8 @@ pub mod pool;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
+/// Pure statement-list builders for caller-owned SQL execution.
+pub mod statement_lists;
 #[cfg(any(test, feature = "test-support"))]
 mod statement_observer;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
@@ -107,9 +109,10 @@ pub use khive_storage::{
     DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
 pub use migrations::{
-    inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
-    run_migrations, run_migrations_with_policy, EmbeddingModelRegistryRecord, Migration,
-    MigrationWritePolicy, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    inspect_integrity, inspect_page_accounting, inspect_schema_is_current, inspect_schema_version,
+    query_embedding_models, read_schema_version, run_migrations, run_migrations_with_policy,
+    EmbeddingModelRegistryRecord, Migration, MigrationWritePolicy, PageAccounting,
+    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,

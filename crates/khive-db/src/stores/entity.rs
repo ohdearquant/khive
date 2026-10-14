@@ -337,7 +337,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -367,7 +367,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|error| map_err(error, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|error| map_err(error, op)), op)
                 .await;
         }
 
@@ -1275,10 +1275,13 @@ impl EntityStore for SqlEntityStore {
         // closure would violate SQLite's nested-transaction rule).
         if let Some(writer_task) = self.current_writer_task("upsert_entities")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_entities(conn, &entities, attempted)
-                        .map_err(|e| map_err(e, "upsert_entities"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_upsert_entities(conn, &entities, attempted)
+                            .map_err(|e| map_err(e, "upsert_entities"))
+                    },
+                    "upsert_entities",
+                )
                 .await;
         }
 
