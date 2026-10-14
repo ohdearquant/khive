@@ -1324,13 +1324,25 @@ All new runtime/pack paths use checked fusion. The existing unvalidated retrieva
 
 ### Decision E — Shared execution and failure boundaries
 
-`khive-retrieval` owns one reusable executor for ordered engine work, bounded concurrency, candidate aggregation, and the two fusion stages. Runtime supplies adapters carrying named provider invocation and store/search access; retrieval must not depend on runtime or a pack. Extend the existing `HybridSearcher` surface for named per-engine inputs and detailed outcomes. Its single-vector operation remains single-space: an unlabelled precomputed vector cannot be broadcast across peers. A multi-engine request with precomputed vectors must bind every supplied vector to its selected engine and validate dimensions.
+`khive-retrieval` owns one reusable executor for ordered engine work, bounded concurrency, candidate aggregation, and the two fusion stages. Runtime supplies adapters carrying named provider invocation and store/search access; retrieval must not depend on runtime or a pack. Add an executor surface alongside the unchanged published search traits. The executor accepts named per-engine inputs and returns detailed outcomes. The existing single-vector operation remains single-space: an unlabelled precomputed vector cannot be broadcast across peers. A multi-engine request with precomputed vectors must bind every supplied vector to its selected engine and validate dimensions.
 
 Packs determine retrieval scope, eligibility, candidate budgets, model-specific ANN/fresh-tail adapters, and post-fusion scoring. Memory decay/salience, knowledge section aggregation, reranking, and session/freshness requirements remain owned by their existing layers. The executor returns per-engine evidence so those policies are not reduced to one anonymous score. Common scheduling/fusion logic is not copied into each pack.
 
 Snapshot the ordered selected engines, identities, parameters, and weights once per request. Preserve existing request cancellation, deadline, Gate, and query-filter semantics. Ordinary provider/index failures can degrade individual arms and must be disclosed; they cannot rebind names or weights. If at least one selected vector engine completes successfully, including a valid empty result, vector execution has succeeded. If all selected vector engines fail, return an error for a vector-only request. A hybrid request may return successful text results with an explicit all-vector-arms-failed degradation, extending D2's previous all-engines-failed rule for that case. A lexical failure in a hybrid request remains an error, matching the restored runtime's explicit text-leg error contract. Cancellation, exhausted request deadlines, invalid configuration, and unmet requested consistency guarantees are fatal, not ordinary arm degradation.
 
 Concurrent fan-out does not promise O(1) cost: total embedding/index work scales with N, and shared accelerator contention can increase latency. Enforce existing request/embedding admission and bound outstanding engine work. Never create unbounded tasks because configuration permits arbitrary engine counts.
+
+#### Compatibility milestone before activation
+
+An additive executor milestone may precede ordered-peer activation. It preserves the published `VectorSearch`, `KeywordSearch`, and `HybridSearcher` contracts, existing engine participation and configuration, namespace/filter rules, candidate windows and intermediate caps, labels, score formulas, response shapes, and pack lifecycle. It does not activate the new configuration, two-stage strategy envelope, or knowledge write/read policy. The current caller behavior remains the comparison oracle, with three explicit corrections:
+
+- **Request stop:** an outer request cancellation or exhausted deadline is fatal, including when an ordinary vector failure would otherwise be tolerated. A shorter stage-local timeout may still degrade while the outer request remains live. The runtime correction ships in a separate pull request before any caller port; removing the outer stop check must make a regression test fail.
+- **Custom resolution:** the new executor resolves a registered `Custom` strategy or returns its typed error before work, including at limit zero. This correction may ship with the executor. The legacy `fuse_search_results` and `fuse_labelled_scored` fallback behavior and its tests remain unchanged.
+- **Memory error precedence:** the memory vector group uses one collect-then-select rule in original slot order, independent of the number of prepared models. Its comparison against the legacy oracle names this error-precedence difference explicitly; it must not be reported as unchanged behavior.
+
+The public executor surface is exactly the surface exercised by a direct external Rust caller compile control. Every other new type or trait stays `pub(crate)` until activation of this amendment; `#[doc(hidden)]` is not a substitute for restricted visibility. `ArmErrorPolicy` is not part of the public surface and remains `pub(crate)`. Preserve existing embedding preparation, session/freshness evidence, filtering, and scoring placement except for the three corrections above.
+
+The compatibility revision requires architectural approval before the retrieval-only executor change merges. That change switches no caller. The separate runtime request-stop fix then precedes the entity, note, and memory ports; Custom resolution is already enforced on their new executor path. This sequence does not ratify the rest of Amendment 5, whose status remains Proposed. The activation requirements and migration gates below still apply before enabling ordered peers.
 
 ### Decision F — Wiring, symmetry, and deferred policy
 
@@ -1343,6 +1355,8 @@ Knowledge activation is paired: model-aware reads, ANN warming, fresh-tail handl
 Retain `AllModels` and `DefaultModel` note policies. The latter selects the first configured peer for new writes and reindex, with the migration consequence documented. Do not delete historical vectors merely because a current write policy excludes their engine. Defer arbitrary named subsets; `[note_kinds.<kind>].engines` is unsupported and rejected until a later amendment specifies the full lifecycle.
 
 ### Migration and compatibility
+
+The following migration requirements govern activation of the ordered-peer contract. The additive compatibility milestone in Decision E preserves the current caller contract except for its three named corrections and does not itself activate this migration.
 
 1. Land this amendment and the matching knowledge contract before dependent implementation merges. Amend the existing document; do not duplicate an accepted amendment number.
 2. Prepare additive checked primitives and adapter APIs before switching public handlers. Keep intermediate support internal or explicitly incomplete; do not accept config weights that deployed readers ignore.

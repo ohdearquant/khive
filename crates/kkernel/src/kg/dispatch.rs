@@ -10,6 +10,7 @@ use super::init;
 use super::review;
 use super::status;
 use super::types::KgCommand;
+use super::update;
 use super::validate;
 
 /// Dispatch `kkernel kg` subcommands to their implementations.
@@ -18,6 +19,7 @@ pub async fn run_kg(cmd: KgCommand) -> Result<()> {
         KgCommand::Validate(args) => validate::cmd_validate(args),
         KgCommand::Init(args) => init::cmd_init(args),
         KgCommand::Fetch(args) => fetch::cmd_fetch(args).await,
+        KgCommand::Update(args) => update::cmd_update(args),
         KgCommand::Export(args) => archive::cmd_export(args).await,
         KgCommand::Import(args) => archive::cmd_import(args).await,
         KgCommand::Status(args) => status::cmd_status(args).await,

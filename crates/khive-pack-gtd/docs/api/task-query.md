@@ -88,6 +88,20 @@ either. Task creation stores dependencies and attempts a best-effort edge
 projection. Completing a blocker changes readiness without rewriting the dependent
 task's lifecycle or deleting its existing edges.
 
+Graph-link cycle validation pages outgoing `depends_on` edges through the shared
+GraphStore, then reads their endpoints through NoteStore. Only edges between live
+task notes participate. The edge namespace is the caller's namespace; endpoint
+lookup uses the stored task IDs without an additional namespace restriction.
+Proposed links in the same batch participate before any link is written.
+
+The breadth-first walk retains a 20,000-node and 20,000-admitted-edge safety
+budget and uses a 20,000-hop depth bound. A separate 20,000-row scan budget also
+counts candidate edges whose endpoints are not live task notes. A budget refusal
+or typed storage decode error rejects the proposed link; a partial walk never
+establishes that a link is acyclic. This scan budget is
+stricter than the previous task-filtered SQL query for graphs with many excluded
+endpoints. Stored targets are visited in UUID order, independently of edge weight.
+
 `gtd.next` remains actionable-only by default. Set `include_blocked=true` to
 include blocked and broken `next`/`active` tasks in the same array; ready work
 sorts first, and every returned task's `actionable` field distinguishes work

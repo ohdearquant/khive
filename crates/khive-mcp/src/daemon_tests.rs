@@ -681,6 +681,13 @@ mod handover {
                 "protocol" => {
                     assert!(matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }))
                 }
+                // A read timeout after a full write is its own outcome and,
+                // like a malformed response, is never replayed: the peer
+                // asserts no second connection arrives.
+                "timeout" => assert!(
+                    matches!(outcome, ForwardOutcome::ResponseTimeout { .. }),
+                    "{outcome:?}"
+                ),
                 _ => assert!(matches!(outcome, ForwardOutcome::ParseFailure)),
             }
             assert_eq!(budget.remaining, 1);
@@ -1041,7 +1048,11 @@ fn disposition_legacy_and_lost_responses_are_unknown() {
     let legacy = map_response(frame_err(Some("legacy failure")), CFG, NS)
         .unwrap()
         .unwrap_err();
-    for error in [legacy, ambiguous_forward_error()] {
+    for error in [
+        legacy,
+        post_write_error(PostWriteFailure::ConnectionLost),
+        post_write_error(PostWriteFailure::ParseFailure),
+    ] {
         let detail = error.data.unwrap();
         assert_eq!(detail["domain_disposition"], "unknown");
         assert!(detail.get("domain_result").is_none());
@@ -1458,8 +1469,16 @@ fn fallback_total_sums_all_reason_counters() {
 // an `Illegitimate` reason bumps it if and only if strict mode is on; every
 // other reason/mode combination must never bump it.
 
+/// Run `f` with `KHIVE_DAEMON_STRICT` set as given and the socket and PID
+/// paths pointed into an empty directory, so an unset value reads "no
+/// rendezvous" whatever daemon the host running the tests has.
 fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     let prev = std::env::var("KHIVE_DAEMON_STRICT").ok();
+    let prev_socket = std::env::var_os("KHIVE_SOCKET");
+    let prev_pid = std::env::var_os("KHIVE_PID");
+    let rendezvous = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("KHIVE_SOCKET", rendezvous.path().join("khived.sock"));
+    std::env::set_var("KHIVE_PID", rendezvous.path().join("khived.pid"));
     match value {
         Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
         None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
@@ -1468,6 +1487,12 @@ fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     match prev {
         Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
         None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+    }
+    for (name, prev) in [("KHIVE_SOCKET", prev_socket), ("KHIVE_PID", prev_pid)] {
+        match prev {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
     }
     result
 }
@@ -3190,11 +3215,30 @@ async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
         response.served_config_id.as_deref(),
         Some(daemon_config_id.as_str())
     );
+
+    // The daemon's socket is on disk, so a client that leaves
+    // KHIVE_DAEMON_STRICT unset is strict and is refused with the reason.
+    let copy = serde_json::from_value::<DaemonResponseFrame>(
+        serde_json::to_value(&response).expect("serialize response"),
+    )
+    .expect("copy response");
+    std::env::remove_var("KHIVE_DAEMON_STRICT");
+    match map_response(copy, &revoked_config_id, "test") {
+        Some(Err(error)) => {
+            let data = error.data.expect("strict rejection carries data");
+            assert_eq!(data["reason"], "config_mismatch", "{data}");
+            assert_eq!(data[STRICT_FALLBACK_MARKER], true, "{data}");
+        }
+        other => panic!("strict-by-default clients must refuse the mismatch, got {other:?}"),
+    }
+
+    std::env::set_var("KHIVE_DAEMON_STRICT", "0");
     assert!(
         map_response(response, &revoked_config_id, "test").is_none(),
         "non-strict clients must take the established config-mismatch fallback path"
     );
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+    std::env::remove_var("KHIVE_DAEMON_STRICT");
+    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 2);
 
     handle.abort();
     let _ = handle.await;
@@ -4198,7 +4242,7 @@ async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure() {
+async fn try_forward_inner_read_timeout_after_full_write_returns_response_timeout() {
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
@@ -4264,10 +4308,16 @@ async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure()
         .expect("try_forward_inner must return within the ceiling plus margin");
     let elapsed = started.elapsed();
 
+    let ForwardOutcome::ResponseTimeout { elapsed_ms } = outcome else {
+        panic!(
+            "a read timeout after a completed write must be ResponseTimeout (terminal \
+             ambiguity, reason daemon_slow); got a different variant: {outcome:?}"
+        );
+    };
     assert!(
-        matches!(outcome, ForwardOutcome::ParseFailure),
-        "a read timeout after a completed write must stay ParseFailure (terminal \
-             ambiguity) — got a different variant: {outcome:?}"
+        elapsed_ms > 0 && u128::from(elapsed_ms) <= elapsed.as_millis(),
+        "elapsed_ms must be the response wait, bounded by the call's own wall time: \
+         elapsed_ms {elapsed_ms}, call {elapsed:?}"
     );
     assert!(
         elapsed < elapsed_limit,
@@ -4498,7 +4548,8 @@ async fn recovery_requires_incumbent_exit_before_spawning() {
         | Err(
             RecoveryError::Spawn(_)
             | RecoveryError::RequestExpired
-            | RecoveryError::PidFileDirectoryUntrusted(_),
+            | RecoveryError::PidFileDirectoryUntrusted(_)
+            | RecoveryError::SupervisedDaemonUnresponsive { .. },
         ) => None,
     };
     let live_pid_file_preserved = pid_file.exists();

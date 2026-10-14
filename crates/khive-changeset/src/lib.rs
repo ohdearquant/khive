@@ -4,11 +4,13 @@
 
 mod changeset;
 mod envelope;
+mod invert;
 mod op;
 mod strict;
 
 pub use changeset::{from_ndjson, to_ndjson, ChangeSet, ChangeSetError};
 pub use envelope::{Envelope, CURRENT_SCHEMA_VERSION};
+pub use invert::{CurrentState, InvertError};
 pub use op::{
     CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage, EntityCreateFields,
     EntityPatch, EntityPreimage, LinkOp, MergeOp, MergePreimage, NoteCreateFields, NotePatch,

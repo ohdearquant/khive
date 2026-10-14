@@ -146,9 +146,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // held while the daemon serves, even when a second process uses another
     // HOME and therefore has a different socket/boot lock. Non-daemon callers
     // keep the existing best-effort boot lock only.
-    if args.daemon {
-        khive_runtime::daemon::mark_warm_index_host();
-    }
+    mark_mcp_host_role(&args);
     let (cli_ns_explicit, cli_ns) =
         resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;
@@ -530,14 +528,25 @@ pub(super) fn start_daemon_components_if_daemon(
         server.events_disk_policy(),
     ) {
         if let Some(socket) = split.socket_path.clone() {
+            // Requests wait at this gate until the supervised events daemon
+            // answers. It is installed here, in the start callback, so it is
+            // in place before the accept loop admits the first request.
+            let (readiness, gate) = khive_runtime::events_split::events_readiness(
+                socket.clone(),
+                khive_runtime::events_split::events_readiness_window(),
+            );
+            if !server.install_events_readiness(gate) {
+                tracing::warn!(target: "khive_mcp::serve", "events readiness gate already installed; keeping the first");
+            }
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon_with_policies(
+                khive_runtime::events_split::supervise_events_daemon_with_readiness(
                     split.db_path.clone(),
                     socket,
                     wal_ceiling,
                     disk_guard,
                     volume_lock_dir,
+                    readiness,
                 ),
             );
         }

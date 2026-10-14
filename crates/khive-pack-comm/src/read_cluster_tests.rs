@@ -826,7 +826,7 @@ async fn thread_physical_ties_legacy_roots_and_mailbox_filter_keep_bounded_reade
 }
 
 #[tokio::test]
-async fn malformed_first_row_keeps_the_original_scalar_get_note_error_bytes() {
+async fn malformed_first_row_keeps_the_typed_scalar_get_note_error() {
     let (runtime, token, registry) = fixture();
     let mut wrong_kind = message(2);
     wrong_kind.kind = "observation".into();
@@ -838,7 +838,7 @@ async fn malformed_first_row_keeps_the_original_scalar_get_note_error_bytes() {
         .get_note(id(1))
         .await
         .unwrap_err();
-    let expected = RuntimeError::Internal(format!("read: get_note: {scalar_error}"));
+    let expected = RuntimeError::Storage(scalar_error);
     let error = registry
         .dispatch(
             "comm.mark_read",
@@ -846,11 +846,156 @@ async fn malformed_first_row_keeps_the_original_scalar_get_note_error_bytes() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, RuntimeError::Internal(_)));
+    let RuntimeError::Storage(khive_storage::StorageError::Driver {
+        capability,
+        operation,
+        source,
+    }) = error.refusal_source()
+    else {
+        panic!("expected the original storage driver failure, got {error:?}");
+    };
+    assert_eq!(*capability, khive_storage::StorageCapability::Notes);
+    assert_eq!(operation.as_ref(), "get_note");
+    let driver = source.downcast_ref::<rusqlite::Error>().unwrap();
+    assert!(matches!(
+        driver,
+        rusqlite::Error::InvalidColumnType(5, column, rusqlite::types::Type::Blob)
+            if column == "content"
+    ));
+    assert_eq!(driver.sqlite_error_code(), None);
     assert_eq!(
         error.to_string().as_bytes(),
         expected.to_string().as_bytes()
     );
+    assert!(!runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(id(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .properties
+        .unwrap()["read"]
+        .as_bool()
+        .unwrap());
+}
+
+#[tokio::test]
+async fn read_admission_failures_keep_typed_wire_errors_and_never_mark_messages() {
+    use std::time::Duration;
+
+    for (verb, params) in [
+        ("comm.read", json!({"id": id(1).to_string(), "body": false})),
+        (
+            "comm.read",
+            json!({"ids": [id(1).to_string(), id(2).to_string()], "body": false}),
+        ),
+        (
+            "comm.mark_read",
+            json!({"ids": [id(1).to_string(), id(2).to_string()], "atomic": true}),
+        ),
+    ] {
+        let (runtime, token, registry) = fixture();
+        seed(&runtime, vec![message(1), message(2)]).await;
+        let store = runtime.notes(&token).unwrap();
+        let before = [
+            store.get_note(id(1)).await.unwrap().unwrap(),
+            store.get_note(id(2)).await.unwrap().unwrap(),
+        ];
+        let pool = runtime.backend().pool();
+        assert_eq!(pool.max_readers(), 0, "private memory backend");
+        let checkout_timeout = pool.config().checkout_timeout;
+        let timeout_ms = u64::try_from(checkout_timeout.as_millis()).unwrap();
+        let held_reader = pool
+            .reader()
+            .expect("hold the only reader admission permit");
+        let reads_before = pool.reader_acquisition_snapshot();
+        assert_eq!(reads_before.reader_admission_capacity, 1);
+        assert_eq!(reads_before.available_reader_admission_slots, 0);
+        let writes_before = pool.writer_acquisition_snapshot().acquisitions;
+
+        // Store admission waits asynchronously before any SQL worker starts.
+        // The guard stays held until dispatch returns; no scheduler race releases it.
+        tokio::time::pause();
+        let error = tokio::time::timeout(
+            checkout_timeout.saturating_mul(3) + Duration::from_secs(1),
+            registry.dispatch(verb, params.clone()),
+        )
+        .await
+        .expect("bounded scalar or batch-then-scalar admission wait")
+        .expect_err("the real reader pool is exhausted");
+        let RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation,
+            timeout_ms: actual_timeout,
+            pool_identity,
+        }) = error.refusal_source()
+        else {
+            panic!("{verb} erased the typed admission failure: {error:?}");
+        };
+        assert_eq!(operation.as_ref(), "get_note");
+        assert_eq!(*actual_timeout, timeout_ms);
+        assert_eq!(pool_identity.as_deref(), Some(":memory:"));
+        let retry = error.retryable_failure_context().unwrap();
+        assert_eq!(retry.stage, "storage_admission_timeout");
+        assert_eq!(retry.timeout, checkout_timeout);
+        assert_eq!(retry.operation.as_deref(), Some("get_note"));
+        assert_eq!(retry.pool_identity.as_deref(), Some(":memory:"));
+
+        let wire =
+            khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+        assert_eq!(wire["kind"], "unavailable");
+        assert_eq!(wire["code"], "storage_admission_timeout");
+        assert_eq!(wire["stage"], "storage_admission_timeout");
+        assert_eq!(wire["retryable"], true);
+        assert_eq!(wire["operation"], "get_note");
+        assert_eq!(wire["timeout_ms"], timeout_ms);
+        assert_eq!(wire["pool_identity"], ":memory:");
+        assert_eq!(wire["domain_disposition"], "unknown");
+        for field in [
+            "sqlite_primary_code",
+            "sqlite_extended_code",
+            "sqlite_write_stage",
+        ] {
+            assert!(wire.get(field).is_none(), "no SQLite work began: {wire}");
+        }
+        let reads_after = pool.reader_acquisition_snapshot();
+        assert!(reads_after.checkout_timeouts > reads_before.checkout_timeouts);
+        assert_eq!(reads_after.acquisitions, reads_before.acquisitions);
+        assert_eq!(
+            pool.writer_acquisition_snapshot().acquisitions,
+            writes_before
+        );
+        drop(held_reader);
+        tokio::time::resume();
+
+        for note in &before {
+            assert_eq!(store.get_note(note.id).await.unwrap().unwrap(), *note);
+            assert_eq!(note.properties.as_ref().unwrap()["read"], false);
+        }
+        let recovered = registry.dispatch(verb, params).await.unwrap();
+        assert_eq!(recovered["status"], "success");
+        assert_eq!(
+            store
+                .get_note(id(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .properties
+                .unwrap()["read"],
+            true
+        );
+        assert_eq!(
+            store
+                .get_note(id(2))
+                .await
+                .unwrap()
+                .unwrap()
+                .properties
+                .unwrap()["read"],
+            recovered.get("results").is_some(),
+            "only the requested scalar target or both requested bulk targets are marked"
+        );
+    }
 }
 
 #[tokio::test]

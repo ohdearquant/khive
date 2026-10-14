@@ -356,7 +356,7 @@ fn index_key_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<Opt
 
 /// The tables a move must not write, whatever the census finds.
 ///
-/// `events` is the record of what happened under the namespace it happened
+/// `events` and `weight_events` record what happened under the namespace it happened
 /// under. The two `ann_consumer_*` tables are excluded by the write-log
 /// decision: the log is appended to at a fresh `seq` and no watermark is edited,
 /// so moving a watermark would claim a consumer is caught up on entries it has
@@ -364,6 +364,7 @@ fn index_key_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<Opt
 /// target, so its `(namespace, index_type)` key has nothing to collide with.
 pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] = &[
     "events",
+    "weight_events",
     "ann_consumer_watermark",
     "ann_consumer_pending",
     "retrieval_snapshots",

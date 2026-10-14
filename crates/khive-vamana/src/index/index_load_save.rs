@@ -592,20 +592,7 @@ impl VamanaIndex {
             Some(codes_hash.as_bytes()),
             Some(&publication_nonce),
         );
-        checkpoint.stage("metadata.bin.tmp", &metadata_data)?;
-        checkpoint.rename("metadata.bin.tmp", "metadata.bin")?;
-
-        // Commit gate is metadata.bin: fsync it durable before promoting segments, so any
-        // post-crash state is either (old metadata + old segments) or (new metadata +
-        // maybe-stale segments) — the latter is checksum-guarded and safe-degrades to rebuild.
-        checkpoint.sync()?;
-
-        checkpoint.rename("vectors.bin.v2new", "vectors.bin")?;
-        checkpoint.rename("graph.bin.v2new", "graph.bin")?;
-        checkpoint.rename("lifecycle.bin.v2new", "lifecycle.bin")?;
-        checkpoint.rename("codes.bin.v2new", "codes.bin")?;
-
-        checkpoint.sync()?;
+        checkpoint.publish_v2(&metadata_data)?;
 
         Ok(())
     }

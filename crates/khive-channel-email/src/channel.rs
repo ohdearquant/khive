@@ -558,6 +558,7 @@ impl Channel for EmailChannel {
         let message_id = envelope.message_id.as_deref();
         let in_reply_to = envelope.in_reply_to.as_deref();
         let references = envelope.references.as_deref();
+        let list_unsubscribe = envelope.list_unsubscribe.as_deref();
 
         debug!(from, to, subject, "email send");
         self.smtp
@@ -570,6 +571,7 @@ impl Channel for EmailChannel {
                 message_id,
                 in_reply_to,
                 references,
+                list_unsubscribe,
             )
             .await
     }
@@ -680,6 +682,7 @@ mod tests {
             _message_id: Option<&str>,
             _in_reply_to: Option<&str>,
             _references: Option<&str>,
+            _list_unsubscribe: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push(format!("{from}->{to}"));
             Ok(())
@@ -1649,6 +1652,7 @@ mod tests {
                 _message_id: Option<&str>,
                 in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1692,6 +1696,7 @@ mod tests {
                 _message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()

@@ -26,6 +26,9 @@ pub use khive_retrieval::{
 
 mod single_engine;
 
+#[cfg(test)]
+mod request_stop_tests;
+
 /// Bounds provider input and per-page outcome memory while amortizing model setup.
 pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
 
@@ -794,9 +797,10 @@ impl KhiveRuntime {
 
     /// Coordinator fan-out variant of [`Self::hybrid_search`]: the text arm
     /// still fails loud (propagated through `hybrid_search_inner`'s
-    /// `tolerate_vector_error=false` semantics for that leg), but a
-    /// vector-arm failure after a successful text leg is captured instead of
-    /// discarding the text hits. Reserved for
+    /// `tolerate_vector_error=false` semantics for that leg), but an
+    /// ordinary vector-arm failure after a successful text leg is captured
+    /// instead of discarding the text hits. Request cancellation and the outer
+    /// deadline remain fatal. Reserved for
     /// `SubstrateCoordinator::fan_out_search_with_visibility` — every other
     /// caller keeps the fail-loud [`Self::hybrid_search`] contract, so a
     /// single backend's vector-store outage does not misreport that
@@ -875,126 +879,131 @@ impl KhiveRuntime {
         tolerate_vector_error: bool,
         vector_pool: Option<Vec<VectorSearchHit>>,
     ) -> RuntimeResult<(Vec<SearchHit>, Option<String>)> {
-        let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
+        khive_storage::await_request_read_phase("hybrid_search", async {
+            let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let visible_ns: Vec<String> = token
-            .visible_namespaces()
-            .iter()
-            .map(|ns| ns.as_str().to_owned())
-            .collect();
-        // sanitize_fts5_query strips known-unsafe FTS5 metacharacters up front, but if
-        // the lexical leg still errors at runtime on residual punctuation the sanitizer
-        // doesn't strip, this fails loud instead of degrading to vector-only fusion.
-        let text_store = self.text(token)?;
-        let text_fut = text_store.search(TextSearchRequest {
-            query: query_text.to_string(),
-            mode: text_mode,
-            filter: Some(TextFilter {
-                namespaces: visible_ns.clone(),
-                // Push the entity-kind filter into the FTS query. Without it the
-                // text arm returns the top `candidates` rows across EVERY entity
-                // kind in the namespace and the kind is applied only afterwards,
-                // so when one kind dominates the lexical ranking a search for a
-                // rarer kind gets back fewer rows than exist, or none. The
-                // `EntityFilter.kinds` check below stays as the backstop.
-                record_kinds: entity_kind
-                    .map(|kind| vec![kind.to_string()])
-                    .unwrap_or_default(),
-                ..TextFilter::default()
-            }),
-            top_k: candidates,
-            snippet_chars: 200,
-        });
-        let text_fut = crate::stage_seam::text_stage(text_fut);
-        // The stages read nothing from each other, so they run together; a text error wins.
-        let vector_fut = async {
-            match vector_pool {
-                Some(pool) => Ok((pool, None)),
-                None => {
-                    self.hybrid_vector_stage(
-                        token,
-                        query_text,
-                        query_vector,
-                        candidates,
-                        vector_similarity_floor,
-                        tolerate_vector_error,
+            let visible_ns: Vec<String> = token
+                .visible_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_owned())
+                .collect();
+            // sanitize_fts5_query strips known-unsafe FTS5 metacharacters up front, but if
+            // the lexical leg still errors at runtime on residual punctuation the sanitizer
+            // doesn't strip, this fails loud instead of degrading to vector-only fusion.
+            let text_store = self.text(token)?;
+            let text_fut = text_store.search(TextSearchRequest {
+                query: query_text.to_string(),
+                mode: text_mode,
+                filter: Some(TextFilter {
+                    namespaces: visible_ns.clone(),
+                    // Push the entity-kind filter into the FTS query. Without it the
+                    // text arm returns the top `candidates` rows across EVERY entity
+                    // kind in the namespace and the kind is applied only afterwards,
+                    // so when one kind dominates the lexical ranking a search for a
+                    // rarer kind gets back fewer rows than exist, or none. The
+                    // `EntityFilter.kinds` check below stays as the backstop.
+                    record_kinds: entity_kind
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default(),
+                    ..TextFilter::default()
+                }),
+                top_k: candidates,
+                snippet_chars: 200,
+            });
+            let text_fut = crate::stage_seam::text_stage(text_fut);
+            // The stages read nothing from each other, so they run together; a text error wins.
+            let vector_fut = async {
+                match vector_pool {
+                    Some(pool) => Ok((pool, None)),
+                    None => {
+                        self.hybrid_vector_stage(
+                            token,
+                            query_text,
+                            query_vector,
+                            candidates,
+                            vector_similarity_floor,
+                            tolerate_vector_error,
+                        )
+                        .await
+                    }
+                }
+            };
+            let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
+            // FtsPasses is counted inside the store's `search()` (khive-db
+            // stores/text.rs), only once a real FTS5 statement is prepared —
+            // an empty/fully-sanitized query short-circuits there before any
+            // statement exists and must not count.
+            let text_hits = crate::error::fts_text_leg_or_err(
+                text_search_result.map_err(RuntimeError::from),
+                "hybrid_search",
+                query_text,
+            )?;
+            let (vector_hits, vector_error) = vector_result?;
+
+            // Each arm fetched `candidates` independently, so their union can contain
+            // twice that many distinct IDs. Keep the complete fetched pool through
+            // ranking and the alive/kind/tag/property filters below; reusing one arm's
+            // cap here lets stale or filtered hits hide live candidates from the other.
+            let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
+            let mut fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
+
+            // tags_any has a SQL column and is pushed into query_entities; properties
+            // filtering has no SQL column and is applied in Rust below on the fetched records.
+            if !fused.is_empty() {
+                let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
+                let alive_page = self
+                    .entities(token)?
+                    .query_entities(
+                        token.namespace().as_str(),
+                        EntityFilter {
+                            ids: candidate_ids,
+                            kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
+                            entity_types: entity_type
+                                .map(|t| vec![t.to_string()])
+                                .unwrap_or_default(),
+                            namespaces: visible_ns,
+                            tags_any: tags_any.to_vec(),
+                            ..EntityFilter::default()
+                        },
+                        PageRequest {
+                            offset: 0,
+                            limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
+                        },
                     )
-                    .await
-                }
-            }
-        };
-        let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
-        // FtsPasses is counted inside the store's `search()` (khive-db
-        // stores/text.rs), only once a real FTS5 statement is prepared —
-        // an empty/fully-sanitized query short-circuits there before any
-        // statement exists and must not count.
-        let text_hits = crate::error::fts_text_leg_or_err(
-            text_search_result.map_err(RuntimeError::from),
-            "hybrid_search",
-            query_text,
-        )?;
-        let (vector_hits, vector_error) = vector_result?;
-
-        // Each arm fetched `candidates` independently, so their union can contain
-        // twice that many distinct IDs. Keep the complete fetched pool through
-        // ranking and the alive/kind/tag/property filters below; reusing one arm's
-        // cap here lets stale or filtered hits hide live candidates from the other.
-        let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
-        let mut fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
-
-        // tags_any has a SQL column and is pushed into query_entities; properties
-        // filtering has no SQL column and is applied in Rust below on the fetched records.
-        if !fused.is_empty() {
-            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
-            let alive_page = self
-                .entities(token)?
-                .query_entities(
-                    token.namespace().as_str(),
-                    EntityFilter {
-                        ids: candidate_ids,
-                        kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
-                        entity_types: entity_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
-                        namespaces: visible_ns,
-                        tags_any: tags_any.to_vec(),
-                        ..EntityFilter::default()
-                    },
-                    PageRequest {
-                        offset: 0,
-                        limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
-                    },
-                )
-                .await?;
-            let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
-            let mut alive: HashSet<Uuid> = HashSet::new();
-            for e in alive_page.items {
-                // Drop non-matching candidates here, before the alive set is built,
-                // so they're excluded ahead of truncation.
-                if let Some(pf) = properties_filter {
-                    if !properties_match(e.properties.as_ref(), pf) {
-                        continue;
+                    .await?;
+                let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
+                let mut alive: HashSet<Uuid> = HashSet::new();
+                for e in alive_page.items {
+                    // Drop non-matching candidates here, before the alive set is built,
+                    // so they're excluded ahead of truncation.
+                    if let Some(pf) = properties_filter {
+                        if !properties_match(e.properties.as_ref(), pf) {
+                            continue;
+                        }
                     }
+                    alive.insert(e.id);
+                    entity_meta.insert(e.id, (e.name, e.description));
                 }
-                alive.insert(e.id);
-                entity_meta.insert(e.id, (e.name, e.description));
-            }
 
-            fused.retain(|h| alive.contains(&h.entity_id));
+                fused.retain(|h| alive.contains(&h.entity_id));
 
-            // Enrich vector-only hits (title/snippet == None) from entity record.
-            for hit in &mut fused {
-                if let Some((name, description)) = entity_meta.get(&hit.entity_id) {
-                    if hit.title.is_none() {
-                        hit.title = Some(name.clone());
-                    }
-                    if hit.snippet.is_none() {
-                        hit.snippet = description.clone();
+                // Enrich vector-only hits (title/snippet == None) from entity record.
+                for hit in &mut fused {
+                    if let Some((name, description)) = entity_meta.get(&hit.entity_id) {
+                        if hit.title.is_none() {
+                            hit.title = Some(name.clone());
+                        }
+                        if hit.snippet.is_none() {
+                            hit.snippet = description.clone();
+                        }
                     }
                 }
             }
-        }
 
-        fused.truncate(limit as usize);
-        Ok((fused, vector_error))
+            fused.truncate(limit as usize);
+            Ok((fused, vector_error))
+        })
+        .await?
     }
 
     /// The vector stage of hybrid entity search: one KNN query over the entity vectors of
@@ -1009,35 +1018,39 @@ impl KhiveRuntime {
         vector_similarity_floor: Option<f64>,
         tolerate_vector_error: bool,
     ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
-        let mut vector_error: Option<String> = None;
-        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            match self
-                .vector_search(
-                    token,
-                    query_vector,
-                    Some(query_text),
-                    candidates,
-                    Some(SubstrateKind::Entity),
-                )
-                .await
-            {
-                Ok(hits) => hits,
-                Err(e) if tolerate_vector_error => {
-                    vector_error = Some(e.to_string());
+        khive_storage::await_request_read_phase("hybrid_search.vector", async {
+            let mut vector_error: Option<String> = None;
+            let mut vector_hits =
+                if query_vector.is_some() || self.config().embedding_model.is_some() {
+                    match self
+                        .vector_search(
+                            token,
+                            query_vector,
+                            Some(query_text),
+                            candidates,
+                            Some(SubstrateKind::Entity),
+                        )
+                        .await
+                    {
+                        Ok(hits) => hits,
+                        Err(e) if tolerate_vector_error => {
+                            vector_error = Some(e.to_string());
+                            Vec::new()
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
                     Vec::new()
-                }
-                Err(e) => return Err(e),
+                };
+            if let Some(cosine_floor) = vector_similarity_floor {
+                // Vector store scores use canonical cosine similarity (`1 - distance`),
+                // so the caller's raw-cosine floor is already on the comparison scale.
+                let score_floor = DeterministicScore::from_f64(cosine_floor);
+                vector_hits.retain(|hit| hit.score >= score_floor);
             }
-        } else {
-            Vec::new()
-        };
-        if let Some(cosine_floor) = vector_similarity_floor {
-            // Vector store scores use canonical cosine similarity (`1 - distance`),
-            // so the caller's raw-cosine floor is already on the comparison scale.
-            let score_floor = DeterministicScore::from_f64(cosine_floor);
-            vector_hits.retain(|hit| hit.score >= score_floor);
-        }
-        Ok((vector_hits, vector_error))
+            Ok((vector_hits, vector_error))
+        })
+        .await?
     }
 
     async fn embed_backfill_page(

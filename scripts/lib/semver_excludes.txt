@@ -6,9 +6,11 @@
 # One blank-/comment-filtered crate name per line.
 khive-channel-telegram
 khive-fs
+khive-graph-diff
 khive-mounts
 khive-pack-agent
 khive-pack-blob
+khive-pack-charter
 khive-pack-exec
 khive-pack-moodboard
 khive-pack-telemetry

@@ -5,7 +5,8 @@
 ### Edge Ontology (ADR-002)
 
 - 20 closed edge relations (18 non-epistemic relations, including `links_to` added by ADR-191, `located_in` added by ADR-196 and `owns` added by ADR-197, plus the 2 epistemic relations added by ADR-055);
-  endpoint contract enforced at the runtime layer in `operations.rs`
+  endpoint contract enforced at the runtime layer through `operations/link_ops.rs`,
+  `operations/graph_rules.rs` and the base rules in `operations.rs`
 - Symmetric relations (`competes_with`, `composed_with`) are stored with `source_uuid < target_uuid`
 - `annotates` is the only cross-substrate relation: source must be a note, target may be anything
 - All base relations other than `annotates` require entity→entity; notes cannot be source/target
@@ -65,7 +66,7 @@
   by-ID access control boundary
 - By-ID operations (get, delete, update) resolve globally unique UUIDs directly — no
   `record.namespace == caller_namespace` check at the runtime layer (rule 2; see
-  `operations.rs::get_entity`)
+  `operations/record_ops.rs::get_entity`)
 - `merge_entity` is the one by-ID operation that still requires a namespace match on
   both sides (it is a same-namespace curation operation, not a generic lookup); it
   rejects the merge when a record's namespace differs from the caller's token namespace
@@ -148,7 +149,8 @@
 
 - Three-case relation contract for link operations: annotates, supersedes, and entity→entity base rules
   (ADR-002 governs the endpoint contract; ADR-019 extends it for task notes).
-- The endpoint validation path is centralized in `operations.rs` so both `link` and `update_edge` share the same contract.
+- `link` and `update_edge` share the endpoint validation in `operations/link_ops.rs`,
+  the relation rules in `operations/graph_rules.rs` and the base rules in `operations.rs`.
 
 ### ADR-021: Memory Pack
 
