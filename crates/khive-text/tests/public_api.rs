@@ -287,6 +287,7 @@ fn script_profile_reexport() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_reexport() {
     assert!(khive_text::is_meaningful_query("search term"));
     assert!(!khive_text::is_meaningful_query(""));

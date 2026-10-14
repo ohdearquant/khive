@@ -482,17 +482,15 @@ pub(super) fn merge_entity_sql(
                 rewired_edge_ids.insert(edge.id);
                 continue;
             }
-            let changed = conn.execute(
-                "UPDATE graph_edges SET \
-                     source_id = ?1, target_id = ?2, updated_at = ?3 \
-                     WHERE namespace = ?4 AND id = ?5",
-                rusqlite::params![
-                    new_src.to_string(),
-                    new_tgt.to_string(),
-                    now_ts,
+            let changed = khive_db::sql_bridge::execute_statements(
+                conn,
+                &[khive_db::stores::graph::edge_merge_rewire_statement(
                     &edge.namespace,
-                    edge.id.to_string(),
-                ],
+                    edge.id,
+                    new_src,
+                    new_tgt,
+                    now_ts,
+                )],
             )?;
             if changed > 0 {
                 rewired_edge_ids.insert(edge.id);
@@ -1169,17 +1167,15 @@ pub(super) fn merge_note_sql(
                     rewired_edge_ids.insert(edge.id);
                     continue;
                 }
-                let changed = conn.execute(
-                    "UPDATE graph_edges SET \
-                     source_id = ?1, target_id = ?2, updated_at = ?3 \
-                     WHERE namespace = ?4 AND id = ?5",
-                    rusqlite::params![
-                        new_src.to_string(),
-                        new_tgt.to_string(),
-                        now_ts,
+                let changed = khive_db::sql_bridge::execute_statements(
+                    conn,
+                    &[khive_db::stores::graph::edge_merge_rewire_statement(
                         &edge.namespace,
-                        edge.id.to_string(),
-                    ],
+                        edge.id,
+                        new_src,
+                        new_tgt,
+                        now_ts,
+                    )],
                 )?;
                 if changed > 0 {
                     rewired_edge_ids.insert(edge.id);
