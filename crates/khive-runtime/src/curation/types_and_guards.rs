@@ -4,22 +4,22 @@ use super::{
     SubstrateKind, Uuid, Value,
 };
 
-pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
+fn stale_snapshot_error(substrate: &str, id: Uuid) -> RuntimeError {
     RuntimeError::Khive(KhiveError::conflict(format!(
-        "note {id} changed concurrently after it was read; retry with fresh state"
+        "{substrate} {id} changed concurrently after it was read; retry with fresh state"
     )))
+}
+
+pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
+    stale_snapshot_error("note", id)
 }
 
 pub(crate) fn stale_entity_snapshot_error(id: Uuid) -> RuntimeError {
-    RuntimeError::Khive(KhiveError::conflict(format!(
-        "entity {id} changed concurrently after it was read; retry with fresh state"
-    )))
+    stale_snapshot_error("entity", id)
 }
 
 pub(crate) fn stale_edge_snapshot_error(id: Uuid) -> RuntimeError {
-    RuntimeError::Khive(KhiveError::conflict(format!(
-        "edge {id} changed concurrently after it was read; retry with fresh state"
-    )))
+    stale_snapshot_error("edge", id)
 }
 
 /// Immutable embedding-registry view for one logical write.
