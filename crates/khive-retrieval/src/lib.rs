@@ -20,6 +20,7 @@ pub mod adapters;
 #[cfg(feature = "ann")]
 #[doc(hidden)]
 pub mod ann;
+pub mod calibration;
 pub mod error;
 pub mod eval;
 pub mod hit;
@@ -43,6 +44,7 @@ pub mod weights;
 pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 
 // Re-export core types
+pub use calibration::{calibrate_engine_hits, CalibratedHit};
 pub use error::{ErrorKind, Result, RetrievalError};
 pub use hit::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 
