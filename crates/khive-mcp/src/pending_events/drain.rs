@@ -643,7 +643,6 @@ pub(super) async fn run_pending_events_on_with_lease(
                     };
                     props["missed_at"] = json!(now.timestamp_micros());
                     if claim.catch_up.is_some() {
-                        props["fired_at"] = Value::Null;
                         if let Err(error) = validate_dispatch_receipt(
                             id,
                             claim.firing_at,

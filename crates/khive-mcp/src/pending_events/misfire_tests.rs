@@ -239,7 +239,12 @@ async fn explicit_horizon_admits_equality_and_rejects_even_inside_global_grace()
             assert!(saved["fired_at"].as_str().is_some());
         } else {
             assert_eq!(summary.missed, vec![id]);
-            assert!(saved["fired_at"].is_null());
+            // A miss records no fire: a repeat keeps its last real fire time.
+            if repeat.is_some() {
+                assert_eq!(saved["fired_at"], "1999-01-01T00:00:00Z");
+            } else {
+                assert!(saved["fired_at"].is_null());
+            }
             assert_eq!(saved["dispatch_receipt"]["state"], "missed");
             assert_eq!(
                 saved["status"],

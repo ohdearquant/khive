@@ -239,8 +239,9 @@ latest recurrence occurrence `L` at or before that clock. The stored raw trigger
 `T` remains the source for the claim CAS; it is never rewritten to `L` before
 claiming. An off-pattern initial cron trigger is still an occurrence, and monthly
 recurrences use their original anchor. The bound admits equality. A miss invokes
-nothing, leaves `fired_at` null, and becomes terminal for a one-shot or re-arms a
-repeat at the first future occurrence. An eligible old-backup row invokes at most
+nothing and writes no `fired_at` (a one-shot keeps it null, a repeat keeps its last
+real fire time), and becomes terminal for a one-shot or re-arms a repeat at the
+first future occurrence. An eligible old-backup row invokes at most
 once per drain, with collapsed older occurrences recorded in `missed_at`.
 
 Catch-up claims use receipt version 2: `source_trigger_at` preserves the raw
