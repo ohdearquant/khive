@@ -1128,9 +1128,14 @@ omitted bound is not frozen into a numeric value at creation. A non-repeating
 event has no period, so `catch_up_once` on a one-shot requires an explicit
 positive `max_lateness`. The pack rejects an omitted bound in that case; it
 must never acquire an unbounded catch-up window by default. Existing rows
-require no migration and continue to use `skip`. Sparse cron patterns can
-have a long default period; callers that need a shorter safety window supply
-an explicit bound.
+require no migration and continue to use `skip`.
+
+The omitted bound never refuses a repeating row. `L` is the latest occurrence
+at or before `now` and `F` the first after it, so the age `now - L` is always
+less than the period `F - L`. The default therefore limits a row to one
+invocation of its latest occurrence; it does not limit lateness, and it does
+not limit how many opted-in rows fire after a restore or a long outage.
+Callers that need lateness to prevent a dispatch supply an explicit bound.
 
 ### Selection and disposition
 
@@ -1200,7 +1205,11 @@ default `skip` rows; the new version must not reinterpret a version-1
 
 The claim records `effective_max_lateness` (positive integer seconds) used
 for its decision so recovery can audit the choice without consulting a later
-daemon environment. If a
+daemon environment. An explicit bound is recorded as given. An omitted bound
+is decided on the exact period, which can be fractional when a cron row's
+initial off-pattern `T` carries sub-second precision, and is recorded rounded
+up to whole seconds. The rounding cannot change the decision, because the age
+of `L` is below the period. If a
 durable success or known failure survives a crash, recovery finalizes that
 same `L` without invoking it again and computes the next future trigger from
 the recovery finalization time. The receipt's `scheduled_for` stays `L` after
