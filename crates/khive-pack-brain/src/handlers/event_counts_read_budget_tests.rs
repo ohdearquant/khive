@@ -91,7 +91,7 @@ async fn both_grouped_count_adapters_preserve_typed_read_refusals_without_fallba
 
 #[tokio::test]
 async fn actual_event_counts_handler_refuses_an_expired_original_request() {
-    let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig::no_embeddings()).unwrap();
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(BrainPack::new(runtime));
