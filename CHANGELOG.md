@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A daemon that supervises an events daemon now holds each request until that child's socket
+  answers for the first time, instead of dispatching while the child is still starting. A write
+  sent in that window could commit its domain change and then report a failed audit commit. If the
+  socket has not answered within 10 seconds of startup, requests are refused before dispatch with
+  `events_daemon_unavailable`, `retryable: true` and `domain_disposition: not_committed`, naming
+  the socket, until it answers. Probe frames are answered without waiting.
+
 ## [0.12.0] - 2026-10-13
 
 ### Documentation

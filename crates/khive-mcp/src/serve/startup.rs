@@ -528,14 +528,25 @@ pub(super) fn start_daemon_components_if_daemon(
         server.events_disk_policy(),
     ) {
         if let Some(socket) = split.socket_path.clone() {
+            // Requests wait at this gate until the supervised events daemon
+            // answers. It is installed here, in the start callback, so it is
+            // in place before the accept loop admits the first request.
+            let (readiness, gate) = khive_runtime::events_split::events_readiness(
+                socket.clone(),
+                khive_runtime::events_split::events_readiness_window(),
+            );
+            if !server.install_events_readiness(gate) {
+                tracing::warn!(target: "khive_mcp::serve", "events readiness gate already installed; keeping the first");
+            }
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon_with_policies(
+                khive_runtime::events_split::supervise_events_daemon_with_readiness(
                     split.db_path.clone(),
                     socket,
                     wal_ceiling,
                     disk_guard,
                     volume_lock_dir,
+                    readiness,
                 ),
             );
         }
