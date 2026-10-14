@@ -6322,3 +6322,42 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
         "ordinary DSL text must survive unmasked: {err}"
     );
 }
+
+/// Without sqlite_stat1, ordering the provenance lookup by the bare columns
+/// lets the planner satisfy `ORDER BY` with the namespace/created_at index
+/// and walk the namespace; the uniqueness `LIMIT 2` is normally never filled,
+/// so that walk reads every event of the namespace. The lookup must seek the
+/// index built for it.
+#[tokio::test]
+async fn creator_provenance_lookup_seeks_its_index_without_statistics() {
+    let (_dir, db_path) = tmp_db();
+    let rt = make_rt(&db_path).await;
+    let mut reader = rt.sql().reader().await.expect("open SQL reader");
+    let rows = reader
+        .explain(creator_provenance_statement(
+            "local",
+            uuid::Uuid::new_v4(),
+            "reminder",
+        ))
+        .await
+        .expect("explain the creator provenance lookup");
+    let details: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row.get("detail") {
+            Some(SqlValue::Text(detail)) => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("idx_schedule_creator_provenance") && detail.contains("target_id=?")
+        }),
+        "creator provenance must seek idx_schedule_creator_provenance: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("idx_events_ns_created")),
+        "creator provenance must not walk the namespace in created_at order: {details:?}"
+    );
+}

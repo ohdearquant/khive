@@ -323,6 +323,8 @@ impl KhiveMcpServer {
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
+            events_readiness: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(unix)]
             bridge_executable: None,
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -364,6 +366,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            events_readiness: Arc::new(std::sync::OnceLock::new()),
             #[cfg(unix)]
             bridge_executable: None,
             stdio_bridge: false,
@@ -620,6 +624,25 @@ impl KhiveMcpServer {
     pub(crate) fn record_schedule_ticker_tick(&self) {
         self.schedule_ticker_last_tick_micros
             .store(chrono::Utc::now().timestamp_micros(), Ordering::Release);
+    }
+
+    /// Install the startup gate for the events daemon this server's daemon
+    /// supervises. Returns `false`, leaving the first gate in place, when one
+    /// is already installed.
+    #[cfg(unix)]
+    pub(crate) fn install_events_readiness(
+        &self,
+        readiness: khive_runtime::events_split::EventsReadiness,
+    ) -> bool {
+        self.events_readiness.set(readiness).is_ok()
+    }
+
+    /// The installed events-daemon startup gate, shared by every clone.
+    #[cfg(unix)]
+    pub(crate) fn events_readiness_gate(
+        &self,
+    ) -> Option<khive_runtime::events_split::EventsReadiness> {
+        self.events_readiness.get().cloned()
     }
 
     /// Warm every pack's in-memory state. Called by the daemon in a background

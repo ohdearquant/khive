@@ -238,8 +238,9 @@ pub enum AuditCommitOutcome {
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
 /// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
-/// these three fields plus `admission_refused_obligations` and
-/// `admission_unresolved_obligations`, which are sourced from process-wide
+/// these three fields plus `admission_refused_obligations`,
+/// `retry_exhausted_obligations`, and `admission_unresolved_obligations`,
+/// which are sourced from process-wide
 /// counters outside `AuditBatch` rather than from this struct — see
 /// `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +513,10 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        StorageError::CapacityUnavailable {
+            phase: khive_storage::CapacityUnavailablePhase::LockContended,
+            ..
+        } => RetryDecision::Retry,
         // Transient availability conditions, not judgments on the batch. The
         // events-daemon forwarding lane (ADR-170) reports an unreachable or
         // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports

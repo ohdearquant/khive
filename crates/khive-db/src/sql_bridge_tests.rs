@@ -5699,3 +5699,32 @@ async fn max_completed_hold_operation_names_the_caller_read_not_a_bridge_constan
         "a pooled read drawn through the writer must record its own operation"
     );
 }
+
+/// The standalone writer takes the same page-cache and map settings as the
+/// pooled connections rather than a copy of its own.
+#[test]
+fn standalone_writer_takes_the_configured_page_cache_and_map() {
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_SQLITE_CACHE_KIB", "1024");
+        command.env("KHIVE_SQLITE_MMAP_BYTES", "4096");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("standalone_writer_page_settings.db")),
+        write_queue_enabled: Some(false),
+        max_readers: 1,
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let conn = open_standalone_writer(&pool).unwrap();
+    let cache: i64 = conn
+        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+        .unwrap();
+    let mmap: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((cache, mmap), (-1024, 4096));
+}

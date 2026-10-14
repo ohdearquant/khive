@@ -19,6 +19,10 @@ pub(super) struct ScoredTextItem {
     pub(super) score: f32,
 }
 
+fn compare_scored_text_items(a: &ScoredTextItem, b: &ScoredTextItem) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f32(a.score, &a.slug, b.score, &b.slug)
+}
+
 pub(super) async fn load_domain_by_id_or_slug(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -318,12 +322,7 @@ pub(super) async fn rerank_text_items(
         for (item, cos) in items.iter_mut().zip(cosines.iter()) {
             item.score = cos.max(0.0);
         }
-        items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.slug.cmp(&b.slug))
-        });
+        items.sort_by(compare_scored_text_items);
     }
     Ok(())
 }
@@ -347,6 +346,10 @@ pub(super) struct KgEntityHit {
     pub(super) name: String,
     pub(super) description: String,
     pub(super) score: f32,
+}
+
+fn compare_kg_entity_hits(a: &KgEntityHit, b: &KgEntityHit) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f32(a.score, &a.id, b.score, &b.id)
 }
 
 /// Finds `concept`/`document` KG entities relevant to `query`, reranked with
@@ -464,12 +467,7 @@ pub(super) async fn search_kg_entities(
         })
         .collect();
 
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    hits.sort_by(compare_kg_entity_hits);
     // Self-calibrating inclusion floor (ADR-051 Amendment 1): an entity only
     // blends in if it outranks the weakest atom that made the final body —
     // no fixed score constant. Applied after rerank, before the cap, so a
@@ -479,3 +477,7 @@ pub(super) async fn search_kg_entities(
     hits.truncate(cap);
     Ok(hits)
 }
+
+#[cfg(test)]
+#[path = "compose_ordering_tests.rs"]
+mod ordering_tests;

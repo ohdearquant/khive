@@ -61,7 +61,8 @@ mod server_build;
 pub use server_build::{
     build_server, build_server_from_multi_backend_registry, build_server_multi_backend,
     build_server_multi_backend_with_db_anchor, build_server_with_explicit_namespace,
-    checkpoint_pool_for, enforce_strict_actor_mode, mcp_max_readers, WiringSurface,
+    checkpoint_pool_for, enforce_strict_actor_mode, is_forwarding_client, mark_mcp_host_role,
+    mcp_max_readers, WiringSurface,
 };
 
 #[cfg(unix)]
@@ -146,6 +147,10 @@ thread_local! {
 mod channel_ingest;
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 use channel_ingest::*;
+
+#[cfg(feature = "channel-email")]
+#[path = "serve/email_host.rs"]
+mod email_host;
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
 /// both Telegram polling and outbound delivery follow the comm runtime, which
@@ -330,7 +335,7 @@ async fn telegram_poll_loop(
     use serde_json::json;
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
+    let mut failed_polls = std::collections::HashMap::<String, u8>::new();
 
     loop {
         // This loop polls before it waits, so shutdown is read at the top as
@@ -383,19 +388,19 @@ async fn telegram_poll_loop(
                         "default_inbound_actor": default_inbound_actor,
                     });
                     if let Err(error) = registry.dispatch("comm.ingest", params).await {
-                        let handled = handle_channel_ingest_failure(
+                        let outcome = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
                             (kind, &slug),
                             Some(&default_inbound_actor),
                             &env,
                             &error,
-                            &mut unknown_ingest_attempts,
+                            &mut failed_polls,
                             // The Telegram adapter declares no retention bound.
                             None,
                         )
                         .await;
-                        if !handled {
+                        if !outcome.released() {
                             all_ingested = false;
                         }
                     }
@@ -406,7 +411,7 @@ async fn telegram_poll_loop(
                     poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforeCommit).await;
                     telegram_channel.commit_offset();
                     for key in batch_attempt_keys {
-                        unknown_ingest_attempts.remove(&key);
+                        failed_polls.remove(&key);
                     }
                 } else {
                     tracing::warn!(
@@ -793,8 +798,12 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .map(|(name, backend)| (name.as_str(), backend.as_ref()))
         .collect();
     quarantine_sources.sort_by(|left, right| left.0.cmp(right.0));
-    crate::legacy_quarantine::repair_legacy_quarantine(&default_runtime, &quarantine_sources)
-        .await?;
+    crate::legacy_quarantine::repair_legacy_quarantine_at_boot(
+        &default_runtime,
+        &quarantine_sources,
+        is_forwarding_client(),
+    )
+    .await?;
 
     // Wrap runtimes in Arc for the coordinator's BackendRegistry.
     let per_pack_runtimes_arc: HashMap<String, Arc<KhiveRuntime>> = per_pack_runtimes_local

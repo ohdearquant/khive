@@ -1369,6 +1369,133 @@ fn allows_token_count_high_entropy() {
     );
 }
 
+// ── `*_token` credential labels (issue: access_token-labelled UUIDs passed) ──
+// A label ending in `_token` is a credential label unless it is one of the
+// position labels in POSITION_TOKEN_LABELS or the receipt labels in
+// RECEIPT_TOKEN_LABELS, matched as the whole label.
+
+#[test]
+fn blocks_uuid_under_access_token_label_in_both_forms() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    for content in [
+        format!("access_token: {uuid}"),
+        format!("{{\"access_token\":\"{uuid}\"}}"),
+    ] {
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("uuid-near-trigger"),
+            "a UUID assigned to access_token must be blocked like one assigned to token: {content:?}"
+        );
+    }
+}
+
+#[test]
+fn blocks_values_under_credential_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in [
+        "access_token",
+        "refresh_token",
+        "session_token",
+        "github_token",
+        "stale_next_token",
+    ] {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{label}={value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_some(),
+                    "a value assigned to credential label {label} must be blocked: {content:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn allows_values_under_position_and_receipt_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in POSITION_TOKEN_LABELS.iter().chain(RECEIPT_TOKEN_LABELS) {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{label}={value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_none(),
+                    "label {label} must not make its value a credential; fired: {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn token_label_rule_fails_closed_on_unlisted_names() {
+    // Documented contract: an unlisted `*_token` name is a credential label
+    // even when it names no secret, and one inside the trigger window counts
+    // even when it labels a different value.
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    for label in [
+        "skip_token",
+        "delta_token",
+        "idempotency_token",
+        "lease_token",
+        "cancel_token",
+    ] {
+        let content = format!("{label}: {uuid}");
+        assert!(
+            scan(&content).is_some(),
+            "unlisted label {label} must be a credential label: {content:?}"
+        );
+    }
+    let content = format!("chars_per_token: 4 for profile {uuid}");
+    assert!(
+        scan(&content).is_some(),
+        "a *_token label in the window counts: {content:?}"
+    );
+}
+
+#[test]
+fn allows_a_quoted_sealed_remember_response() {
+    // The shape `memory.remember` returns when sealing is on: the receipt is
+    // URL-safe base64 under `visibility_token`.
+    let response = "{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"kind\":\"memory\",\
+                    \"salience\":0.5,\"memory_type\":\"episodic\",\
+                    \"visibility_token\":\"Ab3kQ9-x_Zr7TmP2wLs8VnYc4HdJ6uE1gKoF5iRtB0qWzXyM\"}"; // gitleaks:allow
+    assert!(
+        scan(response).is_none(),
+        "a quoted sealed remember response must pass; fired: {:?}",
+        scan(response)
+    );
+}
+
+#[test]
+fn blocks_revision_urls_under_credential_token_labels() {
+    // A repository revision URL is exempt from trigger proximity but not from
+    // a direct credential label; every credential token label is one.
+    let url = "https://github.com/acme/widgets/blob/0123456789abcdef0123456789abcdef01234567/src/runtime/mod.rs";
+    for label in ["token", "access_token", "github_token"] {
+        let content = format!("{label}: {url}");
+        assert!(
+            scan(&content).is_some(),
+            "a revision URL assigned to credential label {label} must be blocked: {content:?}"
+        );
+    }
+    let content = format!("next_page_token: {url}");
+    assert!(
+        scan(&content).is_none(),
+        "a position label does not make a revision URL a credential; fired: {:?}",
+        scan(&content)
+    );
+}
+
 // ── Hex allowlist is not applied when trigger context is present ────────
 // Pure hex tops out at log2(16) = 4.0 bits/char, below ENTROPY_THRESHOLD (4.5), so
 // the entropy heuristic alone never flags it. The hex allowlist must only apply

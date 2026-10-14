@@ -31,9 +31,8 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -134,28 +133,8 @@ fn verify_handle_kind(file: &fs::File, require_directory: bool) -> io::Result<()
 }
 
 fn final_path(file: &fs::File) -> io::Result<Vec<u16>> {
-    let mut path = vec![0u16; 260];
-    loop {
-        // SAFETY: the handle is live and `path` exposes the supplied
-        // writable buffer for the call.
-        let length = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle() as Handle,
-                path.as_mut_ptr(),
-                path.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        };
-        if length == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let length = length as usize;
-        if length < path.len() {
-            path.truncate(length);
-            return Ok(path);
-        }
-        path.resize(length.saturating_add(1), 0);
-    }
+    let path = khive_fs::opened_file::opened_file_path(file)?;
+    Ok(path.as_os_str().encode_wide().collect())
 }
 
 fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
@@ -800,12 +779,6 @@ extern "system" {
         lp_last_access_time: *const FileTime,
         lp_last_write_time: *const FileTime,
     ) -> i32;
-    fn GetFinalPathNameByHandleW(
-        h_file: Handle,
-        lp_sz_file_path: *mut u16,
-        cch_file_path: u32,
-        dw_flags: u32,
-    ) -> u32;
     fn SetFileInformationByHandle(
         h_file: Handle,
         file_information_class: i32,
@@ -867,4 +840,37 @@ pub(super) fn process_start_time_secs(pid: u32) -> Option<i64> {
     const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
     let unix_100ns = ticks.checked_sub(EPOCH_DIFF_100NS)?;
     Some((unix_100ns / 10_000_000) as i64)
+}
+
+#[cfg(test)]
+mod final_path_tests {
+    use super::*;
+
+    #[test]
+    fn final_path_preserves_non_bmp_utf16() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("資料-🚀.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+        ensure_sidecar_dir(&dir).unwrap();
+        let file = open_dir_handle(&dir).unwrap();
+        let expected: Vec<u16> = fs::canonicalize(&dir)
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        let opened = final_path(&file).unwrap();
+        assert_eq!(opened, expected);
+        assert!(!opened.contains(&0));
+        assert!(opened.windows(2).any(|pair| pair == [0xd83d, 0xde80]));
+        let shared: Vec<u16> = khive_fs::opened_file::opened_file_path(&file)
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        assert_eq!(opened, shared);
+        assert!(windows_final_path_matches(&expected, &opened));
+        let mut different = opened;
+        *different.last_mut().unwrap() ^= 1;
+        assert!(!windows_final_path_matches(&expected, &different));
+    }
 }

@@ -526,3 +526,133 @@ fn committed_ingest_decoder_rejects_unrelated_and_malformed_errors() {
         );
     }
 }
+
+#[tokio::test]
+async fn quarantine_on_secondary_backend_is_recorded_without_its_original() {
+    use khive_runtime::{BackendId, Namespace, RuntimeConfig, StorageBackend};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    let main = Arc::new(StorageBackend::memory().expect("main backend"));
+    let comm = Arc::new(StorageBackend::memory().expect("comm backend"));
+    main.prepare_core_schema().expect("main schema");
+    comm.prepare_core_schema().expect("comm schema");
+    let mut config = RuntimeConfig::no_embeddings();
+    config.backend_id = BackendId::parse("comm").expect("backend id");
+    config.packs = vec!["kg".into(), "comm".into()];
+    let runtime = super::KhiveRuntime::from_backend(comm, config).with_core_backend(main);
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+    let original_ref = "c".repeat(64);
+    let body = json!({
+        "from": "email:quarantine",
+        "to": "local",
+        "content": "Inbound channel message quarantined.",
+        "channel_kind": "email",
+        "channel_slug": "inbox",
+        "external_id": "imap:mail.example.com:inbox:14:1673",
+        "metadata": {
+            "quarantined": "true",
+            "quarantine_classification": "unknown",
+            "quarantine_content_ref": original_ref,
+        },
+    });
+
+    let ack = super::handle_ingest(
+        &runtime,
+        &InboxSignal::new(),
+        Some(&capability),
+        &Ok(None),
+        &token,
+        body.clone(),
+        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+    )
+    .await
+    .expect("a quarantine on a secondary comm backend is recorded");
+    let note_id =
+        Uuid::parse_str(ack["full_id"].as_str().expect("full note id")).expect("canonical note id");
+
+    let note = runtime
+        .notes(&token)
+        .expect("comm notes")
+        .get_note(note_id)
+        .await
+        .expect("read quarantine message")
+        .expect("quarantine message is stored on the comm backend");
+    let props = note.properties.as_ref().expect("message properties");
+    assert!(
+        matches!(props.get("quarantined"), Some(Value::Bool(true)))
+            || props.get("quarantined").and_then(Value::as_str) == Some("true"),
+        "the message is still marked quarantined: {props}"
+    );
+    assert!(
+        props.get("quarantine_content_ref").is_none(),
+        "no unowned original reference is persisted: {props}"
+    );
+    assert_eq!(
+        props
+            .get("quarantine_original_retained")
+            .and_then(Value::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        props
+            .get("quarantine_original_not_retained_reason")
+            .and_then(Value::as_str),
+        Some("secondary-backend")
+    );
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("main attachments")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("owner lookup");
+    assert!(owner.is_none(), "no main-backend owner row: {owner:?}");
+    assert!(
+        note.expires_at.is_some(),
+        "the record keeps the quarantine retention deadline"
+    );
+
+    // A later poll delivers the same message again. The replay resolves to the
+    // stored record and still writes no owner row on main, so the channel
+    // moves on instead of refusing the message on every poll.
+    let replay = super::handle_ingest(
+        &runtime,
+        &InboxSignal::new(),
+        Some(&capability),
+        &Ok(None),
+        &token,
+        body,
+        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+    )
+    .await
+    .expect("a replay on a secondary comm backend is acknowledged");
+    assert_eq!(replay["deduplicated"], json!(true), "{replay}");
+    let replayed = runtime
+        .notes(&token)
+        .expect("comm notes")
+        .get_note(note_id)
+        .await
+        .expect("read quarantine message")
+        .expect("quarantine message is still stored");
+    assert!(
+        replayed
+            .properties
+            .as_ref()
+            .and_then(|props| props.get("quarantine_content_ref"))
+            .is_none(),
+        "the replay persists no original reference"
+    );
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("main attachments")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("owner lookup after replay");
+    assert!(
+        owner.is_none(),
+        "no main-backend owner row after replay: {owner:?}"
+    );
+}

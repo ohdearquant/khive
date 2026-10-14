@@ -226,6 +226,7 @@ mod file_identity_tests {
             backend: Some("alias".to_string()),
             strict: true,
             human: false,
+            integrity: false,
         })
         .await
         .expect_err("checking a current main alias must include the legacy secondary");

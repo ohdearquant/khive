@@ -154,6 +154,22 @@ async fn direct_hosts_keep_default_readers() {
     }
 }
 
+#[test]
+#[serial]
+#[serial(config_ledger)]
+fn each_boot_records_its_own_forwarding_role() {
+    let _env = FixtureEnv::clear();
+    let args = Args::parse_from(["mcp", "--no-embed"]);
+    mark_mcp_host_role(&args);
+    assert_eq!(is_forwarding_client(), cfg!(unix));
+    std::env::set_var("KHIVE_NO_DAEMON", "1");
+    mark_mcp_host_role(&args);
+    assert!(
+        !is_forwarding_client(),
+        "a daemonless boot after a forwarding one must run the store-owning boot work"
+    );
+}
+
 #[tokio::test]
 #[serial]
 #[serial(config_ledger)]

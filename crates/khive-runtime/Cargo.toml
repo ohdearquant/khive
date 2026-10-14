@@ -53,6 +53,9 @@ zeroize = "1.9.0"
 base64 = { workspace = true }
 rand = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = { workspace = true }
+
 [dev-dependencies]
 khive-db = { version = "0.12.0", path = "../khive-db", features = ["test-support"] }
 khive-request = { version = "0.12.0", path = "../khive-request" }

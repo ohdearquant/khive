@@ -1530,6 +1530,49 @@ pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteEr
     validate_schema_is_current(&conn)
 }
 
+/// Page accounting for one database file. Each value is a single pragma read,
+/// so the cost does not grow with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageAccounting {
+    /// `PRAGMA page_size`, in bytes.
+    pub page_size: u64,
+    /// `PRAGMA page_count`: every page in the database, free pages included.
+    pub page_count: u64,
+    /// `PRAGMA freelist_count`: pages that later writes can reuse but that stay
+    /// in the file until a `VACUUM`.
+    pub freelist_count: u64,
+}
+
+/// Open `path` read-only and report its page accounting without creating,
+/// migrating or walking the file. The caller must ensure `path` exists.
+pub fn inspect_page_accounting(path: &std::path::Path) -> Result<PageAccounting, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let read = |pragma: &str| -> Result<u64, SqliteError> {
+        let value: i64 = conn.query_row(pragma, [], |row| row.get(0))?;
+        u64::try_from(value)
+            .map_err(|_| SqliteError::InvalidData(format!("{pragma} returned {value}")))
+    };
+    Ok(PageAccounting {
+        page_size: read("PRAGMA page_size")?,
+        page_count: read("PRAGMA page_count")?,
+        freelist_count: read("PRAGMA freelist_count")?,
+    })
+}
+
+/// Open `path` read-only and run `PRAGMA integrity_check` over the whole file,
+/// returning every row SQLite reports: exactly `["ok"]` for a sound file. The
+/// check reads every page, so its cost grows with the file. No error limit is
+/// applied: the pragma's default stops at 100 rows, so the largest limit it
+/// accepts is passed instead.
+pub fn inspect_integrity(path: &std::path::Path) -> Result<Vec<String>, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let mut statement = conn.prepare(&format!("PRAGMA integrity_check({})", i32::MAX))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Require an already-open database to match this build's latest core schema
 /// without applying migrations.
 ///

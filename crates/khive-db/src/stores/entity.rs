@@ -217,6 +217,29 @@ pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     }
 }
 
+/// Preserve merge provenance when tombstoning a live source in its existing namespace.
+pub fn entity_merge_tombstone_statement(
+    namespace: &str,
+    from_id: Uuid,
+    into_id: Uuid,
+    merge_event_id: Uuid,
+    now: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE entities \
+             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1, version = version + 1 \
+             WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
+        vec![
+            SqlValue::Integer(now),
+            SqlValue::Text(into_id.to_string()),
+            SqlValue::Text(merge_event_id.to_string()),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(from_id.to_string()),
+        ],
+    )
+    .labelled("entity-merge-tombstone")
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_entity(Hard)` issues
 /// (no `deleted_at` predicate — purges live and already-tombstoned rows).
 pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
@@ -1581,3 +1604,7 @@ mod direct_busy_tests;
 #[cfg(test)]
 #[path = "entity_list_plan_tests.rs"]
 mod entity_list_plan_tests;
+
+#[cfg(test)]
+#[path = "entity_merge_tombstone_tests.rs"]
+mod entity_merge_tombstone_tests;

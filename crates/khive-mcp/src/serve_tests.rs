@@ -1679,7 +1679,61 @@ async fn db_diagnostics_lists_main_and_routed_secondary() {
             database["diagnostics"]["writer_contention"].is_object(),
             "{database}"
         );
+        assert!(
+            database["diagnostics"]["size_composition"].is_object(),
+            "{database}"
+        );
+        assert!(
+            database["diagnostics"]["page_accounting"]["page_count"].as_u64() > Some(0),
+            "{database}"
+        );
     }
+    assert_eq!(result["complete"], serde_json::json!(true), "{result}");
+
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"db_diagnostics(backend="second", size_composition=false)"#.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("scoped diagnostics dispatch");
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["results"][0]["ok"],
+        serde_json::json!(true),
+        "{response}"
+    );
+    let result = &response["results"][0]["result"];
+    let databases = result["databases"].as_array().expect("database entries");
+    assert_eq!(databases.len(), 1, "{result}");
+    assert_eq!(databases[0]["backend_names"], serde_json::json!(["second"]));
+    assert_eq!(
+        databases[0]["path"],
+        serde_json::json!(second_path.canonicalize().unwrap().display().to_string())
+    );
+    // The root fields are the first inspected report's own, which carries the
+    // path the database was opened with (not canonicalized: on macOS the temp
+    // dir is reached through the /var -> /private/var link).
+    assert_eq!(
+        result["db_path"], databases[0]["diagnostics"]["db_path"],
+        "the root fields describe the selected backend"
+    );
+    assert!(
+        result["db_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("second.db")),
+        "the root fields describe the selected backend: {result}"
+    );
+    assert!(result["size_composition"].is_null(), "{result}");
+    assert_eq!(
+        result["size_composition_error"],
+        serde_json::json!(khive_db::diagnostics::SIZE_COMPOSITION_NOT_REQUESTED)
+    );
+    assert!(
+        result["page_accounting"]["page_count"].as_u64() > Some(0),
+        "{result}"
+    );
+    assert_eq!(result["complete"], serde_json::json!(true), "{result}");
 }
 
 #[tokio::test]
@@ -6701,7 +6755,7 @@ mod channel_ingest_disposition_tests {
             reason: "InvalidInput",
         };
 
-        for expected_attempt in 1..UNKNOWN_INGEST_QUARANTINE_THRESHOLD {
+        for expected_attempt in 1..HOLD_QUARANTINE_THRESHOLD {
             assert_eq!(
                 channel_ingest_disposition(
                     classification,
@@ -6722,22 +6776,34 @@ mod channel_ingest_disposition_tests {
     }
 
     #[test]
-    fn retryable_never_increments_and_permanent_quarantines_immediately() {
+    fn retryable_failure_holds_fifty_nine_attempts_then_quarantines_on_sixty() {
         let mut attempts = HashMap::new();
-        assert_eq!(
-            channel_ingest_disposition(
-                ChannelIngestFailureClass::Retryable { reason: "Storage" },
-                "email",
-                Some("imap:h:1:8"),
-                &mut attempts,
-            ),
-            ChannelIngestDisposition::Hold { attempt: None }
-        );
-        assert!(
-            attempts.is_empty(),
-            "retryable failures must not consume the unknown budget"
-        );
+        let classification = ChannelIngestFailureClass::Retryable { reason: "Storage" };
 
+        for expected_attempt in 1..RETRYABLE_HOLD_QUARANTINE_THRESHOLD {
+            assert_eq!(
+                channel_ingest_disposition(
+                    classification,
+                    "email",
+                    Some("imap:h:1:8"),
+                    &mut attempts,
+                ),
+                ChannelIngestDisposition::Hold {
+                    attempt: Some(expected_attempt),
+                },
+                "a busy store must not quarantine before its longer bound"
+            );
+        }
+        assert_eq!(
+            channel_ingest_disposition(classification, "email", Some("imap:h:1:8"), &mut attempts),
+            ChannelIngestDisposition::Quarantine,
+            "the sixtieth retryable failure must release the page"
+        );
+    }
+
+    #[test]
+    fn permanent_failure_quarantines_immediately_without_counting() {
+        let mut attempts = HashMap::new();
         assert_eq!(
             channel_ingest_disposition(
                 ChannelIngestFailureClass::Permanent {
@@ -6751,8 +6817,132 @@ mod channel_ingest_disposition_tests {
         );
         assert!(
             attempts.is_empty(),
-            "permanent failures bypass the unknown budget"
+            "permanent failures do not consume a hold budget"
         );
+    }
+
+    /// Every hold cause shares one count per message, so holds for a cause
+    /// other than an ingest refusal bring the ingest bound closer.
+    #[test]
+    fn hold_causes_share_one_count_per_message() {
+        let mut attempts = HashMap::new();
+        for expected in 1..=3u8 {
+            assert_eq!(
+                record_channel_hold("email", Some("imap:h:1:10"), &mut attempts),
+                Some(expected)
+            );
+        }
+        let classification = ChannelIngestFailureClass::Unknown {
+            reason: "InvalidInput",
+        };
+        assert_eq!(
+            channel_ingest_disposition(classification, "email", Some("imap:h:1:10"), &mut attempts),
+            ChannelIngestDisposition::Hold { attempt: Some(4) }
+        );
+        assert_eq!(
+            channel_ingest_disposition(classification, "email", Some("imap:h:1:10"), &mut attempts),
+            ChannelIngestDisposition::Quarantine,
+            "three earlier holds plus two ingest refusals reach the bound of five"
+        );
+        assert_eq!(
+            record_channel_hold("email", None, &mut attempts),
+            None,
+            "a message without an external id cannot be counted"
+        );
+    }
+
+    /// The classification names only the error variant ("InvalidInput"); the
+    /// operator needs the refusal itself to tell one cause from another. Both
+    /// warn lines a failed ingest can produce must carry it.
+    #[tokio::test]
+    async fn ingest_failure_warnings_carry_the_ingest_error_text() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let log = CapturedLog::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish(),
+        );
+        // An empty registry has no blob or comm verbs, so the quarantine
+        // attempt on the last call fails and reaches the second warn line.
+        let registry = khive_runtime::VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+        let envelope = khive_channel::ChannelEnvelope::new(
+            "email:sender@example.com",
+            "email:owner@example.com",
+            "body",
+        )
+        .with_external_id("imap:h:1:11");
+        let error =
+            khive_runtime::RuntimeError::InvalidInput("ingest refusal marker 5f2c".to_string());
+        assert!(matches!(
+            error.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Unknown { .. }
+        ));
+
+        let mut attempts = HashMap::new();
+        for _ in 0..HOLD_QUARANTINE_THRESHOLD {
+            let outcome = handle_channel_ingest_failure(
+                &registry,
+                "local",
+                ("email", "owner@example.com"),
+                None,
+                &envelope,
+                &error,
+                &mut attempts,
+                None,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                ChannelIngestFailureOutcome::Held,
+                "no call may report the message released"
+            );
+        }
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let holds: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("comm.ingest failed; holding channel progress"))
+            .collect();
+        let quarantine_failed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("channel quarantine failed; holding progress for retry"))
+            .collect();
+        assert_eq!(
+            holds.len(),
+            usize::from(HOLD_QUARANTINE_THRESHOLD - 1),
+            "{text}"
+        );
+        assert_eq!(quarantine_failed.len(), 1, "{text}");
+        for line in holds.iter().chain(&quarantine_failed) {
+            assert!(
+                line.contains("ingest_error=invalid input: ingest refusal marker 5f2c"),
+                "{line}"
+            );
+        }
     }
 }
 
@@ -7935,7 +8125,10 @@ mod channel_heartbeat_tests {
             &registry,
             "email",
             "recipient@example.com",
-            HeartbeatOutcome::Success,
+            HeartbeatOutcome::Success {
+                held_messages: 0,
+                quarantined_after_hold: 0,
+            },
             None,
         )
         .await;
@@ -7959,7 +8152,10 @@ mod channel_heartbeat_tests {
             &registry,
             "email",
             "recipient@example.com",
-            HeartbeatOutcome::Success,
+            HeartbeatOutcome::Success {
+                held_messages: 0,
+                quarantined_after_hold: 0,
+            },
             None,
         )
         .await;
@@ -7977,6 +8173,109 @@ mod channel_heartbeat_tests {
         );
         assert_eq!(channels[0]["poll_interval_secs"].as_u64(), Some(5));
         assert_eq!(channels[0]["stalled"].as_bool(), Some(false));
+    }
+
+    /// A writer that reports holds maintains them on its heartbeat row:
+    /// `consecutive_held_polls` counts successive held polls, a failed poll
+    /// leaves the hold facts as they were, and a poll without a hold resets
+    /// the count while `last_held_at` keeps the last hold.
+    #[tokio::test]
+    async fn held_polls_are_counted_on_the_heartbeat_and_reset_by_a_clean_poll() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        khive_runtime::PackRegistry::register_packs(
+            &["kg".to_string(), "comm".to_string()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .expect("register kg+comm through the factory path");
+        let registry = builder.build().expect("registry builds");
+        let slug = "inbox@example.com";
+        async fn first_channel(registry: &khive_runtime::VerbRegistry) -> serde_json::Value {
+            let health = registry
+                .dispatch("comm.health", serde_json::json!({}))
+                .await
+                .expect("health succeeds");
+            health["channels"][0].clone()
+        }
+
+        for _ in 0..3 {
+            record_channel_heartbeat(
+                &registry,
+                "email",
+                slug,
+                HeartbeatOutcome::Success {
+                    held_messages: 2,
+                    quarantined_after_hold: 0,
+                },
+                None,
+            )
+            .await;
+        }
+        let held = first_channel(&registry).await;
+        assert_eq!(held["consecutive_held_polls"], 3, "{held}");
+        assert_eq!(held["held_messages"], 2, "{held}");
+        let last_held_at = held["last_held_at"].clone();
+        assert!(last_held_at.is_string(), "{held}");
+        assert!(held["last_quarantined_after_hold_at"].is_null(), "{held}");
+
+        record_channel_heartbeat(
+            &registry,
+            "email",
+            slug,
+            HeartbeatOutcome::Failure {
+                class: "transport",
+                message: "connection reset".to_string(),
+            },
+            None,
+        )
+        .await;
+        let after_failure = first_channel(&registry).await;
+        assert_eq!(after_failure["consecutive_failures"], 1, "{after_failure}");
+        assert_eq!(
+            after_failure["consecutive_held_polls"], 3,
+            "{after_failure}"
+        );
+        assert_eq!(after_failure["held_messages"], 2, "{after_failure}");
+
+        record_channel_heartbeat(
+            &registry,
+            "email",
+            slug,
+            HeartbeatOutcome::Success {
+                held_messages: 0,
+                quarantined_after_hold: 1,
+            },
+            None,
+        )
+        .await;
+        let released = first_channel(&registry).await;
+        assert_eq!(released["consecutive_held_polls"], 0, "{released}");
+        assert_eq!(released["held_messages"], 0, "{released}");
+        assert_eq!(released["last_held_at"], last_held_at, "{released}");
+        assert!(
+            released["last_quarantined_after_hold_at"].is_string(),
+            "{released}"
+        );
+
+        let error = registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": khive_pack_comm::CHANNEL_HEALTH_NAMESPACE,
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "outcome": "failure",
+                    "error_class": "transport",
+                    "held_messages": 1,
+                }),
+            )
+            .await
+            .expect_err("a failed poll read no page, so it carries no hold counts");
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::InvalidInput(_)),
+            "{error:?}"
+        );
     }
 
     /// #606: a daemon polling under a
@@ -8021,7 +8320,10 @@ mod channel_heartbeat_tests {
             &registry,
             "email",
             "recipient@example.com",
-            HeartbeatOutcome::Success,
+            HeartbeatOutcome::Success {
+                held_messages: 0,
+                quarantined_after_hold: 0,
+            },
             None,
         )
         .await;
@@ -8123,7 +8425,17 @@ mod composite_key_registry_tests {
         // Drive exactly what the production poll loop does per tick: iterate
         // the registry and record a heartbeat for every (kind, slug, channel).
         for (kind, slug, _channel) in ch_registry.iter() {
-            record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success, None).await;
+            record_channel_heartbeat(
+                &registry,
+                kind,
+                slug,
+                HeartbeatOutcome::Success {
+                    held_messages: 0,
+                    quarantined_after_hold: 0,
+                },
+                None,
+            )
+            .await;
         }
 
         let health = registry
@@ -9999,6 +10311,467 @@ mod cursor_commit_gating_tests {
         );
     }
 
+    /// The same page on every poll until a checkpoint at its high-water (3)
+    /// is committed, then an empty page. Each call's checkpoint is recorded
+    /// for the test body, as in `PartialFailureChannel`.
+    struct HeldPageChannel {
+        kind: &'static str,
+        limit: Option<usize>,
+        page: fn() -> Vec<ChannelEnvelope>,
+        observed_checkpoints: Arc<Mutex<Vec<Option<StoredChannelCheckpoint>>>>,
+    }
+
+    #[async_trait]
+    impl Channel for HeldPageChannel {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn quarantine_retention_limit(&self) -> Option<usize> {
+            self.limit
+        }
+
+        async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn poll(&self, _since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+            panic!("the daemon poll loop must call poll_page, not poll");
+        }
+
+        async fn poll_page(
+            &self,
+            _since: DateTime<Utc>,
+            checkpoint: Option<&StoredChannelCheckpoint>,
+        ) -> Result<ChannelPollPage, ChannelError> {
+            self.observed_checkpoints
+                .lock()
+                .unwrap()
+                .push(checkpoint.cloned());
+            if checkpoint.is_some_and(|stored| stored.checkpoint.high_water == Some(3)) {
+                return Ok(ChannelPollPage {
+                    envelopes: vec![],
+                    next_checkpoint: None,
+                });
+            }
+            Ok(ChannelPollPage {
+                envelopes: (self.page)(),
+                next_checkpoint: Some(ChannelCheckpoint {
+                    source: SOURCE.to_string(),
+                    generation: 1,
+                    high_water: Some(3),
+                }),
+            })
+        }
+    }
+
+    /// Three messages; the middle one has empty content, which `comm.ingest`
+    /// refuses as `InvalidInput` (an `Unknown` failure) on every attempt.
+    fn page_with_refused_middle(middle_external_id: Option<&str>) -> Vec<ChannelEnvelope> {
+        let message = |external_id: &str, content: &str| {
+            ChannelEnvelope::new("email:sender@example.com", "email:me@example.com", content)
+                .with_external_id(external_id)
+        };
+        let mut middle =
+            ChannelEnvelope::new("email:sender@example.com", "email:me@example.com", "");
+        if let Some(external_id) = middle_external_id {
+            middle = middle.with_external_id(external_id);
+        }
+        vec![
+            message("imap:h:1:1", "first body"),
+            middle,
+            message("imap:h:1:3", "third body"),
+        ]
+    }
+
+    /// kg plus comm with the channel-ingest capability and no blob pack, so
+    /// a `blob.put` of a quarantined original is refused.
+    fn kg_comm_registry() -> khive_runtime::VerbRegistry {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(
+            khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                runtime.clone(),
+                khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+            ),
+        );
+        builder.build().expect("registry builds")
+    }
+
+    /// Run the poll loop over `channel` until `done` holds for the recorded
+    /// checkpoints, bounded by wall-clock time (the `comm.*` dispatches run on
+    /// the blocking pool, so a fixed tick budget cannot bound them).
+    async fn poll_until(
+        registry: &khive_runtime::VerbRegistry,
+        channel: HeldPageChannel,
+        done: impl Fn(&[Option<StoredChannelCheckpoint>]) -> bool,
+        what: &str,
+    ) -> Vec<Option<StoredChannelCheckpoint>> {
+        let observed = channel.observed_checkpoints.clone();
+        let mut ch_registry = ChannelRegistry::new();
+        ch_registry.register(Arc::new(channel));
+        let task = tokio::spawn(channel_poll_loop(
+            Arc::new(ch_registry),
+            registry.clone(),
+            "test-ns".to_string(),
+            "actor:test".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if done(&observed.lock().unwrap()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} within 60s of wall-clock time: {:?}",
+                observed.lock().unwrap()
+            );
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let calls = observed.lock().unwrap().clone();
+        task.abort();
+        calls
+    }
+
+    fn committed_at_page_end(call: &Option<StoredChannelCheckpoint>) -> bool {
+        call.as_ref()
+            .is_some_and(|stored| stored.checkpoint.high_water == Some(3))
+    }
+
+    async fn heartbeat_row(
+        registry: &khive_runtime::VerbRegistry,
+        kind: &str,
+    ) -> serde_json::Value {
+        let health = registry
+            .dispatch("comm.health", json!({}))
+            .await
+            .expect("health succeeds");
+        health["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["channel_kind"] == kind)
+            .cloned()
+            .unwrap_or_else(|| panic!("no heartbeat row for {kind}: {health}"))
+    }
+
+    fn messages_with_external_id<'a>(
+        notes: &'a [serde_json::Value],
+        external_id: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        notes
+            .iter()
+            .filter(|note| note["properties"]["external_id"].as_str() == Some(external_id))
+            .collect()
+    }
+
+    /// A message `comm.ingest` refuses on every poll holds its page for four
+    /// polls and is quarantined on the fifth, after which the page commits at
+    /// its high-water and its neighbours are recorded exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn refused_message_is_quarantined_on_its_fifth_failed_poll_and_the_page_commits() {
+        let registry = kg_comm_registry();
+        let calls = poll_until(
+            &registry,
+            HeldPageChannel {
+                kind: "mock_held",
+                limit: Some(0),
+                page: || page_with_refused_middle(Some("imap:h:1:2")),
+                observed_checkpoints: Arc::default(),
+            },
+            |calls| calls.iter().any(committed_at_page_end),
+            "the page must commit once its refused message reaches the bound",
+        )
+        .await;
+
+        let first_commit = calls
+            .iter()
+            .position(committed_at_page_end)
+            .expect("a committed checkpoint was observed");
+        assert_eq!(
+            first_commit,
+            usize::from(HOLD_QUARANTINE_THRESHOLD),
+            "polls 1-4 hold, poll 5 quarantines and commits, poll 6 observes it: {calls:?}"
+        );
+        assert!(
+            calls[..first_commit].iter().all(Option::is_none),
+            "no checkpoint may commit while the message holds: {calls:?}"
+        );
+
+        let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+        assert_eq!(
+            messages_with_external_id(&notes, "imap:h:1:1").len(),
+            1,
+            "{notes:?}"
+        );
+        assert_eq!(
+            messages_with_external_id(&notes, "imap:h:1:3").len(),
+            1,
+            "{notes:?}"
+        );
+        let quarantined = messages_with_external_id(&notes, "imap:h:1:2");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one record of the refused message: {notes:?}"
+        );
+        let props = &quarantined[0]["properties"];
+        assert_eq!(props["quarantined"], "true");
+        assert_eq!(props["from_actor"], "mock_held:quarantine");
+        assert_eq!(props["quarantine_classification"], "unknown");
+        assert_eq!(props["quarantine_failed_polls"], "5");
+
+        let heartbeat = heartbeat_row(&registry, "mock_held").await;
+        assert_eq!(heartbeat["consecutive_held_polls"], 0, "{heartbeat}");
+        assert!(heartbeat["last_held_at"].is_string(), "{heartbeat}");
+        assert!(
+            heartbeat["last_quarantined_after_hold_at"].is_string(),
+            "{heartbeat}"
+        );
+    }
+
+    /// Control arm for the test above: the same page whose refused message
+    /// has no external id cannot be counted, so its bound never applies. The
+    /// cursor holds on every poll and the heartbeat counts every held poll.
+    #[tokio::test(start_paused = true)]
+    async fn refused_message_without_an_external_id_holds_the_page_on_every_poll() {
+        let registry = kg_comm_registry();
+        let calls = poll_until(
+            &registry,
+            HeldPageChannel {
+                kind: "mock_unbounded",
+                limit: Some(0),
+                page: || page_with_refused_middle(None),
+                observed_checkpoints: Arc::default(),
+            },
+            |calls| calls.len() >= 8,
+            "the loop must poll eight times",
+        )
+        .await;
+        assert!(
+            calls.iter().all(Option::is_none),
+            "an uncountable refusal must hold the page: {calls:?}"
+        );
+
+        let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+        assert!(
+            notes
+                .iter()
+                .all(|note| note["properties"]["quarantined"].is_null()),
+            "nothing is quarantined: {notes:?}"
+        );
+        let heartbeat = heartbeat_row(&registry, "mock_unbounded").await;
+        assert!(
+            heartbeat["consecutive_held_polls"].as_u64() >= Some(7),
+            "the seven polls before the eighth each held: {heartbeat}"
+        );
+        assert_eq!(heartbeat["held_messages"], 1, "{heartbeat}");
+    }
+
+    /// A gate-quarantined email whose original cannot be stored holds its
+    /// page under the same bound, then is recorded without the original,
+    /// naming why, and the page commits.
+    #[tokio::test(start_paused = true)]
+    async fn unstorable_quarantined_original_is_recorded_without_it_after_the_bound() {
+        let registry = kg_comm_registry();
+        let calls = poll_until(
+            &registry,
+            HeldPageChannel {
+                kind: "email",
+                limit: None,
+                page: || {
+                    let mut envelope = ChannelEnvelope::new(
+                        "email:quarantine",
+                        "email:maintainer@example.com",
+                        "untrusted body",
+                    )
+                    .with_external_id("imap:h:account:11:4")
+                    .with_quarantine_replay(
+                        b"raw original".to_vec(),
+                        "email:maintainer@example.com",
+                    );
+                    envelope
+                        .metadata
+                        .insert("quarantined".to_string(), "true".to_string());
+                    envelope
+                        .metadata
+                        .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+                    vec![envelope]
+                },
+                observed_checkpoints: Arc::default(),
+            },
+            |calls| calls.iter().any(committed_at_page_end),
+            "the page must commit once the original's failures reach the bound",
+        )
+        .await;
+        let first_commit = calls
+            .iter()
+            .position(committed_at_page_end)
+            .expect("a committed checkpoint was observed");
+        assert_eq!(
+            first_commit,
+            usize::from(HOLD_QUARANTINE_THRESHOLD),
+            "{calls:?}"
+        );
+        assert!(
+            calls[..first_commit].iter().all(Option::is_none),
+            "{calls:?}"
+        );
+
+        let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+        let recorded = messages_with_external_id(&notes, "imap:h:account:11:4");
+        assert_eq!(recorded.len(), 1, "{notes:?}");
+        let props = &recorded[0]["properties"];
+        assert_eq!(props["quarantined"], "true");
+        assert_eq!(props["quarantine_original_retained"], "false");
+        assert_eq!(
+            props["quarantine_original_not_retained_reason"],
+            "original-store-failed"
+        );
+        assert!(
+            props["quarantine_original_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("blob.put")),
+            "{props}"
+        );
+        assert_eq!(props["quarantine_failed_polls"], "5");
+        assert!(props.get("quarantine_content_ref").is_none(), "{props}");
+
+        let heartbeat = heartbeat_row(&registry, "email").await;
+        assert!(
+            heartbeat["last_quarantined_after_hold_at"].is_string(),
+            "{heartbeat}"
+        );
+    }
+
+    /// Stands in for the blob pack with a `blob.put` that answers with a
+    /// reference `comm.ingest` refuses, so the quarantine record that carries
+    /// it is refused and the record without it is not.
+    struct UnusableRefBlobPack;
+
+    impl khive_types::Pack for UnusableRefBlobPack {
+        const NAME: &'static str = "blob";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "blob.put",
+            description: "answer with an unusable content reference",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Directive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl khive_runtime::PackRuntime for UnusableRefBlobPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: serde_json::Value,
+            _registry: &khive_runtime::VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<serde_json::Value, khive_runtime::RuntimeError> {
+            assert_eq!(verb, "blob.put");
+            Ok(json!({"content_ref": "not-a-content-reference"}))
+        }
+    }
+
+    /// A quarantine record refused only for its original's reference is
+    /// written without it; with no comm pack nothing can be written, which
+    /// is the only case that still holds the page.
+    #[tokio::test]
+    async fn quarantine_record_refused_for_its_reference_is_written_without_it() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(
+            khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                runtime.clone(),
+                khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+            ),
+        );
+        builder.register(UnusableRefBlobPack);
+        let registry = builder.build().expect("registry builds");
+        let envelope = ChannelEnvelope::new(
+            "email:maintainer@example.com",
+            "email:mailbox@example.com",
+            "refused body",
+        )
+        .with_external_id("imap:h:refused:11:21")
+        .with_quarantine_replay(b"original".to_vec(), "email:maintainer@example.com");
+        let classification = khive_runtime::ChannelIngestFailureClass::Unknown {
+            reason: "InvalidInput",
+        };
+
+        quarantine_channel_ingest_failure(
+            &registry,
+            "test-ns",
+            "email",
+            "email",
+            Some("actor:test"),
+            &envelope,
+            classification,
+            Some(5),
+            None,
+        )
+        .await
+        .expect("the record without the reference is written");
+
+        let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+        let recorded = messages_with_external_id(&notes, "imap:h:refused:11:21");
+        assert_eq!(recorded.len(), 1, "{notes:?}");
+        let props = &recorded[0]["properties"];
+        assert_eq!(props["quarantined"], "true");
+        assert_eq!(props["quarantine_original_retained"], "false");
+        assert_eq!(
+            props["quarantine_original_not_retained_reason"],
+            "quarantine-write-failed"
+        );
+        assert!(
+            props["quarantine_original_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("quarantine_content_ref")),
+            "{props}"
+        );
+        assert_eq!(props["quarantine_failed_polls"], "5");
+        assert!(props.get("quarantine_content_ref").is_none(), "{props}");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(UnusableRefBlobPack);
+        let without_comm = builder.build().expect("registry builds");
+        quarantine_channel_ingest_failure(
+            &without_comm,
+            "test-ns",
+            "email",
+            "email",
+            Some("actor:test"),
+            &envelope,
+            classification,
+            Some(5),
+            None,
+        )
+        .await
+        .expect_err("with no store that can write the record, the page must hold");
+    }
+
     /// A channel whose every `poll_page` call returns an empty page with
     /// a `next_checkpoint` that `comm.cursor_commit` itself rejects
     /// (`generation: 0` is outside its documented `1..=i64::MAX` range).
@@ -10668,6 +11441,7 @@ mod cursor_commit_gating_tests {
                 khive_runtime::ChannelIngestFailureClass::Permanent {
                     reason: "SecretDetected",
                 },
+                None,
                 limit,
             )
             .await
@@ -10900,6 +11674,7 @@ mod cursor_commit_gating_tests {
             khive_runtime::ChannelIngestFailureClass::Permanent {
                 reason: "SecretDetected",
             },
+            None,
             None,
         )
         .await

@@ -76,6 +76,16 @@ Read-modify-write against the existing row (if any) so that:
   cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
   remains accepted for a mixed-version internal writer and preserves any
   previously recorded cadence on that row.
+- `held_messages` and `quarantined_after_hold` are accepted only with a
+  success outcome; a failed poll read no page, so it carries neither. A
+  success that reports `held_messages` records it on the row and maintains
+  `consecutive_held_polls`: incremented, with `last_held_at` set, when at
+  least one message held the page; reset to 0 by a poll with no hold. A
+  failure leaves both untouched, so a hold that is interrupted by a transport
+  outage still reads as unresolved. `quarantined_after_hold` greater than 0
+  sets `last_quarantined_after_hold_at`. The shipped email loop reports both
+  on every success; a writer that omits them leaves the row's hold facts as
+  they were.
 
 Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists
 under `token.namespace()` (khive #917) — the dispatch-authorized namespace
@@ -112,6 +122,13 @@ missing cadence/timestamp facts produce `poll_interval_secs: null` and/or
 `stalled: null`. Quarantine-only entries are distinct: all heartbeat facts,
 including `consecutive_failures`, are explicitly `null` because no heartbeat
 was observed.
+
+`consecutive_held_polls`, `held_messages`, `last_held_at` and
+`last_quarantined_after_hold_at` are `null` on a row whose writer never
+reported holds, and on quarantine-only entries. A channel holds its page while
+a message in it cannot be recorded yet; the email loop bounds each message's
+failed polls (ADR-056), so a `consecutive_held_polls` that keeps growing means
+the store itself cannot record even the bounded quarantine row.
 
 `quarantined_count` is independent of those liveness facts. It is the number
 of live `message` rows in the authorized namespace whose generic

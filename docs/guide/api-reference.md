@@ -1093,7 +1093,20 @@ Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagno
 all database files already opened by this server. The existing top-level fields still describe
 main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
 sidecar file size, page-level database size composition, and a WAL-pin holder census.
-Takes no parameters.
+
+| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                           |
+| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.   |
+| `size_composition` | boolean | `true`              | `false` skips the `dbstat` walk behind `size_composition`, which reads every page of each file. `size_composition_error` then says it was not collected, and `page_accounting` is still reported. |
+
+All selected backends share the request's read deadline. The process that runs the request sets
+it from its own environment (`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds); for a running
+daemon that is the daemon's environment, not the caller's. When the deadline arrives, the report
+keeps the backends already inspected, every remaining entry has `diagnostics: null` and an `error`
+starting with `not inspected: request deadline`, and the top-level `complete` is `false`.
+Inspections stop a tenth of the remaining time before the deadline, at most two seconds, so the
+partial report reaches a caller whose own deadline started a little earlier. `complete` is `true`
+when every selected backend was reached. A cancelled request still fails as a whole.
 
 `databases` is an array with one entry per canonical database file (or distinct in-memory
 pool), main first. Each entry has
@@ -1297,7 +1310,14 @@ in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page t
 the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
 count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
 `objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
-object returned by `dbstat`. `size_composition_error` explains an unavailable report.
+object returned by `dbstat`. `size_composition_error` explains an unavailable report, including
+one skipped with `size_composition=false`.
+
+`page_accounting` reports `page_size_bytes`, `page_count`, and `freelist_pages` from three pragma
+reads, so its cost does not grow with the file. Frames still in the WAL are counted.
+`freelist_pages` is the number of pages later writes can reuse that stay in the file until a
+`VACUUM`. It is present on every file-backed report whether or not `size_composition` was
+collected; `page_accounting_error` explains an unavailable value.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
@@ -1524,6 +1544,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
 | `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
 | `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
 | `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
@@ -1539,6 +1560,18 @@ Each result also carries canonical `full_id`; pass it directly to
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
+
+`keyword_only` runs only the full-text search: the query is not embedded and the
+vector index is not searched, so such a recall never reports `degraded`.
+`vector_only` runs only the vector search.
+
+`include_timings=true` adds a `timings` object: `total_us`, the stage wall times
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
+stage did not run; the text and vector searches run concurrently, so the stages do
+not add up), `retrieval_rounds`, and `rounds[]` with each round's
+`candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
+and stage times. An array response becomes `{results, timings}`; an object
+response keeps its fields and gains `timings`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")

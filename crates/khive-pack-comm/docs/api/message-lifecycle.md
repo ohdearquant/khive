@@ -846,6 +846,20 @@ require a separate audited migration or cleanup before the same retention
 guarantee can cover them. A row with the matching slug but no `expires_at`
 can receive its deadline on a matching trusted replay.
 
+When the comm pack runs on a secondary backend, the message and the main-backend
+owner row cannot be written together, so `comm.ingest` records the quarantine
+without its original: it drops `quarantine_content_ref` and stores
+`quarantine_original_retained: "false"` with
+`quarantine_original_not_retained_reason: "secondary-backend"`, and logs a warning
+naming the reference. The record keeps the normal retention deadline and counts
+toward `quarantined_count`, so the cap above still limits how many such records
+exist at once. The object the poller already published has no owner row and is
+not reclaimed when the record expires, because no collector runs today (see
+above); the transport still holds the original message. Refusing the ingest
+instead would hold the channel's progress on that message for every later poll.
+A replay of the same message resolves to the stored record and writes no owner
+row either.
+
 ## Message-ID / References header helpers (#403)
 
 - `message_id_match_candidates`: outbound mail stores its Message-ID in wire
