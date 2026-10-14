@@ -390,15 +390,12 @@ async fn fold_within_tx(
     let (old_mass, last_event_at) = match row {
         None => (0.0, now_us),
         Some(r) => {
-            let mass = match r.get("mass") {
-                Some(SqlValue::Float(v)) => *v,
-                Some(SqlValue::Integer(v)) => *v as f64,
-                _ => return Err(sql_err("read mass", "missing mass column")),
-            };
-            let last = match r.get("last_event_at") {
-                Some(SqlValue::Integer(v)) => *v,
-                _ => return Err(sql_err("read mass", "missing last_event_at column")),
-            };
+            let mass = r
+                .f64("mass")
+                .map_err(|_| sql_err("read mass", "missing mass column"))?;
+            let last = r
+                .i64("last_event_at")
+                .map_err(|_| sql_err("read mass", "missing last_event_at column"))?;
             (mass, last)
         }
     };

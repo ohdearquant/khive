@@ -255,6 +255,10 @@ fn agent_preserves_unknown_channel_heartbeat_nulls() {
             "last_failure_at": null,
             "last_error": null,
             "consecutive_failures": null,
+            "consecutive_held_polls": null,
+            "held_messages": null,
+            "last_held_at": null,
+            "last_quarantined_after_hold_at": null,
             "quarantined_count": 1,
         }]
     });
@@ -268,6 +272,10 @@ fn agent_preserves_unknown_channel_heartbeat_nulls() {
         "last_failure_at",
         "last_error",
         "consecutive_failures",
+        "consecutive_held_polls",
+        "held_messages",
+        "last_held_at",
+        "last_quarantined_after_hold_at",
     ] {
         assert_eq!(
             channel.get(field),

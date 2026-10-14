@@ -1989,6 +1989,7 @@ dependencies = [
  "criterion",
  "hex",
  "khive-runtime",
+ "khive-types",
  "lru",
  "rand 0.8.7",
  "serde",
@@ -2038,6 +2039,7 @@ dependencies = [
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",
+ "khive-storage",
  "khive-types",
  "lettre",
  "mail-parser",
@@ -2858,6 +2860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-rule-evaluator"
+version = "0.12.0"
+dependencies = [
+ "chrono",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "khive-runtime"
 version = "0.12.0"
 dependencies = [
@@ -3070,6 +3083,7 @@ dependencies = [
  "khive-repo-showcase",
  "khive-request",
  "khive-retrieval",
+ "khive-rule-evaluator",
  "khive-runtime",
  "khive-score",
  "khive-storage",
@@ -4361,9 +4375,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

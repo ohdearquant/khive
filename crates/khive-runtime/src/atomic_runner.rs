@@ -261,33 +261,23 @@ impl std::error::Error for AtomicRunnerError {
     }
 }
 
-fn raw_stmt(sql: String) -> SqlStatement {
-    SqlStatement {
-        sql,
-        params: vec![],
-        label: None,
-    }
+async fn execute_savepoint(writer: &mut dyn SqlWriter, sql: String) -> Result<(), StorageError> {
+    writer
+        .execute(SqlStatement::new(sql, vec![]))
+        .await
+        .map(|_| ())
 }
 
 async fn begin_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("SAVEPOINT {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("SAVEPOINT {name}")).await
 }
 
 async fn release_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("RELEASE {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("RELEASE {name}")).await
 }
 
 async fn rollback_to_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("ROLLBACK TO {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("ROLLBACK TO {name}")).await
 }
 
 /// Apply one op's plan statements in order, checking each guarded

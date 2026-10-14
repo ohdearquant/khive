@@ -3,8 +3,9 @@
 #[cfg(feature = "channel-email")]
 use super::{
     channel_cycle_wait, channel_ingest_attempt_key, cleanup_expired_channel_quarantine,
-    handle_channel_ingest_failure, outbox, quarantine_original_may_be_retained, Arc,
-    CHANNEL_POLL_INTERVAL,
+    handle_channel_ingest_failure, outbox, quarantine_original_may_be_retained,
+    record_channel_hold, Arc, ChannelIngestFailureOutcome, CHANNEL_POLL_INTERVAL,
+    HOLD_QUARANTINE_THRESHOLD,
 };
 #[cfg(all(test, feature = "channel-email"))]
 use super::{poll_timing_tests, OutboundEmailPolicy};
@@ -61,10 +62,11 @@ pub(super) async fn channel_poll_loop(
     // (first failure since success, or a change in error class) rather than
     // once per retry. Cleared on every success.
     let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
-    // Unknown ingest failures are bounded per external message ID. Entries
-    // remain pinned through quarantine until the page cursor itself commits,
-    // so a cursor-commit failure cannot restart the five-attempt wait.
-    let mut unknown_ingest_attempts: HashMap<String, u8> = HashMap::new();
+    // Failed polls per external message ID, across every cause that holds a
+    // page (an ingest refusal, or an original that could not be stored).
+    // Entries remain pinned through quarantine until the page cursor itself
+    // commits, so a cursor-commit failure cannot restart the wait.
+    let mut failed_polls: HashMap<String, u8> = HashMap::new();
     let mut next_interval = CHANNEL_POLL_INTERVAL;
     let event_store = registry.event_store();
     // Captured before the loop's first sleep (issue #449 follow-up).
@@ -196,15 +198,6 @@ pub(super) async fn channel_poll_loop(
                         .await;
                     }
 
-                    record_channel_heartbeat(
-                        &registry,
-                        kind,
-                        slug,
-                        HeartbeatOutcome::Success,
-                        event_store.as_ref(),
-                    )
-                    .await;
-
                     // Every envelope in the page must durably ingest before
                     // the cursor is allowed to advance past it (issue #449):
                     // a partial-page ingest failure must leave
@@ -220,91 +213,134 @@ pub(super) async fn channel_poll_loop(
                         })
                         .collect();
                     let mut page_fully_ingested = true;
+                    // Messages holding this page, and messages given a
+                    // terminal disposition this poll because their failed
+                    // polls reached the bound; both ride the heartbeat.
+                    let mut held_messages: u64 = 0;
+                    let mut quarantined_after_hold: u64 = 0;
                     for env in page.envelopes {
                         let mut metadata = env.metadata.clone();
+                        let mut released_after_hold = false;
                         if kind == "email"
                             && metadata.get("quarantined").map(String::as_str) == Some("true")
                         {
-                            let Some(replay) = env.quarantine_replay.as_ref() else {
-                                tracing::warn!(target: "khive_mcp::serve",
-                                    channel = kind,
-                                    external_id = env.external_id.as_deref(),
-                                    "quarantined email has no original-byte replay; holding channel progress"
-                                );
-                                page_fully_ingested = false;
-                                continue;
+                            // The original is stored before the record that
+                            // points at it. Failing to store it holds the page
+                            // like an ingest failure, under the same bound:
+                            // past it the message is recorded without its
+                            // original, naming why, and its external id still
+                            // names it at the source.
+                            let original = match env.quarantine_replay.as_ref() {
+                                None => Err(("original-unavailable", None)),
+                                Some(replay) => match quarantine_original_may_be_retained(
+                                    &registry,
+                                    &ingest_namespace,
+                                    channel.quarantine_retention_limit(),
+                                )
+                                .await
+                                {
+                                    Err(error) => {
+                                        Err(("retention-count-unreadable", Some(error.to_string())))
+                                    }
+                                    Ok(false) => Ok(None),
+                                    Ok(true) => match registry
+                                        .dispatch(
+                                            "blob.put",
+                                            json!({
+                                                "bytes": base64::engine::general_purpose::STANDARD
+                                                    .encode(&replay.bytes)
+                                            }),
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => match result
+                                            .get("content_ref")
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            Some(content_ref) => Ok(Some(content_ref.to_string())),
+                                            None => Err((
+                                                "original-store-failed",
+                                                Some(
+                                                    "blob.put returned no string content_ref"
+                                                        .to_string(),
+                                                ),
+                                            )),
+                                        },
+                                        Err(error) => {
+                                            Err(("original-store-failed", Some(error.to_string())))
+                                        }
+                                    },
+                                },
                             };
-                            let retain_original = match quarantine_original_may_be_retained(
-                                &registry,
-                                &ingest_namespace,
-                                channel.quarantine_retention_limit(),
-                            )
-                            .await
-                            {
-                                Ok(retain) => retain,
-                                Err(error) => {
+                            match original {
+                                Ok(Some(content_ref)) => {
+                                    metadata
+                                        .insert("quarantine_content_ref".to_string(), content_ref);
+                                }
+                                Ok(None) => {
                                     tracing::warn!(target: "khive_mcp::serve",
                                         channel = kind,
                                         external_id = env.external_id.as_deref(),
-                                        %error,
-                                        "could not read the retained quarantine count; holding channel progress"
+                                        limit = channel.quarantine_retention_limit(),
+                                        "quarantine retention limit reached; recording the message without its original bytes"
                                     );
-                                    page_fully_ingested = false;
-                                    continue;
+                                    metadata.insert(
+                                        "quarantine_original_retained".to_string(),
+                                        "false".to_string(),
+                                    );
+                                    metadata.insert(
+                                        "quarantine_original_not_retained_reason".to_string(),
+                                        "retention-limit".to_string(),
+                                    );
                                 }
-                            };
-                            if !retain_original {
-                                tracing::warn!(target: "khive_mcp::serve",
-                                    channel = kind,
-                                    external_id = env.external_id.as_deref(),
-                                    limit = channel.quarantine_retention_limit(),
-                                    "quarantine retention limit reached; recording the message without its original bytes"
-                                );
-                                metadata.insert(
-                                    "quarantine_original_retained".to_string(),
-                                    "false".to_string(),
-                                );
-                                metadata.insert(
-                                    "quarantine_original_not_retained_reason".to_string(),
-                                    "retention-limit".to_string(),
-                                );
-                            } else {
-                                let put = registry
-                                    .dispatch(
-                                        "blob.put",
-                                        json!({
-                                            "bytes": base64::engine::general_purpose::STANDARD
-                                                .encode(&replay.bytes)
-                                        }),
-                                    )
-                                    .await;
-                                let content_ref = match put {
-                                    Ok(result) => {
-                                        match result.get("content_ref").and_then(|v| v.as_str()) {
-                                            Some(content_ref) => content_ref.to_string(),
-                                            None => {
-                                                tracing::warn!(target: "khive_mcp::serve",
-                                                    channel = kind,
-                                                    external_id = env.external_id.as_deref(),
-                                                    "blob.put returned no quarantine content reference; holding channel progress"
-                                                );
-                                                page_fully_ingested = false;
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
+                                Err((reason, error)) => {
+                                    let attempt = record_channel_hold(
+                                        kind,
+                                        env.external_id.as_deref(),
+                                        &mut failed_polls,
+                                    );
+                                    let Some(polls) =
+                                        attempt.filter(|polls| *polls >= HOLD_QUARANTINE_THRESHOLD)
+                                    else {
                                         tracing::warn!(target: "khive_mcp::serve",
                                             channel = kind,
                                             external_id = env.external_id.as_deref(),
-                                            %error,
-                                            "failed to publish quarantined email original; holding channel progress"
+                                            reason,
+                                            error = error.as_deref(),
+                                            attempt,
+                                            threshold = HOLD_QUARANTINE_THRESHOLD,
+                                            "quarantined email original could not be stored; holding channel progress"
                                         );
                                         page_fully_ingested = false;
+                                        held_messages += 1;
                                         continue;
+                                    };
+                                    tracing::warn!(target: "khive_mcp::serve",
+                                        channel = kind,
+                                        external_id = env.external_id.as_deref(),
+                                        reason,
+                                        error = error.as_deref(),
+                                        failed_polls = polls,
+                                        "quarantined email original could not be stored; recording the message without it"
+                                    );
+                                    metadata.insert(
+                                        "quarantine_original_retained".to_string(),
+                                        "false".to_string(),
+                                    );
+                                    metadata.insert(
+                                        "quarantine_original_not_retained_reason".to_string(),
+                                        reason.to_string(),
+                                    );
+                                    if let Some(error) = error {
+                                        metadata
+                                            .insert("quarantine_original_error".to_string(), error);
                                     }
-                                };
-                                metadata.insert("quarantine_content_ref".to_string(), content_ref);
+                                    metadata.insert(
+                                        "quarantine_failed_polls".to_string(),
+                                        polls.to_string(),
+                                    );
+                                    released_after_hold = true;
+                                }
                             }
                         }
                         let params = json!({
@@ -324,23 +360,46 @@ pub(super) async fn channel_poll_loop(
                             "wire_references": env.wire_references.clone(),
                             "metadata": metadata,
                         });
-                        if let Err(error) = registry.dispatch("comm.ingest", params).await {
-                            let handled = handle_channel_ingest_failure(
-                                &registry,
-                                &ingest_namespace,
-                                (kind, slug),
-                                Some(&default_inbound_actor),
-                                &env,
-                                &error,
-                                &mut unknown_ingest_attempts,
-                                channel.quarantine_retention_limit(),
-                            )
-                            .await;
-                            if !handled {
-                                page_fully_ingested = false;
+                        match registry.dispatch("comm.ingest", params).await {
+                            Ok(_) => {
+                                if released_after_hold {
+                                    quarantined_after_hold += 1;
+                                }
+                            }
+                            Err(error) => {
+                                let outcome = handle_channel_ingest_failure(
+                                    &registry,
+                                    &ingest_namespace,
+                                    (kind, slug),
+                                    Some(&default_inbound_actor),
+                                    &env,
+                                    &error,
+                                    &mut failed_polls,
+                                    channel.quarantine_retention_limit(),
+                                )
+                                .await;
+                                if !outcome.released() {
+                                    page_fully_ingested = false;
+                                    held_messages += 1;
+                                }
+                                if outcome == ChannelIngestFailureOutcome::QuarantinedAfterHold {
+                                    quarantined_after_hold += 1;
+                                }
                             }
                         }
                     }
+
+                    record_channel_heartbeat(
+                        &registry,
+                        kind,
+                        slug,
+                        HeartbeatOutcome::Success {
+                            held_messages,
+                            quarantined_after_hold,
+                        },
+                        event_store.as_ref(),
+                    )
+                    .await;
 
                     if page_fully_ingested {
                         match page.next_checkpoint {
@@ -369,7 +428,7 @@ pub(super) async fn channel_poll_loop(
                         }
                         if bootstrap_floor_advances {
                             for key in page_attempt_keys {
-                                unknown_ingest_attempts.remove(&key);
+                                failed_polls.remove(&key);
                             }
                         }
                     } else {
@@ -495,7 +554,13 @@ pub(super) async fn append_channel_lifecycle_event<P: serde::Serialize>(
 /// One poll attempt's outcome, as reported to `comm.heartbeat` (#606).
 #[cfg(feature = "channel-email")]
 pub(super) enum HeartbeatOutcome {
-    Success,
+    /// The page was read. `held_messages` counts messages that held the page
+    /// this poll; `quarantined_after_hold` counts messages given a terminal
+    /// disposition this poll because their failed polls reached the bound.
+    Success {
+        held_messages: u64,
+        quarantined_after_hold: u64,
+    },
     Failure {
         class: &'static str,
         message: String,
@@ -543,12 +608,17 @@ pub(super) async fn record_channel_heartbeat(
 
     let namespace = khive_pack_comm::CHANNEL_HEALTH_NAMESPACE;
     let params = match &outcome {
-        HeartbeatOutcome::Success => json!({
+        HeartbeatOutcome::Success {
+            held_messages,
+            quarantined_after_hold,
+        } => json!({
             "namespace": namespace,
             "channel_kind": channel_kind,
             "channel_slug": channel_slug,
             "poll_interval_secs": CHANNEL_POLL_INTERVAL.as_secs(),
             "outcome": "success",
+            "held_messages": held_messages,
+            "quarantined_after_hold": quarantined_after_hold,
         }),
         HeartbeatOutcome::Failure { class, message } => json!({
             "namespace": namespace,
