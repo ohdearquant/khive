@@ -449,13 +449,97 @@
       "unique_clones": 441,
       "views": 101,
       "unique_views": 8
+    },
+    "2026-09-30": {
+      "clones": 4972,
+      "unique_clones": 395,
+      "views": 51,
+      "unique_views": 6
+    },
+    "2026-10-01": {
+      "clones": 1095,
+      "unique_clones": 190,
+      "views": 49,
+      "unique_views": 11
+    },
+    "2026-10-02": {
+      "clones": 5261,
+      "unique_clones": 383,
+      "views": 98,
+      "unique_views": 7
+    },
+    "2026-10-03": {
+      "clones": 4741,
+      "unique_clones": 484,
+      "views": 263,
+      "unique_views": 10
+    },
+    "2026-10-04": {
+      "clones": 5933,
+      "unique_clones": 555,
+      "views": 747,
+      "unique_views": 7
+    },
+    "2026-10-05": {
+      "clones": 3414,
+      "unique_clones": 412,
+      "views": 135,
+      "unique_views": 8
+    },
+    "2026-10-06": {
+      "clones": 4157,
+      "unique_clones": 375,
+      "views": 367,
+      "unique_views": 8
+    },
+    "2026-10-07": {
+      "clones": 2782,
+      "unique_clones": 270,
+      "views": 451,
+      "unique_views": 5
+    },
+    "2026-10-08": {
+      "clones": 2220,
+      "unique_clones": 220,
+      "views": 41,
+      "unique_views": 5
+    },
+    "2026-10-09": {
+      "clones": 3261,
+      "unique_clones": 201,
+      "views": 202,
+      "unique_views": 6
+    },
+    "2026-10-10": {
+      "clones": 1866,
+      "unique_clones": 213,
+      "views": 129,
+      "unique_views": 2
+    },
+    "2026-10-11": {
+      "clones": 1981,
+      "unique_clones": 188,
+      "views": 147,
+      "unique_views": 2
+    },
+    "2026-10-12": {
+      "clones": 2312,
+      "unique_clones": 300,
+      "views": 207,
+      "unique_views": 4
+    },
+    "2026-10-13": {
+      "clones": 3541,
+      "unique_clones": 302,
+      "views": 196,
+      "unique_views": 2
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-10-01T05:33:51Z",
-    "clones_14d": 45336,
-    "unique_clones_14d": 2829,
-    "views_14d": 1266,
-    "unique_views_14d": 126
+    "taken_at": "2026-10-14T10:20:05Z",
+    "clones_14d": 47536,
+    "unique_clones_14d": 2529,
+    "views_14d": 3083,
+    "unique_views_14d": 57
   }
 }
