@@ -790,24 +790,57 @@ adds an optional cursor mode to `git.receipts`; it preserves the existing offset
 - A request containing both `cursor` and `offset` refuses `invalid_params`, including an explicit
   `offset: 0`. A caller selects one mode; neither parameter silently takes precedence.
 - Keyset mode returns `{receipts, next_offset: null, next_cursor}`. `next_cursor` is a string only
-  when another matching row was observed, and null otherwise. Receipt objects gain no rowid or
+  when another matching row was observed, and null otherwise. Receipt objects gain no rowid, seq or
   cursor metadata. `limit` still defaults to 100 and must be in 1 through 500 in both modes.
 - `repo` canonicalization, optional `session_id` filtering, namespace and calling-actor scope,
   `foreign_actor` refusal and the existing policy check apply on every page in both modes. A
   cursor neither selects an actor nor supplies an authorization decision.
 
+### Sequence ledger
+
+Cursor mode does not key on the implicit rowid. `git_receipts` has a TEXT primary key, so its rowid
+is implicit, and SQLite documents that VACUUM may renumber implicit rowids. `memory.vacuum` runs
+VACUUM against the same database, so a walk that spans it could skip or repeat receipts. The
+repository already keys durable cursors on explicit sequences for this reason (V7
+`007-notes-seq.sql` for notes, V13 `013-list-cursor-sequences.sql` for entity, note and edge list
+cursors), and the receipt cursor follows the V13 shape:
+
+- `git_receipts_seq (seq INTEGER PRIMARY KEY AUTOINCREMENT, receipt_id TEXT NOT NULL UNIQUE)`. An
+  explicit integer primary key is not renumbered by VACUUM, and AUTOINCREMENT never reissues a value.
+- An `AFTER INSERT ON git_receipts` trigger assigns the ledger row inside the insert's own
+  transaction, using `INSERT ... ON CONFLICT(receipt_id) DO NOTHING` as V13 does.
+- An upgrade backfill assigns every existing receipt in `rowid ASC` order, so for pre-existing rows
+  the ledger order equals today's offset order. The backfill is an anti-join, so a re-run repairs a
+  missing ledger row and otherwise assigns nothing.
+- `git_receipts` is created by the git pack's schema plan rather than a numbered `khive-db`
+  migration, so the ledger table, trigger and backfill join that plan beside the table.
+
+V7 names a second hazard, rowid reuse after a hard delete. It does not arise here: no code path
+deletes a `git_receipts` row. The writers are the insert and the disposition update, and a namespace
+move is an in-place `UPDATE` of `namespace`. The ledger is therefore for VACUUM alone. If a
+retention delete ever lands, cursor mode needs no change, because surviving receipts keep their
+sequence values and none is reissued; offset mode would then skip surviving receipts on a walk in
+progress whenever earlier rows are removed, and that amendment must say so and decide what happens
+to a deleted receipt's ledger row.
+
 ### Position, scope and token
 
-The query preserves `rowid ASC`, independent of receipt timestamps. The first keyset page has no
-position predicate. A resumed page selects matching rows with `rowid > after_rowid`, reads at most
-`limit + 1` matching rows, and returns the first `limit`. When the extra row exists, the next token
-names the rowid of the last returned row, never the extra row. Filters are applied before the
-limit. A rowid must be carried separately from the existing receipt decoder so its public object
-is unchanged.
+Keyset mode orders by the ledger's `seq ASC`, independent of receipt timestamps and of rowid. The
+first keyset page has no position predicate. A resumed page selects matching receipts whose ledger
+`seq > after_seq`, through a join or subselect on `git_receipts_seq`, reads at most `limit + 1`
+matching rows, and returns the first `limit`. When the extra row exists, the next token names the
+seq of the last returned row, never the extra row. Filters are applied before the limit. The seq
+must be carried separately from the existing receipt decoder so the public receipt object is
+unchanged.
 
-The token is `v1.` followed by unpadded base64url of a UTF-8 JSON object with exactly `after_rowid`
-and `scope`. `after_rowid` is a canonical decimal string representing a signed 64-bit SQLite rowid,
-with no plus sign or redundant leading zero; negative rowids are representable. `scope` has exactly
+Offset mode is untouched and keeps `ORDER BY rowid ASC LIMIT ... OFFSET ...` byte for byte. The
+backfill assigns seq in rowid order and both advance together on insert, so the two modes return
+the same order until a VACUUM renumbers rowids, and may disagree on order only across one. That is
+the known cost of leaving offset mode unchanged; cursor mode is the order that survives VACUUM.
+
+The token is `v1.` followed by unpadded base64url of a UTF-8 JSON object with exactly `after_seq`
+and `scope`. `after_seq` is a canonical decimal string representing a positive signed 64-bit
+integer, with no plus sign or leading zero. `scope` has exactly
 `namespace`, `actor`, `backend`, `repo` and `session_id`: the effective namespace, resolved calling
 actor and issuing receipt backend label are strings, and the two filters are their effective
 canonical values or JSON null. Member order is immaterial; duplicate or unknown members, missing
@@ -819,7 +852,7 @@ value; a mismatch refuses `invalid_cursor` without returning receipts. Changing 
 Scope binding prevents accidental continuation under different filters; it is not a signature,
 secret or privilege. Editing a token can select a different position within the caller's already
 authorized history, but cannot widen the row predicates or bypass the gate. No credential value
-enters the token. Tokens are local to that receipt backend's rowid history; replacing or rebuilding
+enters the token. Tokens are local to that receipt backend's sequence history; replacing or rebuilding
 the database requires a new walk. A backend label is not physical-file identity enforcement.
 
 ### Live-history semantics
@@ -828,13 +861,15 @@ Neither mode pins a snapshot across calls. An appended matching receipt after a 
 can appear on a later page, including when its clock regresses. Changes to a receipt's disposition
 or result retain its position and may be observed on a later read. A terminal null token means the
 page observed no further matching row; it does not promise that no receipt will be appended later.
-A new walk is required to discover appends after a terminal page. Tokens are read positions, not
-durable write acknowledgements or reconciliation evidence.
+A new walk is required to discover appends after a terminal page. A receipt that becomes matching
+through a namespace move keeps its sequence value, so a walk whose position has already passed it
+does not return it; a new walk does. Tokens are read positions, not durable write acknowledgements
+or reconciliation evidence.
 
 ### Implementation acceptance
 
-1. Against one isolated fixture, cursor and offset walks return the same receipt ID sequence, with
-   no filters, each filter separately and both together. Include interleaved foreign actors and
+1. Against one isolated fixture with no VACUUM between pages, cursor and offset walks return the
+   same receipt ID sequence, with no filters, each filter separately and both together. Include interleaved foreign actors and
    namespaces, nonmatching rows between matching rows, and regressing timestamps. An append between
    nonterminal pages appears exactly once in both walks; use controlled identical histories for
    the comparison rather than comparing two walks during unrelated concurrent writes.
@@ -848,11 +883,21 @@ durable write acknowledgements or reconciliation evidence.
    row rather than the lookahead row. On a disposable copy, using `>=` instead of `>` must duplicate
    the boundary receipt and fail the sequence test; tokenizing the lookahead row must omit a receipt
    and fail it. Removing actor or namespace predicates must fail the scope fixtures.
-5. The cursor SQL contains no OFFSET. Capture query plans and measured row-step or latency evidence
+5. On a scratch copy, a cursor walk interrupted by VACUUM, run through the same top-level
+   maintenance path `memory.vacuum` uses, returns the same receipt ID sequence as an uninterrupted
+   walk. The must-fail control keys the cursor on rowid and must show the skip or repeat, which
+   needs a history that VACUUM actually renumbers. If no renumbering can be produced on the SQLite
+   version in the tree, the arm records that and the seq key stays on the documentation's word,
+   because the contract is SQLite's and not one version's.
+6. The ledger: an upgraded fixture with existing receipts gets seq values in rowid order, a re-run
+   of the backfill assigns nothing, an insert assigns exactly one seq in its own transaction, and a
+   rolled-back insert leaves no ledger row.
+7. The cursor SQL contains no OFFSET. Capture query plans and measured row-step or latency evidence
    on representative owned histories before claiming a performance improvement. Add a supporting
    index only if those plans justify it; optional filters do not by themselves prove an efficient
    seek. This proposal makes no latency, complexity-bound or production-population claim.
 
-This amendment introduces no retention, receipt mutation, operator-wide read, snapshot ownership,
+This amendment adds one ledger table with its trigger and backfill, and introduces no retention,
+receipt mutation, operator-wide read, snapshot ownership,
 new backend opener or change to the git write/reconciliation protocol. Implementation and native
 validation remain pending while this amendment is Proposed.
