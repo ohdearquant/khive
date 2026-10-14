@@ -14,6 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing behavior. Both `is_meaningful_query` functions remain as deprecated
   compatibility wrappers for one release; callers should use the replacement names.
 
+### Fixed
+
+- A daemon that supervises an events daemon now holds each request until that child's socket
+  answers for the first time, instead of dispatching while the child is still starting. A write
+  sent in that window could commit its domain change and then report a failed audit commit. If the
+  socket has not answered within 10 seconds of startup, requests are refused before dispatch with
+  `events_daemon_unavailable`, `retryable: true` and `domain_disposition: not_committed`, naming
+  the socket, until it answers. Probe frames are answered without waiting.
+
+- The email poll loop no longer holds its IMAP page without bound. Every cause that holds a page,
+  a `comm.ingest` refusal or a quarantined message's original that cannot be stored, now counts
+  toward one bound per message: the message is recorded as quarantined on its 60th failed poll
+  while the store refuses it as retryable, and on its 5th for every other cause. If the original
+  cannot be stored, or the record that references it is refused, the record is written without it
+  and names the reason. `comm.health` reports `consecutive_held_polls`, `held_messages`,
+  `last_held_at` and `last_quarantined_after_hold_at` per channel.
+
 ## [0.12.0] - 2026-10-13
 
 ### Documentation

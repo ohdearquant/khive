@@ -331,7 +331,7 @@ async fn telegram_poll_loop(
     use serde_json::json;
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
+    let mut failed_polls = std::collections::HashMap::<String, u8>::new();
 
     loop {
         // This loop polls before it waits, so shutdown is read at the top as
@@ -384,19 +384,19 @@ async fn telegram_poll_loop(
                         "default_inbound_actor": default_inbound_actor,
                     });
                     if let Err(error) = registry.dispatch("comm.ingest", params).await {
-                        let handled = handle_channel_ingest_failure(
+                        let outcome = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
                             (kind, &slug),
                             Some(&default_inbound_actor),
                             &env,
                             &error,
-                            &mut unknown_ingest_attempts,
+                            &mut failed_polls,
                             // The Telegram adapter declares no retention bound.
                             None,
                         )
                         .await;
-                        if !handled {
+                        if !outcome.released() {
                             all_ingested = false;
                         }
                     }
@@ -407,7 +407,7 @@ async fn telegram_poll_loop(
                     poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforeCommit).await;
                     telegram_channel.commit_offset();
                     for key in batch_attempt_keys {
-                        unknown_ingest_attempts.remove(&key);
+                        failed_polls.remove(&key);
                     }
                 } else {
                     tracing::warn!(

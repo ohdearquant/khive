@@ -516,13 +516,12 @@ pub(crate) async fn prepare_atomic_note_requests(
             runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?
         };
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check_at(spec.content, &record, "content")?;
-        if let Some(n) = spec.name {
-            crate::secret_gate::check_at(n, &record, "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, &record, "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(
+            spec.content,
+            spec.name,
+            properties.as_ref(),
+            &record,
+        )?;
 
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);

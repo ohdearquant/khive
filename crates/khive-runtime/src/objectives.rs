@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use khive_fold::objective::{Objective, ObjectiveContext};
 use khive_fold::ordering::HasId;
+use khive_score::Decay;
 
 /// Pre-computed retrieval signals for a single candidate entity.
 ///
@@ -181,6 +182,15 @@ impl HasId for NoteCandidate {
 
 // ── DecayAwareSalienceObjective ──────────────────────────────────────────────
 
+#[inline]
+fn exponential_decay(value: f64, rate: f64, age_days: f64) -> f64 {
+    // Preserve unchecked public candidates outside the shared decay domain.
+    match Decay::exponential(rate).and_then(|decay| decay.apply(value, age_days)) {
+        Ok(score) if age_days >= 0.0 => score,
+        _ => value * (-rate * age_days).exp(),
+    }
+}
+
 /// Scores a `NoteCandidate` by salience with configurable temporal decay.
 ///
 /// Uses the fixed exponential rate supplied at construction:
@@ -217,7 +227,7 @@ impl DecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        candidate.salience * (-self.decay_rate * candidate.age_days).exp()
+        exponential_decay(candidate.salience, self.decay_rate, candidate.age_days)
     }
 
     fn name(&self) -> &str {
@@ -298,7 +308,7 @@ impl Objective<NoteCandidate> for TemporalRecencyObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
         let k = std::f64::consts::LN_2 / self.half_life_days.max(f64::EPSILON);
-        (-k * candidate.age_days).exp()
+        exponential_decay(1.0, k, candidate.age_days)
     }
 
     fn name(&self) -> &str {
@@ -690,6 +700,41 @@ mod tests {
         for bad in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let result = std::panic::catch_unwind(|| DecayAwareSalienceObjective::new(bad));
             assert!(result.is_err(), "accepted invalid decay_rate {bad}");
+        }
+    }
+
+    #[test]
+    fn decay_objectives_preserve_candidate_boundaries() {
+        for age in [
+            -f64::INFINITY,
+            -30.0,
+            -0.0,
+            0.0,
+            30.0,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            for value in [-0.0, 0.8, f64::MAX, f64::INFINITY, f64::NAN] {
+                let candidate = note_candidate(None, value, 0.01, age);
+                for rate in [0.0, 0.01, f64::MAX] {
+                    let actual = DecayAwareSalienceObjective::new(rate).score(&candidate, &ctx());
+                    let expected = value * (-rate * age).exp();
+                    assert!(
+                        actual.to_bits() == expected.to_bits()
+                            || (actual.is_nan() && expected.is_nan())
+                    );
+                }
+                for half_life_days in [0.0, 30.0, f64::INFINITY, f64::NAN] {
+                    let actual =
+                        TemporalRecencyObjective { half_life_days }.score(&candidate, &ctx());
+                    let expected =
+                        (-(std::f64::consts::LN_2 / half_life_days.max(f64::EPSILON)) * age).exp();
+                    assert!(
+                        actual.to_bits() == expected.to_bits()
+                            || (actual.is_nan() && expected.is_nan())
+                    );
+                }
+            }
         }
     }
 

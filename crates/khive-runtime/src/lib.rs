@@ -64,6 +64,7 @@ mod note_index;
 mod note_read;
 pub mod note_search_ann;
 mod note_store_guard;
+mod note_validation;
 pub mod note_write;
 #[cfg(test)]
 mod note_write_tests;

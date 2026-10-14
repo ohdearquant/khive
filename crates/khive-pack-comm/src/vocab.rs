@@ -756,7 +756,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 19] = [
                        counts remain namespace-wide. Heartbeat entries include their \
                        nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
                        fact. `stalled` becomes true after three missed nominal intervals; it is \
-                       null for legacy/malformed rows and known failure/backoff state. This is \
+                       null for legacy/malformed rows and known failure/backoff state. \
+                       `consecutive_held_polls` counts successive polls on which at least one \
+                       message held the channel's page (0 after a poll with no hold), with \
+                       `held_messages` from the latest poll, `last_held_at` and \
+                       `last_quarantined_after_hold_at`; all four are null when the writer does \
+                       not report holds. This is \
                        not a computed healthy bool; overall \
                        health judgment belongs to the caller. Reads from the caller's injected \
                        namespace — `token.namespace()`, the same explicit \
