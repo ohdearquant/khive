@@ -296,12 +296,15 @@ fn summarize_operation(index: usize, op: &Op, decision: &TierDecision) -> Review
         ),
         Op::Update(update) => {
             let target_id = update.target_id().to_string();
-            let (target, entity_ids) = match update.patch() {
-                UpdatePatch::Entity(_) => ("entity", vec![target_id.clone()]),
-                UpdatePatch::Note(_) => ("note", Vec::new()),
-                UpdatePatch::Edge(_) => ("edge", Vec::new()),
+            let (target, summary, entity_ids) = match update.patch() {
+                UpdatePatch::Entity(_) => (
+                    "entity",
+                    format!("Update entity {target_id}"),
+                    vec![target_id.clone()],
+                ),
+                UpdatePatch::Note(_) => ("note", format!("Update note {target_id}"), Vec::new()),
+                UpdatePatch::Edge(_) => ("edge", format!("Update edge {target_id}"), Vec::new()),
             };
-            let summary = format!("Update {target} {target_id}");
             (
                 target_id,
                 "update",
