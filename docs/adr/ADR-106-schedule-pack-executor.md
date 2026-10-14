@@ -5,7 +5,8 @@
 **Amended**: 2026-08-07 (missed-event grace policy, Amendment A; implementation note,
 Amendment B; reminder delivery and failure observability, Amendment C; process-local
 ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E;
-durable dispatch receipts and renewable leases, Amendment F)
+durable dispatch receipts and renewable leases, Amendment F); 2026-09-21 (interval and
+cron recurrence, Amendment G); 2026-10-14 (per-event missed-schedule policy, Amendment H)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time),
