@@ -267,10 +267,11 @@ that only looks atomic.
   parity lands; the verb never applies part of a unit. D2's floor keeps
   `merge` out of tier-1, so tier-1 is unaffected; the reviewed path inherits the refusal and says
   so in its output.
-- **`merge` preimage, once admitted.** The comparison fails closed. It refuses when the live
-  incident edge set, across every namespace ([ADR-007](ADR-007-namespace.md)), holds an
-  edge the op did not list, refuses duplicate entries in the list, and compares edges by
-  identifier, never by list position.
+- **`merge` preimage, once admitted.** Both participant entities are compared like a `delete`,
+  the full captured record except `updated_at`, before the edge-set check. The edge comparison
+  fails closed. It refuses when the live incident edge set, across every namespace
+  ([ADR-007](ADR-007-namespace.md)), holds an edge the op did not list, refuses duplicate entries
+  in the list, and compares edges by identifier, never by list position.
 - **Authorization.** The gate evaluates the request as `apply_changeset` and also evaluates each op
   under its constituent verb (`create`, `link`, `update`, `delete`) with that op's arguments, before
   anything is written. A refusal of any op refuses the unit and names the op's index. A policy that
