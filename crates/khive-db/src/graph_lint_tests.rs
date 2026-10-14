@@ -1,5 +1,5 @@
 use super::*;
-use khive_storage::SqlColumn;
+use khive_storage::types::SqlColumn;
 
 fn row() -> SqlRow {
     SqlRow {

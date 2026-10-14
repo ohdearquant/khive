@@ -1,5 +1,6 @@
 use crate::{KhiveRuntime, NamespaceToken, RuntimeResult, VerbRegistry};
 use khive_storage::{Edge, Entity, Note};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -48,11 +49,17 @@ fn visible(token: &NamespaceToken, namespace: &str) -> bool {
         .iter()
         .any(|ns| ns.as_str() == namespace)
 }
-fn canonical<T: serde::Serialize>(value: &T) -> RuntimeResult<serde_json::Value> {
-    serde_json::to_value(value).map_err(|error| crate::RuntimeError::Internal(error.to_string()))
+/// A digest of the serialized record. Identity checks compare digests, so the capture does
+/// not hold a third copy of every visible record (note bodies included) for them.
+fn canonical<T: serde::Serialize>(value: &T) -> RuntimeResult<[u8; 32]> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| crate::RuntimeError::Internal(error.to_string()))?;
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&Sha256::digest(bytes));
+    Ok(digest)
 }
 fn register<T: serde::Serialize>(
-    identities: &mut HashMap<Uuid, (&'static str, serde_json::Value)>,
+    identities: &mut HashMap<Uuid, (&'static str, [u8; 32])>,
     owners: &mut HashMap<Uuid, Vec<usize>>,
     id: Uuid,
     substrate: &'static str,
@@ -268,52 +275,58 @@ impl VerbRegistry {
         let mut events = HashMap::new();
         for id in endpoint_ids {
             active()?;
+            // The listing passes above captured this record and recorded its owners. The
+            // capture holds no snapshot, so reading it again would compare it with a later
+            // state of the store; only the event store, which no listing covers, is probed.
+            let listed = identities.contains_key(&id);
             for (owner, runtime) in capture.owners.iter().enumerate() {
-                if let Some(entity) = runtime.get_entity_including_deleted(token, id).await? {
-                    if !visible(token, &entity.namespace) {
-                        hidden.insert(id);
-                        continue;
+                if !listed {
+                    if let Some(entity) = runtime.get_entity_including_deleted(token, id).await? {
+                        if !visible(token, &entity.namespace) {
+                            hidden.insert(id);
+                            continue;
+                        }
+                        register(
+                            &mut identities,
+                            &mut capture.record_owners,
+                            id,
+                            "entity",
+                            &entity,
+                            owner,
+                        )?;
+                        capture.all_entities.entry(id).or_insert(entity);
                     }
-                    register(
-                        &mut identities,
-                        &mut capture.record_owners,
-                        id,
-                        "entity",
-                        &entity,
-                        owner,
-                    )?;
-                    capture.all_entities.entry(id).or_insert(entity);
-                }
-                if let Some(note) = runtime.get_note_including_deleted(token, id).await? {
-                    if !visible(token, &note.namespace)
-                        || !mailbox.permits_message_note(token, &note)
-                    {
-                        hidden.insert(id);
-                        continue;
+                    if let Some(note) = runtime.get_note_including_deleted(token, id).await? {
+                        if !visible(token, &note.namespace)
+                            || !mailbox.permits_message_note(token, &note)
+                        {
+                            hidden.insert(id);
+                            continue;
+                        }
+                        register(
+                            &mut identities,
+                            &mut capture.record_owners,
+                            id,
+                            "note",
+                            &note,
+                            owner,
+                        )?;
+                        capture.all_notes.entry(id).or_insert(note);
                     }
-                    register(
-                        &mut identities,
-                        &mut capture.record_owners,
-                        id,
-                        "note",
-                        &note,
-                        owner,
-                    )?;
-                    capture.all_notes.entry(id).or_insert(note);
-                }
-                if let Some(edge) = runtime.get_edge_including_deleted(token, id).await? {
-                    if !visible(token, &edge.namespace) {
-                        hidden.insert(id);
-                        continue;
+                    if let Some(edge) = runtime.get_edge_including_deleted(token, id).await? {
+                        if !visible(token, &edge.namespace) {
+                            hidden.insert(id);
+                            continue;
+                        }
+                        register(
+                            &mut identities,
+                            &mut capture.record_owners,
+                            id,
+                            "edge",
+                            &edge,
+                            owner,
+                        )?;
                     }
-                    register(
-                        &mut identities,
-                        &mut capture.record_owners,
-                        id,
-                        "edge",
-                        &edge,
-                        owner,
-                    )?;
                 }
                 if let Some(event) = runtime.events(token)?.get_event(id).await? {
                     if !visible(token, &event.namespace) {

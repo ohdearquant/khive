@@ -587,6 +587,39 @@ async fn equal_uuid_in_different_substrates_is_an_inspection_error() {
 }
 
 #[tokio::test]
+async fn listed_endpoint_sharing_an_event_uuid_is_an_inspection_error() {
+    let runtime = runtime();
+    let token = token(&runtime);
+    let event = khive_storage::Event::new(
+        "local",
+        "create",
+        khive_types::EventKind::NoteCreated,
+        khive_types::SubstrateKind::Note,
+        "",
+    );
+    runtime
+        .events(&token)
+        .unwrap()
+        .append_event(event.clone())
+        .await
+        .unwrap();
+    let mut note = Note::new("local", "observation", "same UUID as an event");
+    note.id = event.id;
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(note.clone())
+        .await
+        .unwrap();
+    let target = entity(&runtime, "annotated").await;
+    edge(&runtime, note.id, target.id, EdgeRelation::Annotates).await;
+    assert!(matches!(
+        registry().capture_graph_lint(&runtime, &token).await,
+        Err(crate::RuntimeError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
 async fn expired_request_never_returns_a_partial_success() {
     let runtime = runtime();
     let token = token(&runtime);
