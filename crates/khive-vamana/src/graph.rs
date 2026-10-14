@@ -1157,6 +1157,10 @@ mod build_parity_tests;
 mod build_scratch_tests;
 
 #[cfg(test)]
+#[path = "graph_insert_scratch_tests.rs"]
+mod insert_scratch_tests;
+
+#[cfg(test)]
 #[path = "graph_frontier_search_tests.rs"]
 mod frontier_search_tests;
 
