@@ -37,3 +37,4 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 khive-pack-comm = { version = "0.12.0", path = "../khive-pack-comm" }
 khive-pack-kg = { version = "0.12.0", path = "../khive-pack-kg" }
 khive-runtime = { version = "0.12.0", path = "../khive-runtime" }
+khive-storage = { version = "0.12.0", path = "../khive-storage" }

@@ -88,9 +88,12 @@ use read_marking::{
 };
 
 pub(crate) use reply::handle_reply;
-pub use suppression::load_outbound_email_suppressions;
 pub(crate) use suppression::{
     handle_suppression_add, handle_suppression_list, handle_suppression_remove,
+};
+pub use suppression::{
+    load_inbound_email_suppressions, load_outbound_email_suppressions,
+    record_mailto_unsubscribe_suppression,
 };
 
 use validation::{
