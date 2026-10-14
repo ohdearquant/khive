@@ -2864,6 +2864,7 @@ name = "khive-rule-evaluator"
 version = "0.12.0"
 dependencies = [
  "chrono",
+ "khive-changeset",
  "khive-types",
  "serde",
  "serde_json",

@@ -7,16 +7,16 @@
 //! command cannot establish those identities and ADR-145 forbids inventing
 //! optional enrichment.
 
-use std::collections::HashSet;
-
 use anyhow::{bail, Context, Result};
 use khive_changeset::{ChangeSet, CreateTarget, DeletePreimage, Op, UpdatePatch};
 
-use super::commit;
+use khive_rule_evaluator::{classify_changeset, Rules, TierDecision, TierFinding};
+
 use super::types::{
     OutputFormat, ReviewArgs, ReviewCapability, ReviewChangeSet, ReviewFinding, ReviewGate,
     ReviewOperation, ReviewReport, ReviewTierSummary, ReviewValidationSummary, RuleResult,
 };
+use super::{commit, validate};
 
 const REVIEW_SCHEMA_VERSION: &str = "khive.review.v1";
 const TIER_1: &str = "tier_1";
@@ -39,11 +39,13 @@ pub(super) fn cmd_review(args: ReviewArgs) -> Result<()> {
         );
     }
 
-    let rule_results = commit::run_commit_time_rules(&changeset, &args.rules)
+    let rules = validate::load_rules(&args.rules).context("loading review rules")?;
+    let rule_results = commit::run_commit_time_rules_with_rules(&changeset, &rules)
         .context("running read-only commit-time rule pass")?;
     let report = build_report(
         &changeset,
         &rule_results,
+        &rules,
         args.reviewer_model_family.as_deref(),
     );
 
@@ -63,6 +65,7 @@ pub(super) fn cmd_review(args: ReviewArgs) -> Result<()> {
 fn build_report(
     changeset: &ChangeSet,
     rule_results: &[RuleResult],
+    rules: &Rules,
     reviewer_model_family: Option<&str>,
 ) -> ReviewReport {
     let mut findings = flatten_findings(rule_results);
@@ -98,53 +101,21 @@ fn build_report(
         .count();
     let validation_passed = failed_error_rules == 0;
 
-    let mut operations: Vec<ReviewOperation> = changeset
-        .ops
+    let tier_findings: Vec<TierFinding<'_>> = findings
         .iter()
-        .enumerate()
-        .map(|(index, op)| summarize_operation(index, op))
-        .collect();
-
-    // Findings produced by the existing rule projection identify a subject
-    // when they can. An unscoped (or unexpectedly unmapped) error is applied
-    // fail-closed to every operation because silently keeping an operation on
-    // Tier 1 would violate ADR-102's "any operation carrying an error" floor.
-    let known_subjects: HashSet<&str> = operations
-        .iter()
-        .flat_map(|op| {
-            std::iter::once(op.id.as_str()).chain(op.entity_ids.iter().map(String::as_str))
+        .map(|finding| TierFinding {
+            severity: &finding.severity,
+            subject_id: finding.subject_id.as_deref(),
         })
         .collect();
-    let error_subjects: HashSet<&str> = findings
+    let decisions = classify_changeset(rules, changeset, &tier_findings);
+    let operations: Vec<ReviewOperation> = changeset
+        .ops
         .iter()
-        .filter(|finding| finding.severity == "error")
-        .filter_map(|finding| finding.subject_id.as_deref())
+        .zip(&decisions)
+        .enumerate()
+        .map(|(index, (op, decision))| summarize_operation(index, op, decision))
         .collect();
-    let has_global_error = findings.iter().any(|finding| {
-        finding.severity == "error"
-            && finding
-                .subject_id
-                .as_deref()
-                .is_none_or(|subject| !known_subjects.contains(subject))
-    });
-
-    for operation in &mut operations {
-        let carries_error = has_global_error
-            || error_subjects.contains(operation.id.as_str())
-            || operation
-                .entity_ids
-                .iter()
-                .any(|id| error_subjects.contains(id.as_str()));
-        if carries_error {
-            operation.tier = TIER_2.to_string();
-            operation
-                .tier_reasons
-                .push("validation.error_severity_finding".to_string());
-            operation.reason.push_str(
-                " An error-severity validation finding escalates this operation to Tier 2.",
-            );
-        }
-    }
 
     let tier_1 = operations
         .iter()
@@ -285,143 +256,61 @@ fn severity_rank(severity: &str) -> u8 {
     }
 }
 
-fn summarize_operation(index: usize, op: &Op) -> ReviewOperation {
-    match op {
-        Op::Create(create) => match &create.target {
-            CreateTarget::Entity(fields) => ReviewOperation {
-                index,
-                id: create.id.to_string(),
-                op: "create".to_string(),
-                target: "entity".to_string(),
-                tier: TIER_1.to_string(),
-                summary: format!("Create {} entity “{}”", fields.entity_kind, fields.name),
-                reason: "Create is additive and Tier 1-eligible under the ADR-102 floor."
-                    .to_string(),
-                tier_reasons: vec!["adr102.create".to_string()],
-                entity_ids: vec![create.id.to_string()],
-                before: None,
-                after: Some(json_value(&create.target)),
-            },
-            CreateTarget::Note(fields) => ReviewOperation {
-                index,
-                id: create.id.to_string(),
-                op: "create".to_string(),
-                target: "note".to_string(),
-                tier: TIER_1.to_string(),
-                summary: format!("Create {} note {}", fields.note_kind, create.id),
-                reason: "Create is additive and Tier 1-eligible under the ADR-102 floor."
-                    .to_string(),
-                tier_reasons: vec!["adr102.create".to_string()],
-                entity_ids: Vec::new(),
-                before: None,
-                after: Some(json_value(&create.target)),
-            },
-        },
-        Op::Link(link) => {
-            let mut tier = TIER_1;
-            let mut reasons = Vec::new();
-            let mut explanations = Vec::new();
-            if matches!(
-                link.relation.as_str(),
-                "supersedes" | "supports" | "refutes"
-            ) {
-                tier = TIER_2;
-                reasons.push("adr102.judgment_relation".to_string());
-                explanations.push(format!(
-                    "{} is judgment-bearing and requires Tier 2 review.",
-                    link.relation
-                ));
-            }
-            if link.weight < 0.7 {
-                tier = TIER_2;
-                reasons.push("adr102.resulting_weight_below_0_7".to_string());
-                explanations.push(format!(
-                    "The resulting weight {} is below the ADR-102 floor of 0.7.",
-                    link.weight
-                ));
-            }
-            if reasons.is_empty() {
-                reasons.push("adr102.non_judgment_link".to_string());
-                explanations.push(
-                    "This non-judgment link has weight at least 0.7 and is Tier 1-eligible."
-                        .to_string(),
-                );
-            }
-            ReviewOperation {
-                index,
-                id: link.id.to_string(),
-                op: "link".to_string(),
-                target: "edge".to_string(),
-                tier: tier.to_string(),
-                summary: format!("Link {} {} {}", link.source, link.relation, link.target),
-                reason: explanations.join(" "),
-                tier_reasons: reasons,
-                entity_ids: vec![link.source.to_string(), link.target.to_string()],
-                before: None,
-                after: Some(serde_json::json!({
-                    "relation": link.relation,
-                    "weight": link.weight,
-                    "properties": link.properties,
-                })),
-            }
+fn summarize_operation(index: usize, op: &Op, decision: &TierDecision) -> ReviewOperation {
+    let (id, op_name, target, summary, entity_ids, before, after) = match op {
+        Op::Create(create) => {
+            let (target, summary, entity_ids) = match &create.target {
+                CreateTarget::Entity(fields) => (
+                    "entity",
+                    format!("Create {} entity “{}”", fields.entity_kind, fields.name),
+                    vec![create.id.to_string()],
+                ),
+                CreateTarget::Note(fields) => (
+                    "note",
+                    format!("Create {} note {}", fields.note_kind, create.id),
+                    Vec::new(),
+                ),
+            };
+            (
+                create.id.to_string(),
+                "create",
+                target,
+                summary,
+                entity_ids,
+                None,
+                Some(json_value(&create.target)),
+            )
         }
+        Op::Link(link) => (
+            link.id.to_string(),
+            "link",
+            "edge",
+            format!("Link {} {} {}", link.source, link.relation, link.target),
+            vec![link.source.to_string(), link.target.to_string()],
+            None,
+            Some(serde_json::json!({
+                "relation": link.relation,
+                "weight": link.weight,
+                "properties": link.properties,
+            })),
+        ),
         Op::Update(update) => {
             let target_id = update.target_id().to_string();
-            match update.patch() {
-                UpdatePatch::Entity(_) => ReviewOperation {
-                    index,
-                    id: target_id.clone(),
-                    op: "update".to_string(),
-                    target: "entity".to_string(),
-                    tier: TIER_1.to_string(),
-                    summary: format!("Update entity {target_id}"),
-                    reason:
-                        "A mutable entity-field update is Tier 1-eligible under the ADR-102 floor."
-                            .to_string(),
-                    tier_reasons: vec!["adr102.mutable_entity_update".to_string()],
-                    entity_ids: vec![target_id],
-                    before: Some(json_value(update.preimage())),
-                    after: Some(json_value(update.patch())),
-                },
-                UpdatePatch::Note(_) => ReviewOperation {
-                    index,
-                    id: target_id.clone(),
-                    op: "update".to_string(),
-                    target: "note".to_string(),
-                    tier: TIER_2.to_string(),
-                    summary: format!("Update note {target_id}"),
-                    reason: "Note updates are outside ADR-102's enumerated Tier 1 fast path."
-                        .to_string(),
-                    tier_reasons: vec!["adr102.not_tier_1_eligible".to_string()],
-                    entity_ids: Vec::new(),
-                    before: Some(json_value(update.preimage())),
-                    after: Some(json_value(update.patch())),
-                },
-                UpdatePatch::Edge(edge_patch) => {
-                    let mut reasons = vec!["adr102.existing_edge_update".to_string()];
-                    let mut explanation =
-                        "Changing an existing edge relation or weight requires Tier 2 review."
-                            .to_string();
-                    if edge_patch.weight.is_some_and(|weight| weight < 0.7) {
-                        reasons.push("adr102.resulting_weight_below_0_7".to_string());
-                        explanation
-                            .push_str(" The resulting weight is below the ADR-102 floor of 0.7.");
-                    }
-                    ReviewOperation {
-                        index,
-                        id: target_id.clone(),
-                        op: "update".to_string(),
-                        target: "edge".to_string(),
-                        tier: TIER_2.to_string(),
-                        summary: format!("Update edge {target_id}"),
-                        reason: explanation,
-                        tier_reasons: reasons,
-                        entity_ids: Vec::new(),
-                        before: Some(json_value(update.preimage())),
-                        after: Some(json_value(update.patch())),
-                    }
-                }
-            }
+            let (target, entity_ids) = match update.patch() {
+                UpdatePatch::Entity(_) => ("entity", vec![target_id.clone()]),
+                UpdatePatch::Note(_) => ("note", Vec::new()),
+                UpdatePatch::Edge(_) => ("edge", Vec::new()),
+            };
+            let summary = format!("Update {target} {target_id}");
+            (
+                target_id,
+                "update",
+                target,
+                summary,
+                entity_ids,
+                Some(json_value(update.preimage())),
+                Some(json_value(update.patch())),
+            )
         }
         Op::Delete(delete) => {
             let target = match &delete.preimage {
@@ -429,37 +318,43 @@ fn summarize_operation(index: usize, op: &Op) -> ReviewOperation {
                 DeletePreimage::Note(_) => "note",
                 DeletePreimage::Edge(_) => "edge",
             };
-            ReviewOperation {
-                index,
-                id: delete.target_id.to_string(),
-                op: "delete".to_string(),
-                target: target.to_string(),
-                tier: TIER_2.to_string(),
-                summary: format!("Delete {target} {}", delete.target_id),
-                reason: "Every delete requires Tier 2 review under the ADR-102 floor.".to_string(),
-                tier_reasons: vec!["adr102.delete".to_string()],
-                entity_ids: if target == "entity" {
-                    vec![delete.target_id.to_string()]
-                } else {
-                    Vec::new()
-                },
-                before: Some(json_value(&delete.preimage)),
-                after: None,
-            }
+            let entity_ids = if target == "entity" {
+                vec![delete.target_id.to_string()]
+            } else {
+                Vec::new()
+            };
+            (
+                delete.target_id.to_string(),
+                "delete",
+                target,
+                format!("Delete {target} {}", delete.target_id),
+                entity_ids,
+                Some(json_value(&delete.preimage)),
+                None,
+            )
         }
-        Op::Merge(merge) => ReviewOperation {
-            index,
-            id: merge.into_id.to_string(),
-            op: "merge".to_string(),
-            target: "entity".to_string(),
-            tier: TIER_2.to_string(),
-            summary: format!("Merge entity {} into {}", merge.from_id, merge.into_id),
-            reason: "Every merge requires Tier 2 review under the ADR-102 floor.".to_string(),
-            tier_reasons: vec!["adr102.merge".to_string()],
-            entity_ids: vec![merge.into_id.to_string(), merge.from_id.to_string()],
-            before: Some(json_value(&merge.preimage)),
-            after: None,
-        },
+        Op::Merge(merge) => (
+            merge.into_id.to_string(),
+            "merge",
+            "entity",
+            format!("Merge entity {} into {}", merge.from_id, merge.into_id),
+            vec![merge.into_id.to_string(), merge.from_id.to_string()],
+            Some(json_value(&merge.preimage)),
+            None,
+        ),
+    };
+    ReviewOperation {
+        index,
+        id,
+        op: op_name.to_string(),
+        target: target.to_string(),
+        tier: decision.tier.as_str().to_string(),
+        summary,
+        reason: decision.reason.clone(),
+        tier_reasons: decision.reason_ids.clone(),
+        entity_ids,
+        before,
+        after,
     }
 }
 
@@ -656,7 +551,9 @@ mod tests {
             "properties": {},
         }));
 
-        let operation = summarize_operation(0, &changeset.ops[0]);
+        let rules = Rules::parse_toml("").unwrap();
+        let decisions = classify_changeset(&rules, &changeset, &[]);
+        let operation = summarize_operation(0, &changeset.ops[0], &decisions[0]);
         assert_eq!(operation.tier, TIER_2);
         assert!(operation
             .tier_reasons

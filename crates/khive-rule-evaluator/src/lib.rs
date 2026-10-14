@@ -7,6 +7,7 @@
 
 mod config;
 mod evaluate;
+mod tier;
 
 use chrono::{DateTime, Utc};
 use khive_types::EdgeEndpointRule;
@@ -22,6 +23,7 @@ pub use evaluate::{
     check_edge_endpoint_types, check_naming_conventions, collect_edge_ids, collect_ids,
     edge_source_id, edge_target_id, evaluate, record_prefix,
 };
+pub use tier::{classify_changeset, Tier, TierDecision, TierFinding};
 
 /// Immutable input strings, preserving record and substrate scan order.
 #[derive(Clone, Copy, Debug)]

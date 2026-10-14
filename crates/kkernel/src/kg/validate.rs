@@ -739,7 +739,7 @@ fn check_referential_integrity(
 
 // ── Configurable rule loader ──────────────────────────────────────────────────
 
-fn load_rules(rules_path: &Path) -> Result<khive_rule_evaluator::Rules> {
+pub(super) fn load_rules(rules_path: &Path) -> Result<khive_rule_evaluator::Rules> {
     let ext = rules_path
         .extension()
         .and_then(|e| e.to_str())
@@ -763,7 +763,8 @@ fn load_rules(rules_path: &Path) -> Result<khive_rule_evaluator::Rules> {
         khive_rule_evaluator::RulesError::Syntax(source) => anyhow::Error::new(source).context(
             RulesSyntaxOrFormatError(format!("parse rules TOML {}", rules_path.display())),
         ),
-        khive_rule_evaluator::RulesError::Direction(message) => anyhow::Error::msg(message)
+        khive_rule_evaluator::RulesError::Direction(message)
+        | khive_rule_evaluator::RulesError::Tier(message) => anyhow::Error::msg(message)
             .context(format!("validate rules TOML {}", rules_path.display())),
     })
 }
@@ -803,7 +804,7 @@ pub(super) fn configurable_rule_checks_partial_view(
     )
 }
 
-fn evaluate_captured_rules(
+pub(super) fn evaluate_captured_rules(
     rules: &khive_rule_evaluator::Rules,
     state: khive_rule_evaluator::NdjsonState<'_>,
     mode: khive_rule_evaluator::EvaluationMode,
