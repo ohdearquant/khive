@@ -273,7 +273,10 @@ impl MemoryPack {
         }
     }
 
-    pub(crate) async fn handle_recall(
+    /// Run one recall under its own profiler call ID. With profiling disabled no
+    /// ID is taken and no record is written; otherwise every exit, cancellation
+    /// included, writes exactly one `total` record.
+    pub(crate) async fn handle_recall_profiled(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -282,7 +285,7 @@ impl MemoryPack {
     ) -> Result<Value, RuntimeError> {
         if !super::common::recall_profile_enabled() {
             return self
-                .handle_recall_inner(token, params, registry, hard_deadline)
+                .handle_recall(token, params, registry, hard_deadline)
                 .await;
         }
 
@@ -294,12 +297,15 @@ impl MemoryPack {
         PROF_CID
             .scope(
                 call_id,
-                self.handle_recall_inner(token, params, registry, hard_deadline),
+                self.handle_recall(token, params, registry, hard_deadline),
             )
             .await
     }
 
-    async fn handle_recall_inner(
+    /// The recall pipeline. Requests reach it through
+    /// [`Self::handle_recall_profiled`], which scopes the profiler call ID; a
+    /// direct call records its stages under ID 0 and writes no `total`.
+    pub(crate) async fn handle_recall(
         &self,
         token: &NamespaceToken,
         params: Value,

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
-    KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry,
-    VerbRegistryBuilder,
+    KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
+    VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 use serde_json::{json, Value};
@@ -77,10 +77,29 @@ impl PackRuntime for RendezvousBrainPack {
     }
 }
 
-async fn fixture(
-    barrier: Option<Arc<Barrier>>,
-) -> (MemoryPack, NamespaceToken, VerbRegistry, Arc<Notify>) {
-    let rt = with_receipt_credentials(KhiveRuntime::memory().unwrap());
+struct Fixture {
+    // Holds the store file for as long as the pack uses it.
+    _dir: tempfile::TempDir,
+    pack: MemoryPack,
+    token: NamespaceToken,
+    registry: VerbRegistry,
+    entered: Arc<Notify>,
+}
+
+// File-backed like a deployed store: an in-memory store has one connection for
+// reads and writes alike, which two concurrent recalls contend for.
+async fn fixture(barrier: Option<Arc<Barrier>>) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = with_receipt_credentials(
+        KhiveRuntime::new_for_test(RuntimeConfig {
+            db_path: Some(dir.path().join("profile.db")),
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap(),
+    );
     for model in ["profile-model-a", "profile-model-b"] {
         rt.register_embedder(HashVecProvider {
             model_name: model.into(),
@@ -105,19 +124,29 @@ async fn fixture(
         )
         .await
         .unwrap();
-    (pack, token, registry, entered)
+    Fixture {
+        _dir: dir,
+        pack,
+        token,
+        registry,
+        entered,
+    }
 }
 
 fn params() -> Value {
     json!({"query": CONTENT, "profile_id": "profile-fixture", "score_floor": 0.0})
 }
 
+// Every call enters through the deadline wrapper, the path a dispatched
+// `memory.recall` takes, so the profiler scope is the production one.
 async fn exercise(mode: &str) {
     if mode == "concurrent" || mode == "disabled" {
-        let (pack, token, registry, _) = fixture(Some(Arc::new(Barrier::new(2)))).await;
+        let f = fixture(Some(Arc::new(Barrier::new(2)))).await;
         let (left, right) = tokio::join!(
-            pack.handle_recall(&token, params(), &registry, None),
-            pack.handle_recall(&token, params(), &registry, None),
+            f.pack
+                .handle_recall_with_deadline(&f.token, params(), &f.registry),
+            f.pack
+                .handle_recall_with_deadline(&f.token, params(), &f.registry),
         );
         for response in [left.unwrap(), right.unwrap()] {
             assert!(!response.as_array().unwrap().is_empty());
@@ -126,12 +155,13 @@ async fn exercise(mode: &str) {
     }
 
     assert_eq!(mode, "exits");
-    let (pack, token, registry, _) = fixture(None).await;
+    let f = fixture(None).await;
     let mut empty = params();
     empty["query"] = json!("unmatchedquasarfixture");
     empty["fusion_strategy"] = json!("keyword_only");
     assert_eq!(
-        pack.handle_recall(&token, empty, &registry, None)
+        f.pack
+            .handle_recall_with_deadline(&f.token, empty, &f.registry)
             .await
             .unwrap(),
         json!([])
@@ -139,8 +169,9 @@ async fn exercise(mode: &str) {
 
     let mut verbose = params();
     verbose["include_breakdown"] = json!(true);
-    let response = pack
-        .handle_recall(&token, verbose, &registry, None)
+    let response = f
+        .pack
+        .handle_recall_with_deadline(&f.token, verbose, &f.registry)
         .await
         .unwrap();
     assert!(!response["results"].as_array().unwrap().is_empty());
@@ -154,21 +185,26 @@ async fn exercise(mode: &str) {
     );
 
     // Deserialization fails before the original profiler initialization point.
-    assert!(pack
-        .handle_recall(&token, json!({"query": 7}), &registry, None)
+    assert!(f
+        .pack
+        .handle_recall_with_deadline(&f.token, json!({"query": 7}), &f.registry)
         .await
         .is_err());
     let mut invalid = params();
     invalid["query"] = json!("");
-    assert!(pack
-        .handle_recall(&token, invalid, &registry, None)
+    assert!(f
+        .pack
+        .handle_recall_with_deadline(&f.token, invalid, &f.registry)
         .await
         .is_err());
 
-    let (pack, token, registry, entered) = fixture(Some(Arc::new(Barrier::new(2)))).await;
-    let mut recall = Box::pin(pack.handle_recall(&token, params(), &registry, None));
+    let f = fixture(Some(Arc::new(Barrier::new(2)))).await;
+    let mut recall = Box::pin(
+        f.pack
+            .handle_recall_with_deadline(&f.token, params(), &f.registry),
+    );
     tokio::select! {
-        _ = entered.notified() => {},
+        _ = f.entered.notified() => {},
         result = &mut recall => panic!("profile must remain held: {result:?}"),
     }
     drop(recall);
