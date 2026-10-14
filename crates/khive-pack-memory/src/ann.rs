@@ -61,6 +61,15 @@ mod delta;
 #[path = "ann/final_tail.rs"]
 mod final_tail;
 use final_tail::fetch_final_tail_on;
+#[path = "ann/epoch.rs"]
+mod epoch;
+pub(crate) use epoch::{
+    bump_durable_epoch, durable_epoch, ensure_epoch_schema, maybe_check_durable_epoch,
+    MEMORY_SCHEMA_PLAN_STMTS,
+};
+#[path = "ann/scoring.rs"]
+mod scoring;
+pub(crate) use scoring::{AnnScoreRoute, FreshTailSearch};
 #[path = "ann/session_exact.rs"]
 mod session_exact;
 pub(crate) use session_exact::session_exact_candidates;
@@ -131,56 +140,6 @@ khive_vamana::impl_ann_bridge_helpers!(
     AnnBridge,
     /// Stamps the build with the write generation represented by its corpus snapshot.
 );
-
-#[derive(Clone, Copy)]
-pub(crate) enum AnnScoreRoute {
-    Memory,
-    NoteSearch,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FreshTailSearch<'a> {
-    query: &'a [f32],
-    k: usize,
-    route: AnnScoreRoute,
-}
-
-impl<'a> FreshTailSearch<'a> {
-    pub(crate) fn new(query: &'a [f32], k: usize, route: AnnScoreRoute) -> Self {
-        Self { query, k, route }
-    }
-}
-
-impl AnnScoreRoute {
-    fn graph_score(self, squared_l2_distance: f32) -> Result<f64, RuntimeError> {
-        match self {
-            Self::Memory => Ok(f64::from((1.0 - squared_l2_distance / 2.0).max(0.0))),
-            Self::NoteSearch => khive_score::try_cosine_score_with_f32_tolerance(
-                f64::from(squared_l2_distance) / 2.0,
-            )
-            .map(|score| score.to_f64())
-            .map_err(|error| {
-                RuntimeError::Internal(format!("note-search ANN cosine distance: {error}"))
-            }),
-        }
-    }
-
-    fn tail_score(self, query: &[f32], embedding: &[f32]) -> Result<f64, RuntimeError> {
-        let cosine = exact_cosine_unclamped(query, embedding);
-        match self {
-            Self::Memory => Ok(f64::from(cosine.max(0.0))),
-            Self::NoteSearch => {
-                khive_score::try_cosine_score_with_f32_tolerance(1.0 - f64::from(cosine))
-                    .map(|score| score.to_f64())
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!(
-                            "note-search fresh-tail cosine distance: {error}"
-                        ))
-                    })
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 #[test]
@@ -437,12 +396,6 @@ pub(crate) async fn generation_for_test(ann: &SharedAnn, key: &AnnKey) -> u64 {
     current_generation(ann, key).await
 }
 
-/// Debounce interval for the cross-process durable-epoch query.
-#[cfg(not(test))]
-const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(test)]
-const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
-
 /// Delay between chained rebuild tasks so continuous writes coalesce.
 ///
 /// One second coalesces nothing against a fleet that writes continuously: the
@@ -483,99 +436,6 @@ fn resolve_rebuild_chain_debounce(
 /// record is read on an unchanged tick; vector/graph files are reopened only
 /// after a distinct publication identity appears.
 const ROTATION_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Mark a cached graph stale when its debounced durable epoch has advanced.
-///
-/// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
-pub(crate) async fn maybe_check_durable_epoch(rt: &KhiveRuntime, ann: &SharedAnn, key: &AnnKey) {
-    {
-        let mut last = ann
-            .last_epoch_check
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = std::time::Instant::now();
-        let due = last
-            .get(key)
-            .is_none_or(|t| now.duration_since(*t) >= DURABLE_EPOCH_CHECK_INTERVAL);
-        if !due {
-            return;
-        }
-        last.insert(key.clone(), now);
-    }
-
-    let installed_baseline = ann.indexes.read().await.get(key).map(|b| b.epoch_baseline);
-    let Some(baseline) = installed_baseline else {
-        // Nothing installed yet — a genuine cache miss already routes through
-        // the normal build path, which reads the durable epoch itself.
-        return;
-    };
-    let durable = durable_epoch(rt).await;
-    if durable > baseline {
-        tracing::debug!(
-            model = %key.model,
-            baseline,
-            durable,
-            "memory ANN durable epoch advanced; marking cached entry stale"
-        );
-        bump_generation(ann, key).await;
-    }
-}
-
-/// Pack-owned DDL for the durable ANN corpus epoch table.
-pub(crate) const MEMORY_SCHEMA_PLAN_STMTS: [&str; 1] =
-    [::khive_runtime::sql!("memory_ann_epoch_create")];
-
-/// Idempotently create the durable epoch table; never called from the hot read path.
-pub(crate) async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute_script(MEMORY_SCHEMA_PLAN_STMTS[0].to_string())
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))
-}
-
-/// Read the durable corpus epoch, returning zero when unavailable or absent.
-pub(crate) async fn durable_epoch(rt: &KhiveRuntime) -> u64 {
-    let sql = rt.sql();
-    let Ok(mut reader) = sql.reader().await else {
-        return 0;
-    };
-    let Ok(rows) = reader
-        .query_all(SqlStatement {
-            sql: ::khive_runtime::sql!("memory_ann_epoch_select").into(),
-            params: vec![],
-            label: Some("memory_ann_durable_epoch_read".into()),
-        })
-        .await
-    else {
-        return 0;
-    };
-    match rows.first().and_then(|r| r.get("epoch")) {
-        Some(SqlValue::Integer(n)) if *n >= 0 => *n as u64,
-        _ => 0,
-    }
-}
-
-/// Increment and return the durable epoch after persisted snapshot invalidation.
-pub(crate) async fn bump_durable_epoch(rt: &KhiveRuntime) -> Result<u64, RuntimeError> {
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute(SqlStatement {
-        sql: ::khive_runtime::sql!("memory_ann_epoch_increment").into(),
-        params: vec![],
-        label: Some("memory_ann_durable_epoch_bump".into()),
-    })
-    .await
-    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    drop(w);
-    Ok(durable_epoch(rt).await)
-}
 
 /// Return a model's warm lock without holding the lock-map mutex across warming.
 async fn model_warm_lock(ann: &SharedAnn, key: &AnnKey) -> Arc<tokio::sync::Mutex<()>> {

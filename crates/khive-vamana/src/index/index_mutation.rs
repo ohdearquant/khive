@@ -3,7 +3,7 @@ use khive_quant::GsEncodedVector;
 use crate::{
     config::VamanaConfig,
     error::{Result, VamanaError},
-    graph::{is_tombstoned_bit, new_visited_set, robust_prune_inner, sort_dedup_u32, VamanaGraph},
+    graph::{is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, VamanaGraph},
 };
 
 use super::{
@@ -228,16 +228,18 @@ impl VamanaIndex {
             // causing u8 clamping and wrong orderings. Exact f32 is correct here —
             // insert is not a hot path. The gs_codes entry for ordinal is already
             // written above (recycle or push) so search() uses SQ8 correctly.
-            let mut visited = new_visited_set(self.num_vectors);
-            let search_result = self.graph.greedy_search(
-                vecs,
-                self.dimensions,
-                vector,
-                self.config.search_list_size,
-                self.config.search_list_size,
-                &mut visited,
-                tombstones_opt,
-            )?;
+            let search_result = {
+                let mut visited = self.search_visited.checkout(self.num_vectors);
+                self.graph.greedy_search(
+                    vecs,
+                    self.dimensions,
+                    vector,
+                    self.config.search_list_size,
+                    self.config.search_list_size,
+                    &mut visited,
+                    tombstones_opt,
+                )?
+            };
 
             // Candidate pool: expanded ∪ results, excluding ordinal itself, deduped.
             let mut candidates: Vec<u32> = search_result

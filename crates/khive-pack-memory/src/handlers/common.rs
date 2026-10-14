@@ -160,8 +160,9 @@ pub(super) mod retrieval_failpoints {
 // KHIVE_RECALL_PROFILE emits per-call stage JSON to stderr.
 pub(super) static RECALL_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    pub(super) static PROF_CID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+// A recall can resume on another worker or interleave with another recall.
+tokio::task_local! {
+    pub(super) static PROF_CID: u64;
 }
 
 pub(super) fn recall_profile_enabled() -> bool {
@@ -1166,7 +1167,7 @@ impl MemoryPack {
             return Ok(Vec::new());
         }
         let prof = recall_profile_enabled();
-        let call_id = PROF_CID.with(|c| c.get());
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
@@ -1336,7 +1337,7 @@ impl MemoryPack {
         let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
             .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
         let prof = recall_profile_enabled();
-        let call_id = PROF_CID.with(|c| c.get());
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
 
         let mut ann_degraded = false;
         let mut timings = RecallStageTimings::default();
