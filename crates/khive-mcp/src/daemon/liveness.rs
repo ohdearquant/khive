@@ -7,7 +7,8 @@ use khive_runtime::daemon::{
 use tokio::net::UnixStream;
 
 use super::forward::{
-    pid_file_directory_is_trusted_if_present, try_forward_before, ForwardOutcome,
+    pid_file_directory_is_trusted_if_present, read_supervisor_marker, try_forward_before,
+    ForwardOutcome, SupervisorMarker,
 };
 #[cfg(test)]
 use super::test_harness::{FORCE_PID_IS_DAEMON, FORCE_PID_IS_FOREIGN, KILL_COUNT, SIGTERM_COUNT};
@@ -108,9 +109,18 @@ const INCUMBENT_EXIT_POLL_MS: u64 = 25;
 #[derive(Debug)]
 pub(super) enum RecoveryError {
     Spawn(std::io::Error),
-    IncumbentStillAlive { pid: u32 },
+    IncumbentStillAlive {
+        pid: u32,
+    },
     RequestExpired,
     PidFileDirectoryUntrusted(String),
+    /// The PID file names a live daemon on a rendezvous a supervisor claims
+    /// (ADR-185 Amendment 5): the daemon is the supervisor's to restart, so the
+    /// client refused to signal it.
+    SupervisedDaemonUnresponsive {
+        pid: u32,
+        marker: SupervisorMarker,
+    },
 }
 
 pub(super) fn process_is_alive(pid: u32) -> bool {
@@ -198,6 +208,13 @@ pub(super) async fn kill_stale_daemon_inner(
     let wait_for_exit = if let Some(pid) = expected_pid {
         match classify_pid_identity(pid) {
             PidIdentity::KhiveDaemon => {
+                // ADR-185 Amendment 5: a client never signals a daemon whose
+                // rendezvous a supervisor claims, readable marker or not.
+                // Degraded bootstrap may start a daemon where none is alive;
+                // it never replaces one.
+                if let Some(marker) = read_supervisor_marker() {
+                    return Err(RecoveryError::SupervisedDaemonUnresponsive { pid, marker });
+                }
                 if let Ok(signed) = i32::try_from(pid) {
                     if signed > 0 {
                         #[cfg(test)]
@@ -653,6 +670,9 @@ pub(super) async fn probe_daemon_identity(
             | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::RequestTooLarge { .. }) => ProbeOutcome::Timeout,
+        // The probe frame was written and no answer came before the probe
+        // deadline: a slow peer, never evidence that it is dead.
+        Ok(ForwardOutcome::ResponseTimeout { .. }) => ProbeOutcome::Timeout,
         Ok(ForwardOutcome::Unreachable {
             kind,
             os_error_code,

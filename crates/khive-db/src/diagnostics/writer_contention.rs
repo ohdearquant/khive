@@ -64,6 +64,14 @@ impl WriterContentionDiagnostics {
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
+            audit_retry_exhausted_obligations: runtime_audit_batch_metrics
+                .map(|m| m.retry_exhausted_obligations),
+            audit_retry_exhausted_obligations_last_at_ms: runtime_audit_batch_metrics
+                .and_then(|m| m.retry_exhausted_obligations_last_at_ms),
+            audit_retry_exhausted_obligations_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
             audit_admission_unresolved_obligations: runtime_audit_batch_metrics
                 .map(|m| m.admission_unresolved_obligations),
             audit_admission_unresolved_obligations_last_at_ms: runtime_audit_batch_metrics

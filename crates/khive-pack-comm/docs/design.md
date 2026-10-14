@@ -4,7 +4,7 @@
 
 ### Communication Pack (ADR-040)
 
-This crate is the primary implementation of ADR-040. It provides eleven public `comm.*` verbs over the
+This crate is the primary implementation of ADR-040. It provides fourteen public `comm.*` verbs over the
 standard `message` note kind stored in the notes table.
 
 Key design decisions from ADR-040:
@@ -32,10 +32,14 @@ Key design decisions from ADR-040:
   - `comm.thread` — Assertive (queries state)
   - `comm.health` — Assertive (queries channel-poll health)
   - `comm.probe` — Assertive (polls inbound metadata without message payloads)
+  - `comm.suppression_add` — Commissive (the caller commits to suppressing a recipient)
+  - `comm.suppression_list` — Assertive (queries suppression state)
+  - `comm.suppression_remove` — Commissive (the caller commits to lifting a suppression)
 - **Core-owned indexes**: migration V52 installs the six comm indexes on `notes`, including
   `idx_comm_message_direction`, `idx_comm_message_thread`, and
   `idx_comm_message_outbound_ref`, independently of pack loading. The pack's `schema_plan()`
-  retains only its auxiliary `comm_channel_cursor` table. The partial indexes use
+  retains only its two auxiliary pack-owned tables, `comm_channel_cursor` and
+  `comm_suppression`. The partial indexes use
   `WHERE deleted_at IS NULL` rather than `WHERE kind = 'message'` so that the SQLite query planner
   can match them when queries use a parameterized `kind = ?N` predicate.
 - **`read()` is a recipient-only action**: marking an outbound (sent) message as read is rejected.
@@ -53,7 +57,7 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 - `NOTE_KINDS = ["message"]`
 - `ENTITY_KINDS = []`
 - `REQUIRES = ["kg"]`
-- `HANDLERS = COMM_HANDLERS` (11 public verb entries plus 5 internal subhandlers)
+- `HANDLERS = COMM_HANDLERS` (14 public verb entries plus 5 internal subhandlers)
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 

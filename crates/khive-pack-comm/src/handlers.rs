@@ -1,7 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All eleven public verbs (`send`, `delivered`, `transport_status`, `inbox`, `unread`,
-//! `read`, `mark_read`, `reply`, `thread`, `health`, `probe`) store or query comm state.
+//! All fourteen public comm verbs store or query comm state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -53,6 +52,7 @@ mod probe_cursor;
 mod quarantine_heartbeat;
 mod read_marking;
 mod reply;
+mod suppression;
 mod thread;
 mod validation;
 #[doc(hidden)]
@@ -88,6 +88,10 @@ use read_marking::{
 };
 
 pub(crate) use reply::handle_reply;
+pub use suppression::load_outbound_email_suppressions;
+pub(crate) use suppression::{
+    handle_suppression_add, handle_suppression_list, handle_suppression_remove,
+};
 
 use validation::{
     addressed_recipient, caller_inherits_legacy_pool, canonicalize_ingest_sent_at,

@@ -226,6 +226,7 @@ use audit::{
 pub use audit::{
     audit_admission_refused_obligation_count, audit_admission_refused_obligation_last_at_ms,
     audit_admission_unresolved_obligation_count, audit_admission_unresolved_obligation_last_at_ms,
+    audit_retry_exhausted_obligation_count, audit_retry_exhausted_obligation_last_at_ms,
     resolve_explicit_namespace,
 };
 pub(crate) use audit::{audit_append_failure_count, audit_obligation_append_failure_count};

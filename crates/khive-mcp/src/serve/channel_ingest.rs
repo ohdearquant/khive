@@ -437,6 +437,7 @@ pub(super) async fn handle_channel_ingest_failure(
                 external_id = envelope.external_id.as_deref(),
                 attempt,
                 threshold = UNKNOWN_INGEST_QUARANTINE_THRESHOLD,
+                ingest_error = %error,
                 "comm.ingest failed; holding channel progress"
             );
             false
@@ -461,6 +462,7 @@ pub(super) async fn handle_channel_ingest_failure(
                         classification = classification.name(),
                         reason = classification.reason(),
                         external_id = envelope.external_id.as_deref(),
+                        ingest_error = %error,
                         error = %quarantine_error,
                         "channel quarantine failed; holding progress for retry"
                     );

@@ -140,7 +140,8 @@ async fn weighted_event_records_actual_features_tiers_namespace_and_output_order
             ("salience".into(), 0.75),
             ("temporal".into(), 0.25),
             ("text_match".into(), 1.0),
-            ("vector_match".into(), 1.0)
+            ("vector_match".into(), 1.0),
+            ("graph_proximity".into(), 0.0)
         ]
     );
     assert_eq!(
@@ -431,4 +432,185 @@ async fn unrepresentable_raw_features_omit_both_tuples_even_when_final_score_is_
         vec![ids[2].parse::<Id128>().unwrap()]
     );
     assert!(payload.is_valid());
+}
+
+#[tokio::test]
+async fn graph_weight_records_zero_handler_feature_without_reading_candidate_json() {
+    let f = Fixture::new();
+    let a = "00000000-0000-4000-8000-000000000051";
+    let b = "00000000-0000-4000-8000-000000000052";
+    let response = f.registry.dispatch("memory.recall_rerank", json!({
+        "namespace": "graph-rerank", "query_id": "graph-query",
+        "candidates": [
+            {"id": a, "fused_score": 0.5, "salience": 0.75, "temporal": 0.25, "source": "both", "graph_proximity": 1.0},
+            {"id": b, "fused_score": 0.75, "graph_proximity": "not a feature input"}
+        ],
+        "config": {"reranker_weights": {"relevance": 0.6, "graph_proximity": 0.4, "typo": 7.0, "zero_unknown": 0.0}}
+    })).await.unwrap();
+    let rows = response["reranked"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for ((row, id), expected) in rows.iter().zip([a, b]).zip([0.3, 0.45]) {
+        assert_eq!(row["id"], id);
+        assert!((row["rerank_score"].as_f64().unwrap() - expected).abs() < 1e-12);
+        assert_eq!(row["rerank_scores"]["graph_proximity"], 0.0);
+        assert!(row["rerank_scores"].get("typo").is_none());
+    }
+    assert_eq!(rows[0]["rerank_scores"]["relevance"], 0.3);
+    let mut active: Vec<_> = response["active_rerankers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    active.sort_unstable();
+    assert_eq!(active, ["graph_proximity", "relevance", "typo"]);
+    let events = f.events("graph-rerank").await;
+    assert_eq!(events.len(), 1);
+    assert!(f.events("local").await.is_empty());
+    let event = &events[0];
+    assert_eq!(event.namespace, "graph-rerank");
+    assert_eq!(event.actor, "actor:rerank-caller");
+    assert_eq!(event.verb, "memory.recall_rerank");
+    let payload: RerankExecutedPayload = serde_json::from_value(event.payload.clone()).unwrap();
+    assert_eq!(payload.reranker, RerankerKind::Weighted);
+    assert_eq!(payload.query_id.as_deref(), Some("graph-query"));
+    assert_eq!(payload.model_id, None);
+    assert_eq!(payload.served_by_profile_id, None);
+    assert!(!payload.hook_applied && !payload.hook_target_match);
+    assert_eq!(payload.tiers, ["relevance", "graph_proximity"]);
+    assert_eq!(payload.ignored_weights, ["typo", "zero_unknown"]);
+    assert_eq!(payload.unidentified_candidates, 0);
+    assert_eq!(
+        payload.candidates,
+        [a, b].map(|id| id.parse::<Id128>().unwrap())
+    );
+    assert_eq!(
+        payload.reranked[0].1,
+        vec![
+            ("relevance".into(), 0.5),
+            ("salience".into(), 0.75),
+            ("temporal".into(), 0.25),
+            ("text_match".into(), 1.0),
+            ("vector_match".into(), 1.0),
+            ("graph_proximity".into(), 0.0)
+        ]
+    );
+    assert_eq!(payload.reranked.len(), 2);
+    assert_eq!(
+        payload.reranked[1].1.last().unwrap(),
+        &("graph_proximity".to_string(), 0.0)
+    );
+    assert_eq!(
+        payload.final_scores,
+        vec![
+            (
+                a.parse().unwrap(),
+                rows[0]["rerank_score"].as_f64().unwrap() as f32
+            ),
+            (
+                b.parse().unwrap(),
+                rows[1]["rerank_score"].as_f64().unwrap() as f32
+            )
+        ]
+    );
+    assert_ne!(
+        f64::from(payload.final_scores[0].1),
+        rows[0]["rerank_score"].as_f64().unwrap()
+    );
+    assert_eq!(
+        f.observations(event).await,
+        vec![
+            ("candidate".into(), a.into(), 0, "note".into()),
+            ("candidate".into(), b.into(), 1, "note".into()),
+            ("selected".into(), a.into(), 0, "note".into()),
+            ("selected".into(), b.into(), 1, "note".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn absent_zero_and_graph_only_weights_have_honest_tiers_and_components() {
+    let id = "00000000-0000-4000-8000-000000000061";
+    for (weights, expected_score, expected_tiers, has_component) in [
+        (json!({"relevance": 1.0}), 0.5, vec!["relevance"], false),
+        (
+            json!({"relevance": 1.0, "graph_proximity": 0.0}),
+            0.5,
+            vec!["relevance"],
+            false,
+        ),
+        (
+            json!({"relevance": 1.0, "graph_proximity": -0.0}),
+            0.5,
+            vec!["relevance"],
+            false,
+        ),
+        (
+            json!({"graph_proximity": 1.0}),
+            0.0,
+            vec!["graph_proximity"],
+            true,
+        ),
+    ] {
+        let f = Fixture::new();
+        let response = f
+            .registry
+            .dispatch(
+                "memory.recall_rerank",
+                json!({
+                    "candidates": [{"id": id, "fused_score": 0.5, "graph_proximity": 1.0}],
+                    "config": {"reranker_weights": weights}
+                }),
+            )
+            .await
+            .unwrap();
+        let row = &response["reranked"][0];
+        assert_eq!(row["rerank_score"], expected_score);
+        assert_eq!(
+            row["rerank_scores"].get("graph_proximity").is_some(),
+            has_component
+        );
+        let events = f.events("local").await;
+        assert_eq!(events.len(), 1);
+        let payload: RerankExecutedPayload =
+            serde_json::from_value(events[0].payload.clone()).unwrap();
+        assert_eq!(payload.tiers, expected_tiers);
+        assert!(payload.ignored_weights.is_empty());
+        assert_eq!(
+            payload.reranked[0].1.last().unwrap(),
+            &("graph_proximity".to_string(), 0.0)
+        );
+        assert_eq!(
+            payload.final_scores,
+            vec![(id.parse().unwrap(), expected_score as f32)]
+        );
+        assert_eq!(
+            f.observations(&events[0]).await,
+            vec![
+                ("candidate".into(), id.into(), 0, "note".into()),
+                ("selected".into(), id.into(), 0, "note".into())
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_graph_weight_refuses_before_event_append() {
+    let f = Fixture::new();
+    let result = f
+        .registry
+        .dispatch(
+            "memory.recall_rerank",
+            json!({
+                "candidates": [{"id": "00000000-0000-4000-8000-000000000071", "fused_score": 0.5}],
+                "config": {"reranker_weights": {"graph_proximity": -1.0}}
+            }),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(khive_runtime::RuntimeError::InvalidInput(message))
+            if message == "reranker_weights[\"graph_proximity\"] must be a finite non-negative number"
+    ));
+    assert!(f.events("local").await.is_empty());
 }

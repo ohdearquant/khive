@@ -453,7 +453,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
 
         // Partitioned sections follow their source atom. A routed single-target
         // knowledge class carries every source section with its source vectors.
-        "knowledge_sections" => SubjectKeyed {
+        "knowledge_sections" | "atom_weights" => SubjectKeyed {
             subject_column: "atom_id",
         },
 
@@ -477,7 +477,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         },
 
         "ann_write_log" => Appended,
-        "events" => History,
+        "events" | "weight_events" => History,
         "ann_consumer_watermark" | "ann_consumer_pending" => ConsumerWatermark,
         "note_streams" => RefusedBySchema,
 
@@ -925,6 +925,25 @@ fn collisions_for(
     if constraint.table == "graph_edges" && constraint.index == "idx_graph_edges_unique_triple" {
         let predicate = edge_collision_target_predicate(request, target, &mut parameters);
         sql.push_str(&format!(" AND ({predicate})"));
+    }
+
+    if constraint.table == "atom_weights" {
+        let atom = request
+            .route_for(&SubjectClass::Atom)
+            .is_some_and(|route| route.target == target);
+        let domain = request
+            .route_for(&SubjectClass::Domain)
+            .is_some_and(|route| route.target == target);
+        let predicate = match (atom, domain) {
+            (true, true) => "1".to_owned(),
+            (true, false) => format!("NOT {}", knowledge_move::MIRROR_EXISTS),
+            (false, true) => knowledge_move::MIRROR_EXISTS.to_owned(),
+            (false, false) => "0".to_owned(),
+        };
+        sql.push_str(&format!(
+            " AND source.atom_id IN (SELECT atom.id FROM knowledge_atoms AS atom \
+             WHERE atom.namespace = ?1 AND {predicate})"
+        ));
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -1376,11 +1395,11 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
                 move_edges(conn, request, route, &mut counts.rows)?
             }
             SubjectClass::Atom => {
-                move_knowledge_atoms(conn, request, target, false, &mut counts.rows)?
+                move_knowledge_atoms(conn, &census, request, target, false, &mut counts.rows)?
             }
             SubjectClass::Domain => {
                 // A domain and its same-ID mirror atom form one logical subject.
-                move_knowledge_atoms(conn, request, target, true, &mut counts.rows)?;
+                move_knowledge_atoms(conn, &census, request, target, true, &mut counts.rows)?;
                 move_whole_table(conn, "knowledge_domains", source, target, &mut counts.rows)?
             }
         };
@@ -1407,14 +1426,16 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     if request.single_target().is_none() {
         conn.execute_batch("DROP TABLE temp.namespace_move_subject_targets")?;
     }
-    if census
-        .tables
-        .iter()
-        .any(|table| table.name == "vector_provenance")
-    {
-        let left = count_in_namespace(conn, "vector_provenance", source)?;
-        if left > 0 {
-            counts.left_behind.insert("vector_provenance".into(), left);
+    for table in ["vector_provenance", "atom_weights", "weight_events"] {
+        if census
+            .tables
+            .iter()
+            .any(|candidate| candidate.name == table)
+        {
+            let left = count_in_namespace(conn, table, source)?;
+            if left > 0 {
+                counts.left_behind.insert(table.into(), left);
+            }
         }
     }
 

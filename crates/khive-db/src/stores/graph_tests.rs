@@ -5497,3 +5497,183 @@ async fn endpoint_base_counts_separate_structure_from_provenance() {
         store.count_edges(EdgeFilter::default()).await.unwrap()
     );
 }
+
+/// The combined relation and endpoint-base aggregate that `stats` reads must
+/// equal the three single-purpose counts it replaces. The fixture covers the
+/// ways they could disagree: one relation spread over several buckets, one
+/// bucket fed by several relations, unresolved endpoints, a soft-deleted edge,
+/// a tombstoned endpoint, a second namespace, a namespace outside the request,
+/// a namespace listed twice, and enough empty namespaces to split the request
+/// into more than one chunk.
+#[tokio::test]
+async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() {
+    let (pool, store_a) = setup_memory_store_with_substrates();
+    let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "combined-b");
+    let store_c = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "combined-c");
+
+    let (e1, e2, e3, e4, e_dead) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [e1, e2, e3, e4, e_dead] {
+        insert_live_entity(&pool, id);
+    }
+    soft_delete_entity(&pool, e_dead);
+    let (n1, n2, n3, n_dead) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [n1, n2, n3, n_dead] {
+        insert_note(&pool, id, false);
+    }
+    soft_delete_note(&pool, n_dead);
+    let (ghost_a, ghost_b) = (Uuid::new_v4(), Uuid::new_v4());
+    // An id held in both tables: the entity base wins, as in the single-purpose count.
+    let both = Uuid::new_v4();
+    insert_live_entity(&pool, both);
+    insert_note(&pool, both, false);
+
+    for edge in [
+        make_edge(e1, e2, EdgeRelation::Contains, 1.0),
+        make_edge(e3, e4, EdgeRelation::Contains, 1.0),
+        make_edge(e1, e3, EdgeRelation::DependsOn, 1.0),
+        make_edge(n1, e1, EdgeRelation::Annotates, 1.0),
+        make_edge(e2, n2, EdgeRelation::Annotates, 1.0),
+        make_edge(n2, n3, EdgeRelation::Supports, 1.0),
+        make_edge(both, e3, EdgeRelation::Supports, 1.0),
+        make_edge(ghost_a, ghost_b, EdgeRelation::DependsOn, 1.0),
+        // Tombstoned endpoints, entity and note: out of every count.
+        make_edge(e1, e_dead, EdgeRelation::Contains, 1.0),
+        make_edge(n_dead, e1, EdgeRelation::Annotates, 1.0),
+    ] {
+        store_a.upsert_edge(edge).await.unwrap();
+    }
+    // Soft-deleted edge, the only `extends` edge: the relation must not appear.
+    let deleted = make_edge(e2, e4, EdgeRelation::Extends, 1.0);
+    let deleted_id = deleted.id;
+    store_a.upsert_edge(deleted).await.unwrap();
+    assert!(store_a
+        .delete_edge(deleted_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    for (source, target, relation) in [
+        (e1, e4, EdgeRelation::Contains),
+        (n3, e3, EdgeRelation::Annotates),
+        (ghost_a, e1, EdgeRelation::Annotates),
+    ] {
+        let mut edge = make_edge(source, target, relation, 1.0);
+        edge.namespace = "combined-b".to_string();
+        store_b.upsert_edge(edge).await.unwrap();
+    }
+    // Outside the requested namespaces.
+    let mut outside = make_edge(e1, e2, EdgeRelation::Contains, 1.0);
+    outside.namespace = "combined-c".to_string();
+    store_c.upsert_edge(outside).await.unwrap();
+
+    let mut namespaces = vec![
+        "default".to_string(),
+        "combined-b".to_string(),
+        "default".to_string(),
+    ];
+    namespaces.extend((0..999).map(|i| format!("combined-empty-{i}")));
+
+    let rows = store_a
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&namespaces)
+        .await
+        .unwrap();
+    let combined: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = rows.iter().copied().collect();
+    assert_eq!(combined.len(), rows.len(), "one row per relation: {rows:?}");
+
+    // Expected values, so two equally wrong answers cannot agree.
+    let expected: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = [
+        (
+            EdgeRelation::Contains,
+            EdgeEndpointBaseCounts {
+                entity_entity: 3,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::DependsOn,
+            EdgeEndpointBaseCounts {
+                entity_entity: 1,
+                unresolved: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::Annotates,
+            EdgeEndpointBaseCounts {
+                entity_note: 1,
+                note_entity: 2,
+                unresolved: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::Supports,
+            EdgeEndpointBaseCounts {
+                entity_entity: 1,
+                note_note: 1,
+                ..Default::default()
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(combined, expected);
+
+    let by_relation: HashMap<EdgeRelation, u64> = combined
+        .iter()
+        .map(|(relation, counts)| (*relation, counts.total()))
+        .collect();
+    assert_eq!(
+        store_a
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        by_relation,
+        "summing each relation's buckets must give its relation count"
+    );
+
+    let mut by_base = EdgeEndpointBaseCounts::default();
+    for counts in combined.values() {
+        by_base.entity_entity += counts.entity_entity;
+        by_base.entity_note += counts.entity_note;
+        by_base.note_entity += counts.note_entity;
+        by_base.note_note += counts.note_note;
+        by_base.unresolved += counts.unresolved;
+    }
+    assert_eq!(
+        store_a
+            .count_edges_by_endpoint_base_in_namespaces(&namespaces)
+            .await
+            .unwrap(),
+        by_base,
+        "summing the buckets across relations must give the endpoint-base counts"
+    );
+
+    let total = store_a
+        .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(total, 11);
+    assert_eq!(
+        by_base.total(),
+        total,
+        "the groups must partition the total"
+    );
+
+    assert!(store_a
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&[])
+        .await
+        .unwrap()
+        .is_empty());
+}

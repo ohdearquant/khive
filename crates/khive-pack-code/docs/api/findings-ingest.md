@@ -72,3 +72,9 @@ or resets its curated lifecycle state.
 invalid governed values,
 missing failure scenarios, invalid indexed evidence, unavailable source-run identity, and JSON parse
 failures. Messages include the accepted value set or shape so callers can repair input directly.
+
+Invalid severity and confidence errors retain ordinary rejected strings and mask credential-shaped
+values with the runtime's secret masker before storing them in `CodeIngestError::InvalidValue.value`.
+Both display and debug output therefore use the masked value. Generic finding `create` and `update`
+apply the same masking to rejected severity, confidence, and `kind_status` values, preserving their
+parameter names and accepted-value lists.
