@@ -41,13 +41,16 @@ pub mod backoff;
 pub mod channel;
 pub mod config;
 pub mod connector;
+pub mod external_host;
 pub mod external_inbound;
 pub(crate) mod oauth;
 pub mod screening;
+pub(crate) mod unsubscribe;
 
 pub use backoff::{is_backoff_eligible, BackoffTick, ImapBackoff, ImapSingleFlight};
 pub use channel::EmailChannel;
 pub use config::EmailChannelConfig;
+pub use external_host::{ExternalEmailHost, InboundSuppression};
 pub use external_inbound::{
     external_delivery_marking, route_inbound, ExternalDeliveryMarking, ExternalMarkingError,
     InboundRoute, InboundRoutes, InboundRoutesError, ThreadOwner, ORIGIN_EXTERNAL, TRUST_UNTRUSTED,

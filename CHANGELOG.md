@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a claim's posterior, rejecting invalid relations and weights before changing values
   or eviction order. Either signed zero is a mutation-free no-op.
 
+- Inbound email follows one disposition order. A malformed or oversized message is quarantined
+  first. A subject of the form `unsubscribe <token>` whose token verifies records an outbound
+  `recipient_key` suppression entry (source `mailto_token`) and the message is neither delivered
+  nor quarantined. With external senders configured, an inbound suppression entry matching the
+  authenticated sender address or its exact domain quarantines the message with reason `blocked`.
+
 ### Fixed
 
 - A daemon that supervises an events daemon now holds each request until that child's socket
