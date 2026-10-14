@@ -374,10 +374,10 @@ struct SuppressionInsert<'a> {
     reason: &'a str,
 }
 
-/// The one SQL path every suppression entry takes: the three verbs' add path and the channel's
-/// mailto opt-out recording both funnel here, so there is a single insert statement for the list.
-/// Uniqueness is `(scope, kind, value, source)`, so a repeated entry inserts nothing and reports
-/// `Ok(false)` rather than failing.
+/// The one SQL path every suppression entry takes: the suppression verbs' add path and the
+/// channel's mailto opt-out recording both funnel here, so there is a single insert statement for
+/// the list. Uniqueness is `(scope, kind, value, source)`, so a repeated entry inserts nothing and
+/// reports `Ok(false)` rather than failing.
 async fn insert_suppression(
     runtime: &KhiveRuntime,
     entry: SuppressionInsert<'_>,
