@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-14
+
 ### Added
 
 - `EntityPosteriors::fold_evidence` applies weighted `supports` and `refutes` evidence
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recipient_key` suppression entry (source `mailto_token`) and the message is neither delivered
   nor quarantined. With external senders configured, an inbound suppression entry matching the
   authenticated sender address or its exact domain quarantines the message with reason `blocked`.
+
 ### Changed
 
 - Configurable graph rules share the pure `khive-rule-evaluator` crate between
