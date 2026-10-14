@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be stored, or the record that references it is refused, the record is written without it
   and names the reason. `comm.health` reports `consecutive_held_polls`, `held_messages`,
   `last_held_at` and `last_quarantined_after_hold_at` per channel.
+### Changed
+
+- Name the distinct query admission policies `khive_text::is_meaningful_text_query`
+  and `khive_pack_memory::scoring::is_meaningful_recall_query`, preserving their
+  existing behavior. Both `is_meaningful_query` functions remain as deprecated
+  compatibility wrappers for one release; callers should use the replacement names.
 
 ## [0.12.0] - 2026-10-13
 
