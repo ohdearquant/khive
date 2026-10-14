@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EntityPosteriors::fold_evidence` applies weighted `supports` and `refutes` evidence
+  to a claim's posterior, rejecting invalid relations and weights before changing values
+  or eviction order. Either signed zero is a mutation-free no-op.
+
 ### Fixed
 
 - A daemon that supervises an events daemon now holds each request until that child's socket

@@ -595,17 +595,15 @@ pub(super) fn merge_entity_sql(
             &namespace,
         )?;
 
-        conn.execute(
-            "UPDATE entities \
-             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1, version = version + 1 \
-             WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
-            rusqlite::params![
-                now,
-                into_str,
-                merge_event_id.to_string(),
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &[khive_db::stores::entity::entity_merge_tombstone_statement(
                 &namespace,
-                &from_str,
-            ],
+                from_id,
+                into_id,
+                merge_event_id,
+                now,
+            )],
         )?;
     }
 
