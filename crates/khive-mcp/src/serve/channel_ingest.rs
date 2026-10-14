@@ -28,12 +28,37 @@ pub(super) fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
 ) {
+    use crate::serve::email_host::CommExternalEmailHost;
     use khive_channel::ChannelRegistry;
     use khive_channel_email::EmailChannel;
+    use khive_runtime::OutboundEmailPolicy;
     use std::sync::Arc;
 
     match EmailChannel::from_env() {
         Ok(email_ch) => {
+            // The channel takes the external-email services it cannot own from its host: the
+            // boot-resolved outbound policy (the unsubscribe token verifier) and the comm-routed
+            // runtime the mailto opt-out writes through (ADR-200 §5.4 entry point 1). The runtime
+            // is the same one the outbox loop below uses, taken from the server rather than
+            // rebuilt; without it the channel still completes such a message but stores no
+            // opt-out. A policy parse error takes the same path the channel's own config
+            // error took: the warn below and polling disabled.
+            let email_ch = match OutboundEmailPolicy::from_env() {
+                Ok(policy) => {
+                    let host = CommExternalEmailHost::new(
+                        Arc::new(policy),
+                        server.channel_outbox_runtime_clone(),
+                    );
+                    email_ch.with_external_host(Arc::new(host))
+                }
+                Err(e) => {
+                    tracing::warn!(target: "khive_mcp::serve",
+                        "channel-email feature is enabled but configuration is incomplete: {e}; \
+                         email polling is disabled"
+                    );
+                    return;
+                }
+            };
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();

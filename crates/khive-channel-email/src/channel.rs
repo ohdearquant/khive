@@ -16,7 +16,9 @@ use crate::config::{EmailAuth, EmailChannelConfig};
 use crate::connector::imap::{ImapFetcher, ImapProgress, MalformedReason, SelectedMessage};
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
+use crate::external_host::{ExternalEmailHost, InboundSuppression};
 use crate::oauth::TokenProvider;
+use crate::unsubscribe::extract_unsubscribe_token;
 
 /// Literal IMAP folder this connector selects. Not the configured mailbox
 /// address (which identifies the account/credential, not the folder).
@@ -61,6 +63,9 @@ enum QuarantineReason {
     Unaligned,
     /// Domain authentication passed, but the sender is not on the maintainer allowlist.
     OffAllowlist,
+    /// The sender authenticated, but an `inbound` suppression entry matches the `From:` address or
+    /// its exact domain (ADR-200 §7 step 6).
+    Blocked,
     /// The `UID FETCH` response carried no RFC822 body for this UID (khive
     /// #449 High fix: a durable terminal disposition, never a silent drop).
     MissingBody,
@@ -78,6 +83,7 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::DmarcFail => "dmarc-fail",
             QuarantineReason::Unaligned => "unaligned",
             QuarantineReason::OffAllowlist => "off-allowlist",
+            QuarantineReason::Blocked => "blocked",
             QuarantineReason::MissingBody => "missing-body",
             QuarantineReason::ParseFailure => "parse-failure",
             QuarantineReason::TooLarge => "too-large",
@@ -95,6 +101,14 @@ impl From<MalformedReason> for QuarantineReason {
     }
 }
 
+/// A mailto unsubscribe (ADR-200 §5.4 entry point 1) whose token verified during the synchronous
+/// disposition loop, paired with the IMAP UID it came from so a failed store write can be
+/// retried without re-parsing and without logging the sender's address.
+struct PendingUnsubscribe {
+    uid: u32,
+    recipient_key: String,
+}
+
 /// Email channel adapter implementing `Channel` via SMTP + IMAP.
 ///
 /// Configuration is provided at construction time via `EmailChannelConfig`.
@@ -103,6 +117,11 @@ pub struct EmailChannel {
     config: EmailChannelConfig,
     smtp: SmtpSender,
     imap: ImapFetcher,
+    /// The host-supplied external-email services: the unsubscribe token verifier, the inbound
+    /// suppression read, and the mailto opt-out write (ADR-200 §5.1/§5.4/§7). Unset for the many
+    /// tests that build a channel directly; with it unset no token can verify and no inbound list
+    /// is read, matching the `KHIVE_EMAIL_EXTERNAL_SENDERS`-unset production behaviour.
+    external_host: Option<Arc<dyn ExternalEmailHost>>,
 }
 
 impl EmailChannel {
@@ -156,7 +175,21 @@ impl EmailChannel {
             }
         };
 
-        Ok(Self { config, smtp, imap })
+        Ok(Self {
+            config,
+            smtp,
+            imap,
+            external_host: None,
+        })
+    }
+
+    /// Wire the host that supplies the external-email services the channel cannot own.
+    ///
+    /// The channel otherwise holds no store or policy handle, so the daemon start-up calls this
+    /// with the same comm-routed runtime it already builds for the outbox loop.
+    pub fn with_external_host(mut self, host: Arc<dyn ExternalEmailHost>) -> Self {
+        self.external_host = Some(host);
+        self
     }
 
     /// The configured mailbox address (e.g. `mailbox@example.com`).
@@ -183,7 +216,12 @@ impl EmailChannel {
         smtp: SmtpSender,
         imap: ImapFetcher,
     ) -> Self {
-        Self { config, smtp, imap }
+        Self {
+            config,
+            smtp,
+            imap,
+            external_host: None,
+        }
     }
 
     /// Validate that the message sender is authorized.
@@ -274,13 +312,49 @@ impl EmailChannel {
         Err(QuarantineReason::DmarcFail)
     }
 
-    /// Run the full attribution gate: domain authentication, then the sender
-    /// allowlist. Both must pass for a message to be attributed to the
-    /// maintainer; either failing quarantines it (never partially attributed).
-    fn gate(&self, email: &RawEmail) -> Result<(), QuarantineReason> {
+    /// Run the domain-authentication-then-allowlist gate: ADR-200 §7's steps 3 through 7.
+    ///
+    /// Steps 1 and 2 (malformed, and the mailto unsubscribe) are decided before this is reached.
+    /// Step 6: once a sender authenticates and the external-sender configuration is on,
+    /// an `inbound` suppression entry matching the sender's address or its exact domain quarantines
+    /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
+    /// any failing step quarantines it (never partially attributed).
+    ///
+    /// ADR-200 §8.3 screening is not part of this change: the step-7 case keeps today's
+    /// `off-allowlist` outcome.
+    fn gate(
+        &self,
+        email: &RawEmail,
+        inbound: Option<&InboundSuppression>,
+    ) -> Result<(), QuarantineReason> {
         self.evaluate_auth(email)?;
-        self.check_sender(&email.from_addrs, email.sender_addr.as_deref())
-            .map_err(|_| QuarantineReason::OffAllowlist)
+        if self
+            .check_sender(&email.from_addrs, email.sender_addr.as_deref())
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // Step 4 (maintainer) is the allowlist passing above and is unchanged. The sender is not
+        // the maintainer, so it is external: step 5 keeps today's outcome while external senders
+        // are unset, and step 6 consults the inbound list only once they are configured.
+        if self
+            .external_host
+            .as_deref()
+            .is_some_and(|host| host.external_senders_configured())
+        {
+            // "the authenticated `From:` address" is a single well-formed From: a message with
+            // zero or several is unauthorized on its face, not a candidate for the block list.
+            if let [only_from] = email.from_addrs.as_slice() {
+                if let Some(sender) =
+                    khive_types::email_address::normalize_email_recipient(only_from)
+                {
+                    if inbound.is_some_and(|check| check(&sender)) {
+                        return Err(QuarantineReason::Blocked);
+                    }
+                }
+            }
+        }
+        Err(QuarantineReason::OffAllowlist)
     }
 
     /// Build the envelope recorded for a message that failed the attribution
@@ -429,22 +503,40 @@ impl EmailChannel {
         }
     }
 
-    /// Run the gate/quarantine disposition loop over a fetched batch,
-    /// producing the envelopes ready for `comm.ingest`. Extracted from `poll`
-    /// so `poll_page` shares the exact same per-message logic.
+    /// Run ADR-200 §7's ordered disposition over a fetched batch, producing the envelopes ready
+    /// for `comm.ingest` plus any deferred mailto-unsubscribe suppression writes.
     ///
-    /// Every [`SelectedMessage`] produces exactly one disposition here (khive
-    /// #449 High fix): a parsed email is gated as before, and a
-    /// [`SelectedMessage::Malformed`] entry always becomes a quarantine
-    /// envelope, regardless of `quarantine_store` -- see
+    /// Extracted from `poll` so `poll_page` shares the exact same per-message logic. Every
+    /// [`SelectedMessage`] produces exactly one disposition here (khive #449 High fix): a parsed
+    /// email reaches step 2 (mailto unsubscribe) before step 3 (domain authentication) and then
+    /// the gate, and a [`SelectedMessage::Malformed`] entry is step 1 and always becomes a
+    /// quarantine envelope, regardless of `quarantine_store` -- see
     /// [`Self::malformed_quarantine_envelope`].
-    fn disposition(&self, raw: Vec<SelectedMessage>) -> Vec<ChannelEnvelope> {
+    ///
+    /// A message at step 2 produces no envelope: the suppression entry is its machine record, and
+    /// the poll cursor advancing past its UID is how the poller marks it processed, so it is never
+    /// delivered to an actor, never quarantined and never screened. The write itself is deferred to
+    /// the async caller so a store failure can hold the poll rather than silently drop the opt-out.
+    fn disposition(
+        &self,
+        raw: Vec<SelectedMessage>,
+        inbound: Option<&InboundSuppression>,
+    ) -> (Vec<ChannelEnvelope>, Vec<PendingUnsubscribe>) {
         let mut envelopes = Vec::new();
+        let mut pending_unsubscribes = Vec::new();
         for message in raw {
             match message {
                 SelectedMessage::Email(email) => {
                     let uid = email.uid;
-                    match self.gate(&email) {
+                    // §7 step 2 precedes §7 step 3: the token is the authority, so a verified one
+                    // is honoured even when the message would fail domain authentication. A token
+                    // that does not verify (tampered, unknown key id, wrong length, garbage) is
+                    // ignored and the message continues below as ordinary mail.
+                    if let Some(recipient_key) = self.verified_unsubscribe_key(&email) {
+                        pending_unsubscribes.push(PendingUnsubscribe { uid, recipient_key });
+                        continue;
+                    }
+                    match self.gate(&email, inbound) {
                         Ok(()) => envelopes.push(self.to_envelope(*email)),
                         Err(reason) => {
                             if self.config.quarantine_store {
@@ -482,7 +574,72 @@ impl EmailChannel {
                 }
             }
         }
-        envelopes
+        (envelopes, pending_unsubscribes)
+    }
+
+    /// The verified recipient key when the message's subject carries a mailto unsubscribe token,
+    /// or `None` (no token, a non-verifying token, or no configured host).
+    ///
+    /// The token verifier comes from the host's outbound policy; the key variables are never
+    /// parsed a second time here. Only the subject and the host are read, so this never observes
+    /// or logs the `From:` address.
+    fn verified_unsubscribe_key(&self, email: &RawEmail) -> Option<String> {
+        let candidate = extract_unsubscribe_token(&email.subject)?;
+        self.external_host
+            .as_deref()?
+            .verify_unsubscribe_token(candidate)
+    }
+
+    /// Record the deferred mailto-unsubscribe entries (§5.4 entry point 1) through the host.
+    ///
+    /// A second copy of the same unsubscribe is not a failure (uniqueness covers the entry). A
+    /// write failure becomes a retryable channel error so the poll is not allowed to advance: the
+    /// opt-out is never silently dropped.
+    async fn record_unsubscribes(
+        &self,
+        pending: &[PendingUnsubscribe],
+    ) -> Result<(), ChannelError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let Some(host) = self.external_host.as_deref() else {
+            warn!(
+                "mailto unsubscribe: no comm store is wired to this channel; suppression entry not recorded"
+            );
+            return Ok(());
+        };
+        for entry in pending {
+            match host.record_mailto_unsubscribe(&entry.recipient_key).await {
+                Ok(recorded) => {
+                    debug!(
+                        uid = entry.uid,
+                        recorded, "mailto unsubscribe suppression entry processed"
+                    );
+                }
+                Err(error) => {
+                    return Err(ChannelError::Transport(format!(
+                        "mailto unsubscribe suppression write failed: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load the `inbound` suppression check for one poll.
+    ///
+    /// Loaded once per poll (ADR-200 §7 step 6) and shared across the page's messages. When the
+    /// channel has no host, or external senders are unset, no read happens -- matching today's
+    /// behaviour with `KHIVE_EMAIL_EXTERNAL_SENDERS` unset.
+    async fn load_inbound_suppression(&self) -> Result<Option<InboundSuppression>, ChannelError> {
+        let host = self
+            .external_host
+            .as_deref()
+            .filter(|host| host.external_senders_configured());
+        match host {
+            Some(host) => host.inbound_suppression().await.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Convert a `RawEmail` that has already passed `gate` into a `ChannelEnvelope`.
@@ -578,7 +735,10 @@ impl Channel for EmailChannel {
 
     async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
         let raw = self.imap.fetch_since(since, IMAP_PAGE_LIMIT).await?;
-        Ok(self.disposition(raw))
+        let inbound = self.load_inbound_suppression().await?;
+        let (envelopes, pending_unsubscribes) = self.disposition(raw, inbound.as_ref());
+        self.record_unsubscribes(&pending_unsubscribes).await?;
+        Ok(envelopes)
     }
 
     /// Checkpointed poll (issue #449): resolves the durable IMAP
@@ -601,7 +761,12 @@ impl Channel for EmailChannel {
             .imap
             .fetch_page(recovery_since, IMAP_PAGE_LIMIT, progress)
             .await?;
-        let envelopes = self.disposition(page.emails);
+        let inbound = self.load_inbound_suppression().await?;
+        let (envelopes, pending_unsubscribes) = self.disposition(page.emails, inbound.as_ref());
+        // §5.4 entry point 1's machine record must commit before the cursor advances past the UID:
+        // a store failure here surfaces as a channel error, so the poll coordinator holds progress
+        // and the opt-out is not silently dropped.
+        self.record_unsubscribes(&pending_unsubscribes).await?;
         let next_checkpoint = if page.next_progress == progress {
             None
         } else {
@@ -629,7 +794,9 @@ mod tests {
         parse_raw_bytes, ImapConnector, ImapFetchPage, ImapFetcher, ImapProgress,
     };
     use crate::connector::smtp::{SmtpConnector, SmtpSender};
+    use khive_runtime::{KhiveRuntime, OutboundEmailPolicy};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// The `authserv-id` this test suite's channels are configured to trust.
@@ -805,14 +972,20 @@ mod tests {
         config_b.mailbox = "b@example.com".to_string();
         let a = build_channel_from(config_a, vec![]);
         let b = build_channel_from(config_b, vec![]);
-        let a_env = a.disposition(vec![SelectedMessage::Email(Box::new(make_email(
-            "maintainer@example.com",
-            raw,
-        )))]);
-        let b_env = b.disposition(vec![SelectedMessage::Email(Box::new(make_email(
-            "maintainer@example.com",
-            raw,
-        )))]);
+        let (a_env, _) = a.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "maintainer@example.com",
+                raw,
+            )))],
+            None,
+        );
+        let (b_env, _) = b.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "maintainer@example.com",
+                raw,
+            )))],
+            None,
+        );
         assert_eq!(
             a_env[0].external_id.as_deref(),
             Some("imap:mail.example.com:a@example.com:17:42")
@@ -2154,15 +2327,18 @@ mod tests {
         let ch = build_channel_from(config, vec![]);
         let mut good = make_email("maintainer@example.com", "imap:imap.example.com:4:2");
         good.uid = 2;
-        let envelopes = ch.disposition(vec![
-            SelectedMessage::Malformed {
-                uid: 1,
-                imap_external_id: "imap:imap.example.com:4:1".to_string(),
-                reason: MalformedReason::TooLarge,
-                raw_bytes: None,
-            },
-            SelectedMessage::Email(Box::new(good)),
-        ]);
+        let (envelopes, _) = ch.disposition(
+            vec![
+                SelectedMessage::Malformed {
+                    uid: 1,
+                    imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                    reason: MalformedReason::TooLarge,
+                    raw_bytes: None,
+                },
+                SelectedMessage::Email(Box::new(good)),
+            ],
+            None,
+        );
 
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].from, EMAIL_QUARANTINE_SENDER);
@@ -2394,5 +2570,728 @@ mod tests {
             );
             assert_eq!(props["quarantined"], "true", "{builder}");
         }
+    }
+
+    // --- ADR-200 §7 ordered inbound disposition ---
+
+    /// An enabled outbound policy with a fixed test key, so the channel verifies tokens the same
+    /// way the outbound path mints them.
+    fn enabled_policy() -> Arc<OutboundEmailPolicy> {
+        Arc::new(
+            OutboundEmailPolicy::configured_for_tests(
+                vec!["allowed@example.com".into()],
+                vec!["actor:sender".into()],
+                100,
+            )
+            .expect("test policy"),
+        )
+    }
+
+    /// A scripted step-6 suppression check over a sender address.
+    type ScriptedPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+    /// The test host: the external-email services the channel takes from its daemon, wired over
+    /// the same khive-runtime policy and khive-pack-comm store the production host uses.
+    struct TestExternalHost {
+        policy: Option<Arc<OutboundEmailPolicy>>,
+        runtime: Option<KhiveRuntime>,
+        /// What [`ExternalEmailHost::external_senders_configured`] reports. Derived from the
+        /// policy by [`Self::over_runtime`]; fixed directly by [`Self::scripted`].
+        configured: bool,
+        /// A scripted step-6 check, used instead of the store by [`Self::scripted`].
+        predicate: Option<ScriptedPredicate>,
+        /// Counts every call to [`ExternalEmailHost::inbound_suppression`].
+        inbound_reads: Arc<AtomicUsize>,
+    }
+
+    impl TestExternalHost {
+        fn over_runtime(
+            policy: Option<Arc<OutboundEmailPolicy>>,
+            runtime: Option<KhiveRuntime>,
+        ) -> Self {
+            let configured = policy
+                .as_deref()
+                .is_some_and(OutboundEmailPolicy::has_external_senders);
+            Self {
+                policy,
+                runtime,
+                configured,
+                predicate: None,
+                inbound_reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// A host with a fixed configured report and a scripted step-6 predicate, for the tests
+        /// that drive the check directly rather than through the store.
+        fn scripted(
+            configured: bool,
+            predicate: impl Fn(&str) -> bool + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                policy: None,
+                runtime: None,
+                configured,
+                predicate: Some(Arc::new(predicate)),
+                inbound_reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalEmailHost for TestExternalHost {
+        fn external_senders_configured(&self) -> bool {
+            self.configured
+        }
+
+        fn verify_unsubscribe_token(&self, token: &str) -> Option<String> {
+            self.policy.as_deref()?.verify_unsubscribe_token(token)
+        }
+
+        async fn inbound_suppression(&self) -> Result<InboundSuppression, ChannelError> {
+            self.inbound_reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(predicate) = &self.predicate {
+                let predicate = Arc::clone(predicate);
+                return Ok(Arc::new(move |sender: &str| predicate(sender)));
+            }
+            let Some(runtime) = self.runtime.as_ref() else {
+                return Ok(Arc::new(|_: &str| false));
+            };
+            let entries = khive_pack_comm::handlers::load_inbound_email_suppressions(runtime)
+                .await
+                .map_err(|error| {
+                    ChannelError::Transport(format!("inbound suppression read failed: {error}"))
+                })?;
+            Ok(Arc::new(move |sender: &str| {
+                khive_runtime::inbound_email_is_suppressed(sender, &entries)
+            }))
+        }
+
+        async fn record_mailto_unsubscribe(
+            &self,
+            recipient_key: &str,
+        ) -> Result<bool, ChannelError> {
+            let Some(runtime) = self.runtime.as_ref() else {
+                warn!(
+                    "mailto unsubscribe: no comm store is wired to this channel; suppression entry not recorded"
+                );
+                return Ok(false);
+            };
+            let actor = runtime
+                .config()
+                .actor_id
+                .clone()
+                .unwrap_or_else(|| "channel:email".to_string());
+            khive_pack_comm::handlers::record_mailto_unsubscribe_suppression(
+                runtime,
+                recipient_key,
+                &actor,
+            )
+            .await
+            .map_err(|error| ChannelError::Transport(format!("{error}")))
+        }
+    }
+
+    /// Build a channel with a test host over the given policy and comm runtime, so the mailto
+    /// step can record its suppression entry and the step-6 check can read the store.
+    fn build_channel_with_store(
+        maintainer: &str,
+        emails: Vec<RawEmail>,
+        policy: Option<Arc<OutboundEmailPolicy>>,
+        comm: Option<KhiveRuntime>,
+    ) -> EmailChannel {
+        build_channel_with_host(
+            maintainer,
+            emails,
+            TestExternalHost::over_runtime(policy, comm),
+        )
+    }
+
+    /// Build a channel wired to `host`, so tests can inspect the host's read counter.
+    fn build_channel_with_host(
+        maintainer: &str,
+        emails: Vec<RawEmail>,
+        host: TestExternalHost,
+    ) -> EmailChannel {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: calls.clone(),
+        });
+        let imap = ImapFetcher::with_connector(FixedImap { emails });
+        let channel = EmailChannel::with_connectors(make_config(maintainer), smtp, imap);
+        channel.with_external_host(Arc::new(host))
+    }
+
+    /// The step-6 check the store-backed host would produce, for the tests that pass entries
+    /// straight to `disposition`.
+    fn inbound_predicate(entries: &[khive_runtime::EmailSuppression]) -> InboundSuppression {
+        let entries = entries.to_vec();
+        Arc::new(move |sender: &str| khive_runtime::inbound_email_is_suppressed(sender, &entries))
+    }
+
+    /// An in-memory comm runtime whose suppression schema exists (an always-empty read creates it).
+    async fn suppression_runtime() -> KhiveRuntime {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        khive_pack_comm::handlers::load_inbound_email_suppressions(&runtime)
+            .await
+            .expect("create suppression schema");
+        runtime
+    }
+
+    async fn outbound_recipient_key_rows(runtime: &KhiveRuntime) -> Vec<(String, String)> {
+        use khive_storage::SqlStatement;
+
+        let rows = runtime
+            .sql()
+            .reader()
+            .await
+            .expect("reader")
+            .query_all(SqlStatement {
+                sql: "SELECT value, source FROM comm_suppression \
+                      WHERE scope = 'outbound' AND kind = 'recipient_key' \
+                      ORDER BY value"
+                    .into(),
+                params: vec![],
+                label: Some("test-outbound-recipient-keys".into()),
+            })
+            .await
+            .expect("recipient key rows");
+        rows.iter()
+            .map(|row| {
+                let value = match row.get("value") {
+                    Some(khive_storage::SqlValue::Text(value)) => value.clone(),
+                    other => panic!("value column: {other:?}"),
+                };
+                let source = match row.get("source") {
+                    Some(khive_storage::SqlValue::Text(value)) => value.clone(),
+                    other => panic!("source column: {other:?}"),
+                };
+                (value, source)
+            })
+            .collect()
+    }
+
+    fn auth_failing_email(sender: &str, imap_id: &str) -> RawEmail {
+        let mut email = make_email(sender, imap_id);
+        // Replace the trusted, self-aligned header with one whose only trusted method passes for a
+        // different domain, so domain authentication fails at §7 step 3 (as `unaligned`).
+        email.authentication_results = vec![format!(
+            "{TEST_AUTHSERV_ID}; dkim=pass header.d=other.example"
+        )];
+        email
+    }
+
+    // §7 step 2: a verified token is honoured before step 3, so it works even though this
+    // message's domain authentication fails.
+    #[tokio::test]
+    async fn verified_unsubscribe_records_entry_and_drops_message_before_authentication() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        let mut email = auth_failing_email("stranger@example.net", "imap:test:0:1");
+        email.subject = format!("unsubscribe {token}");
+        let runtime = suppression_runtime().await;
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![email],
+            Some(Arc::clone(&policy)),
+            Some(runtime.clone()),
+        );
+
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(
+            envs.is_empty(),
+            "a verified unsubscribe is neither delivered nor quarantined"
+        );
+        let rows = outbound_recipient_key_rows(&runtime).await;
+        assert_eq!(rows.len(), 1, "exactly one recipient_key entry: {rows:?}");
+        assert_eq!(rows[0].0, policy.recipient_key("gone@example.net").unwrap());
+        assert_eq!(rows[0].1, "mailto_token");
+    }
+
+    // §7 step 2: a token whose characters are altered does not verify and the message continues as
+    // ordinary mail. Here it reaches step 3 (which fails) and is quarantined `unaligned`, proving
+    // it was not treated as an opt-out.
+    #[tokio::test]
+    async fn tampered_unsubscribe_token_is_ordinary_mail_and_continues_to_authentication() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        // Flip a single base64url character, keeping the token's length: the tag no longer checks
+        // out, so the candidate must be ignored.
+        let mut flipped: Vec<char> = token.chars().collect();
+        let middle = flipped.len() / 2;
+        flipped[middle] = if flipped[middle] == 'A' { 'B' } else { 'A' };
+        let flipped: String = flipped.into_iter().collect();
+        assert!(
+            policy.verify_unsubscribe_token(&token).is_some(),
+            "the minted token verifies"
+        );
+        assert!(
+            policy.verify_unsubscribe_token(&flipped).is_none(),
+            "the altered token does not verify"
+        );
+        let mut email = auth_failing_email("stranger@example.net", "imap:test:0:2");
+        email.subject = format!("unsubscribe {flipped}");
+        let runtime = suppression_runtime().await;
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![email],
+            Some(Arc::clone(&policy)),
+            Some(runtime.clone()),
+        );
+
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1, "a tampered token is ordinary mail");
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("unaligned"),
+            "the message continued to step 3, where its domain authentication fails"
+        );
+        assert!(outbound_recipient_key_rows(&runtime).await.is_empty());
+    }
+
+    /// One page holding a single parsed message, with the IMAP progress advanced to its UID.
+    struct SingleEmailPageImap {
+        email: RawEmail,
+    }
+
+    #[async_trait]
+    impl ImapConnector for SingleEmailPageImap {
+        async fn fetch_page(
+            &self,
+            _since: DateTime<Utc>,
+            _limit: usize,
+            _progress: ImapProgress,
+        ) -> Result<ImapFetchPage, ChannelError> {
+            Ok(ImapFetchPage {
+                emails: vec![SelectedMessage::Email(Box::new(self.email.clone()))],
+                next_progress: ImapProgress {
+                    uid_validity: NonZeroU32::new(3),
+                    last_seen_uid: NonZeroU32::new(self.email.uid),
+                },
+            })
+        }
+    }
+
+    /// A host whose token verifier works and whose suppression store refuses every write.
+    struct WriteFailingHost {
+        policy: Arc<OutboundEmailPolicy>,
+    }
+
+    #[async_trait]
+    impl ExternalEmailHost for WriteFailingHost {
+        fn external_senders_configured(&self) -> bool {
+            false
+        }
+
+        fn verify_unsubscribe_token(&self, token: &str) -> Option<String> {
+            self.policy.verify_unsubscribe_token(token)
+        }
+
+        async fn inbound_suppression(&self) -> Result<InboundSuppression, ChannelError> {
+            Ok(Arc::new(|_: &str| false))
+        }
+
+        async fn record_mailto_unsubscribe(
+            &self,
+            _recipient_key: &str,
+        ) -> Result<bool, ChannelError> {
+            Err(ChannelError::Transport(
+                "suppression store unavailable".into(),
+            ))
+        }
+    }
+
+    // §7 step 1 precedes step 2: a message that could not be parsed is quarantined even when its
+    // raw bytes carry a subject with a valid token, and no suppression entry is recorded.
+    #[tokio::test]
+    async fn malformed_message_with_a_valid_token_is_quarantined_not_unsubscribed() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        assert!(
+            policy.verify_unsubscribe_token(&token).is_some(),
+            "the token in the raw bytes verifies"
+        );
+
+        struct MalformedPageImap {
+            raw: Vec<u8>,
+        }
+        #[async_trait]
+        impl ImapConnector for MalformedPageImap {
+            async fn fetch_page(
+                &self,
+                _since: DateTime<Utc>,
+                _limit: usize,
+                _progress: ImapProgress,
+            ) -> Result<ImapFetchPage, ChannelError> {
+                Ok(ImapFetchPage {
+                    emails: vec![SelectedMessage::Malformed {
+                        uid: 5,
+                        imap_external_id: "imap:imap.example.com:3:5".to_string(),
+                        reason: MalformedReason::ParseFailure,
+                        raw_bytes: Some(self.raw.clone()),
+                    }],
+                    next_progress: ImapProgress {
+                        uid_validity: NonZeroU32::new(3),
+                        last_seen_uid: NonZeroU32::new(5),
+                    },
+                })
+            }
+        }
+
+        let raw = format!("From: stranger@example.net\r\nSubject: unsubscribe {token}\r\n\r\n")
+            .into_bytes();
+        let runtime = suppression_runtime().await;
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let imap = ImapFetcher::with_connector(MalformedPageImap { raw });
+        let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
+            .with_external_host(Arc::new(TestExternalHost::over_runtime(
+                Some(Arc::clone(&policy)),
+                Some(runtime.clone()),
+            )));
+
+        let page = ch.poll_page(Utc::now(), None).await.unwrap();
+        assert_eq!(page.envelopes.len(), 1, "{:?}", page.envelopes);
+        assert_eq!(
+            page.envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("parse-failure")
+        );
+        assert!(outbound_recipient_key_rows(&runtime).await.is_empty());
+        assert_eq!(page.next_checkpoint.unwrap().high_water, Some(5));
+    }
+
+    // §7 step 2 through the checkpointed poll: the entry is recorded, nothing is emitted, and the
+    // checkpoint advances past the message's UID, which is how the poller marks it processed.
+    #[tokio::test]
+    async fn verified_unsubscribe_advances_the_checkpoint_past_its_uid() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        let mut email = auth_failing_email("stranger@example.net", "imap:test:3:7");
+        email.uid = 7;
+        email.subject = format!("unsubscribe {token}");
+        let runtime = suppression_runtime().await;
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let imap = ImapFetcher::with_connector(SingleEmailPageImap { email });
+        let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
+            .with_external_host(Arc::new(TestExternalHost::over_runtime(
+                Some(Arc::clone(&policy)),
+                Some(runtime.clone()),
+            )));
+
+        let page = ch.poll_page(Utc::now(), None).await.unwrap();
+        assert!(page.envelopes.is_empty(), "{:?}", page.envelopes);
+        assert_eq!(page.next_checkpoint.unwrap().high_water, Some(7));
+        let rows = outbound_recipient_key_rows(&runtime).await;
+        assert_eq!(rows.len(), 1, "exactly one recipient_key entry: {rows:?}");
+        assert_eq!(rows[0].0, policy.recipient_key("gone@example.net").unwrap());
+    }
+
+    // A failed suppression write fails the poll, so the coordinator never persists a checkpoint
+    // past the message and the opt-out is retried on the next poll instead of being lost.
+    #[tokio::test]
+    async fn failed_unsubscribe_write_fails_the_poll() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        let mut email = make_email("maintainer@example.com", "imap:test:3:8");
+        email.uid = 8;
+        email.subject = format!("unsubscribe {token}");
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let imap = ImapFetcher::with_connector(SingleEmailPageImap { email });
+        let ch = EmailChannel::with_connectors(make_config("maintainer@example.com"), smtp, imap)
+            .with_external_host(Arc::new(WriteFailingHost { policy }));
+
+        let error = ch.poll_page(Utc::now(), None).await.unwrap_err();
+        assert!(
+            matches!(&error, ChannelError::Transport(message)
+                if message.contains("mailto unsubscribe suppression write failed")),
+            "{error:?}"
+        );
+    }
+
+    // A §7 step-2 message is a machine record only: no actor-visible envelope, no quarantine row,
+    // and the poll cursor advancing past its UID is how the poller marks it processed.
+    #[tokio::test]
+    async fn verified_unsubscribe_is_not_quarantined_and_not_delivered() {
+        let policy = enabled_policy();
+        let token = policy
+            .mint_unsubscribe_token("gone@example.net")
+            .expect("mint token");
+        let mut email = make_email("maintainer@example.com", "imap:test:0:3");
+        email.subject = format!("unsubscribe {token}");
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![email],
+            Some(Arc::clone(&policy)),
+            None,
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert!(envs.is_empty(), "{envs:?}");
+    }
+
+    // §7 step 5 / A1: with external senders unset the channel holds no verifier, so even a subject
+    // carrying a token mintable elsewhere is ordinary mail and the reader is unchanged -- an
+    // authenticated non-maintainer is quarantined `off-allowlist`.
+    #[tokio::test]
+    async fn senders_unset_keeps_off_allowlist_outcome() {
+        let minting = enabled_policy();
+        let token = minting
+            .mint_unsubscribe_token("gone@example.com")
+            .expect("mint token");
+        let mut email = make_email("stranger@example.com", "imap:test:0:4");
+        email.subject = format!("unsubscribe {token}");
+        let ch = build_channel_with_store("maintainer@example.com", vec![email], None, None);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
+        assert_eq!(
+            envs[0].metadata.get("quarantined").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    // §7 step 6: with external senders unset the channel never reads the inbound suppression list,
+    // so a host that would block every sender is never consulted and the message keeps the
+    // `off-allowlist` outcome.
+    #[tokio::test]
+    async fn external_senders_unset_never_reads_the_inbound_list() {
+        let host = TestExternalHost::scripted(false, |_| true);
+        let reads = Arc::clone(&host.inbound_reads);
+        let ch = build_channel_with_host(
+            "maintainer@example.com",
+            vec![make_email("stranger@example.com", "imap:test:0:5")],
+            host,
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist"),
+            "with external senders unset the outcome stays off-allowlist, never blocked"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the inbound list is not read while external senders are unset"
+        );
+    }
+
+    // §7 step 6: with external senders configured, the loaded predicate quarantines the listed
+    // sender as `blocked` and leaves another non-maintainer at `off-allowlist`.
+    #[tokio::test]
+    async fn external_host_suppression_blocks_a_listed_sender() {
+        let host = TestExternalHost::scripted(true, |sender| sender == "listed@example.com");
+        let reads = Arc::clone(&host.inbound_reads);
+        let ch = build_channel_with_host(
+            "maintainer@example.com",
+            vec![
+                make_email("listed@example.com", "imap:test:0:6"),
+                make_email("other@example.com", "imap:test:0:7"),
+            ],
+            host,
+        );
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 2);
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("blocked")
+        );
+        assert_eq!(
+            envs[1]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist"),
+            "a sender the predicate does not match stays off-allowlist"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    // §7 step 6: an authenticated stranger matching an inbound address entry is quarantined
+    // `blocked`.
+    #[tokio::test]
+    async fn inbound_address_suppression_quarantines_blocked() {
+        let entries = [khive_runtime::EmailSuppression {
+            scope: khive_runtime::EmailSuppressionScope::Inbound,
+            kind: khive_runtime::EmailSuppressionKind::Address,
+            value: "stranger@example.com".into(),
+        }];
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![],
+            Some(enabled_policy()),
+            None,
+        );
+        let (envelopes, _) = ch.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "stranger@example.com",
+                "imap:test:0:8",
+            )))],
+            Some(&inbound_predicate(&entries)),
+        );
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("blocked")
+        );
+    }
+
+    // §7 step 6: an inbound domain entry blocks the domain exactly, never a subdomain.
+    #[tokio::test]
+    async fn inbound_domain_suppression_blocks_domain_but_not_subdomain() {
+        let entries = [khive_runtime::EmailSuppression {
+            scope: khive_runtime::EmailSuppressionScope::Inbound,
+            kind: khive_runtime::EmailSuppressionKind::Domain,
+            value: "example.com".into(),
+        }];
+        let predicate = inbound_predicate(&entries);
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![],
+            Some(enabled_policy()),
+            None,
+        );
+        let (blocked, _) = ch.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "someone@example.com",
+                "imap:test:0:9",
+            )))],
+            Some(&predicate),
+        );
+        assert_eq!(
+            blocked[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("blocked")
+        );
+
+        let (sub, _) = ch.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "someone@sub.example.com",
+                "imap:test:0:10",
+            )))],
+            Some(&predicate),
+        );
+        assert_eq!(
+            sub[0].metadata.get("quarantine_reason").map(String::as_str),
+            Some("off-allowlist"),
+            "a subdomain sender is not blocked by an exact-domain entry"
+        );
+    }
+
+    // §7 step 4: the maintainer is attributed and routed as today, unaffected by an inbound entry
+    // for their address.
+    #[tokio::test]
+    async fn maintainer_is_attributed_despite_inbound_suppression() {
+        let entries = [khive_runtime::EmailSuppression {
+            scope: khive_runtime::EmailSuppressionScope::Inbound,
+            kind: khive_runtime::EmailSuppressionKind::Address,
+            value: "maintainer@example.com".into(),
+        }];
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![],
+            Some(enabled_policy()),
+            None,
+        );
+        let (envelopes, _) = ch.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "maintainer@example.com",
+                "imap:test:0:11",
+            )))],
+            Some(&inbound_predicate(&entries)),
+        );
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].from, "email:maintainer@example.com");
+        assert!(!envelopes[0].metadata.contains_key("quarantined"));
+    }
+
+    // §7 step 7: with external senders configured and no inbound entry, an authenticated stranger
+    // keeps today's outcome until screening lands -- `off-allowlist`.
+    #[tokio::test]
+    async fn step_seven_case_keeps_off_allowlist() {
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![],
+            Some(enabled_policy()),
+            None,
+        );
+        let (envelopes, _) = ch.disposition(
+            vec![SelectedMessage::Email(Box::new(make_email(
+                "stranger@example.com",
+                "imap:test:0:12",
+            )))],
+            None,
+        );
+        assert_eq!(
+            envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("off-allowlist")
+        );
+    }
+
+    // §7 step 1: a malformed message is quarantined before any of the later steps run.
+    #[tokio::test]
+    async fn malformed_message_is_quarantined_first() {
+        let ch = build_channel_with_store(
+            "maintainer@example.com",
+            vec![],
+            Some(enabled_policy()),
+            None,
+        );
+        let (envelopes, _) = ch.disposition(
+            vec![SelectedMessage::Malformed {
+                uid: 1,
+                imap_external_id: "imap:test:0:13".to_string(),
+                reason: MalformedReason::MissingBody,
+                raw_bytes: None,
+            }],
+            None,
+        );
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("missing-body")
+        );
     }
 }
