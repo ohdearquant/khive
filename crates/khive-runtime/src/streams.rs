@@ -38,12 +38,10 @@ use crate::{
 mod append_failure_tests;
 
 fn validate_stream(stream: &str) -> RuntimeResult<()> {
-    if stream.len() > 512 || stream.contains('\0') {
-        return Err(RuntimeError::InvalidInput(
-            "stream must be at most 512 UTF-8 bytes and contain no U+0000".into(),
-        ));
-    }
-    Ok(())
+    crate::note_validation::validate_key(
+        stream,
+        "stream must be at most 512 UTF-8 bytes and contain no U+0000",
+    )
 }
 
 fn write_failure(message: &str) -> StorageError {
@@ -219,12 +217,11 @@ fn stream_batch_fence_count(members: &[StreamBatchMember], fence: Option<&NoteFe
 }
 
 fn validate_stream_batch_fence_count(count: usize) -> RuntimeResult<()> {
-    if count > MAX_BATCH_FENCE_ENTRIES {
-        return Err(RuntimeError::InvalidInput(format!(
+    crate::note_validation::validate_fence_count(count, MAX_BATCH_FENCE_ENTRIES, || {
+        format!(
             "stream.batch admits at most {MAX_BATCH_FENCE_ENTRIES} total fence entries; this call sent {count}: each fence is a read taken while holding the writer"
-        )));
-    }
-    Ok(())
+        )
+    })
 }
 
 /// The member refusal that stopped an atomic batch; nothing was written.

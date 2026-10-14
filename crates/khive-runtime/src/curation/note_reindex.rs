@@ -36,7 +36,7 @@ impl NoteReindexReport {
 
 #[cfg(test)]
 #[path = "note_reindex_report_tests.rs"]
-mod report_tests;
+pub(crate) mod report_tests;
 
 impl KhiveRuntime {
     /// Re-upsert FTS5 and kind-eligible vectors, removing excluded-model rows.

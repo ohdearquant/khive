@@ -214,13 +214,7 @@ impl KgPack {
             }
             merged.sort_by_key(|hit| (hit.node_id, hit.edge_id));
             merged.dedup_by_key(|hit| (hit.node_id, hit.edge_id));
-            merged.sort_by(|a, b| {
-                b.weight
-                    .partial_cmp(&a.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.node_id.cmp(&b.node_id))
-                    .then(a.edge_id.cmp(&b.edge_id))
-            });
+            merged.sort_by(compare_neighbor_hits);
             (merged, scan_incomplete)
         };
         // entity_type is a cheap String field already fetched in the same
@@ -430,6 +424,19 @@ impl KgPack {
     }
 }
 
+fn compare_neighbor_hits(a: &NeighborHit, b: &NeighborHit) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f64(
+        a.weight,
+        &(a.node_id, a.edge_id),
+        b.weight,
+        &(b.node_id, b.edge_id),
+    )
+}
+
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "graph_ordering_tests.rs"]
+mod ordering_tests;

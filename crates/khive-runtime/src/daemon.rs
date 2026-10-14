@@ -224,6 +224,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         .map_err(|message| DaemonDispatchError::new(message, None))
     }
 
+    /// The startup gate for the events daemon this daemon supervises, if any
+    /// ([`crate::events_split::EventsReadiness`]). A request that dispatches
+    /// verbs waits at it before dispatch and is refused, with nothing
+    /// committed, when it does not open; probe, plan, metrics and handover
+    /// frames never wait. `None`, the default, dispatches without waiting.
+    fn events_readiness(&self) -> Option<crate::events_split::EventsReadiness> {
+        None
+    }
+
     /// Warm every pack's in-memory state (ANN indexes, etc.).
     async fn warm_all(&self);
 
@@ -1083,6 +1092,49 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                 return;
             }
         }
+        // A supervised events daemon that has not answered yet would fail
+        // this request's audit commit after its domain write committed, so
+        // the request waits for it here, before anything runs, and is
+        // refused with nothing committed when it does not answer in time.
+        if let Some(readiness) = dispatcher.events_readiness() {
+            let not_ready = tokio::select! {
+                outcome = readiness.wait() => outcome.err(),
+                _ = wait_for_peer_disconnect(&mut peer_read) => return,
+            };
+            if let Some(not_ready) = not_ready {
+                let message = not_ready.to_string();
+                tracing::warn!(
+                    socket = %not_ready.socket.display(),
+                    reason = ?not_ready.reason,
+                    request_id = frame.request_id,
+                    "request refused: the supervised events daemon is not answering"
+                );
+                let refusal = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(message.clone()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "runtime",
+                        "code": "events_daemon_unavailable",
+                        "message": message,
+                        "retryable": true,
+                        "socket": not_ready.socket.display().to_string(),
+                        "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                    })),
+                    request_id: frame.request_id,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(dispatcher.config_id().to_owned()),
+                    version_mismatch: false,
+                    metrics: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&refusal) {
+                    let _ = write_response_frame(&mut peer_write, &payload).await;
+                }
+                return;
+            }
+        }
         // Build the per-request identity context from the frame so the
         // implementor mints the storage/gate token from the CALLER's
         // identity, not the dispatcher's own construction-baked scalars.
@@ -1346,17 +1398,36 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RendezvousPathRole {
+enum RendezvousPathRole<'a> {
     Socket,
     PidFile,
+    Store(&'a std::path::Path),
 }
 
 #[cfg(unix)]
-impl RendezvousPathRole {
+impl RendezvousPathRole<'_> {
+    fn refusal(
+        self,
+        rendezvous: std::fmt::Arguments<'_>,
+        store: std::fmt::Arguments<'_>,
+    ) -> anyhow::Error {
+        match self {
+            Self::Store(db_path) => anyhow::anyhow!(
+                "refusing to open events database {}: {store}. Check the offending directory's \
+                 ownership and permissions (remove group/other write access), or move the store \
+                 to a location trusted end to end. Only the first offending component is \
+                 reported; further untrusted ancestors or components may remain.",
+                db_path.display()
+            ),
+            Self::Socket | Self::PidFile => anyhow::anyhow!("{rendezvous}"),
+        }
+    }
+
     fn env_name(self) -> &'static str {
         match self {
             Self::Socket => SOCKET_PATH_ENV,
             Self::PidFile => PID_PATH_ENV,
+            Self::Store(_) => "events database",
         }
     }
 
@@ -1364,6 +1435,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket directory",
             Self::PidFile => "PID-file directory",
+            Self::Store(_) => "store directory",
         }
     }
 
@@ -1371,6 +1443,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket path",
             Self::PidFile => "PID-file path",
+            Self::Store(_) => "store path",
         }
     }
 
@@ -1378,6 +1451,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket-path",
             Self::PidFile => "PID-file-path",
+            Self::Store(_) => "store-path",
         }
     }
 }
@@ -1411,6 +1485,22 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::Socket, daemon_euid, true)
 }
 
+/// Apply the existing directory trust and default-root repair rules to an events store.
+#[cfg(unix)]
+pub(crate) fn ensure_store_dir_is_trusted(
+    parent: &std::path::Path,
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(
+        parent,
+        RendezvousPathRole::Store(db_path),
+        daemon_euid,
+        true,
+    )
+}
+
 /// Vet the parent directory of a PID file before reading, locking, or writing
 /// it. The file's lock only protects the inode currently named by its path;
 /// every directory component must therefore be as swap-resistant as the
@@ -1429,7 +1519,7 @@ pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Res
 #[cfg(unix)]
 fn ensure_rendezvous_dir_is_trusted(
     parent: &std::path::Path,
-    role: RendezvousPathRole,
+    role: RendezvousPathRole<'_>,
     daemon_euid: u32,
     repair_owned_default: bool,
 ) -> anyhow::Result<()> {
@@ -1438,11 +1528,17 @@ fn ensure_rendezvous_dir_is_trusted(
 
     if repair_owned_default && parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
+            role.refusal(
+                format_args!(
+                    "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
                  owner-only as the {directory_name} for {env_name}; it is part of the \
                  same-uid guarantee this daemon enforces.",
-                parent.display()
+                    parent.display()
+                ),
+                format_args!(
+                    "cannot chmod 0700 store directory {}: {e}",
+                    parent.display()
+                ),
             )
         })?;
         return ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role);
@@ -1451,35 +1547,56 @@ fn ensure_rendezvous_dir_is_trusted(
     // Fail closed on the stat itself: not being able to read the metadata is
     // not the same as the directory passing.
     let meta = std::fs::metadata(parent).map_err(|e| {
-        anyhow::anyhow!(
-            "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
+        role.refusal(
+            format_args!(
+                "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
              It gates rendezvous-path safety, and unreadable metadata is not a passing state.",
-            parent.display()
+                parent.display()
+            ),
+            format_args!(
+                "cannot stat store directory {}: {e}; unreadable metadata is not a passing state",
+                parent.display()
+            ),
         )
     })?;
 
     use std::os::unix::fs::MetadataExt;
     let owner = meta.uid();
     if owner != daemon_euid && owner != 0 {
-        anyhow::bail!(
-            "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
              not this daemon's uid ({daemon_euid}) or root. A directory owner can replace \
              the rendezvous path regardless of mode bits. Point {env_name} at a directory \
              you own, or unset it for the default.",
-            parent.display()
-        );
+                parent.display()
+            ),
+            format_args!(
+                "store directory {} is owned by uid {owner}, not this process's uid \
+                 ({daemon_euid}) or root; its owner can replace the database path",
+                parent.display()
+            ),
+        ));
     }
 
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 {
-        anyhow::bail!(
-            "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
              by group or other, so another local user could replace the rendezvous path. \
              Use a directory only you can write, or unset {env_name} for the default. \
              This daemon is not changing the permissions of a directory it does not own.",
-            parent.display(),
-            mode & 0o7777
-        );
+                parent.display(),
+                mode & 0o7777
+            ),
+            format_args!(
+                "store directory {} is mode {:04o}, writable by group or other, so another local \
+                 user could replace the database path",
+                parent.display(),
+                mode & 0o7777
+            ),
+        ));
     }
 
     ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
@@ -1523,7 +1640,7 @@ fn ensure_socket_path_is_swap_resistant(
 fn ensure_rendezvous_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
-    role: RendezvousPathRole,
+    role: RendezvousPathRole<'_>,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1537,10 +1654,16 @@ fn ensure_rendezvous_path_is_swap_resistant(
     } else {
         std::env::current_dir()
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "refusing to start: cannot resolve the working directory to absolutize \
+                role.refusal(
+                    format_args!(
+                        "refusing to start: cannot resolve the working directory to absolutize \
                      {directory_name} {} for {env_name}: {e}.",
-                    parent.display()
+                        parent.display()
+                    ),
+                    format_args!(
+                        "cannot resolve the working directory for store directory {}: {e}",
+                        parent.display()
+                    ),
                 )
             })?
             .join(parent)
@@ -1573,10 +1696,17 @@ fn ensure_rendezvous_path_is_swap_resistant(
         }
         let candidate = resolved.join(&component);
         let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot stat {component_name} component {} for {env_name}: \
+            role.refusal(
+                format_args!(
+                    "refusing to start: cannot stat {component_name} component {} for {env_name}: \
                  {e}. An unreadable component is not a passing one.",
-                candidate.display()
+                    candidate.display()
+                ),
+                format_args!(
+                    "cannot stat store-path component {}: {e}; unreadable metadata is not a \
+                     passing state",
+                    candidate.display()
+                ),
             )
         })?;
         let owner = meta.uid();
@@ -1584,26 +1714,47 @@ fn ensure_rendezvous_path_is_swap_resistant(
         if meta.file_type().is_symlink() {
             symlinks_followed += 1;
             if symlinks_followed > 40 {
-                anyhow::bail!(
-                    "refusing to start: {path_name} for {env_name} resolves through more than \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {path_name} for {env_name} resolves through more than \
                      40 symlinks at {} — treating this as a loop.",
-                    candidate.display()
-                );
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "store path resolves through more than 40 symlinks at {}; treating this as \
+                         a loop",
+                        candidate.display()
+                    ),
+                ));
             }
             if owner != daemon_euid && owner != 0 {
-                anyhow::bail!(
-                    "refusing to start: {component_name} symlink component {} for {env_name} \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {component_name} symlink component {} for {env_name} \
                      is owned by uid {owner}, not this daemon's uid ({daemon_euid}) or root — \
                      its owner could retarget it after this check and re-root the {path_name}. \
                      Point {env_name} somewhere trusted end to end, or unset it for the default.",
-                    candidate.display()
-                );
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "store-path symlink component {} is owned by uid {owner}, not this \
+                         process's uid ({daemon_euid}) or root; its owner could retarget the \
+                         database path",
+                        candidate.display()
+                    ),
+                ));
             }
             let target = std::fs::read_link(&candidate).map_err(|e| {
-                anyhow::anyhow!(
-                    "refusing to start: cannot read {component_name} symlink component {} \
+                role.refusal(
+                    format_args!(
+                        "refusing to start: cannot read {component_name} symlink component {} \
                      for {env_name}: {e}.",
-                    candidate.display()
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "cannot read store-path symlink component {}: {e}",
+                        candidate.display()
+                    ),
                 )
             })?;
             push_components(&mut stack, &target);
@@ -1614,33 +1765,55 @@ fn ensure_rendezvous_path_is_swap_resistant(
             let mode = meta.permissions().mode();
             let sticky = mode & 0o1000 != 0;
             if owner != daemon_euid && owner != 0 {
-                anyhow::bail!(
+                return Err(role.refusal(
+                    format_args!(
                     "refusing to start: {component_name} ancestor {} for {env_name} is owned by \
                      uid {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
                      could rename the next path component and re-root the {path_name}. Point \
                      {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
-                );
+                    ),
+                    format_args!(
+                        "store-path ancestor {} is owned by uid {owner}, not this process's uid \
+                         ({daemon_euid}) or root; its owner could rename the next path component",
+                        candidate.display()
+                    ),
+                ));
             }
             if mode & 0o022 != 0 && !sticky {
-                anyhow::bail!(
-                    "refusing to start: {component_name} ancestor {} for {env_name} is mode \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {component_name} ancestor {} for {env_name} is mode \
                      {:04o} — writable by group or other without the sticky bit, so another \
                      local user could rename the next path component and re-root the {path_name}. \
                      Point {env_name} somewhere trusted end to end, or unset it for the default.",
-                    candidate.display(),
-                    mode & 0o7777
-                );
+                        candidate.display(),
+                        mode & 0o7777
+                    ),
+                    format_args!(
+                        "store-path ancestor {} is mode {:04o}, writable by group or other without \
+                         the sticky bit, so another local user could rename the next path \
+                         component",
+                        candidate.display(), mode & 0o7777
+                    ),
+                ));
             }
             resolved = candidate;
             continue;
         }
 
-        anyhow::bail!(
-            "refusing to start: {component_name} component {} for {env_name} is neither a \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {component_name} component {} for {env_name} is neither a \
              directory nor a symlink — the {path_name} cannot traverse it.",
-            candidate.display()
-        );
+                candidate.display()
+            ),
+            format_args!(
+                "store-path component {} is neither a directory nor a symlink; the database path \
+                 cannot traverse it",
+                candidate.display()
+            ),
+        ));
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 # ADR-200: External Email Policy: Sender Scope, Suppression, Unsubscribe and Screened Inbound Delivery
 
-- **Status**: Proposed (2026-10-11)
+- **Status**: Accepted (2026-10-11)
 - **Date**: 2026-10-11
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
