@@ -256,12 +256,20 @@ fn configure_decision(decision: &mut TierDecision, op: &Op, config: &TierConfig)
 }
 
 fn entity_fields(patch: &EntityPatch) -> Vec<&'static str> {
+    // Exhaustive, so a new patch field cannot bypass a configured field list.
+    let EntityPatch {
+        name,
+        description,
+        properties,
+        tags,
+        entity_type,
+    } = patch;
     [
-        ("name", patch.name.is_some()),
-        ("description", patch.description.is_some()),
-        ("properties", patch.properties.is_some()),
-        ("tags", patch.tags.is_some()),
-        ("entity_type", patch.entity_type.is_some()),
+        ("name", name.is_some()),
+        ("description", description.is_some()),
+        ("properties", properties.is_some()),
+        ("tags", tags.is_some()),
+        ("entity_type", entity_type.is_some()),
     ]
     .into_iter()
     .filter_map(|(field, touched)| touched.then_some(field))
