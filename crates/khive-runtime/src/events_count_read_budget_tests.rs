@@ -347,7 +347,7 @@ async fn invalid_count_attribution_and_version_refuse_before_namespace_cache() {
         for seconds in [
             None,
             Some(0),
-            Some(khive_storage::MAX_REQUEST_READ_TIMEOUT_SECS + 1),
+            Some(khive_storage::request_context::MAX_REQUEST_READ_TIMEOUT_SECS + 1),
         ] {
             let mut wire = serde_json::to_value(count_request(grouped, seconds)).unwrap();
             if seconds.is_none() {
@@ -381,7 +381,10 @@ async fn invalid_count_attribution_and_version_refuse_before_namespace_cache() {
         assert!(stores.lock().unwrap().is_empty());
     }
     for grouped in [false, true] {
-        for seconds in [1, khive_storage::MAX_REQUEST_READ_TIMEOUT_SECS] {
+        for seconds in [
+            1,
+            khive_storage::request_context::MAX_REQUEST_READ_TIMEOUT_SECS,
+        ] {
             let response =
                 dispatch_events_request(count_request(grouped, Some(seconds)), &backend, &stores)
                     .await;

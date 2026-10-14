@@ -1964,7 +1964,8 @@ async fn dispatch_events_request(
     }
     let count_budget_secs = match request.count_budget_secs() {
         Some(Some(seconds))
-            if (1..=khive_storage::MAX_REQUEST_READ_TIMEOUT_SECS).contains(&seconds) =>
+            if (1..=khive_storage::request_context::MAX_REQUEST_READ_TIMEOUT_SECS)
+                .contains(&seconds) =>
         {
             Some(seconds)
         }
