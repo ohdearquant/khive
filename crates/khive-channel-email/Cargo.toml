@@ -33,6 +33,7 @@ base64 = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+khive-pack-blob = { version = "0.12.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 khive-pack-comm = { version = "0.12.0", path = "../khive-pack-comm" }
 khive-pack-kg = { version = "0.12.0", path = "../khive-pack-kg" }

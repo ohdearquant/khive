@@ -7,17 +7,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use khive_channel::{
     Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
-    StoredChannelCheckpoint,
+    InboundChannelDelivery, StoredChannelCheckpoint,
 };
+use mail_parser::MessageParser;
 use tracing::{debug, warn};
 
 use crate::auth_results;
-use crate::config::{EmailAuth, EmailChannelConfig};
+use crate::config::{EmailAuth, EmailChannelConfig, ExternalInboundConfig};
 use crate::connector::imap::{ImapFetcher, ImapProgress, MalformedReason, SelectedMessage};
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
 use crate::external_host::{ExternalEmailHost, InboundSuppression};
+use crate::external_inbound::{
+    external_delivery_marking, owner_candidates, route_inbound, InboundRoute,
+};
 use crate::oauth::TokenProvider;
+use crate::screening::{screen_message, Disposition, ScreeningOutcome};
 use crate::unsubscribe::extract_unsubscribe_token;
 
 /// Literal IMAP folder this connector selects. Not the configured mailbox
@@ -66,6 +71,8 @@ enum QuarantineReason {
     /// The sender authenticated, but an `inbound` suppression entry matches the `From:` address or
     /// its exact domain (ADR-200 §7 step 6).
     Blocked,
+    /// Deterministic screening requires quarantine (ADR-200 section 8.3).
+    Screened,
     /// The `UID FETCH` response carried no RFC822 body for this UID (khive
     /// #449 High fix: a durable terminal disposition, never a silent drop).
     MissingBody,
@@ -84,6 +91,7 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::Unaligned => "unaligned",
             QuarantineReason::OffAllowlist => "off-allowlist",
             QuarantineReason::Blocked => "blocked",
+            QuarantineReason::Screened => "screened",
             QuarantineReason::MissingBody => "missing-body",
             QuarantineReason::ParseFailure => "parse-failure",
             QuarantineReason::TooLarge => "too-large",
@@ -109,6 +117,11 @@ struct PendingUnsubscribe {
     recipient_key: String,
 }
 
+enum EmailAttribution {
+    Maintainer,
+    External,
+}
+
 /// Email channel adapter implementing `Channel` via SMTP + IMAP.
 ///
 /// Configuration is provided at construction time via `EmailChannelConfig`.
@@ -122,6 +135,7 @@ pub struct EmailChannel {
     /// tests that build a channel directly; with it unset no token can verify and no inbound list
     /// is read, matching the `KHIVE_EMAIL_EXTERNAL_SENDERS`-unset production behaviour.
     external_host: Option<Arc<dyn ExternalEmailHost>>,
+    external_inbound: Option<ExternalInboundConfig>,
 }
 
 impl EmailChannel {
@@ -180,6 +194,7 @@ impl EmailChannel {
             smtp,
             imap,
             external_host: None,
+            external_inbound: None,
         })
     }
 
@@ -189,6 +204,12 @@ impl EmailChannel {
     /// with the same comm-routed runtime it already builds for the outbox loop.
     pub fn with_external_host(mut self, host: Arc<dyn ExternalEmailHost>) -> Self {
         self.external_host = Some(host);
+        self
+    }
+
+    /// Attach the boot-resolved external recipient routes and fallback actor.
+    pub fn with_external_inbound_config(mut self, config: ExternalInboundConfig) -> Self {
+        self.external_inbound = Some(config);
         self
     }
 
@@ -221,6 +242,7 @@ impl EmailChannel {
             smtp,
             imap,
             external_host: None,
+            external_inbound: None,
         }
     }
 
@@ -320,19 +342,17 @@ impl EmailChannel {
     /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
     /// any failing step quarantines it (never partially attributed).
     ///
-    /// ADR-200 §8.3 screening is not part of this change: the step-7 case keeps today's
-    /// `off-allowlist` outcome.
     fn gate(
         &self,
         email: &RawEmail,
         inbound: Option<&InboundSuppression>,
-    ) -> Result<(), QuarantineReason> {
+    ) -> Result<EmailAttribution, QuarantineReason> {
         self.evaluate_auth(email)?;
         if self
             .check_sender(&email.from_addrs, email.sender_addr.as_deref())
             .is_ok()
         {
-            return Ok(());
+            return Ok(EmailAttribution::Maintainer);
         }
         // Step 4 (maintainer) is the allowlist passing above and is unchanged. The sender is not
         // the maintainer, so it is external: step 5 keeps today's outcome while external senders
@@ -348,8 +368,22 @@ impl EmailChannel {
                 if let Some(sender) =
                     khive_types::email_address::normalize_email_recipient(only_from)
                 {
+                    let address =
+                        MailAddress::parse(&sender).ok_or(QuarantineReason::OffAllowlist)?;
+                    if self
+                        .config
+                        .maintainer_addresses
+                        .iter()
+                        .any(|maintainer| maintainer.matches(&address))
+                    {
+                        // A maintainer From with a rejected Sender must not become external.
+                        return Err(QuarantineReason::OffAllowlist);
+                    }
                     if inbound.is_some_and(|check| check(&sender)) {
                         return Err(QuarantineReason::Blocked);
+                    }
+                    if self.external_inbound.is_some() {
+                        return Ok(EmailAttribution::External);
                     }
                 }
             }
@@ -517,11 +551,11 @@ impl EmailChannel {
     /// the poll cursor advancing past its UID is how the poller marks it processed, so it is never
     /// delivered to an actor, never quarantined and never screened. The write itself is deferred to
     /// the async caller so a store failure can hold the poll rather than silently drop the opt-out.
-    fn disposition(
+    async fn disposition(
         &self,
         raw: Vec<SelectedMessage>,
         inbound: Option<&InboundSuppression>,
-    ) -> (Vec<ChannelEnvelope>, Vec<PendingUnsubscribe>) {
+    ) -> Result<(Vec<ChannelEnvelope>, Vec<PendingUnsubscribe>), ChannelError> {
         let mut envelopes = Vec::new();
         let mut pending_unsubscribes = Vec::new();
         for message in raw {
@@ -537,7 +571,12 @@ impl EmailChannel {
                         continue;
                     }
                     match self.gate(&email, inbound) {
-                        Ok(()) => envelopes.push(self.to_envelope(*email)),
+                        Ok(EmailAttribution::Maintainer) => {
+                            envelopes.push(self.to_envelope(*email))
+                        }
+                        Ok(EmailAttribution::External) => {
+                            envelopes.push(self.external_envelope(*email).await?);
+                        }
                         Err(reason) => {
                             if self.config.quarantine_store {
                                 envelopes.push(self.quarantine_envelope(&email, reason));
@@ -574,7 +613,110 @@ impl EmailChannel {
                 }
             }
         }
-        (envelopes, pending_unsubscribes)
+        Ok((envelopes, pending_unsubscribes))
+    }
+
+    async fn external_envelope(&self, email: RawEmail) -> Result<ChannelEnvelope, ChannelError> {
+        let Some(message) = MessageParser::default().parse(&email.raw_bytes) else {
+            let mut envelope = self.quarantine_envelope(&email, QuarantineReason::ParseFailure);
+            envelope.content = "(khive: external email could not be screened as MIME)".into();
+            return Ok(envelope);
+        };
+        let outcome = match screen_message(&message) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let mut envelope = self.quarantine_envelope(&email, QuarantineReason::Screened);
+                envelope.content = "(khive: external email quarantined because screening rules could not be loaded)".into();
+                envelope.metadata.insert("labels".into(), "[]".into());
+                return Ok(envelope);
+            }
+        };
+        if outcome.disposition == Disposition::QuarantineScreened {
+            let mut envelope = self.quarantine_envelope(&email, QuarantineReason::Screened);
+            envelope.content = screening_placeholder("quarantined", &outcome);
+            envelope.metadata.insert(
+                "labels".into(),
+                serde_json::to_string(&outcome.rule_ids)
+                    .map_err(|error| ChannelError::Config(error.to_string()))?,
+            );
+            return Ok(envelope);
+        }
+        let config = self.external_inbound.as_ref().ok_or_else(|| {
+            ChannelError::Config("external inbound routing is not configured".into())
+        })?;
+        let host = self.external_host.as_deref().ok_or_else(|| {
+            ChannelError::Config("external inbound host is not configured".into())
+        })?;
+        let mut verified = std::collections::HashMap::new();
+        let candidates = owner_candidates(&email);
+        let mut pending_owner_candidates = None;
+        for candidate in &candidates {
+            match host.lookup_thread_owner(candidate).await {
+                Ok(Some(owner)) => {
+                    if uuid::Uuid::parse_str(&owner.thread_id).is_err() {
+                        pending_owner_candidates = Some(candidates.clone());
+                    } else {
+                        verified.insert(candidate.clone(), owner);
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Ingest retains the UID and the original typed store failure on retry.
+                    pending_owner_candidates = Some(candidates.clone());
+                    break;
+                }
+            }
+        }
+        let route = route_inbound(&email, &config.routes, &config.actor, |candidate| {
+            verified.get(candidate).cloned()
+        });
+        let (actor, thread_id) = match route {
+            InboundRoute::Owner { actor, thread_id } => {
+                let thread_id = uuid::Uuid::parse_str(&thread_id).map_err(|_| {
+                    ChannelError::Config("verified email owner has an invalid thread UUID".into())
+                })?;
+                (actor, Some(thread_id))
+            }
+            InboundRoute::RoutedAlias { actor, .. } | InboundRoute::ExternalInbound { actor } => {
+                (actor, None)
+            }
+        };
+        let labels: Vec<&str> = outcome.rule_ids.iter().map(String::as_str).collect();
+        let marking = external_delivery_marking(
+            &email.from_addrs[0],
+            &labels,
+            &format!("email:{}", self.maintainer_address()),
+            self.maintainer_address(),
+        )
+        .map_err(|error| ChannelError::Config(error.to_string()))?;
+        let mut envelope = self.to_envelope(email);
+        envelope.from = marking.sender;
+        envelope.correlation_external_id = None;
+        envelope
+            .metadata
+            .insert("origin".into(), marking.origin.into());
+        envelope
+            .metadata
+            .insert("trust".into(), marking.trust.into());
+        envelope.metadata.insert(
+            "labels".into(),
+            serde_json::to_string(&marking.labels)
+                .map_err(|error| ChannelError::Config(error.to_string()))?,
+        );
+        let body_withheld = outcome.withheld();
+        if body_withheld {
+            envelope.content = screening_placeholder("withheld", &outcome);
+        }
+        envelope.inbound_delivery = Some(InboundChannelDelivery {
+            actor,
+            thread_id,
+            labels: marking.labels,
+            body_withheld,
+            reply_opt_out: outcome.opt_out,
+            pending_owner_candidates,
+        });
+        Ok(envelope)
     }
 
     /// The verified recipient key when the message's subject carries a mailto unsubscribe token,
@@ -736,7 +878,7 @@ impl Channel for EmailChannel {
     async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
         let raw = self.imap.fetch_since(since, IMAP_PAGE_LIMIT).await?;
         let inbound = self.load_inbound_suppression().await?;
-        let (envelopes, pending_unsubscribes) = self.disposition(raw, inbound.as_ref());
+        let (envelopes, pending_unsubscribes) = self.disposition(raw, inbound.as_ref()).await?;
         self.record_unsubscribes(&pending_unsubscribes).await?;
         Ok(envelopes)
     }
@@ -762,7 +904,8 @@ impl Channel for EmailChannel {
             .fetch_page(recovery_since, IMAP_PAGE_LIMIT, progress)
             .await?;
         let inbound = self.load_inbound_suppression().await?;
-        let (envelopes, pending_unsubscribes) = self.disposition(page.emails, inbound.as_ref());
+        let (envelopes, pending_unsubscribes) =
+            self.disposition(page.emails, inbound.as_ref()).await?;
         // §5.4 entry point 1's machine record must commit before the cursor advances past the UID:
         // a store failure here surfaces as a channel error, so the poll coordinator holds progress
         // and the opt-out is not silently dropped.
@@ -778,6 +921,13 @@ impl Channel for EmailChannel {
             next_checkpoint,
         })
     }
+}
+
+fn screening_placeholder(disposition: &str, outcome: &ScreeningOutcome) -> String {
+    format!(
+        "(khive: external email body {disposition}; screening labels: {})",
+        outcome.rule_ids.join(", ")
+    )
 }
 
 /// Strip a `"kind:"` prefix from an address string.
@@ -963,8 +1113,8 @@ mod tests {
         assert_eq!(ch.kind(), "email");
     }
 
-    #[test]
-    fn same_imap_uid_in_two_accounts_has_distinct_new_keys_and_shared_legacy_key() {
+    #[tokio::test]
+    async fn same_imap_uid_in_two_accounts_has_distinct_new_keys_and_shared_legacy_key() {
         let raw = "imap:mail.example.com:17:42";
         let mut config_a = make_config("maintainer@example.com");
         config_a.mailbox = "A@Example.com".to_string();
@@ -972,20 +1122,26 @@ mod tests {
         config_b.mailbox = "b@example.com".to_string();
         let a = build_channel_from(config_a, vec![]);
         let b = build_channel_from(config_b, vec![]);
-        let (a_env, _) = a.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "maintainer@example.com",
-                raw,
-            )))],
-            None,
-        );
-        let (b_env, _) = b.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "maintainer@example.com",
-                raw,
-            )))],
-            None,
-        );
+        let (a_env, _) = a
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "maintainer@example.com",
+                    raw,
+                )))],
+                None,
+            )
+            .await
+            .unwrap();
+        let (b_env, _) = b
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "maintainer@example.com",
+                    raw,
+                )))],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             a_env[0].external_id.as_deref(),
             Some("imap:mail.example.com:a@example.com:17:42")
@@ -2320,25 +2476,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oversized_uid_is_quarantined_without_body_even_if_attribution_quarantine_is_off() {
+    #[tokio::test]
+    async fn oversized_uid_is_quarantined_without_body_even_if_attribution_quarantine_is_off() {
         let mut config = make_config("maintainer@example.com");
         config.quarantine_store = false;
         let ch = build_channel_from(config, vec![]);
         let mut good = make_email("maintainer@example.com", "imap:imap.example.com:4:2");
         good.uid = 2;
-        let (envelopes, _) = ch.disposition(
-            vec![
-                SelectedMessage::Malformed {
-                    uid: 1,
-                    imap_external_id: "imap:imap.example.com:4:1".to_string(),
-                    reason: MalformedReason::TooLarge,
-                    raw_bytes: None,
-                },
-                SelectedMessage::Email(Box::new(good)),
-            ],
-            None,
-        );
+        let (envelopes, _) = ch
+            .disposition(
+                vec![
+                    SelectedMessage::Malformed {
+                        uid: 1,
+                        imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                        reason: MalformedReason::TooLarge,
+                        raw_bytes: None,
+                    },
+                    SelectedMessage::Email(Box::new(good)),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].from, EMAIL_QUARANTINE_SENDER);
@@ -2647,6 +2806,13 @@ mod tests {
             self.policy.as_deref()?.verify_unsubscribe_token(token)
         }
 
+        async fn lookup_thread_owner(
+            &self,
+            _candidate: &str,
+        ) -> Result<Option<crate::external_inbound::ThreadOwner>, ChannelError> {
+            Ok(None)
+        }
+
         async fn inbound_suppression(&self) -> Result<InboundSuppression, ChannelError> {
             self.inbound_reads.fetch_add(1, Ordering::SeqCst);
             if let Some(predicate) = &self.predicate {
@@ -2891,6 +3057,13 @@ mod tests {
 
         fn verify_unsubscribe_token(&self, token: &str) -> Option<String> {
             self.policy.verify_unsubscribe_token(token)
+        }
+
+        async fn lookup_thread_owner(
+            &self,
+            _candidate: &str,
+        ) -> Result<Option<crate::external_inbound::ThreadOwner>, ChannelError> {
+            Ok(None)
         }
 
         async fn inbound_suppression(&self) -> Result<InboundSuppression, ChannelError> {
@@ -3153,13 +3326,16 @@ mod tests {
             Some(enabled_policy()),
             None,
         );
-        let (envelopes, _) = ch.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "stranger@example.com",
-                "imap:test:0:8",
-            )))],
-            Some(&inbound_predicate(&entries)),
-        );
+        let (envelopes, _) = ch
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "stranger@example.com",
+                    "imap:test:0:8",
+                )))],
+                Some(&inbound_predicate(&entries)),
+            )
+            .await
+            .unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(
             envelopes[0]
@@ -3185,13 +3361,16 @@ mod tests {
             Some(enabled_policy()),
             None,
         );
-        let (blocked, _) = ch.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "someone@example.com",
-                "imap:test:0:9",
-            )))],
-            Some(&predicate),
-        );
+        let (blocked, _) = ch
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "someone@example.com",
+                    "imap:test:0:9",
+                )))],
+                Some(&predicate),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             blocked[0]
                 .metadata
@@ -3200,13 +3379,16 @@ mod tests {
             Some("blocked")
         );
 
-        let (sub, _) = ch.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "someone@sub.example.com",
-                "imap:test:0:10",
-            )))],
-            Some(&predicate),
-        );
+        let (sub, _) = ch
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "someone@sub.example.com",
+                    "imap:test:0:10",
+                )))],
+                Some(&predicate),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             sub[0].metadata.get("quarantine_reason").map(String::as_str),
             Some("off-allowlist"),
@@ -3229,13 +3411,16 @@ mod tests {
             Some(enabled_policy()),
             None,
         );
-        let (envelopes, _) = ch.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "maintainer@example.com",
-                "imap:test:0:11",
-            )))],
-            Some(&inbound_predicate(&entries)),
-        );
+        let (envelopes, _) = ch
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "maintainer@example.com",
+                    "imap:test:0:11",
+                )))],
+                Some(&inbound_predicate(&entries)),
+            )
+            .await
+            .unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].from, "email:maintainer@example.com");
         assert!(!envelopes[0].metadata.contains_key("quarantined"));
@@ -3251,13 +3436,16 @@ mod tests {
             Some(enabled_policy()),
             None,
         );
-        let (envelopes, _) = ch.disposition(
-            vec![SelectedMessage::Email(Box::new(make_email(
-                "stranger@example.com",
-                "imap:test:0:12",
-            )))],
-            None,
-        );
+        let (envelopes, _) = ch
+            .disposition(
+                vec![SelectedMessage::Email(Box::new(make_email(
+                    "stranger@example.com",
+                    "imap:test:0:12",
+                )))],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             envelopes[0]
                 .metadata
@@ -3276,15 +3464,18 @@ mod tests {
             Some(enabled_policy()),
             None,
         );
-        let (envelopes, _) = ch.disposition(
-            vec![SelectedMessage::Malformed {
-                uid: 1,
-                imap_external_id: "imap:test:0:13".to_string(),
-                reason: MalformedReason::MissingBody,
-                raw_bytes: None,
-            }],
-            None,
-        );
+        let (envelopes, _) = ch
+            .disposition(
+                vec![SelectedMessage::Malformed {
+                    uid: 1,
+                    imap_external_id: "imap:test:0:13".to_string(),
+                    reason: MalformedReason::MissingBody,
+                    raw_bytes: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(
             envelopes[0]
@@ -3294,4 +3485,5 @@ mod tests {
             Some("missing-body")
         );
     }
+    include!("channel/external_inbound_tests.rs");
 }

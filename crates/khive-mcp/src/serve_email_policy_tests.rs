@@ -2,6 +2,112 @@ use super::*;
 use khive_runtime::{Namespace, RequestIdentity};
 use serde_json::{json, Value};
 
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_external_enabled_requires_actor_in_both_host_entrypoints() {
+    isolated_case(
+        "startup_external_enabled_requires_actor_in_both_host_entrypoints",
+        async {
+            use clap::Parser as _;
+            let footer = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(footer.path(), "Reply to unsubscribe: {unsubscribe}").unwrap();
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_SENDERS", "actor:sender");
+            std::env::set_var("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY", "cc".repeat(32));
+            std::env::set_var(
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+                format!("0:{}", "11".repeat(32)),
+            );
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE", footer.path());
+            let args = Args::parse_from([
+                "mcp",
+                "--db",
+                ":memory:",
+                "--no-embed",
+                "--pack",
+                "kg",
+                "--pack",
+                "comm",
+            ]);
+            for actor in [None, Some("")] {
+                if let Some(actor) = actor {
+                    std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", actor);
+                } else {
+                    std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+                }
+                let runtime = KhiveRuntime::memory()
+                    .unwrap()
+                    .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+                let server =
+                    KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+                let before = khive_runtime::daemon::background_task_count();
+                let error = serve_server(server, &args, &TransportRegistry::new(), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"));
+                let error = run(
+                    Args::parse_from([
+                        "mcp",
+                        "--db",
+                        ":memory:",
+                        "--no-embed",
+                        "--pack",
+                        "kg",
+                        "--pack",
+                        "comm",
+                    ]),
+                    &TransportRegistry::new(),
+                )
+                .await
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"));
+                assert_eq!(
+                    khive_runtime::daemon::background_task_count(),
+                    before,
+                    "no channel loop starts on refusal"
+                );
+            }
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let runtime = KhiveRuntime::memory()
+                .unwrap()
+                .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+            let server =
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+            assert!(
+                prepare_host_background_tasks(&args, &server)
+                    .unwrap()
+                    .email
+                    .is_none(),
+                "valid client config does not acquire a poll loop"
+            );
+        },
+    );
+}
+
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_disabled_external_does_not_require_actor_or_parse_routes() {
+    isolated_case(
+        "startup_disabled_external_does_not_require_actor_or_parse_routes",
+        async {
+            use clap::Parser as _;
+            std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+            std::env::set_var("KHIVE_EMAIL_INBOUND_ROUTES", "invalid route");
+            let runtime = KhiveRuntime::memory().unwrap();
+            let server =
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+            let args = Args::parse_from(["mcp"]);
+            assert!(prepare_host_background_tasks(&args, &server)
+                .unwrap()
+                .email
+                .is_none());
+        },
+    );
+}
+
 /// Collects formatted log output so a test can read what a code path reported.
 #[cfg(feature = "channel-email")]
 #[derive(Clone, Default)]
@@ -498,7 +604,8 @@ async fn assert_unset_maintainer_admission(server: &KhiveMcpServer, runtime: &Kh
         let log = CapturedLog::default();
         {
             let _capture = log.capture();
-            spawn_email_channel_loops(server, crate::server::ChannelLoopAdmission::default());
+            let _ = prepare_email_channel_loops(server, true)
+                .expect("disabled external connector remains optional");
         }
         let logged = log.text();
         assert!(

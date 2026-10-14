@@ -4,19 +4,41 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_channel::ChannelError;
-use khive_channel_email::{ExternalEmailHost, InboundSuppression};
-use khive_runtime::{KhiveRuntime, OutboundEmailPolicy};
+use khive_channel_email::{ExternalEmailHost, InboundSuppression, ThreadOwner};
+use khive_runtime::{EmailMessageIdDomains, KhiveRuntime, Namespace, OutboundEmailPolicy};
 
 /// The external-email services the email channel takes from its daemon: the boot-resolved
 /// outbound policy and, when one is wired, the comm store (ADR-200 sections 5.4 and 7).
 pub(super) struct CommExternalEmailHost {
     policy: Arc<OutboundEmailPolicy>,
     runtime: Option<KhiveRuntime>,
+    namespace: Namespace,
+    email_domains: Result<Option<EmailMessageIdDomains>, String>,
 }
 
 impl CommExternalEmailHost {
+    #[cfg(test)]
     pub(super) fn new(policy: Arc<OutboundEmailPolicy>, runtime: Option<KhiveRuntime>) -> Self {
-        Self { policy, runtime }
+        Self::for_ingest(
+            policy,
+            runtime,
+            Namespace::local(),
+            EmailMessageIdDomains::from_env(),
+        )
+    }
+
+    pub(super) fn for_ingest(
+        policy: Arc<OutboundEmailPolicy>,
+        runtime: Option<KhiveRuntime>,
+        namespace: Namespace,
+        email_domains: Result<Option<EmailMessageIdDomains>, String>,
+    ) -> Self {
+        Self {
+            policy,
+            runtime,
+            namespace,
+            email_domains,
+        }
     }
 }
 
@@ -65,6 +87,35 @@ impl ExternalEmailHost for CommExternalEmailHost {
         )
         .await
         .map_err(|error| ChannelError::Transport(format!("{error}")))
+    }
+
+    async fn lookup_thread_owner(
+        &self,
+        candidate: &str,
+    ) -> Result<Option<ThreadOwner>, ChannelError> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            ChannelError::Config("external email owner lookup requires the comm runtime".into())
+        })?;
+        let token = runtime
+            .authorize(self.namespace.clone())
+            .map_err(|error| ChannelError::Transport(error.to_string()))?;
+        khive_pack_comm::handlers::resolve_ingest_correlation(
+            runtime,
+            &token,
+            &self.email_domains,
+            candidate,
+            true,
+        )
+        .await
+        .map(|resolved| {
+            resolved
+                .filter(|resolved| !resolved.actor.trim().is_empty())
+                .map(|resolved| ThreadOwner {
+                    thread_id: resolved.thread_id.to_string(),
+                    actor: resolved.actor,
+                })
+        })
+        .map_err(|error| ChannelError::Transport(error.to_string()))
     }
 }
 
