@@ -21,7 +21,7 @@ enum ActionRefusal {
 }
 
 enum Candidate {
-    Ready(PreparedFix),
+    Ready(Box<PreparedFix>),
     Unsupported(String),
     Conflict(String),
 }
@@ -282,13 +282,13 @@ impl LintCapture {
             },
             _ => return Err(RuntimeError::Internal("unexpected graph lint plan".into())),
         };
-        Ok(Candidate::Ready(PreparedFix {
+        Ok(Candidate::Ready(Box::new(PreparedFix {
             owner: runtime.clone(),
             token: write_token,
             guards,
             plan,
             committed,
-        }))
+        })))
     }
 
     /// Prepare every candidate before the first domain write, then commit each
@@ -352,7 +352,7 @@ impl LintCapture {
                         guards,
                         plan,
                         committed,
-                    } = prepared;
+                    } = *prepared;
                     let operation: PreparedAtomicOp<(), ActionRefusal> = Box::new(move |writer| {
                         Box::pin(async move {
                             for guard in guards {

@@ -197,7 +197,7 @@ async fn duplicate_fix_proposes_a_question_in_the_observed_namespace_without_mer
         let created = registry
             .dispatch_with_identity(
                 "create",
-                json!({"kind":"document","name":"same"}),
+                json!({"kind":"document","name":"same","namespace":"alpha"}),
                 Some(identity.clone()),
             )
             .await
@@ -207,7 +207,7 @@ async fn duplicate_fix_proposes_a_question_in_the_observed_namespace_without_mer
     let fixed = registry
         .dispatch_with_identity(
             "knowledge.lint",
-            json!({"rules":["duplicate-name"],"fix":true}),
+            json!({"rules":["duplicate-name"],"fix":true,"namespace":"alpha"}),
             Some(identity.clone()),
         )
         .await
@@ -227,7 +227,11 @@ async fn duplicate_fix_proposes_a_question_in_the_observed_namespace_without_mer
         question_id
     );
     let question = registry
-        .dispatch_with_identity("get", json!({"id":question_id}), Some(identity.clone()))
+        .dispatch_with_identity(
+            "get",
+            json!({"id":question_id,"namespace":"alpha"}),
+            Some(identity.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(question["namespace"], "alpha");
@@ -238,7 +242,7 @@ async fn duplicate_fix_proposes_a_question_in_the_observed_namespace_without_mer
     let after = registry
         .dispatch_with_identity(
             "knowledge.lint",
-            json!({"rules":["stats-only"]}),
+            json!({"rules":["stats-only"],"namespace":"alpha"}),
             Some(identity.clone()),
         )
         .await
@@ -247,7 +251,11 @@ async fn duplicate_fix_proposes_a_question_in_the_observed_namespace_without_mer
     assert_eq!(after["stats"]["total_notes"], 1);
     for id in &member_ids {
         let kept = registry
-            .dispatch_with_identity("get", json!({"id":id}), Some(identity.clone()))
+            .dispatch_with_identity(
+                "get",
+                json!({"id":id,"namespace":"alpha"}),
+                Some(identity.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(kept["name"], "same");
