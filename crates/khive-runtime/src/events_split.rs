@@ -917,14 +917,14 @@ type EventsDbIdentities = [Option<EventsFileIdentity>; 3];
 /// and cannot be inode-pinned from here — so the remaining defense is the
 /// same one the daemon socket uses: no untrusted local user may be able to
 /// write (or swap components of) the directory the path traverses. Delegates
-/// to the socket-path walk, which validates every ancestor the kernel will
-/// visit, with the same ownership and sticky-bit rules.
+/// to the shared trust walk with store-specific diagnostics, validating every
+/// ancestor the kernel will visit with the same ownership and sticky-bit rules.
 #[cfg(unix)]
 fn ensure_events_db_parent_trusted(db_path: &Path) -> anyhow::Result<()> {
-    let parent = absolutize(db_path);
-    let parent = parent.parent().filter(|p| !p.as_os_str().is_empty());
+    let db_path = absolutize(db_path);
+    let parent = db_path.parent().filter(|p| !p.as_os_str().is_empty());
     match parent {
-        Some(dir) => crate::daemon::ensure_socket_dir_is_trusted(dir).map_err(|e| {
+        Some(dir) => crate::daemon::ensure_store_dir_is_trusted(dir, &db_path).map_err(|e| {
             anyhow::anyhow!("refusing to serve events from an untrusted directory: {e}")
         }),
         None => Ok(()),
@@ -3061,6 +3061,12 @@ mod tests {
     // classification contracts the module itself defines.
 
     include!("events_sidecar_path_tests.rs");
+
+    #[cfg(unix)]
+    mod store_trust_tests {
+        use super::*;
+        include!("events_store_trust_tests.rs");
+    }
 
     #[cfg(unix)]
     #[test]
