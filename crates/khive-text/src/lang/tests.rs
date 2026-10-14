@@ -156,12 +156,14 @@ fn profile_mixed() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn empty_not_meaningful() {
     assert!(!is_meaningful_query(""));
     assert!(!is_meaningful_query("   "));
 }
 
 #[test]
+#[allow(deprecated)]
 fn symbols_only_not_meaningful() {
     assert!(!is_meaningful_query("!!!"));
     assert!(!is_meaningful_query("@#$%"));
@@ -169,23 +171,27 @@ fn symbols_only_not_meaningful() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn single_latin_char_not_meaningful() {
     assert!(!is_meaningful_query("a"));
     assert!(!is_meaningful_query("Z"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn repeated_char_gibberish_not_meaningful() {
     assert!(!is_meaningful_query("aaaaaaa")); // 100%
     assert!(!is_meaningful_query("aaaaab")); // 5/6 ≈ 83% > 80%
 }
 
 #[test]
+#[allow(deprecated)]
 fn repeated_char_below_threshold_is_meaningful() {
     assert!(is_meaningful_query("aaab")); // 3/4 = 75% ≤ 80%
 }
 
 #[test]
+#[allow(deprecated)]
 fn normal_queries_are_meaningful() {
     assert!(is_meaningful_query("rust programming"));
     assert!(is_meaningful_query("你好世界"));
@@ -194,12 +200,14 @@ fn normal_queries_are_meaningful() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn single_digit_is_meaningful() {
     // Only single ASCII letter is blocked, not digit
     assert!(is_meaningful_query("5"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn unicode_symbol_only_queries_are_not_meaningful() {
     assert!(!is_meaningful_query("\u{FF0C}")); // fullwidth comma
     assert!(!is_meaningful_query("\u{3001}")); // ideographic comma
