@@ -164,11 +164,14 @@ impl SqlGraphStore {
         };
         if let Some(writer_task) = writer_task {
             writer_task
-                .send(move |conn| {
-                    dml(conn).map_err(|error| {
-                        StorageError::driver(StorageCapability::Graph, "update_edge", error)
-                    })
-                })
+                .send_at(
+                    move |conn| {
+                        dml(conn).map_err(|error| {
+                            StorageError::driver(StorageCapability::Graph, "update_edge", error)
+                        })
+                    },
+                    "update_edge",
+                )
                 .await
         } else {
             tokio::task::spawn_blocking(move || {

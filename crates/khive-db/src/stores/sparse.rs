@@ -248,7 +248,7 @@ impl SqliteSparseStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -347,10 +347,13 @@ impl SqliteSparseStore {
         if let Some(writer_task) = self.current_writer_task("sparse_insert_batch")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_insert_sparse_dml(conn, &table2, &records, attempted)
-                        .map_err(|e| map_err(e, "sparse_insert_batch"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_insert_sparse_dml(conn, &table2, &records, attempted)
+                            .map_err(|e| map_err(e, "sparse_insert_batch"))
+                    },
+                    "sparse_insert_batch",
+                )
                 .await;
         }
 

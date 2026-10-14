@@ -215,8 +215,17 @@ pub(super) fn preflight_ingest_namespace(
 #[cfg(feature = "channel-email")]
 pub(super) const CHANNEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The failed poll of one message on which it is given a terminal disposition
+/// instead of holding its page again, for every cause other than a retryable
+/// `comm.ingest` refusal: the message holds on the polls before it.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-pub(super) const UNKNOWN_INGEST_QUARANTINE_THRESHOLD: u8 = 5;
+pub(super) const HOLD_QUARANTINE_THRESHOLD: u8 = 5;
+
+/// The same bound while `comm.ingest` refuses the message as retryable (a busy
+/// or briefly unavailable store): about five minutes at the email poll
+/// cadence, so a short spike does not quarantine ordinary mail.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+pub(super) const RETRYABLE_HOLD_QUARANTINE_THRESHOLD: u8 = 60;
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,34 +242,43 @@ pub(super) fn channel_ingest_attempt_key(
     external_id.map(|external_id| format!("{channel_kind}:{external_id}"))
 }
 
+/// Count one more failed poll of a message and return its number. Every
+/// failure cause shares one count per message, so a message cannot stay below
+/// every bound by alternating causes. A message without an external id has no
+/// stable key: it cannot be counted, and it cannot be quarantined, so it holds
+/// without a bound (`None`). Counts live in memory: a daemon restart starts
+/// them again, which costs at most one more bound's worth of polls.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+pub(super) fn record_channel_hold(
+    channel_kind: &str,
+    external_id: Option<&str>,
+    hold_attempts: &mut std::collections::HashMap<String, u8>,
+) -> Option<u8> {
+    let key = channel_ingest_attempt_key(channel_kind, external_id)?;
+    let attempt = hold_attempts.entry(key).or_default();
+    *attempt = attempt.saturating_add(1);
+    Some(*attempt)
+}
+
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 pub(super) fn channel_ingest_disposition(
     classification: khive_runtime::ChannelIngestFailureClass,
     channel_kind: &str,
     external_id: Option<&str>,
-    unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    hold_attempts: &mut std::collections::HashMap<String, u8>,
 ) -> ChannelIngestDisposition {
     use khive_runtime::ChannelIngestFailureClass;
 
-    match classification {
-        ChannelIngestFailureClass::Retryable { .. } => {
-            ChannelIngestDisposition::Hold { attempt: None }
+    let threshold = match classification {
+        ChannelIngestFailureClass::Permanent { .. } => {
+            return ChannelIngestDisposition::Quarantine;
         }
-        ChannelIngestFailureClass::Permanent { .. } => ChannelIngestDisposition::Quarantine,
-        ChannelIngestFailureClass::Unknown { .. } => {
-            let Some(key) = channel_ingest_attempt_key(channel_kind, external_id) else {
-                return ChannelIngestDisposition::Hold { attempt: None };
-            };
-            let attempt = unknown_attempts.entry(key).or_default();
-            *attempt = attempt.saturating_add(1);
-            if *attempt >= UNKNOWN_INGEST_QUARANTINE_THRESHOLD {
-                ChannelIngestDisposition::Quarantine
-            } else {
-                ChannelIngestDisposition::Hold {
-                    attempt: Some(*attempt),
-                }
-            }
-        }
+        ChannelIngestFailureClass::Retryable { .. } => RETRYABLE_HOLD_QUARANTINE_THRESHOLD,
+        ChannelIngestFailureClass::Unknown { .. } => HOLD_QUARANTINE_THRESHOLD,
+    };
+    match record_channel_hold(channel_kind, external_id, hold_attempts) {
+        Some(attempt) if attempt >= threshold => ChannelIngestDisposition::Quarantine,
+        attempt => ChannelIngestDisposition::Hold { attempt },
     }
 }
 
@@ -313,6 +331,7 @@ pub(super) async fn quarantine_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
+    failed_polls: Option<u8>,
     retention_limit: Option<usize>,
 ) -> Result<(), khive_runtime::RuntimeError> {
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -331,38 +350,133 @@ pub(super) async fn quarantine_channel_ingest_failure(
         .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
 
     // The same retention bound as the poller's own quarantine path: past it
-    // the message is still recorded, without its original bytes. An error
-    // reading the count holds progress through the caller.
-    let content_ref = if quarantine_original_may_be_retained(
+    // the message is still recorded, without its original bytes. A failure to
+    // read the count or to store the original also records the message
+    // without its bytes, naming the failure: a quarantine record that waits
+    // for the blob store would hold the channel cursor for as long as that
+    // store is broken.
+    let original = match quarantine_original_may_be_retained(
         registry,
         ingest_namespace,
         retention_limit,
     )
-    .await?
+    .await
     {
-        let put = registry
-            .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
-            .await?;
-        Some(
-            put.get("content_ref")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    khive_runtime::RuntimeError::Internal(
-                        "blob.put returned no string content_ref for channel quarantine"
-                            .to_string(),
-                    )
-                })?
-                .to_string(),
-        )
-    } else {
+        Ok(true) => {
+            match registry
+                .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+                .await
+            {
+                Ok(put) => match put.get("content_ref").and_then(serde_json::Value::as_str) {
+                    Some(content_ref) => QuarantineOriginal::Stored(content_ref.to_string()),
+                    None => QuarantineOriginal::not_stored(
+                        "original-store-failed",
+                        Some("blob.put returned no string content_ref".to_string()),
+                    ),
+                },
+                Err(error) => {
+                    QuarantineOriginal::not_stored("original-store-failed", Some(error.to_string()))
+                }
+            }
+        }
+        Ok(false) => QuarantineOriginal::not_stored("retention-limit", None),
+        Err(error) => {
+            QuarantineOriginal::not_stored("retention-count-unreadable", Some(error.to_string()))
+        }
+    };
+    if let QuarantineOriginal::NotStored { reason, error } = &original {
         tracing::warn!(target: "khive_mcp::serve",
             channel = channel_kind,
             external_id,
             limit = retention_limit,
-            "quarantine retention limit reached; recording the refused message without its original bytes"
+            reason,
+            error = error.as_deref(),
+            "recording the refused message without its original bytes"
         );
-        None
-    };
+    }
+
+    let first = registry
+        .dispatch(
+            "comm.ingest",
+            quarantine_row_params(
+                ingest_namespace,
+                (channel_kind, channel_slug),
+                default_inbound_actor,
+                envelope,
+                notification_to,
+                classification,
+                failed_polls,
+                &original,
+            ),
+        )
+        .await;
+    match (first, &original) {
+        (Ok(_), _) => {}
+        // A row that carries the original's reference can be refused for that
+        // reference alone. The message is recorded without it rather than held:
+        // its external id still names it at the source.
+        (Err(error), QuarantineOriginal::Stored(_)) => {
+            tracing::warn!(target: "khive_mcp::serve",
+                channel = channel_kind,
+                external_id,
+                %error,
+                "quarantine record with the original's reference was refused; recording it without the reference"
+            );
+            let bare =
+                QuarantineOriginal::not_stored("quarantine-write-failed", Some(error.to_string()));
+            registry
+                .dispatch(
+                    "comm.ingest",
+                    quarantine_row_params(
+                        ingest_namespace,
+                        (channel_kind, channel_slug),
+                        default_inbound_actor,
+                        envelope,
+                        notification_to,
+                        classification,
+                        failed_polls,
+                        &bare,
+                    ),
+                )
+                .await?;
+        }
+        (Err(error), QuarantineOriginal::NotStored { .. }) => return Err(error),
+    }
+    log_channel_quarantine(channel_kind, classification, external_id);
+    Ok(())
+}
+
+/// Whether a quarantine record carries a reference to the message's original
+/// bytes, or why it does not.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+enum QuarantineOriginal {
+    Stored(String),
+    NotStored {
+        reason: &'static str,
+        error: Option<String>,
+    },
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+impl QuarantineOriginal {
+    fn not_stored(reason: &'static str, error: Option<String>) -> Self {
+        Self::NotStored { reason, error }
+    }
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
+fn quarantine_row_params(
+    ingest_namespace: &str,
+    (channel_kind, channel_slug): (&str, &str),
+    default_inbound_actor: Option<&str>,
+    envelope: &khive_channel::ChannelEnvelope,
+    notification_to: &str,
+    classification: khive_runtime::ChannelIngestFailureClass,
+    failed_polls: Option<u8>,
+    original: &QuarantineOriginal,
+) -> serde_json::Value {
+    use serde_json::json;
 
     // Quarantine sender prefix invariant: the sender retains the originating
     // channel prefix because prefix-keyed consumers depend on it for alert
@@ -377,17 +491,28 @@ pub(super) async fn quarantine_channel_ingest_failure(
         "quarantined": "true",
         "quarantine_classification": classification.name(),
         "quarantine_reason": classification.reason(),
-        "quarantine_external_id": external_id,
+        "quarantine_external_id": envelope.external_id.as_deref(),
     });
-    let content = match &content_ref {
-        Some(content_ref) => {
+    if let Some(polls) = failed_polls {
+        metadata["quarantine_failed_polls"] = json!(polls.to_string());
+    }
+    let content = match original {
+        QuarantineOriginal::Stored(content_ref) => {
             metadata["quarantine_content_ref"] = json!(content_ref);
-            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference."
+            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.".to_string()
         }
-        None => {
+        QuarantineOriginal::NotStored { reason, error } => {
             metadata["quarantine_original_retained"] = json!("false");
-            metadata["quarantine_original_not_retained_reason"] = json!("retention-limit");
-            "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached."
+            metadata["quarantine_original_not_retained_reason"] = json!(reason);
+            if let Some(error) = error {
+                metadata["quarantine_original_error"] = json!(error);
+            }
+            match *reason {
+                "retention-limit" => "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached.".to_string(),
+                other => format!(
+                    "Inbound channel message quarantined. Its original bytes were not stored ({other}); the external id names it at the source."
+                ),
+            }
         }
     };
     let mut params = json!({
@@ -397,16 +522,35 @@ pub(super) async fn quarantine_channel_ingest_failure(
         "content": content,
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
-        "external_id": external_id,
+        "external_id": envelope.external_id.as_deref(),
         "correlation_external_id": envelope.correlation_external_id.clone(),
         "metadata": metadata,
     });
     if let Some(actor) = default_inbound_actor {
         params["default_inbound_actor"] = json!(actor);
     }
-    registry.dispatch("comm.ingest", params).await?;
-    log_channel_quarantine(channel_kind, classification, external_id);
-    Ok(())
+    params
+}
+
+/// What one failed `comm.ingest` did to its page.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChannelIngestFailureOutcome {
+    /// The message holds its page; the cursor must not advance this poll.
+    Held,
+    /// The message was recorded as quarantined on its first refusal.
+    Quarantined,
+    /// The message was recorded as quarantined because its failed polls
+    /// reached their bound.
+    QuarantinedAfterHold,
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+impl ChannelIngestFailureOutcome {
+    /// Whether the page may advance past this message.
+    pub(super) fn released(self) -> bool {
+        !matches!(self, Self::Held)
+    }
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -418,16 +562,23 @@ pub(super) async fn handle_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
-    unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    failed_polls: &mut std::collections::HashMap<String, u8>,
     retention_limit: Option<usize>,
-) -> bool {
+) -> ChannelIngestFailureOutcome {
+    use khive_runtime::ChannelIngestFailureClass;
+
     let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
+    let threshold = match classification {
+        ChannelIngestFailureClass::Permanent { .. } => None,
+        ChannelIngestFailureClass::Retryable { .. } => Some(RETRYABLE_HOLD_QUARANTINE_THRESHOLD),
+        ChannelIngestFailureClass::Unknown { .. } => Some(HOLD_QUARANTINE_THRESHOLD),
+    };
     match channel_ingest_disposition(
         classification,
         channel_kind,
         envelope.external_id.as_deref(),
-        unknown_attempts,
+        failed_polls,
     ) {
         ChannelIngestDisposition::Hold { attempt } => {
             tracing::warn!(target: "khive_mcp::serve",
@@ -436,12 +587,15 @@ pub(super) async fn handle_channel_ingest_failure(
                 reason = classification.reason(),
                 external_id = envelope.external_id.as_deref(),
                 attempt,
-                threshold = UNKNOWN_INGEST_QUARANTINE_THRESHOLD,
+                threshold,
+                ingest_error = %error,
                 "comm.ingest failed; holding channel progress"
             );
-            false
+            ChannelIngestFailureOutcome::Held
         }
         ChannelIngestDisposition::Quarantine => {
+            let polls = channel_ingest_attempt_key(channel_kind, envelope.external_id.as_deref())
+                .and_then(|key| failed_polls.get(&key).copied());
             match quarantine_channel_ingest_failure(
                 registry,
                 ingest_namespace,
@@ -450,21 +604,24 @@ pub(super) async fn handle_channel_ingest_failure(
                 default_inbound_actor,
                 envelope,
                 classification,
+                polls,
                 retention_limit,
             )
             .await
             {
-                Ok(()) => true,
+                Ok(()) if threshold.is_some() => ChannelIngestFailureOutcome::QuarantinedAfterHold,
+                Ok(()) => ChannelIngestFailureOutcome::Quarantined,
                 Err(quarantine_error) => {
                     tracing::warn!(target: "khive_mcp::serve",
                         channel = channel_kind,
                         classification = classification.name(),
                         reason = classification.reason(),
                         external_id = envelope.external_id.as_deref(),
+                        ingest_error = %error,
                         error = %quarantine_error,
                         "channel quarantine failed; holding progress for retry"
                     );
-                    false
+                    ChannelIngestFailureOutcome::Held
                 }
             }
         }

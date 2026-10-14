@@ -14,7 +14,7 @@ pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
     Validate(ValidateArgs),
 
-    /// Initialize `.khive/kg/` and write `.khive/khive.toml` with defaults.
+    /// Initialize `.khive/kg/` and write `.khive/config.toml` with defaults.
     Init(InitArgs),
 
     /// Fetch a remote KG archive into `.khive/kg/remotes/<remote>/`.
@@ -23,6 +23,9 @@ pub enum KgCommand {
     /// reaches the same implementation.
     #[command(visible_alias = "sync")]
     Fetch(FetchArgs),
+
+    /// Resolve a remote Git ref and update its commit in `.khive/kg/schema.yaml`.
+    Update(UpdateArgs),
 
     /// Export a namespace-scoped KG archive from a SQLite DB.
     Export(ExportArgs),
@@ -45,6 +48,21 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+/// CLI arguments for `kkernel kg update`.
+#[derive(clap::Parser, Debug)]
+pub struct UpdateArgs {
+    /// Remote name in `.khive/kg/schema.yaml`.
+    pub remote: String,
+
+    /// Repository containing `.khive/kg/schema.yaml`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Git ref to resolve; defaults to the remote's `ref`, then its HEAD.
+    #[arg(long = "ref")]
+    pub git_ref: Option<String>,
 }
 
 /// CLI arguments for the read-only `kkernel kg diff` renderer.
@@ -189,7 +207,7 @@ pub struct ImportArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Import format. Infer CSV or TSV by extension; otherwise use archive JSON.
+    /// Import format. Infer CSV, TSV or BibTeX by extension; otherwise use archive JSON.
     #[arg(long, value_enum)]
     pub format: Option<ImportFormat>,
 
@@ -210,6 +228,7 @@ pub enum ImportFormat {
     Ndjson,
     Csv,
     Tsv,
+    Bibtex,
 }
 
 /// CLI arguments for `kkernel kg status`.

@@ -29,7 +29,9 @@ use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
 use crate::ann::{self, AnnKey};
-use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
+use crate::config::{
+    is_english_only_embedding_model, RecallConfig, ScoreBreakdown, WeightedContributions,
+};
 use crate::query_cache::QueryEmbeddingCache;
 use crate::MemoryPack;
 
@@ -497,6 +499,10 @@ pub(super) struct RecallParams {
     /// `annotates` edge, or null when the memory has none.
     #[serde(default)]
     pub(super) include_source_id: Option<bool>,
+    /// When true the response carries a `timings` object with this call's
+    /// per-stage retrieval wall time and per-round candidate counts.
+    #[serde(default)]
+    pub(super) include_timings: Option<bool>,
     /// Entity names to boost in scoring.
     #[serde(default)]
     pub(super) entity_names: Option<Vec<String>>,
@@ -740,6 +746,21 @@ impl RecallStageTimings {
         self.hydrate.is_some()
     }
 
+    /// Per-stage wall time in microseconds for the `include_timings` report.
+    /// `null` marks a stage this recall never entered.
+    pub(super) fn stage_report(self) -> Value {
+        let micros = |stage: Option<Duration>| {
+            stage.map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
+        };
+        serde_json::json!({
+            "embed_us": micros(self.embed),
+            "fts_us": micros(self.fts),
+            "ann_us": micros(self.ann),
+            "fresh_tail_us": micros(self.fresh_tail),
+            "hydrate_us": micros(self.hydrate),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn from_millis_for_test(
         embed: u64,
@@ -821,12 +842,47 @@ impl TextSnippetPolicy {
 
 pub(super) const RECALL_DIAGNOSTIC_SNIPPET_CHARS: usize = 200;
 
+/// The retrieval arms one candidate collection runs. A fusion strategy that
+/// discards an arm's hits never pays for that arm: `keyword_only` neither
+/// embeds the query nor searches ANN or the fresh tail, and `vector_only`
+/// never runs FTS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecallLegs {
+    pub(super) text: bool,
+    pub(super) vector: bool,
+}
+
+impl RecallLegs {
+    /// Both arms: every fusing strategy and the diagnostic subhandlers.
+    pub(super) const BOTH: Self = Self {
+        text: true,
+        vector: true,
+    };
+
+    pub(super) fn for_strategy(strategy: &FusionStrategy) -> Self {
+        match strategy {
+            FusionStrategy::KeywordOnly => Self {
+                text: true,
+                vector: false,
+            },
+            FusionStrategy::VectorOnly => Self {
+                text: false,
+                vector: true,
+            },
+            _ => Self::BOTH,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct RecallCandidateParams<'a> {
     pub(super) candidate_limit: u32,
+    /// Arms to run; a skipped arm contributes no hits and no stage timing.
+    pub(super) legs: RecallLegs,
     pub(super) embedding_model: Option<&'a str>,
     pub(super) session_fence: Option<&'a crate::visibility::VisibilityFence>,
-    /// Route the FTS path through the CJK-bypass tokenizer. Keyed on `contains_cjk`.
+    /// Skip FTS gather term selection. Keyed on `contains_cjk`; read only when FTS gather is
+    /// enabled.
     pub(super) cjk_fts_bypass: bool,
     pub(super) snippet_policy: TextSnippetPolicy,
     pub(super) fts_gather: &'a crate::config::RecallFtsGatherConfig,
@@ -899,11 +955,33 @@ fn vector_labelled(
         .collect()
 }
 
+/// Fuse the candidates with every model's vector list, as `fuse_for_query` does for a query that
+/// is not CJK-dominant.
+#[cfg(test)]
 pub(super) fn fuse_candidates(
     candidates: &RecallCandidateSet,
     memory_ids: &HashSet<Uuid>,
     cfg: &RecallConfig,
     limit: usize,
+) -> Result<Vec<SearchHit>, RuntimeError> {
+    fuse_for_query(candidates, memory_ids, cfg, limit, "", None)
+}
+
+/// Fuse the candidates of one recall.
+///
+/// When `query` is CJK-dominant (`is_cjk_dominant_query`), the vector lists of English-only
+/// embedding models (`is_english_only_embedding_model`) take part with no candidates, so they
+/// carry weight zero under every strategy that fuses per-model vector lists. The list keeps its
+/// slot, which keeps the per-source weights of a weighted strategy aligned. The lists stay
+/// whole when no other model contributed a candidate, and when `requested_model` names an
+/// embedding model explicitly.
+pub(super) fn fuse_for_query(
+    candidates: &RecallCandidateSet,
+    memory_ids: &HashSet<Uuid>,
+    cfg: &RecallConfig,
+    limit: usize,
+    query: &str,
+    requested_model: Option<&str>,
 ) -> Result<Vec<SearchHit>, RuntimeError> {
     let text_source: Vec<_> = candidates
         .text_hits
@@ -922,15 +1000,33 @@ pub(super) fn fuse_candidates(
         })
         .collect();
 
-    let vector_sources: Vec<Vec<_>> = candidates
+    let mut named_vector_sources: Vec<(&str, Vec<(Uuid, DeterministicScore)>)> = candidates
         .vector_hits_per_model
         .iter()
-        .map(|(_, hits)| {
-            hits.iter()
+        .map(|(model, hits)| {
+            let list: Vec<(Uuid, DeterministicScore)> = hits
+                .iter()
                 .filter(|h| memory_ids.contains(&h.subject_id))
                 .map(|h| (h.subject_id, h.score))
-                .collect()
+                .collect();
+            (model.as_str(), list)
         })
+        .collect();
+    if requested_model.is_none()
+        && crate::scoring::is_cjk_dominant_query(query)
+        && named_vector_sources
+            .iter()
+            .any(|(model, list)| !list.is_empty() && !is_english_only_embedding_model(model))
+    {
+        for (model, list) in named_vector_sources.iter_mut() {
+            if is_english_only_embedding_model(model) {
+                list.clear();
+            }
+        }
+    }
+    let vector_sources: Vec<Vec<_>> = named_vector_sources
+        .into_iter()
+        .map(|(_, list)| list)
         .collect();
 
     let vector_only = matches!(&cfg.fuse_strategy, FusionStrategy::VectorOnly);
@@ -1130,6 +1226,7 @@ impl MemoryPack {
         khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallCandidateParams {
             candidate_limit,
+            legs,
             embedding_model,
             session_fence,
             cjk_fts_bypass,
@@ -1149,6 +1246,9 @@ impl MemoryPack {
         let primary_ns = token.namespace().as_str().to_string();
 
         let text_fut = async {
+            if !legs.text {
+                return Ok::<_, RuntimeError>((Vec::new(), None));
+            }
             let started = Instant::now();
             let hits = self
                 .collect_recall_text_hits(
@@ -1161,24 +1261,39 @@ impl MemoryPack {
                     fts_gather,
                 )
                 .await?;
-            Ok::<_, RuntimeError>((hits, started.elapsed()))
+            Ok((hits, Some(started.elapsed())))
         };
-        let vector_fut = self.collect_recall_vector_hits(
-            token,
-            query,
-            &primary_ns,
-            RecallVectorCandidateParams {
-                candidate_limit,
-                embedding_model,
-                session_fence,
-                visible_namespaces: visible.clone(),
-                ann_overfetch_max_rounds,
-                ann_ready_timeout_ms,
-            },
-        );
+        let vector_fut = async {
+            if !legs.vector {
+                // No embedding, ANN, fresh-tail or sqlite-vec work: the arm
+                // never ran, so it reports no hits, no degradation and no
+                // unproven session fence.
+                return Ok::<_, RuntimeError>(RecallVectorCandidateResult {
+                    vector_hits_per_model: Vec::new(),
+                    ann_degraded: false,
+                    ann_degraded_reason: None,
+                    session_unmet_models: Vec::new(),
+                    timings: RecallStageTimings::default(),
+                });
+            }
+            self.collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    session_fence,
+                    visible_namespaces: visible.clone(),
+                    ann_overfetch_max_rounds,
+                    ann_ready_timeout_ms,
+                },
+            )
+            .await
+        };
         let ((text_hits, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
         let mut timings = vector_result.timings;
-        timings.fts = Some(fts_elapsed);
+        timings.fts = fts_elapsed;
         khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
@@ -2146,189 +2261,5 @@ async fn collect_model_ann_hits_inner(
 mod union_reuse_tests;
 
 #[cfg(test)]
-mod request_cancellation_tests {
-    use super::*;
-
-    #[test]
-    fn stage_timings_distinguish_skips_from_sub_millisecond_work() {
-        let skipped = RecallStageTimings::default();
-        let mut measured = RecallStageTimings::default();
-        measured.record_parallel_model(Duration::from_micros(500), Some(Duration::ZERO));
-        measured.add_hydration(Duration::from_micros(500));
-        assert_eq!(skipped.ann_ms(), measured.ann_ms());
-        assert!(!skipped.ann_attempted());
-        assert!(measured.ann_attempted());
-        assert!(measured.fresh_tail_attempted());
-        assert_eq!(measured.fresh_tail_ms(), 0);
-        assert!(measured.hydrate_attempted());
-        assert_eq!(measured.hydrate_ms(), 0);
-
-        let mut total = RecallStageTimings::default();
-        total.add_retrieval_round(skipped);
-        assert!(!total.ann_attempted());
-        total.add_retrieval_round(measured);
-        total.add_retrieval_round(skipped);
-        total.record_parallel_model(Duration::ZERO, None);
-        assert!(total.ann_attempted());
-        assert!(
-            total.fresh_tail_attempted(),
-            "later skipped work cannot erase a measurement"
-        );
-        assert!(!total.embed_attempted());
-        assert!(!total.fts_attempted());
-        assert!(
-            !total.hydrate_attempted(),
-            "hydration is accumulated separately"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn no_model_recall_records_fts_without_inventing_vector_stage_work() {
-        let rt = khive_runtime::KhiveRuntime::memory().unwrap();
-        assert!(rt.registered_embedding_model_names().is_empty());
-        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-        let pack = MemoryPack::new(rt);
-        let result = pack
-            .collect_recall_candidates(
-                "stage telemetry",
-                &token,
-                RecallCandidateParams {
-                    candidate_limit: 10,
-                    embedding_model: None,
-                    session_fence: None,
-                    cjk_fts_bypass: false,
-                    snippet_policy: TextSnippetPolicy::Omit,
-                    fts_gather: &crate::config::RecallFtsGatherConfig::default(),
-                    ann_overfetch_max_rounds: 1,
-                    ann_ready_timeout_ms: 10,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(result.vector_hits_per_model.is_empty());
-        assert!(result.timings.fts_attempted());
-        assert!(!result.timings.embed_attempted());
-        assert!(!result.timings.ann_attempted());
-        assert!(!result.timings.fresh_tail_attempted());
-        assert!(!result.timings.hydrate_attempted());
-    }
-
-    #[tokio::test]
-    async fn exact_sqlite_vec_recall_records_ann_but_skips_fresh_tail() {
-        use crate::test_support::HashVecProvider;
-        use khive_runtime::{KhiveRuntime, RuntimeConfig};
-
-        const MODEL: &str = "stage-timing-exact-model";
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = RuntimeConfig {
-            db_path: Some(dir.path().join("recall-stage.db")),
-            ..RuntimeConfig::no_embeddings()
-        };
-        let writable = KhiveRuntime::new(cfg.clone()).unwrap();
-        writable.register_embedder(HashVecProvider {
-            model_name: MODEL.into(),
-            dims: 8,
-        });
-        let token = writable
-            .authorize(khive_runtime::Namespace::local())
-            .unwrap();
-        writable.vectors_for_model(&token, MODEL).unwrap();
-        let writer_join = writable.backend().pool().take_writer_task_join();
-        drop(token);
-        drop(writable);
-        if let Some(join) = writer_join {
-            tokio::time::timeout(Duration::from_secs(5), join)
-                .await
-                .expect("fixture writer must drain before readonly reopen")
-                .expect("fixture writer must not panic");
-        }
-        let rt = KhiveRuntime::new_readonly(cfg).unwrap();
-        rt.register_embedder(HashVecProvider {
-            model_name: MODEL.into(),
-            dims: 8,
-        });
-        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-        let shared = ann::new_shared();
-        let result = collect_model_ann_hits(
-            &rt,
-            &shared,
-            &token,
-            "local",
-            &["local".into()],
-            MODEL.into(),
-            vec![1.0; 8],
-            10,
-            40,
-            1,
-            10,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            result.used_sqlite_vec_fallback,
-            "must exercise the exact route"
-        );
-        assert!(
-            !result.degraded,
-            "a failed exact query is not a successful control"
-        );
-        assert!(result.fresh_tail_elapsed.is_none());
-        let mut timings = RecallStageTimings::default();
-        timings.record_parallel_model(result.ann_elapsed, result.fresh_tail_elapsed);
-        assert!(timings.ann_attempted());
-        assert!(!timings.fresh_tail_attempted());
-        assert_eq!(timings.fresh_tail_ms(), 0);
-    }
-
-    #[test]
-    fn stage_timings_max_parallel_models_and_sum_sequential_rounds() {
-        let mut first_round = RecallStageTimings::default();
-        first_round
-            .record_parallel_model(Duration::from_millis(13), Some(Duration::from_millis(2)));
-        first_round
-            .record_parallel_model(Duration::from_millis(5), Some(Duration::from_millis(11)));
-        assert_eq!(first_round.ann_ms(), 13);
-        assert_eq!(first_round.fresh_tail_ms(), 11);
-
-        let second_round = RecallStageTimings::from_millis_for_test(3, 7, 17, 19, 0);
-        let mut total = RecallStageTimings::default();
-        total.add_retrieval_round(first_round);
-        total.add_retrieval_round(second_round);
-        total.add_hydration(Duration::from_millis(23));
-
-        assert_eq!(total.embed_ms(), 3);
-        assert_eq!(total.fts_ms(), 7);
-        assert_eq!(total.ann_ms(), 30);
-        assert_eq!(total.fresh_tail_ms(), 30);
-        assert_eq!(total.hydrate_ms(), 23);
-    }
-
-    #[tokio::test]
-    async fn cancelled_embedding_failure_cannot_degrade_to_a_healthy_engine() {
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
-        let result = khive_storage::scope_request_read_cancellation(cancel_rx, async {
-            collect_embed_results(vec![
-                (
-                    "failed".to_string(),
-                    Err(RuntimeError::Internal(
-                        "ordinary engine failure".to_string(),
-                    )),
-                ),
-                (
-                    "healthy".to_string(),
-                    Ok(("healthy".to_string(), vec![1.0, 0.0])),
-                ),
-            ])
-        })
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(RuntimeError::Storage(
-                khive_storage::error::StorageError::Timeout { .. }
-            ))
-        ));
-    }
-}
+#[path = "common_request_cancellation_tests.rs"]
+mod request_cancellation_tests;

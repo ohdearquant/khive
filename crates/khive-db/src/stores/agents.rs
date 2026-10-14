@@ -227,7 +227,7 @@ impl SqlAgentStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await
                 .map_err(preserve_driver_refusal);
         }
@@ -271,9 +271,13 @@ impl AgentStore for SqlAgentStore {
         // supplies the same transaction around this body.
         if let Some(writer_task) = self.current_writer_task("agent_insert")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    insert_agent_dml(conn, &record).map_err(|error| map_err(error, "agent_insert"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        insert_agent_dml(conn, &record)
+                            .map_err(|error| map_err(error, "agent_insert"))
+                    },
+                    "agent_insert",
+                )
                 .await
                 .map_err(preserve_driver_refusal);
         }

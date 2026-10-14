@@ -21,6 +21,38 @@ pub(super) struct VerifiedCreator {
     pub(super) audit_actor: String,
 }
 
+/// The provenance lookup. `LIMIT 2` is a uniqueness check, so the normal
+/// single match never fills it: the `ORDER BY` terms carry unary `+` so that,
+/// without sqlite_stat1, the planner cannot satisfy the order with the
+/// namespace/created_at index and walk every event of the namespace. The
+/// equality terms then seek `idx_schedule_creator_provenance` and the few
+/// matching rows are sorted.
+pub(super) fn creator_provenance_statement(
+    namespace: &str,
+    scheduled_event_id: uuid::Uuid,
+    event_type: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "SELECT actor FROM events \
+              WHERE namespace = ?1 \
+                AND verb = ?2 \
+                AND target_id = ?3 \
+                AND outcome = 'success' \
+                AND json_extract(payload, '$.provenance') = ?4 \
+                AND json_extract(payload, '$.event_type') = ?5 \
+              ORDER BY +created_at ASC, +id ASC LIMIT 2"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_VERB.to_string()),
+            SqlValue::Text(scheduled_event_id.to_string()),
+            SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1.to_string()),
+            SqlValue::Text(event_type.to_string()),
+        ],
+        label: Some("pending_events_creator_provenance".into()),
+    }
+}
+
 pub(super) async fn verified_creator_for_event(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -33,25 +65,11 @@ pub(super) async fn verified_creator_for_event(
         .await
         .context("pending-events: open SQL reader for creator provenance")?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT actor FROM events \
-                  WHERE namespace = ?1 \
-                    AND verb = ?2 \
-                    AND target_id = ?3 \
-                    AND outcome = 'success' \
-                    AND json_extract(payload, '$.provenance') = ?4 \
-                    AND json_extract(payload, '$.event_type') = ?5 \
-                  ORDER BY created_at ASC, id ASC LIMIT 2"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_VERB.to_string()),
-                SqlValue::Text(scheduled_event_id.to_string()),
-                SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1.to_string()),
-                SqlValue::Text(event_type.to_string()),
-            ],
-            label: Some("pending_events_creator_provenance".into()),
-        })
+        .query_all(creator_provenance_statement(
+            namespace,
+            scheduled_event_id,
+            event_type,
+        ))
         .await
         .context("pending-events: query creator provenance")?;
 

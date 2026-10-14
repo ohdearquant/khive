@@ -117,7 +117,7 @@ pub(crate) struct PreparedAtomicNotes {
 /// visibility into that helper, so the check is reproduced here to keep the
 /// atomic path's embedding validation observably identical to the canonical
 /// `create_note_inner` -> `VectorStore::insert` path.
-fn non_finite_index(data: &[f32]) -> Option<usize> {
+pub(crate) fn non_finite_index(data: &[f32]) -> Option<usize> {
     data.iter().position(|v| !v.is_finite())
 }
 
@@ -198,11 +198,38 @@ pub(crate) fn vector_insert_statements(
     embedding: &[f32],
     label_prefix: &str,
 ) -> Vec<PlanStatement> {
+    vector_insert_statements_for_substrate(
+        table,
+        namespace,
+        subject_id,
+        SubstrateKind::Note,
+        field,
+        embedding_model,
+        embedding,
+        label_prefix,
+        None,
+    )
+}
+
+/// Build atomic vector and ANN-log writes for a typed substrate. The caller
+/// chooses whether the two single-row inserts require affected-row evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vector_insert_statements_for_substrate(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    substrate: SubstrateKind,
+    field: &str,
+    embedding_model: &str,
+    embedding: &[f32],
+    label_prefix: &str,
+    insert_guard: Option<AffectedRowGuard>,
+) -> Vec<PlanStatement> {
     let subject = subject_id.to_string();
     let model_key = table
         .strip_prefix("vec_")
         .expect("runtime vector tables use the vec_ prefix");
-    let kind_str = SubstrateKind::Note.to_string();
+    let kind_str = substrate.to_string();
     let blob = khive_storage::encode_f32_native(embedding);
     vec![
         // Delta-log any pre-existing row this REPLACE is about to evict —
@@ -267,7 +294,7 @@ pub(crate) fn vector_insert_statements(
                 ],
                 label: Some(format!("{label_prefix}-insert")),
             },
-            guard: None,
+            guard: insert_guard,
         },
         PlanStatement {
             statement: SqlStatement {
@@ -284,7 +311,7 @@ pub(crate) fn vector_insert_statements(
                 ],
                 label: Some(format!("{label_prefix}-log-upsert")),
             },
-            guard: None,
+            guard: insert_guard,
         },
     ]
 }
@@ -489,13 +516,12 @@ pub(crate) async fn prepare_atomic_note_requests(
             runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?
         };
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check_at(spec.content, &record, "content")?;
-        if let Some(n) = spec.name {
-            crate::secret_gate::check_at(n, &record, "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, &record, "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(
+            spec.content,
+            spec.name,
+            properties.as_ref(),
+            &record,
+        )?;
 
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);

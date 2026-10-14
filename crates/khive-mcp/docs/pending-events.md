@@ -108,7 +108,7 @@ derives both `namespace_explicit` and `actor_explicit` from
 real CLI parse, where there is no other way a namespace value could appear.
 This wrapper's `namespace` argument is not a CLI flag the operator typed;
 it is a plain default this function was called with (`"local"` unless the
-caller passed something else), and `resolve_runtime_config` (`serve.rs`)
+caller passed something else), and `resolve_runtime_config` (`serve/runtime_config.rs`)
 treats a genuine explicit actor override as authoritative — it clears any
 configured `[actor] id` for the resolved-to-`"local"` case rather than
 falling through to it. Routing this default namespace through

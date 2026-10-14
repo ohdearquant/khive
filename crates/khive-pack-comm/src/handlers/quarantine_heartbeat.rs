@@ -7,8 +7,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::note::Note;
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::note::{
+    FilterOp, Note, NoteExpiryFallback, NoteFilter, NoteTimeOrder, PropertyFilter,
+};
+use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::{AttachmentSubstrate, ContentRef};
 
 use crate::params::{
@@ -20,7 +22,7 @@ use super::race_seam;
 use super::validation::parse_supplied_timestamp;
 
 /// Detach only the main-backend original owned by this already hard-deleted
-/// legacy note. The conditional DELETE rejects a competing replacement of the
+/// legacy note. The guarded delete rejects a competing replacement of the
 /// role after the owner read; it never scans for unrelated ownerless rows.
 pub(super) async fn detach_deleted_legacy_original(
     runtime: &KhiveRuntime,
@@ -50,20 +52,17 @@ pub(super) async fn detach_deleted_legacy_original(
             "cleanup_expired_quarantine: deleted note {id} has a mismatched original owner"
         )));
     }
-    let detached = core
-        .sql()
-        .writer()
-        .await?
-        .execute(SqlStatement {
-            sql: khive_runtime::sql!("quarantine_original_detach").into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(expected.as_str().to_string()),
-            ],
-            label: Some("comm_cleanup_legacy_quarantine_original".into()),
-        })
+    #[cfg(test)]
+    race_seam::pause_after_quarantine_role_read().await;
+    let detached = attachments
+        .delete_attachment_if(
+            id,
+            "quarantine-original",
+            AttachmentSubstrate::Note,
+            &expected,
+        )
         .await?;
-    if detached != 1 {
+    if !detached {
         return Err(RuntimeError::Internal(format!(
             "cleanup_expired_quarantine: deleted note {id} original owner changed during cleanup"
         )));
@@ -148,63 +147,65 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         None
     };
     let namespace = token.namespace().as_str();
-    let (sql, sql_params) = if let Some(cutoff) = legacy_cutoff {
+    let mut filter = NoteFilter {
+        kind: Some("message".into()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.channel_kind".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(p.channel_kind.clone()),
+            },
+            PropertyFilter {
+                json_path: "$.quarantined".into(),
+                op: FilterOp::TrueOrTextTrue,
+                value: SqlValue::Null,
+            },
+        ],
+        ..Default::default()
+    };
+    if let Some(cutoff) = legacy_cutoff {
         // Match the #3497 boot-repair selector: missing, JSON null, or a
         // SQLite-space-only text slug. Existing tombstones stay eligible,
         // including an operator-soft-deleted historical quarantine.
-        (
-            khive_runtime::sql!("quarantine_legacy_expired_select"),
-            vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(as_of),
-                SqlValue::Integer(cutoff),
-                SqlValue::Text(p.channel_kind.clone()),
-            ],
-        )
+        filter = filter.include_deleted();
+        filter.expiry_fallback = Some(NoteExpiryFallback {
+            expires_at_or_before: as_of,
+            created_at_or_before: cutoff,
+        });
+        filter.time_order = Some(NoteTimeOrder::ExpiresAtOrCreatedAt);
+        filter.property_filters.push(PropertyFilter {
+            json_path: "$.channel_slug".into(),
+            op: FilterOp::MissingNullOrSpaceEmptyText,
+            value: SqlValue::Null,
+        });
     } else {
-        (
-            khive_runtime::sql!("quarantine_expired_select"),
-            vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(as_of),
-                SqlValue::Text(p.channel_kind.clone()),
-                SqlValue::Text(p.channel_slug.clone()),
-            ],
+        filter = filter.expires_before(as_of);
+        filter.time_order = Some(NoteTimeOrder::ExpiresAt);
+        filter.property_filters.push(PropertyFilter {
+            json_path: "$.channel_slug".into(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(p.channel_slug.clone()),
+        });
+    }
+    let store = runtime.notes(token)?;
+    let page = store
+        .query_notes_filtered_count_free(
+            namespace,
+            &filter,
+            PageRequest {
+                offset: 0,
+                limit: 128,
+            },
         )
-    };
-    let mut reader = runtime
-        .sql()
-        .reader()
         .await
         .map_err(RuntimeError::Storage)?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: sql.into(),
-            params: sql_params,
-            label: Some("comm_cleanup_expired_quarantine".into()),
-        })
-        .await
-        .map_err(RuntimeError::Storage)?;
-    drop(reader);
 
     // Hard deletion by ID is not namespace-scoped. Re-read each UUID through
     // the authorized store and enforce the query's full predicate.
-    let store = runtime.notes(token)?;
     let mut deleted = 0usize;
     let mut routed_owner_detached = 0usize;
-    for row in rows {
-        let id = match row.get("id") {
-            Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|error| {
-                RuntimeError::Internal(format!(
-                    "cleanup_expired_quarantine: invalid stored note id: {error}"
-                ))
-            })?,
-            _ => {
-                return Err(RuntimeError::Internal(
-                    "cleanup_expired_quarantine: query returned no text id".into(),
-                ));
-            }
-        };
+    for selected in page.items {
+        let id = selected.id;
         let note = if legacy_cutoff.is_some() {
             store.get_note_including_deleted(id).await?
         } else {
@@ -330,7 +331,10 @@ pub(super) fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slu
 /// Read-modify-write: `created_at` is preserved across updates, `last_error`
 /// is RETAINED across a subsequent success (design review amendment 3), and
 /// `consecutive_failures` resets on success / increments on failure, read from
-/// the prior row (correct across restarts).
+/// the prior row (correct across restarts). A success that reports
+/// `held_messages` also maintains `consecutive_held_polls` (incremented while
+/// a page holds, reset by a poll with no hold) and `last_held_at`; a failure
+/// read no page, so it leaves them as they were.
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -373,6 +377,13 @@ pub(crate) async fn handle_heartbeat(
     {
         return Err(RuntimeError::InvalidInput(
             "heartbeat: `error_class` is required when outcome is \"failure\"".into(),
+        ));
+    }
+    if outcome == "failure" && (p.held_messages.is_some() || p.quarantined_after_hold.is_some()) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `held_messages` and `quarantined_after_hold` are reported only with \
+             outcome \"success\"; a failed poll read no page"
+                .into(),
         ));
     }
 
@@ -443,6 +454,24 @@ pub(crate) async fn handle_heartbeat(
             props["last_success_at"] = json!(at);
             props["consecutive_failures"] = json!(0);
             // last_error is intentionally left untouched — design review amendment 3.
+            if let Some(held) = p.held_messages {
+                props["held_messages"] = json!(held);
+                if held > 0 {
+                    let prev_held_polls = props
+                        .get("consecutive_held_polls")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    props["consecutive_held_polls"] = json!(prev_held_polls.saturating_add(1));
+                    props["last_held_at"] = json!(at);
+                } else {
+                    props["consecutive_held_polls"] = json!(0);
+                }
+            }
+            if p.quarantined_after_hold
+                .is_some_and(|released| released > 0)
+            {
+                props["last_quarantined_after_hold_at"] = json!(at);
+            }
         }
         "failure" => {
             props["last_failure_at"] = json!(at);

@@ -2,6 +2,8 @@
 #[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
 mod receipt_credentials;
 
+mod auto_feedback_unjudged;
+
 use super::*;
 use khive_runtime::{
     DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig,
@@ -3833,52 +3835,6 @@ async fn issue2772_malformed_results_names_the_parameter_shape_and_an_example() 
 }
 
 #[tokio::test]
-async fn brain_auto_feedback_credits_only_the_selected_result() {
-    let (pack, rt) = make_pack();
-    let registry = empty_registry();
-    let token = rt.authorize(Namespace::local()).unwrap();
-    let first = create_test_entity(&rt, &token).await;
-    let selected = create_test_entity(&rt, &token).await;
-
-    let result = pack
-        .dispatch(
-            "brain.auto_feedback",
-            json!({
-                "query": "recall calibration target",
-                "results": [{ "id": first }, { "id": selected }],
-                "target_id": selected,
-                "signal": "implicit_positive"
-            }),
-            &registry,
-            &token,
-        )
-        .await
-        .expect("auto_feedback succeeds");
-
-    assert_eq!(result["emitted"], json!(true), "emitted must be true");
-    assert_eq!(
-        result["signal"],
-        json!("implicit_positive"),
-        "the caller's signal must be preserved"
-    );
-    let returned_target_id = result["target_id"].as_str().unwrap_or("");
-    assert_eq!(
-        returned_target_id.len(),
-        36,
-        "target_id in auto_feedback response must be full 36-char UUID"
-    );
-    assert_eq!(
-        returned_target_id, selected,
-        "rank position must not override the caller-selected result"
-    );
-    assert_eq!(
-        pack.snapshot().balanced_recall.total_events,
-        1,
-        "auto_feedback must increment total_events"
-    );
-}
-
-#[tokio::test]
 async fn brain_auto_feedback_aliases_resolve_full_id_and_retain_selected_attribution() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
@@ -4071,70 +4027,6 @@ async fn brain_auto_feedback_full_id_rejects_conflicts_duplicates_and_malformed_
         .await
         .unwrap();
     assert!(events.items.is_empty());
-}
-
-#[tokio::test]
-async fn brain_auto_feedback_without_signal_abstains_without_writing() {
-    let (pack, rt) = make_anonymous_pack();
-    let registry = empty_registry();
-    let token = rt.authorize(Namespace::local()).unwrap();
-    let target = create_test_entity(&rt, &token).await;
-    let before = pack.snapshot().balanced_recall.total_events;
-
-    let result = pack
-        .dispatch(
-            "brain.auto_feedback",
-            json!({
-                "query": "no caller judgment",
-                "results": [{"id": target}],
-                "target_id": target
-            }),
-            &registry,
-            &token,
-        )
-        .await
-        .expect("omitting signal is an explicit abstention");
-
-    assert_eq!(result["emitted"], json!(false));
-    assert_eq!(result["reason"], json!("no_signal"));
-    assert_eq!(pack.snapshot().balanced_recall.total_events, before);
-
-    let malformed = pack
-        .dispatch(
-            "brain.auto_feedback",
-            json!({
-                "query": "malformed scorer abstention",
-                "results": [{"id": target}],
-                "scorer_run_id": "run-without-ledger"
-            }),
-            &registry,
-            &token,
-        )
-        .await
-        .expect_err("abstention must not bypass scorer-pair validation");
-    assert!(malformed
-        .to_string()
-        .contains("scorer_run_id and serve_ledger_id must be supplied together"));
-
-    let events = rt
-        .events(&token)
-        .expect("event store")
-        .query_events(
-            khive_storage::event::EventFilter {
-                kinds: vec![khive_types::EventKind::FeedbackExplicit],
-                ..Default::default()
-            },
-            khive_storage::types::PageRequest {
-                limit: 10,
-                offset: 0,
-            },
-        )
-        .await
-        .expect("feedback event query");
-    assert!(
-        events.items.is_empty(),
-        "abstention must not append an event"
-    );
 }
 
 #[tokio::test]
@@ -5863,6 +5755,7 @@ async fn stale_pack_mutation_rebases_on_durable_snapshot() {
 }
 
 #[tokio::test]
+#[serial_test::serial(brain_feedback_precommit)]
 async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
     use khive_storage::types::{SqlStatement, SqlValue};
     use std::sync::Arc;

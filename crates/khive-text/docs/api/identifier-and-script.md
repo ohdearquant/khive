@@ -8,10 +8,17 @@ and reject low-information retrieval queries.
 Returns true only for text with no whitespace, at least one ASCII letter, and a structural boundary:
 an explicit separator, a lowercase-to-uppercase transition, an acronym-to-word boundary such as
 `XMLParser`, or a letter/digit transition. An acronym boundary is an uppercase letter followed by
-another uppercase letter and then a lowercase letter, except a plural `s`: that suffix stays
-with the acronym, so `APIs`, `IDs` and `URLs` remain whole words while `XMLToJSON` still splits
-before `To`. Plain lowercase, titlecase, and all-uppercase words without a boundary are not
-identifiers.
+another uppercase letter and then a lowercase letter, except a terminal plural `s` with no
+following ASCII lowercase letter. That suffix stays with the acronym at the end of input or
+before a separator, uppercase letter, or digit: `APIs`, `IDs` and `URLs` remain whole words,
+and `APIsFoo` splits as `apis`, `foo`. A longer lowercase run restores the acronym boundary:
+`DBUsers` splits as `db`, `users`, `APIUsage` as `api`, `usage`, and `URLsafe` as `ur`, `lsafe`.
+`XMLToJSON` still splits before `To`.
+
+This is a character rule with no dictionary or acronym-length heuristic. `XMLIsEmpty` has the
+same shape as `APIsFoo`, so it splits as `xmlis`, `empty`; the splitter cannot distinguish the
+word `Is` from a plural suffix. Plain lowercase, titlecase, and all-uppercase words without a
+boundary are not identifiers.
 
 ## `split_identifier`
 

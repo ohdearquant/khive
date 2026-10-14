@@ -1,11 +1,38 @@
 //! Beta-posterior fold implementations for brain profiles.
 
-use khive_fold::{Fold, FoldContext};
+use khive_fold::{fold_fn, FilterFold, Fold, FoldContext, MapFold};
 use khive_storage::event::Event;
 use khive_types::EventKind;
 
 use crate::event::interpret;
-use khive_brain_core::{BalancedRecallState, SectionPosteriorState};
+use khive_brain_core::{BalancedRecallState, BrainSignal, SectionPosteriorState};
+
+fn balanced_event_fold(entity_capacity: usize) -> impl Fold<Event, BalancedRecallState> {
+    let signals = fold_fn(
+        move |_| BalancedRecallState::new(entity_capacity),
+        |mut state: BalancedRecallState, signal: &BrainSignal, _| {
+            state.apply_signal(signal);
+            state
+        },
+    );
+    // Unlike other irrelevant events, unjudged telemetry is not a training event.
+    FilterFold::new(MapFold::new(signals, interpret), |event: &Event| {
+        event.kind != EventKind::FeedbackUnjudged
+    })
+}
+
+fn section_event_fold() -> impl Fold<Event, SectionPosteriorState> {
+    MapFold::new(
+        fold_fn(
+            |_| SectionPosteriorState::new(),
+            |mut state: SectionPosteriorState, signal: &BrainSignal, _| {
+                state.apply_signal(signal);
+                state
+            },
+        ),
+        interpret,
+    )
+}
 
 /// Fold for the `balanced-recall-v1` three-scalar Beta-posterior state.
 pub struct BalancedRecallFold {
@@ -26,17 +53,11 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
 
     fn reduce(
         &self,
-        mut state: BalancedRecallState,
+        state: BalancedRecallState,
         event: &Event,
-        _ctx: &FoldContext,
+        ctx: &FoldContext,
     ) -> BalancedRecallState {
-        // Unlike other irrelevant events, unjudged telemetry is not a training event.
-        if event.kind == EventKind::FeedbackUnjudged {
-            return state;
-        }
-        let signal = interpret(event);
-        state.apply_signal(&signal);
-        state
+        balanced_event_fold(self.entity_capacity).reduce(state, event, ctx)
     }
 
     fn finalize(&self, state: BalancedRecallState, _context: &FoldContext) -> BalancedRecallState {
@@ -69,7 +90,7 @@ impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
         &self,
         mut state: SectionPosteriorState,
         event: &Event,
-        _ctx: &FoldContext,
+        ctx: &FoldContext,
     ) -> SectionPosteriorState {
         if event.verb == "brain.section_feedback" {
             if let Ok((_, signals)) = crate::section_feedback::decode_event(event) {
@@ -79,9 +100,7 @@ impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
             }
             return state;
         }
-        let signal = interpret(event);
-        state.apply_signal(&signal);
-        state
+        section_event_fold().reduce(state, event, ctx)
     }
 
     fn finalize(
@@ -92,6 +111,9 @@ impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
         state
     }
 }
+
+#[cfg(test)]
+mod composition_tests;
 
 #[cfg(test)]
 mod tests {

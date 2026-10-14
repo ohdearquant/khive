@@ -484,6 +484,134 @@ const Q: &str = "SELECT production FROM notes";
     }
 
     #[test]
+    fn quoted_and_unquoted_sql_literals_require_exact_live_keeps() {
+        let root = PathBuf::from("/crates");
+        let relative = "fixture/src/literals.rs";
+        let path = root.join(relative);
+        for (name, table, source, expected) in [
+            (
+                "quoted_notes",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "quoted_entities",
+                "entities",
+                r#"const PREFIX: &str = "UPDATE \"entities\" SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE \"entities\" SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "unquoted_notes",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE notes SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE notes SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "literal_backslash_before_n",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE notes SET content = 'path\\name'";"#,
+                "UPDATE notes SET content = 'path\\name'",
+            ),
+        ] {
+            let keep = Keep {
+                name,
+                path: relative,
+                sql: expected,
+                reason: "Fixture-only exact literal spelling control.",
+            };
+            let keeps = std::slice::from_ref(&keep);
+            let sources = BTreeMap::from([(path.clone(), source.to_owned())]);
+            assert_eq!(sql_literals(source), vec![expected.to_owned()]);
+            assert!(inline_errors(&sources, &root, &[], keeps).is_empty());
+            assert_eq!(
+                inline_errors(&sources, &root, &["fixture"], &[]),
+                vec![format!("inline SQL: {relative}: {expected}")]
+            );
+
+            let changed_source = source.replace(table, "other_table");
+            let changed_sql = expected.replace(table, "other_table");
+            let changed = BTreeMap::from([(path.clone(), changed_source)]);
+            assert_eq!(
+                inline_errors(&changed, &root, &[], keeps),
+                vec![
+                    format!("inline SQL: {relative}: {changed_sql}"),
+                    format!("inline keep {name} expected once, found 0"),
+                ]
+            );
+
+            let missing = BTreeMap::from([(path.clone(), String::new())]);
+            assert_eq!(
+                inline_errors(&missing, &root, &[], keeps),
+                vec![format!("inline keep {name} expected once, found 0")]
+            );
+            let duplicate = BTreeMap::from([(path.clone(), format!("{source}\n{source}"))]);
+            assert_eq!(
+                inline_errors(&duplicate, &root, &[], keeps),
+                vec![format!("inline keep {name} expected once, found 2")]
+            );
+
+            let moved_relative = "fixture/src/moved.rs";
+            let moved = BTreeMap::from([(root.join(moved_relative), source.to_owned())]);
+            assert_eq!(
+                inline_errors(&moved, &root, &["fixture"], keeps),
+                vec![
+                    format!("inline SQL: {moved_relative}: {expected}"),
+                    format!("inline keep {name} expected once, found 0"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn aliased_scalar_select_renderings_trip_the_inline_sql_control_without_matching_prose() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for (sql, detected) in [
+            ("SELECT last_insert_rowid()\nAS row_id", true),
+            ("SELECT changes()\nAS affected", true),
+            ("SELECT a source\nas the active option", false),
+            ("SELECT changes()\nto inspect the last write", false),
+            ("SELECT an empty argument list ()\nbefore submitting", false),
+            ("SELECT value\nAS alias", false),
+            ("select last_insert_rowid()\nAS row_id", false),
+        ] {
+            let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = if detected { vec![flat.clone()] } else { vec![] };
+            for rendered in [
+                format!("\"{flat}\""),
+                format!("\"{}\"", sql.replace('\n', "\\n")),
+                format!("\"{}\"", sql.replace('\n', " \\\n            ")),
+                format!("r#\"{sql}\"#"),
+            ] {
+                let source = format!("const Q: &str = {rendered};");
+                assert_eq!(sql_literals(&source), expected, "{source}");
+                let sources = BTreeMap::from([(path.clone(), source)]);
+                let errors = expected
+                    .iter()
+                    .map(|statement| format!("inline SQL: demo/src/lib.rs: {statement}"))
+                    .collect::<Vec<_>>();
+                assert_eq!(inline_errors(&sources, &root, &["demo"], &[]), errors);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "parse Rust source for inline SQL policy")]
+    fn unterminated_quoted_sql_literal_still_fails_closed() {
+        let root = PathBuf::from("/crates");
+        let source = r#"const PREFIX: &str = "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')"#;
+        let keep = Keep {
+            name: "quoted_notes",
+            path: "fixture/src/literals.rs",
+            sql: "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')",
+            reason: "Fixture-only malformed Rust source control.",
+        };
+        let sources = BTreeMap::from([(root.join(keep.path), source.to_owned())]);
+        let _ = inline_errors(&sources, &root, &[], std::slice::from_ref(&keep));
+    }
+
+    #[test]
     fn with_materialization_renderings_trip_the_inline_sql_control() {
         let root = PathBuf::from("/crates");
         let path = root.join("demo/src/lib.rs");

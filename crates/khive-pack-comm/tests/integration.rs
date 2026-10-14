@@ -125,13 +125,14 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_sixteen_handlers() {
+fn comm_pack_declares_nineteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        16,
-        "comm pack must declare 16 handlers: send, delivered, transport_status, inbox, read, \
+        19,
+        "comm pack must declare 19 handlers: send, delivered, transport_status, inbox, read, \
          mark_read, unread, reply, \
-         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit, \
+         suppression_add, suppression_list, suppression_remove \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -3561,7 +3562,8 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
     assert_eq!(plan.pack, "comm", "SchemaPlan.pack must be 'comm'");
     assert_eq!(
         plan.statements,
-        &["CREATE TABLE IF NOT EXISTS comm_channel_cursor (
+        &[
+            "CREATE TABLE IF NOT EXISTS comm_channel_cursor (
     channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),
     channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),
     source TEXT NOT NULL CHECK (length(trim(source)) > 0),
@@ -3569,7 +3571,19 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
     high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (channel_kind, channel_slug)
-)"]
+)",
+            "CREATE TABLE IF NOT EXISTS comm_suppression (
+    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+    scope TEXT NOT NULL CHECK (scope IN ('outbound', 'inbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('address', 'domain', 'recipient_key')),
+    value TEXT NOT NULL CHECK (length(value) > 0),
+    source TEXT NOT NULL CHECK (source IN ('operator', 'mailto_token', 'one_click', 'reply_stop')),
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    UNIQUE (scope, kind, value, source)
+)"
+        ]
     );
 }
 
@@ -3586,8 +3600,8 @@ async fn verb_registry_aggregates_comm_schema_plan() {
         .iter()
         .find(|p| p.pack == "comm")
         .expect("comm plan present");
-    assert!(!comm_plan.is_empty(), "cursor schema stays pack-owned");
-    assert_eq!(comm_plan.statements.len(), 1);
+    assert!(!comm_plan.is_empty(), "auxiliary schema stays pack-owned");
+    assert_eq!(comm_plan.statements.len(), 2);
     let pack = CommPack::new(_rt);
     assert_eq!(
         comm_plan.statements,
@@ -9050,10 +9064,18 @@ async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespac
         "last_failure_at",
         "last_error",
         "consecutive_failures",
+        "consecutive_held_polls",
+        "held_messages",
+        "last_held_at",
+        "last_quarantined_after_hold_at",
     ] {
+        // `get` rather than indexing: indexing a missing key also yields null, so it
+        // would pass with the field absent from the entry.
         assert!(
-            channels[0][field].is_null(),
-            "without a heartbeat, `{field}` is unknown rather than fabricated: {}",
+            channels[0]
+                .get(field)
+                .is_some_and(serde_json::Value::is_null),
+            "without a heartbeat, `{field}` is present and null rather than fabricated: {}",
             channels[0]
         );
     }

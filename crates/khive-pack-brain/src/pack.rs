@@ -492,12 +492,20 @@ impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for B
         self.0.entity_types()
     }
 
+    fn note_property_policies(&self) -> &'static [khive_types::NotePropertyPolicySpec] {
+        self.0.note_property_policies()
+    }
+
     fn note_embedding_policies(&self) -> &'static [khive_types::NoteEmbeddingPolicySpec] {
         self.0.note_embedding_policies()
     }
 
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn khive_runtime::KindHook>> {
         self.0.kind_hook(kind)
+    }
+
+    fn context_contributor(&self) -> Option<Arc<dyn khive_runtime::ContextContributor>> {
+        self.0.context_contributor()
     }
 
     fn schema_plan(&self) -> khive_runtime::SchemaPlan {

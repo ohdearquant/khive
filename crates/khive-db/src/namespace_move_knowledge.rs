@@ -14,6 +14,7 @@ pub(super) fn ordinary_atom_count(conn: &Connection, source: &str) -> rusqlite::
 
 pub(super) fn move_knowledge_atoms(
     conn: &Connection,
+    census: &NamespaceCensus,
     request: &MoveRequest,
     target: &str,
     mirrors: bool,
@@ -25,6 +26,22 @@ pub(super) fn move_knowledge_atoms(
     } else {
         format!("NOT {MIRROR_EXISTS}")
     };
+    // Select while the atoms still belong to the source, never from target residents.
+    if census
+        .tables
+        .iter()
+        .any(|table| table.name == "atom_weights")
+    {
+        let weights = conn.execute(
+            &format!(
+                "UPDATE atom_weights SET namespace = ?2 WHERE namespace = ?1 \
+                 AND atom_id IN (SELECT atom.id FROM knowledge_atoms AS atom \
+                                WHERE atom.namespace = ?1 AND {predicate})"
+            ),
+            rusqlite::params![source, target],
+        )? as u64;
+        *rows.entry("atom_weights".into()).or_default() += weights;
+    }
     if request.single_target().is_none() {
         let sections = conn.execute(
             &format!(

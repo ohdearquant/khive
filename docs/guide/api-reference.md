@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -1093,7 +1093,20 @@ Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagno
 all database files already opened by this server. The existing top-level fields still describe
 main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
 sidecar file size, page-level database size composition, and a WAL-pin holder census.
-Takes no parameters.
+
+| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                           |
+| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.   |
+| `size_composition` | boolean | `true`              | `false` skips the `dbstat` walk behind `size_composition`, which reads every page of each file. `size_composition_error` then says it was not collected, and `page_accounting` is still reported. |
+
+All selected backends share the request's read deadline. The process that runs the request sets
+it from its own environment (`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds); for a running
+daemon that is the daemon's environment, not the caller's. When the deadline arrives, the report
+keeps the backends already inspected, every remaining entry has `diagnostics: null` and an `error`
+starting with `not inspected: request deadline`, and the top-level `complete` is `false`.
+Inspections stop a tenth of the remaining time before the deadline, at most two seconds, so the
+partial report reaches a caller whose own deadline started a little earlier. `complete` is `true`
+when every selected backend was reached. A cancelled request still fails as a whole.
 
 `databases` is an array with one entry per canonical database file (or distinct in-memory
 pool), main first. Each entry has
@@ -1297,7 +1310,14 @@ in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page t
 the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
 count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
 `objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
-object returned by `dbstat`. `size_composition_error` explains an unavailable report.
+object returned by `dbstat`. `size_composition_error` explains an unavailable report, including
+one skipped with `size_composition=false`.
+
+`page_accounting` reports `page_size_bytes`, `page_count`, and `freelist_pages` from three pragma
+reads, so its cost does not grow with the file. Frames still in the WAL are counted.
+`freelist_pages` is the number of pages later writes can reuse that stay in the file until a
+`VACUUM`. It is present on every file-backed report whether or not `size_composition` was
+collected; `page_accounting_error` explains an unavailable value.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
@@ -1524,6 +1544,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
 | `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
 | `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
 | `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
@@ -1539,6 +1560,18 @@ Each result also carries canonical `full_id`; pass it directly to
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
+
+`keyword_only` runs only the full-text search: the query is not embedded and the
+vector index is not searched, so such a recall never reports `degraded`.
+`vector_only` runs only the vector search.
+
+`include_timings=true` adds a `timings` object: `total_us`, the stage wall times
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
+stage did not run; the text and vector searches run concurrently, so the stages do
+not add up), `retrieval_rounds`, and `rounds[]` with each round's
+`candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
+and stage times. An array response becomes `{results, timings}`; an object
+response keeps its fields and gains `timings`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1822,11 +1855,11 @@ right after `memory.recall` instead of hand-building `brain.feedback`.
 | `query`                | string | yes         | The recall query that produced the results.                                                                                                                                      |
 | `results`              | array  | yes         | Recall result objects retained as candidate context: objects with an `id` field (result UUID or compact id) and optionally `served_by_profile_id`; bare id strings are rejected. |
 | `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.                                                                                                                  |
-| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.                                                                                                                        |
+| `signal`               | string | no          | `unjudged` records `feedback_unjudged` telemetry without training; `useful`, `not_useful`, `wrong` record judgments. Omission abstains: no feedback event or posterior update.   |
 | `served_by_profile_id` | string | no          | Profile that served the recall.                                                                                                                                                  |
 | `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.                                                                                                                 |
-| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.                                                                                                            |
-| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.                                                                                                              |
+| `scorer_run_id`        | string | no          | Supply with `serve_ledger_id`; `unjudged` keeps the pair unclaimed, judgments claim it atomically.                                                                               |
+| `serve_ledger_id`      | string | no          | Supply with `scorer_run_id`; must match the serve.                                                                                                                               |
 | `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail.                                                                                                           |
 
 Top-level serve-attribution fields are one pair and take precedence over the selected
@@ -1945,7 +1978,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 11 verbs
+## `comm` pack — 14 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2229,6 +2262,65 @@ No parameters.
 ```
 request(ops="comm.health()")
 ```
+
+### `comm.suppression_add` — Commissive
+
+Add an email suppression entry. Address values are normalized with the shared email
+recipient normalizer; domain values are ASCII-lowercased and match that exact domain only.
+An entry is unique per `(scope, kind, value, source)`; a duplicate refuses with a conflict.
+Only the configured caller actor or an actor allowed as an external sender may add entries.
+
+| Param    | Type   | Required | Notes                                                                   |
+| -------- | ------ | -------- | ----------------------------------------------------------------------- |
+| `scope`  | string | yes      | Suppression direction: `outbound` or `inbound`.                         |
+| `kind`   | string | yes      | Value type: `address`, `domain`, or `recipient_key`.                    |
+| `value`  | string | yes      | Address, exact domain, or opaque recipient key to suppress.             |
+| `source` | string | yes      | Entry source: `operator`, `mailto_token`, `one_click`, or `reply_stop`. |
+| `reason` | string | no       | Optional free-text reason recorded with the entry.                      |
+
+```
+request(ops="comm.suppression_add(scope=\"outbound\", kind=\"address\", value=\"person@example.com\", source=\"operator\")")
+```
+
+Returns the stored entry `{id, scope, kind, value, source, created_by, created_at, reason}`.
+
+### `comm.suppression_list` — Assertive
+
+List live email suppression entries, optionally filtered by scope and kind.
+
+| Param    | Type    | Required | Notes                                                          |
+| -------- | ------- | -------- | -------------------------------------------------------------- |
+| `scope`  | string  | no       | Optional scope filter: `outbound` or `inbound`.                |
+| `kind`   | string  | no       | Optional kind filter: `address`, `domain`, or `recipient_key`. |
+| `limit`  | integer | no       | Page size, default 100, maximum 500.                           |
+| `offset` | integer | no       | Number of matching entries to skip, default 0.                 |
+
+```
+request(ops="comm.suppression_list(scope=\"outbound\")")
+```
+
+Returns `{items, limit, offset}`, where each item carries the same fields as
+`comm.suppression_add`.
+
+### `comm.suppression_remove` — Commissive
+
+Remove one suppression entry by full UUID. Restricted to the configured maintainer actor.
+A non-empty `reason` is required and is recorded in the audit event. Entries whose source
+is an opt-out (`mailto_token`, `one_click`, `reply_stop`) also require
+`evidence_inbound_message_id`: a full UUID of an authenticated inbound email from the same
+address that arrived after the entry was created.
+
+| Param                         | Type   | Required | Notes                                                                                                        |
+| ----------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `id`                          | uuid   | yes      | Full UUID of the suppression entry.                                                                          |
+| `reason`                      | string | yes      | Non-empty reason for removing this entry; included in the audit event.                                       |
+| `evidence_inbound_message_id` | uuid   | no       | Full UUID of an authenticated later inbound email from the suppressed address; required for opt-out sources. |
+
+```
+request(ops="comm.suppression_remove(id=\"<entry-id>\", reason=\"operator request\")")
+```
+
+Returns `{id, removed, audit_event_id}`.
 
 ---
 

@@ -20,6 +20,8 @@ pub mod edge_rules;
 pub mod email_address;
 pub mod entity;
 pub mod entity_type;
+#[cfg(feature = "std")]
+pub mod env;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -55,8 +57,8 @@ pub use entity_type::{
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
-    ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
+    EventSink, ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload,
+    ProposalWithdrawnPayload, RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
@@ -77,9 +79,9 @@ pub use note::{Note, NoteStatus};
 pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteEmbeddingPolicy,
-    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, Pack, PackColumnAddition,
-    PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
-    RESERVED_ENVELOPE_ARGS,
+    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, NotePropertyPolicySpec, Pack,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, PropertyPolicy, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use sql_like::escape_like_literal;
