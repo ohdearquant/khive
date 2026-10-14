@@ -91,7 +91,7 @@ Section content constraints are unchanged.
 
 This ADR is accepted as the governing record for shipped knowledge sections and section
 profile primitives, while explicitly deferring broader resource dual-write, profile-weighted
-compose/suggest, hooks, lint, full graph export, and observability phases.
+compose/suggest, hooks, custom lint rules, full graph export, and observability phases.
 
 | Area                                                        | Status   | Shipped behavior                                                                                                                                                                                                                                                                                                                                           |
 | ----------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -104,7 +104,7 @@ compose/suggest, hooks, lint, full graph export, and observability phases.
 | Brain section posterior primitives                          | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                                                                                                                                                              |
 | `knowledge.suggest` / `knowledge.compose` profile weighting | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests.                                                                                                                                    |
 | Resource entity dual-write                                  | deferred | `knowledge.upsert_atoms` and `knowledge.upsert_domains` write corpus tables; domain mirror is into `knowledge_atoms` for FTS, not graph `entities`.                                                                                                                                                                                                        |
-| `knowledge.lint`, `knowledge.lint_config`                   | deferred | These verbs are not registered in the shipped knowledge pack.                                                                                                                                                                                                                                                                                              |
+| `knowledge.lint`, `knowledge.lint_config`                   | partial  | knowledge.lint registers all thirteen built-ins, visible pre-fix statistics and guarded repairs; custom knowledge.lint_config rules remain deferred.                                                                                                                                                                                                       |
 
 ### Namespace corpus export (#4815)
 
@@ -948,7 +948,7 @@ project-specific conventions. The output is machine-readable and actionable.
 
 The [2026-10-09 amendment](#amendment-2026-10-09-graph-lint-contract-4813)
 specifies the thirteen built-in rules, statistics, and three guarded fix families
-for #4813 below. `knowledge.lint` is still unimplemented. Custom rules and
+for #4813 below. `knowledge.lint` implements the built-in contract. Custom rules and
 `knowledge.lint_config` remain a separate deferred scope.
 
 #### Lint request and caller scope
