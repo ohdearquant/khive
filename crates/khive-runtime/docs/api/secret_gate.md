@@ -6,6 +6,21 @@ full algorithm spec: the allowlist layers that suppress false positives, the tri
 matching rules, and the per-function shape criteria used by the detection helpers. The in-source
 module doc-comment carries only a concise summary and points here.
 
+## Note-field scan composition
+
+`secret_gate::check_note_fields_at(content, name, properties, record)` shares the
+note-field scan used by ordinary and conditional note creation, atomic note
+batches, proposal note preparation, and code-ingest preflight. It scans content,
+then a present name, then present JSON properties through `check_at` and
+`check_json_at`, returning the first refusal with the caller's record label and
+field location. Absent optional fields are skipped; JSON null and non-string
+leaves retain the existing structured scanner's behavior.
+
+The helper implements the existing ADR-115 field checks without changing the
+credential detector or admission contract. Each caller still owns its property
+derivation, reserved-key checks, embedding-input checks, and storage operations;
+those steps keep their existing positions relative to the field scan.
+
 ## Module-level detection algorithm
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,

@@ -331,7 +331,10 @@ pub(super) fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slu
 /// Read-modify-write: `created_at` is preserved across updates, `last_error`
 /// is RETAINED across a subsequent success (design review amendment 3), and
 /// `consecutive_failures` resets on success / increments on failure, read from
-/// the prior row (correct across restarts).
+/// the prior row (correct across restarts). A success that reports
+/// `held_messages` also maintains `consecutive_held_polls` (incremented while
+/// a page holds, reset by a poll with no hold) and `last_held_at`; a failure
+/// read no page, so it leaves them as they were.
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -374,6 +377,13 @@ pub(crate) async fn handle_heartbeat(
     {
         return Err(RuntimeError::InvalidInput(
             "heartbeat: `error_class` is required when outcome is \"failure\"".into(),
+        ));
+    }
+    if outcome == "failure" && (p.held_messages.is_some() || p.quarantined_after_hold.is_some()) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `held_messages` and `quarantined_after_hold` are reported only with \
+             outcome \"success\"; a failed poll read no page"
+                .into(),
         ));
     }
 
@@ -444,6 +454,24 @@ pub(crate) async fn handle_heartbeat(
             props["last_success_at"] = json!(at);
             props["consecutive_failures"] = json!(0);
             // last_error is intentionally left untouched — design review amendment 3.
+            if let Some(held) = p.held_messages {
+                props["held_messages"] = json!(held);
+                if held > 0 {
+                    let prev_held_polls = props
+                        .get("consecutive_held_polls")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    props["consecutive_held_polls"] = json!(prev_held_polls.saturating_add(1));
+                    props["last_held_at"] = json!(at);
+                } else {
+                    props["consecutive_held_polls"] = json!(0);
+                }
+            }
+            if p.quarantined_after_hold
+                .is_some_and(|released| released > 0)
+            {
+                props["last_quarantined_after_hold_at"] = json!(at);
+            }
         }
         "failure" => {
             props["last_failure_at"] = json!(at);

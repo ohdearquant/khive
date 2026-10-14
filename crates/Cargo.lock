@@ -1989,6 +1989,7 @@ dependencies = [
  "criterion",
  "hex",
  "khive-runtime",
+ "khive-types",
  "lru",
  "rand 0.8.7",
  "serde",
@@ -2038,6 +2039,7 @@ dependencies = [
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",
+ "khive-storage",
  "khive-types",
  "lettre",
  "mail-parser",
@@ -2858,6 +2860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-rule-evaluator"
+version = "0.12.0"
+dependencies = [
+ "chrono",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "khive-runtime"
 version = "0.12.0"
 dependencies = [
@@ -3070,6 +3083,7 @@ dependencies = [
  "khive-repo-showcase",
  "khive-request",
  "khive-retrieval",
+ "khive-rule-evaluator",
  "khive-runtime",
  "khive-score",
  "khive-storage",
@@ -3096,9 +3110,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4971127098331617112e83a785ac660a4cb41b8823abcde7d9172b39ce83cf8"
+checksum = "f74253d8eb6650a3a800d25b4689369782e4cb48c3ee68154d1096403a968550"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3115,9 +3129,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31b44c01ceef111f2c3b00dea058dff05d160148f1c49b4d5c8c42a4116c942"
+checksum = "261d1d047e5a87f4bfc9ccd5eea9628166ff78a7379dec951ad02d71b6fb4a93"
 dependencies = [
  "rand 0.8.7",
  "rand_distr",
@@ -3127,9 +3141,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02ccd6ca023a3941caf4bc91f1fd3268d7ce34eab2dbeb5d5773de99718537db"
+checksum = "7164d6239a081970afc8c0e38ddff98e76bcbf5d96cb9677126f67d934f1b6a2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -4361,9 +4375,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4877,7 +4891,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

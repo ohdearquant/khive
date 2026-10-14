@@ -731,6 +731,10 @@ pub(crate) struct RemindParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -740,6 +744,10 @@ pub(crate) struct ScheduleParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -779,6 +787,7 @@ pub(crate) async fn handle_remind(
         ));
     }
 
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -812,6 +821,12 @@ pub(crate) async fn handle_remind(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // The report-returning variant keeps a truncated embedding input from
     // failing the call after the note is committed: the staged event must
@@ -851,6 +866,7 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -895,6 +911,12 @@ pub(crate) async fn handle_schedule(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // See `handle_remind`: activation must follow a committed note even when
     // its embedding input was truncated.

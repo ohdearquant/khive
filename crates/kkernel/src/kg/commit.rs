@@ -275,9 +275,11 @@ pub(super) fn run_commit_time_rules(
 
     if rules_path.exists() {
         let configurable = validate::configurable_rule_checks_partial_view(
-            &entities_path,
-            &edges_path,
-            &notes_path,
+            khive_rule_evaluator::NdjsonState {
+                entities: &projected.entities,
+                edges: &projected.edges,
+                notes: &projected.notes,
+            },
             rules_path,
         )
         .context("evaluating configurable rules")?;
