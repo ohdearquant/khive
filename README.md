@@ -16,6 +16,9 @@ immediately. Come back next session and the graph remembers what you built.
 There's no Neo4j to run and no separate SPARQL endpoint to deploy. It's SQLite on disk, MCP over
 stdio, and `cargo test` finishes in 4 seconds.
 
+khive also runs hosted, as memory and a knowledge graph your agents reach over MCP:
+https://khive.ai/?utm_source=github&utm_campaign=khive-readme
+
 ---
 
 ## What you get
