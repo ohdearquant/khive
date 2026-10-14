@@ -228,6 +228,14 @@ fn partial_view_coverage_findings(changeset: &ChangeSet) -> Vec<ReviewFinding> {
                     };
                     ("delete", delete.target_id.to_string(), kind)
                 }
+                Op::Restore(restore) => {
+                    let kind = match restore.record() {
+                        DeletePreimage::Entity(_) => "entity",
+                        DeletePreimage::Note(_) => "note",
+                        DeletePreimage::Edge(_) => "edge",
+                    };
+                    ("restore", restore.target_id().to_string(), kind)
+                }
                 Op::Merge(merge) => ("merge", merge.into_id.to_string(), "entity"),
                 Op::Create(_) | Op::Link(_) => return None,
             };
@@ -447,6 +455,32 @@ fn summarize_operation(index: usize, op: &Op) -> ReviewOperation {
                 after: None,
             }
         }
+        Op::Restore(restore) => {
+            let target = match restore.record() {
+                DeletePreimage::Entity(_) => "entity",
+                DeletePreimage::Note(_) => "note",
+                DeletePreimage::Edge(_) => "edge",
+            };
+            ReviewOperation {
+                index,
+                id: restore.target_id().to_string(),
+                op: "restore".to_string(),
+                target: target.to_string(),
+                tier: TIER_2.to_string(),
+                summary: format!("Restore {target} {}", restore.target_id()),
+                reason:
+                    "Restoration requires independently reviewed compensation under ADR-102 D4."
+                        .to_string(),
+                tier_reasons: vec!["adr102.restore".to_string()],
+                entity_ids: if target == "entity" {
+                    vec![restore.target_id().to_string()]
+                } else {
+                    Vec::new()
+                },
+                before: None,
+                after: Some(json_value(restore.record())),
+            }
+        }
         Op::Merge(merge) => ReviewOperation {
             index,
             id: merge.into_id.to_string(),
@@ -635,7 +669,7 @@ mod tests {
 
     fn parse(op: serde_json::Value) -> ChangeSet {
         let envelope = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
             "producer": "lambda:atlas",
             "producer_model_family": "family:atlas",
             "staged_at": 1_000_000_u64,
@@ -661,6 +695,33 @@ mod tests {
         assert!(operation
             .tier_reasons
             .contains(&"adr102.resulting_weight_below_0_7".to_string()));
+    }
+
+    #[test]
+    fn restore_is_tier_two_and_blocked_by_partial_rule_coverage() {
+        let changeset = parse(serde_json::json!({
+            "op": "restore",
+            "target_id": "00000000-0000-4000-8000-000000000001",
+            "record": {
+                "substrate": "entity",
+                "id": "00000000-0000-4000-8000-000000000001",
+                "namespace": "local",
+                "created_at": 1,
+                "updated_at": 2,
+                "kind": "concept",
+                "name": "restored",
+                "deleted_at": null
+            }
+        }));
+        let operation = summarize_operation(0, &changeset.ops[0]);
+        assert_eq!(operation.tier, TIER_2);
+        assert_eq!(operation.op, "restore");
+        assert_eq!(operation.after.as_ref().unwrap()["name"], "restored");
+        let findings = partial_view_coverage_findings(&changeset);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, "error");
+        assert!(findings[0].message.contains("restore"));
+        assert!(!evaluate_review_gate(true, false, "producer", Some("other")).approval_ready);
     }
 
     #[test]

@@ -51,8 +51,15 @@ pub enum ChangeSetError {
 ///
 /// # Errors
 ///
-/// Returns [`ChangeSetError::Serialize`] if any envelope or op cannot serialize.
+/// Returns [`ChangeSetError::UnsupportedSchemaVersion`] for a stale envelope, or
+/// [`ChangeSetError::Serialize`] if any envelope or op cannot serialize.
 pub fn to_ndjson(changeset: &ChangeSet) -> Result<String, ChangeSetError> {
+    if changeset.envelope.schema_version != CURRENT_SCHEMA_VERSION {
+        return Err(ChangeSetError::UnsupportedSchemaVersion {
+            found: changeset.envelope.schema_version,
+            expected: CURRENT_SCHEMA_VERSION,
+        });
+    }
     let mut out = String::new();
     out.push_str(&serde_json::to_string(&changeset.envelope).map_err(ChangeSetError::Serialize)?);
     out.push('\n');
