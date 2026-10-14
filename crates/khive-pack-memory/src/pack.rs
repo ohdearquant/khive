@@ -601,7 +601,7 @@ impl MemoryPack {
     ///
     /// Timeout returns `DeadlineExceeded` without claiming to cancel runtime-owned storage
     /// work. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
-    async fn handle_recall_with_deadline(
+    pub(crate) async fn handle_recall_with_deadline(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -614,12 +614,13 @@ impl MemoryPack {
         let start = std::time::Instant::now();
         // `handle_recall` is a large state machine: its text/vector fan-out
         // contains several cancellation-aware select/join branches. Keep that
-        // generator behind one heap pointer at the deadline boundary so it is
+        // generator (inside its profiling wrapper `handle_recall_profiled`)
+        // behind one heap pointer at the deadline boundary so it is
         // not embedded again in this future, `PackRuntime::dispatch`, and the
         // MCP request stack. Inlining it here can overflow Tokio's worker stack
         // even though the pipeline has no recursive call cycle.
         let hard_deadline = start.checked_add(std::time::Duration::from_millis(budget_ms));
-        let recall = Box::pin(self.handle_recall(token, params, registry, hard_deadline));
+        let recall = Box::pin(self.handle_recall_profiled(token, params, registry, hard_deadline));
         match tokio::time::timeout(std::time::Duration::from_millis(budget_ms), recall).await {
             Ok(result) => result,
             Err(_) => {

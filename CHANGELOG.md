@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recipient_key` suppression entry (source `mailto_token`) and the message is neither delivered
   nor quarantined. With external senders configured, an inbound suppression entry matching the
   authenticated sender address or its exact domain quarantines the message with reason `blocked`.
+### Changed
+
+- Name the distinct query admission policies `khive_text::is_meaningful_text_query`
+  and `khive_pack_memory::scoring::is_meaningful_recall_query`, preserving their
+  existing behavior. Both `is_meaningful_query` functions remain as deprecated
+  compatibility wrappers for one release; callers should use the replacement names.
 
 ### Fixed
 
