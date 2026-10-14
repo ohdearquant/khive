@@ -1,6 +1,6 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-09-27 -- channel-scoped external-ID deduplication;
+**Status**: Accepted (amended 2026-10-14 -- every inbound page hold is bounded; amended 2026-09-27 -- channel-scoped external-ID deduplication;
 amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
 amended 2026-09-25 -- `external_id` on a message note is transport-owned at creation; amended 2026-09-25 --
 inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
@@ -8,6 +8,7 @@ inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine healt
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-10-14, bounded page holds](#amendment-2026-10-14----every-inbound-page-hold-is-bounded),
 [§Amendment 2026-09-27, channel-scoped external-ID deduplication](#amendment-2026-09-27----channel-scoped-external-id-deduplication),
 [§Amendment 2026-09-25, Telegram outbound delivery](#amendment-2026-09-25----telegram-outbound-delivery-is-at-least-once-without-deduplication),
 [§Amendment 2026-09-25, `external_id`](#amendment-2026-09-25----external_id-on-a-message-note-is-transport-owned-at-creation),
@@ -20,7 +21,7 @@ identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
 [§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25, 2026-09-27)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25, 2026-09-27, 2026-10-14)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -33,7 +34,80 @@ statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
-#1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment)
+#1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment), #5345 (unbounded
+page holds -- resolved by the 2026-10-14 amendment)
+
+## Amendment 2026-10-14 -- Every inbound page hold is bounded
+
+**Status**: Accepted 2026-10-14.
+
+**Trigger.** #5345. On 2026-10-12 gate-quarantined inbound mail could not be recorded after a store change, and
+the IMAP cursor held for about 20 hours before anyone noticed. Through the whole hold `comm.health` read the
+channel as healthy, because `consecutive_failures` and `stalled` follow the transport poll, which kept
+succeeding. #1831 had bounded one cause of such a hold; this amendment bounds the rest and makes a hold visible.
+
+**Context.** The email poll loop commits its cursor only after every message in the page is recorded (2026-07-09
+amendment). Before this amendment a page held with no bound when `comm.ingest` refused a message as `Retryable`;
+when a gate-quarantined message (2026-07-02 amendment) had no original-byte replay, its retained-quarantine count
+could not be read, or `blob.put` of its original failed or returned no content reference; and when the quarantine
+record itself could not be written. Only an `Unknown` refusal was bounded (five failed polls, then quarantine), and
+a `Permanent` refusal was quarantined at once. The Telegram loop shares the ingest-failure path.
+
+**Decision.**
+
+1. One count of failed polls per message, keyed by channel kind and external id, shared by every cause above, so
+   alternating causes cannot evade the bound. It is cleared when the page's cursor commits.
+2. A message is given a terminal disposition on its 60th failed poll while `comm.ingest` refuses it as
+   `Retryable` (about five minutes at the 5 s email cadence, so a busy store does not quarantine ordinary mail),
+   and on its 5th failed poll for every other cause. `Permanent` refusals are still quarantined at once. A message
+   with no external id cannot be counted or quarantined and still holds; the email adapter always assigns one.
+3. The terminal disposition falls back in order, so that the record of a failure cannot hold the page itself:
+   1. the `<kind>:quarantine` record with the original stored and referenced by `quarantine_content_ref`, as
+      before;
+   2. if the retained-quarantine count cannot be read, the original cannot be stored, or the record carrying its
+      reference is refused: the record without the reference. It carries `quarantine_original_retained = "false"`,
+      `quarantine_original_not_retained_reason` naming the failure (`retention-count-unreadable`,
+      `original-store-failed` or `quarantine-write-failed`), `quarantine_original_error` with the error text, and
+      `quarantine_failed_polls`;
+   3. only if that record is also refused does the page hold. The store then cannot write at all, and the cursor
+      commit, which goes through the same store, could not land either.
+
+   A gate-quarantined email stores its original before it is recorded. A failure there counts toward the same
+   bound (5); past it the message is recorded without the original with the fields of step 2, the reason
+   `original-unavailable` when the envelope carried no replay.
+4. The email loop reports holds on its success heartbeat: `held_messages` (messages holding the page this poll)
+   and `quarantined_after_hold` (messages given a terminal disposition this poll because they reached the bound).
+   The heartbeat row keeps `consecutive_held_polls` (incremented by a poll with a hold, reset to 0 by a poll
+   without), the latest `held_messages`, `last_held_at` and `last_quarantined_after_hold_at`. A failed transport
+   poll read no page and leaves them unchanged, so a hold interrupted by an outage still reads as unresolved.
+   `comm.health` returns the four facts per channel, `null` for a writer that does not report holds and for
+   quarantine-only entries. A `consecutive_held_polls` that keeps growing means the store cannot write even the
+   bounded record, which is the condition an alarm should page on.
+
+**Fetching an original that was not stored.** The record's external id is
+`imap:{host}:{account}:{uidvalidity}:{uid}`; log in to `{host}` as `{account}`, `EXAMINE INBOX`, and if the
+reported UIDVALIDITY equals `{uidvalidity}`, `UID FETCH {uid} BODY.PEEK[]` returns the original bytes (a
+different UIDVALIDITY means the server renumbered the folder and the UID no longer names the message).
+
+**Known bound.** The counts live in daemon memory. A restart starts them again, so a message that keeps failing
+across restarts holds for up to one more bound's worth of polls after each restart. Persisting the counts is not
+part of this amendment.
+
+**Correction.** The 2026-07-09 amendment and §Dependencies named an externally linked `khive-component-email` crate
+as the owner of the email poll cycle. No such crate exists in the tree: the cycle runs in `khive-mcp`'s
+`serve/channel_poll.rs::channel_poll_loop` behind the `channel-email` feature, and that is the code this amendment
+changes. Those passages are corrected in place.
+
+**Acceptance.** A page of three whose middle message `comm.ingest` refuses with an `Unknown` error on every poll:
+after five polls there is exactly one quarantine record for it, the other two messages are recorded once, and the
+cursor commits at the page's high-water; the same page with the bound disabled holds the cursor (a control arm in
+the same suite). A `Retryable` refusal holds for 59 polls and is quarantined on the 60th. A quarantine record
+refused only while it carries `quarantine_content_ref` lands without it and the cursor advances; a record refused
+every time holds the page and the heartbeat reports `held_messages` above zero. A `blob.put` refused on every poll
+records a gate-quarantined message without its original after five polls. `comm.health` reports
+`consecutive_held_polls` 3 after three held polls and 0 after a poll without a hold.
+
+**Refs.** #5345, #1831.
 
 ## Amendment 2026-10-05 -- Disclose committed ingest indexing failures
 
@@ -753,17 +827,16 @@ Telegram's offset remains in-memory as originally documented.
 2. **`EmailChannel::poll_page`** (a new override of the `Channel` trait's default) plus
    `comm.cursor_get`/`comm.cursor_commit`: a fully implemented and unit/integration-tested durable
    checkpoint path, keyed by a stable `imap+tls:{host}:{port}:{mailbox}:INBOX` source string so
-   one account's high-water can never suppress another's. **The externally linked ADR-119
-   `email-channel` component in `khive-component-email` owns this path:** its
-   `start_email_component`/`run_component`/`run_cycle` sequence uses the supervisor-provided
-   `HostContext` server and namespace to call `cursor_get` -> `poll_page` -> every
-   `comm.ingest` -> `cursor_commit`, committing the cursor only after every envelope in the page
-   has durably ingested. The earlier in-process `khive-mcp/src/serve.rs::channel_poll_loop`
-   topology is historical and superseded. A partial-page `comm.ingest` failure leaves the
+   one account's high-water can never suppress another's. **`khive-mcp`'s
+   `serve/channel_poll.rs::channel_poll_loop` owns this path** (corrected 2026-10-14: this
+   passage previously named an externally linked `khive-component-email` crate, which does not
+   exist in the tree): it calls `cursor_get` -> `poll_page` -> every `comm.ingest` ->
+   `cursor_commit`, committing the cursor only after every envelope in the page has durably
+   ingested. A partial-page `comm.ingest` failure leaves the
    checkpoint untouched, so the next poll re-selects the whole page; `comm.ingest`'s
    `INSERT OR IGNORE` dedup then skips re-storing the messages that already succeeded and only
-   the failed one is effectively retried. A `cursor_get` failure returns a retryable component
-   error before polling from an empty checkpoint, preserving the durable state.
+   the failed one is effectively retried. A `cursor_get` failure skips that channel's poll for
+   the cycle rather than polling from an empty checkpoint, preserving the durable state.
 3. **Poison-UID durability** (issue #449 High): a selected UID whose `UID FETCH` response carries
    no RFC822 body, or whose body fails to parse, no longer fails the whole page. It gets a durable
    terminal disposition -- a quarantine envelope carrying the stable `imap:{host}:{uidvalidity}:{uid}`
@@ -776,12 +849,12 @@ Telegram's offset remains in-memory as originally documented.
 - The issue's literal 75-message/50-limit backlog-drain scenario is fixed and covered by tests
   exercising the real `EmailChannel::poll` entrypoint, not only the pure helpers.
 - Full restart durability (a daemon crash or redeploy resuming exactly above the last durably
-  ingested UID) is delivered end-to-end: `khive-component-email::run_cycle` drives
-  `cursor_get`/`poll_page`/`cursor_commit` on every cycle, and the
-  commit-only-after-full-page-ingest ordering is covered by component regression tests for
+  ingested UID) is delivered end-to-end: `channel_poll_loop` drives
+  `cursor_get`/`poll_page`/`cursor_commit` on every cycle (corrected 2026-10-14), and the
+  commit-only-after-full-page-ingest ordering is covered by regression tests for
   partial-ingest-failure non-advancement and cross-restart round-tripping.
 - `comm_channel_cursor`'s subhandlers are pack-owned operational bookkeeping and not a new
-  MCP-callable verb, exercised in production only through the email component's internal
+  MCP-callable verb, exercised in production only through the email poll loop's internal
   dispatch calls. Its table schema was pack-declared through `CREATE TABLE IF NOT EXISTS` when
   this bullet was written; the 2026-07-17 amendment below requires a future core migration while
   its subhandlers stay pack-internal. The 2026-08-01 allocation correction in that amendment is
@@ -3741,13 +3814,12 @@ The email adapter uses `lettre 0.11` (SMTP, `tokio1-rustls-tls` transport), `asy
 (IMAP UID fetch), `async-native-tls 0.5` (TLS layer), and `mail-parser 0.9` (RFC 822 parsing).
 These are workspace dependencies; the adapter crate declares them as non-optional.
 
-A binary that force-links `khive-component-email` gets its link-time inventory submissions,
-which register independent `email-channel` and `email-outbound` ADR-119 components.
-Generic `khive-mcp` owns only the component supervisor and has no channel-specific feature or
-polling loop; a custom/core binary can omit email by not depending on the component crate. When
-all `KHIVE_EMAIL_*` variables are absent, both registered components stop cleanly. A partial or
-invalid configuration instead reports terminal `Unhealthy` state under each component's
-independent health identity.
+The email channel is part of `khive-mcp` behind its `channel-email` feature (enabled through
+`kkernel`'s feature of the same name), which links `khive-channel-email` and, in the daemon
+process, starts the poll loop and the outbox loop once the `KHIVE_EMAIL_*` configuration resolves;
+an incomplete configuration logs a warning and starts neither. A binary built without the feature
+has no email channel. (Corrected 2026-10-14: this paragraph previously described a force-linked
+`khive-component-email` crate registering ADR-119 components; no such crate exists in the tree.)
 
 ## Open Questions
 
