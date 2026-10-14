@@ -22,7 +22,7 @@ This deadline differs from `ann_ready_timeout_ms`: the former returns a typed `D
 
 ## Query validation and routing
 
-Noise-only queries are rejected before expensive embedding work. `is_meaningful_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish.
+Noise-only queries are rejected before expensive embedding work. `is_meaningful_recall_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish. The deprecated `is_meaningful_query` function delegates to this unchanged recall policy for one release; it is distinct from the text crate's `is_meaningful_text_query` policy.
 
 `contains_cjk` (more than 15% CJK characters) sets the FTS CJK bypass, which skips document-frequency term selection in FTS gather mode and sends the first `term_k` query terms, in query order, to the ranked FTS search. The flag is read only when FTS gather is enabled, which it is not by default, and it never removes the FTS leg. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine (issue #1115), whether or not the query contains CJK. The query's script matters at fusion; see "Script-aware model weighting" below.
 
