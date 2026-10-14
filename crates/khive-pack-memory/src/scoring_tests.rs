@@ -1,29 +1,34 @@
 use super::*;
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_empty() {
     assert!(!is_meaningful_query(""));
     assert!(!is_meaningful_query("   "));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_symbols_only() {
     assert!(!is_meaningful_query("!@#$%"));
     assert!(!is_meaningful_query("..."));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_single_latin_char() {
     assert!(!is_meaningful_query("a"));
     assert!(!is_meaningful_query("Z"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_repeated_gibberish() {
     assert!(!is_meaningful_query("aaaa bbbb cccc"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_accepts_normal_queries() {
     assert!(is_meaningful_query("what is the capital of France"));
     assert!(is_meaningful_query("rust async runtime"));
@@ -605,4 +610,60 @@ fn entity_posterior_term_moves_monotonically_with_mean() {
     let high = entity_posterior_term(Some(0.8), ENTITY_POSTERIOR_WEIGHT);
     assert!(low < mid, "low={low} mid={mid}");
     assert!(mid < high, "mid={mid} high={high}");
+}
+
+#[test]
+fn meaningful_query_policies_keep_distinct_admission_rules() {
+    let cases = [
+        ("aaaa bbbb cccc", true, false),
+        ("12345", true, false),
+        ("e", false, false),
+        ("", false, false),
+        (" \t\n", false, false),
+        ("...", false, false),
+        ("😀", false, false),
+        ("5", true, false),
+        ("１", true, false),
+        ("11111", false, false),
+        ("é", true, false),
+        ("Ω", true, false),
+        ("ｅ", true, false),
+        ("你", true, true),
+        ("你你", false, true),
+        ("你好世界", true, true),
+        ("你好你好你好", true, false),
+        ("BM25", true, true),
+        ("a1", true, false),
+        ("a!", true, false),
+        ("aa", false, true),
+        ("a a", false, true),
+        ("a\u{00A0}a", false, true),
+        ("aaa", false, false),
+        ("aaab", true, true),
+        ("aaaab", true, true),
+        ("aaaaab", false, false),
+        ("aaaaaaaa b", false, true),
+        ("aaaaaaaab", false, false),
+        ("aaaaAAAA", true, false),
+        ("aaaa1111", true, false),
+        ("ab!!!!!!!!!!", false, true),
+        ("e\u{0301}", true, false),
+        ("ééé", false, false),
+        ("e\u{0301}e\u{0301}e\u{0301}", true, false),
+        ("the and", true, true),
+        ("hello", true, true),
+    ];
+
+    for (query, text_expected, recall_expected) in cases {
+        assert_eq!(
+            khive_text::is_meaningful_text_query(query),
+            text_expected,
+            "text policy for {query:?}"
+        );
+        assert_eq!(
+            is_meaningful_recall_query(query),
+            recall_expected,
+            "recall policy for {query:?}"
+        );
+    }
 }
