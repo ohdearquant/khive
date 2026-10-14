@@ -87,7 +87,7 @@ impl ScriptProfile {
 /// Rejects empty, symbol-only, single ASCII letter, and repeated-char (>80%) gibberish.
 ///
 /// See `crates/khive-text/docs/api/identifier-and-script.md`.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_text_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -124,6 +124,12 @@ pub fn is_meaningful_query(query: &str) -> bool {
     }
 
     true
+}
+
+/// Deprecated name for [`is_meaningful_text_query`].
+#[deprecated(note = "use is_meaningful_text_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_text_query(query)
 }
 
 #[cfg(test)]
