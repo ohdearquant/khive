@@ -1205,9 +1205,9 @@ projection column. Existing terminal review and withdrawal rules remain in
 force. There is no archive-list or restore API in this issue, and archiving
 does not reclaim disk space or reduce the number of retained projection rows.
 
-The additive migration is V56, following #5057's V55. If that prerequisite does
+The additive migration is V58, following #5185's V57. If that prerequisite does
 not land in the planned order, the migration ordinal must be reallocated before
-implementation; it must not collide with V55 or modify V1. Existing projection
+implementation; it must not collide with V57 or modify V1. Existing projection
 rows start with a null marker, and all existing columns and events are
 preserved. An older binary may show archived rows again because it does not
 apply this new view filter; that compatibility limit is not data loss.
