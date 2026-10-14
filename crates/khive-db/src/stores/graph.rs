@@ -549,6 +549,30 @@ pub fn edge_soft_delete_statement(id: Uuid, now: i64) -> SqlStatement {
     }
 }
 
+/// Rewire a merge edge without changing its other fields or adding revision guards.
+/// The caller owns conflict checks and the transaction; `namespace` is the edge's
+/// stored attribution, which may differ from either merge participant's namespace.
+pub fn edge_merge_rewire_statement(
+    namespace: &str,
+    id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    updated_at: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+        vec![
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+        ],
+    )
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_edge(Hard)` issues.
 pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     SqlStatement {

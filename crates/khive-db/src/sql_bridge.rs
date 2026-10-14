@@ -74,6 +74,52 @@ use query_execution::{
     prepare_bound_statement, settle_pooled_call,
 };
 
+#[cfg(test)]
+#[path = "sql_bridge/sync_executor_tests.rs"]
+mod sync_executor_tests;
+
+/// Execute trusted statements inside a caller-owned active transaction.
+///
+/// The caller owns writer admission, commit, rollback, and connection settlement.
+/// This function starts no transaction or savepoint, installs no hooks, retries
+/// nothing, and does not account committed events. The returned affected-row sum
+/// is execution evidence, not a commit receipt; zero affected rows is successful.
+///
+/// Explicit transaction-control heads are rejected across the list before
+/// preparation. Each element must contain only one SQL statement. Other prepare
+/// failures may be deferred until execution to allow earlier schema changes, so
+/// an error can follow earlier successful writes. Missing raw parameters bind as
+/// NULL; excess parameters fail binding before that element steps.
+///
+/// This is not a SQL sandbox: PRAGMAs, UDFs, triggers, and virtual tables may have
+/// connection or external effects, and SQLite errors can end the transaction.
+/// The owner must handle rollback and verify settlement on error.
+///
+/// # Errors
+/// Returns [`SqliteError::InvalidData`] for autocommit connections (even with an
+/// empty list) or explicit transaction control. Native prepare, bind, and step
+/// failures are preserved as [`SqliteError::Rusqlite`].
+pub fn execute_statements(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+) -> Result<u64, SqliteError> {
+    if conn.is_autocommit() {
+        return Err(SqliteError::InvalidData(
+            "execute_statements requires a caller-owned active transaction".into(),
+        ));
+    }
+    for (index, statement) in statements.iter().enumerate() {
+        if let Some(keyword) = transaction_control_head(&statement.sql) {
+            return Err(SqliteError::InvalidData(format!(
+                "statement at index {index} is transaction control ({keyword}); \
+                 the caller owns the transaction boundary"
+            )));
+        }
+    }
+    let prepared = prepare_batch_statements(conn, statements)?;
+    Ok(execute_prepared_batch(conn, prepared, statements, None)?)
+}
+
 mod reader_capability;
 pub(crate) use reader_capability::reader_capability_admits;
 use reader_capability::{
