@@ -9064,10 +9064,18 @@ async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespac
         "last_failure_at",
         "last_error",
         "consecutive_failures",
+        "consecutive_held_polls",
+        "held_messages",
+        "last_held_at",
+        "last_quarantined_after_hold_at",
     ] {
+        // `get` rather than indexing: indexing a missing key also yields null, so it
+        // would pass with the field absent from the entry.
         assert!(
-            channels[0][field].is_null(),
-            "without a heartbeat, `{field}` is unknown rather than fabricated: {}",
+            channels[0]
+                .get(field)
+                .is_some_and(serde_json::Value::is_null),
+            "without a heartbeat, `{field}` is present and null rather than fabricated: {}",
             channels[0]
         );
     }

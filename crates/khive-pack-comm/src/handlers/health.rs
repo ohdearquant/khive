@@ -59,6 +59,14 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
         "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
         "consecutive_failures": props.get("consecutive_failures").cloned().unwrap_or(json!(0)),
+        // Null on rows from a writer that does not report holds.
+        "consecutive_held_polls": props.get("consecutive_held_polls").cloned().unwrap_or(Value::Null),
+        "held_messages": props.get("held_messages").cloned().unwrap_or(Value::Null),
+        "last_held_at": props.get("last_held_at").cloned().unwrap_or(Value::Null),
+        "last_quarantined_after_hold_at": props
+            .get("last_quarantined_after_hold_at")
+            .cloned()
+            .unwrap_or(Value::Null),
         "quarantined_count": quarantined_count,
     })
 }
@@ -145,6 +153,10 @@ fn quarantine_only_channel_to_json(
         "last_failure_at": Value::Null,
         "last_error": Value::Null,
         "consecutive_failures": Value::Null,
+        "consecutive_held_polls": Value::Null,
+        "held_messages": Value::Null,
+        "last_held_at": Value::Null,
+        "last_quarantined_after_hold_at": Value::Null,
         "quarantined_count": quarantined_count,
     })
 }
