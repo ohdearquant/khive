@@ -22,6 +22,7 @@ pub mod adapters;
 pub mod ann;
 pub mod error;
 pub mod eval;
+pub mod evidence;
 pub mod hit;
 pub mod hybrid;
 pub mod materialization;
@@ -44,6 +45,10 @@ pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 
 // Re-export core types
 pub use error::{ErrorKind, Result, RetrievalError};
+pub use evidence::{
+    ArmEvidence, ArmOutcome, EngineEvidence, RetrievalEnvelope, RetrievalEvidence,
+    RetrievalScoreKind, RetrievalStrategy, StrategySource, RETRIEVAL_STRATEGY_VERSION,
+};
 pub use hit::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 
 #[cfg(feature = "bm25")]
