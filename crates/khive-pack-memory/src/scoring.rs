@@ -599,7 +599,7 @@ pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreErr
 }
 
 /// Returns `true` if the query has enough semantic content for meaningful recall.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_recall_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -640,6 +640,12 @@ pub fn is_meaningful_query(query: &str) -> bool {
     }
 
     true
+}
+
+/// Deprecated name for [`is_meaningful_recall_query`].
+#[deprecated(note = "use is_meaningful_recall_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_recall_query(query)
 }
 
 /// Returns `true` when CJK characters (`is_cjk_char`) outnumber every other letter in `text`.

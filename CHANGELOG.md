@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Name the distinct query admission policies `khive_text::is_meaningful_text_query`
+  and `khive_pack_memory::scoring::is_meaningful_recall_query`, preserving their
+  existing behavior. Both `is_meaningful_query` functions remain as deprecated
+  compatibility wrappers for one release; callers should use the replacement names.
+
 ## [0.12.0] - 2026-10-13
 
 ### Documentation
