@@ -25,7 +25,7 @@ An always-machine-readable copy of this page is at
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
+| `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
@@ -2385,7 +2385,7 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ---
 
-## `knowledge` pack — 20 verbs
+## `knowledge` pack — 21 verbs
 
 The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
 section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
@@ -2763,6 +2763,27 @@ retain their own meanings and are independent of both counts.
 
 ```
 request(ops="knowledge.topic(domain=\"attention\")")
+```
+
+### `knowledge.lint` — Commissive
+
+Inspect the caller-visible graph of entities, notes and edges with thirteen built-in hygiene rules,
+and optionally apply three guarded repair families. Knowledge corpus atoms, domains and sections are
+separate records and stay outside its statistics. Classified Write, including inspection-only and
+stats-only calls. Rule table, fix semantics and partial-failure evidence:
+[Graph lint](../../crates/khive-pack-knowledge/docs/api/lint.md).
+
+| Param      | Type            | Required | Notes                                                                                                                                                                               |
+| ---------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rules`    | array of string | no       | Omit for all thirteen built-ins, or a nonempty array of exact rule IDs. Repeated IDs run once. `["stats-only"]` alone returns exactly `{stats}` and cannot combine with `fix=true`. |
+| `fix`      | boolean         | no       | Default `false`. `true` adds `fixes` (per-action `committed`, `conflict` or `unsupported` receipts) and `summary.fixed`. Never merges entities.                                     |
+| `severity` | string          | no       | `error`, `warn` (default) or `info`: the minimum severity reported. Statistics always cover the complete observation before fixes.                                                  |
+
+Returns `violations`, `summary` and `stats`. Nulls, unknown rule IDs, invalid severities and wrong
+types are refused.
+
+```
+request(ops="knowledge.lint(rules=[\"orphan-entity\", \"dangling-edge\"], severity=\"error\")")
 ```
 
 ### `knowledge.feedback` — Commissive
