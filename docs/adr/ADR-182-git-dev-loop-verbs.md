@@ -770,9 +770,9 @@ call sites. It is mechanical and it is not small. It is also the reason a global
 static or a process env var would reintroduce exactly the defect this amendment removes and would
 make arm 3 impossible to write.
 
-## Proposed Amendment 13 (2026-10-14): opt-in receipt cursor pagination
+## Amendment 13 (2026-10-14): opt-in receipt cursor pagination
 
-Status: **PROPOSED**. This amendment requires architecture acceptance before any dependent
+**Status**: Proposed. This amendment requires architecture acceptance before any dependent
 implementation. The ADR's Accepted status and Amendment 2 item 7 remain unchanged until then.
 
 Issue #3721 identifies the existing `LIMIT ... OFFSET` walk as work that grows with the page's
