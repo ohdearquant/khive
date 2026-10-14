@@ -195,6 +195,7 @@ impl PackRuntime for KgPack {
             "propose" => self.handle_propose(graph_token, params, registry).await,
             "review" => self.handle_review(graph_token, params, registry).await,
             "withdraw" => self.handle_withdraw(graph_token, params).await,
+            "kg.proposal_cleanup" => self.handle_proposal_cleanup(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
             "count" => self.handle_count(token, params).await,
             "stream.append" => self.handle_stream_append(token, params, registry).await,

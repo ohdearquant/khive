@@ -47,6 +47,10 @@ Revision `domain-effects-v13` classifies `comm.suppression_add` and `comm.suppre
 `Write`: they insert or delete suppression rows that change future email admission.
 `comm.suppression_list` is `Read`: it returns the stored suppression rows and writes none.
 
+Revision `domain-effects-v14` classifies `kg.proposal_cleanup` as `Write`: the
+operator-only subhandler archives resolved proposal projection rows. Its internal
+visibility does not exempt it from ordinary caller write restrictions.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -144,6 +148,7 @@ Revision `domain-effects-v13` classifies `comm.suppression_add` and `comm.suppre
 | `gtd.repair`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs)                   |
 | `gtd.tasks`                  | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L271)              |
 | `gtd.transition`             | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L353)              |
+| `kg.proposal_cleanup` | Write | Subhandler | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs) |
 | `knowledge.adjudicate`       | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L578)  |
 | `knowledge.challenge`        | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L542)  |
 | `knowledge.cite`             | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L651)  |
