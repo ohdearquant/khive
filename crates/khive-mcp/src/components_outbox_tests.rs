@@ -21,6 +21,7 @@ struct ScriptedChannel {
     outcomes: Mutex<VecDeque<Outcome>>,
     sends: AtomicUsize,
     cancel_after_send: Option<CancellationToken>,
+    captured: Mutex<Vec<ChannelEnvelope>>,
 }
 
 impl ScriptedChannel {
@@ -30,6 +31,7 @@ impl ScriptedChannel {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             sends: AtomicUsize::new(0),
             cancel_after_send: None,
+            captured: Mutex::new(Vec::new()),
         }
     }
 }
@@ -40,8 +42,9 @@ impl Channel for ScriptedChannel {
         self.kind
     }
 
-    async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+    async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
         self.sends.fetch_add(1, Ordering::SeqCst);
+        self.captured.lock().unwrap().push(envelope);
         let outcome = self.outcomes.lock().unwrap().pop_front().unwrap();
         if let Some(token) = &self.cancel_after_send {
             token.cancel();
@@ -65,7 +68,14 @@ impl Channel for ScriptedChannel {
 }
 
 async fn fixture(recipient: &str) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) {
-    let runtime = KhiveRuntime::new(RuntimeConfig {
+    fixture_with_policy(recipient, None).await
+}
+
+async fn fixture_with_policy(
+    recipient: &str,
+    email_policy: Option<khive_runtime::OutboundEmailPolicy>,
+) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) {
+    let mut runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         actor_id: Some("actor:outbox-supervision".into()),
         brain_profile: None,
@@ -73,6 +83,9 @@ async fn fixture(recipient: &str) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) 
         ..RuntimeConfig::no_embeddings()
     })
     .unwrap();
+    if let Some(policy) = email_policy {
+        runtime = runtime.with_outbound_email_policy(policy);
+    }
     let server = KhiveMcpServer::new(runtime.clone()).unwrap();
     let sent = server
         .verb_registry_clone()
@@ -131,6 +144,14 @@ fn email_registration(
         khive_runtime::OutboundEmailPolicy::configured(vec!["recipient@example.com".into()])
             .unwrap(),
     );
+    email_registration_with_policy(runtime, channel)
+}
+
+#[cfg(feature = "channel-email")]
+fn email_registration_with_policy(
+    runtime: KhiveRuntime,
+    channel: Arc<ScriptedChannel>,
+) -> ComponentRegistration {
     let mut registration = channel_component_registration(
         "email-outbound",
         Arc::new(move |ctx| {
@@ -347,6 +368,214 @@ async fn email_outbound_allowlist_refusal_is_visible_in_sender_sent_mail() {
         .await
         .unwrap()
         .is_empty());
+    cancellation.cancel();
+    task.await.unwrap();
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_email_suppressed_after_admission_fails_before_smtp() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_policy("email:external@example.net", Some(policy)).await;
+    server
+        .verb_registry_clone()
+        .dispatch(
+            "comm.suppression_add",
+            json!({
+                "scope":"outbound",
+                "kind":"address",
+                "value":"external@example.net",
+                "source":"operator"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let props = properties(&runtime, id).await;
+            if props["delivery"] == "failed" {
+                assert!(props["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("suppression"));
+                assert!(!props["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("external@example.net"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("suppressed external message should reach a permanent failure");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
+    cancellation.cancel();
+    task.await.unwrap();
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_email_carries_list_unsubscribe_header_and_footer() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_policy("email:external@example.net", Some(policy.clone())).await;
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if properties(&runtime, id).await["delivery"] == "delivered" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("external message should be delivered");
+    cancellation.cancel();
+    task.await.unwrap();
+
+    let captured = channel.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let envelope = &captured[0];
+    let header = envelope
+        .list_unsubscribe
+        .as_deref()
+        .expect("external message must carry List-Unsubscribe");
+    assert!(header.starts_with("<mailto:"), "{header}");
+    assert!(!header.contains("List-Unsubscribe-Post"), "{header}");
+    let token = header
+        .rsplit("unsubscribe%20")
+        .next()
+        .and_then(|value| value.strip_suffix('>'))
+        .expect("header must carry the token");
+    assert_eq!(
+        policy.verify_unsubscribe_token(token).as_deref(),
+        policy.recipient_key("external@example.net").as_deref()
+    );
+    assert!(
+        envelope
+            .content
+            .ends_with(&format!(
+                "To unsubscribe, send an email to sender@example.com with the subject: unsubscribe {token}"
+            )),
+        "body must end with the rendered footer: {}",
+        envelope.content
+    );
+    assert!(!envelope.content.contains("{unsubscribe}"));
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn policy_recipient_email_carries_no_unsubscribe_header_or_footer() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_policy("email:maintainer@example.com", Some(policy)).await;
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if properties(&runtime, id).await["delivery"] == "delivered" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("policy-recipient message should be delivered");
+    cancellation.cancel();
+    task.await.unwrap();
+
+    let captured = channel.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].list_unsubscribe.is_none());
+    assert!(!captured[0].content.contains("{unsubscribe}"));
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_email_delivered_under_unavailable_footer_fails_before_smtp() {
+    let admitted = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_policy("email:external@example.net", Some(admitted)).await;
+    // The message is now queued; deliver it under a policy whose footer has become unavailable.
+    let runtime = runtime.with_outbound_email_policy(
+        khive_runtime::OutboundEmailPolicy::configured_for_tests(
+            vec!["maintainer@example.com".into()],
+            vec!["actor:outbox-supervision".into()],
+            5,
+        )
+        .unwrap()
+        .with_external_footer_for_tests(Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read")),
+    );
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let props = properties(&runtime, id).await;
+            if props["delivery"] == "failed" {
+                let last_error = props["last_error"].as_str().unwrap();
+                assert!(last_error.contains("footer is unavailable"), "{last_error}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unavailable footer must reach a permanent failure");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
     cancellation.cancel();
     task.await.unwrap();
 }

@@ -33,10 +33,16 @@ pub(super) enum ForwardOutcome {
         kind: std::io::ErrorKind,
         os_error_code: Option<i32>,
     },
-    /// Invalid response framing/JSON or a response timeout after a full write.
+    /// Invalid response framing/JSON, or a read error other than a closed
+    /// connection, after a full write.
     ParseFailure,
     /// EOF/reset after a full write; distinct from malformed frames/timeouts.
     ResponseLost,
+    /// The full request frame was written and no response arrived before the
+    /// exchange deadline: the daemon is alive enough to accept the frame but
+    /// did not answer in time. `elapsed_ms` is the response wait. Terminal like
+    /// `ParseFailure`, and never replayed.
+    ResponseTimeout { elapsed_ms: u64 },
     /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
     /// does not match [`PROTOCOL_VERSION`], in either direction. Below: the
     /// new-client + old-daemon scenario, implicit (a pre-versioning daemon ignores
@@ -187,6 +193,7 @@ pub(super) async fn try_forward_before(
     // must not leave this read pending forever — that would keep the
     // calling task (and the MCP handler awaiting it) alive indefinitely.
     // Bounded by the same deadline as the connect and write phases above.
+    let response_wait_started = tokio::time::Instant::now();
     let resp = match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -215,12 +222,15 @@ pub(super) async fn try_forward_before(
             // The daemon never answered within the deadline. The write
             // already completed, so a timeout remains terminal. It does not
             // establish whether the daemon is still executing this request.
+            let elapsed_ms =
+                u64::try_from(response_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::warn!(
                 target: "khive_mcp::daemon",
+                elapsed_ms,
                 "daemon response read timed out after the request was fully \
                  written — returning terminal ambiguity"
             );
-            return ForwardOutcome::ParseFailure;
+            return ForwardOutcome::ResponseTimeout { elapsed_ms };
         }
     };
     match serde_json::from_slice::<DaemonResponseFrame>(&resp) {

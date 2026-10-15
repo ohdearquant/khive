@@ -332,6 +332,137 @@ async fn quarantine_ingest_degradation_retains_attachment_and_dedup_receipt() {
     assert_degraded_ingest(true).await;
 }
 
+/// ADR-056 (2026-10-15 amendment), decision 4: a new quarantine record's
+/// receipt reports whether the record kept its original. A record written with
+/// its original reports `true` and no reason key; a record written without one
+/// reports `false` and the stored reason; a record with neither an attachment
+/// nor a stored reason reports `false` and no reason key rather than inventing
+/// one. A non-quarantine message carries neither key.
+#[tokio::test]
+async fn ingest_receipt_discloses_quarantine_original_retention() {
+    use khive_storage::BlobStore as _;
+
+    let (runtime, token, signal, capability) = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let blobs = std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0).unwrap(),
+    );
+    let original = blobs.put(b"retained original".to_vec()).await.unwrap();
+    runtime.install_blob_store(blobs).unwrap();
+
+    let mut retained = message();
+    retained["external_id"] = json!("imap:retention:retained:1");
+    retained["metadata"] = json!({
+        "quarantined": true,
+        "quarantine_content_ref": original.as_str(),
+    });
+    let receipt = ingest(&runtime, &token, &signal, &capability, retained)
+        .await
+        .unwrap();
+    assert_eq!(receipt["deduplicated"], json!(false));
+    assert_eq!(
+        receipt["quarantine_original_retained"],
+        json!(true),
+        "a quarantine record written with its original reports retained: {receipt}"
+    );
+    assert!(
+        receipt
+            .get("quarantine_original_not_retained_reason")
+            .is_none(),
+        "a retained original carries no reason key: {receipt}"
+    );
+
+    let mut dropped = message();
+    dropped["external_id"] = json!("imap:retention:dropped:2");
+    dropped["metadata"] = json!({
+        "quarantined": "true",
+        "quarantine_original_retained": "false",
+        "quarantine_original_not_retained_reason": "retention-limit",
+    });
+    let receipt = ingest(&runtime, &token, &signal, &capability, dropped)
+        .await
+        .unwrap();
+    assert_eq!(receipt["deduplicated"], json!(false));
+    assert_eq!(
+        receipt["quarantine_original_retained"],
+        json!(false),
+        "a quarantine record written without its original reports not retained: {receipt}"
+    );
+    assert_eq!(
+        receipt["quarantine_original_not_retained_reason"],
+        json!("retention-limit"),
+        "the receipt names the stored reason: {receipt}"
+    );
+
+    let mut unreasoned = message();
+    unreasoned["external_id"] = json!("imap:retention:unreasoned:3");
+    unreasoned["metadata"] = json!({"quarantined": true});
+    let receipt = ingest(&runtime, &token, &signal, &capability, unreasoned)
+        .await
+        .unwrap();
+    assert_eq!(receipt["quarantine_original_retained"], json!(false));
+    assert!(
+        receipt
+            .get("quarantine_original_not_retained_reason")
+            .is_none(),
+        "a quarantined record with neither an attachment nor a stored reason reports no \
+         invented reason: {receipt}"
+    );
+
+    let mut plain = message();
+    plain["external_id"] = json!("imap:retention:plain:4");
+    let receipt = ingest(&runtime, &token, &signal, &capability, plain)
+        .await
+        .unwrap();
+    assert!(
+        receipt.get("quarantine_original_retained").is_none()
+            && receipt
+                .get("quarantine_original_not_retained_reason")
+                .is_none(),
+        "a non-quarantine message carries neither retention key: {receipt}"
+    );
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 4: a deduplicated re-ingest wrote
+/// no new record, so its acknowledgement carries neither retention key even
+/// when the replayed bytes name a quarantine.
+#[tokio::test]
+async fn deduplicated_ingest_receipt_carries_no_retention_keys() {
+    use khive_storage::BlobStore as _;
+
+    let (runtime, token, signal, capability) = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let blobs = std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0).unwrap(),
+    );
+    let original = blobs.put(b"replayed original".to_vec()).await.unwrap();
+    runtime.install_blob_store(blobs).unwrap();
+
+    let mut body = message();
+    body["external_id"] = json!("imap:retention:replay:5");
+    body["metadata"] = json!({
+        "quarantined": true,
+        "quarantine_content_ref": original.as_str(),
+    });
+    let first = ingest(&runtime, &token, &signal, &capability, body.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["deduplicated"], json!(false));
+    assert_eq!(first["quarantine_original_retained"], json!(true));
+
+    let replay = ingest(&runtime, &token, &signal, &capability, body)
+        .await
+        .unwrap();
+    assert_eq!(replay["deduplicated"], json!(true), "{replay}");
+    assert!(
+        replay.get("quarantine_original_retained").is_none()
+            && replay
+                .get("quarantine_original_not_retained_reason")
+                .is_none(),
+        "a deduplicated acknowledgement carries neither retention key: {replay}"
+    );
+}
+
 #[tokio::test]
 async fn healthy_ingest_omits_degradations_and_precommit_refusal_does_not_wake() {
     let (runtime, token, signal, capability) = fixture();
@@ -525,4 +656,147 @@ fn committed_ingest_decoder_rejects_unrelated_and_malformed_errors() {
             "must reject {key}={value}"
         );
     }
+}
+
+#[tokio::test]
+async fn quarantine_on_secondary_backend_is_recorded_without_its_original() {
+    use khive_runtime::{BackendId, Namespace, RuntimeConfig, StorageBackend};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    let main = Arc::new(StorageBackend::memory().expect("main backend"));
+    let comm = Arc::new(StorageBackend::memory().expect("comm backend"));
+    main.prepare_core_schema().expect("main schema");
+    comm.prepare_core_schema().expect("comm schema");
+    let mut config = RuntimeConfig::no_embeddings();
+    config.backend_id = BackendId::parse("comm").expect("backend id");
+    config.packs = vec!["kg".into(), "comm".into()];
+    let runtime = super::KhiveRuntime::from_backend(comm, config).with_core_backend(main);
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+    let original_ref = "c".repeat(64);
+    let body = json!({
+        "from": "email:quarantine",
+        "to": "local",
+        "content": "Inbound channel message quarantined.",
+        "channel_kind": "email",
+        "channel_slug": "inbox",
+        "external_id": "imap:mail.example.com:inbox:14:1673",
+        "metadata": {
+            "quarantined": "true",
+            "quarantine_classification": "unknown",
+            "quarantine_content_ref": original_ref,
+        },
+    });
+
+    let ack = super::handle_ingest(
+        &runtime,
+        &InboxSignal::new(),
+        Some(&capability),
+        &Ok(None),
+        &token,
+        body.clone(),
+        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+    )
+    .await
+    .expect("a quarantine on a secondary comm backend is recorded");
+    // ADR-056 (2026-10-15 amendment), decision 4: a drop inside `comm.ingest`
+    // is disclosed on the receipt like any other loss, not only on the stored
+    // record.
+    assert_eq!(
+        ack["quarantine_original_retained"],
+        json!(false),
+        "the receipt reports the dropped original: {ack}"
+    );
+    assert_eq!(
+        ack["quarantine_original_not_retained_reason"],
+        json!("secondary-backend"),
+        "the receipt names the `secondary-backend` drop: {ack}"
+    );
+    let note_id =
+        Uuid::parse_str(ack["full_id"].as_str().expect("full note id")).expect("canonical note id");
+
+    let note = runtime
+        .notes(&token)
+        .expect("comm notes")
+        .get_note(note_id)
+        .await
+        .expect("read quarantine message")
+        .expect("quarantine message is stored on the comm backend");
+    let props = note.properties.as_ref().expect("message properties");
+    assert!(
+        matches!(props.get("quarantined"), Some(Value::Bool(true)))
+            || props.get("quarantined").and_then(Value::as_str) == Some("true"),
+        "the message is still marked quarantined: {props}"
+    );
+    assert!(
+        props.get("quarantine_content_ref").is_none(),
+        "no unowned original reference is persisted: {props}"
+    );
+    assert_eq!(
+        props
+            .get("quarantine_original_retained")
+            .and_then(Value::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        props
+            .get("quarantine_original_not_retained_reason")
+            .and_then(Value::as_str),
+        Some("secondary-backend")
+    );
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("main attachments")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("owner lookup");
+    assert!(owner.is_none(), "no main-backend owner row: {owner:?}");
+    assert!(
+        note.expires_at.is_some(),
+        "the record keeps the quarantine retention deadline"
+    );
+
+    // A later poll delivers the same message again. The replay resolves to the
+    // stored record and still writes no owner row on main, so the channel
+    // moves on instead of refusing the message on every poll.
+    let replay = super::handle_ingest(
+        &runtime,
+        &InboxSignal::new(),
+        Some(&capability),
+        &Ok(None),
+        &token,
+        body,
+        std::time::Duration::from_secs(14 * 24 * 60 * 60),
+    )
+    .await
+    .expect("a replay on a secondary comm backend is acknowledged");
+    assert_eq!(replay["deduplicated"], json!(true), "{replay}");
+    let replayed = runtime
+        .notes(&token)
+        .expect("comm notes")
+        .get_note(note_id)
+        .await
+        .expect("read quarantine message")
+        .expect("quarantine message is still stored");
+    assert!(
+        replayed
+            .properties
+            .as_ref()
+            .and_then(|props| props.get("quarantine_content_ref"))
+            .is_none(),
+        "the replay persists no original reference"
+    );
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("main attachments")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("owner lookup after replay");
+    assert!(
+        owner.is_none(),
+        "no main-backend owner row after replay: {owner:?}"
+    );
 }

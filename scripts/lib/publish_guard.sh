@@ -63,3 +63,38 @@ check_crates_ladder() {
     fi
     return 0
 }
+
+# publish_verify_mode <value of NO_VERIFY>
+# Resolves the NO_VERIFY knob for the live ladder: prints `verify` (unset or
+# "0", the default) or `no-verify` ("1"), and fails on any other value so a
+# typo cannot silently choose a mode. `no-verify` makes each live
+# `cargo publish` skip its verification build; use it only when
+# `cargo publish --dry-run --locked --workspace` has already verified every
+# crate at the same commit, so the publishing machine only packages and
+# uploads.
+publish_verify_mode() {
+    case "${1-}" in
+        "" | 0) echo verify ;;
+        1) echo no-verify ;;
+        *)
+            echo "ERROR: NO_VERIFY must be unset, 0 or 1 (got '$1')" >&2
+            return 1
+            ;;
+    esac
+}
+
+# semver_gate_mode <value of KHIVE_PUBLISH_SEMVER_CHECKED_AT> <HEAD sha> <clean|dirty>
+# Decides whether publish.sh runs the SemVer gate. Prints `skip` only when the
+# value is a full 40-character commit sha equal to HEAD and the working tree is
+# clean: the gate already ran at exactly this commit on another machine, so this
+# machine need not rebuild every crate's rustdoc to repeat it. Prints `run` for an
+# unset or empty value, an abbreviated or different sha, or a dirty tree, so a
+# stale or mistyped value runs the gate as before.
+semver_gate_mode() {
+    local checked_at="${1-}" head="${2-}" tree="${3-}"
+    if [[ "$checked_at" =~ ^[0-9a-f]{40}$ && "$checked_at" == "$head" && "$tree" == clean ]]; then
+        echo skip
+    else
+        echo run
+    fi
+}

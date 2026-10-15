@@ -82,6 +82,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         .map_err(|error| daemon::DaemonDispatchError::new(error.message.to_string(), error.data))
     }
 
+    fn events_readiness(&self) -> Option<khive_runtime::events_split::EventsReadiness> {
+        self.events_readiness_gate()
+    }
+
     async fn warm_all(&self) {
         crate::server::KhiveMcpServer::warm_all(self).await;
     }

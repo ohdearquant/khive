@@ -6,6 +6,21 @@ full algorithm spec: the allowlist layers that suppress false positives, the tri
 matching rules, and the per-function shape criteria used by the detection helpers. The in-source
 module doc-comment carries only a concise summary and points here.
 
+## Note-field scan composition
+
+`secret_gate::check_note_fields_at(content, name, properties, record)` shares the
+note-field scan used by ordinary and conditional note creation, atomic note
+batches, proposal note preparation, and code-ingest preflight. It scans content,
+then a present name, then present JSON properties through `check_at` and
+`check_json_at`, returning the first refusal with the caller's record label and
+field location. Absent optional fields are skipped; JSON null and non-string
+leaves retain the existing structured scanner's behavior.
+
+The helper implements the existing ADR-115 field checks without changing the
+credential detector or admission contract. Each caller still owns its property
+derivation, reserved-key checks, embedding-input checks, and storage operations;
+those steps keep their existing positions relative to the field scan.
+
 ## Module-level detection algorithm
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
@@ -501,7 +516,8 @@ own word (`auth header`, `auth:`) still triggers exactly as before.
 The bare substring `token` is NOT in this list because it fires on benign terms like `tokenizer`,
 `token_count`, and `next_token`. Instead the dedicated boundary-aware helpers `has_standalone_token`
 (standalone word) and `has_token_assignment` (`token=` / `token:` with word boundary before) are
-used.
+used. Assignment labels are read whole instead: a label ending in `_token` before its `:`/`=` is a
+credential label unless it names a position (see the credential token label rule below).
 
 ## is_base64_content_hash
 
@@ -615,6 +631,23 @@ For each token, in order:
    stems such as `hmac` are not trigger words. A corpus replay that is identical across such a change
    certifies preservation on the corpus population only; the opened shape class carries its own
    before/after arms.
+   **Credential token labels** (`is_credential_token_label`): the assignment-label path treats a
+   label as a credential label when it is `token` or ends in `_token`, so `access_token: <uuid>`,
+   `{"refresh_token": "<value>"}` and `github_token=<value>` get the checks `token: <value>` gets.
+   The exception is the closed vocabulary `POSITION_TOKEN_LABELS` (`next_token`, `next_page_token`,
+   `page_token`, `pagination_token`, `continuation_token`, `resume_token`, `sync_token`, ...), whose
+   values are cursors into a paged, resumable or synced listing, and `RECEIPT_TOKEN_LABELS`
+   (`visibility_token`), whose value is a sealed receipt the server returns to its own caller: opening
+   it only narrows a scope the caller is already authorized for, so a quoted `memory.remember`
+   response passes. As with lookup keys the match is the whole label, so a qualified spelling such as
+   `stale_next_token` stays a credential label. The same predicate decides whether the label directly
+   before a value is a credential label (`has_immediate_credential_label`), so `access_token:` and
+   `github_token:` also withhold the repository-revision and LaTeX exemptions that `token:` withholds.
+   The rule fails closed: any unlisted `*_token` label is a credential label, including
+   non-secret names such as `skip_token`, `delta_token`, `idempotency_token`, `lease_token` and
+   `cancel_token`, and a `*_token` label that sits within the trigger window but labels a different
+   value still counts (`chars_per_token: 4 for profile <uuid>` is refused). A new non-credential
+   `*_token` name is added to one of the two lists, with a test.
 
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a

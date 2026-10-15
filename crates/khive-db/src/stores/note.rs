@@ -477,7 +477,7 @@ impl SqlNoteStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -523,7 +523,7 @@ impl SqlNoteStore {
         R: Send + 'static,
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
-            return writer_task.send_bounded(f).await;
+            return writer_task.send_bounded_at(f, op).await;
         }
 
         self.pool
@@ -939,7 +939,7 @@ fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
         }
         // `id ASC` over the primary key is already the stable tiebreak for
         // notes sharing a creation timestamp.
-        None => " ORDER BY created_at DESC, id ASC".to_string(),
+        None => DEFAULT_NOTE_PAGE_ORDER.to_string(),
     }
 }
 
@@ -1418,13 +1418,26 @@ fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static st
                 .and_then(|term| term.strip_suffix(", '')"))
                 .is_some_and(numbered_param)
         });
-    if !namespace
-        || !terms.contains(&"deleted_at IS NULL")
-        || !equality("kind = ")
-        || !equality("json_extract(properties, '$.direction') = ")
-        || !recipient
-    {
+    if !namespace || !terms.contains(&"deleted_at IS NULL") || !equality("kind = ") {
         return "";
+    }
+    if !equality("json_extract(properties, '$.direction') = ") || !recipient {
+        // A thread-keyed read selects the thread's own rows. Left to the
+        // planner, `LIMIT` under a `created_at` order picks the creation-order
+        // index and evaluates `$.thread_id` on every message in the namespace,
+        // and a direction term ties the thread index with
+        // `idx_comm_message_outbound_ref`, which walks every outbound message.
+        let thread = equality("json_extract(properties, '$.thread_id') = ")
+            || terms.iter().any(|term| {
+                term.strip_prefix("json_extract(properties, '$.thread_id') IN (")
+                    .and_then(|term| term.strip_suffix(')'))
+                    .is_some_and(|values| values.split(", ").all(numbered_param))
+            });
+        return if thread {
+            " INDEXED BY idx_comm_message_thread"
+        } else {
+            ""
+        };
     }
     if terms.contains(
         &"(json_type(properties, '$.read') IS NULL OR json_type(properties, '$.read') != 'true')",
@@ -1467,6 +1480,90 @@ fn build_note_filter_read_clause(
 /// the same column list out inline.
 const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
      expires_at, properties, created_at, updated_at, deleted_at, key, version";
+
+/// The default note page order, served for one namespace by
+/// `idx_notes_namespace_created`.
+const DEFAULT_NOTE_PAGE_ORDER: &str = " ORDER BY created_at DESC, id ASC";
+
+/// Most namespaces a page read splits into per-namespace arms; a wider visible
+/// set keeps the single `namespace IN (...)` statement.
+const NAMESPACE_ARMS_MAX: usize = 32;
+
+/// The statement and parameters for one `query_notes_filtered_count_free` page
+/// read by `LIMIT`/`OFFSET`.
+///
+/// Several visible namespaces filter as `namespace IN (...)`, and SQLite cannot
+/// take `created_at DESC, id ASC` from `idx_notes_namespace_created` across an
+/// `IN` list: it reads every visible live row and sorts them all before taking
+/// the page. In that case the page is built from one arm per namespace. Each arm
+/// is the same filter with `namespace = ?i`, so it can walk the order index and
+/// stop after `offset + limit` rows, and the outer order takes the page from at
+/// most that many rows per namespace. A row lives in exactly one namespace and
+/// `id` makes the order total, so the page is the one the `IN` form returns.
+///
+/// Every other read keeps the single `IN` statement: an order other than the
+/// default, an index pin chosen for a message read, deleted rows included (the
+/// order index is partial on `deleted_at IS NULL`), and a visible set wider than
+/// [`NAMESPACE_ARMS_MAX`].
+fn note_filter_page_sql(
+    namespace: &str,
+    filter: &NoteFilter,
+    limit: i64,
+    offset: i64,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
+    let mut filter = filter.clone();
+    let mut seen = HashSet::new();
+    filter.namespaces.retain(|ns| seen.insert(ns.clone()));
+    let (read_clause, mut params) = build_note_filter_read_clause(namespace, &filter)?;
+    let order_clause = note_filter_page_order_clause(&filter);
+    let arms = filter.namespaces.len();
+    let in_term = format!(
+        " WHERE namespace IN ({})",
+        (1..=arms)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let arm_rest = read_clause.strip_prefix(in_term.as_str()).filter(|_| {
+        (2..=NAMESPACE_ARMS_MAX).contains(&arms)
+            && !filter.include_deleted
+            && order_clause == DEFAULT_NOTE_PAGE_ORDER
+    });
+    let Some(rest) = arm_rest else {
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+        let limit_idx = params.len() - 1;
+        let offset_idx = params.len();
+        return Ok((
+            format!(
+                "SELECT {NOTE_COLUMNS} FROM notes{read_clause}{order_clause} \
+                 LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            ),
+            params,
+        ));
+    };
+    params.push(Box::new(offset.saturating_add(limit)));
+    let arm_limit_idx = params.len();
+    let arm_sql: Vec<String> = (1..=arms)
+        .map(|i| {
+            format!(
+                "SELECT * FROM (SELECT {NOTE_COLUMNS} FROM notes WHERE namespace = ?{i}{rest}\
+                 {order_clause} LIMIT ?{arm_limit_idx})"
+            )
+        })
+        .collect();
+    params.push(Box::new(limit));
+    params.push(Box::new(offset));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    Ok((
+        format!(
+            "{}{order_clause} LIMIT ?{limit_idx} OFFSET ?{offset_idx}",
+            arm_sql.join(" UNION ALL ")
+        ),
+        params,
+    ))
+}
 
 fn fetch_notes_after_instant(
     conn: &rusqlite::Connection,
@@ -2452,16 +2549,7 @@ impl NoteStore for SqlNoteStore {
                 return Ok(Page { items, total: None });
             }
 
-            let (where_sql, mut params) = build_note_filter_read_clause(&namespace, &filter)?;
-            params.push(Box::new(limit_i64));
-            params.push(Box::new(offset_i64));
-            let limit_idx = params.len() - 1;
-            let offset_idx = params.len();
-            let order_clause = note_filter_page_order_clause(&filter);
-            let sql = format!(
-                "SELECT {NOTE_COLUMNS} FROM notes{where_sql}{order_clause} \
-                 LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
-            );
+            let (sql, params) = note_filter_page_sql(&namespace, &filter, limit_i64, offset_i64)?;
 
             let mut stmt = conn.prepare(&sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =

@@ -90,7 +90,7 @@ async fn section_writes_preserve_tiny_vectors_and_normalize_ordinary_vectors() {
     registry.dispatch("knowledge.upsert_atoms", json!({
         "namespace": "local",
         "atoms": [{"slug": "epsilon-control", "name": "Epsilon Control", "content":
-            "A control atom about vector normalization and section persistence, with enough ordinary text to be independently embedded."}]
+            "A control atom about vector normalization and section persistence, with enough ordinary text to be independently embedded during ordinary writes."}]
     })).await.expect("upsert control atom");
     registry.dispatch("knowledge.edit", json!({
         "namespace": "local", "id": "epsilon-control", "sections": [

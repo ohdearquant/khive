@@ -1107,10 +1107,13 @@ impl KhiveRuntime {
     /// Collect the same per-file report as the primary diagnostic surface for
     /// one opened backend. The process identity comes from main; invoking
     /// `ProcessIdentity::current` on a secondary would miscount main generations.
+    /// `collect_size_composition = false` skips the `dbstat` walk (see
+    /// `khive_db::diagnostics::collect_with_runtime_audit_metrics_for_process_interruptibly`).
     pub async fn db_diagnostics_for_opened_backend_with_audit_metrics(
         &self,
         backend: &OpenedDiagnosticBackend,
         runtime_audit_batch_metrics: Option<khive_db::diagnostics::RuntimeAuditBatchMetrics>,
+        collect_size_composition: bool,
     ) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
         let main_pool = self.core().backend.pool_arc();
         let process = khive_db::diagnostics::ProcessIdentity::current(&main_pool);
@@ -1129,6 +1132,7 @@ impl KhiveRuntime {
                 khive_db::SessionSweepConfig::default().interval,
                 crate::pack::audit_append_failure_count(),
                 runtime_audit_batch_metrics,
+                collect_size_composition,
             )
             .await
             .map_err(RuntimeError::from)?;

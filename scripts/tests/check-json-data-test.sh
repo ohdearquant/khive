@@ -155,4 +155,48 @@ printf '%s\n' '# a comment' '' '   ' '^data/manifest\.json$ 2048' >"$R/.check-js
 git -C "$R" add data/manifest.json .check-json-data-exemptions
 [ "$(run_guard "$R" --all)" = 0 ] && pass || fail "comments or blank lines were treated as rules"
 
+# --- names the extension rules must still see -----------------------------------
+# Case 1 and case 6 are the controls: the lower-case ASCII spelling is refused. Each
+# case below spells the same kind of file differently and must be refused the same way.
+
+echo "--- case 15: an upper-case .JSONL extension is still JSONL ---"
+R=$(fresh_repo c15)
+printf '{"a":1}\n' >"$R/DATA.JSONL"; git -C "$R" add DATA.JSONL
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'DATA.JSONL — JSONL/NDJSON staged' "$ERR" && pass || fail "staged DATA.JSONL was not refused"
+
+echo "--- case 16: a non-ASCII JSONL name is judged as named, not in quoted form ---"
+R=$(fresh_repo c16)
+mkdir -p "$R/notes"; printf '{"a":1}\n' >"$R/notes/données.jsonl"; git -C "$R" add notes/données.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'notes/données.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "staged notes/données.jsonl was not refused"
+
+echo "--- case 17: --all refuses a mixed-case .NDJSON and a non-ASCII .jsonl ---"
+R=$(fresh_repo c17)
+mkdir -p "$R/exports"; printf '{"a":1}\n' >"$R/exports/Corpus.NDJSON"; printf '{"a":1}\n' >"$R/exports/résumé.jsonl"
+[ "$(run_guard "$R" --all)" = 1 ] && grep -qF 'exports/Corpus.NDJSON' "$ERR" && grep -qF 'exports/résumé.jsonl' "$ERR" && pass || fail "--all did not refuse both spellings"
+
+echo "--- case 18: an oversize upper-case .JSON is measured like .json ---"
+R=$(fresh_repo c18)
+big_json "$R" BIG.JSON 300; git -C "$R" add BIG.JSON
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'BIG.JSON — 300KB JSON exceeds' "$ERR" && pass || fail "staged 300KB BIG.JSON passed"
+
+echo "--- case 19: an oversize non-ASCII .json is read from the index by its real name ---"
+R=$(fresh_repo c19)
+big_json "$R" data/größe.json 300; git -C "$R" add data/größe.json
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'data/größe.json — 300KB JSON exceeds' "$ERR" && pass || fail "staged 300KB data/größe.json passed"
+
+echo "--- case 20: a small non-ASCII .json commits (must-pass control for the index read) ---"
+R=$(fresh_repo c20)
+mkdir -p "$R/data"; printf '{"ok":true}\n' >"$R/data/réglages.json"; git -C "$R" add data/réglages.json
+[ "$(run_guard "$R")" = 0 ] && pass || fail "small data/réglages.json was refused"
+
+echo "--- case 21: a staged name starting with '-' is still judged ---"
+R=$(fresh_repo c21)
+printf '{"a":1}\n' >"$R/-data.jsonl"; git -C "$R" add -- -data.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF -- '-data.jsonl — JSONL/NDJSON staged' "$ERR" && pass || fail "staged -data.jsonl was not refused"
+
+echo "--- case 22: --all judges names under a '-' directory and a '-' oversize .json ---"
+R=$(fresh_repo c22)
+mkdir -p "$R/-dir"; printf '{"a":1}\n' >"$R/-dir/x.NDJSON"; big_json "$R" -big.json 300
+[ "$(run_guard "$R" --all)" = 1 ] && grep -qF -- '-dir/x.NDJSON' "$ERR" && grep -qF -- '-big.json — 300KB JSON exceeds' "$ERR" && pass || fail "--all did not refuse both '-' names"
+
 echo "all cases passed"

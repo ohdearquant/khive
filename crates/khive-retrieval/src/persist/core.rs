@@ -14,6 +14,10 @@ pub enum PersistError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Routed storage operation failed, including read-only admission refusal.
+    #[error("Storage error: {0}")]
+    Storage(#[from] khive_storage::StorageError),
+
     /// Serialization failed.
     #[error("Serialization error: {0}")]
     Serialize(String),

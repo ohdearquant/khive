@@ -405,3 +405,79 @@ fn default_kind_refuses_bibtex_before_target_open() {
         assert!(!db.exists());
     }
 }
+
+#[test]
+fn combined_bibtex_import_maps_crossref_and_recovers_from_malformed_middle_entry() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("papers.bib");
+    let db = tmp.path().join("target.db");
+    std::fs::write(
+        &source,
+        r#"@string{authors = "Ada Lovelace and Grace Hopper"}
+@string{topic = "Graph "}
+@inproceedings{child,
+  title = topic # {Methods},
+  abstract = {Child paper.},
+  author = authors,
+  year = 2026,
+  booktitle = {Graph Conference},
+  doi = {10.1234/child},
+  url = {https://example.org/child},
+  crossref = {parent}
+}
+@article{bad, title {malformed middle entry}}
+@proceedings{parent,
+  title = TOPIC # {Proceedings},
+  abstract = {Parent volume.},
+  author = AUTHORS,
+  year = 2025,
+  journal = {Journal of Graphs},
+  doi = {10.1234/parent},
+  archivePrefix = {arXiv},
+  eprint = {2601.01234}
+}
+"#,
+    )
+    .unwrap();
+
+    let output = import(&tmp, &source, &db)
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    assert_summary(&output, 2, 1, 3, 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    assert!(stderr.contains("BibTeX line 13,"), "{stderr}");
+
+    let archive = export(&tmp, &db);
+    assert_papers(&archive, 2);
+    let child = entity(&archive, "Graph Methods");
+    assert_eq!(child["description"], "Child paper.");
+    assert_eq!(
+        child["properties"],
+        json!({
+            "authors": "Ada Lovelace and Grace Hopper",
+            "year": "2026",
+            "venue": "Graph Conference",
+            "doi": "10.1234/child",
+            "source": "url:https://example.org/child"
+        })
+    );
+    let parent = entity(&archive, "Graph Proceedings");
+    assert_eq!(parent["description"], "Parent volume.");
+    assert_eq!(
+        parent["properties"],
+        json!({
+            "authors": "Ada Lovelace and Grace Hopper",
+            "year": "2025",
+            "venue": "Journal of Graphs",
+            "doi": "10.1234/parent",
+            "source": "arxiv:2601.01234"
+        })
+    );
+    let edges = archive["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["source"], child["id"]);
+    assert_eq!(edges[0]["target"], parent["id"]);
+    assert_eq!(edges[0]["relation"], "depends_on");
+}

@@ -1,9 +1,9 @@
 #[cfg(doc)]
 use super::is_pure_hex;
 use super::{
-    contains_bounded_word, extract_token, shannon_entropy, strip_delimiters,
-    wrapper_strip_repeated, COMPOUND_TRIGGER_WORDS, ENTROPY_THRESHOLD, HEX_CREDENTIAL_LENGTHS,
-    MIN_ENTROPY_LEN, TRIGGER_WORDS,
+    contains_bounded_word, extract_token, is_credential_token_label, shannon_entropy,
+    strip_delimiters, wrapper_strip_repeated, COMPOUND_TRIGGER_WORDS, ENTROPY_THRESHOLD,
+    HEX_CREDENTIAL_LENGTHS, MIN_ENTROPY_LEN, TRIGGER_WORDS,
 };
 
 /// `true` when every byte of `run` is an ASCII hex digit. The
@@ -129,7 +129,7 @@ pub(super) fn has_immediate_credential_label(text: &str, token_offset: usize) ->
         .unwrap_or(before);
     let label = trailing_identifier(before).to_ascii_lowercase();
 
-    label == "token"
+    is_credential_token_label(&label)
         || COMPOUND_TRIGGER_WORDS
             .iter()
             .any(|trigger| label.contains(trigger))
