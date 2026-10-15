@@ -81,6 +81,23 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::LintFix { source, detail } => {
+            let mut value = runtime_error_value(*source, DomainDisposition::Unknown);
+            let object = value
+                .as_object_mut()
+                .expect("runtime error projection is an object");
+            let details = object.entry("details").or_insert_with(|| json!({}));
+            if !details.is_object() {
+                *details = json!({});
+            }
+            details["lint_fix"] = json!(detail);
+            // Earlier actions may already have committed. A named refusal of
+            // the last action cannot certify the whole call as not committed.
+            value["domain_disposition"] = json!("unknown");
+            value["retryable"] = json!(false);
+            return value;
+        }
+
         RuntimeError::WithResolution { context } => {
             let crate::error::ResolutionFailureContext { source, resolution } = context;
             let mut value = runtime_error_value(*source, disposition);
