@@ -4,7 +4,48 @@
 //! loaded. Missing required variables produce an error at construction time.
 
 use crate::connector::MailAddress;
+use crate::external_inbound::InboundRoutes;
 use khive_channel::ChannelError;
+
+/// Boot-resolved routing for authenticated external inbound mail (ADR-200 section 8.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalInboundConfig {
+    /// Recipient aliases, matched in delivered-to/to/cc order.
+    pub routes: InboundRoutes,
+    /// Actor receiving mail without a verified owner or recipient route.
+    pub actor: String,
+}
+
+impl ExternalInboundConfig {
+    /// Load routing only when the host's frozen policy enables external senders.
+    pub fn from_env(enabled: bool) -> Result<Option<Self>, ChannelError> {
+        if !enabled {
+            return Ok(None);
+        }
+        let actor = require_env("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR")?;
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return Err(ChannelError::Config(
+                "KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR must not be empty".into(),
+            ));
+        }
+        let raw_routes = match std::env::var("KHIVE_EMAIL_INBOUND_ROUTES") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(error) => {
+                return Err(ChannelError::Config(format!(
+                    "KHIVE_EMAIL_INBOUND_ROUTES is invalid: {error}"
+                )));
+            }
+        };
+        let routes = InboundRoutes::parse(&raw_routes)
+            .map_err(|error| ChannelError::Config(error.to_string()))?;
+        Ok(Some(Self {
+            routes,
+            actor: actor.to_string(),
+        }))
+    }
+}
 
 /// Reserved sentinel value for `KHIVE_EMAIL_AUTHSERV_ID` that selects
 /// [`TrustAnchor::TopmostNoAuthservId`] mode. `!` is not excluded by RFC 8601
@@ -13,6 +54,11 @@ use khive_channel::ChannelError;
 /// guarantee: no real-world domain-form receiving-boundary identifier begins
 /// with `!`, and this config contract reserves the exact string.
 pub const TOPMOST_NO_AUTHSERV_ID_SENTINEL: &str = "!topmost-no-authserv-id";
+
+/// Reserved prefix for `KHIVE_EMAIL_AUTHSERV_ID` that selects
+/// [`TrustAnchor::TopmostWithAuthservId`] mode: `!topmost:<authserv-id>`.
+/// Reserved by the same convention as [`TOPMOST_NO_AUTHSERV_ID_SENTINEL`].
+pub const TOPMOST_AUTHSERV_ID_PREFIX: &str = "!topmost:";
 
 pub(crate) const DEFAULT_IMAP_MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
 pub(crate) const DEFAULT_IMAP_MAX_PAGE_BYTES: usize = 50 * 1024 * 1024;
@@ -41,16 +87,39 @@ pub enum TrustAnchor {
     /// literal (and, for a typo, non-matching) `authserv-id` -- there is no
     /// input that silently falls back to this mode.
     TopmostNoAuthservId,
+    /// A boundary whose own topmost stamp carries an `authserv-id` that other
+    /// boundaries share (e.g. Exchange Online's `mx.microsoft.com`), so the id
+    /// cannot identify this boundary and position stays the discriminator
+    /// (ADR-056 Amendment 2026-10-15): trust the topmost header only, and only
+    /// if it carries this `authserv-id` (case-insensitive) or none. Selected
+    /// by [`TOPMOST_AUTHSERV_ID_PREFIX`] followed by the id.
+    TopmostWithAuthservId(String),
 }
 
 impl TrustAnchor {
     /// Parse the raw `KHIVE_EMAIL_AUTHSERV_ID` value into a `TrustAnchor`.
-    fn parse(raw: String) -> Self {
+    ///
+    /// A `!topmost:` value whose id is empty, or contains whitespace, a
+    /// control character or `;`, cannot equal any parsed `authserv-id` and is
+    /// refused at construction instead of quarantining all mail silently.
+    fn parse(raw: String) -> Result<Self, ChannelError> {
         if raw == TOPMOST_NO_AUTHSERV_ID_SENTINEL {
-            TrustAnchor::TopmostNoAuthservId
-        } else {
-            TrustAnchor::AuthservId(raw)
+            return Ok(TrustAnchor::TopmostNoAuthservId);
         }
+        if let Some(id) = raw.strip_prefix(TOPMOST_AUTHSERV_ID_PREFIX) {
+            if id.is_empty()
+                || id
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == ';')
+            {
+                return Err(ChannelError::Config(format!(
+                    "KHIVE_EMAIL_AUTHSERV_ID {raw:?}: {TOPMOST_AUTHSERV_ID_PREFIX} must be followed \
+                     by one authserv-id token (no whitespace, control characters or ';')"
+                )));
+            }
+            return Ok(TrustAnchor::TopmostWithAuthservId(id.to_string()));
+        }
+        Ok(TrustAnchor::AuthservId(raw))
     }
 }
 
@@ -144,8 +213,8 @@ pub struct EmailChannelConfig {
     /// shape). Required: there is no safe default that would not either
     /// trust an attacker-controlled id or silently accept unauthenticated
     /// mail, so a missing value fails config construction rather than
-    /// falling back to an open default. See [`TrustAnchor`] and
-    /// [`TOPMOST_NO_AUTHSERV_ID_SENTINEL`].
+    /// falling back to an open default. See [`TrustAnchor`],
+    /// [`TOPMOST_NO_AUTHSERV_ID_SENTINEL`] and [`TOPMOST_AUTHSERV_ID_PREFIX`].
     pub trust_anchor: TrustAnchor,
     /// Whether a message that fails the attribution gate (domain authentication
     /// or sender allowlist) is stored as an unattributed quarantine record
@@ -250,7 +319,7 @@ impl EmailChannelConfig {
         }
 
         let authserv_id_raw = require_nonempty_env("KHIVE_EMAIL_AUTHSERV_ID")?;
-        let trust_anchor = TrustAnchor::parse(authserv_id_raw);
+        let trust_anchor = TrustAnchor::parse(authserv_id_raw)?;
         let quarantine_store = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE", true)?;
         let quarantine_max_retained = optional_count(
             "KHIVE_EMAIL_QUARANTINE_MAX_RETAINED",
@@ -916,7 +985,7 @@ mod tests {
     #[test]
     fn trust_anchor_parses_exact_sentinel_to_topmost_no_authserv_id() {
         assert_eq!(
-            TrustAnchor::parse(TOPMOST_NO_AUTHSERV_ID_SENTINEL.to_string()),
+            TrustAnchor::parse(TOPMOST_NO_AUTHSERV_ID_SENTINEL.to_string()).unwrap(),
             TrustAnchor::TopmostNoAuthservId
         );
     }
@@ -928,9 +997,51 @@ mod tests {
         // literal (and therefore non-matching, fail-closed) authserv-id.
         let typo = "!topmost-no-authserv".to_string();
         assert_eq!(
-            TrustAnchor::parse(typo.clone()),
+            TrustAnchor::parse(typo.clone()).unwrap(),
             TrustAnchor::AuthservId(typo)
         );
+    }
+
+    // ── `!topmost:<authserv-id>` parsing (Amendment 2026-10-15) ──────────────
+
+    #[test]
+    fn trust_anchor_parses_topmost_prefix_to_topmost_with_authserv_id() {
+        assert_eq!(
+            TrustAnchor::parse("!topmost:mx.microsoft.com".to_string()).unwrap(),
+            TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string())
+        );
+    }
+
+    #[test]
+    fn trust_anchor_topmost_prefix_without_a_usable_id_fails_construction() {
+        for bad in [
+            "!topmost:",
+            "!topmost: mx.microsoft.com",
+            "!topmost:mx.microsoft.com 1",
+            "!topmost:mx.microsoft.com;",
+            "!topmost:mx.microsoft.com\t",
+        ] {
+            let error = TrustAnchor::parse(bad.to_string())
+                .expect_err("an unusable !topmost: id must fail construction")
+                .to_string();
+            assert!(error.contains("KHIVE_EMAIL_AUTHSERV_ID"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn trust_anchor_prefix_lookalikes_stay_literal_authserv_ids() {
+        // Only the exact prefix selects the positional mode; anything else is
+        // a literal (and, in practice, non-matching) authserv-id.
+        for literal in [
+            "!topmost-no-authserv",
+            "!Topmost:mx.microsoft.com",
+            "topmost:mx.microsoft.com",
+        ] {
+            assert_eq!(
+                TrustAnchor::parse(literal.to_string()).unwrap(),
+                TrustAnchor::AuthservId(literal.to_string())
+            );
+        }
     }
 
     #[test]
@@ -961,6 +1072,45 @@ mod tests {
 
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
         assert_eq!(config.trust_anchor, TrustAnchor::TopmostNoAuthservId);
+    }
+
+    #[test]
+    fn from_env_topmost_prefix_selects_topmost_with_authserv_id_mode() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "!topmost:mx.microsoft.com");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+
+        let config = EmailChannelConfig::from_env().expect("valid config must succeed");
+        assert_eq!(
+            config.trust_anchor,
+            TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string())
+        );
+
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "!topmost:");
+        let error = EmailChannelConfig::from_env()
+            .expect_err("an empty !topmost: id must fail config construction")
+            .to_string();
+        assert!(error.contains("KHIVE_EMAIL_AUTHSERV_ID"), "got: {error}");
     }
 
     #[test]
@@ -1018,4 +1168,5 @@ mod tests {
             .expect("a message ceiling equal to the blob object ceiling is accepted");
         assert_eq!(config.imap_max_message_bytes, MAX_IMAP_MESSAGE_BYTES);
     }
+    include!("config/external_inbound_tests.rs");
 }

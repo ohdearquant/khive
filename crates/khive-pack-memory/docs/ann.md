@@ -250,6 +250,38 @@ recall to re-resolve against — the registry guard rejects the candidate while 
 and that ordering ensures no old bridge remains observable after the watermark advances and
 its intervening tail can be deleted.
 
+## Exact session boundary order
+
+Named-vector search and the session exact arm order raw cosine distance ascending,
+then canonical subject UUID ascending, before each candidate limit. Equal scores after
+score conversion do not imply equal raw distances.
+
+Named-vector search keeps the sqlite-vec MATCH query, with namespace, model and kind
+applied before sqlite-vec's top-k. MATCH orders by distance alone, so the query asks
+for one row more than the limit and doubles that window until the last row returned
+is strictly farther than the boundary row, or the eligible rows run out. The rows are
+then ordered by distance and subject UUID and cut to the limit, so a tie at the
+boundary never depends on table order. A window past MATCH's 4096-neighbor cap uses
+`vec_distance_cosine` over every eligible row instead.
+
+The session exact arm uses `vec_distance_cosine(stored_embedding, query_embedding)`
+over the eligible rows; it does not sort a previously truncated MATCH result.
+
+The session arm keeps the receipt proof, per-namespace materialization, live-note
+join and final projection in one reader statement. Namespace/model/kind/field
+filters precede the per-namespace limit. Missing, deleted or namespace-mismatched
+notes are dropped afterward, without pulling in replacements from beyond that
+limit. Duplicate visible namespaces do not duplicate candidates.
+
+The session arm's scalar scan loses sqlite-vec's chunk-oriented KNN optimization and may cost
+more for large tables. It also bypasses MATCH's internal 4096-neighbor cap; the
+existing nonnegative limit is passed through without a new clamp. Dimension and
+finite-component checks remain, but finite coordinates do not guarantee a defined
+cosine (for example, zero norm or overflow). Invalid distances still fail rather
+than being converted into successful hits; SQL error details may differ from MATCH.
+Native numerical, reopen, query-plan and representative-size cost checks are
+required before accepting this implementation; no performance equivalence is claimed.
+
 ## ADR-118 fresh-tail exact leg
 
 `fresh_tail_leg` gives recall read-your-writes visibility on top of a possibly-stale ANN

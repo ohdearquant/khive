@@ -327,3 +327,31 @@ fn missing_vacuum_estimate_refuses_even_under_a_zero_reserve() {
         .check()
         .expect("an ordinary write is not asked for the estimate");
 }
+
+#[cfg(unix)]
+#[test]
+fn write_unit_volume_checks_read_the_existing_database_without_resolving_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let locks = dir.path().join("locks");
+    std::fs::write(dir.path().join("present.db"), []).unwrap();
+    let admission = admission_with_probe(dir.path(), "present.db", u64::MAX, &locks);
+    let before = crate::disk_guard::resolves_on_this_thread();
+    for _ in 0..10 {
+        admission.check().unwrap();
+        let lease = admission.acquire().unwrap().expect("real volume lease");
+        drop(lease);
+        admission.volume_identity().unwrap();
+    }
+    assert_eq!(
+        crate::disk_guard::resolves_on_this_thread() - before,
+        0,
+        "an existing database answers the volume check with one stat"
+    );
+
+    // Control: a database file that does not exist yet still takes the full
+    // resolve, once per check, on this same counter.
+    let absent = admission_with_probe(dir.path(), "absent.db", u64::MAX, &locks);
+    let before = crate::disk_guard::resolves_on_this_thread();
+    absent.check().unwrap();
+    assert_eq!(crate::disk_guard::resolves_on_this_thread() - before, 2);
+}

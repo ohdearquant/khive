@@ -476,7 +476,14 @@ async fn prepare_email(
         }
     }
     let normalized_recipient = khive_types::email_address::normalize_email_recipient(&recipient);
-    if !runtime.outbound_email_policy().allows(&recipient) {
+    let email_policy = runtime.outbound_email_policy();
+    let policy_recipient = email_policy.allows(&recipient);
+    let external_sender = props
+        .get("from_actor")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|actor| email_policy.allows_external_sender(actor));
+    let external_recipient = !policy_recipient && external_sender && normalized_recipient.is_some();
+    if !policy_recipient && !external_recipient {
         // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
         // must be recorded — skipping with only a log line leaves the row
         // pending forever while the sender saw `ok: true`.
@@ -507,6 +514,101 @@ async fn prepare_email(
             ),
         }
         return Ok(None);
+    }
+
+    if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
+        let suppressions = khive_pack_comm::handlers::load_outbound_email_suppressions(runtime)
+            .await
+            .map_err(|error| {
+                crate::components::ComponentError::Retryable(format!(
+                    "outbound email suppression check is unavailable: {error}"
+                ))
+            })?;
+        let recipient_key = email_policy.recipient_key(normalized);
+        if khive_runtime::outbound_email_is_suppressed(
+            normalized,
+            recipient_key.as_deref(),
+            &suppressions,
+        ) {
+            let failed_at = Utc::now().to_rfc3339();
+            let last_error = "external recipient suppressed by outbound email suppression policy";
+            runtime
+                .mark_outbound_message_failed(token, note.id, failed_at, last_error.to_string())
+                .await
+                .map_err(|error| {
+                    crate::components::ComponentError::Retryable(format!(
+                        "suppressed outbound email could not be marked failed: {error}"
+                    ))
+                })?;
+            tracing::warn!(target: "khive_mcp::serve", note_id = %note_id,
+                recipient = %normalized,
+                "outbox loop: external recipient is suppressed; recorded permanent failure"
+            );
+            return Ok(None);
+        }
+    }
+
+    // ADR-200 §5.3: a message admitted under an earlier configuration may reach delivery
+    // after the footer or the unsubscribe keys became unavailable. Fail it permanently,
+    // naming the condition, without touching SMTP.
+    let mut external_list_unsubscribe: Option<String> = None;
+    let mut external_footer: Option<String> = None;
+    if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
+        let footer = match email_policy.external_footer() {
+            Some(Ok(text)) => text.to_string(),
+            Some(Err(reason)) => {
+                let last_error = format!("external email footer is unavailable: {reason}");
+                let failed_at = Utc::now().to_rfc3339();
+                runtime
+                    .mark_outbound_message_failed(token, note.id, failed_at, last_error.clone())
+                    .await
+                    .map_err(|error| {
+                        crate::components::ComponentError::Retryable(format!(
+                            "unavailable external footer could not be recorded as a failure: {error}"
+                        ))
+                    })?;
+                tracing::warn!(target: "khive_mcp::serve", note_id = %note_id,
+                    "outbox loop: external email footer unavailable; recorded permanent failure"
+                );
+                return Ok(None);
+            }
+            None => {
+                let last_error = "external email configuration is unavailable";
+                let failed_at = Utc::now().to_rfc3339();
+                runtime
+                    .mark_outbound_message_failed(token, note.id, failed_at, last_error.to_string())
+                    .await
+                    .map_err(|error| {
+                        crate::components::ComponentError::Retryable(format!(
+                            "unavailable external configuration could not be recorded as a failure: {error}"
+                        ))
+                    })?;
+                return Ok(None);
+            }
+        };
+        let Some(token_value) = email_policy.mint_unsubscribe_token(normalized) else {
+            let last_error = "external email unsubscribe keys are unavailable";
+            let failed_at = Utc::now().to_rfc3339();
+            runtime
+                .mark_outbound_message_failed(token, note.id, failed_at, last_error.to_string())
+                .await
+                .map_err(|error| {
+                    crate::components::ComponentError::Retryable(format!(
+                        "unavailable unsubscribe keys could not be recorded as a failure: {error}"
+                    ))
+                })?;
+            tracing::warn!(target: "khive_mcp::serve", note_id = %note_id,
+                "outbox loop: external unsubscribe keys unavailable; recorded permanent failure"
+            );
+            return Ok(None);
+        };
+        external_list_unsubscribe = Some(format!(
+            "<mailto:{mailbox}?subject=unsubscribe%20{token_value}>"
+        ));
+        let instruction = format!(
+            "To unsubscribe, send an email to {mailbox} with the subject: unsubscribe {token_value}"
+        );
+        external_footer = Some(footer.replace("{unsubscribe}", &instruction));
     }
 
     let subject = props
@@ -572,6 +674,13 @@ async fn prepare_email(
         }
     };
 
+    // External messages append the operator's footer with the mailto instruction rendered
+    // into `{unsubscribe}`, and carry the List-Unsubscribe mailto header. Policy-recipient
+    // messages get neither.
+    let content = match external_footer {
+        Some(footer) => format!("{content}\n\n{footer}"),
+        None => content,
+    };
     let mut envelope = ChannelEnvelope::new(
         format!("email:{mailbox}"),
         format!("email:{recipient}"),
@@ -579,6 +688,9 @@ async fn prepare_email(
     )
     .with_subject(subject)
     .with_message_id(message_id.clone());
+    if let Some(list_unsubscribe) = external_list_unsubscribe {
+        envelope = envelope.with_list_unsubscribe(list_unsubscribe);
+    }
     if let Some(thread_id) = thread_id {
         envelope = envelope.with_correlation(thread_id);
     }

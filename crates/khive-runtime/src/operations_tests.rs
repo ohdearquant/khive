@@ -156,6 +156,63 @@ async fn resolve_prefix_query_plan_uses_primary_key_range_seeks() {
     );
 }
 
+#[tokio::test]
+async fn resolve_prefix_query_plan_seeks_id_range_with_namespace_filter() {
+    let rt = rt();
+    let mut reader = rt.sql().reader().await.expect("prefix plan reader");
+    let mut plans = Vec::new();
+    let (lower, upper) = super::uuid_prefix_bounds("0b6cf134").expect("valid compact UUID prefix");
+    let namespaces = vec!["local".to_string(), "other".to_string()];
+
+    // The index each table must seek: the primary-key/rowid autoindex for the
+    // TEXT-PRIMARY-KEY tables, and the unique id index for `graph_edges` whose
+    // PRIMARY KEY is `(namespace, id)`.
+    for (table, has_deleted_at, expected_index) in [
+        ("entities", true, "sqlite_autoindex_entities_1"),
+        ("notes", true, "sqlite_autoindex_notes_1"),
+        ("events", false, "sqlite_autoindex_events_1"),
+        ("graph_edges", false, "idx_graph_edges_id_unique"),
+    ] {
+        let rows = reader
+            .explain(super::resolve_prefix_statement(
+                table,
+                has_deleted_at,
+                false,
+                Some(namespaces.as_slice()),
+                &lower,
+                &upper,
+            ))
+            .await
+            .expect("explain prefix query");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        plans.push((table, expected_index, details));
+    }
+
+    assert!(
+        plans.iter().all(|(table, expected_index, details)| {
+            details.iter().any(|detail| {
+                detail.contains(&format!("SEARCH {table} USING INDEX {expected_index}"))
+                    && detail.contains("id>?")
+                    && detail.contains("id<?")
+            }) && !details
+                .iter()
+                .any(|detail| detail.contains(&format!("SCAN {table}")))
+                && !details
+                    .iter()
+                    .any(|detail| detail.contains("idx_entities_namespace")
+                        || detail.contains("idx_notes_namespace")
+                        || detail.contains("idx_events_ns_created_id"))
+        }),
+        "a namespace-scoped short-id lookup must seek the id range, not a namespace index: {plans:?}"
+    );
+}
+
 #[test]
 fn fts_fault_arm_disarms_namespace_when_scope_panics() {
     let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());

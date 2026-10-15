@@ -24,6 +24,9 @@ pub enum KgCommand {
     #[command(visible_alias = "sync")]
     Fetch(FetchArgs),
 
+    /// Resolve a remote Git ref and update its commit in `.khive/kg/schema.yaml`.
+    Update(UpdateArgs),
+
     /// Export a namespace-scoped KG archive from a SQLite DB.
     Export(ExportArgs),
 
@@ -45,6 +48,21 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+/// CLI arguments for `kkernel kg update`.
+#[derive(clap::Parser, Debug)]
+pub struct UpdateArgs {
+    /// Remote name in `.khive/kg/schema.yaml`.
+    pub remote: String,
+
+    /// Repository containing `.khive/kg/schema.yaml`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Git ref to resolve; defaults to the remote's `ref`, then its HEAD.
+    #[arg(long = "ref")]
+    pub git_ref: Option<String>,
 }
 
 /// CLI arguments for the read-only `kkernel kg diff` renderer.
@@ -442,26 +460,7 @@ pub struct ValidationReport {
     pub summary: ValidationSummary,
 }
 
-/// Result for a single validation rule in a `kkernel kg validate` run.
-#[derive(Debug, Serialize)]
-pub struct RuleResult {
-    pub id: String,
-    pub severity: &'static str,
-    pub passed: bool,
-    pub violations: Vec<Violation>,
-}
-
-/// A single rule violation with location metadata and a fixability flag.
-#[derive(Debug, Serialize)]
-pub struct Violation {
-    pub entity_id: Option<String>,
-    pub entity_name: Option<String>,
-    pub entity_kind: Option<String>,
-    pub rule_id: String,
-    pub severity: &'static str,
-    pub message: String,
-    pub fixable: bool,
-}
+pub use khive_rule_evaluator::{RuleResult, Violation};
 
 /// Aggregate counts from a `kkernel kg validate` run.
 #[derive(Debug, Serialize)]

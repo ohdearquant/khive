@@ -82,7 +82,7 @@ effect of listing backends.
   `~/.khive`").
 - **Config / namespace resolution parity with `kkernel mcp`**: `reindex` calls the exact same
   `khive_mcp::serve::resolve_runtime_config` function that `kkernel mcp` uses to build its
-  `RuntimeConfig` (`reindex.rs:498-525`, `khive-mcp/src/serve.rs:1259-1266`, the doc comment on
+  `RuntimeConfig` (`reindex.rs:498-525`, `khive-mcp/src/serve/runtime_config.rs`, the doc comment on
   that function states it was "extracted from `build_server` so `kkernel reindex` reuses the exact
   engine and db resolution, otherwise an admin reindex writes vectors for the default/env model
   set while the MCP server serves recall from the config-file `[[engines]]` set"). The precedence

@@ -154,12 +154,11 @@ impl From<NoteFence> for NoteFences {
 
 impl NoteFences {
     fn validate_count(count: usize) -> RuntimeResult<()> {
-        if count > MAX_NOTE_FENCES {
-            return Err(RuntimeError::InvalidInput(format!(
+        crate::note_validation::validate_fence_count(count, MAX_NOTE_FENCES, || {
+            format!(
                 "fence list admits at most {MAX_NOTE_FENCES} entries; this call sent {count}: each fence is a read taken while holding the writer"
-            )));
-        }
-        Ok(())
+            )
+        })
     }
 
     pub fn entries(&self) -> &[NoteFence] {

@@ -104,7 +104,7 @@ pub(super) enum FallbackSeverity {
     NoDaemon,
 }
 
-/// `KHIVE_DAEMON_STRICT=1` has two independent effects:
+/// Strict mode has two independent effects:
 ///
 /// - Behavior: [`fallback_or_reject`] rejects every [`FallbackReason`] instead
 ///   of completing the request locally, regardless of severity (#947).
@@ -113,10 +113,64 @@ pub(super) enum FallbackSeverity {
 ///   tiers remain WARN-level `daemon_fallback` events and do not increment
 ///   `FALLBACK_STRICT_VIOLATIONS`.
 ///
-/// Plain opt-in, default OFF — no hosted-vs-local auto-detection exists. See
+/// `KHIVE_DAEMON_STRICT` is a tri-state (ADR-049 Amendment 14 §2): an explicit
+/// false value (`0`, `false`, `no`, `off`, any case) is not strict, any other
+/// non-empty value is strict, and unset or empty is strict exactly when a
+/// daemon rendezvous was on disk when the request entered the forward path or
+/// is on disk at the moment of the decision: the resolved socket path or PID
+/// file exists. With neither, Amendment 2's quiet `no_socket` fallback
+/// applies. Every reader of strict mode goes through this function. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub(super) fn is_daemon_strict_mode() -> bool {
-    env_truthy("KHIVE_DAEMON_STRICT")
+    strict_env_setting().unwrap_or_else(daemon_rendezvous_seen)
+}
+
+tokio::task_local! {
+    /// Whether a daemon rendezvous was on disk when this request entered the
+    /// forward path. Recovery removes a dead daemon's socket and PID file
+    /// before it respawns, so a reading taken only at the fallback decision
+    /// would treat a host whose daemon just died like a host that never ran
+    /// one.
+    static RENDEZVOUS_AT_ADMISSION: bool;
+}
+
+/// Run one forward with the rendezvous reading taken now, before any recovery
+/// step can remove a stale socket or PID file.
+pub(super) async fn with_rendezvous_admission_snapshot<F: std::future::Future>(
+    forward: F,
+) -> F::Output {
+    RENDEZVOUS_AT_ADMISSION
+        .scope(daemon_rendezvous_present(), forward)
+        .await
+}
+
+fn daemon_rendezvous_seen() -> bool {
+    RENDEZVOUS_AT_ADMISSION
+        .try_with(|present| *present)
+        .unwrap_or(false)
+        || daemon_rendezvous_present()
+}
+
+/// The explicit `KHIVE_DAEMON_STRICT` setting, or `None` when it is unset or
+/// empty. A value that is not one of the false spellings is strict, including
+/// a value that is not valid Unicode, so a typo fails closed.
+fn strict_env_setting() -> Option<bool> {
+    let raw = std::env::var_os("KHIVE_DAEMON_STRICT")?;
+    let value = raw.to_string_lossy();
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        !["0", "false", "no", "off"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off)),
+    )
+}
+
+/// Whether this client's resolved daemon socket path or PID file exists.
+fn daemon_rendezvous_present() -> bool {
+    khive_runtime::daemon::socket_path().exists() || khive_runtime::daemon::pid_path().exists()
 }
 
 /// `khive_daemon_fallback_total{reason="config_mismatch"}`
@@ -143,6 +197,54 @@ static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
 static FALLBACK_STRICT_VIOLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Phase of a `daemon_slow` refusal (ADR-049 Amendment 14 §3): the daemon is
+/// alive but did not answer in time. A refusal, never a fallback, so it is not
+/// part of the fallback counters or `fallback_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonSlowPhase {
+    /// The boot-fence identity probe timed out; nothing was written.
+    BeforeDispatch,
+    /// The response read timed out after the request frame was fully written.
+    AfterWrite,
+}
+
+impl DaemonSlowPhase {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            DaemonSlowPhase::BeforeDispatch => "before_dispatch",
+            DaemonSlowPhase::AfterWrite => "after_write",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicUsize {
+        match self {
+            DaemonSlowPhase::BeforeDispatch => &DAEMON_SLOW_BEFORE_DISPATCH,
+            DaemonSlowPhase::AfterWrite => &DAEMON_SLOW_AFTER_WRITE,
+        }
+    }
+}
+
+/// `daemon_slow` refusals with `phase: "before_dispatch"` in this bridge process.
+static DAEMON_SLOW_BEFORE_DISPATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `daemon_slow` refusals with `phase: "after_write"` in this bridge process.
+static DAEMON_SLOW_AFTER_WRITE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count one `daemon_slow` refusal. Called once per refusal, where its error is
+/// built; never through [`record_fallback`].
+pub(super) fn record_daemon_slow(phase: DaemonSlowPhase) {
+    phase
+        .counter()
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct BridgeDaemonSlow {
+    before_dispatch: usize,
+    after_write: usize,
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct BridgeFallbackReasons {
     config_mismatch: usize,
@@ -159,6 +261,7 @@ pub(crate) struct BridgeDiagnosticsSnapshot {
     fallback_reasons: BridgeFallbackReasons,
     fallback_total: usize,
     strict_violations: usize,
+    daemon_slow: BridgeDaemonSlow,
 }
 
 pub(crate) fn bridge_diagnostics_snapshot() -> Option<BridgeDiagnosticsSnapshot> {
@@ -187,6 +290,10 @@ pub(crate) fn bridge_diagnostics_snapshot() -> Option<BridgeDiagnosticsSnapshot>
         fallback_reasons,
         fallback_total,
         strict_violations: FALLBACK_STRICT_VIOLATIONS.load(SeqCst),
+        daemon_slow: BridgeDaemonSlow {
+            before_dispatch: DAEMON_SLOW_BEFORE_DISPATCH.load(SeqCst),
+            after_write: DAEMON_SLOW_AFTER_WRITE.load(SeqCst),
+        },
     })
 }
 
@@ -232,6 +339,8 @@ pub(crate) fn reset_fallback_counters() {
     FALLBACK_PARSE_FAILURE.store(0, SeqCst);
     FALLBACK_PROTOCOL_MISMATCH.store(0, SeqCst);
     FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
+    DAEMON_SLOW_BEFORE_DISPATCH.store(0, SeqCst);
+    DAEMON_SLOW_AFTER_WRITE.store(0, SeqCst);
 }
 
 pub(super) fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static str {
@@ -326,8 +435,9 @@ pub(super) fn fallback_or_reject(
     if is_daemon_strict_mode() {
         return Some(Err(daemon_mcp_error(
             format!(
-                "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={}; \
-                 refusing to complete the request via local dispatch",
+                "daemon fallback rejected in strict mode (KHIVE_DAEMON_STRICT, or a daemon \
+                 socket or PID file on disk): reason={}; refusing to complete the request \
+                 via local dispatch",
                 reason.as_str()
             ),
             Some(serde_json::json!({

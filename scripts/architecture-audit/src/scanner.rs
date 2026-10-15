@@ -754,10 +754,8 @@ impl<'ast> Visit<'ast> for References<'_> {
             } else if self.observed.is_some() && sql_looking(&mac.tokens) {
                 self.error("unsupported SQL-looking expression macro arguments");
             }
-        } else if self.observed.is_some() {
-            if sql_looking(&mac.tokens) {
-                self.error("SQL-looking opaque or unresolved macro input");
-            }
+        } else if self.observed.is_some() && sql_looking(&mac.tokens) {
+            self.error("SQL-looking opaque or unresolved macro input");
         }
     }
 }
@@ -1024,6 +1022,11 @@ fn flatten(body: &str) -> String {
                 chars.next();
                 out.push(' ');
             }
+            // Decode literal quote/backslash without turning a following n into whitespace.
+            Some(escaped @ ('"' | '\\')) => {
+                chars.next();
+                out.push(escaped);
+            }
             // A line continuation, or any other escape: the backslash goes,
             // what follows is kept and judged on its own.
             _ => out.push(' '),
@@ -1041,7 +1044,8 @@ pub(super) fn sql_literals(text: &str) -> Vec<String> {
             "WITH ",
             &[" AS (", " AS MATERIALIZED (", " AS NOT MATERIALIZED ("],
         ),
-        ("SELECT ", &[" FROM "]),
+        // Zero-argument scalar calls with an AS alias need no FROM clause.
+        ("SELECT ", &[" FROM ", "() AS "]),
         ("INSERT ", &["INSERT INTO ", "INSERT OR "]),
         ("UPDATE ", &[" SET "]),
         ("DELETE ", &["DELETE FROM "]),
@@ -1220,7 +1224,7 @@ fn sql_looking(tokens: &proc_macro2::TokenStream) -> bool {
         proc_macro2::TokenTree::Literal(value) => syn::parse_str::<syn::LitStr>(&value.to_string())
             .is_ok_and(|s| {
                 let value = s.value();
-                let first = value.trim_start().split_whitespace().next().unwrap_or("");
+                let first = value.split_whitespace().next().unwrap_or("");
                 [
                     "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "WITH",
                     "REPLACE", "PRAGMA",
