@@ -25,6 +25,61 @@ cargo test -p khive-pack-knowledge --test bench \
   benchmark_knowledge_search_warm_latency -- --ignored --nocapture
 ```
 
+## Inline ANN build runtime measurement
+
+The ignored `measure_inline_ann_build_tick_gap` test measures the real
+`load_and_build_from_vector_store` path on a Tokio runtime with two workers,
+while a separate task ticks every 10 ms. It uses an isolated temporary database,
+the existing local test embedder, and deterministic normalized 384-dimensional
+vectors. It does not download an embedding model. Database creation and corpus
+seeding finish before the timing window.
+
+Run from the repository root on the machine where the result will be evaluated:
+
+```bash
+KHIVE_ANN_MEASUREMENT_ROWS=4096 cargo test --manifest-path crates/Cargo.toml \
+  -p khive-pack-knowledge --lib --release \
+  knowledge::vamana::tests::runtime_measurement::measure_inline_ann_build_tick_gap \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+Capture the `ANN_RUNTIME_MEASUREMENT` JSON line with the commit SHA, toolchain,
+CPU, operating system, available memory, exact command, and concurrent machine
+load. The test reports a 20-tick baseline, the elapsed scan-and-build time, the
+number of observed ticks, and the largest gap between ticks. The measured build
+is spawned onto a runtime worker because the async test body itself executes on
+Tokio's `block_on` thread. The ticker records its first tick after completion
+before stopping, so a stall at the end cannot disappear from the report. Its
+window includes dispatch and completion notification overhead. Missed ticks are
+skipped rather than replayed as a burst.
+
+The default corpus has 4,096 rows. `KHIVE_ANN_MEASUREMENT_ROWS` accepts 1 through
+32,768 rows; the upper limit represents 48 MiB of raw vector data before SQLite,
+scan buffers, and index overhead. Each invocation seeds one corpus and performs
+one build. There is no automatic growth or retry loop. Start at the default and,
+if `exceeds_one_second` is false, increase the row count within the limit and run
+again. A run that does not exceed one second is insufficient for the requested
+measurement. If even the limit is too fast, record that limitation instead of
+claiming the requirement was met. Resource limits bound the corpus, not runtime;
+the build remains synchronous CPU work on a worker during this measurement.
+
+The instrument makes no timing pass/fail assertion and no automatic stall
+classification. Compare the recorded maximum gap with the 10 ms target and the
+baseline, and repeat qualifying runs to distinguish machine noise. A small gap
+only shows that this ticker stayed responsive: the second worker may service it
+while the build occupies the first. The elapsed time includes the vector-store
+scan, so it does not isolate graph construction time. Record those limitations
+with the observed result in issue #4491 before choosing a production scheduling
+change. No native result is recorded here yet.
+
+To run the small deterministic checks for corpus bounds, vector generation, and
+delayed tick accounting separately:
+
+```bash
+cargo test --manifest-path crates/Cargo.toml -p khive-pack-knowledge --lib \
+  knowledge::vamana::tests::runtime_measurement:: -- --test-threads=1
+```
+
 ## Environment
 
 - Toolchain: stable (as specified in workspace `rust-toolchain.toml`)
