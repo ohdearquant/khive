@@ -1,6 +1,6 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-10-14 -- every inbound page hold is bounded; amended 2026-09-27 -- channel-scoped external-ID deduplication;
+**Status**: Accepted (amendment 2026-10-15 proposed -- operator notices for messages and originals the channel could not keep; amended 2026-10-14 -- every inbound page hold is bounded; amended 2026-09-27 -- channel-scoped external-ID deduplication;
 amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
 amended 2026-09-25 -- `external_id` on a message note is transport-owned at creation; amended 2026-09-25 --
 inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
@@ -8,6 +8,7 @@ inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine healt
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-10-15, operator notices](#amendment-2026-10-15----operator-notices-for-messages-and-originals-the-channel-could-not-keep),
 [§Amendment 2026-10-14, bounded page holds](#amendment-2026-10-14----every-inbound-page-hold-is-bounded),
 [§Amendment 2026-09-27, channel-scoped external-ID deduplication](#amendment-2026-09-27----channel-scoped-external-id-deduplication),
 [§Amendment 2026-09-25, Telegram outbound delivery](#amendment-2026-09-25----telegram-outbound-delivery-is-at-least-once-without-deduplication),
@@ -21,7 +22,7 @@ identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
 [§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25, 2026-09-27, 2026-10-14)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09, 2026-09-25, 2026-09-27, 2026-10-14, 2026-10-15 proposed)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -35,7 +36,139 @@ statement; its SessionStore design was not carried forward\
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
 #1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment), #5345 (unbounded
-page holds -- resolved by the 2026-10-14 amendment)
+page holds -- resolved by the 2026-10-14 amendment), #5364 and #5404 (operator notices -- addressed by the
+2026-10-15 operator-notices amendment)
+
+## Amendment 2026-10-15 -- Operator notices for messages and originals the channel could not keep
+
+**Status**: Proposed 2026-10-15.
+
+**Trigger.** #5364 and #5404. The 2026-10-14 amendment bounds every page hold and records holds on the heartbeat,
+but nothing tells anyone. A message the channel accepted and then could not record, and a quarantined email whose
+original bytes could not be kept, are visible only to someone who polls `comm.health`, and the second not even
+there: no health field records a lost original. #5404 records a host below the blob store's free-space floor, where
+every quarantined original is refused and the only trace is a log warning per message for as long as the host
+stays below the floor.
+
+**Context.** Two conditions lose something:
+
+1. _An accepted message quarantined._ `comm.ingest` refused a message the channel accepted (not gate-quarantined),
+   either as `Permanent`, which is quarantined at once, or until its failed polls reached the bound, and the poller
+   recorded it as `<kind>:quarantine` instead of delivering it (2026-10-14 amendment, decisions 2 and 3). Both the
+   email and the Telegram loop reach this through the shared ingest-failure path. The email loop's
+   `quarantined_after_hold` count also includes gate-quarantined mail whose original could not be stored past the
+   bound; that mail was never going to be delivered, so it is not this condition.
+2. _A quarantine record without its original._ The record carries `quarantine_original_retained = "false"` and a
+   `quarantine_original_not_retained_reason`. The reasons are `retention-limit` (the configured cap on retained
+   originals is reached), and five failures: `original-unavailable`, `retention-count-unreadable`,
+   `original-store-failed`, `quarantine-write-failed`, and `secondary-backend`, which `comm.ingest` itself writes
+   when it drops the original's reference on a secondary backend (#5405). The poller does not learn about that last
+   one today: `comm.ingest` returns an ordinary receipt.
+
+Authentication and malformed quarantines (`auth-absent`, `dmarc-fail`, `unaligned`, `off-allowlist`,
+`missing-body`, `parse-failure`, `too-large`) are rejections of mail the channel did not accept. A rejection never
+notifies: a notice per rejected message would let any sender flood the operator's inbox. A rejected message whose
+original is lost does take part in the lost-original run of decision 5, whose notices are bounded per credential and
+per hour whatever arrives.
+
+**Decision.**
+
+1. _One setting._ `KHIVE_CHANNEL_NOTIFY_ACTOR` names the actor that receives channel notices, for every channel
+   loop in the daemon. Unset or blank: no notice is sent and behaviour is unchanged. The value must be an actor id
+   without whitespace or control characters whose kind is not a channel transport (`email:`, `telegram:`,
+   `imessage:`): a notice must not depend on the transport that may be failing, and must not be able to arrive
+   back through it. An invalid value disables notices only. It is logged at error level when the channel loops
+   start, the loops start normally, and every email success heartbeat carries `notice_config_error` naming the
+   problem, so `comm.health` shows it. Telegram writes no heartbeat, so there it is visible in the log only.
+2. _How a notice is sent._ `comm.send` dispatched by the poll loop with the identity `channel:<kind>`
+   (`channel:email`, `channel:telegram`) in that channel's ingest namespace, with `self_send: true` so a notify actor
+   equal to the channel actor is accepted. It never reads as coming from the maintainer or the message's sender.
+3. _What a notice carries._ Only values from closed sets or produced by the daemon: channel kind and slug, the
+   record's external id, the quarantine record id (`full_id` from the `comm.ingest` receipt), the ingest failure
+   class and reason tokens (`ChannelIngestFailureClass::name()` and `reason()`), the not-retained reason token, the
+   failed-poll count, and for a lost original the channel credential's running total from the heartbeat row. It
+   never carries error text (`quarantine_original_error` or any error's display string, which can quote rejected
+   input), the message body, subject, sender address, or any header value: those are untrusted, and the notify actor
+   is often an agent.
+4. _Which records count._ A record counts only when the `comm.ingest` call that wrote it (the fallback write
+   without the original's reference included) returns `deduplicated: false`. A re-poll of the same uid, after a crash
+   before the cursor committed, a restart, or a later message holding the page, meets the channel-scoped
+   deduplication of the 2026-09-27 amendment and changes nothing: no notice, no count, no change of run state. This
+   gating applies to the existing `quarantined_after_hold` count as well: today a message already quarantined can be
+   counted again when a later message holds the page and the page is polled again. Whether a record kept its
+   original is read from the receipt: `comm.ingest` returns `quarantine_original_retained` and, when false,
+   `quarantine_original_not_retained_reason` for every new quarantine record, so a drop inside `comm.ingest`
+   (`secondary-backend`) is seen like any other.
+5. _When a notice is sent._ Delivery is at most once per record: a crash between the record and the notice loses
+   the notice, and on email the heartbeat (decision 7) still shows the condition.
+   - An accepted message quarantined (condition 1, at once on a `Permanent` refusal or after a hold): one notice per
+     counted record.
+   - A lost original: one notice for the first counted record that lost its original for one of the five failure
+     reasons, since the daemon started or since the last counted quarantine record that kept its original, per
+     channel credential, gate-quarantined records included: the loss #5404 records was gate-quarantined mail below
+     the floor. Later failures in the same run are counted without another notice; the next failure after a kept
+     original starts a new run. Because rejected mail arrives at a rate any sender sets, lost-original notices are at
+     most one per hour per credential: when a run's first failure comes within an hour of the previous lost-original
+     notice, the run's notice goes with its first failure at least an hour after that notice, and none is sent if
+     the run ends first. Spam arriving under a floor that flaps therefore pages at most hourly, and a run that lasts
+     still pages. `retention-limit` is counted on the heartbeat but never notifies and neither
+     starts nor ends a run: the cap is configured behaviour, and expiry of old records lets it alternate with kept
+     originals at the rate mail arrives, which would page on every expiry.
+   - A record that meets both conditions sends one notice naming both, and it is the run's notice when one is due.
+6. _A notice never holds the page._ It is sent after the record is written and before the cursor commit. A failed
+   send is logged at warn level with the error and not retried; on email it is counted on the heartbeat.
+7. _Health (email)._ The success heartbeat gains: `originals_not_retained` (counted records without their original
+   this poll, every reason including `retention-limit`) with `original_not_retained_reason` (the last such reason
+   this poll), `original_retention_state` (`retained` or `failing`, the state after the last counted record this
+   poll that either kept its original or lost it for a failure reason; absent when there was none),
+   `notices_failed` (failed sends this poll) and `notice_config_error`. `comm.heartbeat` rejects all of them on a
+   failure outcome, requires `original_not_retained_reason` exactly when `originals_not_retained` is above 0, and
+   accepts `original_retention_state` only as one of the two values. The heartbeat row keeps `originals_not_retained`
+   and `notices_failed` as running totals, `last_original_not_retained_at`, `last_original_not_retained_reason`,
+   `original_retention_state`, `last_notice_failed_at` and `notice_config_error` (cleared by a heartbeat without
+   it). `original_retention_state = "failing"` means originals are being lost now. `comm.health` returns these per
+   channel, `null` for a writer that does not report them and for quarantine-only entries, as for the hold fields,
+   and a failed transport poll leaves them unchanged. The Telegram loop still writes no heartbeat; its notices are
+   its only signal, and a failed one is visible in the log only.
+
+**Known bounds.** The failure run lives in daemon memory, so the first failure after a restart notifies even inside
+a run that began before it: one extra notice per restart. The hourly bound also lives in memory. A lost-original
+notice can lag the start of a run by up to an hour when an earlier run notified within the hour; on email the
+heartbeat shows the run at once. Notices are not persisted or retried; on email the
+heartbeat totals are the durable record.
+
+**Acceptance.**
+
+- Email, a page of three whose middle message `comm.ingest` refuses past the bound: exactly one notice, from
+  `channel:email` to the configured actor in the ingest namespace, naming the channel kind and slug, the external
+  id, the record id, the failure class and reason tokens and the failed-poll count; the other two messages are
+  delivered, and a re-poll of the same page sends no second notice and leaves `quarantined_after_hold` unchanged.
+- Telegram, the same refusal past the bound: one notice from `channel:telegram`.
+- `KHIVE_CHANNEL_NOTIFY_ACTOR` unset: no notice. Set to `email:ops@example.com` or to a value containing a space:
+  no notice, polling and delivery continue, and `comm.health` reports `notice_config_error`. Set to `channel:email`:
+  the notice is delivered.
+- An `off-allowlist` quarantine that keeps its original sends no notice.
+- A blob store that refuses originals, three `off-allowlist` records and then one accepted message refused past the
+  bound: one lost-original notice, for the first `off-allowlist` record; none for the second and third; one notice
+  for the accepted message, naming its hold and its lost original; `originals_not_retained` 4.
+- A blob store that refuses originals, `off-allowlist` records only, with a test clock: the first record without its
+  original sends one notice, the next two send none, a record that keeps its original sends none, the next refusal
+  inside the hour sends none, and with the clock past the hour the next refusal in that run sends one;
+  `comm.health` reports `originals_not_retained` 5 and `original_retention_state` `failing`. The same sequence on a
+  second credential in the same daemon notifies independently.
+- Ten `off-allowlist` records alternating kept and lost originals inside an hour: exactly one notice.
+- An accepted message that `comm.ingest` refuses as `Permanent`: one notice, on its first poll.
+- A record that is quarantined after a hold and loses its original sends exactly one notice naming both.
+- The `quarantine-write-failed` fallback and a `secondary-backend` drop each count and notify as failures.
+- `retention-limit` alone, alternating with kept originals: no notice.
+- A notice whose send fails leaves the cursor committed and `notices_failed` 1 with `last_notice_failed_at` set.
+- `comm.heartbeat` refuses the new fields on a failure outcome and a count above 0 without a reason; `comm.health`
+  returns `null` for them on a writer that does not report them.
+- No notice contains any of: the message body, subject, From, To, Message-ID, References, In-Reply-To, or the text
+  of the `blob.put` or `comm.ingest` error (a fixture carries one marker string in each, asserted absent from every
+  notice).
+
+**Refs.** #5364, #5404, #5405.
 
 ## Amendment 2026-10-14 -- Every inbound page hold is bounded
 
