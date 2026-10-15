@@ -780,24 +780,177 @@ async fn text_creates_table_idempotently() {
     assert_eq!(count, 1);
 }
 
+fn warm_text_document(namespace: &str) -> khive_storage::types::TextDocument {
+    khive_storage::types::TextDocument {
+        subject_id: uuid::Uuid::new_v4(),
+        kind: khive_types::SubstrateKind::Note,
+        record_kind: None,
+        title: None,
+        body: "warm fetch".to_string(),
+        tags: vec![],
+        namespace: namespace.to_string(),
+        metadata: None,
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// A search opens its text store on every call. Once the table's rowid-map
+/// marker is durable that fetch must not take the writer, or every search
+/// queues on the volume lease behind unrelated writes.
+#[tokio::test]
+async fn warm_text_fetch_does_not_take_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("text_warm.db")).unwrap();
+    let acquisitions = || {
+        backend
+            .pool
+            .writer_acquisition_snapshot()
+            .pooled_acquisitions
+    };
+
+    let before = acquisitions();
+    backend.text("warm").unwrap();
+    let store = backend.text("warm").unwrap();
+    assert_eq!(
+        acquisitions() - before,
+        2,
+        "a table with no rows has no marker, so every fetch re-checks it"
+    );
+
+    store
+        .upsert_document(warm_text_document("ns"))
+        .await
+        .unwrap();
+    let before = acquisitions();
+    backend.text("warm").unwrap();
+    assert_eq!(
+        acquisitions() - before,
+        1,
+        "the first fetch after a row exists writes the marker"
+    );
+
+    let before = acquisitions();
+    backend.text("warm").unwrap();
+    backend.text("warm").unwrap();
+    assert_eq!(
+        acquisitions(),
+        before,
+        "a fetch after the marker is durable must not take the writer"
+    );
+}
+
+/// The load symptom itself: while another thread holds the writer, a warm
+/// fetch still opens the store instead of waiting out the lease deadline.
+#[tokio::test]
+async fn warm_text_fetch_succeeds_while_the_writer_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("text_held.db")).unwrap();
+    backend
+        .text("held")
+        .unwrap()
+        .upsert_document(warm_text_document("ns"))
+        .await
+        .unwrap();
+    backend.text("held").unwrap();
+
+    let held = backend.pool.try_writer().unwrap();
+    let fetched = std::thread::scope(|scope| {
+        scope
+            .spawn(|| backend.text("held").map(drop))
+            .join()
+            .unwrap()
+    });
+    drop(held);
+    fetched.expect("a warm fetch must not wait for the writer");
+}
+
+/// A table is recorded only after its backfill commits. When the backfill
+/// fails, the fetch reports the error and the next fetch takes the writer and
+/// runs the backfill again instead of trusting an unproven rowid map.
+#[tokio::test]
+async fn failed_backfill_leaves_the_text_table_unproven() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("text_unproven.db")).unwrap();
+    let acquisitions = || {
+        backend
+            .pool
+            .writer_acquisition_snapshot()
+            .pooled_acquisitions
+    };
+    backend
+        .text("unproven")
+        .unwrap()
+        .upsert_document(warm_text_document("ns"))
+        .await
+        .unwrap();
+
+    backend
+        .pool
+        .writer()
+        .unwrap()
+        .conn()
+        .authorizer(Some(|context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Insert {
+                    table_name: "fts_unproven_rowids_state"
+                }
+            ) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .unwrap();
+    let refused = backend.text("unproven").map(|_| ());
+    backend
+        .pool
+        .writer()
+        .unwrap()
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    refused.expect_err("a refused marker write fails the fetch");
+
+    let before = acquisitions();
+    backend.text("unproven").unwrap();
+    assert_eq!(
+        acquisitions() - before,
+        1,
+        "the fetch after a failed backfill takes the writer and runs it again"
+    );
+    let before = acquisitions();
+    backend.text("unproven").unwrap();
+    assert_eq!(
+        acquisitions(),
+        before,
+        "once the backfill commits the table is proven"
+    );
+}
+
 /// khive-runtime never caches the `Arc<dyn TextSearch>` `text()`/
 /// `text_for_notes()` return — every one of its ~26 call sites in
-/// `operations.rs`/`curation.rs` calls `StorageBackend::text()` fresh, so
-/// `ensure_fts_rowid_map_backfilled`'s already-backfilled short-circuit
-/// runs on essentially every text-store access. A first draft of that
-/// function used `SELECT COUNT(*)` for the short-circuit — correct, but
-/// `COUNT(*)` over an FTS5 table costs real per-call time proportional to
-/// row count, which would reintroduce a scan on the read path this
-/// migration exists to remove. Compare SQLite VM work for the same
-/// repeated-open batch at 100 and 5,000 rows. The completion-marker probe
-/// should need similar work at both sizes; a full-table count should not.
-/// Counting executed work keeps scheduler delays out of this growth test.
+/// `operations.rs`/`curation.rs` calls `StorageBackend::text()` fresh. A
+/// backend proves each table once (`text_tables_ready`), so
+/// `ensure_fts_rowid_map_backfilled`'s already-backfilled short-circuit runs
+/// on the first open of a table by each backend, and every later open runs no
+/// SQL. A first draft of that function used `SELECT COUNT(*)` for the
+/// short-circuit — correct, but `COUNT(*)` over an FTS5 table costs real
+/// per-call time proportional to row count, which would reintroduce a scan on
+/// the path this migration exists to remove. Compare SQLite VM work for a
+/// fresh backend's first open at 100 and 5,000 rows: the completion-marker
+/// probe should need similar work at both sizes; a full-table count should
+/// not. The 500 opens after it must do no writer work at all. Counting
+/// executed work keeps scheduler delays out of this growth test.
 #[tokio::test]
 async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    fn repeated_open_work(backend: &StorageBackend) -> u64 {
+    /// Work of the first open on `backend`, then of the 500 opens after it.
+    fn open_work(backend: &StorageBackend) -> (u64, u64) {
         let work = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&work);
         {
@@ -817,7 +970,10 @@ async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
         // All opens use this private backend's pooled writer. Release
         // its guard before re-entry, and remove the hook even when an
         // open returns an error, before asserting or growing the fixture.
-        let result = (0..500).try_for_each(|_| backend.text("hot_path_reopen").map(|_| ()));
+        let first = backend.text("hot_path_reopen").map(|_| ());
+        let cold = work.load(Ordering::Relaxed);
+        let result = first
+            .and_then(|()| (0..500).try_for_each(|_| backend.text("hot_path_reopen").map(|_| ())));
         backend
             .pool()
             .writer()
@@ -826,10 +982,12 @@ async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
             .progress_handler(0, None::<fn() -> bool>)
             .unwrap();
         result.expect("repeated text-store opens must succeed");
-        work.load(Ordering::Relaxed)
+        (cold, work.load(Ordering::Relaxed) - cold)
     }
 
-    let backend = StorageBackend::memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hot_path_reopen.db");
+    let backend = StorageBackend::sqlite_for_test(&path).unwrap();
     let store = backend.text("hot_path_reopen").unwrap();
     let body = "the quick brown fox jumps over the lazy dog ".repeat(35);
     let mut seeded = 0;
@@ -865,16 +1023,21 @@ async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
         // The first populated open records completion outside the work
         // measurement; later upserts maintain the rowid map atomically.
         let _ = backend.text("hot_path_reopen").unwrap();
-        work.push(repeated_open_work(&backend));
+        let (cold, warm) = open_work(&StorageBackend::sqlite_for_test(&path).unwrap());
+        assert_eq!(
+            warm, 0,
+            "opens after the backend proved the table must not use the writer"
+        );
+        work.push(cold);
     }
 
     let [small, large] = [work[0], work[1]];
     assert!(small > 0 && large > 0, "both work meters must be active");
     assert!(
         large <= small * 2,
-        "500 repeated backend.text() calls used {small} SQLite VM progress units at \
-             100 rows and {large} at 5,000 rows; growing the table 50-fold must not \
-             more than double already-backfilled work (for example via COUNT(*))"
+        "a fresh backend's first backend.text() call used {small} SQLite VM progress \
+             units at 100 rows and {large} at 5,000 rows; growing the table 50-fold must \
+             not more than double already-backfilled work (for example via COUNT(*))"
     );
 }
 
@@ -1755,6 +1918,25 @@ fn blob_store_defaults_root_beside_db_file() {
 }
 
 #[test]
+fn blob_store_without_a_configured_floor_enforces_the_volume_default() {
+    // The path the daemon takes: no `[storage.blob] floor_bytes`, root beside
+    // the database. The store's floor is the ADR-111 Amendment 6 formula over
+    // the capacity of the volume that holds its root.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("floor.db")).unwrap();
+    let store = backend.fs_blob_store(None, None).unwrap();
+    let capacity = fs4::total_space(store.root()).unwrap();
+    assert_eq!(
+        store.floor_bytes(),
+        blob::FsBlobStore::default_floor_for_capacity(capacity)
+    );
+    assert_eq!(
+        backend.fs_blob_store(None, Some(0)).unwrap().floor_bytes(),
+        0
+    );
+}
+
+#[test]
 fn blob_store_errors_for_in_memory_backend_with_no_override() {
     let backend = StorageBackend::memory().unwrap();
     assert!(backend.blob_store(None, None).is_err());
@@ -1846,6 +2028,7 @@ fn issue_1029_pool(write_queue_enabled: bool) -> (tempfile::TempDir, StorageBack
         is_file_backed: true,
         path: Some(path),
         vector_tables_ready: Default::default(),
+        text_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };
@@ -1937,6 +2120,7 @@ async fn issue_1029_two_pools_same_file_write_queue_on() {
         is_file_backed: true,
         path: Some(path.clone()),
         vector_tables_ready: Default::default(),
+        text_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };
@@ -1946,6 +2130,7 @@ async fn issue_1029_two_pools_same_file_write_queue_on() {
         is_file_backed: true,
         path: Some(path),
         vector_tables_ready: Default::default(),
+        text_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     };

@@ -741,6 +741,64 @@ impl KhiveRuntime {
         }
     }
 
+    /// Return the live edge total, its relation counts and its endpoint-base
+    /// counts for `stats`.
+    ///
+    /// The three describe one population: live edges with live endpoints in
+    /// the caller's visible namespaces. A backend with the combined aggregate
+    /// answers all of them from one grouped read, and the total is the sum of
+    /// its groups, so the invariants `stats` reports on (relation counts and
+    /// endpoint-base buckets each summing to the total) hold by construction.
+    /// A backend without it gets the three single-purpose counts.
+    pub async fn edge_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<super::EdgeStatsCounts> {
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_by_relation_and_endpoint_base_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(groups) => {
+                let mut counts = super::EdgeStatsCounts::default();
+                for (relation, by_base) in groups {
+                    let relation_total = by_base.total();
+                    counts.edges = counts.edges.saturating_add(relation_total);
+                    let slot = counts
+                        .edges_by_relation
+                        .entry(relation.to_string())
+                        .or_insert(0);
+                    *slot = slot.saturating_add(relation_total);
+                    let totals = &mut counts.edges_by_endpoint_base;
+                    totals.entity_entity =
+                        totals.entity_entity.saturating_add(by_base.entity_entity);
+                    totals.entity_note = totals.entity_note.saturating_add(by_base.entity_note);
+                    totals.note_entity = totals.note_entity.saturating_add(by_base.note_entity);
+                    totals.note_note = totals.note_note.saturating_add(by_base.note_note);
+                    totals.unresolved = totals.unresolved.saturating_add(by_base.unresolved);
+                }
+                Ok(counts)
+            }
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_and_endpoint_base_in_namespaces" =>
+            {
+                Ok(super::EdgeStatsCounts {
+                    edges: self
+                        .count_edges(token, crate::curation::EdgeListFilter::default())
+                        .await?,
+                    edges_by_relation: self.count_edges_by_relation(token).await?,
+                    edges_by_endpoint_base: self.count_edges_by_endpoint_base(token).await?,
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Patch-style edge update. Only `Some(_)` fields are applied.
     ///
     /// When `relation` is `Some(new_rel)`, validates that the edge's existing endpoints

@@ -1140,11 +1140,11 @@ mod tests {
             sha256_hex(&canonical_json_bytes(&serde_json::to_value(&core).unwrap()).unwrap());
         assert_eq!(
             fingerprint,
-            "a9224870bf18dc3f6344621ea1682fcc99b292bb6fd7b40f9fa2280c9dcfeade"
+            "ba3578ee7752e27d5d22b1e34922530d7d1030b74eea3a4f1201eb39f8050e2d"
         );
         assert_eq!(
             format!("moodboard_{fingerprint}_4"),
-            "moodboard_a9224870bf18dc3f6344621ea1682fcc99b292bb6fd7b40f9fa2280c9dcfeade_4"
+            "moodboard_ba3578ee7752e27d5d22b1e34922530d7d1030b74eea3a4f1201eb39f8050e2d_4"
         );
 
         let production_prompt =
@@ -1155,11 +1155,11 @@ mod tests {
         );
         assert_eq!(
             production_prompt.fingerprint,
-            "b9c47923a57499948eaff6ecc51833e189d37dd4c94c7e4054b7f964a07141a8"
+            "380d740d6cc62b3116535d53253cbe113198c0362d9e6c0e01b483c3538d2c52"
         );
         assert_eq!(
             production_prompt.model_key,
-            "moodboard_b9c47923a57499948eaff6ecc51833e189d37dd4c94c7e4054b7f964a07141a8_4"
+            "moodboard_380d740d6cc62b3116535d53253cbe113198c0362d9e6c0e01b483c3538d2c52_4"
         );
 
         let indexed_qwen = DescriptorIdentity::build(
@@ -1170,11 +1170,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             indexed_qwen.fingerprint,
-            "be1791a0588e132f734456084859d7e88e8cd49522775929469e6654e869e7cd"
+            "71b5a53bccf1be22e55c33f44f57676a9e07b87c56ff7bbfee37e77a283ffa33"
         );
         assert_eq!(
             indexed_qwen.model_key,
-            "moodboard_be1791a0588e132f734456084859d7e88e8cd49522775929469e6654e869e7cd_1024"
+            "moodboard_71b5a53bccf1be22e55c33f44f57676a9e07b87c56ff7bbfee37e77a283ffa33_1024"
         );
     }
 

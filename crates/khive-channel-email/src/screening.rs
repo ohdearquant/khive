@@ -262,6 +262,42 @@ pub fn screen(input: &ScreeningInput) -> Result<ScreeningOutcome, ScreeningError
     })
 }
 
+/// Screen parsed MIME, using the existing HTML text conversion only for opt-out detection.
+pub fn screen_message(message: &Message<'_>) -> Result<ScreeningOutcome, ScreeningError> {
+    let input = ScreeningInput::from_message(message);
+    let mut outcome = screen(&input)?;
+    if !outcome.opt_out && input.plain_parts.is_empty() {
+        let extracted = (0..message.text_body_count())
+            .filter_map(|pos| message.body_text(pos))
+            .map(|text| text.into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(first_line) = extracted
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            let first_line = normalize(first_line);
+            if let Some(rule) = rules()?
+                .rules
+                .iter()
+                .find(|rule| rule.family == Family::OptOut)
+            {
+                if rule.terms.iter().any(|term| {
+                    let needle = normalize(term);
+                    !needle.is_empty() && first_line.contains(&needle)
+                }) {
+                    // HTML quotation false positives intentionally run toward suppression.
+                    outcome.opt_out = true;
+                    outcome.rule_ids.push(rule.id.clone());
+                    outcome.families.push(Family::OptOut);
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 fn disposition_for(families: &[Family]) -> Disposition {
     if families.contains(&Family::ExecutableAttachment) {
         return Disposition::QuarantineScreened;

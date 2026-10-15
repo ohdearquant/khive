@@ -17,4 +17,5 @@ khive-pack-telemetry
 khive-pack-tool
 khive-pack-web
 khive-repo-showcase
+khive-rule-evaluator
 khive-wire-protocol

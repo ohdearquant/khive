@@ -10,9 +10,8 @@
 //! - [`external_delivery_marking`] builds the delivery metadata that marks a
 //!   message as external and untrusted.
 //!
-//! Nothing here is wired into the poll, disposition or ingest path. With the
-//! external-sender configuration unset the module is unreachable, so the
-//! channel behaves exactly as before it existed.
+//! The channel's external disposition calls these helpers after authentication
+//! and suppression. The host verifies ownership before the pure routing decision.
 
 use std::collections::HashSet;
 
@@ -246,7 +245,7 @@ pub fn route_inbound(
 /// bytes alone, without assuming a client rewrote the chain: every ancestor in
 /// a reply chain belongs to one conversation, and the earliest khive-owned id
 /// still identifies that conversation's thread.
-fn owner_candidates(email: &RawEmail) -> Vec<String> {
+pub(crate) fn owner_candidates(email: &RawEmail) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for value in [email.khive_thread_id(), email.in_reply_to()]
         .into_iter()
