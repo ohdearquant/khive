@@ -259,6 +259,13 @@ fn agent_preserves_unknown_channel_heartbeat_nulls() {
             "held_messages": null,
             "last_held_at": null,
             "last_quarantined_after_hold_at": null,
+            "originals_not_retained": null,
+            "last_original_not_retained_at": null,
+            "last_original_not_retained_reason": null,
+            "original_retention_state": null,
+            "notices_failed": null,
+            "last_notice_failed_at": null,
+            "notice_config_error": null,
             "quarantined_count": 1,
         }]
     });
@@ -276,6 +283,13 @@ fn agent_preserves_unknown_channel_heartbeat_nulls() {
         "held_messages",
         "last_held_at",
         "last_quarantined_after_hold_at",
+        "originals_not_retained",
+        "last_original_not_retained_at",
+        "last_original_not_retained_reason",
+        "original_retention_state",
+        "notices_failed",
+        "last_notice_failed_at",
+        "notice_config_error",
     ] {
         assert_eq!(
             channel.get(field),
