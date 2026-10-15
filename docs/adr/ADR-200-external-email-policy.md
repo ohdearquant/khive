@@ -5,6 +5,7 @@
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
+- **Amendments**: Amendment 1 (proposed 2026-10-14), at the end of this record
 
 ## Context
 
@@ -343,3 +344,59 @@ Real request, outbox and ingest paths, with a mock transport and recorded raw me
 - Hard-bounce processing into suppression is not covered here.
 - Whether a forwarding rule (as opposed to an alias on the same mailbox) preserves an authentication
   result that passes §7 step 3 depends on the receiving boundary and is to be measured per deployment.
+
+## Amendment 1 (2026-10-14) -- Withheld originals are read through comm, and external routing is narrowed
+
+**Status**: Proposed 2026-10-14.
+
+**Trigger.** §8.3 keeps a withheld message's original bytes "for an explicit operator read" and names neither the
+read nor its callers. The first implementation keeps the original as a blob, records its content reference in the
+delivered message's properties, and documents `blob.get` as the read. `blob.get` reads any object whose reference the
+caller holds and does not check the caller against a message, and inbox and thread reads return message properties.
+Any actor that can list the recipient's inbox could therefore read text that screening withheld. Two further gaps were
+found in the same review: a thread UUID asserted by an external sender can route to a thread that was never an email
+conversation, and an opt-out inside a message that screening quarantines is not recorded.
+
+**Decision.**
+
+1. **One read for withheld originals.** `comm.withheld_body(id)` returns the original RFC 5322 bytes of a delivered
+   withheld message, base64-encoded, with their size. It refuses an id that is not a delivered withheld external
+   message, and it never returns a content reference.
+2. **Callers.** The read is open to the message's recipient actor (its `to_actor`) and to the maintainer (the
+   runtime's configured actor, the same check `comm.suppression_remove` uses). Any other caller is refused before the
+   original is read, with the typed permission-denied form, and the refusal names neither the sender nor any content.
+   Every call, allowed or refused, writes an audit event naming the caller, the message id and the outcome.
+3. **No reference on the delivered message.** A delivered withheld message does not carry `quarantine_content_ref`
+   or any other blob reference in its properties. The original is owned only by the message's `quarantine-original`
+   attachment, which read surfaces already omit. A retried delivery of the same transport message verifies custody
+   through that attachment. Inbox, thread, read and notice surfaces return no original bytes and no reference.
+4. **Thread routing for external mail.** For an external message, the thread-UUID path of §8.2 (an
+   `X-Khive-Thread-ID` that names a thread rather than a Message-ID) routes only when that thread holds an outbound
+   email message whose Message-ID verifies under ADR-122 Amendment 3, the same proof the Message-ID path requires.
+   A UUID naming any other thread falls through to recipient routes and then the external inbound actor. Maintainer
+   mail keeps today's resolution.
+5. **Opt-out independent of the outcome.** An authenticated external message that screening quarantines as
+   `screened` and that carries the `opt_out` label still adds the §5.4 entry point 3 suppression for its `From:`
+   address before the quarantine is acknowledged. §8.4 already says the label does not change the delivery outcome;
+   this makes the suppression not depend on it either, in the direction §8.4 names as safe.
+6. **Quarantine records are addressed to the maintainer.** At ingest, a message that screening quarantines is
+   addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the ingest
+   handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
+   governs every mailbox read (`permits_message_note`, `khive-runtime/src/mailbox_view.rs`) then keeps the record and
+   its `quarantine_content_ref` from every other actor. A runtime with no configured actor has no maintainer, so its
+   quarantine records keep today's landing actor and are visible to that actor.
+
+**Unchanged.** Quarantine records keep `quarantine_content_ref` and their existing operator recovery path. The
+screening rules, outcomes and labels of §8.3 and §8.4 are unchanged.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                    | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A16 withheld read       | The recipient actor and the maintainer each read a withheld original byte for byte; a third actor is refused before any read; each call is audited; an ordinary or quarantined message is refused.                                                                                                                                                                                                                                                                                                                      |
+| A17 no reference        | A delivered withheld message's properties, and every inbox, thread, read and notice result for it, contain no blob reference and no original bytes; a retried delivery of the same transport message is acknowledged through its attachment. A quarantine record is addressed to the maintainer: a non-maintainer landing actor finds it through no inbox, thread, read, get or search result, and the maintainer finds it through each; on a runtime with no configured actor it keeps its landing actor (Decision 6). |
+| A18 thread routing      | An external message whose thread UUID names a thread with a verified outbound email routes to that thread's actor; one naming a thread with no such email routes by recipient alias or to the external inbound actor.                                                                                                                                                                                                                                                                                                   |
+| A19 quarantined opt-out | An authenticated opt-out in a message quarantined as `screened` suppresses its `From:` address, and the next send to that address is refused.                                                                                                                                                                                                                                                                                                                                                                           |
+
+Realistic replies from developers that ask the reader to install, run or connect something are A15 fixtures, and the
+change that adds them reports how many each screening family catches.
