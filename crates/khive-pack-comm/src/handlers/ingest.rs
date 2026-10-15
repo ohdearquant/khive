@@ -502,29 +502,45 @@ pub(crate) async fn handle_ingest(
         ));
     }
     if p.reply_opt_out {
+        let labelled = |metadata: &serde_json::Map<String, Value>| {
+            metadata
+                .get("labels")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| {
+                    labels
+                        .iter()
+                        .any(|label| label.as_str() == Some("opt_out.unsubscribe"))
+                })
+        };
+        // A delivered external message names its sender in `from`. A screened quarantine is sent
+        // as the quarantine marker; screening runs only after the sender authenticated as
+        // external, so its claimed `From:` is that sender (ADR-200 Amendment 1 Decision 5). Any
+        // other quarantine reason is unauthenticated or never screened, and records nothing.
         let marked = p.channel_kind.as_deref() == Some("email")
-            && !is_quarantined
             && p.metadata.as_ref().is_some_and(|metadata| {
-                metadata.get("origin").and_then(Value::as_str) == Some("external")
-                    && metadata.get("trust").and_then(Value::as_str) == Some("untrusted")
-                    && metadata
-                        .get("labels")
-                        .and_then(Value::as_array)
-                        .is_some_and(|labels| {
-                            labels
-                                .iter()
-                                .any(|label| label.as_str() == Some("opt_out.unsubscribe"))
-                        })
+                labelled(metadata)
+                    && if is_quarantined {
+                        metadata.get("quarantine_reason").and_then(Value::as_str)
+                            == Some("screened")
+                    } else {
+                        metadata.get("origin").and_then(Value::as_str) == Some("external")
+                            && metadata.get("trust").and_then(Value::as_str) == Some("untrusted")
+                    }
             });
         if !marked {
             return Err(RuntimeError::InvalidInput(
                 "ingest: reply opt-out requires authenticated external delivery markings".into(),
             ));
         }
-        let address = p
-            .from
-            .trim()
-            .strip_prefix("email:")
+        let sender = if is_quarantined {
+            p.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("quarantine_claimed_from"))
+                .and_then(Value::as_str)
+        } else {
+            p.from.trim().strip_prefix("email:")
+        };
+        let address = sender
             .and_then(khive_types::email_address::normalize_email_recipient)
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(

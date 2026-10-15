@@ -28,6 +28,17 @@ pub(super) fn email_ingest_params(
         }
     }
     let delivery = env.inbound_delivery.as_ref();
+    // A screened quarantine has no delivered route, so its opt-out comes from the channel's own
+    // screening marker (ADR-200 Amendment 1 Decision 5). Ingest re-checks the markings.
+    let screened_opt_out = delivery.is_none()
+        && kind == "email"
+        && ["quarantined", "screening_opt_out"]
+            .iter()
+            .all(|key| metadata.get(*key).and_then(serde_json::Value::as_str) == Some("true"))
+        && metadata
+            .get("quarantine_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("screened");
     if let Some(delivery) = delivery {
         metadata.insert("labels".into(), json!(delivery.labels));
         metadata.insert(
@@ -49,7 +60,7 @@ pub(super) fn email_ingest_params(
         "correlation_external_id": if delivery.is_some() { None } else { env.correlation_external_id.as_deref() },
         "default_inbound_actor": delivery.map(|delivery| delivery.actor.as_str()).unwrap_or(default_actor),
         "thread_id": delivery.and_then(|delivery| delivery.thread_id).map(|id| id.to_string()),
-        "reply_opt_out": delivery.is_some_and(|delivery| delivery.reply_opt_out),
+        "reply_opt_out": delivery.is_some_and(|delivery| delivery.reply_opt_out) || screened_opt_out,
         "pending_owner_candidates": delivery.and_then(|delivery| delivery.pending_owner_candidates.as_ref()),
         "wire_message_id": env.wire_message_id,
         "wire_references": env.wire_references,

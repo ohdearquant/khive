@@ -28,9 +28,13 @@ carries no blob reference, and ordinary inbox, read, thread and notice surfaces 
 not carry those bytes.
 Executable attachments or two withholding families are quarantined as `screened`.
 
-An authenticated opt-out on a marked or withheld delivery commits an outbound
-address suppression through the real ingest path before duplicate acknowledgement
-or message creation. Store failure retains the message's existing bounded failure
+An authenticated opt-out on a marked or withheld delivery, or on a message
+quarantined as `screened`, commits an outbound address suppression through the
+real ingest path before duplicate acknowledgement or message creation. A
+`screened` quarantine carries `screening_opt_out = "true"` when screening found
+the opt-out, and the suppressed address is its `quarantine_claimed_from`: screening
+runs only after the sender authenticated as external. No other quarantine reason
+records an opt-out. Store failure retains the message's existing bounded failure
 identity and holds the coordinator's checkpoint. The channel does not acknowledge
 that obligation from its poll alone.
 
