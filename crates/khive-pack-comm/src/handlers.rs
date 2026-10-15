@@ -71,7 +71,7 @@ pub(crate) use inbox::{handle_inbox, handle_unread};
 #[cfg(test)]
 use ingest::committed_ingest_degradations;
 pub(crate) use ingest::handle_ingest;
-pub use ingest::{resolve_ingest_correlation, ResolvedInboundThread};
+pub use ingest::{resolve_ingest_correlation, ResolvedInboundThread, ThreadUuidProof};
 
 pub(crate) use parameter_aliases::{handle_delivered, handle_mark_read};
 

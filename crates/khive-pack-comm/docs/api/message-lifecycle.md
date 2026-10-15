@@ -732,6 +732,19 @@ ledger. Otherwise the first configured recipient alias wins, then the required
 external inbound actor. Startup validates this configuration before either host
 entrypoint starts its daemon callback, including clients that do not own polling.
 
+For external mail, the callers that run this lookup (the
+`pending_owner_candidates` ingest path and the email host's `lookup_thread_owner`)
+require proof on the thread-UUID pass. A sender-asserted `X-Khive-Thread-ID` that
+names a thread (rather than a Message-ID) selects that thread only when one of the
+thread's outbound notes is an email message whose Message-ID verifies against the
+configured mailbox domains, the same proof the Message-ID pass applies. The pass
+pages through the thread's outbound notes instead of taking the first row, so a
+copied Message-ID or a non-email row that sorts first cannot mask the verified
+owner. A UUID naming any other thread yields no owner, and the route falls through
+to the recipient aliases and then the external inbound actor. Maintainer mail uses
+the `correlation_external_id` path, which keeps the transport-level resolution and
+does not require an email Message-ID.
+
 An authenticated delivered opt-out commits an `outbound/address/reply_stop`
 suppression before duplicate acknowledgement or message creation. It uses the
 same unique insert as mailto and operator entries. A failed insert leaves the

@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and names the reason. `comm.health` reports `consecutive_held_polls`, `held_messages`,
   `last_held_at` and `last_quarantined_after_hold_at` per channel.
 
+- External inbound email no longer routes on an unproven thread UUID. A sender-asserted
+  `X-Khive-Thread-ID` that names a thread routes only when that thread holds an outbound email
+  whose Message-ID verifies under the configured mailbox domains, the same proof the
+  `In-Reply-To`/`References` Message-ID path already requires. A UUID naming any other thread
+  falls through to the recipient aliases and then the external inbound actor. Maintainer mail
+  keeps its existing resolution.
+
 ## [0.12.0] - 2026-10-13
 
 ### Documentation
