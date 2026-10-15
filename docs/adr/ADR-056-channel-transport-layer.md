@@ -52,12 +52,12 @@ stays below the floor.
 
 **Context.** Two conditions lose something:
 
-1. _An accepted message quarantined after a hold._ `comm.ingest` refused a message the channel accepted (not
-   gate-quarantined) until its failed polls reached the bound, and the poller recorded it as `<kind>:quarantine`
-   instead of delivering it (2026-10-14 amendment, decisions 2 and 3). Both the email and the Telegram loop reach this
-   through the shared ingest-failure path. The email loop's `quarantined_after_hold` count also includes
-   gate-quarantined mail whose original could not be stored past the bound; that mail was never going to be
-   delivered, so it is not this condition.
+1. _An accepted message quarantined._ `comm.ingest` refused a message the channel accepted (not gate-quarantined),
+   either as `Permanent`, which is quarantined at once, or until its failed polls reached the bound, and the poller
+   recorded it as `<kind>:quarantine` instead of delivering it (2026-10-14 amendment, decisions 2 and 3). Both the
+   email and the Telegram loop reach this through the shared ingest-failure path. The email loop's
+   `quarantined_after_hold` count also includes gate-quarantined mail whose original could not be stored past the
+   bound; that mail was never going to be delivered, so it is not this condition.
 2. _A quarantine record without its original._ The record carries `quarantine_original_retained = "false"` and a
    `quarantine_original_not_retained_reason`. The reasons are `retention-limit` (the configured cap on retained
    originals is reached), and five failures: `original-unavailable`, `retention-count-unreadable`,
@@ -66,8 +66,10 @@ stays below the floor.
    one today: `comm.ingest` returns an ordinary receipt.
 
 Authentication and malformed quarantines (`auth-absent`, `dmarc-fail`, `unaligned`, `off-allowlist`,
-`missing-body`, `parse-failure`, `too-large`) are rejections of mail the channel did not accept. They never notify:
-a notice per rejected message would let any sender flood the operator's inbox.
+`missing-body`, `parse-failure`, `too-large`) are rejections of mail the channel did not accept. A rejection never
+notifies: a notice per rejected message would let any sender flood the operator's inbox. A rejected message whose
+original is lost does take part in the lost-original run of decision 5, whose notices are bounded per credential and
+per hour whatever arrives.
 
 **Decision.**
 
@@ -99,14 +101,20 @@ a notice per rejected message would let any sender flood the operator's inbox.
    (`secondary-backend`) is seen like any other.
 5. _When a notice is sent._ Delivery is at most once per record: a crash between the record and the notice loses
    the notice, and on email the heartbeat (decision 7) still shows the condition.
-   - An accepted message quarantined after a hold: one notice per counted record.
+   - An accepted message quarantined (condition 1, at once on a `Permanent` refusal or after a hold): one notice per
+     counted record.
    - A lost original: one notice for the first counted record that lost its original for one of the five failure
      reasons, since the daemon started or since the last counted quarantine record that kept its original, per
-     channel credential. Later failures in the same run are counted without another notice; the next failure after
-     a kept original notifies again. `retention-limit` is counted on the heartbeat but never notifies and neither
+     channel credential, gate-quarantined records included: the loss #5404 records was gate-quarantined mail below
+     the floor. Later failures in the same run are counted without another notice; the next failure after a kept
+     original starts a new run. Because rejected mail arrives at a rate any sender sets, lost-original notices are at
+     most one per hour per credential: when a run's first failure comes within an hour of the previous lost-original
+     notice, the run's notice goes with its first failure at least an hour after that notice, and none is sent if
+     the run ends first. Spam arriving under a floor that flaps therefore pages at most hourly, and a run that lasts
+     still pages. `retention-limit` is counted on the heartbeat but never notifies and neither
      starts nor ends a run: the cap is configured behaviour, and expiry of old records lets it alternate with kept
      originals at the rate mail arrives, which would page on every expiry.
-   - A record that meets both conditions sends one notice naming both.
+   - A record that meets both conditions sends one notice naming both, and it is the run's notice when one is due.
 6. _A notice never holds the page._ It is sent after the record is written and before the cursor commit. A failed
    send is logged at warn level with the error and not retried; on email it is counted on the heartbeat.
 7. _Health (email)._ The success heartbeat gains: `originals_not_retained` (counted records without their original
@@ -124,7 +132,9 @@ a notice per rejected message would let any sender flood the operator's inbox.
    its only signal, and a failed one is visible in the log only.
 
 **Known bounds.** The failure run lives in daemon memory, so the first failure after a restart notifies even inside
-a run that began before it: one extra notice per restart. Notices are not persisted or retried; on email the
+a run that began before it: one extra notice per restart. The hourly bound also lives in memory. A lost-original
+notice can lag the start of a run by up to an hour when an earlier run notified within the hour; on email the
+heartbeat shows the run at once. Notices are not persisted or retried; on email the
 heartbeat totals are the durable record.
 
 **Acceptance.**
@@ -137,12 +147,17 @@ heartbeat totals are the durable record.
 - `KHIVE_CHANNEL_NOTIFY_ACTOR` unset: no notice. Set to `email:ops@example.com` or to a value containing a space:
   no notice, polling and delivery continue, and `comm.health` reports `notice_config_error`. Set to `channel:email`:
   the notice is delivered.
-- An `off-allowlist` quarantine sends no notice, including while the blob store refuses originals (it is counted in
-  `originals_not_retained`).
-- A blob store that refuses originals, accepted messages refused by `comm.ingest`: the first record without its
-  original sends one notice, the next two send none, a record that keeps its original sends none, and the next
-  refusal after it sends one; `comm.health` reports `originals_not_retained` 4 and `original_retention_state`
-  `failing`. The same sequence on a second credential in the same daemon notifies independently.
+- An `off-allowlist` quarantine that keeps its original sends no notice.
+- A blob store that refuses originals, three `off-allowlist` records and then one accepted message refused past the
+  bound: one lost-original notice, for the first `off-allowlist` record; none for the second and third; one notice
+  for the accepted message, naming its hold and its lost original; `originals_not_retained` 4.
+- A blob store that refuses originals, `off-allowlist` records only, with a test clock: the first record without its
+  original sends one notice, the next two send none, a record that keeps its original sends none, the next refusal
+  inside the hour sends none, and with the clock past the hour the next refusal in that run sends one;
+  `comm.health` reports `originals_not_retained` 5 and `original_retention_state` `failing`. The same sequence on a
+  second credential in the same daemon notifies independently.
+- Ten `off-allowlist` records alternating kept and lost originals inside an hour: exactly one notice.
+- An accepted message that `comm.ingest` refuses as `Permanent`: one notice, on its first poll.
 - A record that is quarantined after a hold and loses its original sends exactly one notice naming both.
 - The `quarantine-write-failed` fallback and a `secondary-backend` drop each count and notify as failures.
 - `retention-limit` alone, alternating with kept originals: no notice.
