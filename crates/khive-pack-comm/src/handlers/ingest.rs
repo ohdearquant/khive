@@ -12,7 +12,7 @@ use super::{
 
 #[path = "ingest/correlation.rs"]
 mod correlation;
-pub use correlation::{resolve_ingest_correlation, ResolvedInboundThread};
+pub use correlation::{resolve_ingest_correlation, ResolvedInboundThread, ThreadUuidProof};
 
 /// The retention facts disclosed on a new quarantine record's `comm.ingest`
 /// receipt (ADR-056, 2026-10-15 amendment decision 4). `retained` mirrors
@@ -674,8 +674,15 @@ pub(crate) async fn handle_ingest(
     let resolved = if let Some(candidates) = p.pending_owner_candidates.as_ref() {
         let mut selected = None;
         for candidate in candidates {
-            if let Some(owner) =
-                resolve_ingest_correlation(runtime, token, email_domains, candidate, true).await?
+            if let Some(owner) = resolve_ingest_correlation(
+                runtime,
+                token,
+                email_domains,
+                candidate,
+                true,
+                ThreadUuidProof::VerifiedOutboundEmail,
+            )
+            .await?
             {
                 if !owner.actor.trim().is_empty() {
                     selected = Some((owner.thread_id.to_string(), owner.actor));
@@ -691,6 +698,7 @@ pub(crate) async fn handle_ingest(
             email_domains,
             corr,
             p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:"),
+            ThreadUuidProof::Unverified,
         )
         .await?
         .map(|resolved| (resolved.thread_id.to_string(), resolved.actor))

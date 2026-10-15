@@ -7262,6 +7262,304 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
     );
 }
 
+/// The external-marking metadata every `pending_owner_candidates` ingest requires.
+fn external_ingest_metadata() -> serde_json::Value {
+    serde_json::json!({ "origin": "external", "trust": "untrusted" })
+}
+
+/// Plant a message row with an explicit id and an explicit `created_at`, so the
+/// store's `created_at DESC, id ASC` page order is deterministic across fixture
+/// rows. A larger `created_at` sorts first.
+async fn plant_message_note_at(
+    rt: &KhiveRuntime,
+    id: uuid::Uuid,
+    content: &str,
+    props: serde_json::Value,
+    created_at: i64,
+) {
+    use khive_storage::note::Note;
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    let store = rt.notes(&token).expect("notes store");
+    let note = Note {
+        version: 1,
+        key: None,
+        id,
+        namespace: "local".into(),
+        kind: "message".into(),
+        status: "active".into(),
+        name: None,
+        content: content.into(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(props),
+        created_at,
+        updated_at: created_at,
+        deleted_at: None,
+    };
+    store.upsert_note(note).await.expect("upsert planted note");
+}
+
+/// Outbound-email row properties for a thread, for tests that plant rows directly.
+/// The row is an email by its `email:` addresses. It carries no `channel_kind` or
+/// `channel_slug`: the note store refuses those transport-owned keys from this
+/// path, and a row without a slug is verified by its Message-ID alone.
+fn outbound_email_props(thread_id: &str, from_actor: &str, message_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "direction": "outbound",
+        "from": "email:mailbox@khive.ai",
+        "to": "email:user@example.com",
+        "from_actor": from_actor,
+        "to_actor": "email:user@example.com",
+        "external_id": message_id,
+        "thread_id": thread_id,
+        "sent_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// An external ingest whose thread UUID names a thread holding an outbound
+/// email whose Message-ID verifies (ADR-200 Amendment 1, decision 4) routes to
+/// that email's sending actor and thread.
+#[tokio::test]
+async fn external_thread_uuid_routes_to_verified_outbound_email_owner() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let owner_message_id = uuid::Uuid::new_v4();
+    // The thread's oldest row is a non-email `comm.send` whose `from_actor` is
+    // NOT the verified owner: the unproven first-row pass 2 would take it.
+    plant_message_note_at(
+        &rt,
+        uuid::Uuid::new_v4(),
+        "non-email row planted at the thread",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:decoy",
+            "to": "lambda:other",
+            "from_actor": "lambda:decoy",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+        1,
+    )
+    .await;
+    // A second non-email row written later sorts first under `created_at DESC`;
+    // proof must page past it to the verified email below.
+    plant_message_note_at(
+        &rt,
+        uuid::Uuid::new_v4(),
+        "newer non-email row planted at the thread",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:decoy",
+            "to": "lambda:other",
+            "from_actor": "lambda:decoy",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+        3,
+    )
+    .await;
+    // The verified outbound email, stranded between two decoys in page order.
+    plant_message_note_at(
+        &rt,
+        owner_message_id,
+        "outbound email that owns the thread",
+        outbound_email_props(
+            &thread_uuid,
+            "lambda:owner",
+            &format!("<{owner_message_id}@khive.ai>"),
+        ),
+        2,
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply via the thread header",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:positive:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:owner"),
+        "an external thread UUID with a verified outbound email must route to \
+         that message's sending actor; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "the verified email thread must be preserved as the ingested root; \
+         got props={props}"
+    );
+}
+
+/// The same external ingest naming a thread whose only outbound message is NOT
+/// an email does not route there; it lands on the external inbound actor (the
+/// fixture supplies no recipient alias).
+#[tokio::test]
+async fn external_thread_uuid_does_not_route_to_non_email_thread() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    plant_message_note(
+        &rt,
+        "outbound comm.send between actors",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:copier",
+            "to": "lambda:other",
+            "from_actor": "lambda:copier",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply naming a non-email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:non-email:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("actor:external"),
+        "a thread UUID naming a non-email thread must fall through to the \
+         external inbound actor, not that thread's actor; got props={props}"
+    );
+    assert_ne!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "the non-email thread must not be adopted; got props={props}"
+    );
+}
+
+/// A thread holding an outbound email whose Message-ID does not verify under the
+/// configured domains does not route there either.
+#[tokio::test]
+async fn external_thread_uuid_does_not_route_to_unverified_outbound_email() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    // An email row whose Minted Message-ID embeds its own UUID but names a
+    // foreign domain: an email, but not one this mailbox can prove it sent.
+    let foreign_id = uuid::Uuid::new_v4();
+    plant_message_note_at(
+        &rt,
+        foreign_id,
+        "outbound email with a copied Message-ID",
+        outbound_email_props(
+            &thread_uuid,
+            "lambda:owner",
+            &format!("<{foreign_id}@outside.example>"),
+        ),
+        1,
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply naming an unverified email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:unverified:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("actor:external"),
+        "an outbound email whose Message-ID does not verify must not own the \
+         thread for an external sender; got props={props}"
+    );
+}
+
+/// Scope control: maintainer mail (the `correlation_external_id` path) naming the
+/// non-email thread still resolves the way it did before this change.
+#[tokio::test]
+async fn maintainer_thread_uuid_keeps_unverified_resolution() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    plant_message_note(
+        &rt,
+        "outbound comm.send between actors",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:copier",
+            "to": "lambda:other",
+            "from_actor": "lambda:copier",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:maintainer@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "maintainer mail naming a non-email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "correlation_external_id": thread_uuid,
+            "external_id": "imap:maintainer-thread-route:1",
+            "default_inbound_actor": "actor:fallback",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:copier"),
+        "maintainer mail keeps the thread-UUID resolution unchanged; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "maintainer mail must remain attached to the named thread; got props={props}"
+    );
+}
+
 /// Helper: plant a message note directly with the given properties, returning its UUID.
 async fn plant_message_note(
     rt: &KhiveRuntime,
