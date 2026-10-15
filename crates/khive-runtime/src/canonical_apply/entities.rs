@@ -52,9 +52,8 @@ pub(super) async fn prepare(
 impl PreparedEntityUpdate {
     pub(super) fn projected(&self, now: i64) -> RuntimeResult<Entity> {
         let mut entity = self.snapshot.clone();
-        let (_, changed_fields) =
-            KhiveRuntime::apply_entity_patch_fields(&mut entity, self.patch.clone(), &[], true);
-        if changed_fields.is_empty() {
+        KhiveRuntime::apply_entity_patch_fields(&mut entity, self.patch.clone(), &[], true);
+        if same_patchable_values(&entity, &self.snapshot) {
             // An unchanged patch lands as a no-op (see `materialize`), so later
             // operations in the unit see the same revision.
             return Ok(entity);
@@ -95,14 +94,15 @@ pub(super) fn materialize(
     let previous_updated_at = live.updated_at;
     let previous_deleted_at = live.deleted_at;
     let previous_version = live.version;
+    let before = live.clone();
     let (reindex, changed_fields) =
         KhiveRuntime::apply_entity_patch_fields(&mut live, prepared.patch.clone(), &[], true);
     crate::secret_gate::reject_reserved_secret_gate_property(live.properties.as_ref())
         .map_err(|error| failure(error.to_string()))?;
-    if changed_fields.is_empty() {
-        // Live `update` leaves an unchanged entity untouched: no write, no event,
-        // no new revision. A canonical update whose values already hold lands the
-        // same way, so replaying it changes nothing.
+    if same_patchable_values(&live, &before) {
+        // A canonical update whose values already hold lands as a no-op: no write,
+        // no event, no new revision. Its preimage still matches on replay, so this is
+        // what keeps a landed change-set from writing a second time.
         let assertion = SqlStatement {
             sql: include_str!("../../sql/canonical_entity_noop_assertion.sql").into(),
             params: vec![
@@ -172,6 +172,17 @@ pub(super) fn materialize(
         note_embedding_inheritance: None,
         graph_effects: Vec::new(),
     })))
+}
+
+/// Whether a patch left every field it can write equal to the row it was applied to.
+/// `apply_entity_patch_fields` reports the fields a patch names, not the ones whose value
+/// changed, so a patch that restates current values must be detected by comparing values.
+fn same_patchable_values(patched: &Entity, row: &Entity) -> bool {
+    patched.name == row.name
+        && patched.description == row.description
+        && patched.properties == row.properties
+        && patched.tags == row.tags
+        && patched.entity_type == row.entity_type
 }
 
 fn failure(message: String) -> AtomicOpFailure {

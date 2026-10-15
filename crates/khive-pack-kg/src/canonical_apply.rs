@@ -1,7 +1,8 @@
 use khive_changeset::{ChangeSet, CreateTarget, Op};
+use khive_runtime::atomic_prepare::apply_post_commit_effects_with_report;
+use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{
-    apply_post_commit_effects_with_report, AtomicOpFailure, AtomicRunOutcome,
-    EmbeddingTruncationReport, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
+    AtomicOpFailure, AtomicRunOutcome, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_types::event::ProposalPreimageStatus;
 use khive_types::{Details, EntityDraft, KhiveError, NoteDraft, ProposalChangeset};
@@ -108,7 +109,7 @@ pub(crate) fn validate_canonical_admission(
             match &create.target {
                 CreateTarget::Entity(fields) => {
                     let kind = crate::handlers::canonical_entity_kind(
-                        fields.entity_kind.as_str(),
+                        fields.entity_kind.name(),
                         registry,
                     )?;
                     let properties = Some(

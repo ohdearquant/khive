@@ -50,11 +50,11 @@ enum Mutation {
     },
     Entity {
         op: UpdateOp,
-        prepared: entities::PreparedEntityUpdate,
+        prepared: Box<entities::PreparedEntityUpdate>,
     },
     Note {
         op: UpdateOp,
-        prepared: notes::PreparedCanonicalNote,
+        prepared: Box<notes::PreparedCanonicalNote>,
         lookup: CanonicalNoteHookLookup,
     },
     Edge {
@@ -241,7 +241,7 @@ pub async fn prepare_canonical_changeset(
                             shadow.insert(id, Some(Record::Entity(prepared.projected(now)?)));
                             Mutation::Entity {
                                 op: update.clone(),
-                                prepared,
+                                prepared: Box::new(prepared),
                             }
                         }
                         (UpdatePatch::Note(_), Some(Record::Note(row))) => {
@@ -251,7 +251,7 @@ pub async fn prepare_canonical_changeset(
                             shadow.insert(id, Some(Record::Note(prepared.projected(now)?)));
                             Mutation::Note {
                                 op: update.clone(),
-                                prepared,
+                                prepared: Box::new(prepared),
                                 lookup: registry.canonical_note_hook_lookup(),
                             }
                         }
