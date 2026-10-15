@@ -56,6 +56,14 @@ use khive_storage::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "events_count_read_budget.rs"]
+mod events_count_read_budget;
+use events_count_read_budget::CountReadBudget;
+#[doc(hidden)]
+pub use events_count_read_budget::WireReadFailure;
+#[cfg(unix)]
+use events_count_read_budget::{count_storage_error_response, restore_count_read_failure};
+
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
@@ -78,8 +86,9 @@ use crate::daemon::{read_frame, write_frame};
 /// claiming the remote writer task terminated. Version 4 adds exact event-target
 /// filtering and the refusal kind. Older readers would ignore the new filter
 /// field, silently broadening a query. Version 5 adds grouped count requests
-/// and responses; clients and daemons must be upgraded together.
-pub const EVENTS_PROTOCOL_VERSION: u32 = 5;
+/// and responses. Version 6 preserves typed count read failures and the caller
+/// budget attribution; clients and daemons must be upgraded together.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 6;
 
 /// Default bound on the fire-and-forget append queue, in batches. The byte
 /// bound below also applies, so a large batch cannot multiply this depth
@@ -601,11 +610,15 @@ pub enum EventsRequest {
     CountEvents {
         protocol_version: u32,
         namespace: String,
+        #[serde(default)]
+        operator_read_budget_secs: Option<u64>,
         filter: EventFilter,
     },
     CountEventsGrouped {
         protocol_version: u32,
         namespace: String,
+        #[serde(default)]
+        operator_read_budget_secs: Option<u64>,
         filter: EventFilter,
         group_by: EventGroupBy,
     },
@@ -635,6 +648,20 @@ impl EventsRequest {
             | Self::CountEventsGrouped {
                 protocol_version, ..
             } => *protocol_version,
+        }
+    }
+
+    fn count_budget_secs(&self) -> Option<Option<u64>> {
+        match self {
+            Self::CountEvents {
+                operator_read_budget_secs,
+                ..
+            }
+            | Self::CountEventsGrouped {
+                operator_read_budget_secs,
+                ..
+            } => Some(*operator_read_budget_secs),
+            _ => None,
         }
     }
 
@@ -693,6 +720,8 @@ pub enum EventsResponse {
         /// Optional native write evidence; older frames retain their legacy mapping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sqlite_write_failure: Option<khive_storage::error::SqliteWriteFailure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_failure: Option<WireReadFailure>,
     },
 }
 
@@ -917,14 +946,14 @@ type EventsDbIdentities = [Option<EventsFileIdentity>; 3];
 /// and cannot be inode-pinned from here — so the remaining defense is the
 /// same one the daemon socket uses: no untrusted local user may be able to
 /// write (or swap components of) the directory the path traverses. Delegates
-/// to the socket-path walk, which validates every ancestor the kernel will
-/// visit, with the same ownership and sticky-bit rules.
+/// to the shared trust walk with store-specific diagnostics, validating every
+/// ancestor the kernel will visit with the same ownership and sticky-bit rules.
 #[cfg(unix)]
 fn ensure_events_db_parent_trusted(db_path: &Path) -> anyhow::Result<()> {
-    let parent = absolutize(db_path);
-    let parent = parent.parent().filter(|p| !p.as_os_str().is_empty());
+    let db_path = absolutize(db_path);
+    let parent = db_path.parent().filter(|p| !p.as_os_str().is_empty());
     match parent {
-        Some(dir) => crate::daemon::ensure_socket_dir_is_trusted(dir).map_err(|e| {
+        Some(dir) => crate::daemon::ensure_store_dir_is_trusted(dir, &db_path).map_err(|e| {
             anyhow::anyhow!("refusing to serve events from an untrusted directory: {e}")
         }),
         None => Ok(()),
@@ -1092,6 +1121,179 @@ fn verify_events_db_owner_only_unopened(
     Ok(())
 }
 
+/// How long a daemon holds requests at startup for the events daemon it
+/// supervises to answer before it refuses them ([`EventsReadiness`]).
+#[cfg(unix)]
+pub const EVENTS_READINESS_WINDOW: Duration = Duration::from_secs(10);
+
+/// Startup readiness of the events daemon this process supervises (ADR-170),
+/// as seen by the request path.
+///
+/// A daemon with events forwarding enabled commits every write's audit batch
+/// through the supervised events daemon. That child is spawned in the
+/// background after the main socket is bound, and until it binds its own
+/// socket every audit commit fails: a write verb then reports a refusal
+/// while its domain write is already committed. The daemon therefore holds
+/// each request at this gate until the events socket has answered once.
+///
+/// The window is measured from the moment supervision starts, not per
+/// request: once it has elapsed without an answer, requests are refused at
+/// once instead of each waiting again, and a later answer (a respawned child
+/// binding) admits them again. The gate is a startup barrier only; it stays
+/// open after the first answer.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct EventsReadiness {
+    socket: PathBuf,
+    deadline: tokio::time::Instant,
+    ready: tokio::sync::watch::Receiver<bool>,
+}
+
+/// The supervisor's side of an [`EventsReadiness`] gate.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct EventsReadinessSignal {
+    deadline: tokio::time::Instant,
+    ready: tokio::sync::watch::Sender<bool>,
+}
+
+/// Why an [`EventsReadiness`] gate refused a request.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventsNotReadyReason {
+    /// The startup window elapsed without the events socket answering.
+    WindowElapsed,
+    /// The supervisor stopped before the events socket answered.
+    SupervisorStopped,
+}
+
+/// A request refused by an [`EventsReadiness`] gate; names the socket that
+/// did not answer.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventsNotReady {
+    pub socket: PathBuf,
+    pub reason: EventsNotReadyReason,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for EventsNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            EventsNotReadyReason::WindowElapsed => write!(
+                f,
+                "events daemon at {} has not answered since this daemon started; \
+                 the request was refused before dispatch",
+                self.socket.display()
+            ),
+            EventsNotReadyReason::SupervisorStopped => write!(
+                f,
+                "events daemon supervision for {} stopped before the socket answered; \
+                 the request was refused before dispatch",
+                self.socket.display()
+            ),
+        }
+    }
+}
+
+/// Create a readiness gate for the events daemon at `socket`, whose startup
+/// window of `window` starts now.
+#[cfg(unix)]
+pub fn events_readiness(
+    socket: PathBuf,
+    window: Duration,
+) -> (EventsReadinessSignal, EventsReadiness) {
+    let deadline = tokio::time::Instant::now() + window;
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    (
+        EventsReadinessSignal {
+            deadline,
+            ready: sender,
+        },
+        EventsReadiness {
+            socket,
+            deadline,
+            ready: receiver,
+        },
+    )
+}
+
+#[cfg(unix)]
+impl EventsReadinessSignal {
+    /// Record that the events socket answered; opens the gate for good.
+    pub fn mark_ready(&self) {
+        self.ready
+            .send_if_modified(|ready| !std::mem::replace(ready, true));
+    }
+
+    /// Whether requests may still be waiting on this gate: not yet ready and
+    /// the startup window still open.
+    pub fn awaiting(&self) -> bool {
+        !*self.ready.borrow() && tokio::time::Instant::now() < self.deadline
+    }
+
+    /// Whether the events socket has answered.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+}
+
+#[cfg(unix)]
+impl EventsReadiness {
+    /// The events socket this gate waits on.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Whether the events socket has answered.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Wait until the events socket has answered, or refuse once the startup
+    /// window has elapsed or the supervisor has stopped.
+    pub async fn wait(&self) -> Result<(), EventsNotReady> {
+        let mut ready = self.ready.clone();
+        let outcome = tokio::time::timeout_at(self.deadline, ready.wait_for(|ready| *ready))
+            .await
+            .map(|answered| answered.map(|_| ()));
+        let refused = |reason| EventsNotReady {
+            socket: self.socket.clone(),
+            reason,
+        };
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(refused(EventsNotReadyReason::SupervisorStopped)),
+            Err(_) if self.is_ready() => Ok(()),
+            Err(_) => Err(refused(EventsNotReadyReason::WindowElapsed)),
+        }
+    }
+}
+
+/// The startup window for a new [`EventsReadiness`] gate:
+/// [`EVENTS_READINESS_WINDOW`], or `KHIVE_TEST_EVENTS_READY_WINDOW_MS` under
+/// `KHIVE_TEST_HARNESS=1` so integration tests can reach the refusal quickly.
+#[cfg(unix)]
+pub fn events_readiness_window() -> Duration {
+    harness_duration_ms("KHIVE_TEST_EVENTS_READY_WINDOW_MS").unwrap_or(EVENTS_READINESS_WINDOW)
+}
+
+/// A test-only duration in milliseconds read from the variable `name`,
+/// honoured only under `KHIVE_TEST_HARNESS=1`. Unset, malformed or outside
+/// the harness it is `None`.
+#[cfg(unix)]
+pub(crate) fn harness_duration_ms(name: &str) -> Option<Duration> {
+    if std::env::var("KHIVE_TEST_HARNESS").as_deref() != Ok("1") {
+        return None;
+    }
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
 /// Supervise the events daemon from the main daemon process: probe the
 /// socket periodically and (re)spawn the daemon subcommand when unreachable.
 ///
@@ -1145,6 +1347,39 @@ pub async fn supervise_events_daemon_with_policies(
     disk_guard: khive_db::EffectiveDiskGuardConfig,
     volume_lock_dir: PathBuf,
 ) {
+    let (readiness, _unobserved) = events_readiness(socket_path.clone(), EVENTS_READINESS_WINDOW);
+    supervise_events_daemon_with_readiness(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        volume_lock_dir,
+        readiness,
+    )
+    .await;
+}
+
+/// [`supervise_events_daemon_with_policies`], reporting the first answer of
+/// the events socket through `readiness` so the host can hold requests until
+/// then ([`EventsReadiness`]).
+///
+/// While the gate is waiting, the socket is probed every
+/// `FAST_PROBE_INTERVAL` instead of every `PROBE_INTERVAL`, so a request is
+/// admitted within milliseconds of the child binding. Once the startup window
+/// has elapsed without an answer, it is probed every
+/// `UNANSWERED_PROBE_INTERVAL`, so a late bind reopens the gate within a
+/// second instead of up to `PROBE_INTERVAL` later. A spawn still happens at
+/// most once per `PROBE_INTERVAL`, so a child that keeps failing at startup
+/// is respawned no faster than before.
+#[cfg(unix)]
+pub async fn supervise_events_daemon_with_readiness(
+    db_path: PathBuf,
+    socket_path: PathBuf,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+    readiness: EventsReadinessSignal,
+) {
     if let Err(error) = disk_guard.validate() {
         tracing::warn!(%error, "invalid disk policy; events supervisor not started");
         return;
@@ -1154,9 +1389,12 @@ pub async fn supervise_events_daemon_with_policies(
         return;
     }
     const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+    const FAST_PROBE_INTERVAL: Duration = Duration::from_millis(20);
+    const UNANSWERED_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     let shutdown = crate::daemon::daemon_shutdown_token();
     let mut child: Option<std::process::Child> = None;
     let mut respawns: u64 = 0;
+    let mut last_spawn: Option<std::time::Instant> = None;
     loop {
         // Reap first: a child that exited (crashed, lost the advisory lock
         // race, refused an untrusted directory) must not linger as a zombie,
@@ -1187,7 +1425,12 @@ pub async fn supervise_events_daemon_with_policies(
             }
             Err(_) => false,
         };
-        if !reachable && child.is_none() {
+        if reachable {
+            readiness.mark_ready();
+        }
+        let spawn_due = last_spawn.is_none_or(|at| at.elapsed() >= PROBE_INTERVAL);
+        if !reachable && child.is_none() && spawn_due {
+            last_spawn = Some(std::time::Instant::now());
             match std::env::current_exe() {
                 Ok(exe) => {
                     let spawned = events_daemon_command(
@@ -1220,9 +1463,16 @@ pub async fn supervise_events_daemon_with_policies(
                 }
             }
         }
+        let pause = if readiness.awaiting() {
+            FAST_PROBE_INTERVAL
+        } else if readiness.is_ready() {
+            PROBE_INTERVAL
+        } else {
+            UNANSWERED_PROBE_INTERVAL
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
     }
     if let Some(mut c) = child.take() {
@@ -1373,6 +1623,15 @@ pub async fn run_events_daemon_with_policies(
     backend.events()?;
     verify_events_db_owner_only_unopened(db_path, &before_open)?;
 
+    // Integration tests widen the window between the main daemon accepting
+    // requests and this socket answering, which a slow host produces.
+    if let Some(delay) = harness_duration_ms("KHIVE_TEST_EVENTS_DAEMON_BIND_DELAY_MS") {
+        tracing::info!(
+            delay_ms = delay.as_millis() as u64,
+            "test harness: delaying events socket bind"
+        );
+        tokio::time::sleep(delay).await;
+    }
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -1584,12 +1843,30 @@ async fn serve_events_conn(
             Ok(Err(_)) | Err(_) => return,
         };
         let response = match serde_json::from_slice::<EventsRequest>(&payload) {
+            Ok(request) if request.count_budget_secs().is_some() => {
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let dispatch = khive_storage::scope_request_read_cancellation(
+                    cancel_rx,
+                    dispatch_events_request(request, &backend, &stores),
+                );
+                tokio::pin!(dispatch);
+                tokio::select! {
+                    response = &mut dispatch => response,
+                    _ = count_peer_disconnected(&stream) => {
+                        let _ = cancel_tx.send(true);
+                        // The SQLite owner must interrupt and join before this frame's permit drops.
+                        let _ = dispatch.await;
+                        return;
+                    }
+                }
+            }
             Ok(request) => dispatch_events_request(request, &backend, &stores).await,
             Err(error) => EventsResponse::Error {
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
             },
         };
         let bytes = match serde_json::to_vec(&response) {
@@ -1612,6 +1889,7 @@ async fn serve_events_conn(
                 retryable: false,
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
             };
             match serde_json::to_vec(&refusal) {
                 Ok(bytes) => bytes,
@@ -1637,6 +1915,21 @@ async fn serve_events_conn(
 }
 
 #[cfg(unix)]
+async fn count_peer_disconnected(stream: &UnixStream) {
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        let mut byte = [0u8; 1];
+        match stream.try_read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            // Count clients own a one-request socket; extra bytes also end that exchange.
+            _ => return,
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn dispatch_events_request(
     request: EventsRequest,
     backend: &StorageBackend,
@@ -1652,6 +1945,7 @@ async fn dispatch_events_request(
             retryable: false,
             writer_task_failure: None,
             sqlite_write_failure: None,
+            read_failure: None,
         };
     }
     // The wire namespace is an unrestricted client-supplied String until this
@@ -1665,7 +1959,29 @@ async fn dispatch_events_request(
             retryable: false,
             writer_task_failure: None,
             sqlite_write_failure: None,
+            read_failure: None,
         };
+    }
+    let count_budget_secs = match request.count_budget_secs() {
+        Some(Some(seconds))
+            if (1..=khive_storage::request_context::MAX_REQUEST_READ_TIMEOUT_SECS)
+                .contains(&seconds) =>
+        {
+            Some(seconds)
+        }
+        Some(_) => {
+            return storage_error_response(&StorageError::InvalidInput {
+                capability: khive_storage::StorageCapability::Events,
+                operation: "events count".into(),
+                message: "missing or invalid operator_read_budget_secs attribution".into(),
+            })
+        }
+        None => None,
+    };
+    if let Some(seconds) = count_budget_secs {
+        if let Err(error) = khive_storage::ensure_request_read_active("events count") {
+            return count_storage_error_response(error, seconds);
+        }
     }
     let store = match namespace_store(backend, stores, request.namespace()) {
         Ok(store) => store,
@@ -1675,9 +1991,15 @@ async fn dispatch_events_request(
                 retryable: true,
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
             };
         }
     };
+    if let Some(seconds) = count_budget_secs {
+        if let Err(error) = khive_storage::ensure_request_read_active("events count") {
+            return count_storage_error_response(error, seconds);
+        }
+    }
     match request {
         EventsRequest::AppendEvents { events, .. } => match store.append_events(events).await {
             Ok(summary) => EventsResponse::Appended { summary },
@@ -1704,6 +2026,7 @@ async fn dispatch_events_request(
                     retryable: false,
                     writer_task_failure: None,
                     sqlite_write_failure: None,
+                    read_failure: None,
                 };
             }
             match store.query_events(filter, page).await {
@@ -1720,16 +2043,40 @@ async fn dispatch_events_request(
                 Err(error) => storage_error_response(&error),
             }
         }
-        EventsRequest::CountEvents { filter, .. } => match store.count_events(filter).await {
-            Ok(count) => EventsResponse::Count { count },
-            Err(error) => storage_error_response(&error),
-        },
+        EventsRequest::CountEvents { filter, .. } => {
+            let Some(seconds) = count_budget_secs else {
+                return storage_error_response(&StorageError::InvalidInput {
+                    capability: khive_storage::StorageCapability::Events,
+                    operation: "events count".into(),
+                    message: "missing operator_read_budget_secs attribution".into(),
+                });
+            };
+            match store.count_events(filter).await {
+                Ok(count) => match khive_storage::ensure_request_read_active("events count") {
+                    Ok(()) => EventsResponse::Count { count },
+                    Err(error) => count_storage_error_response(error, seconds),
+                },
+                Err(error) => count_storage_error_response(error, seconds),
+            }
+        }
         EventsRequest::CountEventsGrouped {
             filter, group_by, ..
-        } => match store.count_events_grouped(filter, group_by).await {
-            Ok(counts) => EventsResponse::GroupedCount { counts },
-            Err(error) => storage_error_response(&error),
-        },
+        } => {
+            let Some(seconds) = count_budget_secs else {
+                return storage_error_response(&StorageError::InvalidInput {
+                    capability: khive_storage::StorageCapability::Events,
+                    operation: "events count".into(),
+                    message: "missing operator_read_budget_secs attribution".into(),
+                });
+            };
+            match store.count_events_grouped(filter, group_by).await {
+                Ok(counts) => match khive_storage::ensure_request_read_active("events count") {
+                    Ok(()) => EventsResponse::GroupedCount { counts },
+                    Err(error) => count_storage_error_response(error, seconds),
+                },
+                Err(error) => count_storage_error_response(error, seconds),
+            }
+        }
     }
 }
 
@@ -1766,6 +2113,7 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
         retryable: error.is_retryable(),
         writer_task_failure,
         sqlite_write_failure: error.sqlite_write_failure(),
+        read_failure: None,
     }
 }
 
@@ -2099,22 +2447,8 @@ impl EventsSplitClient {
     /// bounds the whole attempt — connect, peer verification, write, read.
     async fn round_trip(&self, request: &EventsRequest) -> StorageResult<EventsResponse> {
         let op = "events daemon round-trip";
-        let payload = serde_json::to_vec(request).map_err(|error| StorageError::Serialization {
-            capability: khive_storage::StorageCapability::Events,
-            message: format!("events request serialization failed: {error}"),
-        })?;
-
-        let attempt = async {
-            let mut stream = connect_verified(&self.socket_path)
-                .await
-                .map_err(|error| ("connect", error))?;
-            write_frame(&mut stream, &payload)
-                .await
-                .map_err(|error| ("write", error))?;
-            read_frame(&mut stream)
-                .await
-                .map_err(|error| ("read", error))
-        };
+        let payload = serialize_events_request(request)?;
+        let attempt = events_round_trip_attempt(&self.socket_path, &payload);
         let bytes = match tokio::time::timeout(REQUEST_TIMEOUT, attempt).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(("read", error))) => {
@@ -2142,13 +2476,65 @@ impl EventsSplitClient {
             }
         };
 
-        serde_json::from_slice::<EventsResponse>(&bytes).map_err(|error| {
-            StorageError::Serialization {
-                capability: khive_storage::StorageCapability::Events,
-                message: format!("events response deserialization failed: {error}"),
-            }
-        })
+        deserialize_events_response(&bytes)
     }
+
+    async fn round_trip_count(
+        &self,
+        request: &EventsRequest,
+        budget: &CountReadBudget,
+    ) -> StorageResult<EventsResponse> {
+        budget.scope(async {
+            let payload = serialize_events_request(request)?;
+            let attempt = events_round_trip_attempt(&self.socket_path, &payload);
+            let result = khive_storage::await_request_read_phase("events daemon count round-trip", attempt)
+                .await.map_err(|error| budget.attribute(error))?;
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(("read", error)) => return Err(StorageError::Serialization {
+                    capability: khive_storage::StorageCapability::Events,
+                    message: format!("events daemon closed or broke the response after connection at {}: {error}", self.socket_path.display()),
+                }),
+                Err((stage, error)) => return Err(StorageError::Pool {
+                    operation: "events daemon count round-trip".into(),
+                    message: format!("events daemon {stage} failed at {}: {error}", self.socket_path.display()),
+                }),
+            };
+            deserialize_events_response(&bytes)
+        }).await
+    }
+}
+
+#[cfg(unix)]
+fn serialize_events_request(request: &EventsRequest) -> StorageResult<Vec<u8>> {
+    serde_json::to_vec(request).map_err(|error| StorageError::Serialization {
+        capability: khive_storage::StorageCapability::Events,
+        message: format!("events request serialization failed: {error}"),
+    })
+}
+
+#[cfg(unix)]
+fn deserialize_events_response(bytes: &[u8]) -> StorageResult<EventsResponse> {
+    serde_json::from_slice(bytes).map_err(|error| StorageError::Serialization {
+        capability: khive_storage::StorageCapability::Events,
+        message: format!("events response deserialization failed: {error}"),
+    })
+}
+
+#[cfg(unix)]
+async fn events_round_trip_attempt(
+    socket_path: &Path,
+    payload: &[u8],
+) -> Result<Vec<u8>, (&'static str, std::io::Error)> {
+    let mut stream = connect_verified(socket_path)
+        .await
+        .map_err(|error| ("connect", error))?;
+    write_frame(&mut stream, payload)
+        .await
+        .map_err(|error| ("write", error))?;
+    read_frame(&mut stream)
+        .await
+        .map_err(|error| ("read", error))
 }
 
 /// Drain every batch currently sitting in the fire-and-forget queue,
@@ -2345,6 +2731,13 @@ impl ForwardingEventStore {
         }
     }
 
+    fn unexpected_count(&self, op: &'static str, response: EventsResponse) -> StorageError {
+        match restore_count_read_failure(response) {
+            Err(error) => error,
+            Ok(other) => self.unexpected(op, other),
+        }
+    }
+
     fn unexpected(&self, op: &'static str, response: EventsResponse) -> StorageError {
         match response {
             EventsResponse::Error {
@@ -2352,7 +2745,13 @@ impl ForwardingEventStore {
                 retryable,
                 writer_task_failure,
                 sqlite_write_failure,
+                read_failure,
             } => {
+                if read_failure.is_some() {
+                    return events_count_read_budget::malformed_read_failure(
+                        "non-count response carries read failure evidence",
+                    );
+                }
                 // Reconstruct the same legacy policy first; evidence must not
                 // widen retries or turn a known rollback into task termination.
                 let source = if retryable {
@@ -2452,14 +2851,16 @@ impl EventStore for ForwardingEventStore {
     }
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+        let budget = CountReadBudget::capture();
         let request = EventsRequest::CountEvents {
             protocol_version: EVENTS_PROTOCOL_VERSION,
             namespace: self.namespace.clone(),
+            operator_read_budget_secs: Some(budget.operator_read_budget_secs),
             filter,
         };
-        match self.client.round_trip(&request).await? {
+        match self.client.round_trip_count(&request, &budget).await? {
             EventsResponse::Count { count } => Ok(count),
-            other => Err(self.unexpected("count_events", other)),
+            other => Err(self.unexpected_count("count_events", other)),
         }
     }
 
@@ -2468,15 +2869,17 @@ impl EventStore for ForwardingEventStore {
         filter: EventFilter,
         group_by: EventGroupBy,
     ) -> StorageResult<BTreeMap<String, u64>> {
+        let budget = CountReadBudget::capture();
         let request = EventsRequest::CountEventsGrouped {
             protocol_version: EVENTS_PROTOCOL_VERSION,
             namespace: self.namespace.clone(),
+            operator_read_budget_secs: Some(budget.operator_read_budget_secs),
             filter,
             group_by,
         };
-        match self.client.round_trip(&request).await? {
+        match self.client.round_trip_count(&request, &budget).await? {
             EventsResponse::GroupedCount { counts } => Ok(counts),
-            other => Err(self.unexpected("count_events_grouped", other)),
+            other => Err(self.unexpected_count("count_events_grouped", other)),
         }
     }
 
@@ -2645,9 +3048,18 @@ impl EventStore for SplitEventStore {
     }
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
-        let legacy = self.legacy.count_events(filter.clone()).await?;
-        let lane = self.lane.count_events(filter).await?;
-        Ok(legacy + lane)
+        let budget = CountReadBudget::capture();
+        budget
+            .scope(async {
+                let legacy = self
+                    .legacy
+                    .count_events(filter.clone())
+                    .await
+                    .map_err(|error| budget.attribute(error))?;
+                let lane = self.lane.count_events(filter).await?;
+                Ok(legacy + lane)
+            })
+            .await
     }
 
     async fn count_events_grouped(
@@ -2655,21 +3067,28 @@ impl EventStore for SplitEventStore {
         filter: EventFilter,
         group_by: EventGroupBy,
     ) -> StorageResult<BTreeMap<String, u64>> {
-        let mut counts = self
-            .legacy
-            .count_events_grouped(filter.clone(), group_by)
-            .await?;
-        for (key, count) in self.lane.count_events_grouped(filter, group_by).await? {
-            let total = counts.entry(key).or_default();
-            *total = total
-                .checked_add(count)
-                .ok_or_else(|| StorageError::InvalidInput {
-                    capability: khive_storage::StorageCapability::Events,
-                    operation: "count_events_grouped".into(),
-                    message: "grouped event count overflow".into(),
-                })?;
-        }
-        Ok(counts)
+        let budget = CountReadBudget::capture();
+        budget
+            .scope(async {
+                let mut counts = self
+                    .legacy
+                    .count_events_grouped(filter.clone(), group_by)
+                    .await
+                    .map_err(|error| budget.attribute(error))?;
+                for (key, count) in self.lane.count_events_grouped(filter, group_by).await? {
+                    let total = counts.entry(key).or_default();
+                    *total =
+                        total
+                            .checked_add(count)
+                            .ok_or_else(|| StorageError::InvalidInput {
+                                capability: khive_storage::StorageCapability::Events,
+                                operation: "count_events_grouped".into(),
+                                message: "grouped event count overflow".into(),
+                            })?;
+                }
+                Ok(counts)
+            })
+            .await
     }
 
     async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
@@ -2782,6 +3201,10 @@ impl EventStore for SplitEventStore {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "events_count_read_budget_tests.rs"]
+mod count_read_budget_tests;
+
 #[cfg(test)]
 #[path = "events_split_sqlite_full_tests.rs"]
 mod sqlite_full_tests;
@@ -2831,6 +3254,12 @@ mod tests {
     // classification contracts the module itself defines.
 
     include!("events_sidecar_path_tests.rs");
+
+    #[cfg(unix)]
+    mod store_trust_tests {
+        use super::*;
+        include!("events_store_trust_tests.rs");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3027,6 +3456,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lease_contention_crosses_events_wire_as_retryable() {
+        assert_eq!(EVENTS_PROTOCOL_VERSION, 6);
+        for (phase, expected_retryable) in [
+            (khive_storage::CapacityUnavailablePhase::LockContended, true),
+            (khive_storage::CapacityUnavailablePhase::Lock, false),
+        ] {
+            let response = storage_error_response(&StorageError::CapacityUnavailable {
+                capability: khive_storage::StorageCapability::Sql,
+                phase,
+                message: "lease admission failed".into(),
+            });
+            let encoded = serde_json::to_vec(&response).expect("serialize server error");
+            let decoded: EventsResponse =
+                serde_json::from_slice(&encoded).expect("decode unchanged protocol");
+            let EventsResponse::Error { retryable, .. } = decoded else {
+                panic!("capacity failure must be an error frame");
+            };
+            assert_eq!(retryable, expected_retryable, "{phase:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn side_effects_unknown_state_crosses_the_wire_as_terminal_failure() {
         let response = storage_error_response(&StorageError::writer_task_terminated(
             khive_storage::WriterTaskRequestState::SideEffectsUnknown,
@@ -3051,6 +3503,7 @@ mod tests {
             EventsResponse::Error {
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
                 ..
             }
         ));
@@ -3090,6 +3543,7 @@ mod tests {
                 retryable: true,
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
                 ..
             }
         ));
@@ -3284,6 +3738,7 @@ mod tests {
             EventsResponse::Error {
                 writer_task_failure: None,
                 sqlite_write_failure: None,
+                read_failure: None,
                 ..
             }
         ));
@@ -3602,6 +4057,7 @@ mod tests {
             EventsRequest::CountEvents {
                 protocol_version: EVENTS_PROTOCOL_VERSION,
                 namespace: huge,
+                operator_read_budget_secs: Some(30),
                 filter: Default::default(),
             },
             &backend,
@@ -3615,6 +4071,7 @@ mod tests {
                     retryable: false,
                     writer_task_failure: None,
                     sqlite_write_failure: None,
+                    read_failure: None,
                     ..
                 }
             ),
@@ -3630,6 +4087,7 @@ mod tests {
             EventsRequest::CountEvents {
                 protocol_version: EVENTS_PROTOCOL_VERSION,
                 namespace: "local".to_string(),
+                operator_read_budget_secs: Some(30),
                 filter: Default::default(),
             },
             &backend,
@@ -3643,6 +4101,7 @@ mod tests {
     }
 
     include!("events_split_shutdown_tests.rs");
+    include!("events_split_readiness_tests.rs");
 
     #[cfg(unix)]
     #[tokio::test]
@@ -4207,6 +4666,7 @@ mod tests {
         let request = EventsRequest::CountEvents {
             protocol_version: EVENTS_PROTOCOL_VERSION + 1,
             namespace: "local".into(),
+            operator_read_budget_secs: Some(30),
             filter: EventFilter::default(),
         };
         let payload = serde_json::to_vec(&request).expect("serialize");

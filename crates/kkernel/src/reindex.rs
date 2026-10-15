@@ -26,8 +26,8 @@ use khive_runtime::{
 use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::error::StorageError;
 use khive_storage::note::{Note, NoteFilter};
-use khive_storage::types::VectorRecord;
-use khive_storage::VectorStore;
+use khive_storage::types::{TextDocument, VectorRecord};
+use khive_storage::{TextSearch, VectorStore};
 use khive_types::{Pack, SubstrateKind};
 
 mod fts_partition_sweep;
@@ -396,9 +396,8 @@ async fn embed_and_store_batch(
     errors
 }
 
-/// Upsert FTS documents for a batch of notes into the namespace text index. Returns the
-/// number of per-note upsert failures. Idempotent: calling again for an already-indexed
-/// note replaces the existing row (FTS upsert semantics). Fails per-note, never panics.
+/// Upsert note documents through the batch capability, preserving their shared
+/// document projection and note-index selection.
 async fn fts_backfill_notes_batch(
     rt: &KhiveRuntime,
     token: &khive_runtime::NamespaceToken,
@@ -411,20 +410,15 @@ async fn fts_backfill_notes_batch(
             return batch.len() as u64;
         }
     };
-    let mut errors: u64 = 0;
-    for note in batch {
-        let doc = note_fts_document(note);
-        if let Err(e) = fts.upsert_document(doc).await {
-            tracing::warn!(id = %note.id, error = %e, "FTS upsert failed for note");
-            errors += 1;
-        }
-    }
-    errors
+    fts_backfill_documents(
+        fts.as_ref(),
+        batch.iter().map(note_fts_document).collect(),
+        SubstrateKind::Note,
+    )
+    .await
 }
 
-/// Upsert FTS documents for a batch of entities into the namespace text index. Returns the
-/// number of per-entity upsert failures. Idempotent: calling again for an already-indexed
-/// entity replaces the existing row (FTS upsert semantics). Fails per-entity, never panics.
+/// Upsert entity documents through the same batch outcome handling as notes.
 async fn fts_backfill_entities_batch(
     rt: &KhiveRuntime,
     token: &khive_runtime::NamespaceToken,
@@ -437,15 +431,62 @@ async fn fts_backfill_entities_batch(
             return batch.len() as u64;
         }
     };
-    let mut errors: u64 = 0;
-    for entity in batch {
-        let doc = entity_fts_document(entity);
-        if let Err(e) = fts.upsert_document(doc).await {
-            tracing::warn!(id = %entity.id, error = %e, "FTS upsert failed for entity");
-            errors += 1;
+    fts_backfill_documents(
+        fts.as_ref(),
+        batch.iter().map(entity_fts_document).collect(),
+        SubstrateKind::Entity,
+    )
+    .await
+}
+
+/// Count per-document refusals only after the batch returns its committed
+/// summary. SQLite isolates row failures with savepoints, but a transaction
+/// failure can roll back the entire batch. An outer error counts every input
+/// as failed; its outcome may be unknown, so it must never trigger replay.
+async fn fts_backfill_documents(
+    fts: &dyn TextSearch,
+    documents: Vec<TextDocument>,
+    kind: SubstrateKind,
+) -> u64 {
+    let expected = documents.len() as u64;
+    if expected == 0 {
+        return 0;
+    }
+    match fts.upsert_documents(documents).await {
+        Ok(summary) => {
+            if summary.attempted != expected
+                || summary.affected.checked_add(summary.failed) != Some(expected)
+            {
+                tracing::warn!(
+                    %kind, expected, attempted = summary.attempted,
+                    affected = summary.affected, failed = summary.failed,
+                    "FTS batch returned inconsistent counts; counting whole batch as failed"
+                );
+                return expected;
+            }
+            if summary.failed > 0 {
+                tracing::warn!(
+                    %kind, failed = summary.failed, error = %summary.first_error,
+                    error_counts = ?summary.error_counts,
+                    errors_truncated = summary.errors_truncated,
+                    errors_omitted = summary.errors_omitted,
+                    "FTS batch contains refused documents"
+                );
+                for error in &summary.errors {
+                    tracing::warn!(
+                        %kind, index = error.index, id = ?error.item_id,
+                        class = ?error.class, retryability = ?error.retryability,
+                        error = %error.message, "FTS upsert failed for document"
+                    );
+                }
+            }
+            summary.failed
+        }
+        Err(error) => {
+            tracing::warn!(%kind, failed = expected, %error, "FTS batch failed");
+            expected
         }
     }
-    errors
 }
 
 /// Return the subset of `ids` that do NOT already have an embedding in `vectors`
@@ -1261,3 +1302,7 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 #[path = "reindex/tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reindex/tests/fts_batch_tests.rs"]
+mod fts_batch_tests;

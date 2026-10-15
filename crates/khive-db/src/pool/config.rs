@@ -98,7 +98,7 @@ pub struct PoolConfig {
     /// (`disk_guard_deadline_ms`, default 2000 ms), so the effective writer
     /// wait under contention is the guard deadline, then `checkout_timeout`:
     /// a 50 ms value here can still wait about 2 s, and a wait that ends at
-    /// the lease returns `CapacityUnavailable` with phase `lock` rather than a
+    /// the lease returns `CapacityUnavailable` with phase `lock_contended` rather than a
     /// checkout timeout. Diagnostics report both bounds and their sum.
     ///
     /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.

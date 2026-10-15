@@ -22,12 +22,10 @@ pub struct KeyedMemorySpec<'a> {
 }
 
 pub fn validate_memory_key(key: &str) -> RuntimeResult<()> {
-    if key.len() > 512 || key.contains('\0') {
-        return Err(RuntimeError::InvalidInput(
-            "key must be at most 512 UTF-8 bytes and must not contain U+0000".into(),
-        ));
-    }
-    Ok(())
+    crate::note_validation::validate_key(
+        key,
+        "key must be at most 512 UTF-8 bytes and must not contain U+0000",
+    )
 }
 
 fn idempotency_conflict(key: &str, existing: &Note) -> RuntimeError {

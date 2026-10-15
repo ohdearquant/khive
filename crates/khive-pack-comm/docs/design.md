@@ -4,7 +4,7 @@
 
 ### Communication Pack (ADR-040)
 
-This crate is the primary implementation of ADR-040. It provides fourteen public `comm.*` verbs over the
+This crate is the primary implementation of ADR-040. It provides fifteen public `comm.*` verbs over the
 standard `message` note kind stored in the notes table.
 
 Key design decisions from ADR-040:
@@ -35,6 +35,7 @@ Key design decisions from ADR-040:
   - `comm.suppression_add` — Commissive (the caller commits to suppressing a recipient)
   - `comm.suppression_list` — Assertive (queries suppression state)
   - `comm.suppression_remove` — Commissive (the caller commits to lifting a suppression)
+  - `comm.withheld_body` — Assertive (reads a delivered withheld message's original bytes)
 - **Core-owned indexes**: migration V52 installs the six comm indexes on `notes`, including
   `idx_comm_message_direction`, `idx_comm_message_thread`, and
   `idx_comm_message_outbound_ref`, independently of pack loading. The pack's `schema_plan()`
@@ -57,7 +58,7 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 - `NOTE_KINDS = ["message"]`
 - `ENTITY_KINDS = []`
 - `REQUIRES = ["kg"]`
-- `HANDLERS = COMM_HANDLERS` (14 public verb entries plus 5 internal subhandlers)
+- `HANDLERS = COMM_HANDLERS` (15 public verb entries plus 5 internal subhandlers)
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 

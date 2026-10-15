@@ -601,6 +601,7 @@ fn bridge_diagnostics_value() -> Value {
         },
         "fallback_total": 0,
         "strict_violations": 0,
+        "daemon_slow": {"before_dispatch": 0, "after_write": 0},
     })
 }
 
@@ -613,7 +614,7 @@ fn bridge_diagnostics_help() -> Value {
     json!({
         "verb": "bridge.diagnostics",
         "pack": "bridge-control",
-        "description": "Read this stdio bridge process image's fallback counters without daemon or store access.",
+        "description": "Read this stdio bridge process image's fallback and slow-daemon counters without daemon or store access.",
         "category": "Read",
         "params": [{
             "name": "help",
@@ -628,7 +629,7 @@ fn bridge_diagnostics_help() -> Value {
         },
         "result_schema": {
             "type": "object",
-            "required": ["bridge_instance_id", "pid", "fallback_reasons", "fallback_total", "strict_violations"],
+            "required": ["bridge_instance_id", "pid", "fallback_reasons", "fallback_total", "strict_violations", "daemon_slow"],
             "properties": {
                 "bridge_instance_id": {"type":"string", "format":"uuid", "description":"Full 36-character generation UUID; changes after an in-place re-exec."},
                 "pid": {"type":"integer", "minimum":0},
@@ -645,7 +646,17 @@ fn bridge_diagnostics_help() -> Value {
                     "additionalProperties": false
                 },
                 "fallback_total": counter,
-                "strict_violations": counter
+                "strict_violations": counter,
+                "daemon_slow": {
+                    "type":"object",
+                    "description":"Requests refused because the daemon was alive but did not answer in time; not fallbacks, so not in fallback_total.",
+                    "required": ["before_dispatch", "after_write"],
+                    "properties": {
+                        "before_dispatch": counter,
+                        "after_write": counter
+                    },
+                    "additionalProperties": false
+                }
             },
             "additionalProperties": false
         },
@@ -685,9 +696,9 @@ pub(super) fn strict_fallback_envelope_response(
     let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
     let total = parsed.ops.len();
     let error_msg = format!(
-        "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
-         refusing to complete the request via local dispatch; \
-         rebuild with `make local` and retry"
+        "daemon fallback rejected in strict mode (KHIVE_DAEMON_STRICT, or a daemon \
+         socket or PID file on disk): reason={reason}; refusing to complete the request \
+         via local dispatch; rebuild with `make local` and retry"
     );
 
     let results: Vec<Value> = match parsed.mode {

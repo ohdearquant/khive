@@ -29,11 +29,11 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
-    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
-    RecallParams, RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
-    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
-    RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
+    compute_score, deser, fuse_for_query, make_pipeline, note_has_any_tag, note_matches_tags, plog,
+    plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    RecallCandidateSet, RecallLegs, RecallParams, RecallStageTimings, TextSnippetPolicy,
+    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
@@ -101,6 +101,49 @@ fn emit_slow_recall_warning(
     );
 }
 
+/// One retrieval round of the `include_timings` report: the round's stage
+/// times plus what it gathered and how many gathered rows could survive.
+fn retrieval_round_report(
+    candidate_limit: u32,
+    candidates: &RecallCandidateSet,
+    hydrated: usize,
+    eligible: usize,
+    hydrate_elapsed: Duration,
+) -> Value {
+    let mut timings = candidates.timings;
+    timings.add_hydration(hydrate_elapsed);
+    let mut report = timings.stage_report();
+    report["candidate_limit"] = json!(candidate_limit);
+    report["text_hits"] = json!(candidates.text_hits.len());
+    report["vector_hits"] = json!(candidates
+        .vector_hits_per_model
+        .iter()
+        .map(|(_, hits)| hits.len())
+        .sum::<usize>());
+    report["hydrated"] = json!(hydrated);
+    report["eligible"] = json!(eligible);
+    report
+}
+
+/// `include_timings`: attach the report to the response this call would
+/// otherwise return. An array response becomes `{results, timings}`; an
+/// object envelope keeps every field it has and gains `timings`.
+fn with_stage_timings(response: Value, report: Option<&Value>, recall_start: Instant) -> Value {
+    let Some(report) = report else {
+        return response;
+    };
+    let mut timings = report.clone();
+    timings["total_us"] =
+        json!(u64::try_from(recall_start.elapsed().as_micros()).unwrap_or(u64::MAX));
+    match response {
+        Value::Object(mut envelope) => {
+            envelope.insert("timings".to_string(), timings);
+            Value::Object(envelope)
+        }
+        results => json!({ "results": results, "timings": timings }),
+    }
+}
+
 async fn load_brain_profile(
     registry: &VerbRegistry,
     token: &NamespaceToken,
@@ -151,6 +194,18 @@ fn session_attempt_deadline(
         attempt_deadline
     } else {
         attempt_deadline.min(wait_end)
+    }
+}
+
+// Own the completion record so early returns and cancelled futures cannot skip it.
+struct RecallProfileTotal {
+    call_id: u64,
+    started: Instant,
+}
+
+impl Drop for RecallProfileTotal {
+    fn drop(&mut self) {
+        plog(self.call_id, "total", self.started.elapsed().as_micros());
     }
 }
 
@@ -218,6 +273,38 @@ impl MemoryPack {
         }
     }
 
+    /// Run one recall under its own profiler call ID. With profiling disabled no
+    /// ID is taken and no record is written; otherwise every exit, cancellation
+    /// included, writes exactly one `total` record.
+    pub(crate) async fn handle_recall_profiled(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+        hard_deadline: Option<Instant>,
+    ) -> Result<Value, RuntimeError> {
+        if !super::common::recall_profile_enabled() {
+            return self
+                .handle_recall(token, params, registry, hard_deadline)
+                .await;
+        }
+
+        let call_id = RECALL_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _total = RecallProfileTotal {
+            call_id,
+            started: Instant::now(),
+        };
+        PROF_CID
+            .scope(
+                call_id,
+                self.handle_recall(token, params, registry, hard_deadline),
+            )
+            .await
+    }
+
+    /// The recall pipeline. Requests reach it through
+    /// [`Self::handle_recall_profiled`], which scopes the profiler call ID; a
+    /// direct call records its stages under ID 0 and writes no `total`.
     pub(crate) async fn handle_recall(
         &self,
         token: &NamespaceToken,
@@ -225,8 +312,6 @@ impl MemoryPack {
         registry: &VerbRegistry,
         hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
-        use std::sync::atomic::Ordering;
-
         let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
 
@@ -296,21 +381,14 @@ impl MemoryPack {
         }
 
         let prof = super::common::recall_profile_enabled();
-        let call_id = if prof {
-            let id = RECALL_CALL_ID.fetch_add(1, Ordering::Relaxed);
-            PROF_CID.with(|c| c.set(id));
-            id
-        } else {
-            0
-        };
-        let t_total = if prof { Some(Instant::now()) } else { None };
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let mut t_stage = if prof { Some(Instant::now()) } else { None };
 
         let query_trimmed = p.query.trim();
         if query_trimmed.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
-        if !crate::scoring::is_meaningful_query(query_trimmed) {
+        if !crate::scoring::is_meaningful_recall_query(query_trimmed) {
             return Err(RuntimeError::InvalidInput(format!(
                 "query {query_trimmed:?} does not contain enough meaningful content \
                  (must have at least 2 alphabetic or CJK characters and not consist \
@@ -456,11 +534,17 @@ impl MemoryPack {
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
         let mut recall_stage_timings = RecallStageTimings::default();
+        let include_timings = p.include_timings.unwrap_or(false);
+        let mut round_reports: Vec<Value> = Vec::new();
+        // A strategy that discards an arm's hits at fusion never runs that
+        // arm, in the first round or in any widening round.
+        let legs = RecallLegs::for_strategy(&cfg.fuse_strategy);
         let mut candidates = Box::pin(self.collect_recall_candidates_with_session(
             query_trimmed,
             token,
             RecallCandidateParams {
                 candidate_limit: current_candidate_limit,
+                legs,
                 embedding_model: p.embedding_model.as_deref(),
                 session_fence: session_fence.as_ref(),
                 cjk_fts_bypass,
@@ -477,7 +561,8 @@ impl MemoryPack {
         let hydrate_started = Instant::now();
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
-        recall_stage_timings.add_hydration(hydrate_started.elapsed());
+        let hydrate_elapsed = hydrate_started.elapsed();
+        recall_stage_timings.add_hydration(hydrate_elapsed);
 
         // Widening must count only candidates the created_at window can keep:
         // the window predicate runs post-fusion, so counting raw candidates
@@ -518,16 +603,30 @@ impl MemoryPack {
                 .count()
         };
         let mut eligible_count = count_eligible(&candidates, &notes_by_id);
+        if include_timings {
+            round_reports.push(retrieval_round_report(
+                current_candidate_limit,
+                &candidates,
+                notes_by_id.len(),
+                eligible_count,
+                hydrate_elapsed,
+            ));
+        }
 
         for _round in 1..ann_overfetch_max_rounds {
             if eligible_count >= limit {
                 break;
             }
-            let corpus_exhausted = candidates.text_hits.len() < current_candidate_limit as usize
-                && candidates
-                    .vector_hits_per_model
-                    .iter()
-                    .all(|(_, h)| h.len() < current_candidate_limit as usize);
+            // Exhaustion is judged on the arms this strategy runs. A skipped
+            // arm returns no hits and so already reads as exhausted; the
+            // `legs` terms state the intent and change no outcome.
+            let text_exhausted = candidates.text_hits.len() < current_candidate_limit as usize;
+            let vector_exhausted = candidates
+                .vector_hits_per_model
+                .iter()
+                .all(|(_, h)| h.len() < current_candidate_limit as usize);
+            let corpus_exhausted =
+                (!legs.text || text_exhausted) && (!legs.vector || vector_exhausted);
             if corpus_exhausted {
                 break;
             }
@@ -543,6 +642,7 @@ impl MemoryPack {
                 token,
                 RecallCandidateParams {
                     candidate_limit: current_candidate_limit,
+                    legs,
                     embedding_model: p.embedding_model.as_deref(),
                     session_fence: session_fence.as_ref(),
                     cjk_fts_bypass,
@@ -559,10 +659,26 @@ impl MemoryPack {
             let hydrate_started = Instant::now();
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
-            recall_stage_timings.add_hydration(hydrate_started.elapsed());
+            let hydrate_elapsed = hydrate_started.elapsed();
+            recall_stage_timings.add_hydration(hydrate_elapsed);
             eligible_count = count_eligible(&candidates, &notes_by_id);
+            if include_timings {
+                round_reports.push(retrieval_round_report(
+                    current_candidate_limit,
+                    &candidates,
+                    notes_by_id.len(),
+                    eligible_count,
+                    hydrate_elapsed,
+                ));
+            }
         }
         let candidate_limit = current_candidate_limit;
+        let timings_report: Option<Value> = include_timings.then(|| {
+            let mut report = recall_stage_timings.stage_report();
+            report["retrieval_rounds"] = json!(round_reports.len());
+            report["rounds"] = Value::Array(round_reports);
+            report
+        });
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -619,7 +735,14 @@ impl MemoryPack {
             map
         };
 
-        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize)?;
+        let fused = fuse_for_query(
+            &candidates,
+            &memory_ids,
+            &cfg,
+            candidate_limit as usize,
+            query_trimmed,
+            p.embedding_model.as_deref(),
+        )?;
         // Needed on both the empty and non-empty completion paths.
         let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
@@ -664,16 +787,26 @@ impl MemoryPack {
                 let reason = ann_degraded_reason
                     .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
                 khive_storage::ensure_request_read_active("memory.recall")?;
-                return to_json(&json!({
+                let response = to_json(&json!({
                     "results": Vec::<Value>::new(),
                     "degraded": true,
                     // Captured at the failure site (see
                     // collect_model_ann_hits_inner / collect_model_ann_hits).
                     "degraded_reason": reason,
-                }));
+                }))?;
+                return Ok(with_stage_timings(
+                    response,
+                    timings_report.as_ref(),
+                    recall_start,
+                ));
             }
             khive_storage::ensure_request_read_active("memory.recall")?;
-            return to_json(&Vec::<Value>::new());
+            let response = to_json(&Vec::<Value>::new())?;
+            return Ok(with_stage_timings(
+                response,
+                timings_report.as_ref(),
+                recall_start,
+            ));
         }
 
         let fused_pairs: Vec<(Uuid, f32)> = fused
@@ -1191,22 +1324,24 @@ impl MemoryPack {
                 0
             };
             khive_storage::ensure_request_read_active("memory.recall")?;
-            return to_json(&json!({
+            let response = to_json(&json!({
                 "results": results,
                 "candidates": {
                     "vector_candidates_per_model": per_model,
                 },
                 "budget_capped": budget_capped,
                 "truncated_for_budget": truncated_for_budget,
-            }));
+            }))?;
+            return Ok(with_stage_timings(
+                response,
+                timings_report.as_ref(),
+                recall_start,
+            ));
         }
 
         if prof {
             if let Some(ref t) = t_stage {
                 plog_n(call_id, "serialize", t.elapsed().as_micros(), results.len());
-            }
-            if let Some(ref t) = t_total {
-                plog(call_id, "total", t.elapsed().as_micros());
             }
         }
 
@@ -1234,7 +1369,12 @@ impl MemoryPack {
                 envelope["degraded_reason"] = json!(reason);
             }
             khive_storage::ensure_request_read_active("memory.recall")?;
-            return to_json(&envelope);
+            let response = to_json(&envelope)?;
+            return Ok(with_stage_timings(
+                response,
+                timings_report.as_ref(),
+                recall_start,
+            ));
         }
 
         if results.is_empty() && ann_degraded {
@@ -1248,17 +1388,27 @@ impl MemoryPack {
             let reason = ann_degraded_reason
                 .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
             khive_storage::ensure_request_read_active("memory.recall")?;
-            return to_json(&json!({
+            let response = to_json(&json!({
                 "results": results,
                 "degraded": true,
                 // Captured at the failure site (see
                 // collect_model_ann_hits_inner / collect_model_ann_hits).
                 "degraded_reason": reason,
-            }));
+            }))?;
+            return Ok(with_stage_timings(
+                response,
+                timings_report.as_ref(),
+                recall_start,
+            ));
         }
 
         khive_storage::ensure_request_read_active("memory.recall")?;
-        to_json(&results)
+        let response = to_json(&results)?;
+        Ok(with_stage_timings(
+            response,
+            timings_report.as_ref(),
+            recall_start,
+        ))
     }
 
     fn track_recall_serve(
@@ -1497,3 +1647,11 @@ mod tests;
 #[cfg(test)]
 #[path = "recall_audit_batch_tests.rs"]
 mod audit_batch_tests;
+
+#[cfg(test)]
+#[path = "recall_strategy_legs_tests.rs"]
+mod strategy_legs_tests;
+
+#[cfg(test)]
+#[path = "recall_profile_tests.rs"]
+mod profile_tests;
