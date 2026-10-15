@@ -893,6 +893,21 @@ instead would hold the channel's progress on that message for every later poll.
 A replay of the same message resolves to the stored record and writes no owner
 row either.
 
+The `comm.ingest` receipt discloses the retention outcome for every NEW
+quarantine record (the `deduplicated=false` path): `quarantine_original_retained`
+is a JSON boolean read from the attachment actually persisted after the
+`secondary-backend` drop, so a drop inside `comm.ingest` reads like any other
+loss. When it is `false` the receipt also carries
+`quarantine_original_not_retained_reason` with the record's own stored reason
+(for example `retention-limit`, `original-unavailable`, `original-store-failed`,
+`quarantine-write-failed` or `secondary-backend`). A retained original and a
+lost one are otherwise indistinguishable from the response alone. A
+non-quarantine message carries neither key, and a deduplicated acknowledgement
+(`deduplicated=true`) carries neither, because it wrote no new record.
+Integrity note: a quarantined record with neither an attachment nor a stored
+reason is reported as `quarantine_original_retained: false` with no reason key;
+the reason is never invented.
+
 ## Message-ID / References header helpers (#403)
 
 - `message_id_match_candidates`: outbound mail stores its Message-ID in wire

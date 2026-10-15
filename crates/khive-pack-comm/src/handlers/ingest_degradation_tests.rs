@@ -332,6 +332,137 @@ async fn quarantine_ingest_degradation_retains_attachment_and_dedup_receipt() {
     assert_degraded_ingest(true).await;
 }
 
+/// ADR-056 (2026-10-15 amendment), decision 4: a new quarantine record's
+/// receipt reports whether the record kept its original. A record written with
+/// its original reports `true` and no reason key; a record written without one
+/// reports `false` and the stored reason; a record with neither an attachment
+/// nor a stored reason reports `false` and no reason key rather than inventing
+/// one. A non-quarantine message carries neither key.
+#[tokio::test]
+async fn ingest_receipt_discloses_quarantine_original_retention() {
+    use khive_storage::BlobStore as _;
+
+    let (runtime, token, signal, capability) = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let blobs = std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0).unwrap(),
+    );
+    let original = blobs.put(b"retained original".to_vec()).await.unwrap();
+    runtime.install_blob_store(blobs).unwrap();
+
+    let mut retained = message();
+    retained["external_id"] = json!("imap:retention:retained:1");
+    retained["metadata"] = json!({
+        "quarantined": true,
+        "quarantine_content_ref": original.as_str(),
+    });
+    let receipt = ingest(&runtime, &token, &signal, &capability, retained)
+        .await
+        .unwrap();
+    assert_eq!(receipt["deduplicated"], json!(false));
+    assert_eq!(
+        receipt["quarantine_original_retained"],
+        json!(true),
+        "a quarantine record written with its original reports retained: {receipt}"
+    );
+    assert!(
+        receipt
+            .get("quarantine_original_not_retained_reason")
+            .is_none(),
+        "a retained original carries no reason key: {receipt}"
+    );
+
+    let mut dropped = message();
+    dropped["external_id"] = json!("imap:retention:dropped:2");
+    dropped["metadata"] = json!({
+        "quarantined": "true",
+        "quarantine_original_retained": "false",
+        "quarantine_original_not_retained_reason": "retention-limit",
+    });
+    let receipt = ingest(&runtime, &token, &signal, &capability, dropped)
+        .await
+        .unwrap();
+    assert_eq!(receipt["deduplicated"], json!(false));
+    assert_eq!(
+        receipt["quarantine_original_retained"],
+        json!(false),
+        "a quarantine record written without its original reports not retained: {receipt}"
+    );
+    assert_eq!(
+        receipt["quarantine_original_not_retained_reason"],
+        json!("retention-limit"),
+        "the receipt names the stored reason: {receipt}"
+    );
+
+    let mut unreasoned = message();
+    unreasoned["external_id"] = json!("imap:retention:unreasoned:3");
+    unreasoned["metadata"] = json!({"quarantined": true});
+    let receipt = ingest(&runtime, &token, &signal, &capability, unreasoned)
+        .await
+        .unwrap();
+    assert_eq!(receipt["quarantine_original_retained"], json!(false));
+    assert!(
+        receipt
+            .get("quarantine_original_not_retained_reason")
+            .is_none(),
+        "a quarantined record with neither an attachment nor a stored reason reports no \
+         invented reason: {receipt}"
+    );
+
+    let mut plain = message();
+    plain["external_id"] = json!("imap:retention:plain:4");
+    let receipt = ingest(&runtime, &token, &signal, &capability, plain)
+        .await
+        .unwrap();
+    assert!(
+        receipt.get("quarantine_original_retained").is_none()
+            && receipt
+                .get("quarantine_original_not_retained_reason")
+                .is_none(),
+        "a non-quarantine message carries neither retention key: {receipt}"
+    );
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 4: a deduplicated re-ingest wrote
+/// no new record, so its acknowledgement carries neither retention key even
+/// when the replayed bytes name a quarantine.
+#[tokio::test]
+async fn deduplicated_ingest_receipt_carries_no_retention_keys() {
+    use khive_storage::BlobStore as _;
+
+    let (runtime, token, signal, capability) = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let blobs = std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0).unwrap(),
+    );
+    let original = blobs.put(b"replayed original".to_vec()).await.unwrap();
+    runtime.install_blob_store(blobs).unwrap();
+
+    let mut body = message();
+    body["external_id"] = json!("imap:retention:replay:5");
+    body["metadata"] = json!({
+        "quarantined": true,
+        "quarantine_content_ref": original.as_str(),
+    });
+    let first = ingest(&runtime, &token, &signal, &capability, body.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["deduplicated"], json!(false));
+    assert_eq!(first["quarantine_original_retained"], json!(true));
+
+    let replay = ingest(&runtime, &token, &signal, &capability, body)
+        .await
+        .unwrap();
+    assert_eq!(replay["deduplicated"], json!(true), "{replay}");
+    assert!(
+        replay.get("quarantine_original_retained").is_none()
+            && replay
+                .get("quarantine_original_not_retained_reason")
+                .is_none(),
+        "a deduplicated acknowledgement carries neither retention key: {replay}"
+    );
+}
+
 #[tokio::test]
 async fn healthy_ingest_omits_degradations_and_precommit_refusal_does_not_wake() {
     let (runtime, token, signal, capability) = fixture();
@@ -569,6 +700,19 @@ async fn quarantine_on_secondary_backend_is_recorded_without_its_original() {
     )
     .await
     .expect("a quarantine on a secondary comm backend is recorded");
+    // ADR-056 (2026-10-15 amendment), decision 4: a drop inside `comm.ingest`
+    // is disclosed on the receipt like any other loss, not only on the stored
+    // record.
+    assert_eq!(
+        ack["quarantine_original_retained"],
+        json!(false),
+        "the receipt reports the dropped original: {ack}"
+    );
+    assert_eq!(
+        ack["quarantine_original_not_retained_reason"],
+        json!("secondary-backend"),
+        "the receipt names the `secondary-backend` drop: {ack}"
+    );
     let note_id =
         Uuid::parse_str(ack["full_id"].as_str().expect("full note id")).expect("canonical note id");
 
