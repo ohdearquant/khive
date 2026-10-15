@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -1978,7 +1978,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 14 verbs
+## `comm` pack — 15 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2321,6 +2321,29 @@ request(ops="comm.suppression_remove(id=\"<entry-id>\", reason=\"operator reques
 ```
 
 Returns `{id, removed, audit_event_id}`.
+
+### `comm.withheld_body` — Assertive
+
+Read the original RFC 5322 bytes of a delivered withheld message: an external message whose
+body a screening rule replaced with a rule-ID placeholder. Open to the message's recipient
+actor (its `to_actor`) and to the configured maintainer actor. Any other caller is refused
+before the original is read, and the refusal names neither the sender nor any content. An id
+that is not a delivered withheld external message, a quarantine record included, is refused.
+Every call, allowed or refused, writes an audit event naming the caller, the message id and
+the outcome (`allowed`, `not_found`, `refused_caller`, `refused_not_withheld` or
+`original_unavailable`).
+
+| Param | Type   | Required | Notes                                                      |
+| ----- | ------ | -------- | ---------------------------------------------------------- |
+| `id`  | string | yes      | Short 8-char prefix or full UUID of the delivered message. |
+
+```
+request(ops="comm.withheld_body(id=\"<message-id>\")")
+```
+
+Returns `{id, size_bytes, original_base64, audit_event_id}`. The response never carries a
+content reference. An original larger than the blob store's whole-object read limit is
+refused with that limit named, never returned truncated.
 
 ---
 

@@ -314,6 +314,11 @@ fn verb_categories_match_spec() {
         VerbCategory::Declaration,
         "comm.ingest must be Declaration"
     );
+    assert_eq!(
+        h("comm.withheld_body").category,
+        VerbCategory::Assertive,
+        "comm.withheld_body must be Assertive"
+    );
 }
 
 #[test]

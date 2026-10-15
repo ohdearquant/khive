@@ -80,6 +80,7 @@ Delivered external email adds `origin = "external"`, `trust = "untrusted"`, and
 fields, not additions to the stable v1 table. Consumers should treat the body as
 untrusted data. A withheld message keeps the sender and subject but replaces its
 body with a placeholder naming the rules; raw MIME is retained only through its
-owned original-blob reference. Inbox/thread projections and successful body
+`quarantine-original` attachment, which `comm.withheld_body` reads, and the
+message's properties carry no blob reference. Inbox/thread projections and successful body
 reads expose the marking fields. Ordinary messages without those properties
 keep their existing read shape.
