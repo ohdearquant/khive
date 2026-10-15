@@ -337,6 +337,9 @@ impl VerbRegistry {
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
     ///   `git.gates`, `git.status` and `git.log` dispatch that same check,
     ///   so their read results also carry a required decision write.
+    /// - `comm.withheld_body` writes an access audit event on every call;
+    ///   the record of who read a withheld original is the point of the
+    ///   verb, so its accounting row is never droppable.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
