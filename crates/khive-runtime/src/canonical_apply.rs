@@ -101,14 +101,20 @@ impl Record {
     }
     fn check_update(&self, op: &UpdateOp) -> Result<(), AtomicOpFailure> {
         let result = match self {
-            Self::Entity(x) => khive_changeset::check_update(
-                op,
-                CanonicalRecordRef::Entity(&projection::entity(x).map_err(storage)?),
-            ),
-            Self::Note(x) => khive_changeset::check_update(
-                op,
-                CanonicalRecordRef::Note(&projection::note(x).map_err(storage)?),
-            ),
+            Self::Entity(x) => {
+                let mut live = projection::entity(x).map_err(storage)?;
+                if let khive_changeset::UpdatePreimage::Entity(captured) = op.preimage() {
+                    omit_unclaimed_reserved(captured.properties.as_ref(), &mut live.properties);
+                }
+                khive_changeset::check_update(op, CanonicalRecordRef::Entity(&live))
+            }
+            Self::Note(x) => {
+                let mut live = projection::note(x).map_err(storage)?;
+                if let khive_changeset::UpdatePreimage::Note(captured) = op.preimage() {
+                    omit_unclaimed_reserved(captured.properties.as_ref(), &mut live.properties);
+                }
+                khive_changeset::check_update(op, CanonicalRecordRef::Note(&live))
+            }
             Self::Edge(x) => khive_changeset::check_update(
                 op,
                 CanonicalRecordRef::Edge(&projection::edge(x).map_err(storage)?),
@@ -698,6 +704,21 @@ async fn read_writer(
         .map_err(storage)?;
     Ok((!events.is_empty()).then_some(Record::Event))
 }
+/// ADR-115 §4 applied to a W1 property preimage, the same rule as the incoming map: a captured
+/// map that omits a reserved key makes no claim about it, so the live value leaves the
+/// comparison; a captured reserved value is compared like any other key.
+fn omit_unclaimed_reserved(
+    captured: Option<&std::collections::BTreeMap<String, khive_types::PropertyValue>>,
+    live: &mut std::collections::BTreeMap<String, khive_types::PropertyValue>,
+) {
+    if let Some(captured) = captured {
+        for key in crate::secret_gate::RESERVED_PROPERTY_KEYS {
+            if !captured.contains_key(key) {
+                live.remove(key);
+            }
+        }
+    }
+}
 fn mismatch(target_id: Uuid, field_path: &str) -> AtomicOpFailure {
     AtomicOpFailure::PreimageMismatch {
         target_id,
@@ -733,5 +754,7 @@ fn reject_delete_alias(op: &DeleteOp) -> RuntimeResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod reserved_property_tests;
 #[cfg(test)]
 mod tests;

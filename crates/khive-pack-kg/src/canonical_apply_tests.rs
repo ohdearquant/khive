@@ -38,7 +38,12 @@ fn setup() -> (KhiveRuntime, VerbRegistry) {
 fn canonical_delta_requires_exact_envelope_and_supported_outer_version() {
     let text = delta(&[create(1, "one"), create(2, "two")]);
     let decoded = decode_delta(&text, Some(1)).unwrap();
-    assert_eq!(khive_changeset::to_ndjson(&decoded).unwrap(), text);
+    assert_eq!(decoded.ops.len(), 2);
+    // The fixture is hand-built JSON. The byte layout belongs to the codec, so
+    // the codec's own output is the fixed point a decode and re-encode keeps.
+    let encoded = khive_changeset::to_ndjson(&decoded).unwrap();
+    let reencoded = khive_changeset::to_ndjson(&decode_delta(&encoded, Some(1)).unwrap()).unwrap();
+    assert_eq!(reencoded, encoded);
     assert!(decode_delta(&text, Some(2)).is_err());
     assert!(decode_delta(
         &text.replacen("\"schema_version\":1", "\"schema_version\":2", 1),
@@ -333,7 +338,8 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
         .dispatch_with_identity("apply_changeset", json!({"delta":text}), Some(identity))
         .await
         .is_err());
-    let seen = gate.seen.lock().unwrap();
+    // A snapshot, so no lock is held across the reads below that await.
+    let seen = gate.seen.lock().unwrap().clone();
     // Dispatch gates the wrapper once; the landing path does not check it again.
     assert_eq!(
         seen.iter()
@@ -347,7 +353,6 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
     assert!(seen
         .iter()
         .all(|request| request.actor.binding_id() == Some("lambda:canonical-test")));
-    drop(seen);
     let token = runtime
         .authorize(khive_runtime::Namespace::local())
         .unwrap();

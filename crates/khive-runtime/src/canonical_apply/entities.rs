@@ -49,10 +49,66 @@ pub(super) async fn prepare(
     })
 }
 
+/// Apply a canonical patch to `before` under ADR-115 §4. An incoming reserved value that
+/// echoes the stored one is dropped and any other incoming reserved value is refused. A
+/// stored reserved value is carried only while the bytes it vouches for (name, description,
+/// properties outside the reserved keys, tags) are unchanged. Canonical writes take no
+/// manifest exemption, so a changed row loses the stamp and must pass the strict scans as a
+/// whole.
+fn apply_canonical_patch(
+    before: &Entity,
+    patch: &crate::curation::EntityPatch,
+) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+    let mut patch = patch.clone();
+    if let Some(properties) = patch.properties.as_mut() {
+        crate::secret_gate::strip_reserved_echo(properties, before.properties.as_ref())?;
+    }
+    let mut entity = before.clone();
+    let (reindex, mut changed_fields) =
+        KhiveRuntime::apply_entity_patch_fields(&mut entity, patch, &[], true);
+    let stored = crate::secret_gate::reserved_properties(before.properties.as_ref());
+    if !stored.is_empty() {
+        let unchanged = entity.name == before.name
+            && entity.description == before.description
+            && entity.tags == before.tags
+            && crate::secret_gate::without_reserved_properties(entity.properties.as_ref())
+                == crate::secret_gate::without_reserved_properties(before.properties.as_ref());
+        let properties = entity
+            .properties
+            .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput("canonical entity properties must be an object".into())
+            })?;
+        if unchanged {
+            properties.extend(
+                stored
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value)),
+            );
+        } else {
+            for key in crate::secret_gate::RESERVED_PROPERTY_KEYS {
+                properties.remove(key);
+            }
+            crate::secret_gate::check_at(&entity.name, "entity", "name")?;
+            if let Some(description) = &entity.description {
+                crate::secret_gate::check_at(description, "entity", "description")?;
+            }
+            if let Some(properties) = &entity.properties {
+                crate::secret_gate::check_json_at(properties, "entity", "properties")?;
+            }
+            crate::secret_gate::check_tags_at(&entity.tags, "entity", "tags")?;
+        }
+        if entity.properties != before.properties && !changed_fields.contains(&"properties") {
+            changed_fields.push("properties");
+        }
+    }
+    Ok((entity, reindex, changed_fields))
+}
+
 impl PreparedEntityUpdate {
     pub(super) fn projected(&self, now: i64) -> RuntimeResult<Entity> {
-        let mut entity = self.snapshot.clone();
-        KhiveRuntime::apply_entity_patch_fields(&mut entity, self.patch.clone(), &[], true);
+        let (mut entity, _, _) = apply_canonical_patch(&self.snapshot, &self.patch)?;
         if same_patchable_values(&entity, &self.snapshot) {
             // An unchanged patch lands as a no-op (see `materialize`), so later
             // operations in the unit see the same revision.
@@ -95,10 +151,19 @@ pub(super) fn materialize(
     let previous_deleted_at = live.deleted_at;
     let previous_version = live.version;
     let before = live.clone();
-    let (reindex, changed_fields) =
-        KhiveRuntime::apply_entity_patch_fields(&mut live, prepared.patch.clone(), &[], true);
-    crate::secret_gate::reject_reserved_secret_gate_property(live.properties.as_ref())
+    let (patched, reindex, changed_fields) = apply_canonical_patch(&before, &prepared.patch)
         .map_err(|error| failure(error.to_string()))?;
+    live = patched;
+    crate::secret_gate::check_reserved_carry_forward(
+        before.properties.as_ref(),
+        live.properties.as_ref(),
+        live.name == before.name
+            && live.description == before.description
+            && live.tags == before.tags
+            && crate::secret_gate::without_reserved_properties(live.properties.as_ref())
+                == crate::secret_gate::without_reserved_properties(before.properties.as_ref()),
+    )
+    .map_err(|error| failure(error.to_string()))?;
     if same_patchable_values(&live, &before) {
         // A canonical update whose values already hold lands as a no-op: no write,
         // no event, no new revision. Its preimage still matches on replay, so this is

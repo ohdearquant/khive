@@ -71,6 +71,18 @@ impl KhiveRuntime {
                 "note update policy does not match the stored note kind".into(),
             ));
         }
+        // Canonical writes follow ADR-115 §4: an incoming reserved value that echoes the
+        // stored one is dropped, any other incoming reserved value is refused, and the stored
+        // value is carried below only while the bytes it vouches for are unchanged.
+        let mut patch = patch;
+        let stored_reserved = if canonical {
+            if let Some(properties) = patch.properties.as_mut() {
+                crate::secret_gate::strip_reserved_echo(properties, note.properties.as_ref())?;
+            }
+            crate::secret_gate::reserved_properties(note.properties.as_ref())
+        } else {
+            Vec::new()
+        };
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
             crate::secret_gate::check_at(content, "note", "content")?;
@@ -238,9 +250,43 @@ impl KhiveRuntime {
             note.status = status;
         }
 
-        // The whole-note CAS persists the merged properties, including keys
-        // carried from the snapshot when the patch changes another field.
-        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
+        if !stored_reserved.is_empty() {
+            let unchanged = original_name == note.name
+                && original_content == note.content
+                && crate::secret_gate::without_reserved_properties(original_properties.as_ref())
+                    == crate::secret_gate::without_reserved_properties(note.properties.as_ref());
+            let properties = note
+                .properties
+                .get_or_insert_with(|| Value::Object(Default::default()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput("canonical note properties must be an object".into())
+                })?;
+            if unchanged {
+                properties.extend(
+                    stored_reserved
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value)),
+                );
+            } else {
+                // Canonical writes take no manifest exemption, so a changed row loses the
+                // stamp and must pass the strict scans as a whole.
+                for key in crate::secret_gate::RESERVED_PROPERTY_KEYS {
+                    properties.remove(key);
+                }
+                crate::secret_gate::check_at(&note.content, "note", "content")?;
+                if let Some(name) = &note.name {
+                    crate::secret_gate::check_at(name, "note", "name")?;
+                }
+                if let Some(properties) = &note.properties {
+                    crate::secret_gate::check_json_at(properties, "note", "properties")?;
+                }
+            }
+        } else {
+            // The whole-note CAS persists the merged properties, including keys
+            // carried from the snapshot when the patch changes another field.
+            crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
+        }
 
         // JSON object key order is not meaningful to callers. Tags are also
         // set-like in every existing note reader, so their order is ignored

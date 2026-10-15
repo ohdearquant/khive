@@ -297,17 +297,114 @@ pub fn reject_reserved_secret_gate_property(
     properties: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
     if let Some(serde_json::Value::Object(map)) = properties {
-        if map.contains_key(RESERVED_SECRET_GATE_KEY) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
-                 created, replaced, merged, or removed by callers"
-            )));
+        if let Some(key) = RESERVED_PROPERTY_KEYS
+            .into_iter()
+            .find(|key| map.contains_key(*key))
+        {
+            return Err(reserved_property_error(key));
         }
-        if map.contains_key(RESERVED_WEB_RECEIPT_KEY) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "property key `{RESERVED_WEB_RECEIPT_KEY}` is web-pack-owned and cannot be \
-                 created, replaced, merged, or removed by callers"
-            )));
+    }
+    Ok(())
+}
+
+/// The top-level property keys no caller may set, in the order their refusals are reported.
+pub(crate) const RESERVED_PROPERTY_KEYS: [&str; 2] =
+    [RESERVED_SECRET_GATE_KEY, RESERVED_WEB_RECEIPT_KEY];
+
+fn reserved_property_error(key: &str) -> RuntimeError {
+    let owner = if key == RESERVED_WEB_RECEIPT_KEY {
+        "web-pack-owned"
+    } else {
+        "runtime-owned"
+    };
+    RuntimeError::InvalidInput(format!(
+        "property key `{key}` is {owner} and cannot be created, replaced, merged, or removed by \
+         callers"
+    ))
+}
+
+/// ADR-115 §4 for a whole-map property write against a persisted row.
+///
+/// An incoming reserved key whose value is byte-identical to the persisted value is an echo
+/// of runtime state and is removed from `incoming`. A reserved key the row does not carry, or
+/// one whose value differs (`null` included), is refused. Omitting a reserved key from a
+/// whole map is not a removal: whether the persisted value carries forward is the caller's
+/// decision, conditioned on the exempted bytes (see [`reserved_properties`]).
+pub(crate) fn strip_reserved_echo(
+    incoming: &mut serde_json::Value,
+    persisted: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    let Some(map) = incoming.as_object_mut() else {
+        return Ok(());
+    };
+    let persisted = persisted.and_then(serde_json::Value::as_object);
+    for key in RESERVED_PROPERTY_KEYS {
+        let Some(value) = map.get(key) else {
+            continue;
+        };
+        let echo = persisted
+            .and_then(|row| row.get(key))
+            .is_some_and(|stored| same_bytes(stored, value));
+        if !echo {
+            return Err(reserved_property_error(key));
+        }
+        map.remove(key);
+    }
+    Ok(())
+}
+
+fn same_bytes(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    matches!(
+        (serde_json::to_vec(left), serde_json::to_vec(right)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+/// The reserved entries a persisted property map carries, in [`RESERVED_PROPERTY_KEYS`] order.
+pub(crate) fn reserved_properties(
+    properties: Option<&serde_json::Value>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let Some(map) = properties.and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    RESERVED_PROPERTY_KEYS
+        .into_iter()
+        .filter_map(|key| map.get(key).map(|value| (key, value.clone())))
+        .collect()
+}
+
+/// `properties` with the reserved keys removed: the part of a property map the secret gate
+/// scans, and so the part an exemption stamp vouches for.
+pub(crate) fn without_reserved_properties(
+    properties: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut properties = properties.cloned();
+    if let Some(serde_json::Value::Object(map)) = properties.as_mut() {
+        for key in RESERVED_PROPERTY_KEYS {
+            map.remove(key);
+        }
+    }
+    properties
+}
+
+/// The write-site check for ADR-115 §4 on a whole-row replace of a row that may carry a
+/// reserved key. A reserved value may reach the row only as a byte-identical carry of the
+/// value `persisted` already holds, and only while the bytes it vouches for are unchanged
+/// (`vouched_unchanged`). Every such write site calls this immediately before it builds the
+/// write, whatever its preparation checked, so a preparation that drifts cannot persist a
+/// stamp over bytes it never covered.
+pub(crate) fn check_reserved_carry_forward(
+    persisted: Option<&serde_json::Value>,
+    outgoing: Option<&serde_json::Value>,
+    vouched_unchanged: bool,
+) -> RuntimeResult<()> {
+    let persisted = reserved_properties(persisted);
+    for (key, value) in reserved_properties(outgoing) {
+        let carried = persisted
+            .iter()
+            .any(|(stored_key, stored)| *stored_key == key && same_bytes(stored, &value));
+        if !carried || !vouched_unchanged {
+            return Err(reserved_property_error(key));
         }
     }
     Ok(())

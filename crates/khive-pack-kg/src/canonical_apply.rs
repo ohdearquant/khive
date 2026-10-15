@@ -91,20 +91,9 @@ pub(crate) fn validate_canonical_admission(
                     .into(),
             ));
         }
-        let properties = match op {
-            Op::Link(link) => Some(&link.properties),
-            Op::Update(update) => match update.patch() {
-                khive_changeset::UpdatePatch::Entity(patch) => patch.properties.as_ref(),
-                khive_changeset::UpdatePatch::Note(patch) => patch.properties.as_ref(),
-                khive_changeset::UpdatePatch::Edge(_) => None,
-            },
-            _ => None,
-        };
-        if let Some(properties) = properties {
-            let value = serde_json::to_value(properties)
-                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&value))?;
-        }
+        // Reserved property keys on updates and links are decided by the runtime against the
+        // row each operation meets in the writer (ADR-115 §4): an update may echo the stored
+        // value, and a link's new edge has none to echo.
         if let Op::Create(create) = op {
             match &create.target {
                 CreateTarget::Entity(fields) => {

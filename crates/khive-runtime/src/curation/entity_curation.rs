@@ -57,9 +57,16 @@ impl KhiveRuntime {
             patch.entity_type =
                 Some(self.validate_entity_type_for_kind(&current.kind, Some(entity_type))?);
         }
+        // ADR-115 §4 against the prepared row: the writer repeats this against the row it
+        // meets, which also decides whether a stored reserved value carries.
+        if let Some(properties) = &patch.properties {
+            crate::secret_gate::strip_reserved_echo(
+                &mut properties.clone(),
+                current.properties.as_ref(),
+            )?;
+        }
         let mut projected = current.clone();
         Self::apply_entity_patch_fields(&mut projected, patch.clone(), &[], true);
-        crate::secret_gate::reject_reserved_secret_gate_property(projected.properties.as_ref())?;
         if let Some(hook) = self.entity_kind_hook(&current.kind) {
             hook.validate_entity_update(self, token, &projected, projected.properties.as_ref())
                 .await?;

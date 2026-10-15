@@ -17,7 +17,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibili
 pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
     HandlerDef {
         name: "apply_changeset",
-        description: "Apply one bounded ADR-101 NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
+        description: "Apply one bounded canonical NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

@@ -936,6 +936,16 @@ impl KhiveRuntime {
         let expected_deleted_at = snapshot.deleted_at;
         let expected_snapshot_version = snapshot.version;
         validate_head(&note)?;
+        crate::secret_gate::check_reserved_carry_forward(
+            snapshot.properties.as_ref(),
+            note.properties.as_ref(),
+            note.name == snapshot.name
+                && note.content == snapshot.content
+                && crate::secret_gate::without_reserved_properties(note.properties.as_ref())
+                    == crate::secret_gate::without_reserved_properties(
+                        snapshot.properties.as_ref(),
+                    ),
+        )?;
         // ADR-172 Amendment 5: the no-op answer is for unfenced updates only.
         // A write that names `expected_version` is asking for exactly one
         // accepted write at that version, and the version it mints is the only
