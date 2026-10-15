@@ -19,16 +19,16 @@ async fn context_anchor_edges_share_the_record_budget_and_keep_admitted_endpoint
     registry.call_register_entity_type_validators(&runtime);
     let mut ids = Vec::new();
     for label in ["甲", "乙", "丙", "丁"] {
-        let entity = registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "concept", "name": label.repeat(40),
-                    "namespace": namespace, "skip_dedup_check": true,
-                }),
-            )
-            .await
-            .unwrap();
+        let mut create_args = json!({
+            "kind": "concept", "name": label.repeat(40),
+            "namespace": namespace, "skip_dedup_check": true,
+        });
+        // The second anchor's record costs more than one anchor edge, so a budget can cut
+        // that anchor while an edge naming it would still fit.
+        if label == "乙" {
+            create_args["description"] = json!(label.repeat(400));
+        }
+        let entity = registry.dispatch("create", create_args).await.unwrap();
         ids.push(entity["id"].as_str().unwrap().to_owned());
     }
     for (source, target) in [(0, 1), (1, 2), (0, 3)] {
@@ -88,8 +88,24 @@ async fn context_anchor_edges_share_the_record_budget_and_keep_admitted_endpoint
     let complete_cost = earlier_cost + full_anchor_edges.iter().map(cost).sum::<usize>();
     assert!(earlier_cost > 256);
     assert!(full_anchor_edges[0].to_string().len() > first_edge_cost);
+    // Admit the first anchor and exactly one anchor edge's cost: the second anchor is cut, the
+    // first anchor's neighbor pair does not fit, and the edge from the first anchor to the cut
+    // second anchor fits on cost alone, so only endpoint admission keeps it out.
+    assert_eq!(blocks[0].entity_json["id"], ids[0].as_str());
+    assert_eq!(blocks[1].entity_json["id"], ids[1].as_str());
+    let cut_endpoint_edge = full_anchor_edges
+        .iter()
+        .find(|edge| edge["source_id"] == ids[0].as_str() && edge["target_id"] == ids[1].as_str())
+        .unwrap();
+    let cut_endpoint_budget = blocks[0].entity_size + cost(cut_endpoint_edge);
+    assert!(cost(cut_endpoint_edge) < blocks[1].entity_size);
+    assert!(blocks[0]
+        .pairs
+        .iter()
+        .all(|pair| pair.size > cost(cut_endpoint_edge)));
     for budget in [
         256,
+        cut_endpoint_budget,
         earlier_cost,
         earlier_cost + first_edge_cost - 1,
         earlier_cost + first_edge_cost,
@@ -122,6 +138,15 @@ async fn context_anchor_edges_share_the_record_budget_and_keep_admitted_endpoint
             full_anchor_edges.len() - anchor_edges.len()
         );
         if anchor_edges.len() < full_anchor_edges.len() {
+            assert_eq!(bounded["truncated"], true);
+        }
+        if budget == cut_endpoint_budget {
+            assert_eq!(
+                bounded["anchors"].as_array().unwrap().len(),
+                1,
+                "budget {budget}"
+            );
+            assert!(anchor_edges.is_empty(), "budget {budget}");
             assert_eq!(bounded["truncated"], true);
         }
         if budget == earlier_cost + first_edge_cost {
