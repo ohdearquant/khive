@@ -732,6 +732,19 @@ ledger. Otherwise the first configured recipient alias wins, then the required
 external inbound actor. Startup validates this configuration before either host
 entrypoint starts its daemon callback, including clients that do not own polling.
 
+For external mail, the callers that run this lookup (the
+`pending_owner_candidates` ingest path and the email host's `lookup_thread_owner`)
+require proof on the thread-UUID pass. A sender-asserted `X-Khive-Thread-ID` that
+names a thread (rather than a Message-ID) selects that thread only when one of the
+thread's outbound notes is an email message whose Message-ID verifies against the
+configured mailbox domains, the same proof the Message-ID pass applies. The pass
+pages through the thread's outbound notes instead of taking the first row, so a
+copied Message-ID or a non-email row that sorts first cannot mask the verified
+owner. A UUID naming any other thread yields no owner, and the route falls through
+to the recipient aliases and then the external inbound actor. Maintainer mail uses
+the `correlation_external_id` path, which keeps the transport-level resolution and
+does not require an email Message-ID.
+
 An authenticated delivered opt-out commits an `outbound/address/reply_stop`
 suppression before duplicate acknowledgement or message creation. It uses the
 same unique insert as mailto and operator entries. A failed insert leaves the
@@ -895,6 +908,21 @@ above); the transport still holds the original message. Refusing the ingest
 instead would hold the channel's progress on that message for every later poll.
 A replay of the same message resolves to the stored record and writes no owner
 row either.
+
+The `comm.ingest` receipt discloses the retention outcome for every NEW
+quarantine record (the `deduplicated=false` path): `quarantine_original_retained`
+is a JSON boolean read from the attachment actually persisted after the
+`secondary-backend` drop, so a drop inside `comm.ingest` reads like any other
+loss. When it is `false` the receipt also carries
+`quarantine_original_not_retained_reason` with the record's own stored reason
+(for example `retention-limit`, `original-unavailable`, `original-store-failed`,
+`quarantine-write-failed` or `secondary-backend`). A retained original and a
+lost one are otherwise indistinguishable from the response alone. A
+non-quarantine message carries neither key, and a deduplicated acknowledgement
+(`deduplicated=true`) carries neither, because it wrote no new record.
+Integrity note: a quarantined record with neither an attachment nor a stored
+reason is reported as `quarantine_original_retained: false` with no reason key;
+the reason is never invented.
 
 ## Message-ID / References header helpers (#403)
 

@@ -227,14 +227,7 @@ impl OutboundEmailPolicy {
     pub fn mint_unsubscribe_token(&self, normalized_recipient: &str) -> Option<String> {
         let recipient_key = self.recipient_key_bytes(normalized_recipient)?;
         let (&key_id, key) = self.token_keys.iter().next_back()?;
-        let mut body = Vec::with_capacity(2 + RECIPIENT_KEY_BYTES);
-        body.push(UNSUBSCRIBE_TOKEN_VERSION);
-        body.push(key_id);
-        body.extend_from_slice(&recipient_key);
-        let tag = hmac_sha256(key, &body);
-        let mut token = body;
-        token.extend_from_slice(&tag[..UNSUBSCRIBE_TAG_BYTES]);
-        Some(URL_SAFE_NO_PAD.encode(token))
+        Some(encode_unsubscribe_token(key_id, key, &recipient_key))
     }
 
     /// Verify an unsubscribe token and return the recipient key text it identifies, or `None`
@@ -566,6 +559,23 @@ fn read_external_footer(path: Option<&str>) -> Result<Arc<str>, Arc<str>> {
 }
 
 /// Lowercase hex of a byte slice (no `hex` crate dependency).
+/// Encode an unsubscribe token: `0x01 || key_id || recipient_key || tag`, where the tag is the
+/// first [`UNSUBSCRIBE_TAG_BYTES`] bytes of `HMAC-SHA256(key, 0x01 || key_id || recipient_key)`,
+/// as base64url without padding.
+fn encode_unsubscribe_token(
+    key_id: u8,
+    key: &[u8],
+    recipient_key: &[u8; RECIPIENT_KEY_BYTES],
+) -> String {
+    let mut token = Vec::with_capacity(UNSUBSCRIBE_TOKEN_BYTES);
+    token.push(UNSUBSCRIBE_TOKEN_VERSION);
+    token.push(key_id);
+    token.extend_from_slice(recipient_key);
+    let tag = hmac_sha256(key, &token);
+    token.extend_from_slice(&tag[..UNSUBSCRIBE_TAG_BYTES]);
+    URL_SAFE_NO_PAD.encode(token)
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1032,6 +1042,52 @@ mod tests {
 
         // A truncated token fails.
         assert!(policy.verify_unsubscribe_token("AAAA").is_none());
+    }
+
+    // A published test vector for the token format, shared with an independent verifier so that
+    // a change to how either side mints or verifies fails a suite. The token key is test
+    // material, never deployment key material.
+    const VECTOR_KEY_ID: u8 = 3;
+    const VECTOR_TOKEN_KEY_HEX: &str =
+        "efaaa78a85da8a505a5278b5ad7d202a8b5028bb0b279c7a01f410c0ff84c09d";
+    const VECTOR_RECIPIENT_KEY_HEX: &str =
+        "cd5ac2457bd4442f53a23cfa9972cc3cdf3d0f1bcf1722bd5503ab20acfa3930";
+    const VECTOR_TOKEN: &str =
+        "AQPNWsJFe9REL1OiPPqZcsw83z0PG88XIr1VA6sgrPo5MFRThmznJxzUr1otDEzmcaE";
+    const VECTOR_TOKEN_FLIPPED_TAG: &str =
+        "AQPNWsJFe9REL1OiPPqZcsw83z0PG88XIr1VA6sgrPo5MFRThmznJxzUr1otDEzmcaA";
+
+    #[test]
+    fn shared_vector_mints_and_verifies_byte_for_byte() {
+        let recipient_key: [u8; RECIPIENT_KEY_BYTES] = unhex(VECTOR_RECIPIENT_KEY_HEX)
+            .try_into()
+            .expect("the vector recipient key is 32 bytes");
+        assert_eq!(
+            encode_unsubscribe_token(VECTOR_KEY_ID, &unhex(VECTOR_TOKEN_KEY_HEX), &recipient_key),
+            VECTOR_TOKEN,
+            "minting the vector inputs must reproduce the vector token"
+        );
+
+        let policy = OutboundEmailPolicy::configured_for_tests_with(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+            &rk(),
+            &format!("{VECTOR_KEY_ID}:{VECTOR_TOKEN_KEY_HEX}"),
+            Ok("Reply to unsubscribe: {unsubscribe}"),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.verify_unsubscribe_token(VECTOR_TOKEN).as_deref(),
+            Some(VECTOR_RECIPIENT_KEY_HEX),
+            "the vector token verifies to the vector recipient key"
+        );
+        assert!(
+            policy
+                .verify_unsubscribe_token(VECTOR_TOKEN_FLIPPED_TAG)
+                .is_none(),
+            "the vector token with one tag bit flipped does not verify"
+        );
     }
 
     #[test]
