@@ -160,8 +160,9 @@ pub(super) mod retrieval_failpoints {
 // KHIVE_RECALL_PROFILE emits per-call stage JSON to stderr.
 pub(super) static RECALL_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    pub(super) static PROF_CID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+// A recall can resume on another worker or interleave with another recall.
+tokio::task_local! {
+    pub(super) static PROF_CID: u64;
 }
 
 pub(super) fn recall_profile_enabled() -> bool {
@@ -499,6 +500,10 @@ pub(super) struct RecallParams {
     /// `annotates` edge, or null when the memory has none.
     #[serde(default)]
     pub(super) include_source_id: Option<bool>,
+    /// When true the response carries a `timings` object with this call's
+    /// per-stage retrieval wall time and per-round candidate counts.
+    #[serde(default)]
+    pub(super) include_timings: Option<bool>,
     /// Entity names to boost in scoring.
     #[serde(default)]
     pub(super) entity_names: Option<Vec<String>>,
@@ -742,6 +747,21 @@ impl RecallStageTimings {
         self.hydrate.is_some()
     }
 
+    /// Per-stage wall time in microseconds for the `include_timings` report.
+    /// `null` marks a stage this recall never entered.
+    pub(super) fn stage_report(self) -> Value {
+        let micros = |stage: Option<Duration>| {
+            stage.map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
+        };
+        serde_json::json!({
+            "embed_us": micros(self.embed),
+            "fts_us": micros(self.fts),
+            "ann_us": micros(self.ann),
+            "fresh_tail_us": micros(self.fresh_tail),
+            "hydrate_us": micros(self.hydrate),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn from_millis_for_test(
         embed: u64,
@@ -823,9 +843,43 @@ impl TextSnippetPolicy {
 
 pub(super) const RECALL_DIAGNOSTIC_SNIPPET_CHARS: usize = 200;
 
+/// The retrieval arms one candidate collection runs. A fusion strategy that
+/// discards an arm's hits never pays for that arm: `keyword_only` neither
+/// embeds the query nor searches ANN or the fresh tail, and `vector_only`
+/// never runs FTS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecallLegs {
+    pub(super) text: bool,
+    pub(super) vector: bool,
+}
+
+impl RecallLegs {
+    /// Both arms: every fusing strategy and the diagnostic subhandlers.
+    pub(super) const BOTH: Self = Self {
+        text: true,
+        vector: true,
+    };
+
+    pub(super) fn for_strategy(strategy: &FusionStrategy) -> Self {
+        match strategy {
+            FusionStrategy::KeywordOnly => Self {
+                text: true,
+                vector: false,
+            },
+            FusionStrategy::VectorOnly => Self {
+                text: false,
+                vector: true,
+            },
+            _ => Self::BOTH,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct RecallCandidateParams<'a> {
     pub(super) candidate_limit: u32,
+    /// Arms to run; a skipped arm contributes no hits and no stage timing.
+    pub(super) legs: RecallLegs,
     pub(super) embedding_model: Option<&'a str>,
     pub(super) session_fence: Option<&'a crate::visibility::VisibilityFence>,
     /// Skip FTS gather term selection. Keyed on `contains_cjk`; read only when FTS gather is
@@ -1113,7 +1167,7 @@ impl MemoryPack {
             return Ok(Vec::new());
         }
         let prof = recall_profile_enabled();
-        let call_id = PROF_CID.with(|c| c.get());
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
@@ -1173,6 +1227,7 @@ impl MemoryPack {
         khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallCandidateParams {
             candidate_limit,
+            legs,
             embedding_model,
             session_fence,
             cjk_fts_bypass,
@@ -1192,6 +1247,9 @@ impl MemoryPack {
         let primary_ns = token.namespace().as_str().to_string();
 
         let text_fut = async {
+            if !legs.text {
+                return Ok::<_, RuntimeError>((Vec::new(), None));
+            }
             let started = Instant::now();
             let hits = self
                 .collect_recall_text_hits(
@@ -1204,24 +1262,39 @@ impl MemoryPack {
                     fts_gather,
                 )
                 .await?;
-            Ok::<_, RuntimeError>((hits, started.elapsed()))
+            Ok((hits, Some(started.elapsed())))
         };
-        let vector_fut = self.collect_recall_vector_hits(
-            token,
-            query,
-            &primary_ns,
-            RecallVectorCandidateParams {
-                candidate_limit,
-                embedding_model,
-                session_fence,
-                visible_namespaces: visible.clone(),
-                ann_overfetch_max_rounds,
-                ann_ready_timeout_ms,
-            },
-        );
+        let vector_fut = async {
+            if !legs.vector {
+                // No embedding, ANN, fresh-tail or sqlite-vec work: the arm
+                // never ran, so it reports no hits, no degradation and no
+                // unproven session fence.
+                return Ok::<_, RuntimeError>(RecallVectorCandidateResult {
+                    vector_hits_per_model: Vec::new(),
+                    ann_degraded: false,
+                    ann_degraded_reason: None,
+                    session_unmet_models: Vec::new(),
+                    timings: RecallStageTimings::default(),
+                });
+            }
+            self.collect_recall_vector_hits(
+                token,
+                query,
+                &primary_ns,
+                RecallVectorCandidateParams {
+                    candidate_limit,
+                    embedding_model,
+                    session_fence,
+                    visible_namespaces: visible.clone(),
+                    ann_overfetch_max_rounds,
+                    ann_ready_timeout_ms,
+                },
+            )
+            .await
+        };
         let ((text_hits, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
         let mut timings = vector_result.timings;
-        timings.fts = Some(fts_elapsed);
+        timings.fts = fts_elapsed;
         khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
@@ -1264,7 +1337,7 @@ impl MemoryPack {
         let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
             .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
         let prof = recall_profile_enabled();
-        let call_id = PROF_CID.with(|c| c.get());
+        let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
 
         let mut ann_degraded = false;
         let mut timings = RecallStageTimings::default();

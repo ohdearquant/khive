@@ -198,9 +198,63 @@ pub struct FsBlobStore {
 }
 
 impl FsBlobStore {
-    /// Default fail-closed free-space floor (khive#292 SPEC-gate ruling):
-    /// 100 GB. Config-overridable via the `floor_bytes` constructor argument.
+    /// The fixed default floor before ADR-111 Amendment 6 (100 GB). No
+    /// longer applied: an unconfigured floor now scales with the volume, see
+    /// [`Self::default_floor_for_root`].
+    #[deprecated(
+        note = "the default floor scales with the volume; use `FsBlobStore::default_floor_for_root`"
+    )]
     pub const DEFAULT_FLOOR_BYTES: u64 = 100_000_000_000;
+
+    /// Smallest default free-space floor (ADR-111 Amendment 6): 5 GiB.
+    pub const MIN_DEFAULT_FLOOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+    /// The default floor for a volume of `capacity_bytes` when none is
+    /// configured (ADR-111 Amendment 6): 2% of the volume, never below
+    /// [`Self::MIN_DEFAULT_FLOOR_BYTES`].
+    pub const fn default_floor_for_capacity(capacity_bytes: u64) -> u64 {
+        let fraction = capacity_bytes / 50;
+        if fraction > Self::MIN_DEFAULT_FLOOR_BYTES {
+            fraction
+        } else {
+            Self::MIN_DEFAULT_FLOOR_BYTES
+        }
+    }
+
+    /// The default floor for the volume holding `root`, measured on its
+    /// nearest existing ancestor when `root` does not exist yet. An unreadable
+    /// capacity falls back to [`Self::MIN_DEFAULT_FLOOR_BYTES`] with a
+    /// warning rather than failing the store.
+    pub fn default_floor_for_root(root: &Path) -> u64 {
+        let probe = Self::capacity_probe(root);
+        match fs4::total_space(probe) {
+            Ok(capacity) => Self::default_floor_for_capacity(capacity),
+            Err(error) => {
+                tracing::warn!(
+                    path = %probe.display(),
+                    %error,
+                    floor_bytes = Self::MIN_DEFAULT_FLOOR_BYTES,
+                    "blob store: volume capacity unreadable; using the minimum default free-space floor"
+                );
+                Self::MIN_DEFAULT_FLOOR_BYTES
+            }
+        }
+    }
+
+    /// The path whose volume is measured for `root`: `root` itself when it
+    /// exists, otherwise its nearest existing ancestor, however deep the
+    /// missing part is. `.` when no ancestor exists (an empty relative path).
+    fn capacity_probe(root: &Path) -> &Path {
+        root.ancestors()
+            .find(|path| !path.as_os_str().is_empty() && path.exists())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    /// The floor a store rooted at `root` enforces: `configured` when set
+    /// (including `0`), otherwise [`Self::default_floor_for_root`].
+    pub fn resolve_floor(root: &Path, configured: Option<u64>) -> u64 {
+        configured.unwrap_or_else(|| Self::default_floor_for_root(root))
+    }
 
     /// Default orphan-sweep publish grace period: 1 hour. Generous on
     /// purpose — it only needs to outlast the gap between a client's `put`
@@ -283,6 +337,11 @@ impl FsBlobStore {
     }
 
     /// The resolved root directory this store writes under.
+    /// The free-space floor this store enforces on every new object.
+    pub fn floor_bytes(&self) -> u64 {
+        self.floor_bytes
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

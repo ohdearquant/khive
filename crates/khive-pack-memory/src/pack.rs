@@ -195,7 +195,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results. include_timings=true adds a timings field to whichever shape applies, wrapping an array as {results, timings}.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -266,7 +266,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "fusion_strategy",
                 param_type: "string",
                 required: false,
-                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config.",
+                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config. keyword_only runs only the text search (no query embedding, no vector search, so it never reports degraded; under a session fence it still waits for the fence's ANN watermark); vector_only runs only the vector search.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -306,6 +306,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "boolean",
                 required: false,
                 description: "Include per-component score breakdowns in results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_timings",
+                param_type: "boolean",
+                required: false,
+                description: "When true the response carries timings: total_us, the retrieval stage wall times embed_us, fts_us, ann_us, fresh_tail_us and hydrate_us (null when the stage did not run; FTS and the vector search run concurrently, so they do not add up), retrieval_rounds, and rounds[] with each round's candidate_limit, text_hits, vector_hits, hydrated and eligible counts and stage times. An array response becomes {results, timings}; an object response gains timings. Default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -594,7 +601,7 @@ impl MemoryPack {
     ///
     /// Timeout returns `DeadlineExceeded` without claiming to cancel runtime-owned storage
     /// work. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
-    async fn handle_recall_with_deadline(
+    pub(crate) async fn handle_recall_with_deadline(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -607,12 +614,13 @@ impl MemoryPack {
         let start = std::time::Instant::now();
         // `handle_recall` is a large state machine: its text/vector fan-out
         // contains several cancellation-aware select/join branches. Keep that
-        // generator behind one heap pointer at the deadline boundary so it is
+        // generator (inside its profiling wrapper `handle_recall_profiled`)
+        // behind one heap pointer at the deadline boundary so it is
         // not embedded again in this future, `PackRuntime::dispatch`, and the
         // MCP request stack. Inlining it here can overflow Tokio's worker stack
         // even though the pipeline has no recursive call cycle.
         let hard_deadline = start.checked_add(std::time::Duration::from_millis(budget_ms));
-        let recall = Box::pin(self.handle_recall(token, params, registry, hard_deadline));
+        let recall = Box::pin(self.handle_recall_profiled(token, params, registry, hard_deadline));
         match tokio::time::timeout(std::time::Duration::from_millis(budget_ms), recall).await {
             Ok(result) => result,
             Err(_) => {

@@ -6,6 +6,7 @@
 //! pack-written provenance event. The mirrored `created_by_actor` note
 //! property is display metadata only and is never an authorization source.
 pub mod handlers;
+pub mod misfire;
 mod pack;
 pub mod repeat;
 mod tests;
