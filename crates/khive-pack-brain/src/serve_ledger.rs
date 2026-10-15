@@ -139,11 +139,8 @@ pub(crate) async fn record_serves(
             )
         })
         .collect();
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
-    let affected = writer
-        .execute_batch(statements)
-        .await
-        .map_err(|e| sql_err("insert serve batch", e))?;
+    let mut writer = sql.writer().await?;
+    let affected = writer.execute_batch(statements).await?;
     let written = usize::try_from(affected)
         .map_err(|_| sql_err("insert serve batch", "affected row count exceeds usize"))?;
     let skipped = rows.len().checked_sub(written).ok_or_else(|| {
@@ -204,15 +201,14 @@ pub async fn get_serve_row(
     sql: &dyn SqlAccess,
     id: &str,
 ) -> Result<Option<ServeLedgerRow>, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let mut reader = sql.reader().await?;
     let row = reader
         .query_row(SqlStatement {
             sql: sql!("brain_serve_ledger_row").into(),
             params: vec![SqlValue::Text(id.to_string())],
             label: Some("brain_serve_ledger_get".into()),
         })
-        .await
-        .map_err(|e| sql_err("read row", e))?;
+        .await?;
 
     let Some(row) = row else {
         return Ok(None);
@@ -277,8 +273,7 @@ pub(crate) async fn backfill_grade_on_writer(
             ],
             label: Some("brain_serve_ledger_backfill_grade".into()),
         })
-        .await
-        .map_err(|e| sql_err("backfill grade", e))?;
+        .await?;
     if affected != 1 {
         return Err(RuntimeError::Internal(format!(
             "serve ledger backfill grade: expected one row for {id:?}, updated {affected}"
