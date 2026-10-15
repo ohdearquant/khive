@@ -400,3 +400,33 @@ screening rules, outcomes and labels of §8.3 and §8.4 are unchanged.
 
 Realistic replies from developers that ask the reader to install, run or connect something are A15 fixtures, and the
 change that adds them reports how many each screening family catches.
+
+## Amendment 2 (2026-10-15) -- External inbound without external senders
+
+**Status**: Proposed 2026-10-15.
+
+**Trigger.** §7 step 5 ties external inbound to configured external senders: while `KHIVE_EMAIL_EXTERNAL_SENDERS` is
+unset, every authenticated message from a sender other than the maintainer is quarantined as `off-allowlist`. A
+deployment that has to receive mail from outside senders, such as service notices addressed to its mailbox, but must
+not send outside its policy recipients has no setting for that: configuring external senders also enables outbound
+external sending.
+
+**Decision.**
+
+1. `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` enables external inbound on its own. External inbound is enabled when
+   external senders are configured or this setting is `enabled`. §7 step 5 reads "External inbound not enabled:
+   quarantine as `off-allowlist`", and steps 6 and 7 apply whenever it is enabled.
+2. The setting changes nothing outbound. While external senders are unset, a send to an address outside the outbound
+   allowlist is refused as before (§2), and no unsubscribe token verifies (§5).
+3. A message admitted under it is delivered exactly as §8 describes: sender `email:<address>`, `origin = external`,
+   `trust = untrusted`, screening per §8.3, routing per §8.2 and Amendment 1 decision 4.
+   `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is required whenever external inbound is enabled, and start-up fails while it
+   is unset or empty.
+4. Unset or empty means disabled. Any other value is a configuration error at start-up, so a misspelled value never
+   reads as disabled.
+
+**Acceptance (added to the ADR's table).**
+
+| Case             | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A20 inbound only | With external senders unset and the setting enabled, an authenticated message from a sender other than the maintainer is delivered to its routed actor marked external and untrusted, an inbound suppression entry still blocks it, a send to an address outside the outbound allowlist is refused, and start-up fails while the inbound actor is unset or empty or the setting holds an unrecognised value. |

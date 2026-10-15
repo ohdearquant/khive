@@ -1,8 +1,11 @@
 # External inbound email
 
-External replies are enabled by the daemon's boot-resolved external-sender policy.
-While disabled, inbound routing settings are inert and non-maintainer mail keeps
-the existing `off-allowlist` disposition.
+External inbound is enabled by the daemon's boot-resolved external-sender policy,
+or on its own by `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled`, which receives external
+mail while outbound external sending stays disabled. Any other non-empty value
+of that variable refuses start-up. While external inbound is disabled, inbound
+routing settings are inert and non-maintainer mail keeps the existing
+`off-allowlist` disposition.
 
 When enabled, `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is required and nonempty.
 `KHIVE_EMAIL_INBOUND_ROUTES` optionally contains comma-separated `address=actor`

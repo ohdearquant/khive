@@ -109,6 +109,107 @@ fn startup_disabled_external_does_not_require_actor_or_parse_routes() {
     );
 }
 
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_inbound_only_requires_actor_and_leaves_outbound_external_refused() {
+    isolated_case(
+        "startup_inbound_only_requires_actor_and_leaves_outbound_external_refused",
+        async {
+            use clap::Parser as _;
+            assert!(std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_none());
+            let args = || {
+                Args::parse_from([
+                    "mcp",
+                    "--db",
+                    ":memory:",
+                    "--no-embed",
+                    "--pack",
+                    "kg",
+                    "--pack",
+                    "comm",
+                ])
+            };
+            let server = || {
+                let runtime = KhiveRuntime::memory()
+                    .unwrap()
+                    .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap()
+            };
+
+            // An unrecognised switch value refuses start-up rather than reading as disabled.
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "yes");
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let error = serve_server(server(), &args(), &TransportRegistry::new(), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not recognised"), "{error}");
+
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "enabled");
+            for actor in [None, Some("")] {
+                if let Some(actor) = actor {
+                    std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", actor);
+                } else {
+                    std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+                }
+                let before = khive_runtime::daemon::background_task_count();
+                let error = serve_server(server(), &args(), &TransportRegistry::new(), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"),
+                    "{error}"
+                );
+                let error = run(args(), &TransportRegistry::new()).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"),
+                    "{error}"
+                );
+                assert_eq!(
+                    khive_runtime::daemon::background_task_count(),
+                    before,
+                    "no channel loop starts on refusal"
+                );
+            }
+
+            // Control: the same configuration with the actor set starts.
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let server = server();
+            assert!(prepare_host_background_tasks(&args(), &server)
+                .unwrap()
+                .email
+                .is_none());
+
+            // Outbound external sending stays disabled: an address outside the policy is
+            // refused, while a policy recipient is still admitted.
+            let registry = server.verb_registry_clone();
+            registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to":"email:allowed@example.com","content":"policy recipient"}),
+                )
+                .await
+                .unwrap();
+            let refused = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to":"email:visitor@outside.example","content":"no outbound"}),
+                )
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(khive_runtime::RuntimeError::PermissionDenied { .. })
+                ),
+                "{refused:?}"
+            );
+        },
+    );
+}
+
 /// Collects formatted log output so a test can read what a code path reported.
 #[cfg(feature = "channel-email")]
 #[derive(Clone, Default)]

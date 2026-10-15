@@ -424,14 +424,15 @@ the behaviour described above are unchanged:
    authentication, because the token is the authority.
 3. Domain authentication failing is quarantined as before.
 4. A `From:` that is the maintainer is attributed and routed as before.
-5. With `KHIVE_EMAIL_EXTERNAL_SENDERS` unset, any other authenticated sender is
-   quarantined `off-allowlist` — exactly today's behaviour.
-6. With external senders configured, an `inbound` suppression entry matching
-   the authenticated sender's address or its exact domain (no subdomain match)
-   is quarantined `blocked`.
-7. Otherwise the outcome is unchanged for now: external delivery and screening
-   are later steps of the same series, so this case keeps the `off-allowlist`
-   quarantine.
+5. While external inbound is disabled (neither `KHIVE_EMAIL_EXTERNAL_SENDERS`
+   nor `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` is set), any other authenticated
+   sender is quarantined `off-allowlist`.
+6. With external inbound enabled, an `inbound` suppression entry matching the
+   authenticated sender's address or its exact domain (no subdomain match) is
+   quarantined `blocked`.
+7. Otherwise screening decides between delivery to the routed actor, withheld
+   delivery and quarantine (see the email channel's external inbound
+   documentation).
 
 The `inbound` suppression entries are read from the same comm store the
 `comm.suppression_add` / `comm.suppression_list` / `comm.suppression_remove`
@@ -511,6 +512,17 @@ did before, and the values are ignored entirely.
   `{unsubscribe}`, which the channel replaces with the mailto opt-out
   instruction. External admission is refused while it is unset, unreadable or
   missing the placeholder; policy-recipient messages are unaffected)
+
+Mail from outside senders can be received without enabling external sending:
+`KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` admits authenticated non-maintainer mail
+as external inbound (sender `email:<address>`, `origin=external`,
+`trust=untrusted`, routed by verified thread owner, then
+`KHIVE_EMAIL_INBOUND_ROUTES`, then `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR`) while
+`KHIVE_EMAIL_EXTERNAL_SENDERS` stays unset, so a send to an address outside the
+outbound allowlist is still refused. Start-up fails if
+`KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or empty while external inbound
+is enabled, and any value of `KHIVE_EMAIL_EXTERNAL_INBOUND` other than
+`enabled` or empty is a configuration error.
 
 An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
 the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a
