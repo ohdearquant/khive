@@ -353,17 +353,14 @@ pub use read_helpers::{
 pub use record_ops::NoteCreateSpec;
 
 pub use edge_query::QueryResult;
-use graph_rules::{
-    accepted_entity_relations_description, pack_rule_allows,
-    static_impossible_edge_pattern_warnings,
-};
+use graph_rules::{accepted_entity_relations_description, static_impossible_edge_pattern_warnings};
 pub use graph_rules::{
     accepted_entity_relations_for_entities, accepted_pack_relations_for_entities,
     merge_entry_metadata,
 };
 pub(crate) use graph_rules::{
     canonical_edge_endpoint_kinds, canonical_edge_endpoints, merge_dependency_kind,
-    validate_edge_metadata, validate_edge_weight,
+    pack_rule_allows, validate_edge_metadata, validate_edge_weight,
 };
 #[cfg(test)]
 use link_ops::guarded_link_batch_failure;

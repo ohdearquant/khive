@@ -173,6 +173,10 @@ impl PackRuntime for KgPack {
         );
 
         match verb {
+            "apply_changeset" => {
+                self.handle_apply_changeset(graph_token, params, registry)
+                    .await
+            }
             // Kind-discriminated: override only for entity/edge kinds.
             "create" | "list" | "search" => {
                 let tok = if kind_is_entity_or_edge {

@@ -29,6 +29,7 @@ fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result
     use khive_runtime::secret_gate::reject_reserved_secret_gate_property;
 
     match changeset {
+        ProposalChangeset::Canonical { .. } => Ok(()),
         ProposalChangeset::AddEntity { entity } => {
             reject_reserved_secret_gate_property(entity.properties.as_ref())
         }
@@ -158,6 +159,7 @@ impl KgPack {
                     RuntimeError::InvalidInput(format!("invalid changeset: {serde_message}"))
                 }
             })?;
+        crate::canonical_apply::validate_proposal(&changeset, registry)?;
         reject_reserved_changeset_properties(&changeset)?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
@@ -324,6 +326,19 @@ impl KgPack {
             khive_runtime::secret_gate::check_at(c, "review", "comment")?;
         }
 
+        let changeset = crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+            .load_changeset(token, proposal_id)
+            .await?;
+        let preimage = match &changeset {
+            ProposalChangeset::Canonical {
+                schema_version,
+                delta,
+            } => crate::canonical_apply::preimage_status(&crate::canonical_apply::decode_delta(
+                delta,
+                Some(*schema_version),
+            )?),
+            _ => khive_types::event::ProposalPreimageStatus::None,
+        };
         let payload = ProposalReviewedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             reviewer: actor.clone(),
@@ -377,6 +392,7 @@ impl KgPack {
             "reviewer": actor,
             "decision": p.decision,
             "status": new_status,
+            "preimage": preimage,
         }))?;
         super::create::add_embedding_truncation_warning(
             &mut response,

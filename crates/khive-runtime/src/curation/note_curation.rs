@@ -13,8 +13,34 @@ impl KhiveRuntime {
     pub(crate) async fn prepare_update_note_from_snapshot(
         &self,
         _token: &NamespaceToken,
+        note: khive_storage::note::Note,
+        patch: NotePatch,
+    ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        if patch.content.is_some() || patch.properties.is_some() {
+            if let Some(error) = self.stream_member_error(&note).await? {
+                return Err(error);
+            }
+        }
+        let pack_owned = self.is_pack_owned_note_kind(&note.kind);
+        Self::apply_note_update_fields(
+            note,
+            patch,
+            pack_owned,
+            false,
+            false,
+            chrono::Utc::now().timestamp_micros(),
+        )
+    }
+
+    /// Shared field validation and mutation. Canonical callers replace the
+    /// complete property map; ordinary updates retain their merge semantics.
+    pub(crate) fn apply_note_update_fields(
         mut note: khive_storage::note::Note,
         patch: NotePatch,
+        pack_owned: bool,
+        replace_properties: bool,
+        canonical: bool,
+        now: i64,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
         if note.properties.as_ref().is_some_and(|properties| {
             properties
@@ -44,11 +70,6 @@ impl KhiveRuntime {
             return Err(RuntimeError::InvalidInput(
                 "note update policy does not match the stored note kind".into(),
             ));
-        }
-        if patch.content.is_some() || patch.properties.is_some() {
-            if let Some(error) = self.stream_member_error(&note).await? {
-                return Err(error);
-            }
         }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
@@ -96,101 +117,122 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
-            // Kind-owned identity is protected below pack hooks, including
-            // direct runtime and atomic/proposal update preparation. The merge
-            // path restores these same keys on its surviving row.
-            let owned_keys = kind_owned_properties(&note.kind);
-            if !owned_keys.is_empty() {
-                let object = props.as_object().ok_or_else(|| {
-                    if note.kind == "message" {
-                        RuntimeError::InvalidInput(
-                            "properties on a `message` note must be patched with an object: a \
+            if replace_properties {
+                let replacement = props.as_object().ok_or_else(|| {
+                    RuntimeError::InvalidInput("canonical note properties must be an object".into())
+                })?;
+                let original = note.properties.as_ref().and_then(Value::as_object);
+                for key in kind_owned_properties(&note.kind).iter().copied().chain(
+                    super::OWNER_ESTABLISHED_PROPERTIES
+                        .iter()
+                        .copied()
+                        .filter(|_| pack_owned),
+                ) {
+                    if original.and_then(|map| map.get(key)) != replacement.get(key) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "canonical replacement cannot change owner-established property `{key}` on a `{}` note",
+                            note.kind
+                        )));
+                    }
+                }
+                note.properties = Some(props);
+            } else {
+                // Kind-owned identity is protected below pack hooks, including
+                // direct runtime and atomic/proposal update preparation. The merge
+                // path restores these same keys on its surviving row.
+                let owned_keys = kind_owned_properties(&note.kind);
+                if !owned_keys.is_empty() {
+                    let object = props.as_object().ok_or_else(|| {
+                        if note.kind == "message" {
+                            RuntimeError::InvalidInput(
+                                "properties on a `message` note must be patched with an object: a \
                              non-object patch would replace the transport-owned quarantine and \
                              channel provenance established by `comm.ingest`"
-                                .into(),
-                        )
-                    } else {
-                        RuntimeError::InvalidInput(format!(
-                            "properties on a `{}` note must be patched with an object; \
+                                    .into(),
+                            )
+                        } else {
+                            RuntimeError::InvalidInput(format!(
+                                "properties on a `{}` note must be patched with an object; \
                              a non-object patch would erase its owner-established identity",
-                            note.kind
-                        ))
-                    }
-                })?;
-                if let Some(named) = owned_keys.iter().find(|key| object.contains_key(**key)) {
-                    if note.kind == "message" {
-                        return Err(RuntimeError::InvalidInput(format!(
+                                note.kind
+                            ))
+                        }
+                    })?;
+                    if let Some(named) = owned_keys.iter().find(|key| object.contains_key(**key)) {
+                        if note.kind == "message" {
+                            return Err(RuntimeError::InvalidInput(format!(
                             "`{named}` is transport-owned on a `message` note and cannot be patched; \
                              only `comm.ingest` may establish quarantine disposition and channel \
                              provenance"
                         )));
-                    }
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "`{named}` is not patchable on a `{}` note; \
+                        }
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "`{named}` is not patchable on a `{}` note; \
                          use `comm.heartbeat` to report health without changing the row's identity",
-                        note.kind
-                    )));
+                            note.kind
+                        )));
+                    }
                 }
-            }
-            // On a pack-owned note kind, the properties in
-            // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
-            // and read back by it to decide something structural — who wrote
-            // the record and when, which author-side record it copies, which
-            // conversation it belongs to. A caller cannot patch them here.
-            // Only a patch that *names* one of them is refused, and naming is
-            // the exact test: the merge below is `PreferFrom`, so a patch that
-            // names an owned key would overwrite it while a patch that does
-            // not name it leaves it intact. Every other key still merges
-            // normally — arbitrary metadata on a pack-owned record (a
-            // `blocked_on` note on a `task`) has no other write path and must
-            // keep working.
-            if self.is_pack_owned_note_kind(&note.kind) {
-                // A non-object patch names nothing, so it slips past the
-                // named-key check below and then takes `merge_json`'s
-                // non-object `PreferFrom` arm, which replaces the whole
-                // property object rather than merging into it — erasing
-                // every owned key. Refused on every pack-owned kind, not only
-                // rows that currently carry an owned key, so an identical
-                // call cannot succeed or fail on state the caller cannot see.
-                if !props.is_object() {
-                    return Err(RuntimeError::InvalidInput(format!(
+                // On a pack-owned note kind, the properties in
+                // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
+                // and read back by it to decide something structural — who wrote
+                // the record and when, which author-side record it copies, which
+                // conversation it belongs to. A caller cannot patch them here.
+                // Only a patch that *names* one of them is refused, and naming is
+                // the exact test: the merge below is `PreferFrom`, so a patch that
+                // names an owned key would overwrite it while a patch that does
+                // not name it leaves it intact. Every other key still merges
+                // normally — arbitrary metadata on a pack-owned record (a
+                // `blocked_on` note on a `task`) has no other write path and must
+                // keep working.
+                if pack_owned {
+                    // A non-object patch names nothing, so it slips past the
+                    // named-key check below and then takes `merge_json`'s
+                    // non-object `PreferFrom` arm, which replaces the whole
+                    // property object rather than merging into it — erasing
+                    // every owned key. Refused on every pack-owned kind, not only
+                    // rows that currently carry an owned key, so an identical
+                    // call cannot succeed or fail on state the caller cannot see.
+                    if !props.is_object() {
+                        return Err(RuntimeError::InvalidInput(format!(
                         "properties on a `{}` note must be patched with an object: a non-object \
                          patch names no key, so it would replace the whole property object rather \
                          than merging into it. Pass an object containing the keys you intend to \
                          set.",
                         note.kind
                     )));
-                }
-                if let Some(named) = owner_established_property_named_in(&props) {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "`{named}` is not patchable on a `{}` note: the pack that owns this \
+                    }
+                    if let Some(named) = owner_established_property_named_in(&props) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "`{named}` is not patchable on a `{}` note: the pack that owns this \
                          kind establishes it and reads it back — to decide how the record is \
                          attributed and grouped, or to reproduce it verbatim when the record \
                          is re-emitted — so it is written by the owner and immutable to a \
                          caller patch. Patch any other property key here, or omit \
                          `{named}` from this patch.",
-                        note.kind
-                    )));
-                }
-            }
-            let incoming_properties = Some(props);
-            let (mut merged, _) = merge_properties(
-                &note.properties,
-                &incoming_properties,
-                EntityDedupMergePolicy::PreferFrom,
-            );
-            if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
-                for key in patch.update_policy.null_clearing_properties {
-                    if incoming_properties
-                        .as_ref()
-                        .and_then(|incoming| incoming.get(*key))
-                        .is_some_and(Value::is_null)
-                    {
-                        properties.remove(*key);
+                            note.kind
+                        )));
                     }
                 }
+                let incoming_properties = Some(props);
+                let (mut merged, _) = merge_properties(
+                    &note.properties,
+                    &incoming_properties,
+                    EntityDedupMergePolicy::PreferFrom,
+                );
+                if let Some(properties) = merged.as_mut().and_then(Value::as_object_mut) {
+                    for key in patch.update_policy.null_clearing_properties {
+                        if incoming_properties
+                            .as_ref()
+                            .and_then(|incoming| incoming.get(*key))
+                            .is_some_and(Value::is_null)
+                        {
+                            properties.remove(*key);
+                        }
+                    }
+                }
+                note.properties = merged;
             }
-            note.properties = merged;
         }
         if let Some(status) = patch.kind_status {
             note.status = status;
@@ -208,7 +250,11 @@ impl KhiveRuntime {
             || original_content != note.content
             || original_salience != note.salience
             || original_decay_factor != note.decay_factor
-            || !note_update_values_equal(&original_properties, &note.properties)
+            || if canonical {
+                original_properties != note.properties
+            } else {
+                !note_update_values_equal(&original_properties, &note.properties)
+            }
             || original_status != note.status;
         if !changed {
             return Ok((stored, text_changed, false));
@@ -225,9 +271,7 @@ impl KhiveRuntime {
                 note.id
             ))
         })?;
-        note.updated_at = chrono::Utc::now()
-            .timestamp_micros()
-            .max(minimum_updated_at);
+        note.updated_at = now.max(minimum_updated_at);
         Ok((note, text_changed, true))
     }
 

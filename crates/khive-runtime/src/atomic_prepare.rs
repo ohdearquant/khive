@@ -63,6 +63,9 @@ use khive_db::stores::note::{
 use khive_db::stores::text::{delete_document_statements, insert_document_statements};
 
 mod add_update;
+pub(crate) use add_update::{
+    attach_note_update_effects, prepare_add_entity_record, prepare_add_note_record,
+};
 pub use add_update::{
     prepare_add_entity, prepare_add_note, prepare_op, prepare_update, prepare_update_entity_plan,
     prepare_update_from_note_snapshot, validate_note_update_expected_kind, AtomicUpdateKind,
@@ -79,6 +82,10 @@ use patch_helpers::{
     optional_f64_patch, optional_properties, optional_str, optional_string_patch, optional_tags,
     refuse_pack_registry_tags, require_str, require_uuid,
 };
+
+pub(crate) fn canonical_refuse_registry_tags(tags: &[String], verb: &str) -> RuntimeResult<()> {
+    refuse_pack_registry_tags(tags, verb)
+}
 
 pub(crate) async fn prepare_update_entity_plan_with_version(
     runtime: &KhiveRuntime,
@@ -116,8 +123,10 @@ pub(crate) use post_commit::apply_one_post_commit_effect;
 pub use post_commit::{apply_post_commit_effects, apply_post_commit_effects_with_report};
 
 mod edge_delete;
+pub(crate) use edge_delete::prepare_delete_edge;
+use edge_delete::prepare_update_edge;
 pub use edge_delete::{prepare_delete, AtomicDeleteKind};
-use edge_delete::{prepare_delete_edge, prepare_update_edge};
+pub(crate) use edge_delete::{prepare_delete_from_snapshot, prepare_update_edge_plan};
 
 #[cfg(test)]
 #[path = "atomic_prepare_tests.rs"]

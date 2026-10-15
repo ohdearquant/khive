@@ -17,6 +17,7 @@ fault-injection = []
 test-internals = ["khive-db/test-support"]
 
 [dependencies]
+khive-changeset = { version = "0.13.0", path = "../khive-changeset" }
 khive-channel = { version = "0.13.0", path = "../khive-channel" }
 khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde", "blake3"] }
 khive-storage = { version = "0.13.0", path = "../khive-storage" }

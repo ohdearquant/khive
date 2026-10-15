@@ -93,12 +93,12 @@ fn list_items(response: &Value) -> &[Value] {
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
 // db_diagnostics (ADR-091 operator surface), then restore, then scan.
 #[test]
-fn pack_verbs_returns_twenty_seven() {
+fn pack_verbs_returns_twenty_eight() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        27,
-        "KgPack must expose exactly 27 verbs including grouped event count"
+        28,
+        "KgPack must expose exactly 28 verbs including canonical change-set apply"
     );
 }
 
@@ -107,6 +107,7 @@ fn pack_verbs_names_are_correct() {
     let pack = pack();
     let names: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
     for expected in &[
+        "apply_changeset",
         "create",
         "get",
         "list",
