@@ -108,6 +108,8 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
             degraded: true,
             admission_refused_obligations: 5,
             admission_refused_obligations_last_at_ms: Some(1_700_000_000_123),
+            retry_exhausted_obligations: 4,
+            retry_exhausted_obligations_last_at_ms: Some(1_700_000_000_789),
             admission_unresolved_obligations: 2,
             admission_unresolved_obligations_last_at_ms: Some(1_700_000_000_456),
         }),
@@ -163,6 +165,25 @@ async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_contr
     assert!(without_control
         .writer_contention
         .audit_admission_unresolved_obligations_unavailable_reason
+        .is_some());
+
+    let wire = serde_json::to_value(&with_control.writer_contention).unwrap();
+    assert_eq!(wire["audit_retry_exhausted_obligations"], 4);
+    assert_eq!(
+        wire["audit_retry_exhausted_obligations_last_at_ms"],
+        1_700_000_000_789_u64
+    );
+    assert!(with_control
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
+        .is_none());
+    assert!(without_control
+        .writer_contention
+        .audit_retry_exhausted_obligations
+        .is_none());
+    assert!(without_control
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
         .is_some());
 
     // Existing fields must be unaffected by the new ones — additive, not
@@ -1416,4 +1437,73 @@ async fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path_asy
              not left unexplained: {:?}",
         report.wal_pin
     );
+}
+
+#[tokio::test]
+async fn size_composition_can_be_skipped_while_page_accounting_is_still_reported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pages.db");
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(path),
+        ..PoolConfig::for_test()
+    })
+    .expect("pool open");
+    {
+        let writer = pool.try_writer().expect("writer");
+        writer
+            .conn()
+            .execute_batch("CREATE TABLE ballast (body BLOB);")
+            .expect("create ballast");
+        for _ in 0..40 {
+            writer
+                .conn()
+                .execute("INSERT INTO ballast (body) VALUES (zeroblob(4096))", [])
+                .expect("insert ballast row");
+        }
+        writer
+            .conn()
+            .execute("DELETE FROM ballast", [])
+            .expect("free the ballast pages");
+    }
+    let pool = Arc::new(pool);
+    let collect = |collect_size_composition: bool| {
+        collect_with_runtime_audit_metrics_for_process_interruptibly(
+            Arc::clone(&pool),
+            BuildIdentity::from_env("test", None),
+            ProcessIdentity::current(&pool),
+            Duration::from_secs(30),
+            0,
+            None,
+            collect_size_composition,
+        )
+    };
+
+    let full = collect(true).await.expect("full report");
+    let composition = full
+        .size_composition
+        .expect("the dbstat composition is collected by default");
+    let pages = full.page_accounting.expect("page accounting on a file");
+    assert_eq!(
+        (
+            pages.page_size_bytes,
+            pages.page_count,
+            pages.freelist_pages
+        ),
+        (
+            composition.page_size_bytes,
+            composition.page_count,
+            composition.freelist_pages
+        ),
+        "the pragma reads and the composition must agree on one file"
+    );
+    assert!(pages.freelist_pages >= 40, "{pages:?}");
+
+    let skipped = collect(false).await.expect("report without the walk");
+    assert!(skipped.size_composition.is_none(), "{skipped:?}");
+    assert_eq!(
+        skipped.size_composition_error.as_deref(),
+        Some(SIZE_COMPOSITION_NOT_REQUESTED)
+    );
+    assert_eq!(skipped.page_accounting, Some(pages));
+    assert!(skipped.page_accounting_error.is_none());
 }

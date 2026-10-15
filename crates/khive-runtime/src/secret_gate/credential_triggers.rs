@@ -42,6 +42,41 @@ pub(super) fn is_lookup_key_label(label: &str) -> bool {
     LOOKUP_KEY_LABELS.contains(&label)
 }
 
+/// Closed vocabulary of member names whose `_token` suffix names a position in
+/// a paged, resumable or synced listing rather than a credential. The
+/// exception is an allowlist for the same reason as [`LOOKUP_KEY_LABELS`]: any
+/// other `*_token` label (`access_token`, `refresh_token`, `session_token`,
+/// `github_token`, ...) is a credential label, so a value assigned to it gets
+/// the checks a value assigned to `token` gets. The match is the whole label.
+pub(super) const POSITION_TOKEN_LABELS: &[&str] = &[
+    "continuation_token",
+    "next_page_token",
+    "next_token",
+    "page_token",
+    "pagination_token",
+    "prev_page_token",
+    "previous_page_token",
+    "resume_token",
+    "start_page_token",
+    "sync_token",
+];
+
+/// Closed vocabulary of member names whose `_token` value is a receipt the
+/// server issues back to its own caller, not a credential. A
+/// `visibility_token` is sealed by the runtime and opening it only narrows a
+/// scope the caller is already authorized for, so quoting a `memory.remember`
+/// response does not disclose access. The match is the whole label.
+pub(super) const RECEIPT_TOKEN_LABELS: &[&str] = &["visibility_token"];
+
+/// `token` itself, or a `*_token` label outside [`POSITION_TOKEN_LABELS`] and
+/// [`RECEIPT_TOKEN_LABELS`].
+pub(super) fn is_credential_token_label(label: &str) -> bool {
+    label == "token"
+        || (label.ends_with("_token")
+            && !POSITION_TOKEN_LABELS.contains(&label)
+            && !RECEIPT_TOKEN_LABELS.contains(&label))
+}
+
 /// Finds a canonical compound credential label beginning at an identifier
 /// boundary. The trailing edge is deliberately unbounded so version suffixes
 /// and larger underscore-composed labels remain protected.
@@ -108,7 +143,7 @@ pub(super) fn assignment_credential_trigger(low_text: &str) -> Option<&'static s
                         && contains_bounded_word(label, tw)
                 })
             })
-            .or_else(|| (label == "token").then_some("token"))
+            .or_else(|| is_credential_token_label(label).then_some("token"))
     })
 }
 

@@ -8,7 +8,10 @@ use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use crate::handlers::{handle_reply, handle_send, handle_suppression_add, handle_suppression_list};
+use crate::handlers::{
+    handle_reply, handle_send, handle_suppression_add, handle_suppression_list,
+    record_mailto_unsubscribe_suppression,
+};
 use crate::inbox_signal::InboxSignal;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -896,4 +899,45 @@ async fn external_daily_cap_counts_fresh_messages_but_not_exact_replays() {
     assert_eq!(replay["full_id"], first["full_id"]);
     assert_eq!(snapshot(&runtime).await, before_refusal);
     assert_eq!(signal.snapshot(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn mailto_unsubscribe_entry_refuses_the_next_send_to_that_recipient() {
+    let policy = external_policy(&["actor:sender"], 5);
+    let recipient_key = policy.recipient_key("external@example.net").unwrap();
+    let runtime = runtime().with_outbound_email_policy(policy);
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let signal = InboxSignal::new();
+
+    // The channel records the verified token's key; admission must then refuse a fresh send.
+    let recorded = record_mailto_unsubscribe_suppression(&runtime, &recipient_key, "channel:email")
+        .await
+        .unwrap();
+    assert!(recorded, "the first opt-out inserts an entry");
+    // A second copy of the same unsubscribe must not fail and must not duplicate.
+    let replay = record_mailto_unsubscribe_suppression(&runtime, &recipient_key, "channel:email")
+        .await
+        .unwrap();
+    assert!(!replay, "a repeated opt-out is a no-op, not a failure");
+    let listed = handle_suppression_list(&runtime, &token, json!({"scope":"outbound"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+
+    let before = snapshot(&runtime).await;
+    external_denied(
+        send(
+            &runtime,
+            &signal,
+            &token,
+            external_request("external@example.net", "post-opt-out"),
+        )
+        .await
+        .unwrap_err(),
+        "comm.send",
+        "recipient is suppressed",
+    );
+    assert_eq!(snapshot(&runtime).await, before);
+    assert_eq!(signal.snapshot(), 0);
 }
