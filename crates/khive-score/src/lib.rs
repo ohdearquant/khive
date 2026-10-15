@@ -16,7 +16,9 @@ mod weights;
 
 pub use arithmetic_error::ArithmeticError;
 pub use band::{min_max_band, min_max_band_f32, min_max_band_fixed, DegenerateSpan};
-pub use comparator::{cmp_asc_then_id, cmp_desc_then_id, Ranked};
+pub use comparator::{
+    cmp_asc_then_id, cmp_desc_then_id, cmp_desc_then_id_f32, cmp_desc_then_id_f64, Ranked,
+};
 pub use decay::{Decay, DecayParameter, HalfLife};
 // REASON: re-export the deprecated legacy function so downstream callers receive
 // the deprecation warning at their call sites, not here in the crate facade.

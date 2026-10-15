@@ -14,7 +14,7 @@ use crate::handlers;
 use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing fourteen public `comm.*` verbs.
+/// Communication pack providing fifteen public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -417,6 +417,9 @@ impl PackRuntime for CommPack {
             }
             "comm.suppression_remove" => {
                 handlers::handle_suppression_remove(self.runtime(), token, params).await
+            }
+            "comm.withheld_body" => {
+                handlers::handle_withheld_body(self.runtime(), token, params).await
             }
             "comm.send" => {
                 handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await

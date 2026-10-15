@@ -177,6 +177,11 @@ fn read_message_fields_prepared(note: &Note, attachment_fields: Value) -> Value 
         "direction": message["direction"],
         "created_at": message["created_at"],
     });
+    for key in ["origin", "trust", "labels"] {
+        if let Some(value) = note.properties.as_ref().and_then(|props| props.get(key)) {
+            fields[key] = value.clone();
+        }
+    }
     if let (Some(fields), Value::Object(attachment_fields)) =
         (fields.as_object_mut(), attachment_fields)
     {

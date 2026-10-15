@@ -178,3 +178,21 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
   `khive-mcp`, which owns the daemon tick loop, decorates successful
   `schedule.agenda` results with process-local `ticker.last_tick_at` per ADR-106
   Amendment D. The heartbeat is not pack data and is never persisted.
+
+## Per-event missed occurrences
+
+Both creation verbs accept optional `misfire_policy` and `max_lateness` under
+ADR-106 Amendment H. Omission preserves the existing `skip` behavior and stores
+no new policy fields. Explicit `skip` may be stored but cannot carry a bound.
+`catch_up_once` always requires a positive integer bound in seconds, including
+one-shots; no recurrence period supplies a default. Creation and the executor
+share `misfire::parse_misfire_policy`, including strict stored-value validation.
+
+The executor considers only the latest due occurrence within the explicit bound,
+including equality. Repeating rows retain the armed trigger as an occurrence and
+use the shared recurrence parser and original monthly anchor. Older due
+occurrences collapse into `missed_at`; they are never dispatched individually.
+An opted-in repeating row restored from an old backup can still invoke once when
+its latest occurrence is recent, so this is not a restore-wide zero-firing rule.
+The executor persists a v2 receipt distinguishing the exact source trigger from
+the selected occurrence. Legacy skip rows keep their v1 receipt behavior.

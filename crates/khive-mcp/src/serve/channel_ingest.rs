@@ -18,110 +18,172 @@ pub(super) fn email_poll_shutdown_token(
     process_shutdown
 }
 
+/// Email configuration resolved before either host entrypoint may report startup success.
 #[cfg(feature = "channel-email")]
+pub(super) struct PreparedEmailChannelLoops {
+    channel: std::sync::Arc<khive_channel_email::EmailChannel>,
+    ingest_namespace: String,
+    default_inbound_actor: String,
+}
+
+#[cfg(feature = "channel-email")]
+pub(super) fn prepare_email_channel_loops(
+    server: &KhiveMcpServer,
+    prepare_polling: bool,
+) -> anyhow::Result<Option<PreparedEmailChannelLoops>> {
+    use crate::serve::email_host::CommExternalEmailHost;
+    use khive_channel_email::{EmailChannel, ExternalInboundConfig};
+    use khive_runtime::{EmailMessageIdDomains, Namespace, OutboundEmailPolicy};
+    use std::sync::Arc;
+
+    let runtime = server.channel_outbox_runtime_clone();
+    if !prepare_polling
+        && runtime.is_none()
+        && std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_none()
+    {
+        return Ok(None);
+    }
+    let policy = match runtime.as_ref() {
+        Some(runtime) => runtime.outbound_email_policy().clone(),
+        None => match OutboundEmailPolicy::from_env() {
+            Ok(policy) => policy,
+            Err(error) if std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_some() => {
+                anyhow::bail!("email policy configuration: {error}");
+            }
+            Err(error) => {
+                tracing::warn!(target: "khive_mcp::serve", "channel-email feature is enabled but configuration is incomplete: {error}; email polling is disabled");
+                return Ok(None);
+            }
+        },
+    };
+    let external = ExternalInboundConfig::from_env(policy.has_external_senders())?;
+    if external.is_some() && runtime.is_none() {
+        anyhow::bail!("external email requires a comm-routed runtime for verified routing and opt-out commits");
+    }
+    if !prepare_polling {
+        return Ok(None);
+    }
+    let email_ch = match EmailChannel::from_env() {
+        Ok(channel) => channel,
+        Err(error) if external.is_some() => return Err(error.into()),
+        Err(error) => {
+            tracing::warn!(target: "khive_mcp::serve",
+                "channel-email feature is enabled but configuration is incomplete: {error}; email polling is disabled"
+            );
+            return Ok(None);
+        }
+    };
+    let ingest_namespace = ingest_namespace_from_env();
+    let namespace = Namespace::parse(&ingest_namespace)?;
+    let domains = EmailMessageIdDomains::from_env();
+    if external.is_some() {
+        if let Err(error) = &domains {
+            anyhow::bail!("external email Message-ID configuration: {error}");
+        }
+    }
+    let host = CommExternalEmailHost::for_ingest(Arc::new(policy), runtime, namespace, domains);
+    let mut email_ch = email_ch.with_external_host(Arc::new(host));
+    if let Some(external) = external {
+        email_ch = email_ch.with_external_inbound_config(external);
+    }
+    Ok(Some(PreparedEmailChannelLoops {
+        channel: Arc::new(email_ch),
+        ingest_namespace,
+        default_inbound_actor: email_default_inbound_actor_from_env(),
+    }))
+}
+
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
+#[cfg(feature = "channel-email")]
 pub(super) fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
+    prepared: PreparedEmailChannelLoops,
 ) {
     use khive_channel::ChannelRegistry;
-    use khive_channel_email::EmailChannel;
     use std::sync::Arc;
+    let email_ch = prepared.channel;
+    let mut ch_registry = ChannelRegistry::new();
+    let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+    #[cfg(test)]
+    let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+        .with(|channel| channel.borrow_mut().take())
+        .unwrap_or(dyn_ch);
+    ch_registry.register(dyn_ch);
+    let ch_registry = Arc::new(ch_registry);
+    let verb_reg = server.verb_registry_clone();
+    let runtime = server.channel_outbox_runtime_clone();
+    let ingest_ns = prepared.ingest_namespace;
+    let default_actor = prepared.default_inbound_actor;
+    let mailbox = email_ch.mailbox().to_string();
 
-    match EmailChannel::from_env() {
-        Ok(email_ch) => {
-            let email_ch = Arc::new(email_ch);
-            let mut ch_registry = ChannelRegistry::new();
-            let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
-            #[cfg(test)]
-            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
-                .with(|channel| channel.borrow_mut().take())
-                .unwrap_or(dyn_ch);
-            ch_registry.register(dyn_ch);
-            let ch_registry = Arc::new(ch_registry);
-            let verb_reg = server.verb_registry_clone();
-            let runtime = server.channel_outbox_runtime_clone();
-            let ingest_ns = ingest_namespace_from_env();
-            let default_actor = email_default_inbound_actor_from_env();
-            let mailbox = email_ch.mailbox().to_string();
+    let ingest_ns_clone = ingest_ns.clone();
+    let default_actor_clone = default_actor.clone();
+    let verb_reg_poll = verb_reg.clone();
+    let ingest_ns_outbox = ingest_ns.clone();
+    let mailbox_clone = mailbox.clone();
+    let email_ch_clone = Arc::clone(&email_ch);
+    let runtime_outbox = runtime.clone();
 
-            let ingest_ns_clone = ingest_ns.clone();
-            let default_actor_clone = default_actor.clone();
-            let verb_reg_poll = verb_reg.clone();
-            let ingest_ns_outbox = ingest_ns.clone();
-            let mailbox_clone = mailbox.clone();
-            let email_ch_clone = Arc::clone(&email_ch);
-            let runtime_outbox = runtime.clone();
-
-            let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                if admission.inbound_poll {
-                    let poll_shutdown =
-                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
-                    khive_runtime::track_named_background_task("email_channel_poll", async move {
-                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
-                        {
-                            tracing::error!(target: "khive_mcp::serve",
-                                error = %error,
-                                "email polling disabled: quarantine storage readiness check failed"
-                            );
-                            return;
-                        }
-                        channel_poll_loop(
-                            ch_registry,
-                            verb_reg_poll,
-                            ingest_ns_clone,
-                            default_actor_clone,
-                            poll_shutdown,
-                        )
-                        .await;
-                    });
-                    tracing::info!(target: "khive_mcp::serve", "email channel polling loop started");
+    let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
+        if admission.inbound_poll {
+            let poll_shutdown = email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
+            khive_runtime::track_named_background_task("email_channel_poll", async move {
+                if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
+                    tracing::error!(target: "khive_mcp::serve",
+                        error = %error,
+                        "email polling disabled: quarantine storage readiness check failed"
+                    );
+                    return;
                 }
-                if admission.outbound_delivery {
-                    match runtime_outbox {
-                        Some(rt) => {
-                            crate::components::start_channel_component(
-                                "email-outbound",
-                                server,
-                                move |ctx| {
-                                    Box::pin(channel_outbox_loop(
-                                        email_ch_clone.clone(),
-                                        rt.clone(),
-                                        ingest_ns_outbox.clone(),
-                                        mailbox_clone.clone(),
-                                        ctx,
-                                    ))
-                                },
-                            );
-                            tracing::info!(target: "khive_mcp::serve", "email channel outbox loop started");
-                        }
-                        None => {
-                            tracing::error!(target: "khive_mcp::serve",
-                                "email outbox loop was NOT started: server has no comm-routed \
-                                 runtime handle, which the loop needs to scan, claim, and mark \
-                                 outbound notes; outbound mail will not be sent"
-                            );
-                        }
-                    }
-                }
+                channel_poll_loop(
+                    ch_registry,
+                    verb_reg_poll,
+                    ingest_ns_clone,
+                    default_actor_clone,
+                    poll_shutdown,
+                )
+                .await;
             });
-            if !spawned {
-                tracing::error!(target: "khive_mcp::serve",
-                    namespace = %ingest_ns,
-                    "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
-                );
+            tracing::info!(target: "khive_mcp::serve", "email channel polling loop started");
+        }
+        if admission.outbound_delivery {
+            match runtime_outbox {
+                Some(rt) => {
+                    crate::components::start_channel_component(
+                        "email-outbound",
+                        server,
+                        move |ctx| {
+                            Box::pin(channel_outbox_loop(
+                                email_ch_clone.clone(),
+                                rt.clone(),
+                                ingest_ns_outbox.clone(),
+                                mailbox_clone.clone(),
+                                ctx,
+                            ))
+                        },
+                    );
+                    tracing::info!(target: "khive_mcp::serve", "email channel outbox loop started");
+                }
+                None => {
+                    tracing::error!(target: "khive_mcp::serve",
+                        "email outbox loop was NOT started: server has no comm-routed \
+                         runtime handle, which the loop needs to scan, claim, and mark \
+                         outbound notes; outbound mail will not be sent"
+                    );
+                }
             }
         }
-        Err(e) => {
-            tracing::warn!(target: "khive_mcp::serve",
-                "channel-email feature is enabled but configuration is incomplete: {e}; \
-                 email polling is disabled"
-            );
-        }
+    });
+    if !spawned {
+        tracing::error!(target: "khive_mcp::serve",
+            namespace = %ingest_ns,
+            "email channel loops NOT started: ingest namespace authorization failed (fail-closed)"
+        );
     }
 }
 
@@ -496,6 +558,13 @@ fn quarantine_row_params(
     if let Some(polls) = failed_polls {
         metadata["quarantine_failed_polls"] = json!(polls.to_string());
     }
+    if let Some(delivery) = envelope.inbound_delivery.as_ref() {
+        metadata["origin"] = json!("external");
+        metadata["trust"] = json!("untrusted");
+        metadata["labels"] = json!(delivery.labels);
+        metadata["screening_body_withheld"] = json!(false);
+    }
+
     let content = match original {
         QuarantineOriginal::Stored(content_ref) => {
             metadata["quarantine_content_ref"] = json!(content_ref);

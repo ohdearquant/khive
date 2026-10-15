@@ -420,7 +420,11 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
 /// considered (position is the sole discriminator when no authserv-id
 /// exists); it is trusted only if it parses AND is itself in the
 /// no-authserv-id form -- any authserv-id on it, or a parse failure, fails
-/// closed to `None` rather than falling through to a lower header. See
+/// closed to `None` rather than falling through to a lower header.
+/// `TrustAnchor::TopmostWithAuthservId` (ADR-056 Amendment 2026-10-15): the
+/// same positional rule, except that the topmost header may also carry the
+/// configured `authserv-id`; any other id on it, or a parse failure, fails
+/// closed the same way. See
 /// crates/khive-channel-email/docs/api/auth-results.md#select_trusted for
 /// the topmost-wins rationale and its receiving-MTA precondition.
 pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Option<AuthResults> {
@@ -440,6 +444,14 @@ pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Op
                 Some(topmost)
             } else {
                 None
+            }
+        }
+        TrustAnchor::TopmostWithAuthservId(configured_id) => {
+            let topmost = parse_header(raw_headers.first()?)?;
+            match topmost.authserv_id.as_deref() {
+                None => Some(topmost),
+                Some(id) if id.eq_ignore_ascii_case(configured_id) => Some(topmost),
+                Some(_) => None,
             }
         }
     }
@@ -744,6 +756,73 @@ mod tests {
             !selected.dmarc_pass(),
             "the topmost (failing) no-id header must win over a forged passing header below it"
         );
+    }
+
+    // --- Topmost trust with a shared authserv-id (ADR-056 Amendment 2026-10-15) ---
+
+    /// The plain `Authentication-Results` value Exchange Online stamps on mail
+    /// delivered to a Microsoft 365 mailbox from an external sender, with the
+    /// `mx.microsoft.com` authserv-id and the RFC 8601 version token. Shape
+    /// from a delivered message; the envelope address and domains are
+    /// replaced with example values.
+    const EXO_AUTHSERV_ID_FIXTURE_HEADER_VALUE: &str = "mx.microsoft.com 1; spf=pass (sender IP is 192.0.2.10) smtp.mailfrom=send.example.com; dkim=pass (signature was verified) header.d=example.com;dkim=pass (signature was verified) header.d=amazonses.com;dmarc=pass action=none header.from=example.com;compauth=pass reason=100";
+
+    fn shared_id_anchor() -> TrustAnchor {
+        TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string())
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_picks_the_stamped_topmost() {
+        let headers = vec![EXO_AUTHSERV_ID_FIXTURE_HEADER_VALUE.to_string()];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert_eq!(selected.authserv_id.as_deref(), Some("mx.microsoft.com"));
+        assert!(selected.dmarc_pass_aligned("example.com"));
+        assert!(selected.dkim_pass_aligned("example.com"));
+        // The same header is refused by the no-authserv-id mode.
+        assert!(select_trusted(&headers, &TrustAnchor::TopmostNoAuthservId).is_none());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_matches_the_id_case_insensitively() {
+        let headers = vec!["MX.Microsoft.COM 1; dmarc=pass header.from=example.com".to_string()];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_some());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_still_accepts_an_unstamped_topmost() {
+        let headers = vec![EXO_FIXTURE_HEADER_VALUE.to_string()];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert!(selected.authserv_id.is_none());
+        assert!(selected.dmarc_pass_aligned("gmail.com"));
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_refuses_another_id_at_the_top() {
+        // A different id at the top fails closed even when a lower header
+        // carries the configured id: position, not the id, picks the header.
+        let headers = vec![
+            "mx.example.net; dmarc=pass header.from=example.com".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_none());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_never_falls_through_below_the_topmost() {
+        // The boundary's own failing stamp is topmost; a forged passing header
+        // with the same shared id sits below it and must not be selected.
+        let headers = vec![
+            "mx.microsoft.com 1; spf=fail smtp.mailfrom=evil.example; dmarc=fail action=quarantine header.from=example.com".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert!(!selected.dmarc_pass());
+        // An unparseable topmost fails closed instead of reaching the lower header.
+        let headers = vec![
+            "   ".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_none());
     }
 
     #[test]

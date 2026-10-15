@@ -740,6 +740,38 @@ note's own UUID becomes the canonical root per ADR-040.
 back to the sending actor), (2) caller-supplied `default_inbound_actor` (fresh
 email landing actor), (3) `p.to.trim()` (back-compat: raw recipient address).
 
+External email uses the shared verified outbound-owner lookup in
+`handlers/ingest/correlation.rs`, trying `X-Khive-Thread-ID`, `In-Reply-To`, then
+each `References` token in document order. A completed lookup supplies the
+selected actor/thread through nonserialized channel context and does not run a
+second correlation lookup at ingest. If the host lookup fails, the ordered
+candidates remain attached to that selected transport message; ingest repeats
+the same lookup so typed storage errors reach the existing per-message hold
+ledger. Otherwise the first configured recipient alias wins, then the required
+external inbound actor. Startup validates this configuration before either host
+entrypoint starts its daemon callback, including clients that do not own polling.
+
+For external mail, the callers that run this lookup (the
+`pending_owner_candidates` ingest path and the email host's `lookup_thread_owner`)
+require proof on the thread-UUID pass. A sender-asserted `X-Khive-Thread-ID` that
+names a thread (rather than a Message-ID) selects that thread only when one of the
+thread's outbound notes is an email message whose Message-ID verifies against the
+configured mailbox domains, the same proof the Message-ID pass applies. The pass
+pages through the thread's outbound notes instead of taking the first row, so a
+copied Message-ID or a non-email row that sorts first cannot mask the verified
+owner. A UUID naming any other thread yields no owner, and the route falls through
+to the recipient aliases and then the external inbound actor. Maintainer mail uses
+the `correlation_external_id` path, which keeps the transport-level resolution and
+does not require an email Message-ID.
+
+An authenticated delivered opt-out, or one on a quarantine whose
+`quarantine_reason` is `screened` (addressed from its `quarantine_claimed_from`),
+commits an `outbound/address/reply_stop` suppression before duplicate
+acknowledgement or message creation. Both require the `opt_out.unsubscribe`
+label; ingest refuses a claimed opt-out on any other quarantine reason. It uses the
+same unique insert as mailto and operator entries. A failed insert leaves the
+message unacknowledged; an identical retry adds no second entry.
+
 Deduplication: when `external_id` is supplied, the trusted ingest insert uses a
 verify-after-insert check on the durable unique index over the external ID
 and exact `(channel_kind, channel_slug)` provenance. Missing channel fields
@@ -800,6 +832,26 @@ generic `create(kind="message", properties=...)` and `update` mutations refuse
 caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
 `comm.ingest` subhandler remains their only supported writer; ordinary custom
 message metadata is unaffected.
+
+Delivered external email carries `origin: "external"`, `trust: "untrusted"`, and
+a JSON array of screening rule IDs. Inbox and thread reads retain these in
+properties; their projections and successful `comm.read` body results also
+expose `origin`, `trust`, and `labels`. Withheld content is a rule-ID placeholder.
+Its original RFC5322 bytes are published as a blob and atomically owned by a
+`quarantine-original` attachment on the delivered message, with no quarantine
+disposition or quarantine expiry. The delivered message carries no
+`quarantine_content_ref` or other blob reference in its properties; the attachment
+alone owns the original. Retries require matching channel identity and an owner
+attachment holding the replayed bytes; they never repair or extend a delivered note.
+Unsupported secondary-backend atomic custody refuses withheld delivery rather than
+dropping its original. Ordinary read surfaces and inbox notices contain no original
+body and no reference. The message's recipient actor and the maintainer read the
+original through `comm.withheld_body`, which audits every call.
+
+Failed withheld publication follows ADR-056's 2026-10-14 Decisions 1–3: the
+existing 60-retryable/5-other per-message bounds terminate in true quarantine,
+preserving screening labels and disclosing when the original could not be kept.
+Only failure to write that terminal quarantine continues to hold progress.
 
 When a quarantined inbound message carries `quarantine_content_ref`, ingest
 commits a `quarantine-original` note attachment with that same reference in the
@@ -878,6 +930,21 @@ above); the transport still holds the original message. Refusing the ingest
 instead would hold the channel's progress on that message for every later poll.
 A replay of the same message resolves to the stored record and writes no owner
 row either.
+
+The `comm.ingest` receipt discloses the retention outcome for every NEW
+quarantine record (the `deduplicated=false` path): `quarantine_original_retained`
+is a JSON boolean read from the attachment actually persisted after the
+`secondary-backend` drop, so a drop inside `comm.ingest` reads like any other
+loss. When it is `false` the receipt also carries
+`quarantine_original_not_retained_reason` with the record's own stored reason
+(for example `retention-limit`, `original-unavailable`, `original-store-failed`,
+`quarantine-write-failed` or `secondary-backend`). A retained original and a
+lost one are otherwise indistinguishable from the response alone. A
+non-quarantine message carries neither key, and a deduplicated acknowledgement
+(`deduplicated=true`) carries neither, because it wrote no new record.
+Integrity note: a quarantined record with neither an attachment nor a stored
+reason is reported as `quarantine_original_retained: false` with no reason key;
+the reason is never invented.
 
 ## Message-ID / References header helpers (#403)
 

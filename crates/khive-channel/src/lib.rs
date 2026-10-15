@@ -48,6 +48,21 @@ impl std::fmt::Debug for QuarantineReplay {
     }
 }
 
+/// Verified per-message routing and deterministic screening results for inbound delivery.
+/// Raw transport bytes remain exclusively in [`QuarantineReplay`].
+#[derive(Debug, Clone)]
+pub struct InboundChannelDelivery {
+    pub actor: String,
+    pub thread_id: Option<Uuid>,
+    pub labels: Vec<String>,
+    pub body_withheld: bool,
+    /// Commit the authenticated opt-out at ingest, before any cursor acknowledgement.
+    pub reply_opt_out: bool,
+    /// A failed host lookup is retried at ingest, where typed failures retain
+    /// the selected message's bounded hold identity. Absent after a completed lookup.
+    pub pending_owner_candidates: Option<Vec<String>>,
+}
+
 /// A message envelope passed between the channel transport and the runtime.
 ///
 /// Outbound envelopes are produced by the runtime and delivered by a `Channel`.
@@ -85,6 +100,9 @@ pub struct ChannelEnvelope {
     /// Non-serialized replay context for a message that may need quarantine.
     #[serde(skip)]
     pub quarantine_replay: Option<QuarantineReplay>,
+    /// Host-verified routing, never accepted from serialized transport metadata.
+    #[serde(skip)]
+    pub inbound_delivery: Option<InboundChannelDelivery>,
     /// RFC 822 Message-ID to set on the outbound email (including angle brackets,
     /// e.g. `<uuid@domain>`). `None` on inbound envelopes and when the transport
     /// should auto-generate the identifier.
@@ -130,6 +148,7 @@ impl ChannelEnvelope {
             correlation_external_id: None,
             metadata: HashMap::new(),
             quarantine_replay: None,
+            inbound_delivery: None,
             message_id: None,
             wire_message_id: None,
             wire_references: None,

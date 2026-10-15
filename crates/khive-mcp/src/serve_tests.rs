@@ -9418,7 +9418,9 @@ mod spawn_email_channel_loops_tests {
                 )),
             }));
         });
-        spawn_email_channel_loops(&server, admission);
+        if let Some(prepared) = prepare_email_channel_loops(&server, true).unwrap() {
+            spawn_email_channel_loops(&server, admission, prepared);
+        }
         EMAIL_POLL_TEST_CHANNEL.with(|slot| {
             assert!(
                 slot.borrow_mut().take().is_none(),
@@ -9504,7 +9506,9 @@ mod spawn_email_channel_loops_tests {
 
         // Must not panic: EmailChannel::from_env() fails closed on the missing
         // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
-        spawn_email_channel_loops(&server, server.channel_loop_admission());
+        if let Some(prepared) = prepare_email_channel_loops(&server, true).unwrap() {
+            spawn_email_channel_loops(&server, server.channel_loop_admission(), prepared);
+        }
     }
 
     /// Regression for #602: `spawn_email_channel_loops_if_daemon` is the
@@ -9680,7 +9684,7 @@ mod spawn_email_channel_loops_tests {
         // Daemon role: the wrapper must take the spawn branch (still fails
         // closed on missing KHIVE_EMAIL_* — no network I/O — but must not
         // panic reaching it).
-        spawn_email_channel_loops_if_daemon(&server, &args);
+        spawn_email_channel_loops_if_daemon(&server, &args, None);
     }
 
     #[tokio::test]
@@ -9703,7 +9707,7 @@ mod spawn_email_channel_loops_tests {
 
         // Client role: the wrapper must take the skip branch and never
         // attempt to construct an EmailChannel at all.
-        spawn_email_channel_loops_if_daemon(&server, &args);
+        spawn_email_channel_loops_if_daemon(&server, &args, None);
     }
 }
 

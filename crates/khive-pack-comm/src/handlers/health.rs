@@ -67,6 +67,26 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count:
             .get("last_quarantined_after_hold_at")
             .cloned()
             .unwrap_or(Value::Null),
+        // Null on rows from a writer that does not report notice delivery.
+        "originals_not_retained": props.get("originals_not_retained").cloned().unwrap_or(Value::Null),
+        "last_original_not_retained_at": props
+            .get("last_original_not_retained_at")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "last_original_not_retained_reason": props
+            .get("last_original_not_retained_reason")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "original_retention_state": props
+            .get("original_retention_state")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "notices_failed": props.get("notices_failed").cloned().unwrap_or(Value::Null),
+        "last_notice_failed_at": props
+            .get("last_notice_failed_at")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "notice_config_error": props.get("notice_config_error").cloned().unwrap_or(Value::Null),
         "quarantined_count": quarantined_count,
     })
 }
@@ -157,6 +177,13 @@ fn quarantine_only_channel_to_json(
         "held_messages": Value::Null,
         "last_held_at": Value::Null,
         "last_quarantined_after_hold_at": Value::Null,
+        "originals_not_retained": Value::Null,
+        "last_original_not_retained_at": Value::Null,
+        "last_original_not_retained_reason": Value::Null,
+        "original_retention_state": Value::Null,
+        "notices_failed": Value::Null,
+        "last_notice_failed_at": Value::Null,
+        "notice_config_error": Value::Null,
         "quarantined_count": quarantined_count,
     })
 }
