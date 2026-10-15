@@ -599,7 +599,7 @@ async fn find_projects<T>(
 // `created_at`, id tie-break) and the condition surfaced as a report warning,
 // never an arbitrary or silent pick (ADR-088 Amendment 2).
 const PROJECTS_BY_SLUG: ProjectQuery<Uuid> = ProjectQuery {
-    select: EntityRows::ProjectsBySlug,
+    select: |value| EntityRows::ProjectsBySlug(value),
     decode: |row| row.uuid("id").ok(),
 };
 
@@ -613,7 +613,7 @@ const PROJECTS_BY_SLUG: ProjectQuery<Uuid> = ProjectQuery {
 /// normalized URL evidence below. Raw equality alone never overwrites an
 /// already-derived identity.
 const PROJECTS_BY_LEGACY_REPO_URL: ProjectQuery<Uuid> = ProjectQuery {
-    select: EntityRows::ProjectsByLegacyRepoUrl,
+    select: |value| EntityRows::ProjectsByLegacyRepoUrl(value),
     decode: |row| row.uuid("id").ok(),
 };
 
@@ -623,7 +623,7 @@ const PROJECTS_BY_LEGACY_REPO_URL: ProjectQuery<Uuid> = ProjectQuery {
 /// higher-precedence step-1 lookup. SQL ordering makes candidate selection
 /// deterministic before the async normalization pass (#1708).
 const PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String)> = ProjectQuery {
-    select: EntityRows::ProjectsWithoutCanonicalSlug,
+    select: |value| EntityRows::ProjectsWithoutCanonicalSlug(value),
     decode: |row| {
         let id = row.uuid("id").ok()?;
         let url = row.text_or_none("repo_url")?.to_owned();
@@ -638,7 +638,7 @@ const PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String)> = ProjectQue
 /// present-but-noncanonical slugs remain URL-reconciliation candidates.
 const SOFT_DELETED_PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String, i64)> =
     ProjectQuery {
-        select: EntityRows::SoftDeletedProjectsWithoutCanonicalSlug,
+        select: |value| EntityRows::SoftDeletedProjectsWithoutCanonicalSlug(value),
         decode: |row| {
             let id = row.uuid("id").ok()?;
             let deleted_at = row.i64_or_none("deleted_at").unwrap_or(0);
