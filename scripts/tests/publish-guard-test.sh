@@ -113,5 +113,73 @@ if [[ ! -f "$SEMVER_HELPER" ]] ||
 fi
 echo "PASS"
 
+echo "--- case 7: NO_VERIFY knob defaults to verify and refuses unknown values ---"
+for value in "" 0; do
+    mode=$(publish_verify_mode "$value")
+    if [[ "$mode" != verify ]]; then
+        echo "FAIL: NO_VERIFY='$value' must resolve to verify, got '$mode'" >&2
+        exit 1
+    fi
+done
+mode=$(unset NO_VERIFY; publish_verify_mode "${NO_VERIFY-}")
+if [[ "$mode" != verify ]]; then
+    echo "FAIL: an unset NO_VERIFY must resolve to verify, got '$mode'" >&2
+    exit 1
+fi
+mode=$(publish_verify_mode 1)
+if [[ "$mode" != no-verify ]]; then
+    echo "FAIL: NO_VERIFY=1 must resolve to no-verify, got '$mode'" >&2
+    exit 1
+fi
+for value in true yes 2 " 1" "1 "; do
+    if publish_verify_mode "$value" >/dev/null 2>"$STDERR_CAPTURE"; then
+        echo "FAIL: NO_VERIFY='$value' must be refused" >&2
+        exit 1
+    fi
+    if ! grep -q "NO_VERIFY must be unset, 0 or 1" "$STDERR_CAPTURE"; then
+        echo "FAIL: refusal of NO_VERIFY='$value' must name the accepted values" >&2
+        exit 1
+    fi
+done
+if [[ "$(grep -c -- '--no-verify' "$PUBLISH_SCRIPT" | tr -d ' ')" -lt 1 ]] ||
+    [[ "$(grep -c -- 'cargo publish -p "\$crate" --no-verify' "$PUBLISH_SCRIPT" | tr -d ' ')" != 1 ]] ||
+    ! grep -B1 -- 'cargo publish -p "\$crate" --no-verify' "$PUBLISH_SCRIPT" | grep -q 'VERIFY_MODE" == no-verify'; then
+    echo "FAIL: publish.sh must pass --no-verify only on the branch selected by NO_VERIFY=1" >&2
+    exit 1
+fi
+echo "PASS"
+
+echo "--- case 8: the SemVer gate is skipped only for a clean checkout of the named commit ---"
+HEAD40=0123456789abcdef0123456789abcdef01234567
+OTHER40=89abcdef0123456789abcdef0123456789abcdef
+expect_gate() {
+    local want="$1" got
+    shift
+    got=$(semver_gate_mode "$@")
+    if [[ "$got" != "$want" ]]; then
+        echo "FAIL: semver_gate_mode $* must print $want, got '$got'" >&2
+        exit 1
+    fi
+}
+expect_gate skip "$HEAD40" "$HEAD40" clean
+expect_gate run "$OTHER40" "$HEAD40" clean
+expect_gate run "" "$HEAD40" clean
+expect_gate run "$HEAD40" "$HEAD40" dirty
+expect_gate run "${HEAD40:0:12}" "${HEAD40:0:12}" clean
+expect_gate run "$(tr 'a-f' 'A-F' <<<"$HEAD40")" "$(tr 'a-f' 'A-F' <<<"$HEAD40")" clean
+expect_gate run "$HEAD40" "" clean
+mode=$(unset KHIVE_PUBLISH_SEMVER_CHECKED_AT; semver_gate_mode "${KHIVE_PUBLISH_SEMVER_CHECKED_AT-}" "$HEAD40" clean)
+if [[ "$mode" != run ]]; then
+    echo "FAIL: an unset KHIVE_PUBLISH_SEMVER_CHECKED_AT must run the gate, got '$mode'" >&2
+    exit 1
+fi
+if ! grep -q 'semver_gate_mode "${KHIVE_PUBLISH_SEMVER_CHECKED_AT-}" "$PUBLISH_HEAD" "$PUBLISH_TREE"' "$PUBLISH_SCRIPT" ||
+    [[ "$(grep -c 'cargo semver-checks check-release' "$PUBLISH_SCRIPT" | tr -d ' ')" != 1 ]] ||
+    ! awk '/SEMVER_GATE_MODE" == skip/ {s=1} s && /^else$/ {e=1} e && /cargo semver-checks check-release/ {f=1} END {exit !f}' "$PUBLISH_SCRIPT"; then
+    echo "FAIL: publish.sh must run cargo semver-checks only on the branch semver_gate_mode does not skip" >&2
+    exit 1
+fi
+echo "PASS"
+
 echo ""
 echo "=== publish-guard-test: all cases passed ==="

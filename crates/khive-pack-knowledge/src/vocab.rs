@@ -1,4 +1,4 @@
-//! Static handler descriptor table for the knowledge pack (20 verbs + 1 subhandler).
+//! Static handler descriptor table for the knowledge pack (21 verbs + 1 subhandler).
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
@@ -12,7 +12,7 @@ pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
     khive_runtime::sql!("knowledge_eval_runs_ns_run_at_index"),
 ];
 
-pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 21] = [
+pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -715,6 +715,29 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 21] = [
                 param_type: "integer",
                 required: false,
                 description: "Max results; defaults to 20, capped at 100",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "knowledge.lint",
+        description: "Inspect the caller-visible graph with thirteen built-in hygiene rules and complete pre-fix statistics. fix=true requests three guarded repair families with per-action committed/conflict/unsupported receipts; partial failures retain confirmed effects and typed settlement evidence. Corpus atoms and sections are separate from graph records. Classified Write, including inspection and stats-only.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "rules", param_type: "array of string", required: false,
+                description: "Omit for all thirteen built-ins, or a nonempty array of exact IDs: orphan-entity, dangling-edge, min-edge-density, direction-violation, missing-entity-type, missing-introduced-by, missing-implements, duplicate-name, superseded-not-marked, concept-no-parent, paper-missing-metadata, low-weight-edge, note-no-annotates. Repeated IDs run once. Sole stats-only returns exactly {stats} and cannot combine with fix=true. Nulls and unknown IDs refuse.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "fix", param_type: "boolean", required: false,
+                description: "Default false. True prepares every reported fix candidate before any mutation, then checks each observed revision/witness in its owning database. Ordinary create/update/delete gates still apply. Adds fixes and summary.fixed (confirmed commits only); never automatically merges duplicate entities. Wrong types and null refuse.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "severity", param_type: "string", required: false,
+                description: "Exact error | warn | info, default warn. Minimum reported severity; statistics always cover the full visible observation before fixes. Does not change rule severity. Invalid spellings, wrong types and null refuse.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

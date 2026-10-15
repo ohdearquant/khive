@@ -409,6 +409,35 @@ Every channel poller must supply both `Channel::kind()` and `Channel::slug()`;
 kind alone cannot distinguish two accounts using the same adapter. Duplicate
 `external_id` values are ignored, making re-delivery idempotent.
 
+#### Inbound disposition order
+
+Each polled message is disposed in a fixed order (ADR-200 §7). Steps that keep
+the behaviour described above are unchanged:
+
+1. A message that is malformed or over the byte cap is quarantined.
+2. A subject carrying a verified mailto unsubscribe token is a machine record,
+   not mail: the token's recipient key is added to the suppression list
+   (`source = mailto_token`) and the message is neither delivered to an actor
+   nor quarantined. The poll cursor advancing past its UID is how the poller
+   marks it processed, so it is not polled again. A second copy of the same
+   unsubscribe neither fails nor duplicates. This runs before domain
+   authentication, because the token is the authority.
+3. Domain authentication failing is quarantined as before.
+4. A `From:` that is the maintainer is attributed and routed as before.
+5. With `KHIVE_EMAIL_EXTERNAL_SENDERS` unset, any other authenticated sender is
+   quarantined `off-allowlist` — exactly today's behaviour.
+6. With external senders configured, an `inbound` suppression entry matching
+   the authenticated sender's address or its exact domain (no subdomain match)
+   is quarantined `blocked`.
+7. Otherwise the outcome is unchanged for now: external delivery and screening
+   are later steps of the same series, so this case keeps the `off-allowlist`
+   quarantine.
+
+The `inbound` suppression entries are read from the same comm store the
+`comm.suppression_add` / `comm.suppression_list` / `comm.suppression_remove`
+verbs write, so an operator or the channel itself can add one without a
+restart.
+
 ### Configuration
 
 `EmailChannelConfig::from_env` reads configuration exclusively from
@@ -426,8 +455,10 @@ Required:
 - `KHIVE_EMAIL_AUTHSERV_ID` (the trust anchor for validating inbound
   `Authentication-Results` headers; the reserved value
   `!topmost-no-authserv-id` selects trust of the topmost header when the
-  receiving boundary emits no `authserv-id` at all, as with Exchange Online's
-  internal-hop stamp)
+  receiving boundary emits no `authserv-id` at all; `!topmost:<authserv-id>`
+  also trusts only the topmost header, accepting either no `authserv-id` or the
+  given one, for a boundary such as Exchange Online that stamps
+  `mx.microsoft.com` on its own header for some senders and nothing for others)
 
 Auth mode (choose one):
 

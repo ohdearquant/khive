@@ -1,6 +1,6 @@
 # ADR-140: Add a bounded graph payload to context responses
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 
 ## Context
@@ -15,7 +15,7 @@ ADR-089 already bounds expansion by `hops` and a per-node neighbor cap (`fanout`
 
 ## Decision
 
-Upon acceptance, this ADR amends ADR-089 so that the `context` response adds a top-level `edges` array — a sibling of `anchors`, `truncated`, and `dropped` — containing the graph relationships selected for the returned context. (Source: [ADR-089](ADR-089-context-verb.md), §Response shape.)
+This ADR amends ADR-089 so that the `context` response adds a top-level `edges` array — a sibling of `anchors`, `truncated`, and `dropped` — containing the graph relationships selected for the returned context. (Source: [ADR-089](ADR-089-context-verb.md), §Response shape.)
 
 ### Edge-row schema
 
@@ -103,7 +103,7 @@ Every `edges` row is the edge that discovered the corresponding neighbor record 
 
 Emission is atomic per discovered node: the budget walk appends a neighbor record and its corresponding `edges` row together, as one unit, in that walk position. A neighbor is never emitted without its edge, and an edge is never emitted without its neighbor. Consequently `dropped.edges` is defined to equal `dropped.neighbors` under this rule — both count the same set of budget-cut discovery steps — and a client can rely on the two counts staying equal without reconciling them independently.
 
-Upon acceptance, the concrete two-pass rule below replaces ADR-089 §Semantics item 5's generic global-stop prose. That prose is not used as authority for a different assembly order; ADR-089 remains Accepted and unchanged while this ADR is Proposed.
+The concrete two-pass rule below replaces ADR-089 §Semantics item 5's generic global-stop prose, and ADR-089 item 5 points here. That prose is not used as authority for a different assembly order.
 
 1. First admit the longest fitting prefix of anchor entity records in selection order. If the next anchor does not fit, stop this pass; do not substitute a later anchor.
 2. For each admitted anchor in that order, admit the longest fitting prefix of its neighbor/edge pairs. If its next pair does not fit, stop only that anchor's neighbor pass and continue with the next admitted anchor. Do not skip an oversized pair to admit a later pair under the same anchor.
@@ -114,7 +114,7 @@ The existing effective-budget bounds, clamp indicator, anchor priority, fanout l
 
 ## Acceptance and implementation gate
 
-This ADR remains **Proposed**. The endpoint-record/null-name decisions, pair costing, and explicit replacement of ADR-089's generic budget prose require architecture acceptance before dependent implementation merges. A source-prepared implementation may reference issue #4970 for review; preparation does not accept this ADR or establish issue closure.
+This ADR is **Accepted**. The endpoint-record/null-name decisions, pair costing, and the replacement of ADR-089's generic budget prose are in force, and the `context` handler implements them (issue #4970).
 
 ## Consequences
 
