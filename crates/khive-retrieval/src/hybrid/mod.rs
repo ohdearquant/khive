@@ -7,6 +7,8 @@ mod config;
 #[cfg(feature = "native-rerank")]
 mod cross_encoder;
 pub mod dual_index;
+#[cfg(feature = "executor")]
+pub mod executor;
 mod identity;
 mod labelled;
 mod labelled_scored;

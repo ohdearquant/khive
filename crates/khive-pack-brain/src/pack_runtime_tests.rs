@@ -181,6 +181,18 @@ impl khive_runtime::ContextContributor for ContextProbe {
     }
 }
 
+static PROBE_PROPERTY_POLICIES: [khive_types::NotePropertyPolicySpec; 2] = [
+    khive_types::NotePropertyPolicySpec {
+        kind: "probe-note",
+        key: "derived",
+        policy: khive_types::PropertyPolicy::Derived,
+    },
+    khive_types::NotePropertyPolicySpec {
+        kind: "probe-note",
+        key: "owner",
+        policy: khive_types::PropertyPolicy::OwnerOnly,
+    },
+];
 macro_rules! metadata_probes {
     ($($name:ident -> $ty:ty = $value:expr;)*) => {
         $(fn $name(&self) -> $ty { self.hit(stringify!($name)); $value })*
@@ -203,6 +215,7 @@ impl PackRuntime for Probe<'_> {
         entity_types -> &'static [khive_types::EntityTypeDef] = &[];
         requires -> &'static [&'static str] = &["probe-required"];
         note_kind_specs -> &'static [khive_runtime::NoteKindSpec] = &[];
+        note_property_policies -> &'static [khive_types::NotePropertyPolicySpec] = &PROBE_PROPERTY_POLICIES;
         note_embedding_policies -> &'static [khive_types::NoteEmbeddingPolicySpec] = &[];
         schema_column_additions -> &'static [khive_types::PackColumnAddition] = &[];
         validation_rules -> &'static [khive_runtime::ValidationRule] = &[];
@@ -423,6 +436,9 @@ async fn forwards_every_runtime_method_to_the_same_inner_instance() {
     assert!(called!(entity_types, wrapper.entity_types()).is_empty());
     assert_eq!(called!(requires, wrapper.requires()), &["probe-required"]);
     assert!(called!(note_kind_specs, wrapper.note_kind_specs()).is_empty());
+    let policies = called!(note_property_policies, wrapper.note_property_policies());
+    assert_eq!(policies, &PROBE_PROPERTY_POLICIES);
+    assert!(std::ptr::eq(policies, &PROBE_PROPERTY_POLICIES[..]));
     assert!(called!(note_embedding_policies, wrapper.note_embedding_policies()).is_empty());
     assert!(called!(kind_hook, wrapper.kind_hook("probe-kind")).is_none());
     let capability = called!(context_contributor, wrapper.context_contributor())

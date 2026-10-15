@@ -89,6 +89,8 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
 /// reintroducing one of them: a category-only census would stay green if
 /// any name were re-added to the allowlist.
 const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
+    "comm.suppression_list",
+    "comm.withheld_body",
     "db_diagnostics",
     "git.checkout",
     "git.diff",
@@ -1730,6 +1732,74 @@ fn all_handlers_with_names_includes_subhandlers() {
             ("beta", "create"),
         ]
     );
+}
+
+#[test]
+fn disabled_verbs_are_hidden_only_from_public_catalogs() {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(AlphaPack);
+    builder.register(BetaPack);
+    builder.with_disabled_verbs("alpha", &["create".to_string()]);
+    let reg = builder
+        .build()
+        .expect("registry with a disabled public verb");
+
+    let verbs: Vec<_> = reg.all_verbs().iter().map(|handler| handler.name).collect();
+    assert_eq!(verbs, vec!["list", "notify"]);
+    let public: Vec<_> = reg
+        .all_verbs_with_names()
+        .iter()
+        .map(|(pack, handler)| (*pack, handler.name))
+        .collect();
+    assert_eq!(public, vec![("alpha", "list"), ("beta", "notify")]);
+    let complete: Vec<_> = reg
+        .all_handlers_with_names()
+        .iter()
+        .map(|(pack, handler)| (*pack, handler.name, handler.visibility))
+        .collect();
+    assert_eq!(
+        complete,
+        vec![
+            ("alpha", "create", Visibility::Verb),
+            ("alpha", "list", Visibility::Verb),
+            ("beta", "notify", Visibility::Verb),
+            ("beta", "create", Visibility::Subhandler),
+        ]
+    );
+}
+
+#[test]
+fn pack_metadata_lookup_is_exact_and_preserves_declared_slices() {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(AlphaPack);
+    builder.register(BetaPack);
+    builder.with_disabled_verbs("alpha", &["create".to_string()]);
+    let reg = builder.build().expect("registry with declared metadata");
+
+    // A registered pack's empty dependency list is distinct from a missing pack.
+    assert_eq!(reg.pack_requires("alpha"), Some(&[][..]));
+    assert_eq!(reg.pack_requires("beta"), Some(&[][..]));
+    assert_eq!(reg.pack_note_kinds("alpha"), Some(&["memo", "log"][..]));
+    assert_eq!(reg.pack_note_kinds("beta"), Some(&["alert"][..]));
+    assert_eq!(reg.pack_entity_kinds("alpha"), Some(&["widget"][..]));
+    assert_eq!(
+        reg.pack_entity_kinds("beta"),
+        Some(&["widget", "gadget"][..])
+    );
+    // Metadata retains disabled public handlers and internal handlers, including
+    // their description, visibility, category and parameter declarations.
+    assert_eq!(reg.pack_verbs("alpha"), Some(AlphaPack::HANDLERS));
+    assert_eq!(reg.pack_verbs("beta"), Some(BetaPack::HANDLERS));
+
+    for name in ["missing", "Alpha", "Beta"] {
+        assert!(reg.pack_requires(name).is_none(), "requires for {name}");
+        assert!(reg.pack_note_kinds(name).is_none(), "note kinds for {name}");
+        assert!(
+            reg.pack_entity_kinds(name).is_none(),
+            "entity kinds for {name}"
+        );
+        assert!(reg.pack_verbs(name).is_none(), "handlers for {name}");
+    }
 }
 
 #[test]

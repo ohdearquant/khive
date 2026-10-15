@@ -329,7 +329,7 @@ mod tests {
             );
 
             let unavailable = SqliteError::CapacityUnavailable {
-                phase: CapacityUnavailablePhase::Lock,
+                phase: CapacityUnavailablePhase::LockContended,
                 message: "lease timed out".to_string(),
             }
             .into_storage_error(capability, "write");
@@ -338,7 +338,7 @@ mod tests {
                     unavailable,
                     StorageError::CapacityUnavailable {
                         capability: StorageCapability::Sql,
-                        phase: CapacityUnavailablePhase::Lock,
+                        phase: CapacityUnavailablePhase::LockContended,
                         ..
                     }
                 ),

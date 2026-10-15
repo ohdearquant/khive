@@ -61,6 +61,18 @@ mod delta;
 #[path = "ann/final_tail.rs"]
 mod final_tail;
 use final_tail::fetch_final_tail_on;
+#[path = "ann/epoch.rs"]
+mod epoch;
+pub(crate) use epoch::{
+    bump_durable_epoch, durable_epoch, ensure_epoch_schema, maybe_check_durable_epoch,
+    MEMORY_SCHEMA_PLAN_STMTS,
+};
+#[path = "ann/scoring.rs"]
+mod scoring;
+pub(crate) use scoring::{AnnScoreRoute, FreshTailSearch};
+#[path = "ann/session_exact.rs"]
+mod session_exact;
+pub(crate) use session_exact::session_exact_candidates;
 #[cfg(test)]
 #[path = "ann/rotation_watch_test_support.rs"]
 mod rotation_watch_test_support;
@@ -124,69 +136,10 @@ pub(crate) struct AnnBridge {
     drop_probe: Option<Arc<()>>,
 }
 
-impl std::ops::Deref for AnnBridge {
-    type Target = AnnBridgeCore;
-
-    fn deref(&self) -> &AnnBridgeCore {
-        &self.core
-    }
-}
-
-impl std::ops::DerefMut for AnnBridge {
-    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
-        &mut self.core
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum AnnScoreRoute {
-    Memory,
-    NoteSearch,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FreshTailSearch<'a> {
-    query: &'a [f32],
-    k: usize,
-    route: AnnScoreRoute,
-}
-
-impl<'a> FreshTailSearch<'a> {
-    pub(crate) fn new(query: &'a [f32], k: usize, route: AnnScoreRoute) -> Self {
-        Self { query, k, route }
-    }
-}
-
-impl AnnScoreRoute {
-    fn graph_score(self, squared_l2_distance: f32) -> Result<f64, RuntimeError> {
-        match self {
-            Self::Memory => Ok(f64::from((1.0 - squared_l2_distance / 2.0).max(0.0))),
-            Self::NoteSearch => khive_score::try_cosine_score_with_f32_tolerance(
-                f64::from(squared_l2_distance) / 2.0,
-            )
-            .map(|score| score.to_f64())
-            .map_err(|error| {
-                RuntimeError::Internal(format!("note-search ANN cosine distance: {error}"))
-            }),
-        }
-    }
-
-    fn tail_score(self, query: &[f32], embedding: &[f32]) -> Result<f64, RuntimeError> {
-        let cosine = exact_cosine_unclamped(query, embedding);
-        match self {
-            Self::Memory => Ok(f64::from(cosine.max(0.0))),
-            Self::NoteSearch => {
-                khive_score::try_cosine_score_with_f32_tolerance(1.0 - f64::from(cosine))
-                    .map(|score| score.to_f64())
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!(
-                            "note-search fresh-tail cosine distance: {error}"
-                        ))
-                    })
-            }
-        }
-    }
-}
+khive_vamana::impl_ann_bridge_helpers!(
+    AnnBridge,
+    /// Stamps the build with the write generation represented by its corpus snapshot.
+);
 
 #[cfg(test)]
 #[test]
@@ -443,12 +396,6 @@ pub(crate) async fn generation_for_test(ann: &SharedAnn, key: &AnnKey) -> u64 {
     current_generation(ann, key).await
 }
 
-/// Debounce interval for the cross-process durable-epoch query.
-#[cfg(not(test))]
-const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(test)]
-const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
-
 /// Delay between chained rebuild tasks so continuous writes coalesce.
 ///
 /// One second coalesces nothing against a fleet that writes continuously: the
@@ -489,99 +436,6 @@ fn resolve_rebuild_chain_debounce(
 /// record is read on an unchanged tick; vector/graph files are reopened only
 /// after a distinct publication identity appears.
 const ROTATION_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Mark a cached graph stale when its debounced durable epoch has advanced.
-///
-/// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
-pub(crate) async fn maybe_check_durable_epoch(rt: &KhiveRuntime, ann: &SharedAnn, key: &AnnKey) {
-    {
-        let mut last = ann
-            .last_epoch_check
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = std::time::Instant::now();
-        let due = last
-            .get(key)
-            .is_none_or(|t| now.duration_since(*t) >= DURABLE_EPOCH_CHECK_INTERVAL);
-        if !due {
-            return;
-        }
-        last.insert(key.clone(), now);
-    }
-
-    let installed_baseline = ann.indexes.read().await.get(key).map(|b| b.epoch_baseline);
-    let Some(baseline) = installed_baseline else {
-        // Nothing installed yet — a genuine cache miss already routes through
-        // the normal build path, which reads the durable epoch itself.
-        return;
-    };
-    let durable = durable_epoch(rt).await;
-    if durable > baseline {
-        tracing::debug!(
-            model = %key.model,
-            baseline,
-            durable,
-            "memory ANN durable epoch advanced; marking cached entry stale"
-        );
-        bump_generation(ann, key).await;
-    }
-}
-
-/// Pack-owned DDL for the durable ANN corpus epoch table.
-pub(crate) const MEMORY_SCHEMA_PLAN_STMTS: [&str; 1] =
-    [::khive_runtime::sql!("memory_ann_epoch_create")];
-
-/// Idempotently create the durable epoch table; never called from the hot read path.
-pub(crate) async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute_script(MEMORY_SCHEMA_PLAN_STMTS[0].to_string())
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))
-}
-
-/// Read the durable corpus epoch, returning zero when unavailable or absent.
-pub(crate) async fn durable_epoch(rt: &KhiveRuntime) -> u64 {
-    let sql = rt.sql();
-    let Ok(mut reader) = sql.reader().await else {
-        return 0;
-    };
-    let Ok(rows) = reader
-        .query_all(SqlStatement {
-            sql: ::khive_runtime::sql!("memory_ann_epoch_select").into(),
-            params: vec![],
-            label: Some("memory_ann_durable_epoch_read".into()),
-        })
-        .await
-    else {
-        return 0;
-    };
-    match rows.first().and_then(|r| r.get("epoch")) {
-        Some(SqlValue::Integer(n)) if *n >= 0 => *n as u64,
-        _ => 0,
-    }
-}
-
-/// Increment and return the durable epoch after persisted snapshot invalidation.
-pub(crate) async fn bump_durable_epoch(rt: &KhiveRuntime) -> Result<u64, RuntimeError> {
-    let sql = rt.sql();
-    let mut w = sql
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute(SqlStatement {
-        sql: ::khive_runtime::sql!("memory_ann_epoch_increment").into(),
-        params: vec![],
-        label: Some("memory_ann_durable_epoch_bump".into()),
-    })
-    .await
-    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    drop(w);
-    Ok(durable_epoch(rt).await)
-}
 
 /// Return a model's warm lock without holding the lock-map mutex across warming.
 async fn model_warm_lock(ann: &SharedAnn, key: &AnnKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -672,12 +526,6 @@ impl AnnBridge {
             #[cfg(test)]
             drop_probe: None,
         })
-    }
-
-    /// Stamps the build with the write generation represented by its corpus snapshot.
-    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
-        self.generation = generation;
-        self
     }
 
     /// Stamps the build with the independently durable corpus epoch it observed.
@@ -2699,132 +2547,6 @@ pub(crate) async fn session_unmet_fences(
         }
     }
     unmet
-}
-
-/// Return exact KNN candidates only when the same SQL statement also proves
-/// the write fence. An original log row proves the un-compacted tail; this
-/// consumer's active wildcard watermark proves a published segment covered a
-/// compacted row. The exact scan and both proof alternatives share one SQLite
-/// snapshot, so a separate preflight clock cannot certify later candidates.
-/// Per-namespace KNN queries are materialized before their union is ranked,
-/// so a global top-k cannot hide candidates in another visible namespace.
-pub(crate) async fn session_exact_candidates(
-    rt: &KhiveRuntime,
-    model: &str,
-    query: &[f32],
-    visible_namespaces: &[String],
-    receipt_namespace: &str,
-    required_seq: u64,
-    k: usize,
-) -> Result<Option<Vec<(Uuid, f32)>>, String> {
-    let Ok(required_seq) = i64::try_from(required_seq) else {
-        // SQLite rowids cannot reach this otherwise well-formed future fence.
-        return Ok(None);
-    };
-    if query.is_empty() || query.iter().any(|component| !component.is_finite()) {
-        return Err("session exact query vector is empty or non-finite".into());
-    }
-
-    let table_name = format!("vec_{}", sanitize_model_key(model));
-    let query_blob = khive_storage::encode_f32_native(query);
-    let mut params = vec![
-        SqlValue::Blob(query_blob),
-        SqlValue::Integer(i64::try_from(k).unwrap_or(i64::MAX)),
-        SqlValue::Text(model.to_owned()),
-        SqlValue::Integer(required_seq),
-        SqlValue::Text(receipt_namespace.to_owned()),
-        SqlValue::Text(ANN_CONSUMER.into()),
-        SqlValue::Text(ANN_WILDCARD_NS.into()),
-    ];
-    let mut seen = HashSet::new();
-    let mut knn_ctes = Vec::new();
-    let mut union_arms = Vec::new();
-    let scopes = if k == 0 { &[][..] } else { visible_namespaces };
-    for namespace in scopes {
-        if !seen.insert(namespace.as_str()) {
-            continue;
-        }
-        let index = knn_ctes.len();
-        let parameter = params.len() + 1;
-        params.push(SqlValue::Text(namespace.clone()));
-        knn_ctes.push(format!(
-            "session_knn_{index} AS MATERIALIZED ( \
-               SELECT v.subject_id, v.namespace AS vector_namespace, distance \
-                 FROM {table_name} v \
-                WHERE embedding MATCH ?1 AND namespace = ?{parameter} \
-                  AND embedding_model = ?3 AND kind = 'note' AND field = 'note.content' \
-                ORDER BY distance LIMIT ?2)"
-        ));
-        union_arms.push(format!(
-            "SELECT subject_id, vector_namespace, distance FROM session_knn_{index}"
-        ));
-    }
-    let union = if union_arms.is_empty() {
-        "SELECT NULL AS subject_id, NULL AS vector_namespace, NULL AS distance WHERE 0".into()
-    } else {
-        union_arms.join(" UNION ALL ")
-    };
-    let knn_ctes = if knn_ctes.is_empty() {
-        String::new()
-    } else {
-        format!("{}, ", knn_ctes.join(", "))
-    };
-    let proof = session_fence_predicate(3, 4, 5, 6, 7);
-    let sql = format!(
-        "WITH session_proof AS MATERIALIZED ( \
-           SELECT ({proof}) AS has_fence), \
-         {knn_ctes}session_union AS MATERIALIZED ({union}), \
-         session_ranked AS MATERIALIZED ( \
-           SELECT c.subject_id, c.distance FROM session_union c \
-           JOIN notes n ON n.id = c.subject_id \
-             AND n.namespace = c.vector_namespace AND n.deleted_at IS NULL \
-           ORDER BY c.distance, c.subject_id LIMIT ?2) \
-         SELECT p.has_fence, r.subject_id, r.distance \
-           FROM session_proof p LEFT JOIN session_ranked r ON 1 = 1 \
-          ORDER BY r.distance, r.subject_id"
-    );
-    let mut reader = rt.sql().reader().await.map_err(|error| error.to_string())?;
-    #[cfg(test)]
-    let _ = SESSION_EXACT_STATEMENT_COUNT.try_with(|count| count.set(count.get() + 1));
-    let rows = reader
-        .query_all(SqlStatement {
-            sql,
-            params,
-            label: Some("memory_session_exact_snapshot".into()),
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let first = rows
-        .first()
-        .ok_or("session exact statement returned no proof row")?;
-    match first.get("has_fence") {
-        Some(SqlValue::Integer(0)) => return Ok(None),
-        Some(SqlValue::Integer(1)) => {}
-        other => {
-            return Err(format!(
-                "session exact proof has unexpected value {other:?}"
-            ))
-        }
-    }
-
-    let mut candidates = Vec::with_capacity(rows.len().min(k));
-    for row in rows {
-        let (id, distance) = match (row.get("subject_id"), row.get("distance")) {
-            (Some(SqlValue::Null), Some(SqlValue::Null)) => continue,
-            (Some(SqlValue::Text(id)), Some(SqlValue::Float(distance))) => (id, *distance),
-            other => {
-                return Err(format!(
-                    "session exact candidate has unexpected value {other:?}"
-                ))
-            }
-        };
-        let id = Uuid::parse_str(id).map_err(|error| format!("session exact id: {error}"))?;
-        let score = khive_score::try_cosine_score_with_f32_tolerance(distance)
-            .map_err(|_| format!("session exact cosine distance out of range: {distance}"))?
-            .to_f64() as f32;
-        candidates.push((id, score));
-    }
-    Ok(Some(candidates))
 }
 
 /// Merge a fresh-tail's coalesced final ops into an ANN candidate list

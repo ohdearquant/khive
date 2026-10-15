@@ -242,8 +242,23 @@ async fn read_only_backend_loads_weights_and_refuses_both_write_entry_points() {
     .await
     .expect("seed writable database");
     let before = snapshot(&writable).await;
-    let read_only = StorageBackend::sqlite_read_only_for_test(scratch.0.join("weights.db"))
-        .expect("open read-only backend");
+    // A read-only open refuses a WAL store whose -shm a live writer still holds,
+    // so the writer drains and closes first and the store is a frozen snapshot.
+    let writer_join = writable.pool().take_writer_task_join();
+    drop(writable);
+    if let Some(writer_join) = writer_join {
+        tokio::time::timeout(Duration::from_secs(10), writer_join)
+            .await
+            .expect("writer task must close before read-only inspection")
+            .expect("writer task joins cleanly");
+    }
+    let weights_db = scratch.0.join("weights.db");
+    assert!(
+        !weights_db.with_extension("db-shm").exists(),
+        "no writable SHM before inspection"
+    );
+    let read_only =
+        StorageBackend::sqlite_read_only_for_test(&weights_db).expect("open read-only backend");
     read_only
         .prepare_core_schema()
         .expect("validate migrated schema");
@@ -290,7 +305,8 @@ async fn read_only_backend_loads_weights_and_refuses_both_write_entry_points() {
         before_writers
     );
     assert_eq!(snapshot(&read_only).await, before);
-    assert_eq!(snapshot(&writable).await, before);
+    drop(read_only);
+    assert_eq!(snapshot(&scratch.queued_backend()).await, before);
 }
 
 #[tokio::test]

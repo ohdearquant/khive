@@ -757,6 +757,98 @@ async fn bounded_verified_get_accepts_exact_and_portable_maximum_limits() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn bounded_verified_get_accepts_exact_and_portable_maximum_limits_on_windows_long_paths() {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn root_with_utf16_len(base: &Path, length: usize) -> PathBuf {
+        let mut root = base.join(format!("資料-🚀-{length}"));
+        loop {
+            let current = root.as_os_str().encode_wide().count();
+            let remaining = length.checked_sub(current).unwrap_or_else(|| {
+                panic!("canonical temp prefix is too long for {length}-unit root: {root:?}")
+            });
+            if remaining == 0 {
+                break;
+            }
+            assert!(remaining >= 2, "no room for a path component: {root:?}");
+            // One separator plus a legal component, never leaving only the
+            // separator's unit for the next component.
+            let mut component_length = (remaining - 1).min(96);
+            if remaining - component_length - 1 == 1 {
+                component_length -= 1;
+            }
+            root.push("x".repeat(component_length));
+        }
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        root
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // canonicalize supplies the verbatim prefix needed for native long paths.
+    let base = dir.path().canonicalize().unwrap();
+    let bytes = b"bounded Unicode blob path".to_vec();
+    let retained_bytes = b"another blob must survive deletion".to_vec();
+    // The two shard components and 64-digit leaf add 71 UTF-16 units.
+    // Exercise both initial buffer boundaries, then resize the root query too.
+    for (root_length, leaf_length) in [
+        (188, 259),
+        (189, 260),
+        (190, 261),
+        (440, 511),
+        (441, 512),
+        (442, 513),
+        (513, 584),
+    ] {
+        let root = root_with_utf16_len(&base, root_length);
+        let store = FsBlobStore::new(root, 0).unwrap();
+        assert_eq!(store.root().as_os_str().encode_wide().count(), root_length);
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        let retained_ref = store.put(retained_bytes.clone()).await.unwrap();
+        let leaf = shard_path(store.root(), &content_ref);
+        assert_eq!(leaf.as_os_str().encode_wide().count(), leaf_length);
+
+        let handle =
+            open_blob_shard_file_no_follow(store.root(), &store.root_handle, &content_ref).unwrap();
+        let resolved_root = khive_fs::opened_file::opened_file_path(&store.root_handle).unwrap();
+        let resolved_leaf = khive_fs::opened_file::opened_file_path(&handle).unwrap();
+        assert_eq!(resolved_root, store.root());
+        assert_eq!(resolved_leaf, leaf);
+        assert!(!resolved_root
+            .as_os_str()
+            .encode_wide()
+            .any(|unit| unit == 0));
+        assert!(!resolved_leaf
+            .as_os_str()
+            .encode_wide()
+            .any(|unit| unit == 0));
+        // The verified read handle deliberately denies delete sharing.
+        drop(handle);
+
+        for limit in [bytes.len() as u64, MAX_BLOB_WHOLE_BYTES] {
+            assert_eq!(
+                store
+                    .get_bounded_verified(&content_ref, limit)
+                    .await
+                    .unwrap(),
+                bytes,
+                "root length {root_length}, leaf length {leaf_length}, limit {limit}"
+            );
+        }
+        assert!(store.delete(&content_ref).await.unwrap());
+        assert!(!leaf.exists());
+        assert!(!store.exists(&content_ref).await.unwrap());
+        assert_eq!(
+            store
+                .get_bounded_verified(&retained_ref, retained_bytes.len() as u64)
+                .await
+                .unwrap(),
+            retained_bytes
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn bounded_verified_get_resolves_a_configured_symlink_root_once() {

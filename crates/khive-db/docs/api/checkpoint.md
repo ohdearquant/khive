@@ -12,7 +12,16 @@ pins down each guarantee.
 
 ## Module overview (ADR-091 Planks 0/1/2)
 
-See `crates/khive-db/src/checkpoint.rs` module doc.
+See `crates/khive-db/src/checkpoint.rs` module doc. The public checkpoint API
+and process-wide metric statics remain there. Private concerns live under
+`crates/khive-db/src/checkpoint/`:
+
+- `lifecycle.rs`: session sweeps, lifecycle emission and the dedicated connection.
+- `task_loop.rs`: the periodic checkpoint and FTS maintenance loop.
+- `checkpoint_core.rs`: synchronous checkpoint and TRUNCATE decisions.
+- `backfill_queries.rs`: WAL observations and backfill queries.
+- `walpin_sidecar.rs`: heartbeat state and bounded sidecar housekeeping.
+- `walpin_attribution.rs`: awaited holder attribution and report logging.
 
 `crates/khive-db/src/checkpoint/config.rs` owns `CheckpointConfig`, its defaults,
 and the shared transaction-age environment thresholds. The public configuration
@@ -350,7 +359,7 @@ available. These values are reported as census data; they do not remove or rank 
 
 ## `run_checkpoint_task` — shutdown design history
 
-See `crates/khive-db/src/checkpoint.rs` — `run_checkpoint_task`.
+See `crates/khive-db/src/checkpoint/task_loop.rs` — `run_checkpoint_task`.
 
 An earlier version of this task used `Arc::strong_count(&pool) <= 1` as its
 exit condition instead of an explicit signal. That check is unreachable
@@ -395,7 +404,7 @@ outlive the checkpoint task.
 
 ## Private tx-registry logging helpers (Plank 0)
 
-See `crates/khive-db/src/checkpoint.rs` — `log_tx_registry_oldest_debug`,
+See `crates/khive-db/src/checkpoint/checkpoint_core.rs` — `log_tx_registry_oldest_debug`,
 `log_tx_registry_oldest_warn`, `log_tx_registry_snapshot_warn`.
 
 All three read `khive_storage::tx_registry` and are observe-only — none
@@ -410,7 +419,7 @@ below→above crossing (`warn_pages` / `high_water_pages` respectively, via
 
 ## `maybe_truncate` — TRUNCATE attempt gating (Plank 2)
 
-See `crates/khive-db/src/checkpoint.rs` — private fn `maybe_truncate`.
+See `crates/khive-db/src/checkpoint/checkpoint_core.rs` — private fn `maybe_truncate`.
 
 Runs on the same dedicated checkpoint connection the caller already holds —
 never performs its own checkout, and never touches the pool's writer mutex.

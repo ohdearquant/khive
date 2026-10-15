@@ -1,0 +1,534 @@
+use super::*;
+use crate::entity::EntityKind;
+
+fn reg() -> EntityTypeRegistry {
+    EntityTypeRegistry::builtin()
+}
+
+// ── Basic happy-path resolution ──────────────────────────────────────────
+
+#[test]
+fn research_report_resolves_in_every_stored_spelling() {
+    let r = reg();
+    for raw in ["research-report", "research_report", "Research Report"] {
+        let res = r
+            .resolve(EntityKind::Document, Some(raw))
+            .unwrap_or_else(|e| panic!("{raw} must resolve as a Document subtype: {e}"));
+        assert_eq!(res.entity_type.as_deref(), Some("research_report"), "{raw}");
+    }
+    // A Document genre, not a Concept one: the same spelling on another
+    // kind is still refused, so the registry stays kind-scoped.
+    assert!(r
+        .resolve(EntityKind::Concept, Some("research-report"))
+        .is_err());
+}
+
+#[test]
+fn resolve_paper_infers_document() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Document, Some("paper"))
+        .expect("paper is a valid Document subtype");
+    assert_eq!(res.kind, EntityKind::Document);
+    assert_eq!(res.entity_type.as_deref(), Some("paper"));
+}
+
+#[test]
+fn resolve_none_entity_type_always_ok() {
+    let r = reg();
+    for kind in EntityKind::ALL {
+        let res = r.resolve(kind, None).expect("None entity_type always ok");
+        assert_eq!(res.entity_type, None);
+    }
+}
+
+#[test]
+fn resolve_algo_alias_to_algorithm() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("algo"))
+        .expect("algo is a valid alias for algorithm");
+    assert_eq!(res.kind, EntityKind::Concept);
+    assert_eq!(res.entity_type.as_deref(), Some("algorithm"));
+}
+
+#[test]
+fn resolve_spec_alias_to_specification() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Document, Some("spec"))
+        .expect("spec is alias for specification");
+    assert_eq!(res.entity_type.as_deref(), Some("specification"));
+}
+
+// ── Rejection tests ──────────────────────────────────────────────────────
+
+#[test]
+fn reject_brain_profile_for_concept() {
+    let r = reg();
+    let err = r
+        .resolve(EntityKind::Concept, Some("brain_profile"))
+        .expect_err("brain_profile is not a Concept subtype");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("brain_profile"),
+        "error must mention the rejected type; got: {msg}"
+    );
+    assert!(
+        msg.contains("concept"),
+        "error must mention the target kind; got: {msg}"
+    );
+}
+
+#[test]
+fn reject_unknown_subtype_with_valid_list() {
+    let r = reg();
+    let err = r
+        .resolve(EntityKind::Document, Some("mystery_type"))
+        .expect_err("mystery_type must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("mystery_type"),
+        "error must echo the rejected value; got: {msg}"
+    );
+    // Valid subtypes for Document must appear.
+    assert!(
+        msg.contains("paper"),
+        "error must list valid Document subtypes; got: {msg}"
+    );
+}
+
+#[test]
+fn reject_wrong_kind_subtype_mentions_correct_kind() {
+    // "paper" belongs to Document; passing it for Concept must fail.
+    let r = reg();
+    let err = r
+        .resolve(EntityKind::Concept, Some("paper"))
+        .expect_err("paper is a Document subtype, not Concept");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("document") || msg.contains("Document"),
+        "error must name the correct kind; got: {msg}"
+    );
+}
+
+// ── Extensibility ────────────────────────────────────────────────────────
+
+#[test]
+fn register_brain_profile_for_concept() {
+    let mut r = EntityTypeRegistry::builtin();
+    r.register(EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "brain_profile",
+        aliases: &[],
+    });
+    let res = r
+        .resolve(EntityKind::Concept, Some("brain_profile"))
+        .expect("brain_profile registered for Concept");
+    assert_eq!(res.entity_type.as_deref(), Some("brain_profile"));
+}
+
+#[test]
+fn with_extra_adds_subtypes() {
+    // Use a pack-specific subtype that is NOT in BUILTIN_DEFS.
+    let r = EntityTypeRegistry::with_extra([EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "grpc_service",
+        aliases: &["grpc"],
+    }]);
+    let res = r
+        .resolve(EntityKind::Service, Some("grpc"))
+        .expect("grpc alias for grpc_service");
+    assert_eq!(res.entity_type.as_deref(), Some("grpc_service"));
+}
+
+#[test]
+fn service_api_is_builtin() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Service, Some("api"))
+        .expect("api is a built-in Service subtype");
+    assert_eq!(res.entity_type.as_deref(), Some("api"));
+    let res2 = r
+        .resolve(EntityKind::Service, Some("endpoint"))
+        .expect("endpoint is an alias for api");
+    assert_eq!(res2.entity_type.as_deref(), Some("api"));
+}
+
+#[test]
+fn service_mcp_server_is_builtin() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Service, Some("mcp_server"))
+        .expect("mcp_server is a built-in Service subtype");
+    assert_eq!(res.entity_type.as_deref(), Some("mcp_server"));
+    let res2 = r
+        .resolve(EntityKind::Service, Some("mcp"))
+        .expect("mcp is an alias for mcp_server");
+    assert_eq!(res2.entity_type.as_deref(), Some("mcp_server"));
+}
+
+#[test]
+fn project_has_no_service_subtype() {
+    let r = reg();
+    r.resolve(EntityKind::Project, Some("service"))
+        .expect_err("service must not be a Project subtype");
+    r.resolve(EntityKind::Project, Some("svc"))
+        .expect_err("svc must not be a Project subtype");
+}
+
+#[test]
+fn benchmark_is_dataset_not_concept() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Dataset, Some("benchmark"))
+        .expect("benchmark is a valid Dataset subtype");
+    assert_eq!(res.entity_type.as_deref(), Some("benchmark"));
+    r.resolve(EntityKind::Concept, Some("benchmark"))
+        .expect_err("benchmark must not be a Concept subtype");
+}
+
+#[test]
+fn model_alias_resolves_to_model_family() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("model"))
+        .expect("model is an alias for model_family");
+    assert_eq!(res.entity_type.as_deref(), Some("model_family"));
+    let res2 = r
+        .resolve(EntityKind::Concept, Some("model_family"))
+        .expect("model_family is the canonical name");
+    assert_eq!(res2.entity_type.as_deref(), Some("model_family"));
+}
+
+// ── Case insensitivity ───────────────────────────────────────────────────
+
+#[test]
+fn resolve_is_case_insensitive() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("Algorithm"))
+        .expect("Algorithm (mixed case) must resolve");
+    assert_eq!(res.entity_type.as_deref(), Some("algorithm"));
+}
+
+// ── valid_types_for ──────────────────────────────────────────────────────
+
+#[test]
+fn valid_types_for_person_is_none_registered() {
+    let r = reg();
+    let s = r.valid_types_for(EntityKind::Person);
+    assert_eq!(
+        s, "(none registered)",
+        "Person has no built-in subtypes; got: {s}"
+    );
+}
+
+#[test]
+fn valid_types_for_concept_includes_algorithm() {
+    let r = reg();
+    let s = r.valid_types_for(EntityKind::Concept);
+    assert!(
+        s.contains("algorithm"),
+        "Concept valid types must include algorithm; got: {s}"
+    );
+}
+
+#[test]
+fn resolve_inductive_alias_to_structure() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("inductive"))
+        .expect("inductive is a valid alias for structure");
+    assert_eq!(res.kind, EntityKind::Concept);
+    assert_eq!(res.entity_type.as_deref(), Some("structure"));
+}
+
+#[test]
+fn resolve_goal_subtype() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("goal"))
+        .expect("goal is a valid Concept subtype");
+    assert_eq!(res.kind, EntityKind::Concept);
+    assert_eq!(res.entity_type.as_deref(), Some("goal"));
+}
+
+// ── Global registry ──────────────────────────────────────────────────────
+
+#[cfg(feature = "std")]
+#[test]
+fn global_registry_is_accessible() {
+    let r = EntityTypeRegistry::global();
+    let res = r
+        .resolve(EntityKind::Document, Some("paper"))
+        .expect("global registry must resolve paper");
+    assert_eq!(res.entity_type.as_deref(), Some("paper"));
+}
+
+// ── snake_case normalisation (ADR-001:106) ───────────────────────────────
+
+#[test]
+fn to_snake_case_converts_hyphen_to_underscore() {
+    assert_eq!(to_snake_case("proof-goal"), "proof_goal");
+}
+
+#[test]
+fn to_snake_case_converts_space_to_underscore() {
+    assert_eq!(to_snake_case("Proof Goal"), "proof_goal");
+}
+
+#[test]
+fn to_snake_case_collapses_mixed_separators() {
+    assert_eq!(to_snake_case("proof - goal"), "proof_goal");
+    assert_eq!(to_snake_case("proof__goal"), "proof_goal");
+}
+
+#[test]
+fn to_snake_case_strips_leading_trailing_separators() {
+    assert_eq!(to_snake_case("-theorem-"), "theorem");
+    assert_eq!(to_snake_case(" theorem "), "theorem");
+}
+
+#[test]
+fn resolve_proof_goal_hyphen_normalises_to_goal() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("proof-goal"))
+        .expect("proof-goal must resolve via snake_case normalisation + alias");
+    assert_eq!(res.entity_type.as_deref(), Some("goal"));
+}
+
+#[test]
+fn resolve_proof_goal_space_normalises_to_goal() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Concept, Some("Proof Goal"))
+        .expect("Proof Goal must resolve via snake_case normalisation + alias");
+    assert_eq!(res.entity_type.as_deref(), Some("goal"));
+}
+
+#[test]
+fn resolve_blog_hyphen_normalises_to_blog_post_non_formal() {
+    let r = reg();
+    let res = r
+        .resolve(EntityKind::Document, Some("blog-post"))
+        .expect("blog-post must normalise to blog_post");
+    assert_eq!(res.entity_type.as_deref(), Some("blog_post"));
+}
+
+// ── ADR-085 code subtypes ────────────────────────────────────────────────
+
+#[test]
+fn entity_type_registry_accepts_code_tokens_and_aliases() {
+    let r = reg();
+    for (raw, canonical) in [
+        ("module", "module"),
+        ("mod", "module"),
+        ("namespace", "module"),
+        ("function", "function"),
+        ("fn", "function"),
+        ("func", "function"),
+        ("method", "function"),
+        ("datatype", "datatype"),
+        ("enum", "datatype"),
+        ("record", "datatype"),
+        ("type_alias", "datatype"),
+        ("interface", "interface"),
+        ("trait", "interface"),
+        ("protocol", "interface"),
+    ] {
+        let res = r
+            .resolve(EntityKind::Concept, Some(raw))
+            .unwrap_or_else(|e| panic!("{raw:?} must resolve for Concept: {e}"));
+        assert_eq!(
+            res.entity_type.as_deref(),
+            Some(canonical),
+            "{raw:?} must resolve to {canonical:?}"
+        );
+    }
+}
+
+#[test]
+fn entity_type_registry_does_not_claim_struct_or_class_for_code() {
+    let r = reg();
+    let struct_res = r
+        .resolve(EntityKind::Concept, Some("struct"))
+        .expect("struct remains a valid Concept subtype (owned by formal structure)");
+    assert_eq!(
+        struct_res.entity_type.as_deref(),
+        Some("structure"),
+        "struct must still resolve to formal-math structure, not datatype"
+    );
+    let class_res = r
+        .resolve(EntityKind::Concept, Some("class"))
+        .expect("class remains a valid Concept subtype (owned by formal structure)");
+    assert_eq!(
+        class_res.entity_type.as_deref(),
+        Some("structure"),
+        "class must still resolve to formal-math structure, not datatype"
+    );
+}
+
+// ADR-191: the web pack's registry footprint shrank from five ARW-shaped
+// tokens to three web-native ones. This test is the acceptance witness
+// for that deletion — it accepts the surviving tokens under their kinds
+// and refuses the deleted ones under every kind, not just their former one.
+#[test]
+fn entity_type_registry_accepts_web_tokens_and_aliases() {
+    let r = reg();
+    for (kind, canonical, alias) in [
+        (EntityKind::Service, "site", "origin"),
+        (EntityKind::Document, "page", "web_page"),
+    ] {
+        for raw in [canonical, alias] {
+            let resolved = r
+                .resolve(kind, Some(raw))
+                .unwrap_or_else(|e| panic!("{raw:?} must resolve for {kind}: {e}"));
+            assert_eq!(resolved.kind, kind);
+            assert_eq!(resolved.entity_type.as_deref(), Some(canonical));
+            for other_kind in EntityKind::ALL {
+                if other_kind != kind {
+                    r.resolve(other_kind, Some(raw))
+                        .expect_err("web subtypes belong to exactly one base kind");
+                }
+            }
+        }
+    }
+
+    // `resource` has no alias.
+    let resolved = r
+        .resolve(EntityKind::Document, Some("resource"))
+        .expect("resource must resolve for Document");
+    assert_eq!(resolved.kind, EntityKind::Document);
+    assert_eq!(resolved.entity_type.as_deref(), Some("resource"));
+    for other_kind in EntityKind::ALL {
+        if other_kind != EntityKind::Document {
+            r.resolve(other_kind, Some("resource"))
+                .expect_err("resource belongs to exactly one base kind");
+        }
+    }
+
+    // Deleted ARW-shaped tokens (and their aliases) must be refused under
+    // every kind, not just their former one — a partial deletion that
+    // left one arm registered would otherwise pass silently.
+    for gone in [
+        "machine_view",
+        "view",
+        "agent_tool",
+        "mcp_tool",
+        "agent_skill",
+        "skill_manifest",
+    ] {
+        for kind in EntityKind::ALL {
+            r.resolve(kind, Some(gone)).expect_err(
+                "deleted web token must be refused for every kind, not just its former one",
+            );
+        }
+    }
+}
+
+#[test]
+fn web_tokens_and_aliases_have_unique_registry_owners() {
+    for token in ["site", "origin", "page", "web_page", "resource"] {
+        let owners: Vec<_> = BUILTIN_DEFS
+            .iter()
+            .filter(|def| {
+                to_snake_case(def.type_name) == token
+                    || def
+                        .aliases
+                        .iter()
+                        .any(|alias| to_snake_case(alias) == token)
+            })
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "{token:?} has conflicting owners: {owners:?}"
+        );
+    }
+}
+
+#[test]
+fn web_vocabulary_preserves_tool_as_a_project_subtype() {
+    let r = reg();
+    assert_eq!(
+        r.resolve(EntityKind::Project, Some("tool"))
+            .expect("tool remains a project subtype")
+            .entity_type
+            .as_deref(),
+        Some("tool")
+    );
+    r.resolve(EntityKind::Service, Some("tool"))
+        .expect_err("tool is not a service subtype");
+    r.resolve(EntityKind::Document, Some("skill"))
+        .expect_err("skill is not a document subtype");
+}
+
+// ── check_extra_collisions: ADR-001 normalisation (PR #925) ──
+//
+// `check_extra_collisions` must reject collisions that only become
+// visible after ADR-001:104-107's write-time `to_snake_case`
+// normalisation — i.e. two raw spellings that differ in case or
+// separator style but land on the same kind-qualified key once
+// normalised. Before the r2 fix these three cases silently passed
+// (`Ok(())`) because the check compared raw, unnormalised strings.
+
+#[test]
+fn check_extra_collisions_detects_normalized_alias_vs_alias() {
+    let def_a = EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "widget_service",
+        aliases: &["Widget-Alias"],
+    };
+    let def_b = EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "gadget_service",
+        aliases: &["widget_alias"],
+    };
+    let err = EntityTypeRegistry::check_extra_collisions([("pack_a", &def_a), ("pack_b", &def_b)])
+        .expect_err(
+            "aliases that only differ in case/hyphenation but normalise to the same \
+             kind-qualified key must collide",
+        );
+    assert!(err.contains("pack_a"), "error must name pack_a: {err}");
+    assert!(err.contains("pack_b"), "error must name pack_b: {err}");
+}
+
+#[test]
+fn check_extra_collisions_detects_normalized_alias_vs_canonical() {
+    let def_a = EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "primary_service",
+        aliases: &[],
+    };
+    let def_b = EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "secondary_service",
+        aliases: &["Primary-Service"],
+    };
+    let err = EntityTypeRegistry::check_extra_collisions([("pack_a", &def_a), ("pack_b", &def_b)])
+        .expect_err(
+            "an alias that normalises onto another owner's canonical key must collide, \
+             even when the raw spellings differ",
+        );
+    assert!(err.contains("pack_a"), "error must name pack_a: {err}");
+    assert!(err.contains("pack_b"), "error must name pack_b: {err}");
+}
+
+#[test]
+fn check_extra_collisions_detects_normalized_builtin_vs_pack_collision() {
+    // BUILTIN_DEFS declares Document "paper". A pack declaring a
+    // differently-cased spelling that normalises onto the same
+    // kind-qualified key must still collide with the built-in owner.
+    let def = EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "Paper",
+        aliases: &[],
+    };
+    let err = EntityTypeRegistry::check_extra_collisions([("pack_a", &def)]).expect_err(
+        "a pack canonical name that normalises onto a builtin canonical key must collide",
+    );
+    assert!(err.contains("builtin"), "error must name builtin: {err}");
+    assert!(err.contains("pack_a"), "error must name pack_a: {err}");
+}

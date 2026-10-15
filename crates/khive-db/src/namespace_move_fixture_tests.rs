@@ -1306,10 +1306,14 @@ fn atom_weight_collisions_name_only_the_routed_target_and_leave_every_row_unchan
         let conn = migrated();
         seed_weight_atom(&conn, "ordinary", "source", false);
         seed_weight_atom(&conn, "mirror", "source", true);
+        // Each id also sits at the target it is not routed to. Those rows are not
+        // collisions, so a check that ignores the route would name them as well.
         for (namespace, atom_id) in [
             ("source", "ordinary"),
             ("source", "mirror"),
             (target, colliding_id),
+            ("domain-target", "ordinary"),
+            ("atom-target", "mirror"),
         ] {
             conn.execute(
                 "INSERT INTO atom_weights (namespace, atom_id, weight, updated_at, version) \

@@ -48,6 +48,19 @@ Callers can supply an explicit directory through `PoolConfig.volume_lock_dir`,
 `StorageBackend::sqlite_with_volume_lock_dir`, or the constructor accepting both
 captured policies. Test callers use private fixture directories.
 
+Within one process, requests for a volume slot are queued in the order they
+enter its registry mutex. Only the front waiter can acquire a free slot; a new
+arrival cannot overtake queued requests. An expired waiter removes itself and
+returns `CapacityUnavailable` with phase `lock_contended` at its guard deadline. The FIFO
+order does not extend to separate processes competing for the advisory file
+lock. Same-thread re-entry still refuses immediately, and detached leases retain
+exclusion until their eventual release.
+
+Under `KHIVE_TEST_HARNESS=1`, private lock directories also isolate in-process
+slots. File-backed test fixtures must own a private directory for their whole
+runtime lifetime or run through the isolated child-process helper. A private
+database filename alone does not isolate a physical-volume lease.
+
 Memory and read-only backends do not take the disk lease or capacity probe.
 Diagnostics report the resolved numeric values and their configuration sources,
 the identified volume and probe path, and any inability to inspect that volume.
@@ -147,9 +160,12 @@ handles cannot prove ownership or actual close and are outside this API contract
 ## Refusals and limits
 
 `sqlite_capacity_refused` carries available, reserve and required-headroom bytes.
-`sqlite_capacity_unavailable` distinguishes `identity`, `lock` and `probe` phases.
-Neither asks for automatic retry. An operator may recover space or complete a
-checkpoint and then make a new explicit attempt. Native `SQLITE_FULL` retains its
+`sqlite_capacity_unavailable` distinguishes `identity`, `lock`, `lock_contended`
+and `probe` phases. Only `lock_contended`, where the guard deadline elapsed waiting
+for the volume lease, is retryable within the caller's bounded retry budget. Every
+retried attempt still takes the lease before sampling capacity. Floor refusal and
+the other unavailable phases remain non-retryable; an operator may recover space
+or complete a checkpoint and then make a new explicit attempt. Native `SQLITE_FULL` retains its
 SQLite primary and extended result codes and separate escalation; it is never
 reported as a preflight floor refusal. Its best-effort incident sink does not write
 back to the guarded SQLite database.

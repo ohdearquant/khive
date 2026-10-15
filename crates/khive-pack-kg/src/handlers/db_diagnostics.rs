@@ -1,8 +1,11 @@
 //! `db_diagnostics` verb handler.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{NamespaceToken, OpenedDiagnosticBackend, RuntimeError, VerbRegistry};
+use khive_storage::{RequestReadDeadline, RequestReadStopReason};
 
 use super::common::{deser, DbDiagnosticsParams};
 use crate::KgPack;
@@ -64,14 +67,57 @@ fn annotate_graph_edge_integrity(report: &mut Value) {
     );
 }
 
+/// `error` of a backend whose inspection the request deadline interrupted.
+const DEADLINE_INTERRUPTED: &str =
+    "not inspected: request deadline (arrived during this backend's inspection)";
+/// `error` of a backend the report never reached because the deadline had passed.
+const DEADLINE_NOT_REACHED: &str =
+    "not inspected: request deadline (arrived before this backend was reached)";
+
+/// The longest stretch held back from the request deadline so the handler can
+/// assemble and return a partial report. Clients start their own deadline a
+/// little before the daemon starts this one, so a report finished exactly at
+/// the deadline would usually arrive after the client stopped waiting.
+const PARTIAL_REPORT_RESERVE: Duration = Duration::from_secs(2);
+
+/// How much of the `left` time before the request deadline backend inspections
+/// may use: all but a tenth of it, keeping at most [`PARTIAL_REPORT_RESERVE`].
+fn inspection_window(left: Duration) -> Duration {
+    left - (left / 10).min(PARTIAL_REPORT_RESERVE)
+}
+
+/// The deadline backend inspections run under, or `None` when the request
+/// carries no deadline.
+fn inspection_deadline() -> Option<RequestReadDeadline> {
+    let deadline = khive_storage::capture_request_read_context().deadline()?;
+    let left = deadline
+        .blocking_at()
+        .saturating_duration_since(std::time::Instant::now());
+    Some(RequestReadDeadline::after(inspection_window(left)))
+}
+
 struct BackendDiagnosticResult {
     backend_names: Vec<String>,
     path: Option<String>,
     result: Result<Value, String>,
 }
 
+impl BackendDiagnosticResult {
+    fn not_inspected(backend: &OpenedDiagnosticBackend, marker: &str) -> Self {
+        Self {
+            backend_names: backend.backend_names.clone(),
+            path: backend
+                .canonical_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            result: Err(marker.to_string()),
+        }
+    }
+}
+
 fn assemble_backend_diagnostics(
     results: Vec<BackendDiagnosticResult>,
+    complete: bool,
 ) -> Result<Value, RuntimeError> {
     let mut primary = serde_json::Map::new();
     let mut databases = Vec::with_capacity(results.len());
@@ -95,6 +141,7 @@ fn assemble_backend_diagnostics(
         }));
     }
     primary.insert("databases".into(), Value::Array(databases));
+    primary.insert("complete".into(), Value::Bool(complete));
     Ok(Value::Object(primary))
 }
 
@@ -105,11 +152,16 @@ impl KgPack {
     /// writer acquisition, pooled-timeout, and audit-failure counters; build and
     /// OS process identity; duplicate edge-ID and list-ledger counts; checkpoint counters;
     /// a PASSIVE probe; WAL file size; and a qualified WAL-pin census.
-    /// Zero-arg, reports every already-open backend regardless of the caller's
-    /// namespace. The existing root fields describe main; `databases` carries
-    /// one report or error per canonical file. The PASSIVE probe may backfill
-    /// WAL frames (normal checkpoint I/O); it never changes logical state, escalates to
-    /// TRUNCATE, or deletes sidecar evidence.
+    /// Reports every already-open backend regardless of the caller's namespace,
+    /// or only the one serving `backend`. The root fields describe the first
+    /// inspected file (main unless `backend` selects another); `databases`
+    /// carries one report or error per canonical file. `size_composition=false`
+    /// skips the `dbstat` walk. The backends share the request's read deadline:
+    /// when it arrives, the backends already inspected are returned with the
+    /// rest marked not inspected and `complete: false`, rather than failing the
+    /// whole verb. The PASSIVE probe may backfill WAL frames (normal checkpoint
+    /// I/O); it never changes logical state, escalates to TRUNCATE, or deletes
+    /// sidecar evidence.
     ///
     /// ADR-133: `registry` is the seam that actually owns the audit-batch
     /// control, so its `audit_batch_metrics()` feeds the batch-health
@@ -121,18 +173,76 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let _p: DbDiagnosticsParams = deser(params)?;
-        let mut results = Vec::new();
-        for backend in self.runtime.diagnostic_backends().iter() {
-            khive_storage::ensure_request_read_active("db_diagnostics")?;
-            let result = match self
-                .runtime
-                .db_diagnostics_for_opened_backend_with_audit_metrics(
+        let p: DbDiagnosticsParams = deser(params)?;
+        let collect_size_composition = p.size_composition.unwrap_or(true);
+        let opened = self.runtime.diagnostic_backends();
+        let selected: Vec<&OpenedDiagnosticBackend> = match p.backend.as_deref() {
+            None => opened.iter().collect(),
+            Some(name) => {
+                let matched: Vec<_> = opened
+                    .iter()
+                    .filter(|backend| backend.backend_names.iter().any(|n| n == name))
+                    .collect();
+                if matched.is_empty() {
+                    let mut names: Vec<&str> = opened
+                        .iter()
+                        .flat_map(|backend| backend.backend_names.iter().map(String::as_str))
+                        .collect();
+                    names.sort_unstable();
+                    names.dedup();
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "db_diagnostics: no opened backend is named {name:?}; opened backends: {}",
+                        names.join(", ")
+                    )));
+                }
+                matched
+            }
+        };
+
+        let deadline = inspection_deadline();
+        let mut results = Vec::with_capacity(selected.len());
+        let mut complete = true;
+        for backend in selected {
+            if complete {
+                match khive_storage::capture_request_read_context().stop_reason() {
+                    Some(RequestReadStopReason::Deadline) => complete = false,
+                    Some(RequestReadStopReason::Cancelled) => {
+                        khive_storage::ensure_request_read_active("db_diagnostics")?;
+                    }
+                    None => {}
+                }
+            }
+            if !complete {
+                results.push(BackendDiagnosticResult::not_inspected(
                     backend,
-                    registry.audit_batch_metrics(),
+                    DEADLINE_NOT_REACHED,
+                ));
+                continue;
+            }
+            let inspect = async {
+                let outcome = self
+                    .runtime
+                    .db_diagnostics_for_opened_backend_with_audit_metrics(
+                        backend,
+                        registry.audit_batch_metrics(),
+                        collect_size_composition,
+                    )
+                    .await;
+                (
+                    outcome,
+                    khive_storage::capture_request_read_context().stop_reason(),
                 )
-                .await
-            {
+            };
+            let (outcome, stopped) = match deadline {
+                Some(deadline) => {
+                    khive_storage::scope_request_read_deadline_at(deadline, inspect).await
+                }
+                None => inspect.await,
+            };
+            if stopped == Some(RequestReadStopReason::Deadline) {
+                complete = false;
+            }
+            let result = match outcome {
                 Ok(report) => {
                     let mut value = serde_json::to_value(&report).map_err(|e| {
                         RuntimeError::Internal(format!("db_diagnostics: serialize: {e}"))
@@ -140,11 +250,15 @@ impl KgPack {
                     annotate_graph_edge_integrity(&mut value);
                     Ok(value)
                 }
-                Err(error) => {
-                    // A cancelled request is not a failed backend inspection.
-                    khive_storage::ensure_request_read_active("db_diagnostics")?;
-                    Err(error.to_string())
+                // A cancelled request is not a failed backend inspection, and
+                // nobody is waiting for a partial report.
+                Err(error) if stopped == Some(RequestReadStopReason::Cancelled) => {
+                    return Err(error)
                 }
+                Err(_) if stopped == Some(RequestReadStopReason::Deadline) => {
+                    Err(DEADLINE_INTERRUPTED.to_string())
+                }
+                Err(error) => Err(error.to_string()),
             };
             results.push(BackendDiagnosticResult {
                 backend_names: backend.backend_names.clone(),
@@ -155,116 +269,10 @@ impl KgPack {
                 result,
             });
         }
-        assemble_backend_diagnostics(results)
+        assemble_backend_diagnostics(results, complete)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{
-        annotate_graph_edge_integrity, assemble_backend_diagnostics, BackendDiagnosticResult,
-    };
-
-    #[test]
-    fn one_backend_diagnostics_error_keeps_other_entries() {
-        let result = assemble_backend_diagnostics(vec![
-            BackendDiagnosticResult {
-                backend_names: vec!["main".into()],
-                path: Some("/main.db".into()),
-                result: Ok(json!({"db_path": "/main.db", "reader_contention": {"reader_acquisitions": 1}})),
-            },
-            BackendDiagnosticResult {
-                backend_names: vec!["broken".into()],
-                path: Some("/broken.db".into()),
-                result: Err("inspection failed".into()),
-            },
-            BackendDiagnosticResult {
-                backend_names: vec!["healthy".into()],
-                path: Some("/healthy.db".into()),
-                result: Ok(json!({"db_path": "/healthy.db", "reader_contention": {"reader_acquisitions": 3}})),
-            },
-        ])
-        .expect("one failed file must not fail the verb");
-        assert_eq!(result["db_path"], "/main.db");
-        assert_eq!(result["databases"].as_array().unwrap().len(), 3);
-        assert_eq!(result["databases"][1]["error"], "inspection failed");
-        assert!(result["databases"][1]["diagnostics"].is_null());
-        assert_eq!(
-            result["databases"][2]["diagnostics"]["db_path"],
-            "/healthy.db"
-        );
-    }
-
-    #[test]
-    fn graph_edge_integrity_explains_retained_delete_history() {
-        let mut report = json!({
-            "graph_edge_integrity": {
-                "graph_edges_rows": 3,
-                "graph_edges_seq_rows": 5,
-            }
-        });
-
-        annotate_graph_edge_integrity(&mut report);
-
-        let integrity = &report["graph_edge_integrity"];
-        assert_eq!(
-            integrity["graph_edges_rows_scope"],
-            json!({"namespaces": "all", "rows": "live_and_soft_deleted"})
-        );
-        assert_eq!(
-            integrity["graph_edges_seq_rows_scope"],
-            json!({
-                "namespaces": "all",
-                "rows": "inserted_ids_retained_after_hard_delete",
-            })
-        );
-        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], 2);
-        assert_eq!(
-            integrity["graph_edges_seq_relationship"],
-            "ledger_ahead_consistent_with_hard_deletes"
-        );
-    }
-
-    #[test]
-    fn graph_edge_integrity_marks_a_ledger_deficit_unexpected() {
-        let mut report = json!({
-            "graph_edge_integrity": {
-                "graph_edges_rows": 3,
-                "graph_edges_seq_rows": 2,
-            }
-        });
-
-        annotate_graph_edge_integrity(&mut report);
-
-        let integrity = &report["graph_edge_integrity"];
-        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], -1);
-        assert_eq!(
-            integrity["graph_edges_seq_relationship"],
-            "ledger_behind_unexpected"
-        );
-    }
-
-    #[test]
-    fn graph_edge_integrity_classifies_pre_v14_duplicate_state_as_legacy() {
-        // Mirrors the khive-db regression fixture: two graph_edges rows share
-        // one ledger row and the report flags the pre-V14 duplicate state.
-        let mut report = json!({
-            "graph_edge_integrity": {
-                "graph_edges_rows": 2,
-                "graph_edges_seq_rows": 1,
-                "pre_v14_duplicate_edge_state_detected": true,
-            }
-        });
-
-        annotate_graph_edge_integrity(&mut report);
-
-        let integrity = &report["graph_edge_integrity"];
-        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], -1);
-        assert_eq!(
-            integrity["graph_edges_seq_relationship"],
-            "ledger_behind_pre_v14_duplicate_edge_state"
-        );
-    }
-}
+#[path = "db_diagnostics_tests.rs"]
+mod tests;

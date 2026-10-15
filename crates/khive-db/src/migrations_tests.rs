@@ -10,6 +10,8 @@ use super::{
 mod admission;
 #[path = "migrations_tests/atom_weights.rs"]
 mod atom_weights;
+#[path = "migrations_tests/page_accounting.rs"]
+mod page_accounting;
 #[path = "migrations_tests/retrieval_snapshots.rs"]
 mod retrieval_snapshots;
 

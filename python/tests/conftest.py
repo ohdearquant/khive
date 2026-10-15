@@ -41,6 +41,28 @@ from _dsl_fake import DslParseError, parse_dsl_with_mode
 API_KEY = "test-key-123"
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Iterator[None]:
+    """Attach every scratch daemon's full stderr to a failed test's report.
+
+    A fixture that starts its own daemon lists the daemon root directories on
+    `item.scratch_daemon_roots`; each start writes `daemon-<n>.stderr` there.
+    The report is built before fixture teardown removes those directories,
+    and a daemon-side error (for example the store error behind a write
+    verb's `retry_exhausted`) is visible only in that stderr, never in the
+    client's response.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    if report.passed or report.skipped:
+        return
+    for root in getattr(item, "scratch_daemon_roots", ()):
+        for path in sorted(Path(root).glob("daemon-*.stderr")):
+            report.sections.append(
+                (f"scratch daemon stderr: {path}", path.read_text(errors="replace"))
+            )
+
+
 def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
     """A tiny fake op-dispatcher mirroring khive-cloud's envelope shape.
 
