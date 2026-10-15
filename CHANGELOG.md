@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recipient_key` suppression entry (source `mailto_token`) and the message is neither delivered
   nor quarantined. With external senders configured, an inbound suppression entry matching the
   authenticated sender address or its exact domain quarantines the message with reason `blocked`.
+
+- `KHIVE_EMAIL_AUTHSERV_ID` accepts `!topmost:<authserv-id>` (`TrustAnchor::TopmostWithAuthservId`).
+  Only the topmost `Authentication-Results` header is considered, as with `!topmost-no-authserv-id`,
+  and it is trusted when it carries the configured `authserv-id` or none. This covers Exchange
+  Online, which stamps `mx.microsoft.com 1` on its own header for some senders and no `authserv-id`
+  for others. An empty or malformed id after the prefix fails configuration. Adding the variant to
+  the public `TrustAnchor` enum is a breaking change for exhaustive matches.
 ### Changed
 
 - Configurable graph rules share the pure `khive-rule-evaluator` crate between

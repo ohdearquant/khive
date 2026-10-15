@@ -1731,6 +1731,101 @@ mod tests {
         );
     }
 
+    // --- Topmost trust with a shared authserv-id, end-to-end (ADR-056 Amendment 2026-10-15) ---
+
+    #[tokio::test]
+    async fn exo_stamp_with_shared_authserv_id_end_to_end_is_attributed_in_topmost_mode() {
+        // Exchange Online stamps `mx.microsoft.com 1` on its own topmost plain
+        // header for mail from some external senders (shape from a delivered
+        // message; addresses and domains replaced with example values). No ARC
+        // header is present. The no-authserv-id mode refuses it; the topmost
+        // mode configured with that id attributes it.
+        let raw = b"Authentication-Results: mx.microsoft.com 1; spf=pass (sender IP is 192.0.2.10) smtp.mailfrom=send.example.com; dkim=pass (signature was verified) header.d=example.com;dkim=pass (signature was verified) header.d=amazonses.com;dmarc=pass action=none header.from=example.com;compauth=pass reason=100\r\n\
+                    Received-SPF: Pass (protection.outlook.com: domain of send.example.com designates 192.0.2.10 as permitted sender) receiver=protection.outlook.com; client-ip=192.0.2.10; helo=mail.example.net; pr=C\r\n\
+                    From: Example Sender <noreply@example.com>\r\n\
+                    To: Example Recipient <recipient@example.org>\r\n\
+                    Subject: sign-in link\r\n\
+                    \r\n\
+                    body text";
+
+        for (anchor, attributed) in [
+            (TrustAnchor::TopmostNoAuthservId, false),
+            (
+                TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string()),
+                true,
+            ),
+        ] {
+            let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+            let mut config = make_config("noreply@example.com");
+            config.trust_anchor = anchor.clone();
+            let ch = build_channel_from(config, vec![email]);
+            let envs = ch.poll(Utc::now()).await.unwrap();
+            assert_eq!(envs.len(), 1);
+            if attributed {
+                assert_eq!(envs[0].from, "email:noreply@example.com", "{anchor:?}");
+            } else {
+                assert_eq!(envs[0].from, EMAIL_QUARANTINE_SENDER, "{anchor:?}");
+                assert_eq!(
+                    envs[0]
+                        .metadata
+                        .get("quarantine_reason")
+                        .map(String::as_str),
+                    Some("auth-absent"),
+                    "{anchor:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exo_unstamped_gmail_shape_still_attributes_in_topmost_with_authserv_id_mode() {
+        // Gmail-origin mail to the same mailbox carries no authserv-id on the
+        // topmost plain header, and `mx.microsoft.com 1` only on ARC, which is
+        // never trusted. The topmost mode accepts the unstamped shape too.
+        let raw = b"ARC-Authentication-Results: i=2; mx.microsoft.com 1; spf=pass smtp.mailfrom=gmail.com; dmarc=pass header.from=gmail.com; dkim=pass header.d=gmail.com\r\n\
+                    Authentication-Results: spf=pass (sender IP is 2607:f8b0:4864:20::1129) smtp.mailfrom=gmail.com; dkim=pass (signature was verified) header.d=gmail.com;dmarc=pass action=none header.from=gmail.com;compauth=pass reason=100\r\n\
+                    From: Example Sender <sender@gmail.com>\r\n\
+                    To: Example Recipient <recipient@example.com>\r\n\
+                    Subject: unstamped topmost\r\n\
+                    \r\n\
+                    body text";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let mut config = make_config("sender@gmail.com");
+        config.trust_anchor = TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string());
+        let ch = build_channel_from(config, vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, "email:sender@gmail.com");
+    }
+
+    #[tokio::test]
+    async fn topmost_with_authserv_id_mode_ignores_a_forged_pass_below_a_failing_stamp() {
+        // The boundary's genuine failing stamp is topmost; a sender-forged
+        // passing header with the same shared id sits below it.
+        let raw = b"Authentication-Results: mx.microsoft.com 1; spf=fail smtp.mailfrom=evil.example; dkim=none; dmarc=fail action=quarantine header.from=example.com;compauth=fail reason=000\r\n\
+                    Authentication-Results: mx.microsoft.com 1; spf=pass smtp.mailfrom=example.com; dkim=pass header.d=example.com; dmarc=pass action=none header.from=example.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: forged pass below the stamp\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let mut config = make_config("maintainer@example.com");
+        config.trust_anchor = TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string());
+        let ch = build_channel_from(config, vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].from, EMAIL_QUARANTINE_SENDER);
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("dmarc-fail"),
+            "the topmost stamp is the one trusted, and it fails"
+        );
+    }
+
     #[tokio::test]
     async fn quarantine_store_off_drops_unattributed_message() {
         let mut config = make_config("maintainer@example.com");

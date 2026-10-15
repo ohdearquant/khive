@@ -455,8 +455,10 @@ Required:
 - `KHIVE_EMAIL_AUTHSERV_ID` (the trust anchor for validating inbound
   `Authentication-Results` headers; the reserved value
   `!topmost-no-authserv-id` selects trust of the topmost header when the
-  receiving boundary emits no `authserv-id` at all, as with Exchange Online's
-  internal-hop stamp)
+  receiving boundary emits no `authserv-id` at all; `!topmost:<authserv-id>`
+  also trusts only the topmost header, accepting either no `authserv-id` or the
+  given one, for a boundary such as Exchange Online that stamps
+  `mx.microsoft.com` on its own header for some senders and nothing for others)
 
 Auth mode (choose one):
 
