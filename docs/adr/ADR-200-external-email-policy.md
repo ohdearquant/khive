@@ -414,7 +414,7 @@ external sending.
 **Decision.**
 
 1. `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` enables external inbound on its own. External inbound is enabled when
-   external senders are configured or this setting is `enabled`. §7 step 5 reads "External inbound not enabled:
+   external senders are configured or this setting is `enabled`. §7 step 5 is read as "External inbound not enabled:
    quarantine as `off-allowlist`", and steps 6 and 7 apply whenever it is enabled.
 2. The setting changes nothing outbound. While external senders are unset, a send to an address outside the outbound
    allowlist is refused as before (§2), and no unsubscribe token verifies (§5).
