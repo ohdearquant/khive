@@ -4,7 +4,48 @@
 //! loaded. Missing required variables produce an error at construction time.
 
 use crate::connector::MailAddress;
+use crate::external_inbound::InboundRoutes;
 use khive_channel::ChannelError;
+
+/// Boot-resolved routing for authenticated external inbound mail (ADR-200 section 8.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalInboundConfig {
+    /// Recipient aliases, matched in delivered-to/to/cc order.
+    pub routes: InboundRoutes,
+    /// Actor receiving mail without a verified owner or recipient route.
+    pub actor: String,
+}
+
+impl ExternalInboundConfig {
+    /// Load routing only when the host's frozen policy enables external senders.
+    pub fn from_env(enabled: bool) -> Result<Option<Self>, ChannelError> {
+        if !enabled {
+            return Ok(None);
+        }
+        let actor = require_env("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR")?;
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return Err(ChannelError::Config(
+                "KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR must not be empty".into(),
+            ));
+        }
+        let raw_routes = match std::env::var("KHIVE_EMAIL_INBOUND_ROUTES") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(error) => {
+                return Err(ChannelError::Config(format!(
+                    "KHIVE_EMAIL_INBOUND_ROUTES is invalid: {error}"
+                )));
+            }
+        };
+        let routes = InboundRoutes::parse(&raw_routes)
+            .map_err(|error| ChannelError::Config(error.to_string()))?;
+        Ok(Some(Self {
+            routes,
+            actor: actor.to_string(),
+        }))
+    }
+}
 
 /// Reserved sentinel value for `KHIVE_EMAIL_AUTHSERV_ID` that selects
 /// [`TrustAnchor::TopmostNoAuthservId`] mode. `!` is not excluded by RFC 8601
@@ -1127,4 +1168,5 @@ mod tests {
             .expect("a message ceiling equal to the blob object ceiling is accepted");
         assert_eq!(config.imap_max_message_bytes, MAX_IMAP_MESSAGE_BYTES);
     }
+    include!("config/external_inbound_tests.rs");
 }

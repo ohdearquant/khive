@@ -28,6 +28,8 @@ fn default_severity() -> String {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RulesFile {
     #[serde(default)]
+    pub tier: TierConfig,
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
     /// Rule class 1: edge `(source kind, relation, target kind)` endpoint
     /// contract, checked against the live pack/base allowlist.
@@ -45,6 +47,81 @@ pub(crate) struct RulesFile {
     /// Rule class 5: forward-dated citation/property values.
     #[serde(default)]
     pub citation_date_lint: Option<CitationDateLintConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TierConfig {
+    #[serde(default = "default_tier_operations")]
+    pub tier_1_operations: Vec<String>,
+    pub tier_1_relations: Option<Vec<String>>,
+    pub tier_1_entity_fields: Option<Vec<String>>,
+    #[serde(default = "default_tier_weight")]
+    pub minimum_weight: f64,
+}
+
+fn default_tier_operations() -> Vec<String> {
+    ["create", "link", "update"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_tier_weight() -> f64 {
+    0.7
+}
+
+impl Default for TierConfig {
+    fn default() -> Self {
+        Self {
+            tier_1_operations: default_tier_operations(),
+            tier_1_relations: None,
+            tier_1_entity_fields: None,
+            minimum_weight: default_tier_weight(),
+        }
+    }
+}
+
+fn validate_tier_list(
+    field: &str,
+    values: &[String],
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        if !allowed(value) {
+            return Err(format!("tier.{field}: invalid value {value:?}"));
+        }
+        if !seen.insert(value) {
+            return Err(format!("tier.{field}: duplicate value {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tier(config: &TierConfig) -> Result<(), String> {
+    validate_tier_list("tier_1_operations", &config.tier_1_operations, |value| {
+        matches!(value, "create" | "link" | "update" | "delete" | "merge")
+    })?;
+    if let Some(relations) = &config.tier_1_relations {
+        validate_tier_list("tier_1_relations", relations, |value| {
+            value
+                .parse::<EdgeRelation>()
+                .is_ok_and(|relation| relation.as_str() == value)
+        })?;
+    }
+    if let Some(fields) = &config.tier_1_entity_fields {
+        validate_tier_list("tier_1_entity_fields", fields, |value| {
+            matches!(
+                value,
+                "name" | "description" | "properties" | "tags" | "entity_type"
+            )
+        })?;
+    }
+    if !config.minimum_weight.is_finite() || !(0.0..=1.0).contains(&config.minimum_weight) {
+        return Err("tier.minimum_weight must be finite and in [0.0, 1.0]".into());
+    }
+    Ok(())
 }
 
 fn default_enabled() -> bool {
@@ -215,18 +292,19 @@ fn validate_direction_rule_entries(relations: &[DirectionRuleConfig]) -> Result<
 #[derive(Debug)]
 pub struct Rules(pub(crate) RulesFile);
 
-/// Rule-file syntax and direction-contract errors, before any graph evaluation.
+/// Rule-file syntax and semantic contract errors, before any graph evaluation.
 #[derive(Debug)]
 pub enum RulesError {
     Syntax(toml::de::Error),
     Direction(String),
+    Tier(String),
 }
 
 impl std::fmt::Display for RulesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Syntax(error) => write!(f, "{error}"),
-            Self::Direction(message) => f.write_str(message),
+            Self::Direction(message) | Self::Tier(message) => f.write_str(message),
         }
     }
 }
@@ -235,7 +313,7 @@ impl std::error::Error for RulesError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Syntax(error) => Some(error),
-            Self::Direction(_) => None,
+            Self::Direction(_) | Self::Tier(_) => None,
         }
     }
 }
@@ -246,6 +324,7 @@ impl Rules {
         if let Some(config) = &rules.edge_direction_conventions {
             validate_direction_rule_entries(&config.relations).map_err(RulesError::Direction)?;
         }
+        validate_tier(&rules.tier).map_err(RulesError::Tier)?;
         Ok(Self(rules))
     }
 

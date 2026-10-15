@@ -86,6 +86,26 @@ Read-modify-write against the existing row (if any) so that:
   sets `last_quarantined_after_hold_at`. The shipped email loop reports both
   on every success; a writer that omits them leaves the row's hold facts as
   they were.
+- `originals_not_retained`, `original_not_retained_reason`,
+  `original_retention_state`, `notices_failed` and `notice_config_error` are
+  accepted only with a success outcome; a failed poll wrote no records and
+  sent no notices. `originals_not_retained` (records written this poll without
+  their original, every reason including the retention limit) and
+  `notices_failed` (failed notice sends) are running totals: each success that
+  reports them ADDS to the row's value rather than replacing it.
+  `original_not_retained_reason` is required exactly when
+  `originals_not_retained` is above zero and refused otherwise; it must be one
+  of `retention-limit`, `original-unavailable`, `retention-count-unreadable`,
+  `original-store-failed`, `quarantine-write-failed` or `secondary-backend`,
+  and when present (with a count above zero) it sets
+  `last_original_not_retained_reason` alongside `last_original_not_retained_at`.
+  `original_retention_state` is exactly `retained` or `failing` and replaces
+  the row's value. `notices_failed` above zero sets `last_notice_failed_at`.
+  `notice_config_error` is a short current-problem string (non-blank, at most
+  255 bytes, no control characters); a success that carries it sets the row's
+  value and a success that omits it CLEARS the row, so a resolved
+  configuration problem stops being reported. A failure leaves every one of
+  these facts unchanged.
 
 Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists
 under `token.namespace()` (khive #917) — the dispatch-authorized namespace
@@ -129,6 +149,13 @@ reported holds, and on quarantine-only entries. A channel holds its page while
 a message in it cannot be recorded yet; the email loop bounds each message's
 failed polls (ADR-056), so a `consecutive_held_polls` that keeps growing means
 the store itself cannot record even the bounded quarantine row.
+
+`originals_not_retained`, `last_original_not_retained_at`,
+`last_original_not_retained_reason`, `original_retention_state`,
+`notices_failed`, `last_notice_failed_at` and `notice_config_error` are `null`
+on a row whose writer never reported them, and on quarantine-only entries,
+the same rule as the hold fields. A writer that only reports some of them
+leaves the others `null` on its row.
 
 `quarantined_count` is independent of those liveness facts. It is the number
 of live `message` rows in the authorized namespace whose generic

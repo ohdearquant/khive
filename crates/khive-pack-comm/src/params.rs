@@ -206,6 +206,12 @@ pub(crate) struct IngestParams {
     /// back to `p.to.trim()` when absent and no correlation match is found.
     #[serde(default)]
     pub default_inbound_actor: Option<String>,
+    /// Authenticated deterministic reply-stop result from the internal channel consumer.
+    #[serde(default)]
+    pub reply_opt_out: bool,
+    /// Ordered candidates whose host lookup failed before a route was verified.
+    #[serde(default)]
+    pub pending_owner_candidates: Option<Vec<String>>,
     /// This message's own RFC 822 Message-ID (angle brackets included), distinct
     /// from `external_id` (the transport dedup key). Persisted for In-Reply-To/
     /// References on a later reply.
@@ -270,6 +276,24 @@ pub(crate) struct HeartbeatParams {
     /// failed polls reached the writer's bound. Absent from older writers.
     #[serde(default)]
     pub quarantined_after_hold: Option<u64>,
+    /// Records written this poll without their original, across every reason
+    /// (including the retention limit). A success-only report.
+    #[serde(default)]
+    pub originals_not_retained: Option<u64>,
+    /// The last reason a record was written without its original this poll.
+    /// Required exactly when `originals_not_retained` is above zero.
+    #[serde(default)]
+    pub original_not_retained_reason: Option<String>,
+    /// `retained` or `failing`: the retention state after the last counted
+    /// record this poll. A success-only report.
+    #[serde(default)]
+    pub original_retention_state: Option<String>,
+    /// Notice sends that failed this poll.
+    #[serde(default)]
+    pub notices_failed: Option<u64>,
+    /// A short description of the notice configuration problem, if any.
+    #[serde(default)]
+    pub notice_config_error: Option<String>,
 }
 
 /// Parameters for `comm.probe` — read-only poll for new inbound message

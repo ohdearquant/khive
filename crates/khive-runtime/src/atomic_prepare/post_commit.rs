@@ -35,7 +35,7 @@ pub async fn apply_post_commit_effects_with_report(
     }
 }
 
-pub(super) async fn apply_one_post_commit_effect(
+pub(crate) async fn apply_one_post_commit_effect(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     effect: PostCommitEffect,

@@ -3,13 +3,25 @@
 #[cfg(test)]
 use super::race_seam;
 use super::{
-    canonicalize_ingest_sent_at, canonicalize_thread_id, json, message_id_match_candidates,
-    outbound_email_message, short_id, thread_id_query_spellings,
-    verified_outbound_email_external_id, Attachment, AttachmentSubstrate, ContentRef,
-    EmailMessageIdDomains, FilterOp, InboxSignal, IngestParams, KhiveRuntime, NamespaceToken,
-    NewAttachment, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlStatement,
-    SqlValue, Utc, Uuid, Value, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    canonicalize_ingest_sent_at, canonicalize_thread_id, json, short_id, Attachment,
+    AttachmentSubstrate, ContentRef, EmailMessageIdDomains, FilterOp, InboxSignal, IngestParams,
+    KhiveRuntime, NamespaceToken, NewAttachment, Note, NoteFilter, PageRequest, PropertyFilter,
+    RuntimeError, SqlStatement, SqlValue, Utc, Uuid, Value, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
 };
+
+#[path = "ingest/correlation.rs"]
+mod correlation;
+pub use correlation::{resolve_ingest_correlation, ResolvedInboundThread};
+
+/// The retention facts disclosed on a new quarantine record's `comm.ingest`
+/// receipt (ADR-056, 2026-10-15 amendment decision 4). `retained` mirrors
+/// whether the committed record kept a `quarantine-original` attachment;
+/// `reason` is present only when it did not and the record carried a reason.
+struct QuarantineRetentionDisclosure {
+    retained: bool,
+    reason: Option<String>,
+}
 
 /// Reuse the stored thread identity for either form of duplicate detection.
 fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
@@ -42,6 +54,76 @@ fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
         ack["thread_id_canonical"] = json!(false);
     }
     ack
+}
+
+/// Withheld retries only verify the original atomic owner; they never backfill
+/// a delivered note or install quarantine expiry on it.
+#[allow(clippy::too_many_arguments)]
+async fn verify_duplicate_replay(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    duplicate: &Note,
+    attachment: Option<&NewAttachment>,
+    channel_kind: Option<&str>,
+    channel_slug: Option<&str>,
+    retention: std::time::Duration,
+    extend_retention: bool,
+    body_withheld: bool,
+) -> Result<(), RuntimeError> {
+    let props = duplicate.properties.as_ref();
+    let stored_quarantine = props.is_some_and(|props| {
+        props.get("quarantined") == Some(&Value::Bool(true))
+            || props.get("quarantined").and_then(Value::as_str) == Some("true")
+    });
+    let stored_withheld =
+        props.is_some_and(|props| props.get("screening_body_withheld") == Some(&Value::Bool(true)));
+    if stored_withheld || (body_withheld && !stored_quarantine) {
+        let attachment = attachment.ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "ingest: duplicate withheld delivery lacks original replay".into(),
+            )
+        })?;
+        let props = props.ok_or_else(|| {
+            RuntimeError::InvalidInput("ingest: duplicate withheld delivery lacks markings".into())
+        })?;
+        if !stored_withheld
+            || stored_quarantine
+            || props.get("origin").and_then(Value::as_str) != Some("external")
+            || props.get("trust").and_then(Value::as_str) != Some("untrusted")
+            || !props.get("labels").is_some_and(Value::is_array)
+            || props.get("channel_kind").and_then(Value::as_str) != channel_kind
+            || props.get("channel_slug").and_then(Value::as_str) != channel_slug
+            || props.get("quarantine_content_ref").and_then(Value::as_str)
+                != Some(attachment.content_ref.as_str())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: duplicate withheld delivery disagrees with original custody".into(),
+            ));
+        }
+        let existing = runtime
+            .core()
+            .attachments()?
+            .get_attachment(duplicate.id, "quarantine-original")
+            .await?;
+        if !matches!(existing, Some(ref owner) if owner.substrate == AttachmentSubstrate::Note && owner.content_ref == attachment.content_ref)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: duplicate withheld delivery has no matching atomic original owner".into(),
+            ));
+        }
+        return Ok(());
+    }
+    repair_duplicate_quarantine(
+        runtime,
+        ns,
+        duplicate,
+        attachment,
+        channel_kind,
+        channel_slug,
+        retention,
+        extend_retention,
+    )
+    .await
 }
 
 /// A duplicate quarantine must prove replay ownership before acknowledgement.
@@ -352,7 +434,23 @@ pub(crate) async fn handle_ingest(
         matches!(metadata.get("quarantined"), Some(Value::Bool(true)))
             || metadata.get("quarantined").and_then(Value::as_str) == Some("true")
     });
-    let quarantine_attachment = if is_quarantined {
+    let body_withheld = p.metadata.as_ref().is_some_and(|metadata| {
+        metadata.get("screening_body_withheld") == Some(&Value::Bool(true))
+    });
+    if body_withheld
+        && (is_quarantined
+            || !p.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("origin").and_then(Value::as_str) == Some("external")
+                    && metadata.get("trust").and_then(Value::as_str) == Some("untrusted")
+                    && metadata.get("labels").is_some_and(Value::is_array)
+            }))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: withheld delivery requires external markings and a delivered disposition"
+                .into(),
+        ));
+    }
+    let quarantine_attachment = if is_quarantined || body_withheld {
         match p
             .metadata
             .as_ref()
@@ -378,6 +476,69 @@ pub(crate) async fn handle_ingest(
     } else {
         None
     };
+    if body_withheld && quarantine_attachment.is_none() {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: withheld delivery requires its original attachment".into(),
+        ));
+    }
+    if body_withheld && runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN {
+        return Err(RuntimeError::Unconfigured(
+            "ingest: withheld delivery requires atomic original ownership on the main backend"
+                .into(),
+        ));
+    }
+    if p.pending_owner_candidates.is_some()
+        && (supplied_thread_id.is_some()
+            || p.correlation_external_id.is_some()
+            || p.channel_kind.as_deref() != Some("email")
+            || !p.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("origin").and_then(Value::as_str) == Some("external")
+                    && metadata.get("trust").and_then(Value::as_str) == Some("untrusted")
+            }))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: pending owner lookup requires an unresolved external email route".into(),
+        ));
+    }
+    if p.reply_opt_out {
+        let marked = p.channel_kind.as_deref() == Some("email")
+            && !is_quarantined
+            && p.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("origin").and_then(Value::as_str) == Some("external")
+                    && metadata.get("trust").and_then(Value::as_str) == Some("untrusted")
+                    && metadata
+                        .get("labels")
+                        .and_then(Value::as_array)
+                        .is_some_and(|labels| {
+                            labels
+                                .iter()
+                                .any(|label| label.as_str() == Some("opt_out.unsubscribe"))
+                        })
+            });
+        if !marked {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: reply opt-out requires authenticated external delivery markings".into(),
+            ));
+        }
+        let address = p
+            .from
+            .trim()
+            .strip_prefix("email:")
+            .and_then(khive_types::email_address::normalize_email_recipient)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "ingest: reply opt-out requires a normalized email sender".into(),
+                )
+            })?;
+        let actor = runtime
+            .config()
+            .actor_id
+            .clone()
+            .unwrap_or_else(|| "channel:email".into());
+        // Do this before both dedup acknowledgements: a failed write retains the
+        // UID in the coordinator's existing bounded hold ledger; retries are unique.
+        super::record_reply_opt_out_suppression(runtime, &address, &actor).await?;
+    }
     // A quarantine original is owned by a main-backend attachment on its
     // quarantine message (ADR-121 item 7), and the runtime refuses that write
     // when the message lives on a secondary backend. Refusing the ingest held
@@ -440,7 +601,7 @@ pub(crate) async fn handle_ingest(
             )
             .await?;
         if let Some(duplicate) = new_page.items.first() {
-            repair_duplicate_quarantine(
+            verify_duplicate_replay(
                 runtime,
                 ns,
                 duplicate,
@@ -449,6 +610,7 @@ pub(crate) async fn handle_ingest(
                 p.channel_slug.as_deref(),
                 quarantine_retention,
                 true,
+                body_withheld,
             )
             .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
@@ -490,7 +652,7 @@ pub(crate) async fn handle_ingest(
             )
             .await?;
         if let Some(duplicate) = old_page.items.first() {
-            repair_duplicate_quarantine(
+            verify_duplicate_replay(
                 runtime,
                 ns,
                 duplicate,
@@ -499,6 +661,7 @@ pub(crate) async fn handle_ingest(
                 p.channel_slug.as_deref(),
                 quarantine_retention,
                 false,
+                body_withheld,
             )
             .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
@@ -508,141 +671,29 @@ pub(crate) async fn handle_ingest(
     // Thread resolution: resolve correlation_external_id to the original message's
     // thread_id + from_actor. Two-query fallback (Message-ID pass, then thread-UUID
     // pass) — see crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
-    let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
-        if !corr.is_empty() {
-            // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
-            let mut pass1 = None;
-            let email_reply =
-                p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:");
-            for candidate in message_id_match_candidates(corr) {
-                let corr_filter = NoteFilter {
-                    kind: Some("message".to_string()),
-                    property_filters: vec![
-                        PropertyFilter {
-                            json_path: "$.external_id".to_string(),
-                            op: FilterOp::Eq,
-                            value: SqlValue::Text(candidate),
-                        },
-                        PropertyFilter {
-                            json_path: "$.direction".to_string(),
-                            op: FilterOp::Eq,
-                            value: SqlValue::Text("outbound".to_string()),
-                        },
-                    ],
-                    ..Default::default()
-                };
-                let mut offset = 0;
-                loop {
-                    let corr_page = store
-                        .query_notes_filtered_count_free(
-                            ns,
-                            &corr_filter,
-                            PageRequest { limit: 100, offset },
-                        )
-                        .await?;
-                    let count = corr_page.items.len();
-                    if let Some(n) = corr_page.items.iter().find(|n| {
-                        if email_reply || outbound_email_message(n) {
-                            verified_outbound_email_external_id(n, email_domains)
-                        } else {
-                            true
-                        }
-                    }) {
-                        // A copied Message-ID can sort first. Only the row that
-                        // owns its UUID may supply the thread and actor.
-                        let thread_id = n
-                            .properties
-                            .as_ref()
-                            .and_then(|props| props.get("thread_id"))
-                            .and_then(Value::as_str)
-                            .and_then(|s| s.parse::<Uuid>().ok())
-                            .map(|id| id.as_hyphenated().to_string())
-                            .unwrap_or_else(|| n.id.as_hyphenated().to_string());
-                        let from_actor = n
-                            .properties
-                            .as_ref()
-                            .and_then(|props| props.get("from_actor"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        pass1 = Some((thread_id, from_actor));
-                        break;
-                    }
-                    if count < 100 {
-                        break;
-                    }
-                    offset = offset.checked_add(count as u64).ok_or_else(|| {
-                        RuntimeError::Internal(
-                            "ingest: correlation pagination offset overflowed".into(),
-                        )
-                    })?;
-                }
-                if pass1.is_some() {
+    let resolved = if let Some(candidates) = p.pending_owner_candidates.as_ref() {
+        let mut selected = None;
+        for candidate in candidates {
+            if let Some(owner) =
+                resolve_ingest_correlation(runtime, token, email_domains, candidate, true).await?
+            {
+                if !owner.actor.trim().is_empty() {
+                    selected = Some((owner.thread_id.to_string(), owner.actor));
                     break;
                 }
             }
-
-            if pass1.is_some() {
-                pass1
-            } else if let Ok(correlation_root) = corr.trim().parse::<Uuid>() {
-                // Pass 2: `corr` is a UUID — may be a thread UUID from X-Khive-Thread-ID.
-                // Match the canonical spelling written by v1 against $.thread_id on an
-                // outbound note to recover from_actor. The selected root stays canonical
-                // even when the transport supplied a compact or braced UUID.
-                let canonical_correlation_root = correlation_root.as_hyphenated().to_string();
-                // No backfill rewrites pre-v1 rows, so probe every spelling older
-                // handlers could have stored (canonical, compact, braced, URN, and
-                // upper-hex) as well as the canonical v1 form. Whatever spelling
-                // matched, the selected root returned below is always canonical.
-                let candidates = thread_id_query_spellings(correlation_root, Some(corr.trim()));
-
-                let mut thread_match = None;
-                for candidate in candidates {
-                    let thread_filter = NoteFilter {
-                        kind: Some("message".to_string()),
-                        property_filters: vec![
-                            PropertyFilter {
-                                json_path: "$.thread_id".to_string(),
-                                op: FilterOp::Eq,
-                                value: SqlValue::Text(candidate),
-                            },
-                            PropertyFilter {
-                                json_path: "$.direction".to_string(),
-                                op: FilterOp::Eq,
-                                value: SqlValue::Text("outbound".to_string()),
-                            },
-                        ],
-                        ..Default::default()
-                    };
-                    let thread_page = store
-                        .query_notes_filtered_count_free(
-                            ns,
-                            &thread_filter,
-                            PageRequest {
-                                limit: 1,
-                                offset: 0,
-                            },
-                        )
-                        .await?;
-                    if let Some(note) = thread_page.items.first() {
-                        let from_actor = note
-                            .properties
-                            .as_ref()
-                            .and_then(|props| props.get("from_actor"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        thread_match = Some((canonical_correlation_root.clone(), from_actor));
-                        break;
-                    }
-                }
-                thread_match
-            } else {
-                None
-            }
-        } else {
-            None
         }
+        selected
+    } else if let Some(corr) = p.correlation_external_id.as_deref() {
+        resolve_ingest_correlation(
+            runtime,
+            token,
+            email_domains,
+            corr,
+            p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:"),
+        )
+        .await?
+        .map(|resolved| (resolved.thread_id.to_string(), resolved.actor))
     } else {
         None
     };
@@ -723,6 +774,29 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // Read the two retention facts a NEW quarantine record is stored with off
+    // `props`, before it is moved into the write: whether the original was kept
+    // (the attachment actually persisted) and, when it was not, the stored
+    // reason. A `secondary-backend` drop rewrote `props` above, so this reads
+    // the final state. `None` means the message is not a quarantine record, so
+    // the receipt emits neither key.
+    let quarantine_retention_disclosure = is_quarantined.then(|| {
+        if quarantine_attachment.is_some() {
+            QuarantineRetentionDisclosure {
+                retained: true,
+                reason: None,
+            }
+        } else {
+            QuarantineRetentionDisclosure {
+                retained: false,
+                reason: props
+                    .get("quarantine_original_not_retained_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }
+        }
+    });
+
     let created = if let Some(attachment) = quarantine_attachment.clone() {
         runtime
             .try_create_note_as_trusted_ingest_with_attachment(
@@ -785,7 +859,7 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: duplicate external_id {external_id:?} has no existing row"
                 ))
             })?;
-            repair_duplicate_quarantine(
+            verify_duplicate_replay(
                 runtime,
                 ns,
                 duplicate,
@@ -794,6 +868,7 @@ pub(crate) async fn handle_ingest(
                 p.channel_slug.as_deref(),
                 quarantine_retention,
                 true,
+                body_withheld,
             )
             .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
@@ -808,6 +883,12 @@ pub(crate) async fn handle_ingest(
         "external_id": p.external_id,
         "deduplicated": false,
     });
+    if let Some(quarantine_retention) = quarantine_retention_disclosure {
+        response["quarantine_original_retained"] = json!(quarantine_retention.retained);
+        if let Some(reason) = quarantine_retention.reason {
+            response["quarantine_original_not_retained_reason"] = json!(reason);
+        }
+    }
     if let Some(report) = degradations {
         response["post_commit_degradations"] = report;
     }

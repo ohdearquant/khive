@@ -5,6 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use khive_channel::ChannelError;
 
+use crate::external_inbound::ThreadOwner;
+
 /// External-email services the channel takes from its host (ADR-200 sections 5.4 and 7).
 ///
 /// The channel depends on no store or policy crate; the daemon implements this over its comm
@@ -21,6 +23,12 @@ pub trait ExternalEmailHost: Send + Sync {
     /// Load the inbound suppression check for one poll: the returned predicate takes a
     /// normalized sender address and answers whether an inbound entry suppresses it.
     async fn inbound_suppression(&self) -> Result<InboundSuppression, ChannelError>;
+
+    /// Resolve one sender-asserted candidate only through verified outbound ownership.
+    async fn lookup_thread_owner(
+        &self,
+        candidate: &str,
+    ) -> Result<Option<ThreadOwner>, ChannelError>;
 
     /// Record a verified mailto unsubscribe for `recipient_key`. `Ok(true)` when a new entry was
     /// written, `Ok(false)` when an identical entry already existed.

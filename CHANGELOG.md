@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Online, which stamps `mx.microsoft.com 1` on its own header for some senders and no `authserv-id`
   for others. An empty or malformed id after the prefix fails configuration. Adding the variant to
   the public `TrustAnchor` enum is a breaking change for exhaustive matches.
+
 ### Changed
 
 - Configurable graph rules share the pure `khive-rule-evaluator` crate between
@@ -51,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be stored, or the record that references it is refused, the record is written without it
   and names the reason. `comm.health` reports `consecutive_held_polls`, `held_messages`,
   `last_held_at` and `last_quarantined_after_hold_at` per channel.
+
+- A new quarantine record's `comm.ingest` receipt now reports whether the record kept its original:
+  `quarantine_original_retained` (a boolean) and, when it is false,
+  `quarantine_original_not_retained_reason` naming the stored reason. A non-quarantine message and a
+  deduplicated acknowledgement carry neither. The success heartbeat gains `originals_not_retained`
+  (a running total of records written without their original, with `original_not_retained_reason`),
+  `original_retention_state` (`retained` or `failing`), `notices_failed` (a running total) and
+  `notice_config_error` (cleared by a later success that omits it); a failure heartbeat refuses all
+  of them. `comm.health` reports each per channel, `null` for a writer that does not report them and
+  for quarantine-only entries.
 
 ## [0.12.0] - 2026-10-13
 

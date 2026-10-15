@@ -71,6 +71,7 @@ pub(crate) use inbox::{handle_inbox, handle_unread};
 #[cfg(test)]
 use ingest::committed_ingest_degradations;
 pub(crate) use ingest::handle_ingest;
+pub use ingest::{resolve_ingest_correlation, ResolvedInboundThread};
 
 pub(crate) use parameter_aliases::{handle_delivered, handle_mark_read};
 
@@ -93,7 +94,7 @@ pub(crate) use suppression::{
 };
 pub use suppression::{
     load_inbound_email_suppressions, load_outbound_email_suppressions,
-    record_mailto_unsubscribe_suppression,
+    record_mailto_unsubscribe_suppression, record_reply_opt_out_suppression,
 };
 
 use validation::{

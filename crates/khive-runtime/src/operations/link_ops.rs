@@ -307,6 +307,25 @@ impl KhiveRuntime {
         src: Option<&Resolved>,
         tgt: Option<&Resolved>,
     ) -> RuntimeResult<()> {
+        self.validate_link_endpoints_by_resolved_with_rules(
+            source_id,
+            target_id,
+            relation,
+            src,
+            tgt,
+            &self.pack_edge_rules(),
+        )
+    }
+
+    pub(crate) fn validate_link_endpoints_by_resolved_with_rules(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        src: Option<&Resolved>,
+        tgt: Option<&Resolved>,
+        pack_rules: &[khive_types::EdgeEndpointRule],
+    ) -> RuntimeResult<()> {
         if source_id == target_id {
             return Err(RuntimeError::InvalidInput(
                 "self-loop edges are not allowed: source_id and target_id must be different".into(),
@@ -347,7 +366,7 @@ impl KhiveRuntime {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
                         let legal_relations = accepted_entity_relations_description(
-                            &self.pack_edge_rules(),
+                            pack_rules,
                             &src_e.kind,
                             src_e.entity_type.as_deref(),
                             &tgt_e.kind,
@@ -399,8 +418,7 @@ impl KhiveRuntime {
 
         // All remaining base relations: entity→entity with kind-level restrictions.
         // Consult pack rules installed on this (source) runtime first.
-        let pack_rules = self.pack_edge_rules();
-        if pack_rule_allows(&pack_rules, relation, src, tgt) {
+        if pack_rule_allows(pack_rules, relation, src, tgt) {
             return Ok(());
         }
 
@@ -435,7 +453,7 @@ impl KhiveRuntime {
 
         if !base_entity_rule_allows(src_kind, relation, tgt_kind) {
             let legal_relations = accepted_entity_relations_description(
-                &pack_rules,
+                pack_rules,
                 src_kind,
                 src_entity_type,
                 tgt_kind,
