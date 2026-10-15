@@ -112,3 +112,12 @@ Selects the trusted `Authentication-Results` header per the configured `TrustAnc
   carries any authserv-id, or fails to parse, that violates the invariant that this
   boundary's own stamp is topmost and unadorned, so the message quarantines (fails closed)
   rather than falling through to a lower header.
+- `TrustAnchor::TopmostWithAuthservId` (ADR-056 Amendment 2026-10-15, configured as
+  `!topmost:<authserv-id>`): the boundary stamps its own topmost header with an
+  authserv-id that other boundaries share (Exchange Online writes `mx.microsoft.com 1`
+  for some senders and no authserv-id for others), so the id cannot identify this
+  boundary and position stays the discriminator. Only `raw_headers[0]` is considered,
+  exactly as in the no-authserv-id mode; it is trusted if it parses AND carries either no
+  authserv-id or the configured one (case-insensitive). Any other authserv-id on it, or a
+  parse failure, quarantines rather than falling through to a lower header, so a forged
+  header carrying the shared id below the boundary's stamp is never selected.

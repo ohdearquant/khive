@@ -329,11 +329,23 @@ impl KhiveRuntime {
                 )
                 .await?;
                 let report = outcomes
-                    .into_iter()
-                    .next()
-                    .map(|outcome| outcome.truncation)
+                    .first()
+                    .map(|outcome| outcome.truncation.clone())
                     .unwrap_or_default();
-                Ok((note, report))
+                let degradations = super::note_reindex::NoteReindexReport {
+                    truncation: report.clone(),
+                    failures: outcomes
+                        .into_iter()
+                        .flat_map(|outcome| outcome.failures)
+                        .collect(),
+                }
+                .post_commit_degradations();
+                crate::operations::legacy_post_commit_result(
+                    "update_note",
+                    id,
+                    (note, report),
+                    degradations,
+                )
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::NoteConflict(conflict),

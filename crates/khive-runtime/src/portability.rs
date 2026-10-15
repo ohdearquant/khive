@@ -117,17 +117,46 @@ where
         .map_err(|error| serde::de::Error::custom(format!("timestamp must be RFC3339: {error}")))
 }
 
+/// Why an archive edge was skipped during a successful import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportEdgeSkipCause {
+    /// The source entity was not found during the initial endpoint check.
+    MissingSource,
+    /// The source exists, but the target entity was not found.
+    MissingTarget,
+    /// The later endpoint-contract check returned InvalidInput or NotFound.
+    EndpointContract,
+}
+
+/// One skipped archive edge, retaining its identity and endpoint-contract error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSkippedEdge {
+    pub edge_id: Uuid,
+    pub source: Uuid,
+    pub target: Uuid,
+    pub relation: EdgeRelation,
+    pub cause: ImportEdgeSkipCause,
+    /// The original RuntimeError display text for EndpointContract only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Outcome of a successful import operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportSummary {
     pub entities_imported: usize,
     pub edges_imported: usize,
-    /// Number of edges that were skipped because one or both endpoint UUIDs
-    /// were not found in the target namespace after entity import.
+    /// Number of edges skipped for missing endpoints or endpoint-contract refusal.
     ///
-    /// A non-zero value indicates the archive contained dangling edges (edges
-    /// referencing entities not present in the archive or the existing graph).
+    /// Newly successful imports set this to skipped_edges.len(). Historical
+    /// summaries can retain a non-zero count without individual details.
     pub edges_skipped: usize,
+    /// Every skipped entry in archive order, including duplicates. Missing-source
+    /// takes precedence when both endpoints are absent. Empty lists are omitted
+    /// from JSON to preserve the previous zero-skip summary shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_edges: Vec<ImportSkippedEdge>,
     /// Aggregate actual outcomes from reindexing imported entities. Source
     /// text remains complete in the entity store and FTS when this is non-zero.
     #[serde(default)]
@@ -429,7 +458,7 @@ impl KhiveRuntime {
         // dangling references in the graph store.
         let graph = self.graph(token)?;
         let mut edges_imported = 0usize;
-        let mut edges_skipped = 0usize;
+        let mut skipped_edges = Vec::new();
         for ee in &archive.edges {
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
@@ -443,7 +472,14 @@ impl KhiveRuntime {
                     relation = ?ee.relation,
                     "import_kg: skipping edge — source entity not found in namespace {ns:?}"
                 );
-                edges_skipped += 1;
+                skipped_edges.push(ImportSkippedEdge {
+                    edge_id: ee.edge_id,
+                    source: ee.source,
+                    target: ee.target,
+                    relation: ee.relation,
+                    cause: ImportEdgeSkipCause::MissingSource,
+                    error: None,
+                });
                 continue;
             }
             let target_ok = match self.get_entity(token, ee.target).await {
@@ -458,7 +494,14 @@ impl KhiveRuntime {
                     relation = ?ee.relation,
                     "import_kg: skipping edge — target entity not found in namespace {ns:?}"
                 );
-                edges_skipped += 1;
+                skipped_edges.push(ImportSkippedEdge {
+                    edge_id: ee.edge_id,
+                    source: ee.source,
+                    target: ee.target,
+                    relation: ee.relation,
+                    cause: ImportEdgeSkipCause::MissingTarget,
+                    error: None,
+                });
                 continue;
             }
             // Only a contract verdict (InvalidInput) or an endpoint-resolution
@@ -478,7 +521,14 @@ impl KhiveRuntime {
                         error = %e,
                         "import_kg: skipping edge — endpoint contract violation in namespace {ns:?}"
                     );
-                    edges_skipped += 1;
+                    skipped_edges.push(ImportSkippedEdge {
+                        edge_id: ee.edge_id,
+                        source: ee.source,
+                        target: ee.target,
+                        relation: ee.relation,
+                        cause: ImportEdgeSkipCause::EndpointContract,
+                        error: Some(e.to_string()),
+                    });
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -503,7 +553,8 @@ impl KhiveRuntime {
         Ok(ImportSummary {
             entities_imported,
             edges_imported,
-            edges_skipped,
+            edges_skipped: skipped_edges.len(),
+            skipped_edges,
             embedding_truncation,
         })
     }
@@ -1843,5 +1894,288 @@ mod tests {
             re_edge.edge_id, original_edge_id,
             "edge_id must be identical across export → import → export"
         );
+    }
+
+    // Skipped-edge details retain archive identity, order and the original refusal.
+    fn skip_report_entity(id: Uuid, name: &str) -> ExportedEntity {
+        let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ExportedEntity {
+            id,
+            kind: "document".into(),
+            entity_type: None,
+            name: name.into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
+    fn skip_report_edge(
+        id: u128,
+        source: Uuid,
+        target: Uuid,
+        relation: EdgeRelation,
+    ) -> ExportedEdge {
+        let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ExportedEdge {
+            edge_id: Uuid::from_u128(id),
+            source,
+            target,
+            relation,
+            weight: 0.7,
+            properties: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
+    fn skip_report_archive(entities: Vec<ExportedEntity>, edges: Vec<ExportedEdge>) -> KgArchive {
+        KgArchive {
+            format: "khive-kg".into(),
+            version: "0.1".into(),
+            namespace: "local".into(),
+            exported_at: Utc::now(),
+            entities,
+            edges,
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_edge_details_cover_three_causes_and_retain_the_valid_edge() {
+        let runtime = make_rt().await;
+        let token = NamespaceToken::local();
+        let source = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let absent = Uuid::from_u128(3);
+        let mut valid = skip_report_edge(101, source, target, EdgeRelation::LinksTo);
+        valid.properties = Some(serde_json::json!({"retained": true}));
+        let archive = skip_report_archive(
+            vec![
+                skip_report_entity(source, "Source"),
+                skip_report_entity(target, "Target"),
+            ],
+            vec![
+                skip_report_edge(100, absent, source, EdgeRelation::LinksTo),
+                valid.clone(),
+                skip_report_edge(102, source, absent, EdgeRelation::DependsOn),
+                skip_report_edge(103, source, target, EdgeRelation::Annotates),
+            ],
+        );
+        let summary = runtime.import_kg(&archive, &token).await.unwrap();
+        let expected = vec![
+            ImportSkippedEdge {
+                edge_id: Uuid::from_u128(100),
+                source: absent,
+                target: source,
+                relation: EdgeRelation::LinksTo,
+                cause: ImportEdgeSkipCause::MissingSource,
+                error: None,
+            },
+            ImportSkippedEdge {
+                edge_id: Uuid::from_u128(102),
+                source,
+                target: absent,
+                relation: EdgeRelation::DependsOn,
+                cause: ImportEdgeSkipCause::MissingTarget,
+                error: None,
+            },
+            ImportSkippedEdge {
+                edge_id: Uuid::from_u128(103),
+                source,
+                target,
+                relation: EdgeRelation::Annotates,
+                cause: ImportEdgeSkipCause::EndpointContract,
+                error: Some(format!(
+                    "invalid input: annotates source {source} must be a note"
+                )),
+            },
+        ];
+        assert_eq!(summary.entities_imported, 2);
+        assert_eq!(summary.edges_imported, 1);
+        assert_eq!(summary.edges_skipped, 3);
+        assert_eq!(summary.skipped_edges, expected);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            wire["skipped_edges"],
+            serde_json::json!([
+                {"edge_id":Uuid::from_u128(100),"source":absent,"target":source,
+                 "relation":"links_to","cause":"missing_source"},
+                {"edge_id":Uuid::from_u128(102),"source":source,"target":absent,
+                 "relation":"depends_on","cause":"missing_target"},
+                {"edge_id":Uuid::from_u128(103),"source":source,"target":target,
+                 "relation":"annotates","cause":"endpoint_contract",
+                 "error":format!("invalid input: annotates source {source} must be a note")}
+            ])
+        );
+        let decoded: ImportSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.skipped_edges, expected);
+        assert_eq!(decoded.edges_skipped, 3);
+        for id in [100, 102, 103] {
+            assert!(runtime
+                .get_edge(&token, Uuid::from_u128(id))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let stored = runtime
+            .get_edge(&token, valid.edge_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Uuid::from(stored.id), valid.edge_id);
+        assert_eq!(stored.source_id, source);
+        assert_eq!(stored.target_id, target);
+        assert_eq!(stored.relation, EdgeRelation::LinksTo);
+        assert_eq!(stored.metadata, valid.properties);
+        assert_eq!(stored.created_at, valid.created_at);
+        assert_eq!(stored.updated_at, valid.updated_at);
+        let exported = runtime.export_kg(&token).await.unwrap();
+        assert_eq!(exported.edges.len(), 1);
+        assert_eq!(exported.edges[0].edge_id, valid.edge_id);
+    }
+
+    #[tokio::test]
+    async fn skipped_edge_details_preserve_duplicates_order_and_both_missing_precedence() {
+        let runtime = make_rt().await;
+        let token = NamespaceToken::local();
+        let present = Uuid::from_u128(1);
+        let absent = Uuid::from_u128(3);
+        let other_absent = Uuid::from_u128(4);
+        let repeated = skip_report_edge(111, absent, present, EdgeRelation::LinksTo);
+        let archive = skip_report_archive(
+            vec![skip_report_entity(present, "Present")],
+            vec![
+                skip_report_edge(110, present, absent, EdgeRelation::DependsOn),
+                repeated.clone(),
+                skip_report_edge(112, absent, present, EdgeRelation::LinksTo),
+                repeated,
+                skip_report_edge(113, absent, other_absent, EdgeRelation::Extends),
+            ],
+        );
+        let summary = runtime.import_kg(&archive, &token).await.unwrap();
+        assert_eq!(summary.edges_imported, 0);
+        assert_eq!(summary.edges_skipped, 5);
+        assert_eq!(
+            summary.skipped_edges,
+            vec![
+                ImportSkippedEdge {
+                    edge_id: Uuid::from_u128(110),
+                    source: present,
+                    target: absent,
+                    relation: EdgeRelation::DependsOn,
+                    cause: ImportEdgeSkipCause::MissingTarget,
+                    error: None,
+                },
+                ImportSkippedEdge {
+                    edge_id: Uuid::from_u128(111),
+                    source: absent,
+                    target: present,
+                    relation: EdgeRelation::LinksTo,
+                    cause: ImportEdgeSkipCause::MissingSource,
+                    error: None,
+                },
+                ImportSkippedEdge {
+                    edge_id: Uuid::from_u128(112),
+                    source: absent,
+                    target: present,
+                    relation: EdgeRelation::LinksTo,
+                    cause: ImportEdgeSkipCause::MissingSource,
+                    error: None,
+                },
+                ImportSkippedEdge {
+                    edge_id: Uuid::from_u128(111),
+                    source: absent,
+                    target: present,
+                    relation: EdgeRelation::LinksTo,
+                    cause: ImportEdgeSkipCause::MissingSource,
+                    error: None,
+                },
+                ImportSkippedEdge {
+                    edge_id: Uuid::from_u128(113),
+                    source: absent,
+                    target: other_absent,
+                    relation: EdgeRelation::Extends,
+                    cause: ImportEdgeSkipCause::MissingSource,
+                    error: None,
+                },
+            ]
+        );
+        assert!(runtime.export_kg(&token).await.unwrap().edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_imports_without_skips_keep_the_previous_json_shape() {
+        let token = NamespaceToken::local();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        for (archive, entities, edges) in [
+            (skip_report_archive(vec![], vec![]), 0, 0),
+            (
+                skip_report_archive(
+                    vec![skip_report_entity(a, "A"), skip_report_entity(b, "B")],
+                    vec![skip_report_edge(101, a, b, EdgeRelation::LinksTo)],
+                ),
+                2,
+                1,
+            ),
+        ] {
+            let runtime = make_rt().await;
+            let summary = runtime.import_kg(&archive, &token).await.unwrap();
+            assert!(summary.skipped_edges.is_empty());
+            assert_eq!(summary.edges_skipped, 0);
+            assert_eq!(
+                serde_json::to_value(&summary).unwrap(),
+                serde_json::json!({
+                    "entities_imported":entities,"edges_imported":edges,"edges_skipped":0,
+                    "embedding_truncation":{"truncated":0,"discarded_bytes":0}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn historical_summary_counts_do_not_invent_skipped_edge_details() {
+        for count in [0, 2] {
+            let old = serde_json::json!({
+                "entities_imported":1,"edges_imported":0,"edges_skipped":count
+            });
+            let summary: ImportSummary = serde_json::from_value(old).unwrap();
+            assert_eq!(summary.edges_skipped, count);
+            assert!(summary.skipped_edges.is_empty());
+            assert_eq!(
+                serde_json::to_value(summary).unwrap(),
+                serde_json::json!({
+                    "entities_imported":1,"edges_imported":0,"edges_skipped":count,
+                    "embedding_truncation":{"truncated":0,"discarded_bytes":0}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_edge_cause_spellings_are_closed_and_error_is_preserved_verbatim() {
+        let wire = serde_json::json!({
+            "edge_id":"00000000-0000-0000-0000-000000000103",
+            "source":"00000000-0000-0000-0000-000000000001",
+            "target":"00000000-0000-0000-0000-000000000002",
+            "relation":"annotates","cause":"endpoint_contract",
+            "error":"not found: link target changed during endpoint validation"
+        });
+        let detail: ImportSkippedEdge = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(detail.cause, ImportEdgeSkipCause::EndpointContract);
+        assert_eq!(
+            detail.error.as_deref(),
+            Some("not found: link target changed during endpoint validation")
+        );
+        assert_eq!(serde_json::to_value(detail).unwrap(), wire);
+        let mut invalid = wire;
+        invalid["cause"] = serde_json::json!("storage_failure");
+        assert!(serde_json::from_value::<ImportSkippedEdge>(invalid).is_err());
     }
 }

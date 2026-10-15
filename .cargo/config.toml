@@ -5,3 +5,16 @@
 # run the built binary directly (outside the Cargo environment), which never
 # receives this marker.
 KHIVE_TEST_HARNESS = { value = "1", force = true }
+
+# The bundled SQLite build in libsqlite3-sys reads these flags. Both remove a process-wide
+# mutex that every connection would otherwise share:
+#   -DSQLITE_DEFAULT_MEMSTATUS=0           memory statistics off; with them on, every
+#                                          sqlite3_malloc and sqlite3_free takes one global lock.
+#   -USQLITE_ENABLE_MEMORY_MANAGEMENT      one page cache per connection instead of one cache
+#                                          for the whole process behind one lock.
+# FTS5 ranking allocates and fetches pages per row, so with either lock concurrent searches
+# serialize, and a write waiting behind them waits too. khive uses none of what the two give
+# up (sqlite3_memory_used, sqlite3_status, sqlite3_release_memory, heap limits). An environment
+# value overrides this one, which is how comparison builds are made. The guard is
+# crates/khive-db/tests/sqlite_compile_options.rs.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0"

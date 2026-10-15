@@ -583,7 +583,7 @@ fn declared_fresh_main_import_succeeds_with_configured_writer_limits() {
     let db = tmp.path().join("fresh/nested/db");
     let source = write_format(&tmp, "json", &records());
     let cfg = tmp.path().join("main.toml");
-    std::fs::write(&cfg,format!("[schema]\nstrict=false\n[[backends]]\nname=\"main\"\npath={:?}\nwal_ceiling_bytes=104857600\ndisk_reserve_bytes=0\ndisk_guard_deadline_ms=777\n",db.to_str().unwrap())).unwrap();
+    std::fs::write(&cfg,format!("[schema]\nstrict=false\n[[backends]]\nname=\"main\"\npath={:?}\ndisk_reserve_bytes=0\ndisk_guard_deadline_ms=777\n",db.to_str().unwrap())).unwrap();
     assert_success(&import(&tmp, &source, &db, &cfg, "json", "off"));
     assert_eq!(export(&tmp, &db)["entities"].as_array().unwrap().len(), 3);
 }

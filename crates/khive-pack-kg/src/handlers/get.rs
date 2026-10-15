@@ -744,23 +744,15 @@ async fn resolve_id_through_arms(
 }
 
 fn parse_uuid_column(row: &SqlRow, name: &str) -> Result<Uuid, RuntimeError> {
-    Uuid::from_str(
-        &row.text(name)
-            .map(str::to_owned)
-            .map_err(|_| event_column_error(row, name))?,
-    )
-    .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+    row.uuid(name).map_err(|_| event_column_error(row, name))
 }
 
 fn sql_optional_uuid(row: &SqlRow, name: &str) -> Result<Option<Uuid>, RuntimeError> {
-    row.opt_text_or_absent(name)
-        .map(|value| value.map(str::to_owned))
-        .map_err(|_| event_column_error(row, name))?
-        .map(|v| {
-            Uuid::from_str(&v)
-                .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
-        })
-        .transpose()
+    if row.get(name).is_none() {
+        return Ok(None);
+    }
+    row.opt_uuid(name)
+        .map_err(|_| event_column_error(row, name))
 }
 
 fn event_column_error(row: &SqlRow, name: &str) -> RuntimeError {

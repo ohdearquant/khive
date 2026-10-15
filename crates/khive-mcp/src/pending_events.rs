@@ -6,9 +6,9 @@
 //! their creating actors through `comm.send`, and durably records each action
 //! outcome before finalizing the event lifecycle. Successful one-shots become
 //! `"fired"`; failed one-shots retry only when the domain outcome permits it;
-//! named repeats advance to their next occurrence. Events overdue by more than
-//! the configured grace window are never dispatched, per the missed-event
-//! policy below.
+//! named repeats advance to their next occurrence. The default skip policy
+//! uses the configured grace window; explicit catch_up_once rows select one
+//! latest occurrence within their stored bound, per the missed-event policy below.
 //!
 //! Full design rationale (module placement, invocation-mode tradeoffs,
 //! namespace-isolation and missed-event-policy background) lives in
@@ -59,6 +59,12 @@
 //! occurrence strictly after now rather than firing a catch-up burst. The
 //! creator-identity fence runs first for generic actions: an unattributed
 //! legacy row becomes `failed`, not `missed`, even when stale.
+//!
+//! Explicit `catch_up_once` uses its required `max_lateness` instead of the
+//! global grace window. It selects only the latest due occurrence, records a
+//! version-2 receipt naming that occurrence and the raw source trigger, and
+//! advances repeats past the finalization time. Earlier occurrences never
+//! dispatch separately. Version-1 receipts keep their original interpretation.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
@@ -81,17 +87,18 @@ use dispatch::{
     stored_action_is_non_single, verified_creator_for_event, DispatchLeaseTarget,
 };
 #[cfg(test)]
-use dispatch::{action_failures, dispatch_action};
+use dispatch::{action_failures, creator_provenance_statement, dispatch_action};
 
 #[cfg(test)]
 use drain::run_pending_events_on_with_lease;
 pub use drain::{run_pending_events, run_pending_events_on, run_pending_events_with_config};
 
 use receipt::{
-    apply_final_disposition, claim_pending_event, completion_from_receipt,
-    dispatch_error_property_keys, dispatch_occurrence_id, final_properties_after_dispatch,
-    mark_dispatch_invoking, mark_dispatch_receipt_indeterminate, mark_recurrence_failure,
-    mask_json_content, persist_dispatch_outcome, renew_dispatch_lease, validate_dispatch_receipt,
+    apply_final_disposition, claim_pending_catch_up_event, claim_pending_event,
+    completion_from_receipt, dispatch_error_property_keys, dispatch_occurrence_id,
+    final_properties_after_dispatch, final_properties_after_dispatch_at, mark_dispatch_invoking,
+    mark_dispatch_receipt_indeterminate, mark_recurrence_failure, mask_json_content,
+    persist_dispatch_outcome, renew_dispatch_lease, validate_dispatch_receipt,
 };
 
 use reclaim::{
@@ -108,7 +115,8 @@ use recurrence::{
 };
 use recurrence::{
     advance_repeat_past_missed_for_event, append_reminder_delivery_failure_event,
-    next_trigger_at_for_event, reminder_delivery_action, UNADVANCEABLE_REPEAT,
+    next_trigger_at_for_event, reminder_delivery_action, select_catch_up_occurrence,
+    UNADVANCEABLE_REPEAT,
 };
 
 /// Default renewable dispatch-lease duration. A live invocation renews at one
@@ -123,6 +131,46 @@ const DEFAULT_DISPATCH_LEASE_SECS: u64 = 5 * 60;
 const LEGACY_STALE_FIRING_TIMEOUT_MICROS: i64 = 5 * 60 * 1_000_000;
 
 const DISPATCH_RECEIPT_VERSION: u64 = 1;
+const CATCH_UP_RECEIPT_VERSION: u64 = 2;
+
+#[cfg(test)]
+tokio::task_local! {
+    static MISFIRE_NOW: DateTime<Utc>;
+}
+
+fn misfire_now() -> DateTime<Utc> {
+    #[cfg(test)]
+    if let Ok(now) = MISFIRE_NOW.try_with(|now| *now) {
+        return now;
+    }
+    Utc::now()
+}
+
+#[derive(Clone, Debug)]
+struct CatchUpOccurrence {
+    source_trigger_at: String,
+    scheduled_for: DateTime<Utc>,
+    decision_at: i64,
+    effective_max_lateness: i64,
+}
+
+impl CatchUpOccurrence {
+    fn is_missed(&self) -> bool {
+        let decision = DateTime::<Utc>::from_timestamp_micros(self.decision_at)
+            .expect("validated decision timestamp");
+        decision.signed_duration_since(self.scheduled_for)
+            > Duration::try_seconds(self.effective_max_lateness)
+                .expect("validated lateness duration")
+    }
+
+    fn add_to_receipt(&self, receipt: &mut Value) {
+        receipt["version"] = json!(CATCH_UP_RECEIPT_VERSION);
+        receipt["source_trigger_at"] = json!(self.source_trigger_at);
+        receipt["scheduled_for"] = json!(self.scheduled_for.to_rfc3339());
+        receipt["decision_at"] = json!(self.decision_at);
+        receipt["effective_max_lateness"] = json!(self.effective_max_lateness);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct DispatchLeaseConfig {
@@ -157,6 +205,7 @@ struct DispatchClaim {
     occurrence_id: uuid::Uuid,
     invocation_id: uuid::Uuid,
     actor: String,
+    catch_up: Option<CatchUpOccurrence>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,14 +216,18 @@ struct RecoverySnapshot<'a> {
 
 impl DispatchClaim {
     fn claimed_receipt(&self) -> Value {
-        json!({
+        let mut receipt = json!({
             "version": DISPATCH_RECEIPT_VERSION,
             "occurrence_id": self.occurrence_id,
             "invocation_id": self.invocation_id,
             "actor": self.actor.as_str(),
             "state": DispatchReceiptState::Claimed.as_str(),
             "claimed_at": self.firing_at,
-        })
+        });
+        if let Some(catch_up) = &self.catch_up {
+            catch_up.add_to_receipt(&mut receipt);
+        }
+        receipt
     }
 
     fn completed_without_invocation_receipt(
@@ -187,7 +240,7 @@ impl DispatchClaim {
             state,
             DispatchReceiptState::NotInvoked | DispatchReceiptState::Missed
         ));
-        json!({
+        let mut receipt = json!({
             "version": DISPATCH_RECEIPT_VERSION,
             "occurrence_id": self.occurrence_id,
             "invocation_id": self.invocation_id,
@@ -197,7 +250,11 @@ impl DispatchClaim {
             "completed_at": completed_at,
             "error": error,
             "error_payload": null,
-        })
+        });
+        if let Some(catch_up) = &self.catch_up {
+            catch_up.add_to_receipt(&mut receipt);
+        }
+        receipt
     }
 }
 
@@ -245,6 +302,7 @@ struct ValidatedDispatchReceipt {
     invocation_id: uuid::Uuid,
     actor: String,
     state: DispatchReceiptState,
+    catch_up: Option<CatchUpOccurrence>,
 }
 
 /// CancellationToken itself does not cancel when its last handle is dropped.
@@ -587,3 +645,7 @@ pub(crate) mod race_seam;
 #[cfg(test)]
 #[path = "pending_events_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pending_events/misfire_tests.rs"]
+mod misfire_tests;

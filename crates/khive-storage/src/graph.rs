@@ -422,6 +422,29 @@ pub trait GraphStore: Send + Sync + 'static {
             }),
         }
     }
+    /// Count live edges across the given namespaces grouped by relation and,
+    /// within each relation, by the base each endpoint resolves against.
+    ///
+    /// The live edge total, the relation counts and the endpoint-base counts
+    /// describe one population, so one grouped scan answers all three:
+    /// summing each relation's buckets gives its relation count, and summing
+    /// the buckets across relations gives the endpoint-base counts. Asking for
+    /// them as three aggregates walks the edge table and its endpoint probes
+    /// three times. Backends without this aggregate report `Unsupported`, and
+    /// callers fall back to the three single-purpose counts.
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>> {
+        let _ = namespaces;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "count_edges_by_relation_and_endpoint_base_in_namespaces".into(),
+            message: "this backend does not implement the combined relation and endpoint-base \
+                      edge count"
+                .into(),
+        })
+    }
     /// Seek-pagination page of edges ordered by `id` ascending, using an
     /// indexed range scan (`id > after`) against the `(namespace, id)`
     /// primary key instead of `OFFSET`. `after` is exclusive; `None` starts

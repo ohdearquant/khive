@@ -2562,6 +2562,115 @@ async fn test_cjk_query_finds_note_embedded_by_primary_engine() {
     );
 }
 
+async fn recalled_ids(registry: &VerbRegistry, args: Value) -> Vec<String> {
+    let recall = registry
+        .dispatch("memory.recall", args)
+        .await
+        .expect("recall");
+    recall
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("hit id").to_owned())
+        .collect()
+}
+
+/// A CJK-dominant query leaves an English-only engine's candidates out of fusion when another
+/// engine contributed candidates. An English query and an explicit `embedding_model` keep them.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_cjk_query_leaves_english_only_engine_out_of_fusion() {
+    const ENGLISH_ONLY: &str = "all-minilm-l6-v2";
+    const MULTILINGUAL: &str = "paraphrase-multilingual-minilm-l12-v2";
+
+    let rt = make_runtime();
+    rt.register_embedder(ConstVecProvider::new(
+        ENGLISH_ONLY,
+        EmbeddingModel::AllMiniLmL6V2.dimensions(),
+        0.5,
+    ));
+    rt.register_embedder(ConstVecProvider::new(
+        MULTILINGUAL,
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2.dimensions(),
+        0.6,
+    ));
+    let registry = make_registry(rt.clone());
+
+    // Each note is embedded through one engine only, so each engine's candidate list holds
+    // exactly one note. Neither note shares a word with the queries below, so the text leg
+    // returns nothing.
+    let mut note_ids = Vec::new();
+    for (content, model) in [
+        ("note indexed through the english only engine", ENGLISH_ONLY),
+        ("note indexed through the multilingual engine", MULTILINGUAL),
+    ] {
+        let created = registry
+            .dispatch(
+                "memory.remember",
+                json!({ "content": content, "salience": 0.7, "embedding_model": model }),
+            )
+            .await
+            .expect("remember through one engine");
+        note_ids.push(created["id"].as_str().expect("note id").to_owned());
+    }
+    let (english_only_note, multilingual_note) = (&note_ids[0], &note_ids[1]);
+
+    let cjk = recalled_ids(
+        &registry,
+        json!({ "query": "你好世界的中文查询", "limit": 10 }),
+    )
+    .await;
+    assert!(
+        cjk.contains(multilingual_note),
+        "the multilingual engine's candidate must be returned; got: {cjk:?}"
+    );
+    assert!(
+        !cjk.contains(english_only_note),
+        "a CJK-dominant query must not return a candidate only the English-only engine has; \
+         got: {cjk:?}"
+    );
+
+    let explicit = recalled_ids(
+        &registry,
+        json!({ "query": "你好世界的中文查询", "limit": 10, "embedding_model": ENGLISH_ONLY }),
+    )
+    .await;
+    assert!(
+        explicit.contains(english_only_note),
+        "an explicit embedding_model request must be respected; got: {explicit:?}"
+    );
+
+    let english = recalled_ids(
+        &registry,
+        json!({ "query": "zebra giraffe walrus", "limit": 10 }),
+    )
+    .await;
+    assert!(
+        english.contains(english_only_note) && english.contains(multilingual_note),
+        "an English query must keep every engine's candidates; got: {english:?}"
+    );
+
+    // memory.recall_fuse fuses through the same rule.
+    let fused = registry
+        .dispatch(
+            "memory.recall_fuse",
+            json!({ "query": "你好世界的中文查询" }),
+        )
+        .await
+        .expect("memory.recall_fuse");
+    let fused_ids: Vec<String> = fused["fused_candidates"]
+        .as_array()
+        .expect("fused array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("fused id").to_owned())
+        .collect();
+    assert!(
+        fused_ids.contains(multilingual_note) && !fused_ids.contains(english_only_note),
+        "recall_fuse must leave the English-only engine out for a CJK-dominant query; \
+         got: {fused_ids:?}"
+    );
+}
+
 // ── Wave-2 regression tests (M-C1..M-C4) ──────────────────────────────────────
 
 /// M-C1: memory_type="procedural" must be rejected with a clear error listing

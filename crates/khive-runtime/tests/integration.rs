@@ -4906,6 +4906,16 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         "edges_by_relation must sum to the edges scalar under all identities"
     );
 
+    // `stats()` reads the three edge counts as one grouped aggregate, which
+    // must answer exactly what the separate counts answer.
+    let combined = rt.edge_stats_counts(&vis_tok).await.unwrap();
+    assert_eq!(combined.edges, stats_edges);
+    assert_eq!(combined.edges_by_relation, edges_by_relation);
+    assert_eq!(
+        combined.edges_by_endpoint_base,
+        rt.count_edges_by_endpoint_base(&vis_tok).await.unwrap()
+    );
+
     let full_notes = rt.list_notes(&vis_tok, None, 200, 0).await.unwrap();
     let stats_notes = rt.count_notes(&vis_tok, None).await.unwrap();
     assert_eq!(

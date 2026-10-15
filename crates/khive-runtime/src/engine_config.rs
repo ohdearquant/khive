@@ -47,7 +47,7 @@ pub enum ConfigError {
         path: PathBuf,
         key: &'static str,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("exactly one engine must be marked `default = true`; found {found}")]
@@ -583,6 +583,8 @@ pub enum BlobConfig {
     Fs {
         #[serde(default)]
         root: Option<String>,
+        /// Free-space floor in bytes. Absent: 2% of the volume holding the
+        /// root, at least 5 GiB (ADR-111 Amendment 6); `0` disables it.
         #[serde(default)]
         floor_bytes: Option<u64>,
     },
@@ -1321,8 +1323,30 @@ impl Default for SchemaSectionConfig {
 // source span. Other sections remain under the full loader's validation.
 #[derive(Deserialize)]
 struct SchemaSyntaxProbe {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_schema_table")]
     schema: SchemaSectionConfig,
+}
+
+fn deserialize_schema_table<'de, D>(deserializer: D) -> Result<SchemaSectionConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SchemaTableVisitor;
+    impl<'de> serde::de::Visitor<'de> for SchemaTableVisitor {
+        type Value = SchemaSectionConfig;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a schema configuration table")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            SchemaSectionConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(SchemaTableVisitor)
 }
 
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
@@ -1562,7 +1586,7 @@ impl KhiveConfig {
                 } else {
                     "schema.strict"
                 },
-                source,
+                source: Box::new(source),
             })?;
         let unknown_schema_keys: Vec<String> = document
             .get("schema")

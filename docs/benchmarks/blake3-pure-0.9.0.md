@@ -89,3 +89,13 @@ same BLAKE3 algorithm. The accepted risk is performance only, justified for the
 bounded 0.9.0 window by the cross-compilation requirement and the already-merged
 upstream exit. If lattice 0.10.0 publication is delayed past the next dependency
 refresh, the decision must be reopened rather than copied forward.
+
+## Exit
+
+The exit condition is met by lattice 0.11.1. `lattice-embed` 0.11.1 replaces its
+BLAKE3 provenance hash with SHA-256 and no published lattice crate in Khive's graph
+depends on BLAKE3, so `cargo tree -e features -i blake3 --workspace` no longer
+reports the `pure` feature. With lattice no longer contributing `std` either, each
+Khive member that runs on std enables `blake3/std` itself, which keeps runtime SIMD
+detection on x86_64; `khive-types` keeps its no_std dependency. Persisted digests
+are unchanged because both backends compute the same BLAKE3 function.

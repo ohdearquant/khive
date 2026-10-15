@@ -254,12 +254,14 @@ pub(super) async fn reclaim_stale_firing_events(
             invocation_id,
             actor,
             state,
+            catch_up,
         } = validated;
         let claim = DispatchClaim {
             firing_at,
             occurrence_id,
             invocation_id,
             actor,
+            catch_up,
         };
         if state == DispatchReceiptState::Claimed {
             let error =
@@ -375,13 +377,14 @@ pub(super) async fn reclaim_stale_firing_events(
             .and_then(Value::as_str)
             .map(str::to_string);
         let (final_properties, disposition) = match trigger_at_fixed {
-            Some(trigger_at_fixed) => final_properties_after_dispatch(
+            Some(trigger_at_fixed) => final_properties_after_dispatch_at(
                 properties,
                 receipt,
                 &completion,
                 trigger_at_fixed.with_timezone(&Utc),
                 *trigger_at_fixed.offset(),
                 &repeat,
+                DateTime::<Utc>::from_timestamp_micros(now_micros).unwrap_or_else(misfire_now),
             ),
             None => {
                 properties["dispatch_receipt"] = receipt;

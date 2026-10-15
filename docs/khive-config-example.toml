@@ -343,6 +343,23 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.
+#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the four variables
+#   below are read only when it is set and are ignored while it is unset.
+#   KHIVE_EMAIL_EXTERNAL_SENDERS=lambda:example
+#                                Comma-separated actor ids allowed to send to external recipients.
+#   KHIVE_EMAIL_EXTERNAL_DAILY_CAP=200
+#                                Required with EXTERNAL_SENDERS. Positive integer; bounds fresh
+#                                external admissions in any trailing 24 hours.
+#   KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY=            Hex key material (>= 32 bytes). Secret.
+#                                Recipient-key secret; the key is HMAC-SHA256(addr) under it.
+#   KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS=0:<hex>,1:<hex>
+#                                Comma-separated id:key pairs (id 0-255, unique, key >= 32 bytes
+#                                hex). Highest id mints tokens; retired ids keep verifying. Secret.
+#   KHIVE_EMAIL_EXTERNAL_FOOTER_FILE=/etc/khive/footer.txt
+#                                Text file appended to every external message. Must be readable and
+#                                contain {unsubscribe}, replaced with the mailto opt-out sentence.
+#                                External admission is refused while it is unset, unreadable or
+#                                missing the placeholder.
 #   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
 #   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
 #   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.
@@ -410,6 +427,8 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_RECALL_FTS_GATHER_LIMIT=        Explicit row cap for rank_subset mode (> 0). Default: derived.
 #   KHIVE_RECALL_FTS_CJK_BYPASS=true      CJK queries bypass term-K selection. Accepts 1/true/0/false.
 #   KHIVE_RECALL_PROFILE=1                Emit per-stage recall timing JSON to stderr (presence = on).
+#   KHIVE_SEARCH_PROFILE=1                Emit per-stage timing JSON for searches that fan out across
+#                                        [[backends]] to stderr (presence = on; kkernel).
 #   ANN_OVERFETCH_MAX_ROUNDS=3           Max ANN over-fetch retry rounds when post-filtering drops
 #                                        candidates below the requested limit (un-prefixed; pack `memory`).
 #
