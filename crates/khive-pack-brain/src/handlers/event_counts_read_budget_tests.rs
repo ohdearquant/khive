@@ -92,12 +92,31 @@ async fn both_grouped_count_adapters_preserve_typed_read_refusals_without_fallba
 #[tokio::test]
 async fn actual_event_counts_handler_refuses_an_expired_original_request() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = runtime
+        .authorize_with_visibility(Namespace::local(), runtime.visible_namespaces().to_vec())
+        .unwrap();
+    let pack = BrainPack::new(runtime.clone());
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(BrainPack::new(runtime));
     let registry = builder.build().unwrap();
-    let result = khive_storage::scope_request_read_deadline_at(
-        khive_storage::RequestReadDeadline::after(std::time::Duration::ZERO),
+    let expired = || khive_storage::RequestReadDeadline::after(std::time::Duration::ZERO);
+
+    // The handler checks the original deadline before any read and names the operator budget.
+    let direct = khive_storage::scope_request_read_deadline_at(
+        expired(),
+        pack.handle_event_counts(&token, json!({"since": "2026-10-01T00:00:00Z"})),
+    )
+    .await;
+    assert!(
+        matches!(&direct, Err(RuntimeError::Storage(khive_storage::StorageError::Timeout { operation })) if operation.contains("operator read budget") && operation.contains("brain.event_counts")),
+        "direct handler result: {direct:?}"
+    );
+
+    // Through the registry the pack's state load reads first, so the refusal is a typed
+    // timeout from whichever read meets the expired deadline; no count is returned.
+    let dispatched = khive_storage::scope_request_read_deadline_at(
+        expired(),
         registry.dispatch(
             "brain.event_counts",
             json!({"since": "2026-10-01T00:00:00Z"}),
@@ -105,7 +124,13 @@ async fn actual_event_counts_handler_refuses_an_expired_original_request() {
     )
     .await;
     assert!(
-        matches!(result, Err(RuntimeError::Storage(khive_storage::StorageError::Timeout { operation })) if operation.contains("operator read budget") && operation.contains("brain.event_counts"))
+        matches!(
+            &dispatched,
+            Err(RuntimeError::Storage(
+                khive_storage::StorageError::Timeout { .. }
+            ))
+        ),
+        "dispatched result: {dispatched:?}"
     );
     let live = registry
         .dispatch(
