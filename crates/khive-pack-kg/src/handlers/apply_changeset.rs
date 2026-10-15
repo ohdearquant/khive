@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,6 +15,18 @@ struct ApplyChangesetParams {
 }
 
 impl KgPack {
+    /// [`Self::handle_apply_changeset`] behind one heap allocation. A plain function builds the
+    /// future and moves it into the box, so the large unpolled future never occupies the stack
+    /// frame of the async dispatch that awaits it.
+    pub(crate) fn handle_apply_changeset_boxed<'a>(
+        &'a self,
+        token: &'a NamespaceToken,
+        params: Value,
+        registry: &'a VerbRegistry,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, RuntimeError>> + Send + 'a>> {
+        Box::pin(self.handle_apply_changeset(token, params, registry))
+    }
+
     pub(crate) async fn handle_apply_changeset(
         &self,
         token: &NamespaceToken,

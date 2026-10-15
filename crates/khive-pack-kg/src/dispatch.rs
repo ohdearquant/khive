@@ -173,10 +173,12 @@ impl PackRuntime for KgPack {
         );
 
         match verb {
-            // Boxed: the canonical apply future is large, and inline it would grow the stack
-            // frame of every dispatch, whichever verb is called.
+            // Built and boxed outside this async body: the canonical apply future is large, and
+            // constructed here it would grow the stack frame of every dispatch, whichever verb is
+            // called.
             "apply_changeset" => {
-                Box::pin(self.handle_apply_changeset(graph_token, params, registry)).await
+                self.handle_apply_changeset_boxed(graph_token, params, registry)
+                    .await
             }
             // Kind-discriminated: override only for entity/edge kinds.
             "create" | "list" | "search" => {
