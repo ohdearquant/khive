@@ -104,6 +104,12 @@ fn external_raw_fixture(name: &str) -> &'static [u8] {
             }
             recorded::MIME
         }
+        "executable-opt-out" => {
+            mod recorded {
+                include!("../../tests/fixtures/external-inbound/executable-opt-out.eml.rs");
+            }
+            recorded::MIME
+        }
         "ordinary-attachment" => {
             mod recorded {
                 include!("../../tests/fixtures/external-inbound/ordinary-attachment.eml.rs");
@@ -576,7 +582,12 @@ async fn emitted_external_ingest_params(
         "default_inbound_actor": delivery.map(|delivery| delivery.actor.as_str()).unwrap_or("lambda:recipient"),
         "thread_id": delivery.and_then(|delivery| delivery.thread_id).map(|id| id.to_string()),
         "pending_owner_candidates": delivery.and_then(|delivery| delivery.pending_owner_candidates.as_ref()),
-        "reply_opt_out": delivery.is_some_and(|delivery| delivery.reply_opt_out),
+        "reply_opt_out": delivery.is_some_and(|delivery| delivery.reply_opt_out)
+            || (delivery.is_none()
+                && ["quarantined", "screening_opt_out"]
+                    .iter()
+                    .all(|key| env.metadata.get(*key).map(String::as_str) == Some("true"))
+                && env.metadata.get("quarantine_reason").map(String::as_str) == Some("screened")),
         "wire_message_id": env.wire_message_id,
         "wire_references": env.wire_references,
         "metadata": metadata,
@@ -839,4 +850,64 @@ async fn a15_raw_two_withholding_families_quarantine_as_screened() {
     let duplicate = registry.dispatch("comm.ingest", params).await.unwrap();
     assert_eq!(duplicate["deduplicated"], true);
     assert_eq!(first["thread_id"], duplicate["thread_id"]);
+}
+
+/// ADR-200 Amendment 1 Decision 5 (A19): an authenticated opt-out in a message that screening
+/// quarantines still suppresses its sender; the same quarantine without an opt-out records nothing.
+#[tokio::test]
+async fn a19_screened_quarantine_opt_out_suppresses_the_authenticated_sender() {
+    for (name, opt_out) in [("executable-opt-out", true), ("executable-screened", false)] {
+        let page = external_raw_page(
+            name,
+            Arc::new(RoutingHost {
+                enabled: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let env = &page.envelopes[0];
+        assert!(env.inbound_delivery.is_none(), "{name}");
+        assert_eq!(
+            env.metadata.get("quarantine_reason").map(String::as_str),
+            Some("screened"),
+            "{name}"
+        );
+        assert_eq!(
+            env.metadata.get("screening_opt_out").map(String::as_str),
+            opt_out.then_some("true"),
+            "{name}"
+        );
+        let (registry, runtime) = external_ingest_registry();
+        let params = emitted_external_ingest_params(env, &registry).await;
+        assert_eq!(params["reply_opt_out"], opt_out, "{name}");
+        let labels = params["metadata"]["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|label| label
+            .as_str()
+            .is_some_and(|id| id.starts_with("executable_attachment."))));
+        assert_eq!(
+            labels.iter().any(|label| label == "opt_out.unsubscribe"),
+            opt_out,
+            "{name}"
+        );
+        registry
+            .dispatch("comm.ingest", params.clone())
+            .await
+            .unwrap();
+        let duplicate = registry.dispatch("comm.ingest", params).await.unwrap();
+        assert_eq!(duplicate["deduplicated"], true, "{name}");
+        let entries = khive_pack_comm::handlers::load_outbound_email_suppressions(&runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == khive_runtime::EmailSuppressionKind::Address
+                        && entry.value == "stranger@outside.example"
+                })
+                .count(),
+            usize::from(opt_out),
+            "{name}"
+        );
+    }
 }
