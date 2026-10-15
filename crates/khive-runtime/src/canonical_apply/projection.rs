@@ -41,7 +41,7 @@ pub(super) fn note(value: &khive_storage::Note) -> Result<khive_types::Note, Sto
     };
     let note = khive_types::Note {
         header: Header {
-            id: value.id.into(),
+            id: super::id128(value.id),
             namespace: Namespace::parse(&value.namespace).map_err(|_| invalid("namespace"))?,
             created_at: timestamp(value.created_at, "created_at")?,
             updated_at: timestamp(value.updated_at, "updated_at")?,
@@ -71,7 +71,7 @@ pub(super) fn note(value: &khive_storage::Note) -> Result<khive_types::Note, Sto
 pub(super) fn entity(value: &khive_storage::Entity) -> Result<khive_types::Entity, StorageError> {
     Ok(khive_types::Entity {
         header: Header {
-            id: value.id.into(),
+            id: super::id128(value.id),
             namespace: Namespace::parse(&value.namespace).map_err(|_| invalid("namespace"))?,
             created_at: timestamp(value.created_at, "created_at")?,
             updated_at: timestamp(value.updated_at, "updated_at")?,
@@ -91,10 +91,10 @@ pub(super) fn entity(value: &khive_storage::Entity) -> Result<khive_types::Entit
 
 pub(super) fn edge(value: &khive_storage::Edge) -> Result<khive_types::Link, StorageError> {
     let edge = khive_types::Link {
-        id: uuid::Uuid::from(value.id).into(),
+        id: super::id128(uuid::Uuid::from(value.id)),
         namespace: value.namespace.clone(),
-        source: value.source_id.into(),
-        target: value.target_id.into(),
+        source: super::id128(value.source_id),
+        target: super::id128(value.target_id),
         relation: value.relation,
         properties: properties(&value.metadata)?,
         weight: value.weight,

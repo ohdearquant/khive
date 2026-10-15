@@ -341,6 +341,10 @@ impl ProposalApplyWorker {
                     budget.consume_new_entry()?;
                 }
             }
+            // A direct `apply_changeset` call is gated by registry dispatch; a reviewed
+            // proposal reaches the landing path here instead, so its wrapper is checked
+            // against the applying caller before anything is prepared.
+            registry.authorize_canonical_changeset(token, delta).await?;
             return match crate::canonical_apply::apply_delta(
                 &self.runtime,
                 registry,

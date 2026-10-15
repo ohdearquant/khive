@@ -17,6 +17,15 @@ use crate::{
     VerbRegistry,
 };
 
+/// Change-set identifiers are `Id128`; runtime records key on `Uuid`. Both carry the same 16 bytes.
+fn uuid(id: khive_types::Id128) -> Uuid {
+    Uuid::from_bytes(*id.as_bytes())
+}
+
+fn id128(id: Uuid) -> khive_types::Id128 {
+    khive_types::Id128::from_bytes(*id.as_bytes())
+}
+
 mod entities;
 mod links;
 mod notes;
@@ -104,9 +113,9 @@ impl Record {
                 op,
                 CanonicalRecordRef::Edge(&projection::edge(x).map_err(storage)?),
             ),
-            Self::Event => return Err(mismatch(op.target_id().into(), "substrate")),
+            Self::Event => return Err(mismatch(uuid(op.target_id()), "substrate")),
         };
-        result.map_err(|e| mismatch(op.target_id().into(), &e.field_path))
+        result.map_err(|e| mismatch(uuid(op.target_id()), &e.field_path))
     }
     fn check_delete(&self, op: &DeleteOp) -> Result<(), AtomicOpFailure> {
         let result = match self {
@@ -122,9 +131,9 @@ impl Record {
                 op,
                 CanonicalRecordRef::Edge(&projection::edge(x).map_err(storage)?),
             ),
-            Self::Event => return Err(mismatch(op.target_id.into(), "substrate")),
+            Self::Event => return Err(mismatch(uuid(op.target_id), "substrate")),
         };
-        result.map_err(|e| mismatch(op.target_id.into(), &e.field_path))
+        result.map_err(|e| mismatch(uuid(op.target_id), &e.field_path))
     }
 }
 
@@ -195,10 +204,10 @@ pub async fn prepare_canonical_changeset(
                             "canonical staged id is reused".into(),
                         ));
                     }
-                    let source = read_prepare(runtime, &op_token, link.source.into(), &mut shadow)
+                    let source = read_prepare(runtime, &op_token, uuid(link.source), &mut shadow)
                         .await?
                         .ok_or_else(|| RuntimeError::NotFound("canonical link source".into()))?;
-                    let target = read_prepare(runtime, &op_token, link.target.into(), &mut shadow)
+                    let target = read_prepare(runtime, &op_token, uuid(link.target), &mut shadow)
                         .await?
                         .ok_or_else(|| RuntimeError::NotFound("canonical link target".into()))?;
                     let rules = runtime.pack_edge_rules();
@@ -211,8 +220,8 @@ pub async fn prepare_canonical_changeset(
                             .1
                             .push(crate::LinkSpec {
                                 namespace: Some(link.namespace.as_str().into()),
-                                source_id: link.source.into(),
-                                target_id: link.target.into(),
+                                source_id: uuid(link.source),
+                                target_id: uuid(link.target),
                                 relation: link.relation,
                                 weight: link.weight,
                                 metadata: edge.metadata.clone(),
@@ -386,10 +395,11 @@ fn validate(changeset: &ChangeSet) -> RuntimeResult<()> {
             "unsupported canonical schema_version".into(),
         ));
     }
-    if changeset.ops.len() > 2_000 {
-        return Err(RuntimeError::InvalidInput(
-            "canonical changeset exceeds 2000 operations".into(),
-        ));
+    let max = khive_types::pack::ATOMIC_MAX_OPS_DEFAULT;
+    if changeset.ops.len() > max {
+        return Err(RuntimeError::InvalidInput(format!(
+            "canonical changeset exceeds {max} operations"
+        )));
     }
     if let Some((op_index, _)) = changeset
         .ops
@@ -464,11 +474,11 @@ fn gate_args(op: &Op) -> RuntimeResult<(&'static str, Uuid, Value)> {
                 }
             };
             args["namespace"] = json!(x.namespace.as_str());
-            ("create", x.id.into(), args)
+            ("create", uuid(x.id), args)
         }
         Op::Link(x) => (
             "link",
-            x.id.into(),
+            uuid(x.id),
             json!({"namespace":x.namespace.as_str(),"source_id":x.source,"target_id":x.target,
             "relation":x.relation,"weight":x.weight,"metadata":x.properties}),
         ),
@@ -479,11 +489,11 @@ fn gate_args(op: &Op) -> RuntimeResult<(&'static str, Uuid, Value)> {
                 .expect("typed patch is an object")
                 .remove("target");
             args["id"] = json!(x.target_id());
-            ("update", x.target_id().into(), args)
+            ("update", uuid(x.target_id()), args)
         }
         Op::Delete(x) => (
             "delete",
-            x.target_id.into(),
+            uuid(x.target_id),
             json!({"id":x.target_id,"hard":x.hard}),
         ),
         Op::Merge(_) => {

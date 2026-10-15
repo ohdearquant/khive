@@ -62,13 +62,13 @@ pub(super) fn draft(
     }
     crate::operations::validate_edge_weight(op.weight)?;
     let (source_id, target_id) =
-        canonical_edge_endpoints(op.relation, op.source.into(), op.target.into());
+        canonical_edge_endpoints(op.relation, super::uuid(op.source), super::uuid(op.target));
     let mut metadata = Some(
         serde_json::to_value(&op.properties)
             .map_err(|_| RuntimeError::InvalidInput("invalid canonical edge properties".into()))?,
     );
     if op.relation == EdgeRelation::DependsOn {
-        let (a, b) = if source_id == Uuid::from(op.source) {
+        let (a, b) = if source_id == super::uuid(op.source) {
             (source, target)
         } else {
             (target, source)
@@ -87,7 +87,7 @@ pub(super) fn draft(
     let now = chrono::DateTime::from_timestamp_micros(now)
         .ok_or_else(|| RuntimeError::InvalidInput("invalid canonical link timestamp".into()))?;
     Ok(Edge {
-        id: Uuid::from(op.id).into(),
+        id: super::uuid(op.id).into(),
         namespace: op.namespace.as_str().into(),
         source_id,
         target_id,

@@ -334,7 +334,13 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
         .await
         .is_err());
     let seen = gate.seen.lock().unwrap();
-    assert!(seen.iter().any(|request| request.verb == "apply_changeset"));
+    // Dispatch gates the wrapper once; the landing path does not check it again.
+    assert_eq!(
+        seen.iter()
+            .filter(|request| request.verb == "apply_changeset")
+            .count(),
+        1
+    );
     assert!(seen
         .iter()
         .any(|request| request.verb == "create" && request.args["name"] == "denied"));

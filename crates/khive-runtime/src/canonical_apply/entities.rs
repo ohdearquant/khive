@@ -3,7 +3,7 @@ use crate::atomic_runner::{AtomicOpFailure, AtomicOpPlan};
 use crate::runtime::EntityOwnerHookLookup;
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 use khive_changeset::{UpdateOp, UpdatePatch};
-use khive_storage::Entity;
+use khive_storage::{Entity, SqlStatement, SqlValue};
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedEntityUpdate {
@@ -52,7 +52,13 @@ pub(super) async fn prepare(
 impl PreparedEntityUpdate {
     pub(super) fn projected(&self, now: i64) -> RuntimeResult<Entity> {
         let mut entity = self.snapshot.clone();
-        KhiveRuntime::apply_entity_patch_fields(&mut entity, self.patch.clone(), &[], true);
+        let (_, changed_fields) =
+            KhiveRuntime::apply_entity_patch_fields(&mut entity, self.patch.clone(), &[], true);
+        if changed_fields.is_empty() {
+            // An unchanged patch lands as a no-op (see `materialize`), so later
+            // operations in the unit see the same revision.
+            return Ok(entity);
+        }
         entity.updated_at = now.max(
             entity
                 .updated_at
@@ -88,10 +94,43 @@ pub(super) fn materialize(
     }
     let previous_updated_at = live.updated_at;
     let previous_deleted_at = live.deleted_at;
+    let previous_version = live.version;
     let (reindex, changed_fields) =
         KhiveRuntime::apply_entity_patch_fields(&mut live, prepared.patch.clone(), &[], true);
     crate::secret_gate::reject_reserved_secret_gate_property(live.properties.as_ref())
         .map_err(|error| failure(error.to_string()))?;
+    if changed_fields.is_empty() {
+        // Live `update` leaves an unchanged entity untouched: no write, no event,
+        // no new revision. A canonical update whose values already hold lands the
+        // same way, so replaying it changes nothing.
+        let assertion = SqlStatement {
+            sql: include_str!("../../sql/canonical_entity_noop_assertion.sql").into(),
+            params: vec![
+                SqlValue::Text(id.to_string()),
+                SqlValue::Integer(previous_updated_at),
+                previous_deleted_at
+                    .map(SqlValue::Integer)
+                    .unwrap_or(SqlValue::Null),
+                SqlValue::Integer(previous_version),
+            ],
+            label: Some("canonical-entity-noop-assertion".into()),
+        };
+        return Ok(AtomicOpPlan::Update(Box::new(UpdatePlan {
+            target_id: id,
+            statements: vec![PlanStatement {
+                statement: assertion,
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: true,
+            entity_guard: None,
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+            graph_effects: Vec::new(),
+        })));
+    }
     live.updated_at = now.max(
         previous_updated_at
             .checked_add(1)

@@ -80,9 +80,9 @@ CRATES=(
     khive-channel          # no khive-* deps; transport abstraction; dep of khive-runtime
     khive-request        # needs khive-types only; versioned dev-dep of khive-runtime, so publish first
     khive-retrieval      # needs khive-fusion/score/types (all above); dep of khive-runtime, so publish first
+    khive-changeset      # needs khive-types (above); dep of khive-runtime, so publish first
     khive-runtime
     khive-vcs-adapters
-    khive-changeset      # needs khive-types (above)
     khive-rule-evaluator # pure rules; needs khive-types and khive-changeset (above), used by kkernel
     khive-graph-diff     # needs khive-types (above); pure graph-state diff
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)

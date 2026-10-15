@@ -25,7 +25,7 @@ fn changeset(ops: Vec<Op>) -> ChangeSet {
 }
 fn entity_create(id: Uuid, name: &str) -> Op {
     Op::Create(khive_changeset::CreateOp {
-        id: id.into(),
+        id: id128(id),
         namespace: Namespace::local(),
         target: CreateTarget::Entity(khive_changeset::EntityCreateFields {
             entity_kind: khive_types::EntityKind::Concept,
@@ -40,7 +40,7 @@ fn entity_create(id: Uuid, name: &str) -> Op {
 fn rename(id: Uuid, old: &str, new: &str) -> Op {
     Op::Update(
         UpdateOp::new(
-            id.into(),
+            id128(id),
             UpdatePatch::Entity(EntityPatch {
                 name: Some(new.into()),
                 description: None,
@@ -75,10 +75,10 @@ async fn ordered_creates_link_and_updates_keep_staged_ids() {
         rename(a, "a", "a2"),
         rename(a, "a2", "a3"),
         Op::Link(khive_changeset::LinkOp {
-            id: e.into(),
+            id: id128(e),
             namespace: Namespace::local(),
-            source: a.into(),
-            target: b.into(),
+            source: id128(a),
+            target: id128(b),
             relation: khive_types::EdgeRelation::CompetesWith,
             weight: 0.75,
             properties: Default::default(),
@@ -104,6 +104,59 @@ async fn ordered_creates_link_and_updates_keep_staged_ids() {
     let edge = rt.get_edge(&token, e).await.unwrap().unwrap();
     assert_eq!(Uuid::from(edge.id), e);
     assert_eq!(edge.weight, 0.75);
+}
+
+#[tokio::test]
+async fn unchanged_entity_update_is_a_no_op_and_replays_without_a_new_revision() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    let updated = || khive_storage::EventFilter {
+        target_id: Some(a),
+        kinds: vec![khive_types::EventKind::EntityUpdated],
+        ..Default::default()
+    };
+    let version = |rt: &KhiveRuntime, token: &NamespaceToken| {
+        let entities = rt.entities(token).unwrap();
+        async move { entities.get_entity(a).await.unwrap().unwrap().version }
+    };
+    let create = changeset(vec![entity_create(a, "same")]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &create)
+        .await
+        .unwrap();
+    crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap();
+    let created = version(rt, &token).await;
+    for cs in [
+        changeset(vec![rename(a, "same", "same")]),
+        changeset(vec![rename(a, "same", "same")]),
+    ] {
+        let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+            .await
+            .unwrap();
+        assert!(matches!(
+            crate::run_atomic_unit(rt.sql().as_ref(), plans)
+                .await
+                .unwrap(),
+            crate::AtomicRunOutcome::Committed { .. }
+        ));
+    }
+    assert_eq!(version(rt, &token).await, created);
+    let events = rt.events(&token).unwrap();
+    assert_eq!(events.count_events(updated()).await.unwrap(), 0);
+
+    // A real change still writes one revision and one event.
+    let cs = changeset(vec![rename(a, "same", "changed")]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+        .await
+        .unwrap();
+    crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap();
+    assert_eq!(version(rt, &token).await, created + 1);
+    assert_eq!(events.count_events(updated()).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -235,7 +288,7 @@ async fn delete_ignores_only_updated_at_and_keeps_ordinary_delete_effects() {
         .await
         .unwrap();
     let op = Op::Delete(DeleteOp {
-        target_id: id.into(),
+        target_id: id128(id),
         hard: false,
         preimage: khive_changeset::DeletePreimage::Entity(Box::new(
             projection::entity(&row).unwrap(),
@@ -302,10 +355,10 @@ async fn live_and_tombstone_ids_and_edge_keys_never_absorb_staged_ids() {
     let (a, b, e) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let link = |id: Uuid| {
         Op::Link(khive_changeset::LinkOp {
-            id: id.into(),
+            id: id128(id),
             namespace: Namespace::local(),
-            source: a.into(),
-            target: b.into(),
+            source: id128(a),
+            target: id128(b),
             relation: khive_types::EdgeRelation::CompetesWith,
             weight: 0.5,
             properties: Default::default(),
@@ -417,7 +470,7 @@ async fn note_map_replacement_preserves_same_writer_tag_drift_and_tag_order() {
     let new = serde_json::from_value(json!({"replacement":2})).unwrap();
     let op = Op::Update(
         UpdateOp::new(
-            id.into(),
+            id128(id),
             UpdatePatch::Note(khive_changeset::NotePatch {
                 content: None,
                 salience: None,
@@ -519,10 +572,10 @@ async fn edge_update_then_delete_observes_earlier_writer_state() {
         entity_create(a, "a"),
         entity_create(b, "b"),
         Op::Link(khive_changeset::LinkOp {
-            id: e.into(),
+            id: id128(e),
             namespace: Namespace::local(),
-            source: a.into(),
-            target: b.into(),
+            source: id128(a),
+            target: id128(b),
             relation: khive_types::EdgeRelation::CompetesWith,
             weight: 0.5,
             properties: Default::default(),
@@ -542,7 +595,7 @@ async fn edge_update_then_delete_observes_earlier_writer_state() {
     deleted.weight = 0.75;
     let update = Op::Update(
         UpdateOp::new(
-            e.into(),
+            id128(e),
             UpdatePatch::Edge(khive_changeset::EdgePatch {
                 relation: None,
                 weight: Some(0.75),
@@ -555,7 +608,7 @@ async fn edge_update_then_delete_observes_earlier_writer_state() {
         .unwrap(),
     );
     let delete = Op::Delete(DeleteOp {
-        target_id: e.into(),
+        target_id: id128(e),
         hard: false,
         preimage: khive_changeset::DeletePreimage::Edge(Box::new(deleted)),
     });

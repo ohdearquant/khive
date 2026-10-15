@@ -209,7 +209,6 @@ pub(crate) async fn apply_delta(
 ) -> Result<CanonicalApplyOutcome, RuntimeError> {
     let changeset = decode_delta(delta, outer_version)?;
     validate_canonical_admission(&changeset, registry)?;
-    registry.authorize_canonical_changeset(token, delta).await?;
     let plans =
         khive_runtime::prepare_canonical_changeset(runtime, registry, token, &changeset).await?;
     let outcome = match khive_runtime::run_atomic_unit(runtime.sql().as_ref(), plans).await {
@@ -254,8 +253,8 @@ pub(crate) async fn apply_delta(
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    Op::Create(op) => Some(Uuid::from(op.id)),
-                    Op::Link(op) => Some(Uuid::from(op.id)),
+                    Op::Create(op) => Some(Uuid::from_bytes(*op.id.as_bytes())),
+                    Op::Link(op) => Some(Uuid::from_bytes(*op.id.as_bytes())),
                     _ => None,
                 })
                 .collect();
