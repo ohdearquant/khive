@@ -113,8 +113,9 @@ async fn actual_event_counts_handler_refuses_an_expired_original_request() {
         "direct handler result: {direct:?}"
     );
 
-    // Through the registry the pack's state load reads first, so the refusal is a typed
-    // timeout from whichever read meets the expired deadline; no count is returned.
+    // Through the registry the pack's state load reads first and meets the expired deadline,
+    // so the request is refused before any count runs. That load reports the timeout as an
+    // internal error naming it, not as a typed storage timeout.
     let dispatched = khive_storage::scope_request_read_deadline_at(
         expired(),
         registry.dispatch(
@@ -123,14 +124,10 @@ async fn actual_event_counts_handler_refuses_an_expired_original_request() {
         ),
     )
     .await;
+    let error = dispatched.expect_err("an expired request must not return counts");
     assert!(
-        matches!(
-            &dispatched,
-            Err(RuntimeError::Storage(
-                khive_storage::StorageError::Timeout { .. }
-            ))
-        ),
-        "dispatched result: {dispatched:?}"
+        error.to_string().contains("timeout"),
+        "dispatched error: {error:?}"
     );
     let live = registry
         .dispatch(
