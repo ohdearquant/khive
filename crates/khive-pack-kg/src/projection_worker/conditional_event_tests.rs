@@ -8,7 +8,7 @@ fn event() -> Event {
         "local",
         "conditional-test",
         EventKind::LinkCreated,
-        SubstrateKind::Edge,
+        SubstrateKind::Entity,
         "test:actor",
     );
     event.payload = json!({"source_id":Uuid::new_v4(), "target_id":Uuid::new_v4()});
@@ -43,7 +43,10 @@ fn conditional_inserts_keep_all_shared_bindings_and_derived_rows() {
     assert_eq!(conditional.len(), 4, "event plus three link observations");
     assert_eq!(canonical.len(), conditional.len());
     for (canonical, conditional) in canonical.iter().zip(&conditional) {
-        assert_eq!(canonical.params, conditional.params);
+        assert_eq!(
+            format!("{:?}", canonical.params),
+            format!("{:?}", conditional.params)
+        );
         assert_eq!(columns(&canonical.sql), columns(&conditional.sql));
         assert!(conditional.sql.ends_with("WHERE (changes() = 1)\n"));
     }
@@ -51,9 +54,15 @@ fn conditional_inserts_keep_all_shared_bindings_and_derived_rows() {
         conditional[0].label.as_deref(),
         Some("projection_worker.conditional_event_insert")
     );
-    assert_eq!(conditional[0].params[9], SqlValue::Integer(i64::MAX));
-    assert_eq!(conditional[0].params[16], SqlValue::Integer(2));
-    assert_eq!(conditional[0].params[17], SqlValue::Text("resolved".into()));
+    assert!(matches!(
+        conditional[0].params[9],
+        SqlValue::Integer(i64::MAX)
+    ));
+    assert!(matches!(conditional[0].params[16], SqlValue::Integer(2)));
+    assert!(matches!(
+        &conditional[0].params[17],
+        SqlValue::Text(text) if text == "resolved"
+    ));
 }
 
 async fn fixture() -> (KhiveRuntime, ProposalsProjectionWorker) {
