@@ -356,8 +356,7 @@ async fn append_brain_event_on_writer(
             ],
             label: Some("brain_event_log_append".into()),
         })
-        .await
-        .map_err(|e| sql_err("append event", e))?;
+        .await?;
 
     Ok(())
 }
@@ -393,8 +392,7 @@ async fn upsert_snapshot_json_on_writer(
             ],
             label: Some("brain_snapshot_upsert".into()),
         })
-        .await
-        .map_err(|e| sql_err("upsert snapshot", e))?;
+        .await?;
 
     Ok(())
 }
@@ -407,7 +405,7 @@ pub async fn append_brain_event(
     payload: &Value,
     created_at_us: i64,
 ) -> Result<(), RuntimeError> {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    let mut writer = sql.writer().await?;
     append_brain_event_on_writer(
         writer.as_mut(),
         namespace,
@@ -425,7 +423,7 @@ pub async fn upsert_snapshot(
     snapshot: &BrainStateSnapshot,
     updated_at_us: i64,
 ) -> Result<(), RuntimeError> {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    let mut writer = sql.writer().await?;
     upsert_snapshot_on_writer(writer.as_mut(), namespace, snapshot, updated_at_us).await
 }
 
@@ -652,8 +650,7 @@ async fn load_latest_snapshot_on_reader<R: SqlReader + ?Sized>(
             ],
             label: Some("brain_snapshot_load".into()),
         })
-        .await
-        .map_err(|e| sql_err("load snapshot", e))?;
+        .await?;
 
     match row {
         None => Ok(None),
@@ -680,7 +677,7 @@ pub async fn load_latest_snapshot(
     namespace: &str,
     entity_capacity: usize,
 ) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let mut reader = sql.reader().await?;
     load_latest_snapshot_on_reader(reader.as_mut(), namespace, entity_capacity).await
 }
 
@@ -697,8 +694,7 @@ async fn load_snapshot_version_on_reader<R: SqlReader + ?Sized>(
             ],
             label: Some("brain_snapshot_version".into()),
         })
-        .await
-        .map_err(|e| sql_err("load snapshot version", e))?;
+        .await?;
 
     match row {
         None => Ok(None),
@@ -714,7 +710,7 @@ async fn load_snapshot_version(
     sql: &dyn SqlAccess,
     namespace: &str,
 ) -> Result<Option<i64>, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let mut reader = sql.reader().await?;
     load_snapshot_version_on_reader(reader.as_mut(), namespace).await
 }
 
@@ -897,7 +893,7 @@ async fn load_events_since_with_window(
     window_start_us: i64,
     window_end_us: Option<i64>,
 ) -> Result<LoadEventsResult, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let mut reader = sql.reader().await?;
     let rows = reader
         .query_all(SqlStatement {
             sql: sql!("brain_event_log_since").into(),
@@ -907,8 +903,7 @@ async fn load_events_since_with_window(
             ],
             label: Some("brain_events_replay".into()),
         })
-        .await
-        .map_err(|e| sql_err("load events", e))?;
+        .await?;
 
     let mut events = Vec::with_capacity(rows.len());
     let mut quarantined: Vec<QuarantinedRow> = Vec::new();
@@ -3048,3 +3043,6 @@ mod persist_write_queue_routing {
 
 #[cfg(test)]
 mod namespace_move_tests;
+
+#[cfg(test)]
+mod storage_error_tests;

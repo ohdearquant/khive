@@ -1107,7 +1107,7 @@ async fn record_serve_primary_key_collision_with_different_natural_key_propagate
     .await
     .expect_err("a PK collision with a mismatched natural key must not be tolerated");
     assert!(
-        matches!(err, RuntimeError::Internal(_)),
+        matches!(err, RuntimeError::Storage(_)),
         "expected the original insert error to propagate, got {err:?}"
     );
 }
