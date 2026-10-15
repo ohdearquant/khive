@@ -48,7 +48,7 @@ fn conditional_inserts_keep_all_shared_bindings_and_derived_rows() {
             format!("{:?}", conditional.params)
         );
         assert_eq!(columns(&canonical.sql), columns(&conditional.sql));
-        assert!(conditional.sql.ends_with("WHERE (changes() = 1)\n"));
+        assert!(conditional.sql.ends_with("WHERE (changes() = 1)"));
     }
     assert_eq!(
         conditional[0].label.as_deref(),
