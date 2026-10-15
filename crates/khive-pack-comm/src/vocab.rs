@@ -17,7 +17,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
 pub(crate) const COMM_SUPPRESSION_SCHEMA_STMT: &str =
     khive_runtime::sql!("comm_suppression_create");
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 19] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "comm.suppression_add",
         description: "Add a suppression entry for an email address, exact domain, or recipient key. Address values are normalized with the shared email recipient normalizer; domain values are ASCII-lowercased and match that domain only.",
@@ -123,6 +123,21 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 19] = [
                 required: false,
                 description: "Full UUID of an authenticated later inbound email from the suppressed address; required for opt-out sources.",
                 resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.withheld_body",
+        description: "Read the original RFC 5322 bytes of a delivered withheld message, base64-encoded with their size. Open to the message's recipient actor and to the configured maintainer; every other caller is refused before the original is read. Never returns a content reference, and every call is audited.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Short 8-char prefix or full UUID of the delivered withheld message.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },

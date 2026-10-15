@@ -51,6 +51,10 @@ Revision `domain-effects-v15` classifies `knowledge.lint` as `Write`, including
 inspection and stats-only requests: the same verb can explicitly apply guarded
 graph repairs. Read access does not authorize its requested fix effects.
 
+Revision `domain-effects-v16` classifies `comm.withheld_body` as `Write`, like `comm.read`:
+every call, allowed or refused, appends an audit event, and an allowed call returns the
+original bytes of a withheld external message.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -109,6 +113,7 @@ graph repairs. Read access does not authorize its requested fix effects.
 | `comm.thread`                     | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L336)                              |
 | `comm.transport_status`           | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L139)                              |
 | `comm.unread`                     | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L293)                              |
+| `comm.withheld_body`              | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L130)                              |
 | `context`                         | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1091)                   |
 | `count`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L19)                     |
 | `create`                          | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L71)                     |

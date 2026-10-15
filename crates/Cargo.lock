@@ -2387,6 +2387,7 @@ name = "khive-pack-comm"
 version = "0.12.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "inventory",
