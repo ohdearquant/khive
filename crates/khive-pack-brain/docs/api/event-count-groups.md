@@ -31,3 +31,20 @@ it retains the existing safety limit and live-view consistency caveat.
 ```text
 request(ops='brain.event_counts(since="2026-09-01T00:00:00Z", until="2026-09-02T00:00:00Z", kind="audit", group_by=["verb","actor"], exhaustive=true)')
 ```
+
+Counts consume the original operator request-read budget
+(`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds, maximum 86400), retaining
+any earlier caller deadline across legacy and events stores. Count RPCs are
+bound by that original client deadline; append and non-count RPCs retain their
+10-second transport timeout. No deadline or clock value crosses the count socket.
+The daemon stops and settles the count when the caller's budget expires and the
+connection closes, using the existing SQLite interrupt/join path. It does not
+enforce an independent deadline or renew the allowance at receipt.
+
+A read timeout remains a typed storage error naming the budget, with no partial
+successful `window_event_total`. Admission failures retain their actual wait
+duration and pool identity. Both remain subject to the existing retry classifier.
+The existing hard-cap exception is unchanged: if a worker ignores interruption,
+it can remain unrecovered and retain admission; a timeout alone does not prove
+that its pool recovered. The events protocol is version 6, so clients and daemons
+must be upgraded together; version skew is refused without replay or downgrade.

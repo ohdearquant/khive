@@ -617,6 +617,14 @@ impl std::error::Error for ResolutionFailureContext {
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A lint fix stopped, retaining its exact typed cause and confirmed receipts.
+    #[error("{source}")]
+    LintFix {
+        #[source]
+        source: Box<RuntimeError>,
+        detail: Box<crate::graph_lint::LintFixFailureDetail>,
+    },
+
     /// The domain handler succeeded, but its post-dispatch obligation did not.
     #[error("{failure}")]
     AuditObligation {
@@ -928,6 +936,7 @@ impl RuntimeError {
             error = match error {
                 Self::RefusedWithEvents { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
+                Self::LintFix { source, .. } => source.as_ref(),
                 _ => return error,
             };
         }
@@ -1023,6 +1032,7 @@ impl RuntimeError {
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
             Self::RefusedWithEvents { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
+            Self::LintFix { source, .. } => source.variant_name(),
         }
     }
 
@@ -1135,6 +1145,16 @@ impl RuntimeError {
     /// Recover every typed failure for which this process can prove that
     /// retrying the one failed operation cannot duplicate a side effect.
     pub fn retryable_failure_context(&self) -> Option<RetryableFailureContext> {
+        let mut enclosing = self;
+        loop {
+            match enclosing {
+                Self::LintFix { .. } => return None,
+                Self::RefusedWithEvents { context } => enclosing = &context.source,
+                Self::WithResolution { context } => enclosing = &context.source,
+                _ => break,
+            }
+        }
+
         let source = self.refusal_source();
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());

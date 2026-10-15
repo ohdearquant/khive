@@ -1,6 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All fourteen public comm verbs store or query comm state.
+//! All fifteen public comm verbs store or query comm state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -56,6 +56,7 @@ mod reply;
 mod suppression;
 mod thread;
 mod validation;
+mod withheld_body;
 #[doc(hidden)]
 pub use probe_cursor::PROBE_SQL;
 pub(crate) use probe_cursor::{handle_cursor_commit, handle_cursor_get, handle_probe};
@@ -73,6 +74,7 @@ pub(crate) use inbox::{handle_inbox, handle_unread};
 #[cfg(test)]
 use ingest::committed_ingest_degradations;
 pub(crate) use ingest::handle_ingest;
+pub use ingest::{resolve_ingest_correlation, ResolvedInboundThread, ThreadUuidProof};
 
 pub(crate) use parameter_aliases::{handle_delivered, handle_mark_read};
 
@@ -90,10 +92,14 @@ use read_marking::{
 };
 
 pub(crate) use reply::handle_reply;
-pub use suppression::load_outbound_email_suppressions;
 pub(crate) use suppression::{
     handle_suppression_add, handle_suppression_list, handle_suppression_remove,
 };
+pub use suppression::{
+    load_inbound_email_suppressions, load_outbound_email_suppressions,
+    record_mailto_unsubscribe_suppression, record_reply_opt_out_suppression,
+};
+pub(crate) use withheld_body::handle_withheld_body;
 
 use validation::{
     addressed_recipient, caller_inherits_legacy_pool, canonicalize_ingest_sent_at,

@@ -63,6 +63,7 @@ fn expected_params() -> &'static [(&'static str, &'static [&'static str])] {
         ("knowledge.upsert_domains", &["domains"]),
         ("knowledge.get", &["id", "include_sections"]),
         ("knowledge.export", &["format"]),
+        ("knowledge.lint", &["rules", "fix", "severity"]),
         (
             "knowledge.list",
             &[

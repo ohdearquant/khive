@@ -415,6 +415,8 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_RECALL_FTS_GATHER_LIMIT=        Explicit row cap for rank_subset mode (> 0). Default: derived.
 #   KHIVE_RECALL_FTS_CJK_BYPASS=true      CJK queries bypass term-K selection. Accepts 1/true/0/false.
 #   KHIVE_RECALL_PROFILE=1                Emit per-stage recall timing JSON to stderr (presence = on).
+#   KHIVE_SEARCH_PROFILE=1                Emit per-stage timing JSON for searches that fan out across
+#                                        [[backends]] to stderr (presence = on; kkernel).
 #   ANN_OVERFETCH_MAX_ROUNDS=3           Max ANN over-fetch retry rounds when post-filtering drops
 #                                        candidates below the requested limit (un-prefixed; pack `memory`).
 #

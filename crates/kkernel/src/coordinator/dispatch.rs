@@ -22,6 +22,7 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+use super::search_profile;
 
 #[cfg(test)]
 #[path = "message_search_scope_tests.rs"]
@@ -691,11 +692,15 @@ impl SubstrateCoordinator {
         namespace: &Namespace,
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(request, namespace, extra_visible, None)
             .await;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
             .await;
+        search_profile::stage("finalize", started, &[]);
         (entity_hits, note_hits, per_backend)
     }
 
@@ -713,6 +718,7 @@ impl SubstrateCoordinator {
                 .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
                 .await;
         }
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(
                 request,
@@ -721,8 +727,11 @@ impl SubstrateCoordinator {
                 Some((token, args)),
             )
             .await;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
             .await;
+        search_profile::stage("finalize", started, &[]);
         (entity_hits, note_hits, per_backend)
     }
 
@@ -988,6 +997,7 @@ impl SubstrateCoordinator {
         #[cfg(not(test))]
         let delay_backend: Option<(String, Duration)> = None;
 
+        let fan_out_started = search_profile::start();
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
             let q = query.clone();
@@ -1193,6 +1203,10 @@ impl SubstrateCoordinator {
                     }
                 }
             };
+            let finished_at = fan_out_started.map(|_| match &joined {
+                Ok(Ok((_, completed_at))) => *completed_at,
+                _ => tokio::time::Instant::now(),
+            });
             match joined {
                 Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
@@ -1269,12 +1283,19 @@ impl SubstrateCoordinator {
                     });
                 }
             }
+            if let (Some(started), Some(finished_at), Some(result)) =
+                (fan_out_started, finished_at, per_backend.last())
+            {
+                search_profile::backend(result, finished_at.duration_since(started));
+            }
         }
 
+        let started = search_profile::start();
         let merged_entities =
             rrf_merge_entity_hits_filtered(entity_ranked_lists, usize::MAX, request.source());
         let merged_notes =
             rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
+        search_profile::stage("merge", started, &[]);
         (merged_entities, merged_notes, per_backend)
     }
 }

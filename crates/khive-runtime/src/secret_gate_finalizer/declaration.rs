@@ -325,7 +325,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.heartbeat",
-        site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::handle_heartbeat",
+        site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::persist_heartbeat",
         expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -338,7 +338,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.claim",
-        site: "khive-mcp/src/pending_events/receipt.rs::claim_pending_event",
+        site: "khive-mcp/src/pending_events/receipt.rs::claim_pending_event_inner",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,

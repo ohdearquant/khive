@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use khive_db::migrations::AttachmentCutoverStatus;
 use khive_runtime::{BlobHydrator, LegacyPreferenceVerifier, RuntimeError, StorageBackend};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::SqlStatement;
 use khive_storage::{Attachment, AttachmentSubstrate, SqlAccess};
 
 const FANN_NETWORK_ROLE: &str = "fann-network";
@@ -23,8 +23,8 @@ pub(crate) async fn legacy_preference_model_count(
     sql: &dyn SqlAccess,
 ) -> Result<u64, RuntimeError> {
     let mut reader = sql.reader().await?;
-    match reader
-        .query_scalar(SqlStatement {
+    Ok(reader
+        .count(SqlStatement {
             sql: "SELECT COUNT(*) FROM entities \
                   WHERE kind = 'artifact' AND entity_type = 'moodboard_model' \
                     AND content_ref IS NOT NULL"
@@ -32,13 +32,7 @@ pub(crate) async fn legacy_preference_model_count(
             params: vec![],
             label: Some("moodboard_legacy_preference_model_count".to_string()),
         })
-        .await?
-    {
-        Some(SqlValue::Integer(count)) if count >= 0 => Ok(count as u64),
-        other => Err(RuntimeError::Internal(format!(
-            "moodboard legacy preference model count returned invalid value {other:?}"
-        ))),
-    }
+        .await?)
 }
 
 enum CutoverMode {
@@ -107,18 +101,14 @@ async fn scalar_count(
         .reader()
         .await
         .with_context(|| format!("{label}: acquire SQL reader"))?;
-    match reader
-        .query_scalar(SqlStatement {
+    reader
+        .count(SqlStatement {
             sql: sql.to_string(),
             params: vec![],
             label: Some(label.to_string()),
         })
         .await
-        .with_context(|| format!("{label}: execute count"))?
-    {
-        Some(SqlValue::Integer(count)) if count >= 0 => Ok(count as u64),
-        other => anyhow::bail!("{label}: invalid count result {other:?}"),
-    }
+        .with_context(|| format!("{label}: execute count"))
 }
 
 /// The V21 legacy-moodboard verifier for this build, or `None` when compiled
@@ -426,6 +416,128 @@ mod tests {
     use khive_storage::BlobStore as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_model_count_includes_recoverable_models_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("legacy-model-count.db");
+        let (_, content_ref) = create_v20_database_fixture(&db_path, "moodboard_model", None);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (kind, entity_type, deleted_at, content_ref) in [
+            (
+                "artifact",
+                "moodboard_model",
+                Some(2),
+                Some(content_ref.as_str()),
+            ),
+            ("artifact", "visual_asset", None, Some(content_ref.as_str())),
+            ("artifact", "moodboard_model", None, None),
+            (
+                "document",
+                "moodboard_model",
+                None,
+                Some(content_ref.as_str()),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO entities (id, namespace, kind, entity_type, name, tags, \
+                 created_at, updated_at, deleted_at, content_ref) \
+                 VALUES (?1, 'other', ?2, ?3, 'count fixture', '[]', 1, 1, ?4, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    kind,
+                    entity_type,
+                    deleted_at,
+                    content_ref
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let backend = StorageBackend::sqlite_for_test(&db_path).unwrap();
+        backend.prepare_core_schema().unwrap();
+        assert_eq!(
+            legacy_preference_model_count(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_preflight_counts_across_cutover_states_and_propagates_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("secondary-count.db");
+        let (entity_id, content_ref) = create_v20_database_fixture(&db_path, "visual_asset", None);
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
+        assert_eq!(
+            backend.prepare_core_schema().unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1
+        );
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Pending
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .execute("UPDATE entities SET content_ref = NULL", [])
+                .unwrap(),
+            1
+        );
+        require_secondary_attachment_empty(Arc::clone(&backend), "secondary")
+            .await
+            .expect("pending schema has no attachments table");
+
+        let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
+            .await
+            .unwrap();
+        backend.stage_attachment_cutover(&owner).unwrap();
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Incomplete
+        );
+        require_secondary_attachment_empty(Arc::clone(&backend), "secondary")
+            .await
+            .unwrap();
+        backend.finalize_attachment_cutover(&owner).unwrap();
+        drop(owner);
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Complete
+        );
+        require_secondary_attachment_empty(Arc::clone(&backend), "secondary")
+            .await
+            .expect("complete schema has no legacy content_ref column");
+
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO attachments (record_uuid, substrate, role, content_ref, created_at) \
+                 VALUES (?1, 'entity', 'content', ?2, 1)",
+                rusqlite::params![entity_id.to_string(), content_ref.as_str()],
+            )
+            .unwrap();
+        let error = require_secondary_attachment_empty(Arc::clone(&backend), "secondary")
+            .await
+            .expect_err("completed attachment rows still participate in liveness");
+        assert!(error
+            .to_string()
+            .contains("legacy_refs=0, attachment_rows=1"));
+
+        let error = scalar_count(
+            &backend,
+            "SELECT COUNT(*) FROM absent_attachment_count_fixture",
+            "missing_attachment_count",
+        )
+        .await
+        .expect_err("a failed count must never become zero");
+        assert_eq!(error.to_string(), "missing_attachment_count: execute count");
+        assert!(matches!(
+            error.downcast_ref::<khive_storage::StorageError>(),
+            Some(khive_storage::StorageError::Driver { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn non_model_legacy_content_resumes_to_attachment_only_v21_without_a_blob_store() {

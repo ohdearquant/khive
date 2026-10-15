@@ -680,6 +680,17 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "last_failure_at",
     "last_error",
     "consecutive_failures",
+    "consecutive_held_polls",
+    "held_messages",
+    "last_held_at",
+    "last_quarantined_after_hold_at",
+    "originals_not_retained",
+    "last_original_not_retained_at",
+    "last_original_not_retained_reason",
+    "original_retention_state",
+    "notices_failed",
+    "last_notice_failed_at",
+    "notice_config_error",
 ];
 
 /// Empty collection fields that define a stable response envelope and must

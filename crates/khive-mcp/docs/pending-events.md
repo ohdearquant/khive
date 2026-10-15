@@ -70,7 +70,7 @@ advance, so a day already lost to an earlier clamp cannot be recovered.
 
 ## Missed-event policy (ADR-106 amendment)
 
-An event is "missed" when it is discovered overdue by more than
+Under the default `skip` policy, an event is "missed" when it is overdue by more than
 `KHIVE_FIRE_GRACE_SECS` (default 300s / 5 minutes). A missed event is
 **never dispatched** — it is marked `status="missed"` with `missed_at`
 stamped (epoch µs) and `fired_at` left null. A missed _repeating_ event is
@@ -81,6 +81,17 @@ a first boot against a store with a large stale backlog) marks the entire
 overdue backlog missed on its first tick and dispatches zero of them. The
 creator-identity fence runs first for generic actions: an unattributed
 legacy row becomes `failed`, not `missed`, even when stale.
+
+An explicit `catch_up_once` policy changes that decision for its row only. It
+requires a positive `max_lateness` and selects the latest due occurrence,
+including the stored initial trigger; it never emits the earlier missed
+occurrences. Equality at the bound dispatches once, while an older selected
+occurrence is missed. A period-derived default would always admit this latest
+occurrence, so no such default exists. Opted-in rows restored from an old backup
+can each yield one eligible action; they do not inherit the default policy's
+zero-backlog-dispatch guarantee. Version-2 receipts retain the selected occurrence
+through crash recovery and future re-arming. See the
+[catch-up API contract](api/pending-events.md#per-event-catch-up-policy-adr-106-amendment-h).
 
 ## Server construction: explicit namespace, implicit actor
 

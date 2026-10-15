@@ -146,6 +146,15 @@ impl KgReadResolver {
         }
     }
 
+    /// Every configured graph owner, before lint's physical-database deduplication.
+    pub(crate) fn runtimes_for_lint(&self) -> Vec<KhiveRuntime> {
+        let mut by_pack: Vec<_> = self.by_pack.iter().collect();
+        by_pack.sort_by_key(|(pack, _)| *pack);
+        std::iter::once(self.primary.clone())
+            .chain(by_pack.into_iter().map(|(_, runtime)| runtime.clone()))
+            .collect()
+    }
+
     pub(crate) fn runtime_for_pack(&self, pack: &str) -> &KhiveRuntime {
         self.by_pack.get(pack).unwrap_or(&self.primary)
     }
