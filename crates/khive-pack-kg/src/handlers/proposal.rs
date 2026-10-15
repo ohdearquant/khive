@@ -1,7 +1,5 @@
 //! `propose`, `review`, `withdraw`, and `list(kind=proposal)` verb handlers.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 
 use serde_json::Value;
@@ -328,7 +326,19 @@ impl KgPack {
             khive_runtime::secret_gate::check_at(c, "review", "comment")?;
         }
 
-        let preimage = self.review_preimage(token, proposal_id).await?;
+        let changeset = crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+            .load_changeset(token, proposal_id)
+            .await?;
+        let preimage = match &changeset {
+            ProposalChangeset::Canonical {
+                schema_version,
+                delta,
+            } => crate::canonical_apply::preimage_status(&crate::canonical_apply::decode_delta(
+                delta,
+                Some(*schema_version),
+            )?),
+            _ => khive_types::event::ProposalPreimageStatus::None,
+        };
         let payload = ProposalReviewedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             reviewer: actor.clone(),
@@ -389,36 +399,6 @@ impl KgPack {
             embedding_truncation.any_truncated(),
         );
         Ok(response)
-    }
-
-    /// The preimage status of a proposal's stored change-set. The change-set is loaded and
-    /// read behind one heap allocation built outside any async body, so neither it nor its load
-    /// future becomes part of the review future or of the dispatch frame that holds it.
-    fn review_preimage<'a>(
-        &'a self,
-        token: &'a NamespaceToken,
-        proposal_id: Uuid,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<khive_types::event::ProposalPreimageStatus, RuntimeError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let changeset = crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
-                .load_changeset(token, proposal_id)
-                .await?;
-            Ok::<_, RuntimeError>(match &changeset {
-                ProposalChangeset::Canonical {
-                    schema_version,
-                    delta,
-                } => crate::canonical_apply::preimage_status(
-                    &crate::canonical_apply::decode_delta(delta, Some(*schema_version))?,
-                ),
-                _ => khive_types::event::ProposalPreimageStatus::None,
-            })
-        })
     }
 
     pub(crate) async fn handle_withdraw(
