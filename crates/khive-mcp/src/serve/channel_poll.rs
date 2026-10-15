@@ -3,9 +3,9 @@
 #[cfg(feature = "channel-email")]
 use super::{
     channel_cycle_wait, channel_ingest_attempt_key, cleanup_expired_channel_quarantine,
-    handle_channel_ingest_failure, outbox, quarantine_original_may_be_retained,
-    record_channel_hold, Arc, ChannelIngestFailureOutcome, CHANNEL_POLL_INTERVAL,
-    HOLD_QUARANTINE_THRESHOLD,
+    email_ingest_params, handle_channel_ingest_failure, outbox,
+    quarantine_original_may_be_retained, record_channel_hold, retain_withheld_original, Arc,
+    ChannelIngestFailureOutcome, CHANNEL_POLL_INTERVAL, HOLD_QUARANTINE_THRESHOLD,
 };
 #[cfg(all(test, feature = "channel-email"))]
 use super::{poll_timing_tests, OutboundEmailPolicy};
@@ -221,6 +221,41 @@ pub(super) async fn channel_poll_loop(
                     for env in page.envelopes {
                         let mut metadata = env.metadata.clone();
                         let mut released_after_hold = false;
+                        if env
+                            .inbound_delivery
+                            .as_ref()
+                            .is_some_and(|delivery| delivery.body_withheld)
+                        {
+                            let original = retain_withheld_original(&registry, &env).await;
+                            match original {
+                                Ok(content_ref) => {
+                                    metadata.insert("quarantine_content_ref".into(), content_ref);
+                                }
+                                Err(error) => {
+                                    let outcome = handle_channel_ingest_failure(
+                                        &registry,
+                                        &ingest_namespace,
+                                        (kind, slug),
+                                        Some(&default_inbound_actor),
+                                        &env,
+                                        &error,
+                                        &mut failed_polls,
+                                        channel.quarantine_retention_limit(),
+                                    )
+                                    .await;
+                                    if !outcome.released() {
+                                        page_fully_ingested = false;
+                                        held_messages += 1;
+                                    }
+                                    if outcome == ChannelIngestFailureOutcome::QuarantinedAfterHold
+                                    {
+                                        quarantined_after_hold += 1;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         if kind == "email"
                             && metadata.get("quarantined").map(String::as_str) == Some("true")
                         {
@@ -343,23 +378,13 @@ pub(super) async fn channel_poll_loop(
                                 }
                             }
                         }
-                        let params = json!({
-                            "namespace": ingest_namespace,
-                            "from": env.from.clone(),
-                            "to": env.to.clone(),
-                            "content": env.content.clone(),
-                            "subject": env.subject.clone(),
-                            "channel_kind": kind,
-                            "channel_slug": slug,
-                            "external_id": env.external_id.clone(),
-                            "legacy_external_id": env.legacy_external_id.clone(),
-                            "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
-                            "correlation_external_id": env.correlation_external_id.clone(),
-                            "default_inbound_actor": default_inbound_actor,
-                            "wire_message_id": env.wire_message_id.clone(),
-                            "wire_references": env.wire_references.clone(),
-                            "metadata": metadata,
-                        });
+                        let params = email_ingest_params(
+                            &ingest_namespace,
+                            (kind, slug),
+                            &default_inbound_actor,
+                            &env,
+                            metadata,
+                        );
                         match registry.dispatch("comm.ingest", params).await {
                             Ok(_) => {
                                 if released_after_hold {

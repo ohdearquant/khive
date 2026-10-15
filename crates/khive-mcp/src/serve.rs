@@ -135,6 +135,10 @@ pub use startup::{
 mod demand_startup_tests;
 
 #[cfg(all(test, feature = "channel-email"))]
+#[path = "serve/adr200_inbound_tests.rs"]
+mod adr200_inbound_tests;
+
+#[cfg(all(test, feature = "channel-email"))]
 thread_local! {
     static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
         const { std::cell::RefCell::new(None) };
@@ -147,6 +151,12 @@ thread_local! {
 mod channel_ingest;
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 use channel_ingest::*;
+
+#[cfg(feature = "channel-email")]
+#[path = "serve/email_delivery.rs"]
+mod email_delivery;
+#[cfg(feature = "channel-email")]
+use email_delivery::*;
 
 #[cfg(feature = "channel-email")]
 #[path = "serve/email_host.rs"]
@@ -528,13 +538,14 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
+    let prepared_background = prepare_host_background_tasks(args, &server)?;
     #[cfg(unix)]
     if args.daemon {
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
             server,
             boot_guard,
             args.daemon_options(),
-            |server| start_host_background_tasks(args, server, schedule_rt),
+            |server| start_host_background_tasks(args, server, schedule_rt, prepared_background),
         )
         .await?;
         return Ok(());
@@ -552,7 +563,7 @@ pub async fn serve_server(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
-    start_host_background_tasks(args, &server, schedule_rt);
+    start_host_background_tasks(args, &server, schedule_rt, prepared_background);
     serve_with_session_sweep(server, args, registry).await
 }
 
