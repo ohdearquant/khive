@@ -213,6 +213,17 @@ impl EmailChannel {
         self
     }
 
+    /// Whether this channel admits authenticated mail from senders other than the maintainer as
+    /// external inbound: a host is wired that reports external inbound enabled, and inbound
+    /// routing is attached (ADR-200 sections 7 and 8.2).
+    pub fn external_inbound_enabled(&self) -> bool {
+        self.external_inbound.is_some()
+            && self
+                .external_host
+                .as_deref()
+                .is_some_and(|host| host.external_inbound_enabled())
+    }
+
     /// The configured mailbox address (e.g. `mailbox@example.com`).
     ///
     /// Used by the outbox delivery loop to derive the sender address and

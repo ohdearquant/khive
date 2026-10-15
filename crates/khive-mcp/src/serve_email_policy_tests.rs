@@ -183,6 +183,28 @@ fn startup_inbound_only_requires_actor_and_leaves_outbound_external_refused() {
                 .email
                 .is_none());
 
+            // A polling host hands the switch to the channel it builds; without the switch the
+            // same configuration builds a channel that keeps external mail off the allowlist.
+            for name in [
+                "KHIVE_EMAIL_SMTP_HOST",
+                "KHIVE_EMAIL_IMAP_HOST",
+                "KHIVE_EMAIL_PASSWORD",
+                "KHIVE_EMAIL_AUTHSERV_ID",
+            ] {
+                std::env::set_var(name, "unused.example.com");
+            }
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            let prepared = prepare_email_channel_loops(&server, true)
+                .unwrap()
+                .expect("a complete configuration prepares the polling channel");
+            assert!(prepared.external_inbound_enabled());
+            std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND");
+            let prepared = prepare_email_channel_loops(&server, true)
+                .unwrap()
+                .expect("a complete configuration prepares the polling channel");
+            assert!(!prepared.external_inbound_enabled());
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "enabled");
+
             // Outbound external sending stays disabled: an address outside the policy is
             // refused, while a policy recipient is still admitted.
             let registry = server.verb_registry_clone();

@@ -26,6 +26,13 @@ pub(super) struct PreparedEmailChannelLoops {
     default_inbound_actor: String,
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+impl PreparedEmailChannelLoops {
+    pub(super) fn external_inbound_enabled(&self) -> bool {
+        self.channel.external_inbound_enabled()
+    }
+}
+
 #[cfg(feature = "channel-email")]
 pub(super) fn prepare_email_channel_loops(
     server: &KhiveMcpServer,
@@ -87,11 +94,17 @@ pub(super) fn prepare_email_channel_loops(
             anyhow::bail!("external email Message-ID configuration: {error}");
         }
     }
+    let outbound_external = policy.has_external_senders();
     let host = CommExternalEmailHost::for_ingest(Arc::new(policy), runtime, namespace, domains)
         .with_external_inbound(external.is_some());
     let mut email_ch = email_ch.with_external_host(Arc::new(host));
     if let Some(external) = external {
         email_ch = email_ch.with_external_inbound_config(external);
+    }
+    if email_ch.external_inbound_enabled() {
+        tracing::info!(target: "khive_mcp::serve", outbound_external,
+            "email channel admits external inbound mail as untrusted"
+        );
     }
     Ok(Some(PreparedEmailChannelLoops {
         channel: Arc::new(email_ch),
