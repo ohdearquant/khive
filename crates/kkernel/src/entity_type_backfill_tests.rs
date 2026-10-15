@@ -374,7 +374,7 @@ async fn nullable_census_counts_only_live_null_types_in_the_exact_namespace() {
         .writer()
         .unwrap()
         .execute(
-            "UPDATE entities SET entity_type = 'paper' \
+            "UPDATE entities SET entity_type = 'paper', version = version + 1 \
              WHERE namespace = 'census' AND entity_type IS NULL AND deleted_at IS NULL",
             [],
         )

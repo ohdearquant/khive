@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use khive_runtime::curation::EntityPatch;
 use khive_runtime::pack::{IngestAuditStore, PackRegistry, VerbRegistry};
