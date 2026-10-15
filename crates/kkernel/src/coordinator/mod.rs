@@ -4,6 +4,7 @@ mod dispatch;
 mod locator;
 mod ranking;
 mod registry;
+mod search_profile;
 pub mod service;
 
 pub use dispatch::{
@@ -17,5 +18,7 @@ pub use service::SubstrateCoordinatorService;
 mod fusion_label_tests;
 #[cfg(test)]
 mod ranking_tests;
+#[cfg(test)]
+mod search_profile_tests;
 #[cfg(test)]
 mod tests;

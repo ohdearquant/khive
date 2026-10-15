@@ -9366,6 +9366,13 @@ async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespac
         "held_messages",
         "last_held_at",
         "last_quarantined_after_hold_at",
+        "originals_not_retained",
+        "last_original_not_retained_at",
+        "last_original_not_retained_reason",
+        "original_retention_state",
+        "notices_failed",
+        "last_notice_failed_at",
+        "notice_config_error",
     ] {
         // `get` rather than indexing: indexing a missing key also yields null, so it
         // would pass with the field absent from the entry.
@@ -9902,6 +9909,251 @@ async fn heartbeat_rejects_invalid_outcome() {
     );
 }
 
+/// ADR-056 (2026-10-15 amendment), decision 7: the retention/notice fields are
+/// accepted only with a success outcome. A failed poll wrote no records and
+/// sent no notices, so each of the five is refused on a failure outcome, the
+/// same way the hold fields are.
+#[tokio::test]
+async fn heartbeat_rejects_retention_and_notice_fields_on_failure() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for field in [
+        ("originals_not_retained", serde_json::json!(2)),
+        (
+            "original_not_retained_reason",
+            serde_json::json!("retention-limit"),
+        ),
+        ("original_retention_state", serde_json::json!("retained")),
+        ("notices_failed", serde_json::json!(1)),
+        (
+            "notice_config_error",
+            serde_json::json!("missing notice target"),
+        ),
+    ] {
+        let mut params = serde_json::json!({
+            "namespace": "local",
+            "channel_kind": "email",
+            "channel_slug": "recipient@example.com",
+            "outcome": "failure",
+            "error_class": "transport",
+        });
+        params[field.0] = field.1.clone();
+        let err = registry
+            .dispatch("comm.heartbeat", params)
+            .await
+            .expect_err("a failure heartbeat must refuse retention/notice fields");
+        assert!(
+            err.to_string().contains("success"),
+            "the refusal must name the success-only rule for `{}`: {err}",
+            field.0
+        );
+    }
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: `original_not_retained_reason`
+/// is required exactly when `originals_not_retained` is above zero, refused
+/// when it is zero or absent, and accepted only as a known token; and
+/// `original_retention_state` is accepted only as `retained` or `failing`.
+#[tokio::test]
+async fn heartbeat_validates_retention_reason_and_state() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let cases = [
+        (
+            "count above zero without a reason",
+            serde_json::json!({"originals_not_retained": 2}),
+            "original_not_retained_reason",
+        ),
+        (
+            "reason with a zero count",
+            serde_json::json!({
+                "originals_not_retained": 0,
+                "original_not_retained_reason": "retention-limit",
+            }),
+            "original_not_retained_reason",
+        ),
+        (
+            "reason with an absent count",
+            serde_json::json!({"original_not_retained_reason": "retention-limit"}),
+            "original_not_retained_reason",
+        ),
+        (
+            "unknown reason token",
+            serde_json::json!({
+                "originals_not_retained": 1,
+                "original_not_retained_reason": "not-a-reason",
+            }),
+            "unknown",
+        ),
+        (
+            "unknown retention state",
+            serde_json::json!({"original_retention_state": "ok"}),
+            "original_retention_state",
+        ),
+    ];
+    for (label, extra, needle) in cases {
+        let mut params = serde_json::json!({
+            "namespace": "local",
+            "channel_kind": "email",
+            "channel_slug": "recipient@example.com",
+            "outcome": "success",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            params[key.as_str()] = value.clone();
+        }
+        let err = registry
+            .dispatch("comm.heartbeat", params)
+            .await
+            .expect_err("a malformed retention/notice report must be refused");
+        assert!(
+            err.to_string().contains(needle),
+            "the refusal for `{label}` must name `{needle}`: {err}"
+        );
+    }
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: `originals_not_retained` and
+/// `notices_failed` are running totals, the last-reason/last-timestamp facts
+/// track the most recent count above zero, `original_retention_state` is
+/// replaced, `notice_config_error` is cleared by a later success that omits it,
+/// and a failure heartbeat in between changes none of them.
+#[tokio::test]
+async fn heartbeat_accumulates_retention_totals_and_clears_config_error() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let slug = "retention-totals@example.com";
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "success",
+                "originals_not_retained": 3,
+                "original_not_retained_reason": "retention-limit",
+                "original_retention_state": "failing",
+                "notices_failed": 1,
+                "notice_config_error": "no notice target configured",
+            }),
+        )
+        .await
+        .expect("first success heartbeat");
+
+    // A failed transport poll in between must leave every retention/notice fact
+    // exactly as the last success left it.
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "failure",
+                "error_class": "transport",
+            }),
+        )
+        .await
+        .expect("intervening failure heartbeat");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = health["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .find(|channel| channel["channel_slug"] == slug)
+        .expect("the heartbeat row appears");
+    assert_eq!(
+        channel["originals_not_retained"].as_u64(),
+        Some(3),
+        "the failure leaves the first total: {channel}"
+    );
+    assert_eq!(
+        channel["notices_failed"].as_u64(),
+        Some(1),
+        "the failure leaves the first notice total: {channel}"
+    );
+    assert_eq!(
+        channel["last_original_not_retained_reason"].as_str(),
+        Some("retention-limit"),
+        "the failure leaves the first reason: {channel}"
+    );
+    assert_eq!(
+        channel["original_retention_state"].as_str(),
+        Some("failing"),
+        "the failure leaves the first retention state: {channel}"
+    );
+    assert_eq!(
+        channel["notice_config_error"].as_str(),
+        Some("no notice target configured"),
+        "a success that carries a config error stores it, and the failure keeps it: {channel}"
+    );
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "success",
+                "originals_not_retained": 2,
+                "original_not_retained_reason": "original-store-failed",
+                "original_retention_state": "retained",
+                "notices_failed": 4,
+            }),
+        )
+        .await
+        .expect("second success heartbeat");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = health["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .find(|channel| channel["channel_slug"] == slug)
+        .expect("the heartbeat row appears");
+
+    assert_eq!(
+        channel["originals_not_retained"].as_u64(),
+        Some(5),
+        "originals_not_retained must be a running total: {channel}"
+    );
+    assert_eq!(
+        channel["notices_failed"].as_u64(),
+        Some(5),
+        "notices_failed must be a running total across the failure: {channel}"
+    );
+    assert_eq!(
+        channel["last_original_not_retained_reason"].as_str(),
+        Some("original-store-failed"),
+        "the last reason is from the most recent count above zero: {channel}"
+    );
+    assert!(
+        channel["last_original_not_retained_at"].as_str().is_some(),
+        "last_original_not_retained_at must be set: {channel}"
+    );
+    assert_eq!(
+        channel["original_retention_state"].as_str(),
+        Some("retained"),
+        "the retention state is replaced by the latest report: {channel}"
+    );
+    assert!(
+        channel["notice_config_error"].is_null(),
+        "a success without a config error clears the row's value: {channel}"
+    );
+    assert!(
+        channel["last_notice_failed_at"].as_str().is_some(),
+        "last_notice_failed_at must be set: {channel}"
+    );
+}
+
 /// Spec: "report TIMESTAMPS only ... never a computed `healthy: bool`" — the channel entry shape must not carry any boolean health verdict.
 #[tokio::test]
 async fn health_channel_entry_never_carries_a_healthy_bool() {
@@ -9933,6 +10185,47 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
         !ch.contains_key("healthy"),
         "channel entry must never carry a computed healthy bool: {ch:?}"
     );
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: a writer that does not report
+/// the retention/notice fields leaves every one of them `null` on its row,
+/// rather than a fabricated zero or empty string.
+#[tokio::test]
+async fn health_nulls_retention_and_notice_fields_a_writer_never_reports() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "recipient@example.com",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = &health["channels"][0];
+    for field in [
+        "originals_not_retained",
+        "last_original_not_retained_at",
+        "last_original_not_retained_reason",
+        "original_retention_state",
+        "notices_failed",
+        "last_notice_failed_at",
+        "notice_config_error",
+    ] {
+        assert!(
+            channel.get(field).is_some_and(serde_json::Value::is_null),
+            "a writer that never reports `{field}` must leave it a present null: {channel}"
+        );
+    }
 }
 
 /// khive #877: `comm.health` must read `channel_health` rows from the caller's injected namespace (`token.namespace()`), not the fixed `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant.

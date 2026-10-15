@@ -290,9 +290,7 @@ where
 
     let event = attribution.stamp(build_event(fold_outcome.as_ref(), forced_zero));
 
-    khive_db::stores::event::append_event_on_writer(writer, &event)
-        .await
-        .map_err(|e| sql_err("append feedback event", e))?;
+    khive_db::stores::event::append_event_on_writer(writer, &event).await?;
 
     if let (Some((scorer_run_id, serve_ledger_id)), Some(grade)) = (dedup_key, grade) {
         crate::serve_ledger::backfill_grade_on_writer(
@@ -358,8 +356,7 @@ pub(crate) async fn claim_dedup_within_tx(
             ],
             label: Some("brain_scorer_dedup_claim".into()),
         })
-        .await
-        .map_err(|e| sql_err("claim scorer dedup", e))?;
+        .await?;
     Ok(rows_affected > 0)
 }
 
@@ -384,8 +381,7 @@ async fn fold_within_tx(
             ],
             label: Some("brain_implicit_mass_read".into()),
         })
-        .await
-        .map_err(|e| sql_err("read mass", e))?;
+        .await?;
 
     let (old_mass, last_event_at) = match row {
         None => (0.0, now_us),
@@ -428,8 +424,7 @@ async fn fold_within_tx(
             ],
             label: Some("brain_implicit_mass_upsert".into()),
         })
-        .await
-        .map_err(|e| sql_err("write mass", e))?;
+        .await?;
 
     Ok(FoldGateOutcome {
         effective_weight,

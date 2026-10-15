@@ -14,6 +14,15 @@ use super::{
 mod correlation;
 pub use correlation::{resolve_ingest_correlation, ResolvedInboundThread, ThreadUuidProof};
 
+/// The retention facts disclosed on a new quarantine record's `comm.ingest`
+/// receipt (ADR-056, 2026-10-15 amendment decision 4). `retained` mirrors
+/// whether the committed record kept a `quarantine-original` attachment;
+/// `reason` is present only when it did not and the record carried a reason.
+struct QuarantineRetentionDisclosure {
+    retained: bool,
+    reason: Option<String>,
+}
+
 /// Reuse the stored thread identity for either form of duplicate detection.
 fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
     // Preserve the stored thread identity, including a pre-v1 free-form label.
@@ -773,6 +782,29 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // Read the two retention facts a NEW quarantine record is stored with off
+    // `props`, before it is moved into the write: whether the original was kept
+    // (the attachment actually persisted) and, when it was not, the stored
+    // reason. A `secondary-backend` drop rewrote `props` above, so this reads
+    // the final state. `None` means the message is not a quarantine record, so
+    // the receipt emits neither key.
+    let quarantine_retention_disclosure = is_quarantined.then(|| {
+        if quarantine_attachment.is_some() {
+            QuarantineRetentionDisclosure {
+                retained: true,
+                reason: None,
+            }
+        } else {
+            QuarantineRetentionDisclosure {
+                retained: false,
+                reason: props
+                    .get("quarantine_original_not_retained_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }
+        }
+    });
+
     let created = if let Some(attachment) = quarantine_attachment.clone() {
         runtime
             .try_create_note_as_trusted_ingest_with_attachment(
@@ -859,6 +891,12 @@ pub(crate) async fn handle_ingest(
         "external_id": p.external_id,
         "deduplicated": false,
     });
+    if let Some(quarantine_retention) = quarantine_retention_disclosure {
+        response["quarantine_original_retained"] = json!(quarantine_retention.retained);
+        if let Some(reason) = quarantine_retention.reason {
+            response["quarantine_original_not_retained_reason"] = json!(reason);
+        }
+    }
     if let Some(report) = degradations {
         response["post_commit_degradations"] = report;
     }
