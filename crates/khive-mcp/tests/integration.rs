@@ -82,7 +82,7 @@ async fn connect(
 fn first_text(r: &CallToolResult) -> String {
     r.content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .unwrap_or_default()
 }

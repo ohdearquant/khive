@@ -382,7 +382,7 @@ mod tests {
                     page_size,
                     journal,
                     powersafe_overwrite,
-                    crate::pool::CACHE_SIZE_KIB,
+                    &crate::pool::sqlite_cache_size_pragma().to_string(),
                 );
                 let case = format!("{page_size} {journal:?} psow={powersafe_overwrite}");
                 eprintln!("{case}: peak {peak} estimate {estimate}");

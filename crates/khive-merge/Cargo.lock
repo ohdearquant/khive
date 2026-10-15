@@ -19,12 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -126,9 +120,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -136,9 +130,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -841,8 +835,6 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -1261,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1277,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1308,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1322,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1330,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "khive-score",
  "serde",
@@ -1339,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -1351,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "khive-merge"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "khive-runtime",
@@ -1365,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "khive-types",
  "thiserror",
@@ -1373,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1394,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1407,6 +1399,7 @@ dependencies = [
  "khive-channel",
  "khive-db",
  "khive-fold",
+ "khive-fs",
  "khive-fusion",
  "khive-gate",
  "khive-query",
@@ -1423,6 +1416,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook-registry",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1435,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -1443,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1460,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "serde",
@@ -1470,18 +1464,18 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
+checksum = "f74253d8eb6650a3a800d25b4689369782e4cb48c3ee68154d1096403a968550"
 dependencies = [
  "async-trait",
- "blake3",
  "chrono",
  "lattice-inference",
  "lru",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
@@ -1489,9 +1483,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
+checksum = "7164d6239a081970afc8c0e38ddff98e76bcbf5d96cb9677126f67d934f1b6a2"
 dependencies = [
  "base64",
  "clap",
@@ -1562,11 +1556,11 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2104,9 +2098,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2169,9 +2163,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",

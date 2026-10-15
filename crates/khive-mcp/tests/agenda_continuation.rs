@@ -64,7 +64,7 @@ async fn request(
     let text = response
         .content
         .first()
-        .and_then(|content| content.raw.as_text())
+        .and_then(|content| content.as_text())
         .expect("JSON text envelope from the real MCP request tool");
     let body: Value = serde_json::from_str(&text.text)?;
     let receipts = body["results"].as_array().expect("per-operation receipts");

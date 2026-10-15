@@ -933,7 +933,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<bool> {
         self.vectors_for_model(token, model_name)?;
         let (storage_model, dimensions) = self.vector_model_metadata(model_name)?;
-        if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+        if let Some(index) = crate::atomic_message::non_finite_index(vector) {
             return Err(RuntimeError::InvalidInput(format!(
                 "non-finite entity vector at index {index}"
             )));

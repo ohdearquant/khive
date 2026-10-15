@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
+use khive_types::EdgeRelation;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -192,6 +193,44 @@ impl EntityPosteriors {
         self.map.peek(id)
     }
 
+    /// Apply `supports` evidence to alpha or `refutes` evidence to beta for a claim.
+    ///
+    /// Weights must be finite and within `[0.0, 1.0]`. Refusals and either signed
+    /// zero leave values and eviction order unchanged, without creating a claim.
+    /// Positive evidence uses the existing posterior or a default `(1, 1)` prior,
+    /// and promotes the claim according to this map's bounded LRU policy.
+    pub fn fold_evidence(
+        &mut self,
+        relation: EdgeRelation,
+        weight: f64,
+        claim_id: Uuid,
+    ) -> Result<(), String> {
+        let supports = match relation {
+            EdgeRelation::Supports => true,
+            EdgeRelation::Refutes => false,
+            _ => {
+                return Err(format!(
+                    "fold_evidence: relation must be supports or refutes, got {relation}"
+                ));
+            }
+        };
+        if !khive_types::validate_edge_weight(weight) {
+            return Err(format!(
+                "fold_evidence: weight must be finite and within [0.0, 1.0], got {weight}"
+            ));
+        }
+        if weight == 0.0 {
+            return Ok(());
+        }
+        let posterior = self.get_or_insert(claim_id, BetaPosterior::default);
+        if supports {
+            posterior.update_success_weighted(weight);
+        } else {
+            posterior.update_failure_weighted(weight);
+        }
+        Ok(())
+    }
+
     /// Effective maximum number of retained entity posteriors.
     ///
     /// A requested capacity of zero is normalized to one by construction.
@@ -276,6 +315,24 @@ impl EntityPosteriors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epistemic_evidence_uses_default_prior_and_relation_polarity() {
+        let id = Uuid::from_u128(1);
+        let mut posteriors = EntityPosteriors::new(1);
+        posteriors
+            .fold_evidence(EdgeRelation::Supports, 0.8, id)
+            .unwrap();
+        let posterior = posteriors.get(&id).unwrap();
+        assert_eq!(posterior.alpha(), 1.8);
+        assert_eq!(posterior.beta(), 1.0);
+        posteriors
+            .fold_evidence(EdgeRelation::Refutes, 0.5, id)
+            .unwrap();
+        let posterior = posteriors.get(&id).unwrap();
+        assert_eq!(posterior.alpha(), 1.8);
+        assert_eq!(posterior.beta(), 1.5);
+    }
 
     #[test]
     fn beta_posterior_mean() {

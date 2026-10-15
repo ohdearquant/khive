@@ -1140,11 +1140,11 @@ mod tests {
             sha256_hex(&canonical_json_bytes(&serde_json::to_value(&core).unwrap()).unwrap());
         assert_eq!(
             fingerprint,
-            "b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5"
+            "ba3578ee7752e27d5d22b1e34922530d7d1030b74eea3a4f1201eb39f8050e2d"
         );
         assert_eq!(
             format!("moodboard_{fingerprint}_4"),
-            "moodboard_b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5_4"
+            "moodboard_ba3578ee7752e27d5d22b1e34922530d7d1030b74eea3a4f1201eb39f8050e2d_4"
         );
 
         let production_prompt =
@@ -1155,26 +1155,26 @@ mod tests {
         );
         assert_eq!(
             production_prompt.fingerprint,
-            "5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b"
+            "380d740d6cc62b3116535d53253cbe113198c0362d9e6c0e01b483c3538d2c52"
         );
         assert_eq!(
             production_prompt.model_key,
-            "moodboard_5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b_4"
+            "moodboard_380d740d6cc62b3116535d53253cbe113198c0362d9e6c0e01b483c3538d2c52_4"
         );
 
-        let indexed_qwen_09 = DescriptorIdentity::build(
+        let indexed_qwen = DescriptorIdentity::build(
             "hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17".to_string(),
             "6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3".to_string(),
             1024,
         )
         .unwrap();
         assert_eq!(
-            indexed_qwen_09.fingerprint,
-            "bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f"
+            indexed_qwen.fingerprint,
+            "71b5a53bccf1be22e55c33f44f57676a9e07b87c56ff7bbfee37e77a283ffa33"
         );
         assert_eq!(
-            indexed_qwen_09.model_key,
-            "moodboard_bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f_1024"
+            indexed_qwen.model_key,
+            "moodboard_71b5a53bccf1be22e55c33f44f57676a9e07b87c56ff7bbfee37e77a283ffa33_1024"
         );
     }
 

@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Benchmark
 use khive_text::{
     analyzer::StandardAnalyzer,
     filter::{LowercaseFilter, MinLengthFilter, StopWordFilter},
-    lang::{contains_cjk, is_meaningful_query, ScriptProfile},
+    lang::{contains_cjk, is_meaningful_text_query, ScriptProfile},
     preset,
     tokenizer::{CjkCharTokenizer, WhitespaceTokenizer},
     Analyzer, Tokenizer,
@@ -119,11 +119,11 @@ fn bench_lang_detect(c: &mut Criterion) {
     });
 
     g.bench_function("is_meaningful_query/normal", |b| {
-        b.iter(|| is_meaningful_query(black_box("transformer attention mechanism")))
+        b.iter(|| is_meaningful_text_query(black_box("transformer attention mechanism")))
     });
 
     g.bench_function("is_meaningful_query/gibberish", |b| {
-        b.iter(|| is_meaningful_query(black_box("aaaaaaaaa")))
+        b.iter(|| is_meaningful_text_query(black_box("aaaaaaaaa")))
     });
 
     g.finish();

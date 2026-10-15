@@ -937,4 +937,7 @@ ADR-102 D1-D4; a line-level git merge of committed NDJSON is no longer the integ
 Still standing, as extensions of shipped verbs that do not depend on the git merge path:
 `kg import --on-conflict error|skip|update` and `--force` (§13; [ADR-036](ADR-036-kg-import-export-adapters.md)
 keeps the same flags for adapter imports), and `kg update <remote> [--ref <ref>]` (§8), which
-moves the pin `kg fetch` already consumes.
+moves the schema remote's Git `commit` pin. The current `kg fetch` path remains
+explicit-argument-only as recorded in [ADR-037](ADR-037-remote-resolution-and-hash-verification.md):
+it does not load schema remotes. Its optional archive-content `pin` is a separate SHA-256
+value; moving a Git commit does not implicitly repin archive content or fetch an archive.
