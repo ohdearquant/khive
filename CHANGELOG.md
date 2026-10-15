@@ -7,7 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-15
+
+### Documentation
+
+- Accept ADR-200, the external email policy: sender scope, suppression, unsubscribe and
+  screened inbound delivery.
+- Accept ADR-106 Amendment H, a per-event missed-schedule policy in which `catch_up_once`
+  requires an explicit `max_lateness`.
+- Accept ADR-140, the context graph payload budget rule; ADR-089 now points to it.
+- Accept the ADR-102 and ADR-046 2026-10-14 amendments: a staged change-set lands through one
+  atomic `apply_changeset` verb, and canonical change-set proposals land through the same path.
+  Neither is implemented yet.
+
 ### Added
+
+- `knowledge.lint` inspects the caller-visible graph against the thirteen built-in hygiene
+  rules and returns typed violations, with statistics taken before any fix. Requested fixes
+  soft-delete unchanged dangling edges, propose questions about duplicate groups and mark
+  unchanged superseded entities deprecated, each checked inside its own transaction; the
+  receipt keeps earlier committed fixes when a later one conflicts or fails. The gate
+  classifies the verb as Write. Custom rules (`knowledge.lint_config`) remain deferred.
+
+- With `KHIVE_EMAIL_EXTERNAL_SENDERS` set, authenticated mail from outside senders passes
+  deterministic screening and routes to a verified thread owner, a configured recipient alias
+  or a fallback actor. Delivered messages read back marked `origin: external` and
+  `trust: untrusted` with the rule IDs that matched. A screening rule can withhold the body:
+  the message is delivered with a rule-ID placeholder, and its `quarantine-original` attachment
+  owns the original MIME bytes, which the recipient actor or the configured maintainer reads
+  through `comm.withheld_body`. A reply asking to stop records an address suppression
+  before the message is acknowledged. With the variable unset, startup and mail handling are
+  unchanged.
+
+- `schedule.remind` and `schedule.schedule` accept `misfire_policy` (`skip` or
+  `catch_up_once`) and `max_lateness` (positive seconds, required with `catch_up_once`). An
+  overdue `catch_up_once` event dispatches its latest due occurrence once when that occurrence
+  is no older than `max_lateness`; older occurrences are recorded as missed and never
+  dispatched. Events without a policy keep the existing skip behaviour and the
+  `KHIVE_FIRE_GRACE_SECS` window.
+
+- `kkernel kg review` reads Tier 1 eligibility from the same rules snapshot it validates
+  with. An optional `[tier]` section configures the operation kinds, link relations, mutable
+  entity fields and minimum link weight eligible for Tier 1. Empty lists narrow eligibility,
+  and judgment relations, destructive operations, existing-edge updates, low weights and
+  error findings still require Tier 2. `khive-rule-evaluator` now depends on
+  `khive-changeset`.
 
 - `comm.withheld_body` reads the original RFC 5322 bytes of a delivered withheld external
   message, base64-encoded with their size. Only the message's recipient actor and the
@@ -33,13 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for others. An empty or malformed id after the prefix fails configuration. Adding the variant to
   the public `TrustAnchor` enum is a breaking change for exhaustive matches.
 
+- With `KHIVE_SEARCH_PROFILE` set, each search the coordinator runs across configured backends
+  writes one JSON line per stage to stderr (`backend`, `merge`, `fanout`, `finalize`, `hydrate`
+  and `search`), grouped by a call id that a nested search shares with its outer call. A
+  `backend` line names the backend, its hit count and its outcome (`ok`, `error` or `timeout`).
+  With the variable unset nothing is written and no stage timer reads the clock.
+
 ### Changed
 
-- A delivered withheld external message no longer carries `quarantine_content_ref` in its
-  properties; its `quarantine-original` attachment alone owns the original, and a retried
-  delivery proves custody through that attachment. Read the original with
-  `comm.withheld_body` instead of `blob.get`. Messages stored before this change keep the
-  property, and quarantine records keep theirs.
+- With no configured floor, the filesystem blob store's free-space floor is 2% of the volume
+  holding the blob root, never less than 5 GiB, instead of a fixed 100 GB. A configured
+  `floor_bytes` is used as given, including `0`. `FsBlobStore::DEFAULT_FLOOR_BYTES` remains,
+  deprecated.
+- Event counts keep the caller's request-read budget (`KHIVE_REQUEST_READ_TIMEOUT_SECS`)
+  instead of the fixed 10-second RPC timeout, and typed read and admission timeouts cross the
+  events wire intact. The events protocol version is now 6, so clients and daemons must be
+  upgraded together.
 - Configurable graph rules share the pure `khive-rule-evaluator` crate between
   `kg validate` and `kg commit`, using captured NDJSON inputs and explicit citation
   time. Runtime and offline checks share the canonical endpoint table and matcher.
@@ -71,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `In-Reply-To`/`References` Message-ID path already requires. A UUID naming any other thread
   falls through to the recipient aliases and then the external inbound actor. Maintainer mail
   keeps its existing resolution.
+
 - A new quarantine record's `comm.ingest` receipt now reports whether the record kept its original:
   `quarantine_original_retained` (a boolean) and, when it is false,
   `quarantine_original_not_retained_reason` naming the stored reason. A non-quarantine message and a
@@ -80,6 +134,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `notice_config_error` (cleared by a later success that omits it); a failure heartbeat refuses all
   of them. `comm.health` reports each per channel, `null` for a writer that does not report them and
   for quarantine-only entries.
+
+- Brain verbs report storage timeouts and admission refusals as typed storage errors instead
+  of internal errors, so callers keep the retryable classification.
+
+- A note update whose model reindex fails after the commit returns the typed committed
+  degradation error, naming each failed model and stage, instead of reporting success.
+
+- A verified mailto opt-out received while the email host has no comm store is kept for retry
+  instead of being consumed as already recorded.
+
+- With `KHIVE_RECALL_PROFILE=1`, each memory recall labels its stage records with its own call
+  ID and writes exactly one `total` record on every exit, including empty results, errors and
+  cancellation.
+
+- Events store directory refusals name the database path and the ownership, permission or
+  location remedy.
+
+### Performance
+
+- Reindex writes each page of notes or entities to the full-text index as one batch, keeping
+  successful documents when one in the page is refused.
+- Vamana insertion reuses pooled visited-node scratch instead of allocating it per insert.
+
+### Breaking (Rust crates)
+
+- `khive_channel::ChannelEnvelope` adds `inbound_delivery`, the host-verified routing for an
+  inbound message (never serialized). Direct struct literals must set it, usually to `None`.
+- `khive_runtime::events_split::EventsRequest::CountEvents` and `CountEventsGrouped` add
+  `operator_read_budget_secs`, and `EventsResponse::Error` adds `read_failure`. Direct
+  constructors and exhaustive destructurings of these variants must account for them.
+- `khive_runtime::RuntimeError` adds the `LintFix` variant, which keeps a lint fix's typed
+  cause and its confirmed receipts. The enum is not `#[non_exhaustive]`, so downstream
+  exhaustive matches must handle it.
+- `khive_channel_email::config::TrustAnchor` adds the `TopmostWithAuthservId` variant for
+  `!topmost:<authserv-id>`. The enum is not `#[non_exhaustive]`, so downstream exhaustive
+  matches must handle it.
 
 ## [0.12.0] - 2026-10-13
 
