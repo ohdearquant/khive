@@ -62,7 +62,6 @@ cd "$SCRIPT_DIR/../crates"
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
     khive-types
-    khive-rule-evaluator # pure rules; needs khive-types, used by kkernel
     khive-score
     khive-quant
     khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first
@@ -84,6 +83,7 @@ CRATES=(
     khive-runtime
     khive-vcs-adapters
     khive-changeset      # needs khive-types (above)
+    khive-rule-evaluator # pure rules; needs khive-types and khive-changeset (above), used by kkernel
     khive-graph-diff     # needs khive-types (above); pure graph-state diff
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
