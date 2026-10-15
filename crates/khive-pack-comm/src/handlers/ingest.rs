@@ -86,6 +86,9 @@ async fn verify_duplicate_replay(
         let props = props.ok_or_else(|| {
             RuntimeError::InvalidInput("ingest: duplicate withheld delivery lacks markings".into())
         })?;
+        // Custody is the attachment alone: a delivered withheld message keeps no
+        // blob reference in its properties, so a replayed delivery proves the
+        // original by the `quarantine-original` owner below, not by a property.
         if !stored_withheld
             || stored_quarantine
             || props.get("origin").and_then(Value::as_str) != Some("external")
@@ -93,8 +96,6 @@ async fn verify_duplicate_replay(
             || !props.get("labels").is_some_and(Value::is_array)
             || props.get("channel_kind").and_then(Value::as_str) != channel_kind
             || props.get("channel_slug").and_then(Value::as_str) != channel_slug
-            || props.get("quarantine_content_ref").and_then(Value::as_str)
-                != Some(attachment.content_ref.as_str())
         {
             return Err(RuntimeError::InvalidInput(
                 "ingest: duplicate withheld delivery disagrees with original custody".into(),
@@ -769,7 +770,16 @@ pub(crate) async fn handle_ingest(
     // `sent_by_process`), preventing adapter metadata from fabricating a
     // contract field or process provenance.
     // `forwarded` is reserved for message provenance, not adapter metadata.
-    if let Some(metadata) = p.metadata {
+    if let Some(mut metadata) = p.metadata {
+        // A delivered withheld message is stored without any blob reference: the
+        // original is owned only by its `quarantine-original` attachment, which
+        // read surfaces omit. Dropping the metadata key here keeps
+        // `quarantine_content_ref` out of the delivered properties while the
+        // attachment written below still owns the bytes. Quarantine records keep
+        // the property and their existing operator recovery path.
+        if body_withheld && !is_quarantined {
+            metadata.remove("quarantine_content_ref");
+        }
         if let Some(obj) = props.as_object_mut() {
             for (k, v) in metadata {
                 if COMM_STABLE_PROPERTY_KEYS.contains(&k.as_str())

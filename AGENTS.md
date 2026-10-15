@@ -232,7 +232,7 @@ and match the serve. Unjudged preserves their grade/dedup budget: a later eligib
 `useful`, `not_useful`, or `wrong` auto-feedback judgment using that pair commits
 exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 
-### Comm pack — 14 verbs (`comm.` prefix)
+### Comm pack — 15 verbs (`comm.` prefix)
 
 | Verb                      | What it does                                                                                                                                         | When to use                                                 |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -250,6 +250,7 @@ exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 | `comm.suppression_add`    | Add an email suppression entry (address, exact domain, or recipient key); requires `scope`, `kind`, `value`, `source`                                | Record an opt-out or operator block                         |
 | `comm.suppression_list`   | List live suppression entries, optionally filtered by `scope` and `kind`                                                                             | Audit what is currently suppressed                          |
 | `comm.suppression_remove` | Remove one suppression entry by full UUID; a non-empty `reason` is required, and opt-out sources also need later authenticated same-address evidence | Lift a block with an audit trail                            |
+| `comm.withheld_body`      | Read a delivered withheld external message's original bytes, base64-encoded; open to its recipient actor and the maintainer, every call audited      | Recover what a screening rule withheld                      |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80

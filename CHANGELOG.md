@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `comm.withheld_body` reads the original RFC 5322 bytes of a delivered withheld external
+  message, base64-encoded with their size. Only the message's recipient actor and the
+  configured maintainer may read it; any other caller is refused before the original is read,
+  and an id that is not a delivered withheld message is refused. Every call writes an audit
+  event naming the caller, the message id and the outcome. The response never carries a
+  content reference.
+
 - `EntityPosteriors::fold_evidence` applies weighted `supports` and `refutes` evidence
   to a claim's posterior, rejecting invalid relations and weights before changing values
   or eviction order. Either signed zero is a mutation-free no-op.
@@ -28,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A delivered withheld external message no longer carries `quarantine_content_ref` in its
+  properties; its `quarantine-original` attachment alone owns the original, and a retried
+  delivery proves custody through that attachment. Read the original with
+  `comm.withheld_body` instead of `blob.get`. Messages stored before this change keep the
+  property, and quarantine records keep theirs.
 - Configurable graph rules share the pure `khive-rule-evaluator` crate between
   `kg validate` and `kg commit`, using captured NDJSON inputs and explicit citation
   time. Runtime and offline checks share the canonical endpoint table and matcher.

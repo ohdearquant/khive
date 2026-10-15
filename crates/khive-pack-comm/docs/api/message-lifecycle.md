@@ -817,11 +817,14 @@ properties; their projections and successful `comm.read` body results also
 expose `origin`, `trust`, and `labels`. Withheld content is a rule-ID placeholder.
 Its original RFC5322 bytes are published as a blob and atomically owned by a
 `quarantine-original` attachment on the delivered message, with no quarantine
-disposition or quarantine expiry. Retries require matching channel identity,
-reference, and owner; they never repair or extend a delivered note. Unsupported
-secondary-backend atomic custody refuses withheld delivery rather than dropping
-its original. Ordinary read surfaces and inbox notices contain no original body;
-an operator can read the referenced original using `blob.get` and base64 decoding.
+disposition or quarantine expiry. The delivered message carries no
+`quarantine_content_ref` or other blob reference in its properties; the attachment
+alone owns the original. Retries require matching channel identity and an owner
+attachment holding the replayed bytes; they never repair or extend a delivered note.
+Unsupported secondary-backend atomic custody refuses withheld delivery rather than
+dropping its original. Ordinary read surfaces and inbox notices contain no original
+body and no reference. The message's recipient actor and the maintainer read the
+original through `comm.withheld_body`, which audits every call.
 
 Failed withheld publication follows ADR-056's 2026-10-14 Decisions 1–3: the
 existing 60-retryable/5-other per-message bounds terminate in true quarantine,

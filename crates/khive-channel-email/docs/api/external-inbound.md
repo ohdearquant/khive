@@ -22,8 +22,10 @@ Authentication and inbound suppression run before deterministic MIME screening.
 Delivered external messages retain `origin=external`, `trust=untrusted`, their
 normalized email sender and rule identifiers. Routing never grants trust.
 Withheld messages contain a placeholder naming the labels; original RFC5322 bytes
-are referenced from their atomic replay attachment for explicit `blob.get` reads.
-Ordinary inbox, read, thread and notice surfaces do not carry those bytes.
+are owned by their atomic replay attachment and read through `comm.withheld_body`,
+open to the message's recipient actor and the maintainer. The delivered message
+carries no blob reference, and ordinary inbox, read, thread and notice surfaces do
+not carry those bytes.
 Executable attachments or two withholding families are quarantined as `screened`.
 
 An authenticated opt-out on a marked or withheld delivery commits an outbound

@@ -1,6 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All fourteen public comm verbs store or query comm state.
+//! All fifteen public comm verbs store or query comm state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -55,6 +55,7 @@ mod reply;
 mod suppression;
 mod thread;
 mod validation;
+mod withheld_body;
 #[doc(hidden)]
 pub use probe_cursor::PROBE_SQL;
 pub(crate) use probe_cursor::{handle_cursor_commit, handle_cursor_get, handle_probe};
@@ -96,6 +97,7 @@ pub use suppression::{
     load_inbound_email_suppressions, load_outbound_email_suppressions,
     record_mailto_unsubscribe_suppression, record_reply_opt_out_suppression,
 };
+pub(crate) use withheld_body::handle_withheld_body;
 
 use validation::{
     addressed_recipient, caller_inherits_legacy_pool, canonicalize_ingest_sent_at,

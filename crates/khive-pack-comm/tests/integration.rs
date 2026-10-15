@@ -125,14 +125,14 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_nineteen_handlers() {
+fn comm_pack_declares_twenty_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        19,
-        "comm pack must declare 19 handlers: send, delivered, transport_status, inbox, read, \
+        20,
+        "comm pack must declare 20 handlers: send, delivered, transport_status, inbox, read, \
          mark_read, unread, reply, \
          thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit, \
-         suppression_add, suppression_list, suppression_remove \
+         suppression_add, suppression_list, suppression_remove, withheld_body \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -191,6 +191,11 @@ fn comm_pack_declares_nineteen_handlers() {
         names.contains(&"comm.health"),
         "comm.health verb must be registered (khive #606)"
     );
+    let withheld_body = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.withheld_body")
+        .expect("comm.withheld_body verb must be registered (ADR-200 Amendment 1)");
+    assert_eq!(withheld_body.visibility, Visibility::Verb);
 }
 
 #[test]
