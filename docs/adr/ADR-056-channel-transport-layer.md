@@ -1,6 +1,7 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amendment 2026-10-15 proposed -- operator notices for messages and originals the channel could not keep; amended 2026-10-14 -- every inbound page hold is bounded; amended 2026-09-27 -- channel-scoped external-ID deduplication;
+**Status**: Accepted (amendment 2026-10-15 proposed -- topmost trust with a shared authserv-id; amendment
+2026-10-15 proposed -- operator notices for messages and originals the channel could not keep; amended 2026-10-14 -- every inbound page hold is bounded; amended 2026-09-27 -- channel-scoped external-ID deduplication;
 amended 2026-09-25 -- Telegram outbound delivery is at-least-once without deduplication;
 amended 2026-09-25 -- `external_id` on a message note is transport-owned at creation; amended 2026-09-25 --
 inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
@@ -8,6 +9,7 @@ inbound email has a per-message byte cap; amended 2026-08-09 -- quarantine healt
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-10-15, topmost trust with a shared authserv-id](#amendment-2026-10-15----topmost-trust-with-a-shared-authserv-id),
 [§Amendment 2026-10-15, operator notices](#amendment-2026-10-15----operator-notices-for-messages-and-originals-the-channel-could-not-keep),
 [§Amendment 2026-10-14, bounded page holds](#amendment-2026-10-14----every-inbound-page-hold-is-bounded),
 [§Amendment 2026-09-27, channel-scoped external-ID deduplication](#amendment-2026-09-27----channel-scoped-external-id-deduplication),
@@ -37,7 +39,92 @@ statement; its SessionStore design was not carried forward\
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
 #1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment), #5345 (unbounded
 page holds -- resolved by the 2026-10-14 amendment), #5364 and #5404 (operator notices -- addressed by the
-2026-10-15 operator-notices amendment)
+2026-10-15 operator-notices amendment), #5407 (Exchange Online stamps two shapes -- resolved by the 2026-10-15
+topmost-trust amendment)
+
+## Amendment 2026-10-15 -- Topmost trust with a shared authserv-id
+
+**Status**: Proposed 2026-10-15.
+
+**Trigger.** #5407. This amendment adds a third trust-anchor mode to
+[§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary). The two modes it
+defines are unchanged.
+
+### Finding
+
+Exchange Online does not stamp one shape on the plain `Authentication-Results` header it writes for a
+Microsoft 365 mailbox. Mail from a transactional sender (Amazon SES), delivered 2026-10-14, carried as its
+topmost and only `Authentication-Results`, with no ARC header at all:
+
+```
+Authentication-Results: mx.microsoft.com 1; spf=pass (sender IP is ...) smtp.mailfrom=...;
+  dkim=pass (signature was verified) header.d=<sender domain>;
+  dkim=pass (signature was verified) header.d=amazonses.com;
+  dmarc=pass action=none header.from=<sender domain>; compauth=pass reason=100
+```
+
+Gmail-origin mail to the same mailbox (newest sample read, 2026-09-22) carried the shape the 2026-07-03
+amendment recorded: no `authserv-id` on the plain header, and `mx.microsoft.com 1` only on
+`ARC-Authentication-Results`. Whether the difference follows the sending path or a change over time is not
+established, so a deployment must accept both.
+
+Neither existing mode does. Topmost-no-`authserv-id` mode refuses a topmost header that carries any
+`authserv-id`, by design, so every message of the first shape is quarantined as `auth-absent` although it
+passed SPF, DKIM and DMARC with alignment. `authserv-id` mode configured with `mx.microsoft.com` matches
+nothing on the second shape. The parser reads both shapes correctly; the gap is in selection.
+
+### Decision
+
+A third mode of `KHIVE_EMAIL_AUTHSERV_ID`, chosen only from configuration:
+
+3. **Topmost mode with a shared `authserv-id`**, selected by the reserved prefix `!topmost:` followed by
+   the id (for Exchange Online, `!topmost:mx.microsoft.com`). Consider **only the topmost**
+   `Authentication-Results` header. Trust it if it parses **and** carries either no `authserv-id` or the
+   configured one (case-insensitive). If it carries any other `authserv-id`, or does not parse, quarantine;
+   never fall through to a lower header. Absence of any `Authentication-Results` quarantines, unchanged. The
+   configured id is the one observed on a delivered message, per the 2026-07-02 rule, not taken from
+   provider documentation.
+
+Position remains the sole discriminator, as in topmost-no-`authserv-id` mode. The id is a check on the
+shape of the boundary's own stamp, not an identification of the boundary.
+
+**Why accepting no `authserv-id` does not weaken the mode.** Under the operational precondition the topmost
+header is the boundary's own, whatever its shape. If the precondition failed, a forger who controls the top
+could write either shape, so requiring one shape would not stop them. Requiring one shape would only turn a
+format difference between sending paths into quarantine of every message of the other shape, which is the
+outage this amendment removes. A different `authserv-id` at the top still fails closed.
+
+### Rejected alternatives
+
+- **`authserv-id` mode with `mx.microsoft.com`.** The 2026-07-03 rejection stands. The id is shared by every
+  Microsoft 365 tenant, so it does not identify this boundary. And `authserv-id` mode selects the topmost
+  _matching_ header: on a message whose topmost stamp has no id (the Gmail path), selection would fall
+  through to a lower header carrying `mx.microsoft.com`, which a sender can write. The positional rule never
+  looks below the top.
+- **Trust only the stamped shape (`!topmost:<id>` without the no-id case).** Quarantines the unstamped
+  sending paths; see the Decision.
+
+### Operational precondition
+
+Unchanged from the 2026-07-03 amendment and still load-bearing. Before a deployment switches to this mode,
+re-run the #448 live probe with a forged topmost `Authentication-Results: mx.microsoft.com 1; ...;
+dmarc=pass` and confirm the boundary's own stamp lands above it.
+
+### Configuration
+
+`KHIVE_EMAIL_AUTHSERV_ID` gains the reserved prefix `!topmost:`, reserved by the same convention as
+`!topmost-no-authserv-id`. The id after it must be a single token: an empty id, or one containing whitespace,
+a control character or `;`, can never equal a parsed `authserv-id` and fails configuration, so the channel
+does not start. A value without the exact prefix (`!Topmost:...`, `topmost:...`) remains a literal
+`authserv-id`, as before; no value silently degrades to trusting the topmost header.
+
+### Consequences
+
+Exchange Online mailboxes are attributed for both stamped and unstamped sending paths once the precondition
+is re-attested. RFC-compliant boundaries are unaffected. The change is confined to the trust-anchor parse
+and `select_trusted` mode dispatch; the parser, the alignment check, quarantine reasons and dispositions are
+unchanged. `TrustAnchor` is a public enum, so the new variant is a breaking change for code that matches it
+exhaustively. #5406 tracks reporting a header the anchor declined separately from an absent one.
 
 ## Amendment 2026-10-15 -- Operator notices for messages and originals the channel could not keep
 
