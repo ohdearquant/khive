@@ -173,9 +173,10 @@ impl PackRuntime for KgPack {
         );
 
         match verb {
+            // Boxed: the canonical apply future is large, and inline it would grow the stack
+            // frame of every dispatch, whichever verb is called.
             "apply_changeset" => {
-                self.handle_apply_changeset(graph_token, params, registry)
-                    .await
+                Box::pin(self.handle_apply_changeset(graph_token, params, registry)).await
             }
             // Kind-discriminated: override only for entity/edge kinds.
             "create" | "list" | "search" => {
