@@ -30,3 +30,59 @@ fn crosses_floor_saturates_instead_of_underflowing_when_write_exceeds_available(
     // `0 < 0` is false.
     assert!(!crosses_floor(10, 100, 0));
 }
+
+// ── Default floor scales with the volume (ADR-111 Amendment 6) ───────────────
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[test]
+fn default_floor_is_two_percent_of_a_large_volume() {
+    assert_eq!(
+        FsBlobStore::default_floor_for_capacity(1_000_000_000_000),
+        20_000_000_000
+    );
+    assert_eq!(
+        FsBlobStore::default_floor_for_capacity(4096 * GIB),
+        4096 * GIB / 50
+    );
+}
+
+#[test]
+fn default_floor_never_drops_below_five_gib_on_a_small_volume() {
+    assert_eq!(FsBlobStore::MIN_DEFAULT_FLOOR_BYTES, 5 * GIB);
+    for capacity in [0, 64 * GIB, 100 * GIB, 250 * GIB] {
+        assert_eq!(
+            FsBlobStore::default_floor_for_capacity(capacity),
+            5 * GIB,
+            "capacity {capacity}"
+        );
+    }
+    // The first volume size whose 2% exceeds the minimum.
+    assert_eq!(
+        FsBlobStore::default_floor_for_capacity(250 * GIB + 50),
+        5 * GIB + 1
+    );
+}
+
+#[test]
+fn resolved_floor_keeps_a_configured_value_including_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(FsBlobStore::resolve_floor(dir.path(), Some(0)), 0);
+    assert_eq!(
+        FsBlobStore::resolve_floor(dir.path(), Some(100_000_000_000)),
+        100_000_000_000
+    );
+}
+
+#[test]
+fn resolved_floor_without_configuration_follows_the_volume_of_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let capacity = fs4::total_space(dir.path()).unwrap();
+    let expected = FsBlobStore::default_floor_for_capacity(capacity);
+    assert_eq!(FsBlobStore::resolve_floor(dir.path(), None), expected);
+    // A root that does not exist yet is measured on its parent's volume.
+    assert_eq!(
+        FsBlobStore::resolve_floor(&dir.path().join("blobs-not-yet-created"), None),
+        expected
+    );
+}

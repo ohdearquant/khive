@@ -1415,8 +1415,9 @@ impl StorageBackend {
     /// `KHIVE_BLOB_ROOT` env var > `config_root` (a caller-resolved
     /// `khive.toml` override — `khive-db` has no TOML parser of its own) >
     /// beside this backend's database directory. `floor_bytes` overrides the
-    /// default 100 GB fail-closed free-space floor (`None` keeps the
-    /// default). Errors if none of the three roots apply — e.g. an in-memory
+    /// default fail-closed free-space floor (`None` keeps the default, 2% of
+    /// the volume and at least 5 GiB; ADR-111 Amendment 6). Errors if none of
+    /// the three roots apply — e.g. an in-memory
     /// backend with no override and no env var has nowhere to default to.
     pub fn blob_store(
         &self,
@@ -1424,7 +1425,7 @@ impl StorageBackend {
         floor_bytes: Option<u64>,
     ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
         let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
-        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        let floor = blob::FsBlobStore::resolve_floor(&root, floor_bytes);
         Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
     }
 
@@ -1438,7 +1439,7 @@ impl StorageBackend {
         floor_bytes: Option<u64>,
     ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
         let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
-        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        let floor = blob::FsBlobStore::resolve_floor(&root, floor_bytes);
         Ok(Arc::new(blob::FsBlobStore::open_existing(root, floor)?))
     }
 
