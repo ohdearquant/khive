@@ -24,66 +24,7 @@ fn unjudged_kind_precedes_signal_and_verb_interpretation() {
     }
 }
 
-#[test]
-fn recall_success_with_target_is_hit() {
-    let id = Uuid::new_v4();
-    let e = make_event("recall", EventOutcome::Success, Some(id));
-    match interpret(&e) {
-        BrainSignal::RecallHit { target_id, .. } => assert_eq!(target_id, id),
-        other => panic!("expected RecallHit, got {other:?}"),
-    }
-}
-
-#[test]
-fn memory_recall_success_with_target_is_hit() {
-    // Namespaced verb, as actually dispatched by the runtime's VerbRegistry
-    // for `memory.recall` — see khive-runtime/src/pack.rs's dispatch hook.
-    let id = Uuid::new_v4();
-    let e = make_event("memory.recall", EventOutcome::Success, Some(id));
-    match interpret(&e) {
-        BrainSignal::RecallHit { target_id, .. } => assert_eq!(target_id, id),
-        other => panic!("expected RecallHit, got {other:?}"),
-    }
-}
-
-#[test]
-fn recall_hit_decodes_serving_profile_attribution() {
-    let id = Uuid::new_v4();
-    let mut e = make_event("memory.recall", EventOutcome::Success, Some(id));
-    e.payload = serde_json::json!({
-        "served_by_profile_id": "custom-recall-v1",
-        "serve_attribution": "profile"
-    });
-    match interpret(&e) {
-        BrainSignal::RecallHit {
-            served_by_profile_id,
-            serve_attribution,
-            ..
-        } => {
-            assert_eq!(served_by_profile_id.as_deref(), Some("custom-recall-v1"));
-            assert_eq!(serve_attribution, ServeAttribution::Profile);
-        }
-        other => panic!("expected RecallHit, got {other:?}"),
-    }
-}
-
-#[test]
-fn recall_hit_decodes_explicit_unattributed_marker() {
-    let id = Uuid::new_v4();
-    let mut e = make_event("memory.recall", EventOutcome::Success, Some(id));
-    e.payload = serde_json::json!({"serve_attribution": "unattributed"});
-    match interpret(&e) {
-        BrainSignal::RecallHit {
-            served_by_profile_id,
-            serve_attribution,
-            ..
-        } => {
-            assert!(served_by_profile_id.is_none());
-            assert_eq!(serve_attribution, ServeAttribution::Unattributed);
-        }
-        other => panic!("expected RecallHit, got {other:?}"),
-    }
-}
+include!("tests/recall_shapes.rs");
 
 #[test]
 fn recall_success_without_target_is_miss() {
@@ -192,62 +133,7 @@ fn unknown_verb_is_irrelevant() {
     assert!(matches!(interpret(&e), BrainSignal::Irrelevant));
 }
 
-#[test]
-fn entity_signal_for_hit() {
-    let id = Uuid::new_v4();
-    let sig = BrainSignal::RecallHit {
-        target_id: id,
-        latency_us: 100,
-        served_by_profile_id: None,
-        serve_attribution: ServeAttribution::Unspecified,
-    };
-    assert_eq!(entity_signal(&sig), Some((id, true)));
-}
-
-#[test]
-fn entity_signal_for_miss() {
-    assert_eq!(entity_signal(&BrainSignal::RecallMiss), None);
-}
-
-#[test]
-fn recall_positive_classification() {
-    let hit = BrainSignal::RecallHit {
-        target_id: Uuid::new_v4(),
-        latency_us: 0,
-        served_by_profile_id: None,
-        serve_attribution: ServeAttribution::Unspecified,
-    };
-    assert_eq!(is_recall_positive(&hit), Some(true));
-    assert_eq!(is_recall_positive(&BrainSignal::RecallMiss), Some(false));
-    assert_eq!(
-        is_recall_positive(&BrainSignal::SearchCompleted { latency_us: 0 }),
-        None
-    );
-}
-
-#[test]
-fn feedback_not_useful_is_negative_entity_signal() {
-    let id = Uuid::new_v4();
-    let sig = BrainSignal::Feedback {
-        target_id: id,
-        signal: FeedbackSignal::NotUseful,
-        served_by_profile_id: None,
-        section_signals: None,
-    };
-    assert_eq!(entity_signal(&sig), Some((id, false)));
-}
-
-#[test]
-fn feedback_wrong_is_negative_entity_signal() {
-    let id = Uuid::new_v4();
-    let sig = BrainSignal::Feedback {
-        target_id: id,
-        signal: FeedbackSignal::Wrong,
-        served_by_profile_id: None,
-        section_signals: None,
-    };
-    assert_eq!(entity_signal(&sig), Some((id, false)));
-}
+include!("tests/entity_signal_values.rs");
 
 #[test]
 fn brain_feedback_invalid_signal_data_is_irrelevant() {
@@ -335,37 +221,7 @@ fn semantic_feedback_preserves_section_signals_for_replay() {
 
 // ── FeedbackEventKind unit tests (MAJ-001 coverage) ──────────────────────
 
-#[test]
-fn feedback_event_kind_from_signal_str_all_variants() {
-    assert_eq!(
-        FeedbackEventKind::from_signal_str("explicit_positive"),
-        Some(FeedbackEventKind::ExplicitPositive)
-    );
-    assert_eq!(
-        FeedbackEventKind::from_signal_str("explicit_negative"),
-        Some(FeedbackEventKind::ExplicitNegative)
-    );
-    assert_eq!(
-        FeedbackEventKind::from_signal_str("implicit_positive"),
-        Some(FeedbackEventKind::ImplicitPositive)
-    );
-    assert_eq!(
-        FeedbackEventKind::from_signal_str("implicit_negative"),
-        Some(FeedbackEventKind::ImplicitNegative)
-    );
-    assert_eq!(
-        FeedbackEventKind::from_signal_str("correction"),
-        Some(FeedbackEventKind::Correction)
-    );
-}
-
-#[test]
-fn feedback_event_kind_from_signal_str_unknown_returns_none() {
-    assert_eq!(FeedbackEventKind::from_signal_str("useful"), None);
-    assert_eq!(FeedbackEventKind::from_signal_str("not_useful"), None);
-    assert_eq!(FeedbackEventKind::from_signal_str(""), None);
-    assert_eq!(FeedbackEventKind::from_signal_str("ExplicitPositive"), None);
-}
+include!("tests/feedback_kind_parsing.rs");
 
 #[test]
 fn feedback_event_kind_update_weight_values() {
