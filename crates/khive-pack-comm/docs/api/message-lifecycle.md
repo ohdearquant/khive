@@ -745,8 +745,11 @@ to the recipient aliases and then the external inbound actor. Maintainer mail us
 the `correlation_external_id` path, which keeps the transport-level resolution and
 does not require an email Message-ID.
 
-An authenticated delivered opt-out commits an `outbound/address/reply_stop`
-suppression before duplicate acknowledgement or message creation. It uses the
+An authenticated delivered opt-out, or one on a quarantine whose
+`quarantine_reason` is `screened` (addressed from its `quarantine_claimed_from`),
+commits an `outbound/address/reply_stop` suppression before duplicate
+acknowledgement or message creation. Both require the `opt_out.unsubscribe`
+label; ingest refuses a claimed opt-out on any other quarantine reason. It uses the
 same unique insert as mailto and operator entries. A failed insert leaves the
 message unacknowledged; an identical retry adds no second entry.
 

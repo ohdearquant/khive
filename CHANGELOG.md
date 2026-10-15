@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ingested after the upgrade: a quarantine record already stored keeps the landing actor it
   was written with, and nothing re-addresses it. A runtime with no configured actor keeps the
   landing actor.
+### Fixed
+
+- An authenticated opt-out in a message that screening quarantines as `screened` now records
+  the reply-stop suppression for its sender before the quarantine is acknowledged, as a
+  delivered opt-out already did. No other quarantine reason records an opt-out, and ingest
+  refuses one claimed on them.
 
 ## [0.13.0] - 2026-10-15
 

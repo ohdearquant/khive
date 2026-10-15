@@ -952,3 +952,130 @@ async fn a17_delivered_withheld_message_carries_no_blob_reference() {
         .unwrap();
     assert_eq!(after.content_ref, owner.content_ref);
 }
+
+/// A quarantine envelope as the email channel builds it, carrying the opt-out label and the
+/// channel's opt-out marker; `reason` is the quarantine reason.
+fn quarantine_opt_out_envelope(reason: &str) -> ChannelEnvelope {
+    let mut env = ChannelEnvelope::new(
+        "email:quarantine",
+        "email:maintainer@example.com",
+        "External email quarantined [executable_attachment.declared_or_sniffed, opt_out.unsubscribe]",
+    )
+    .with_subject("review")
+    .with_external_id("imap:fixture:account:11:8")
+    .with_quarantine_replay(ORIGINAL.to_vec(), "email:maintainer@example.com");
+    for (key, value) in [
+        ("quarantined", "true"),
+        ("quarantine_reason", reason),
+        ("quarantine_claimed_from", "Stranger@Example.COM"),
+        (
+            "labels",
+            r#"["executable_attachment.declared_or_sniffed","opt_out.unsubscribe"]"#,
+        ),
+        ("screening_opt_out", "true"),
+    ] {
+        env.metadata.insert(key.into(), value.into());
+    }
+    env
+}
+
+/// ADR-200 Amendment 1 Decision 5 (A19): an authenticated opt-out in a message quarantined as
+/// `screened` suppresses its `From:` address before the quarantine is acknowledged, and the next
+/// send to that address is refused.
+#[tokio::test]
+async fn a19_screened_quarantine_opt_out_stops_the_next_send() {
+    let (_blobs, runtime, registry) = fixture();
+    let env = quarantine_opt_out_envelope("screened");
+    let params = email_ingest_params(
+        "local",
+        ("email", "adr200"),
+        "actor:fallback",
+        &env,
+        env.metadata.clone(),
+    );
+    assert_eq!(params["reply_opt_out"], true);
+    let first = ingest(&registry, &env).await;
+    let replay = ingest(&registry, &env).await;
+    assert_eq!(replay["deduplicated"], true);
+    assert_eq!(first["thread_id"], replay["thread_id"]);
+    let rows = as_actor(
+        &registry,
+        "comm.suppression_list",
+        json!({"scope":"outbound","kind":"address"}),
+    )
+    .await;
+    assert_eq!(rows["items"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["items"][0]["source"], "reply_stop");
+    assert_eq!(rows["items"][0]["value"], "stranger@example.com");
+    let suppressions = khive_pack_comm::handlers::load_outbound_email_suppressions(&runtime)
+        .await
+        .unwrap();
+    assert_eq!(
+        suppressions
+            .iter()
+            .filter(|entry| entry.value == "stranger@example.com")
+            .count(),
+        1
+    );
+    assert!(registry
+        .dispatch_with_identity(
+            "comm.send",
+            json!({"to":"email:Stranger@Example.COM","content":"suppressed"}),
+            Some(RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some(ACTOR.into()),
+                ..Default::default()
+            })
+        )
+        .await
+        .is_err());
+}
+
+/// Only a `screened` quarantine follows authentication, so no other quarantine reason records an
+/// opt-out, and ingest refuses one that claims it, as it refuses a screened quarantine without the
+/// opt-out label.
+#[tokio::test]
+async fn unauthenticated_quarantine_opt_out_records_nothing() {
+    let (_blobs, runtime, registry) = fixture();
+    let env = quarantine_opt_out_envelope("dmarc-fail");
+    let mut unlabelled = quarantine_opt_out_envelope("screened");
+    unlabelled.metadata.insert(
+        "labels".into(),
+        r#"["executable_attachment.declared_or_sniffed"]"#.into(),
+    );
+    for (case, claimed) in [
+        ("dmarc-fail", &env),
+        ("screened without label", &unlabelled),
+    ] {
+        let mut params = email_ingest_params(
+            "local",
+            ("email", "adr200"),
+            "actor:fallback",
+            claimed,
+            claimed.metadata.clone(),
+        );
+        params["reply_opt_out"] = json!(true);
+        let refused = registry
+            .dispatch("comm.ingest", params)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("reply opt-out requires authenticated external delivery markings"),
+            "{case}: {refused}"
+        );
+    }
+    let params = email_ingest_params(
+        "local",
+        ("email", "adr200"),
+        "actor:fallback",
+        &env,
+        env.metadata.clone(),
+    );
+    assert_eq!(params["reply_opt_out"], false);
+    ingest(&registry, &env).await;
+    let suppressions = khive_pack_comm::handlers::load_outbound_email_suppressions(&runtime)
+        .await
+        .unwrap();
+    assert!(suppressions.is_empty(), "{suppressions:?}");
+}

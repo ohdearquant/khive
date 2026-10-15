@@ -639,6 +639,13 @@ impl EmailChannel {
                 serde_json::to_string(&outcome.rule_ids)
                     .map_err(|error| ChannelError::Config(error.to_string()))?,
             );
+            // ADR-200 Amendment 1 Decision 5: an opt-out from an authenticated sender is recorded
+            // whatever the screening outcome, so the quarantine carries it to ingest.
+            if outcome.opt_out {
+                envelope
+                    .metadata
+                    .insert("screening_opt_out".into(), "true".into());
+            }
             return Ok(envelope);
         }
         let config = self.external_inbound.as_ref().ok_or_else(|| {
