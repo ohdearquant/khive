@@ -379,9 +379,9 @@ conversation, and an opt-out inside a message that screening quarantines is not 
    `screened` and that carries the `opt_out` label still adds the §5.4 entry point 3 suppression for its `From:`
    address before the quarantine is acknowledged. §8.4 already says the label does not change the delivery outcome;
    this makes the suppression not depend on it either, in the direction §8.4 names as safe.
-6. **Quarantine records are addressed to the maintainer.** At ingest, a message that screening quarantines is
-   addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the ingest
-   handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
+6. **Quarantine records are addressed to the maintainer.** At ingest, a message the channel quarantines, whatever
+   its reason, is addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the
+   ingest handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
    governs every mailbox read (`permits_message_note`, `khive-runtime/src/mailbox_view.rs`) then keeps the record and
    its `quarantine_content_ref` from every other actor. A runtime with no configured actor has no maintainer, so its
    quarantine records keep today's landing actor and are visible to that actor.

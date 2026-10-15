@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- With a configured runtime actor, a message the email channel quarantines, whatever its
+  reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
+  no other actor's inbox, thread, read, get or search result shows the quarantine record or its
+  content reference. A runtime with no configured actor keeps the landing actor.
+
 ## [0.13.0] - 2026-10-15
 
 ### Documentation
