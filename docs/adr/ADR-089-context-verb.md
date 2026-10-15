@@ -97,6 +97,11 @@ the two verbs no longer diverge.
    of each appended record — the same serialization the response returns — so the count
    is deterministic across clients. Truncation is a view decision; nothing is mutated or
    re-queried.
+   [ADR-140](ADR-140-context-graph-payload.md) §Assembly order and neighbor/edge atomicity
+   replaces the single global stop above with a two-pass rule: anchors first, then each
+   admitted anchor's neighbor/edge pairs, stopping per anchor. It keeps this cost model and
+   charges a neighbor record and its edge row together as one pair. Where the two texts
+   differ, ADR-140 governs.
 
 ### Response shape
 

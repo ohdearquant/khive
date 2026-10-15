@@ -194,6 +194,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::assert_daemon_store_identities(guards)?;
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
+    let prepared_background = prepare_host_background_tasks(&args, &server)?;
 
     #[cfg(unix)]
     if args.daemon {
@@ -201,7 +202,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
             server,
             boot_guard,
             args.daemon_options(),
-            |server| start_host_background_tasks(&args, server, schedule_rt),
+            |server| start_host_background_tasks(&args, server, schedule_rt, prepared_background),
         )
         .await?;
         return Ok(());
@@ -218,7 +219,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // ADR-091 Amendment 2 Plank A: every non-daemon process runs the
     // observe-only session sweep (never PASSIVE/TRUNCATE checkpointing —
     // that stays daemon-owned).
-    start_host_background_tasks(&args, &server, schedule_rt);
+    start_host_background_tasks(&args, &server, schedule_rt, prepared_background);
     serve_with_session_sweep(server, &args, registry).await
 }
 
@@ -259,11 +260,34 @@ pub(super) fn daemon_startup_report(
     report
 }
 
+#[derive(Default)]
+pub(super) struct PreparedHostBackgroundTasks {
+    #[cfg(feature = "channel-email")]
+    pub(super) email: Option<PreparedEmailChannelLoops>,
+}
+
+pub(super) fn prepare_host_background_tasks(
+    _args: &Args,
+    _server: &KhiveMcpServer,
+) -> anyhow::Result<PreparedHostBackgroundTasks> {
+    Ok(PreparedHostBackgroundTasks {
+        #[cfg(feature = "channel-email")]
+        email: prepare_email_channel_loops(
+            _server,
+            _args.daemon
+                && _args.daemon_options().lifetime != khive_runtime::daemon::DaemonLifetime::Demand,
+        )?,
+    })
+}
+
 pub(super) fn start_host_background_tasks(
     args: &Args,
     server: &KhiveMcpServer,
     schedule_rt: Option<KhiveRuntime>,
+    prepared: PreparedHostBackgroundTasks,
 ) -> khive_runtime::daemon::DaemonStartupReport {
+    #[cfg(not(feature = "channel-email"))]
+    let _ = prepared;
     let report = daemon_startup_report(args, server, schedule_rt.is_some());
     if args.daemon
         && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
@@ -275,7 +299,7 @@ pub(super) fn start_host_background_tasks(
         return report;
     }
     #[cfg(feature = "channel-email")]
-    spawn_email_channel_loops_if_daemon(server, args);
+    spawn_email_channel_loops_if_daemon(server, args, prepared.email);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(server, args);
     start_daemon_components_if_daemon(args, server, schedule_rt);
@@ -472,7 +496,11 @@ pub(super) async fn serve_holding_sweep(
 /// is the intended behavior, not a silent failure; the log line makes it
 /// observable.
 #[cfg(feature = "channel-email")]
-pub(super) fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
+pub(super) fn spawn_email_channel_loops_if_daemon(
+    server: &KhiveMcpServer,
+    args: &Args,
+    prepared: Option<PreparedEmailChannelLoops>,
+) {
     let admission = channel_loop_plan(server, args);
     if !is_daemon_role(args) {
         tracing::info!(target: "khive_mcp::serve", "email channel loops: skipped (client role; daemon owns channel loops)");
@@ -490,7 +518,9 @@ pub(super) fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args:
         outbound_delivery = admission.outbound_delivery,
         "email channel loops: applying daemon/runtime admission"
     );
-    spawn_email_channel_loops(server, admission);
+    if let Some(prepared) = prepared {
+        spawn_email_channel_loops(server, admission, prepared);
+    }
 }
 
 /// Start ADR-119 daemon components in daemon role only. Non-daemon roles
@@ -528,14 +558,25 @@ pub(super) fn start_daemon_components_if_daemon(
         server.events_disk_policy(),
     ) {
         if let Some(socket) = split.socket_path.clone() {
+            // Requests wait at this gate until the supervised events daemon
+            // answers. It is installed here, in the start callback, so it is
+            // in place before the accept loop admits the first request.
+            let (readiness, gate) = khive_runtime::events_split::events_readiness(
+                socket.clone(),
+                khive_runtime::events_split::events_readiness_window(),
+            );
+            if !server.install_events_readiness(gate) {
+                tracing::warn!(target: "khive_mcp::serve", "events readiness gate already installed; keeping the first");
+            }
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon_with_policies(
+                khive_runtime::events_split::supervise_events_daemon_with_readiness(
                     split.db_path.clone(),
                     socket,
                     wal_ceiling,
                     disk_guard,
                     volume_lock_dir,
+                    readiness,
                 ),
             );
         }

@@ -163,13 +163,12 @@ pub async fn prepare_add_note(
     // (threaded in by the apply worker), not the proposer's.
     let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
-    crate::secret_gate::check_at(content, "note", "content")?;
-    if let Some(ref n) = name {
-        crate::secret_gate::check_at(n, "note", "name")?;
-    }
-    if let Some(ref p) = properties {
-        crate::secret_gate::check_json_at(p, "note", "properties")?;
-    }
+    crate::secret_gate::check_note_fields_at(
+        content,
+        name.as_deref(),
+        properties.as_ref(),
+        "note",
+    )?;
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let ns = token.namespace().as_str();

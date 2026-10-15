@@ -46,6 +46,7 @@ async fn no_model_recall_records_fts_without_inventing_vector_stage_work() {
             &token,
             RecallCandidateParams {
                 candidate_limit: 10,
+                legs: RecallLegs::BOTH,
                 embedding_model: None,
                 session_fence: None,
                 cjk_fts_bypass: false,

@@ -37,6 +37,8 @@ pub mod extension;
 #[cfg(any(unix, windows))]
 pub mod file_identity;
 mod fts_maintenance;
+/// Read predicates and transaction assertions for the graph-lint caller.
+pub mod graph_lint;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).

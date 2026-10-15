@@ -586,20 +586,18 @@ impl ScoringConfig {
 
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {
-    if !score.is_finite() {
-        return Err(crate::config::MinScoreError::NotFinite);
-    }
-    if (0.0..=1.0).contains(&score) {
-        return Ok(score as f32);
-    }
-    if (1.0..=100.0).contains(&score) {
-        return Ok((score / 100.0) as f32);
-    }
-    Err(crate::config::MinScoreError::OutOfRange(score))
+    khive_score::UnitScore::from_fraction_or_percent(score)
+        .map(|score| score.value() as f32)
+        .map_err(|error| match error {
+            khive_score::ArithmeticError::NonFinite { .. } => {
+                crate::config::MinScoreError::NotFinite
+            }
+            _ => crate::config::MinScoreError::OutOfRange(score),
+        })
 }
 
 /// Returns `true` if the query has enough semantic content for meaningful recall.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_recall_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -640,6 +638,12 @@ pub fn is_meaningful_query(query: &str) -> bool {
     }
 
     true
+}
+
+/// Deprecated name for [`is_meaningful_recall_query`].
+#[deprecated(note = "use is_meaningful_recall_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_recall_query(query)
 }
 
 /// Returns `true` when CJK characters (`is_cjk_char`) outnumber every other letter in `text`.

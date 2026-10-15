@@ -23,9 +23,9 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
+| `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
@@ -1544,6 +1544,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `fusion_strategy`   | string  | no       | `rrf`\|`weighted`\|`union`\|`vector_only`\|`keyword_only`.                |
 | `embedding_model`   | string  | no       | Registered model name; defaults to pack config.                           |
 | `include_breakdown` | bool    | no       | Include per-component score breakdown.                                    |
+| `include_timings`   | bool    | no       | Return per-stage retrieval timings; see below.                            |
 | `entity_names`      | array   | no       | Names to boost; matches get a 1.3x multiplier.                            |
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
@@ -1559,6 +1560,18 @@ Each result also carries canonical `full_id`; pass it directly to
 `full_id` is present when the resolved output format is `json`, the builtin
 default, under any presentation mode. The `auto` and `table` formats omit it
 unless the request sets `presentation=verbose`.
+
+`keyword_only` runs only the full-text search: the query is not embedded and the
+vector index is not searched, so such a recall never reports `degraded`.
+`vector_only` runs only the vector search.
+
+`include_timings=true` adds a `timings` object: `total_us`, the stage wall times
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us` and `hydrate_us` (`null` when the
+stage did not run; the text and vector searches run concurrently, so the stages do
+not add up), `retrieval_rounds`, and `rounds[]` with each round's
+`candidate_limit`, `text_hits`, `vector_hits`, `hydrated` and `eligible` counts
+and stage times. An array response becomes `{results, timings}`; an object
+response keeps its fields and gains `timings`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1965,7 +1978,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 14 verbs
+## `comm` pack — 15 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2309,6 +2322,29 @@ request(ops="comm.suppression_remove(id=\"<entry-id>\", reason=\"operator reques
 
 Returns `{id, removed, audit_event_id}`.
 
+### `comm.withheld_body` — Assertive
+
+Read the original RFC 5322 bytes of a delivered withheld message: an external message whose
+body a screening rule replaced with a rule-ID placeholder. Open to the message's recipient
+actor (its `to_actor`) and to the configured maintainer actor. Any other caller is refused
+before the original is read, and the refusal names neither the sender nor any content. An id
+that is not a delivered withheld external message, a quarantine record included, is refused.
+Every call, allowed or refused, writes an audit event naming the caller, the message id and
+the outcome (`allowed`, `not_found`, `refused_caller`, `refused_not_withheld` or
+`original_unavailable`).
+
+| Param | Type   | Required | Notes                                                      |
+| ----- | ------ | -------- | ---------------------------------------------------------- |
+| `id`  | string | yes      | Short 8-char prefix or full UUID of the delivered message. |
+
+```
+request(ops="comm.withheld_body(id=\"<message-id>\")")
+```
+
+Returns `{id, size_bytes, original_base64, audit_event_id}`. The response never carries a
+content reference. An original larger than the blob store's whole-object read limit is
+refused with that limit named, never returned truncated.
+
 ---
 
 ## `schedule` pack — 4 verbs
@@ -2372,7 +2408,7 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ---
 
-## `knowledge` pack — 20 verbs
+## `knowledge` pack — 21 verbs
 
 The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
 section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
@@ -2750,6 +2786,27 @@ retain their own meanings and are independent of both counts.
 
 ```
 request(ops="knowledge.topic(domain=\"attention\")")
+```
+
+### `knowledge.lint` — Commissive
+
+Inspect the caller-visible graph of entities, notes and edges with thirteen built-in hygiene rules,
+and optionally apply three guarded repair families. Knowledge corpus atoms, domains and sections are
+separate records and stay outside its statistics. Classified Write, including inspection-only and
+stats-only calls. Rule table, fix semantics and partial-failure evidence:
+[Graph lint](../../crates/khive-pack-knowledge/docs/api/lint.md).
+
+| Param      | Type            | Required | Notes                                                                                                                                                                               |
+| ---------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rules`    | array of string | no       | Omit for all thirteen built-ins, or a nonempty array of exact rule IDs. Repeated IDs run once. `["stats-only"]` alone returns exactly `{stats}` and cannot combine with `fix=true`. |
+| `fix`      | boolean         | no       | Default `false`. `true` adds `fixes` (per-action `committed`, `conflict` or `unsupported` receipts) and `summary.fixed`. Never merges entities.                                     |
+| `severity` | string          | no       | `error`, `warn` (default) or `info`: the minimum severity reported. Statistics always cover the complete observation before fixes.                                                  |
+
+Returns `violations`, `summary` and `stats`. Nulls, unknown rule IDs, invalid severities and wrong
+types are refused.
+
+```
+request(ops="knowledge.lint(rules=[\"orphan-entity\", \"dangling-edge\"], severity=\"error\")")
 ```
 
 ### `knowledge.feedback` — Commissive
