@@ -1424,9 +1424,19 @@ impl StorageBackend {
         config_root: Option<&Path>,
         floor_bytes: Option<u64>,
     ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
+        Ok(Arc::new(self.fs_blob_store(config_root, floor_bytes)?))
+    }
+
+    /// The concrete store behind [`Self::blob_store`], so its resolved floor
+    /// can be read back.
+    pub(crate) fn fs_blob_store(
+        &self,
+        config_root: Option<&Path>,
+        floor_bytes: Option<u64>,
+    ) -> Result<blob::FsBlobStore, SqliteError> {
         let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
         let floor = blob::FsBlobStore::resolve_floor(&root, floor_bytes);
-        Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
+        blob::FsBlobStore::new(root, floor)
     }
 
     /// Resolve the filesystem blob root exactly like [`Self::blob_store`] but

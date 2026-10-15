@@ -80,9 +80,14 @@ fn resolved_floor_without_configuration_follows_the_volume_of_the_root() {
     let capacity = fs4::total_space(dir.path()).unwrap();
     let expected = FsBlobStore::default_floor_for_capacity(capacity);
     assert_eq!(FsBlobStore::resolve_floor(dir.path(), None), expected);
-    // A root that does not exist yet is measured on its parent's volume.
+    // A root that does not exist yet is measured on its nearest existing
+    // ancestor, however deep the missing part is.
     assert_eq!(
         FsBlobStore::resolve_floor(&dir.path().join("blobs-not-yet-created"), None),
+        expected
+    );
+    assert_eq!(
+        FsBlobStore::resolve_floor(&dir.path().join("a").join("b").join("blobs"), None),
         expected
     );
 }

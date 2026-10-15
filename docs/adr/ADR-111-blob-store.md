@@ -856,8 +856,8 @@ laptops and small servers keep free, and the same number applies to a 256 GB dis
    still builds. The write-size-aware comparison, the per-root serialization and the `CapacityFloor`
    refusal in §5 are unchanged.
 3. If the capacity cannot be read, construction uses the 5 GiB minimum and logs that it did, rather than
-   failing the store or falling back to 100 GB. A root that does not exist yet is measured on its parent's
-   volume.
+   failing the store or falling back to 100 GB. A root that does not exist yet is measured on the volume of its
+   nearest existing ancestor.
 4. Nothing new reports the floor: the `CapacityFloor` refusal already names the floor in force, which is
    where an operator meets it.
 

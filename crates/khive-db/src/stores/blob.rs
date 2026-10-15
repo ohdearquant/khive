@@ -221,18 +221,15 @@ impl FsBlobStore {
         }
     }
 
-    /// The default floor for the volume holding `root` (its parent when
-    /// `root` does not exist yet). An unreadable capacity falls back to
-    /// [`Self::MIN_DEFAULT_FLOOR_BYTES`] with a warning rather than failing
-    /// the store.
+    /// The default floor for the volume holding `root`, measured on its
+    /// nearest existing ancestor when `root` does not exist yet. An unreadable
+    /// capacity falls back to [`Self::MIN_DEFAULT_FLOOR_BYTES`] with a
+    /// warning rather than failing the store.
     pub fn default_floor_for_root(root: &Path) -> u64 {
-        let probe = if root.exists() {
-            root
-        } else {
-            root.parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-        };
+        let probe = root
+            .ancestors()
+            .find(|path| !path.as_os_str().is_empty() && path.exists())
+            .unwrap_or_else(|| Path::new("."));
         match fs4::total_space(probe) {
             Ok(capacity) => Self::default_floor_for_capacity(capacity),
             Err(error) => {
@@ -334,6 +331,11 @@ impl FsBlobStore {
     }
 
     /// The resolved root directory this store writes under.
+    /// The free-space floor this store enforces on every new object.
+    pub fn floor_bytes(&self) -> u64 {
+        self.floor_bytes
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

@@ -1918,6 +1918,25 @@ fn blob_store_defaults_root_beside_db_file() {
 }
 
 #[test]
+fn blob_store_without_a_configured_floor_enforces_the_volume_default() {
+    // The path the daemon takes: no `[storage.blob] floor_bytes`, root beside
+    // the database. The store's floor is the ADR-111 Amendment 6 formula over
+    // the capacity of the volume that holds its root.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = StorageBackend::sqlite_for_test(&dir.path().join("floor.db")).unwrap();
+    let store = backend.fs_blob_store(None, None).unwrap();
+    let capacity = fs4::total_space(store.root()).unwrap();
+    assert_eq!(
+        store.floor_bytes(),
+        blob::FsBlobStore::default_floor_for_capacity(capacity)
+    );
+    assert_eq!(
+        backend.fs_blob_store(None, Some(0)).unwrap().floor_bytes(),
+        0
+    );
+}
+
+#[test]
 fn blob_store_errors_for_in_memory_backend_with_no_override() {
     let backend = StorageBackend::memory().unwrap();
     assert!(backend.blob_store(None, None).is_err());
