@@ -123,10 +123,15 @@ async fn event_probes_and_entity_note_precedence_remain_distinct() {
             .await
             .unwrap()
             .is_none());
-        assert!(matches!(
-            runtime.resolve_edge_endpoint(&local, id).await.unwrap(),
-            Some(Resolved::Event(_))
-        ));
+        // The event store reads by ID within the caller's namespace, so an edge
+        // endpoint resolves only the caller's own events.
+        assert_eq!(
+            matches!(
+                runtime.resolve_edge_endpoint(&local, id).await.unwrap(),
+                Some(Resolved::Event(_))
+            ),
+            owner.namespace() == local.namespace()
+        );
         assert_eq!(
             runtime.resolve_primary(&local, id).await.unwrap().is_some(),
             owner.namespace() == local.namespace()
@@ -228,11 +233,16 @@ async fn edge_reads_use_stored_namespace_and_the_requested_liveness() {
             .namespace,
         owner.namespace().as_str()
     );
-    assert!(runtime
-        .get_edge_visible(&caller, id)
-        .await
-        .unwrap()
-        .is_none());
+    // By-ID edge reads are namespace-agnostic, including the visible variant.
+    assert_eq!(
+        runtime
+            .get_edge_visible(&caller, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .namespace,
+        owner.namespace().as_str()
+    );
     assert!(runtime
         .get_edge_including_deleted(&caller, id)
         .await
@@ -245,6 +255,11 @@ async fn edge_reads_use_stored_namespace_and_the_requested_liveness() {
         .await
         .unwrap();
     assert!(runtime.get_edge(&caller, id).await.unwrap().is_none());
+    assert!(runtime
+        .get_edge_visible(&caller, id)
+        .await
+        .unwrap()
+        .is_none());
     assert!(runtime
         .get_edge_including_deleted(&caller, id)
         .await
