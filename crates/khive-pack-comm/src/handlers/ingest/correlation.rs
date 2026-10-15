@@ -3,7 +3,8 @@
 use super::super::{
     message_id_match_candidates, outbound_email_message, thread_id_query_spellings,
     verified_outbound_email_external_id, EmailMessageIdDomains, FilterOp, KhiveRuntime,
-    NamespaceToken, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlValue, Uuid, Value,
+    NamespaceToken, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlValue, Uuid,
+    Value,
 };
 
 /// A thread and sending actor selected by the existing verified outbound lookup.
@@ -13,14 +14,47 @@ pub struct ResolvedInboundThread {
     pub actor: String,
 }
 
+/// Whether the thread-UUID pass must prove ownership the way the Message-ID
+/// pass does before it may select a thread.
+///
+/// The thread UUID arrives in a sender-asserted header (`X-Khive-Thread-ID`)
+/// on external mail. The Message-ID pass accepts a row only when the row owns
+/// a verified Message-ID; an external caller must apply the same proof to the
+/// thread-UUID pass, or a forged UUID reaches any thread an outbound note
+/// mentions. Non-email callers keep the transport-level resolution, which
+/// does not require an email Message-ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadUuidProof {
+    /// Select a thread only when one of its outbound notes is an email message
+    /// whose Message-ID verifies under the configured domains.
+    VerifiedOutboundEmail,
+    /// Select the first outbound note for the thread, as the transport-level
+    /// resolution always has.
+    Unverified,
+}
+
+/// Read a note's `from_actor` property, empty when absent.
+fn from_actor_of_note(note: &Note) -> String {
+    note.properties
+        .as_ref()
+        .and_then(|props| props.get("from_actor"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Resolve one routing candidate without trusting copied Message-IDs or changing
 /// the independent UUID-root fallback. Shared by ingest and the email host.
+///
+/// `thread_uuid_proof` governs pass 2 only; pass 1 is identical for every
+/// caller. See [`ThreadUuidProof`] for why an external caller requires proof.
 pub async fn resolve_ingest_correlation(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     corr: &str,
     email_reply: bool,
+    thread_uuid_proof: ThreadUuidProof,
 ) -> Result<Option<ResolvedInboundThread>, RuntimeError> {
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
@@ -71,14 +105,7 @@ pub async fn resolve_ingest_correlation(
                         .and_then(|s| s.parse::<Uuid>().ok())
                         .map(|id| id.as_hyphenated().to_string())
                         .unwrap_or_else(|| n.id.as_hyphenated().to_string());
-                    let from_actor = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("from_actor"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    pass1 = Some((thread_id, from_actor));
+                    pass1 = Some((thread_id, from_actor_of_note(n)));
                     break;
                 }
                 if count < 100 {
@@ -127,24 +154,58 @@ pub async fn resolve_ingest_correlation(
                     ],
                     ..Default::default()
                 };
-                let thread_page = store
-                    .query_notes_filtered_count_free(
-                        ns,
-                        &thread_filter,
-                        PageRequest {
-                            limit: 1,
-                            offset: 0,
-                        },
-                    )
-                    .await?;
-                if let Some(note) = thread_page.items.first() {
-                    let from_actor = note
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("from_actor"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                let matched_actor = match thread_uuid_proof {
+                    ThreadUuidProof::Unverified => {
+                        let thread_page = store
+                            .query_notes_filtered_count_free(
+                                ns,
+                                &thread_filter,
+                                PageRequest {
+                                    limit: 1,
+                                    offset: 0,
+                                },
+                            )
+                            .await?;
+                        thread_page.items.first().map(from_actor_of_note)
+                    }
+                    ThreadUuidProof::VerifiedOutboundEmail => {
+                        // An external sender asserts this header. Reuse the
+                        // Message-ID proof pass 1 applies: only an outbound email
+                        // row that owns its verified Message-ID may select the
+                        // thread. Page the whole thread (pass 1's shape) so a
+                        // copied id or a non-email row sorting first cannot hide
+                        // the verified owner.
+                        let mut verified_actor = None;
+                        let mut offset = 0;
+                        loop {
+                            let thread_page = store
+                                .query_notes_filtered_count_free(
+                                    ns,
+                                    &thread_filter,
+                                    PageRequest { limit: 100, offset },
+                                )
+                                .await?;
+                            let count = thread_page.items.len();
+                            if let Some(note) = thread_page.items.iter().find(|note| {
+                                outbound_email_message(note)
+                                    && verified_outbound_email_external_id(note, email_domains)
+                            }) {
+                                verified_actor = Some(from_actor_of_note(note));
+                                break;
+                            }
+                            if count < 100 {
+                                break;
+                            }
+                            offset = offset.checked_add(count as u64).ok_or_else(|| {
+                                RuntimeError::Internal(
+                                    "ingest: correlation pagination offset overflowed".into(),
+                                )
+                            })?;
+                        }
+                        verified_actor
+                    }
+                };
+                if let Some(from_actor) = matched_actor {
                     thread_match = Some((canonical_correlation_root.clone(), from_actor));
                     break;
                 }

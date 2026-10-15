@@ -107,6 +107,7 @@ impl ExternalEmailHost for CommExternalEmailHost {
             &self.email_domains,
             candidate,
             true,
+            khive_pack_comm::handlers::ThreadUuidProof::VerifiedOutboundEmail,
         )
         .await
         .map(|resolved| {
@@ -142,6 +143,117 @@ mod tests {
             .await
             .expect("create suppression schema");
         runtime
+    }
+
+    /// Plant one outbound message row with the given id, returning nothing. The
+    /// runtime is in-memory; the caller's namespace is `local`.
+    async fn plant_outbound_message(
+        runtime: &KhiveRuntime,
+        id: uuid::Uuid,
+        props: serde_json::Value,
+    ) {
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let store = runtime.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = khive_storage::note::Note {
+            version: 1,
+            key: None,
+            id,
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: "planted outbound message".into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(props),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert planted note");
+    }
+
+    /// Fixture properties for an outbound email row planted at `thread_id`. The
+    /// row is an email by its `email:` addresses; it carries no `channel_kind` or
+    /// `channel_slug`, which the note store refuses from this path, so its
+    /// Message-ID alone decides verification.
+    fn outbound_email_props(
+        thread_id: &str,
+        from_actor: &str,
+        message_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "email:mailbox@khive.ai",
+            "to": "email:user@example.com",
+            "from_actor": from_actor,
+            "to_actor": "email:user@example.com",
+            "external_id": message_id,
+            "thread_id": thread_id,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    #[tokio::test]
+    async fn thread_owner_requires_a_verified_outbound_email() {
+        let runtime = comm_runtime().await;
+        let host = CommExternalEmailHost::for_ingest(
+            policy(),
+            Some(runtime),
+            Namespace::local(),
+            EmailMessageIdDomains::from_mailbox_and_history("mailbox@khive.ai", "").map(Some),
+        );
+
+        // Control: a thread holding an outbound email whose Message-ID embeds the
+        // row's own UUID on the configured domain yields a verified owner.
+        let verified_thread = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        let verified_id = uuid::Uuid::new_v4();
+        plant_outbound_message(
+            host.runtime.as_ref().expect("runtime wired"),
+            verified_id,
+            outbound_email_props(
+                &verified_thread,
+                "lambda:owner",
+                &format!("<{verified_id}@khive.ai>"),
+            ),
+        )
+        .await;
+        let owner = host
+            .lookup_thread_owner(&verified_thread)
+            .await
+            .expect("owner lookup runs");
+        assert_eq!(
+            owner.map(|owner| owner.actor),
+            Some("lambda:owner".to_string()),
+            "a thread with a verified outbound email must yield its owner"
+        );
+
+        // The subject case: an email row that does not own its Message-ID (foreign
+        // domain), so the thread-UUID path cannot prove the mailbox sent it.
+        let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        let foreign_id = uuid::Uuid::new_v4();
+        plant_outbound_message(
+            host.runtime.as_ref().expect("runtime wired"),
+            foreign_id,
+            outbound_email_props(
+                &thread_uuid,
+                "lambda:owner",
+                &format!("<{foreign_id}@outside.example>"),
+            ),
+        )
+        .await;
+        let owner = host
+            .lookup_thread_owner(&thread_uuid)
+            .await
+            .expect("owner lookup runs");
+        assert!(
+            owner.is_none(),
+            "a thread UUID with no verified outbound email must yield no owner; got {owner:?}"
+        );
     }
 
     #[tokio::test]

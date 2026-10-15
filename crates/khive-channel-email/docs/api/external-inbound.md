@@ -11,6 +11,13 @@ malformed entries are startup errors. A verified outbound owner wins over an
 alias. Otherwise the first configured alias across `Delivered-To`, `To`, then
 `Cc` wins; unmatched mail goes to the external inbound actor.
 
+A thread UUID in `X-Khive-Thread-ID` counts as a verified outbound owner only when
+the named thread holds an outbound email whose Message-ID verifies under the
+configured mailbox domains (ADR-200 Amendment 1 decision 4). An `In-Reply-To` or
+`References` Message-ID is verified the same way. A UUID naming a thread with no
+such email is not an owner, so routing falls through to the recipient aliases and
+then the external inbound actor.
+
 Authentication and inbound suppression run before deterministic MIME screening.
 Delivered external messages retain `origin=external`, `trust=untrusted`, their
 normalized email sender and rule identifiers. Routing never grants trust.
