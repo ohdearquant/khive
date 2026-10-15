@@ -2229,14 +2229,16 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
-        # One job-level predicate is admitted: the documentation lane. A job it
-        # skips is reported under its unevaluated name, which is neither a
-        # required check name nor an ordinary job name, so the replay
-        # distinction holds; CI gate and the secret scan never carry it, and
-        # the gate accepts those skips only on a successful docs_only=true
-        # classification (AggregateGateWorkflowTests). Gating the same jobs per
-        # step would still start every runner, the macOS one included.
-        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
+        # One job-level predicate is admitted: the documentation and
+        # integration lanes. A job it skips is reported under its unevaluated
+        # name, which is neither a required check name nor an ordinary job
+        # name, so the replay distinction holds; CI gate and the secret scan
+        # never carry it, and the gate accepts those skips only on a successful
+        # docs_only=true or integration_only=true classification
+        # (AggregateGateWorkflowTests). Gating the same jobs per step would
+        # still start every runner, the macOS one included.
+        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                     " && needs.changed-paths.outputs.integration_only != 'true'")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
