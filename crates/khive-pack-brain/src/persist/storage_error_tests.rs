@@ -3,10 +3,13 @@ use khive_storage::{SqlReader, SqlRow, StorageError, StorageResult};
 
 /// A store whose reader is handed out by `reader`, and which nothing in these
 /// tests writes to.
-struct ReaderOnly<F: Fn() -> StorageResult<Box<dyn SqlReader>> + Send + Sync>(F);
+struct ReaderOnly<F>(F);
 
 #[async_trait::async_trait]
-impl<F: Fn() -> StorageResult<Box<dyn SqlReader>> + Send + Sync> SqlAccess for ReaderOnly<F> {
+impl<F> SqlAccess for ReaderOnly<F>
+where
+    F: Fn() -> StorageResult<Box<dyn SqlReader>> + Send + Sync + 'static,
+{
     async fn reader(&self) -> StorageResult<Box<dyn SqlReader>> {
         (self.0)()
     }
