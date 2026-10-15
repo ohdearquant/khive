@@ -1923,7 +1923,7 @@ fn blob_store_without_a_configured_floor_enforces_the_volume_default() {
     // the database. The store's floor is the ADR-111 Amendment 6 formula over
     // the capacity of the volume that holds its root.
     let dir = tempfile::tempdir().unwrap();
-    let backend = StorageBackend::sqlite_for_test(&dir.path().join("floor.db")).unwrap();
+    let backend = StorageBackend::sqlite_for_test(dir.path().join("floor.db")).unwrap();
     let store = backend.fs_blob_store(None, None).unwrap();
     let capacity = fs4::total_space(store.root()).unwrap();
     assert_eq!(

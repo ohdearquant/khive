@@ -91,3 +91,23 @@ fn resolved_floor_without_configuration_follows_the_volume_of_the_root() {
         expected
     );
 }
+
+#[test]
+fn capacity_probe_is_the_root_or_its_nearest_existing_ancestor() {
+    // On a volume under 250 GiB the floor is the minimum whether or not the
+    // capacity was read, so the test above cannot tell a measured volume from
+    // the fallback there. The probe path shows which directory is measured on
+    // any volume.
+    use std::path::Path;
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(FsBlobStore::capacity_probe(dir.path()), dir.path());
+    assert_eq!(
+        FsBlobStore::capacity_probe(&dir.path().join("blobs")),
+        dir.path()
+    );
+    let deep = dir.path().join("a").join("b").join("blobs");
+    assert_eq!(FsBlobStore::capacity_probe(&deep), dir.path());
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    assert_eq!(FsBlobStore::capacity_probe(&deep), dir.path().join("a"));
+    assert_eq!(FsBlobStore::capacity_probe(Path::new("")), Path::new("."));
+}

@@ -226,10 +226,7 @@ impl FsBlobStore {
     /// capacity falls back to [`Self::MIN_DEFAULT_FLOOR_BYTES`] with a
     /// warning rather than failing the store.
     pub fn default_floor_for_root(root: &Path) -> u64 {
-        let probe = root
-            .ancestors()
-            .find(|path| !path.as_os_str().is_empty() && path.exists())
-            .unwrap_or_else(|| Path::new("."));
+        let probe = Self::capacity_probe(root);
         match fs4::total_space(probe) {
             Ok(capacity) => Self::default_floor_for_capacity(capacity),
             Err(error) => {
@@ -242,6 +239,15 @@ impl FsBlobStore {
                 Self::MIN_DEFAULT_FLOOR_BYTES
             }
         }
+    }
+
+    /// The path whose volume is measured for `root`: `root` itself when it
+    /// exists, otherwise its nearest existing ancestor, however deep the
+    /// missing part is. `.` when no ancestor exists (an empty relative path).
+    fn capacity_probe(root: &Path) -> &Path {
+        root.ancestors()
+            .find(|path| !path.as_os_str().is_empty() && path.exists())
+            .unwrap_or_else(|| Path::new("."))
     }
 
     /// The floor a store rooted at `root` enforces: `configured` when set
