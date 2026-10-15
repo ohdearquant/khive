@@ -342,15 +342,20 @@ async fn live_and_tombstone_ids_and_edge_keys_never_absorb_staged_ids() {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            crate::run_atomic_unit(rt.sql().as_ref(), plans)
-                .await
-                .unwrap(),
+        // The staged-id check refuses it, not a later key constraint on the insert.
+        match crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap()
+        {
             crate::AtomicRunOutcome::RolledBack {
                 failed_op_index: 0,
-                ..
-            }
-        ));
+                failure,
+            } => assert!(
+                format!("{failure:?}").contains("canonical staged id already exists"),
+                "{failure:?}"
+            ),
+            other => panic!("deleted={deleted}: {other:?}"),
+        }
     }
     let (a, b, e) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let link = |id: Uuid| {

@@ -75,13 +75,15 @@ impl Stamped {
             .unwrap()
     }
 
-    fn preimage(&self) -> EntityPreimage {
+    /// The stored values of exactly the fields `patch` touches, as a canonical update must
+    /// capture them.
+    fn preimage(&self, patch: &EntityPatch) -> EntityPreimage {
         let projected = projection::entity(&self.row).unwrap();
         EntityPreimage {
-            name: Some(projected.name),
-            description: Some(projected.description),
+            name: patch.name.as_ref().map(|_| projected.name),
+            description: patch.description.as_ref().map(|_| projected.description),
             entity_type: None,
-            properties: Some(projected.properties),
+            properties: patch.properties.as_ref().map(|_| projected.properties),
             tags: None,
         }
     }
@@ -102,7 +104,7 @@ impl Stamped {
         let registry = crate::VerbRegistryBuilder::new().build().unwrap();
         let plans = prepare_canonical_changeset(&self.runtime, &registry, &self.token, &changeset)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| chain(&error))?;
         match crate::run_atomic_unit(self.runtime.sql().as_ref(), plans).await {
             Ok(crate::AtomicRunOutcome::Committed { .. }) => Ok(()),
             other => Err(format!("{other:?}")),
@@ -115,6 +117,19 @@ impl Stamped {
             serde_json::to_value(&self.row).unwrap()
         );
     }
+}
+
+/// An error and every source under it, so a refusal wrapped as one operation's admission
+/// failure still shows its cause.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut next = error.source();
+    while let Some(source) = next {
+        rendered.push_str(": ");
+        rendered.push_str(&source.to_string());
+        next = source.source();
+    }
+    rendered
 }
 
 fn properties(value: Value) -> std::collections::BTreeMap<String, khive_types::PropertyValue> {
@@ -136,13 +151,11 @@ fn properties_patch(value: Value) -> EntityPatch {
 #[tokio::test]
 async fn canonical_update_refuses_a_differing_stamp_value() {
     let s = stamped().await;
+    let patch =
+        properties_patch(json!({"purpose": "fixture", RESERVED_SECRET_GATE_KEY: "exempted:other"}));
+    let preimage = s.preimage(&patch);
     let error = s
-        .apply(
-            properties_patch(
-                json!({"purpose": "fixture", RESERVED_SECRET_GATE_KEY: "exempted:other"}),
-            ),
-            s.preimage(),
-        )
+        .apply(patch, preimage)
         .await
         .expect_err("a differing reserved value must be refused");
     assert!(error.contains("runtime-owned"), "{error}");
@@ -154,12 +167,11 @@ async fn canonical_update_refuses_a_differing_stamp_value() {
 #[tokio::test]
 async fn canonical_update_admits_a_byte_exact_stamp_echo() {
     let s = stamped().await;
-    s.apply(
-        properties_patch(json!({"purpose": "fixture", RESERVED_SECRET_GATE_KEY: STAMP})),
-        s.preimage(),
-    )
-    .await
-    .expect("a byte-exact echo of the stored stamp must be admitted");
+    let patch = properties_patch(json!({"purpose": "fixture", RESERVED_SECRET_GATE_KEY: STAMP}));
+    let preimage = s.preimage(&patch);
+    s.apply(patch, preimage)
+        .await
+        .expect("a byte-exact echo of the stored stamp must be admitted");
     s.assert_unchanged().await;
 }
 
@@ -168,9 +180,10 @@ async fn canonical_update_admits_a_byte_exact_stamp_echo() {
 #[tokio::test]
 async fn canonical_whole_map_omitting_the_stamp_carries_it_while_bytes_are_unchanged() {
     let s = stamped().await;
-    let mut preimage = s.preimage();
+    let patch = properties_patch(json!({"purpose": "fixture"}));
+    let mut preimage = s.preimage(&patch);
     preimage.properties = Some(properties(json!({"purpose": "fixture"})));
-    s.apply(properties_patch(json!({"purpose": "fixture"})), preimage)
+    s.apply(patch, preimage)
         .await
         .expect("omitting the stamp over unchanged bytes must carry it");
     let live = s.live().await;
@@ -185,18 +198,17 @@ async fn canonical_whole_map_omitting_the_stamp_carries_it_while_bytes_are_uncha
 #[tokio::test]
 async fn canonical_update_that_changes_vouched_bytes_drops_the_stamp() {
     let s = stamped().await;
-    s.apply(
-        EntityPatch {
-            name: None,
-            description: Some(Some("a plain description".into())),
-            entity_type: None,
-            properties: None,
-            tags: None,
-        },
-        s.preimage(),
-    )
-    .await
-    .expect("a clean canonical update must be admitted");
+    let patch = EntityPatch {
+        name: None,
+        description: Some(Some("a plain description".into())),
+        entity_type: None,
+        properties: None,
+        tags: None,
+    };
+    let preimage = s.preimage(&patch);
+    s.apply(patch, preimage)
+        .await
+        .expect("a clean canonical update must be admitted");
     let live = s.live().await;
     assert_eq!(live.description.as_deref(), Some("a plain description"));
     assert_eq!(live.properties, Some(json!({"purpose": "fixture"})));
@@ -208,17 +220,16 @@ async fn canonical_update_that_changes_vouched_bytes_drops_the_stamp() {
 #[tokio::test]
 async fn canonical_update_refuses_manifest_exempt_content_once_the_stamp_drops() {
     let s = stamped().await;
+    let patch = EntityPatch {
+        name: Some("renamed".into()),
+        description: None,
+        entity_type: None,
+        properties: None,
+        tags: None,
+    };
+    let preimage = s.preimage(&patch);
     let error = s
-        .apply(
-            EntityPatch {
-                name: Some("renamed".into()),
-                description: None,
-                entity_type: None,
-                properties: None,
-                tags: None,
-            },
-            s.preimage(),
-        )
+        .apply(patch, preimage)
         .await
         .expect_err("manifest-exempt content must not pass a canonical write");
     assert!(error.contains("secret pattern"), "{error}");
@@ -274,7 +285,7 @@ async fn canonical_note_update_refuses_an_invented_reserved_property() {
     );
     let registry = crate::VerbRegistryBuilder::new().build().unwrap();
     let refused = match prepare_canonical_changeset(&rt, &registry, &token, &changeset).await {
-        Err(error) => error.to_string(),
+        Err(error) => chain(&error),
         Ok(plans) => format!(
             "{:?}",
             crate::run_atomic_unit(rt.sql().as_ref(), plans).await
