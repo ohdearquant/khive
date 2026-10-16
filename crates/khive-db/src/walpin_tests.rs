@@ -1209,12 +1209,13 @@ fn stale_window_from_boundary_inclusive_and_floors_subsecond_cadence_at_three_se
     assert_eq!(stale_window_from(Duration::from_secs(1)), 3);
 }
 
-/// Boundary inclusivity exercised end-to-end through `enumerate_live`:
+/// Boundary inclusivity exercised through the enumeration's fixed-clock seam:
 /// an entry exactly `3 x max(interval, 1000ms)` old is still live
 /// (`<=`, not `<`); one second older is stale.
 #[test]
 #[cfg(unix)]
 fn enumerate_live_new_style_heartbeat_boundary_is_inclusive() {
+    const NOW: i64 = 1_700_000_000;
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("khive.db.walpin");
     let pid = std::process::id();
@@ -1228,28 +1229,43 @@ fn enumerate_live_new_style_heartbeat_boundary_is_inclusive() {
             .write(true)
             .open(&heartbeat_path)
             .unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(NOW as u64 - age_secs))
             .unwrap();
+    };
+    let enumerate = || {
+        orphan_temp::enumerate_live_bounded_with_clock(
+            &dir,
+            Duration::from_secs(5),
+            MAX_SIDECAR_ENTRIES,
+            EnumerationPurpose::Attribution,
+            || NOW,
+        )
+        .unwrap()
     };
 
     touch(6);
-    let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+    let report = enumerate();
     assert_eq!(
         report.reporting().count(),
         1,
         "exactly 3x the declared interval old must still classify live: {report:?}"
     );
 
-    // Re-write (enumeration deletes stale/live entries it processes,
-    // but a live entry is retained — reuse the same file) and push one
-    // second past the boundary.
+    // A live entry is retained, so reuse it one second past the boundary.
     touch(7);
-    let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+    let report = enumerate();
     assert_eq!(
         report.reporting().count(),
         0,
         "one second past 3x the declared interval must classify stale: {report:?}"
     );
+    assert!(matches!(
+        report.entries.as_slice(),
+        [WalpinPidHealth::Unknown {
+            reason: "stale walpin heartbeat",
+            ..
+        }]
+    ));
 }
 
 /// Sub-second declared cadence floors the effective window at three
