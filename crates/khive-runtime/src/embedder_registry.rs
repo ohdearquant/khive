@@ -940,6 +940,16 @@ mod tests {
             Ok(texts.iter().map(|_| vec![1.0]).collect())
         }
 
+        async fn embed_query(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+        ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+            // This custom service owns its inputs; a built-in instruction must
+            // not rewrite the sentinel that releases its synthetic worker.
+            self.embed(texts, model).await
+        }
+
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
             true
         }
