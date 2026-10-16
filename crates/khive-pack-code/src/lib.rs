@@ -15,6 +15,7 @@ mod pack;
 mod safe_source;
 pub(crate) mod scanner_rust;
 pub mod source_ingest;
+mod source_reads;
 pub(crate) mod vocab;
 
 pub use clippy_adapter::{
@@ -25,5 +26,5 @@ pub use ingest::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions, CODE_
 pub use pack::CodePack;
 pub use source_ingest::{
     CodeSourceIngestError, CodeSourceIngestL2Report, CodeSourceIngestOptions,
-    CodeSourceIngestReport,
+    CodeSourceIngestReport, CodeSourceReadReport,
 };
