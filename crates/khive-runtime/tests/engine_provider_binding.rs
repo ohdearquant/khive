@@ -433,6 +433,31 @@ fn cloned_and_core_registries_run_hooks_once_while_empty_pack_stays_empty() {
 }
 
 #[tokio::test]
+async fn custom_query_role_is_used_for_single_and_batch_requests() {
+    let runtime = make_runtime(vec![peer(CUSTOM, Some(12))]);
+    let calls = Arc::new(Calls::default());
+    register(&runtime, CUSTOM, 12, &calls);
+    runtime.finalize_embedding_engines().unwrap();
+
+    assert_eq!(
+        runtime
+            .embed_query_with_model(CUSTOM, "single")
+            .await
+            .unwrap(),
+        vec![1.0; 12]
+    );
+    assert_eq!(
+        runtime
+            .embed_query_batch_with_model(CUSTOM, &["first".into(), "second".into()])
+            .await
+            .unwrap(),
+        vec![vec![1.0; 12]; 2]
+    );
+    assert_eq!(calls.queries.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.builds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn custom_default_text_hybrid_reaches_vector_only_candidate() {
     let runtime = make_runtime(vec![peer(CUSTOM, Some(12))]);
     let calls = Arc::new(Calls::default());

@@ -230,9 +230,12 @@ fn engine(name: &str, dims: Option<i64>) -> EngineConfig {
     }
 }
 
+// Match the shared host resolver's explicit in-memory database input.
+const FIXTURE_DB: &str = ":memory:";
+
 fn configured(engines: Vec<EngineConfig>) -> RuntimeConfig {
     RuntimeConfig {
-        db_path: None,
+        db_path: khive_runtime::resolve_db_anchor(Some(FIXTURE_DB)),
         engines: Some(engines),
         default_namespace: Namespace::parse("engine-binding-test").unwrap(),
         actor_id: Some("engine-binding-test".into()),
@@ -408,10 +411,13 @@ async fn multi_startup_binds_each_registry_once_and_repeated_aliases_do_not_buil
     if isolated() {
         return;
     }
-    let built =
-        build_registry_for_multi_backend(configured(peers()), &topology("secondary", false), None)
-            .await
-            .unwrap();
+    let built = build_registry_for_multi_backend(
+        configured(peers()),
+        &topology("secondary", false),
+        Some(FIXTURE_DB),
+    )
+    .await
+    .unwrap();
     let state = built.registry.pack_host_state::<Counts>(PACK).unwrap();
     let pack = &built.per_pack_runtimes[PACK];
     let core = pack.core();
@@ -456,7 +462,7 @@ async fn multi_startup_refuses_missing_or_zero_dimensional_provider() {
         let error = match build_registry_for_multi_backend(
             configured(vec![engine(name, None)]),
             &topology("secondary", false),
-            None,
+            Some(FIXTURE_DB),
         )
         .await
         {
@@ -470,10 +476,13 @@ async fn multi_startup_refuses_missing_or_zero_dimensional_provider() {
             assert!(error.to_string().contains("invalid dimensions 0"));
         }
     }
-    let healthy =
-        build_registry_for_multi_backend(configured(peers()), &topology("secondary", false), None)
-            .await
-            .unwrap();
+    let healthy = build_registry_for_multi_backend(
+        configured(peers()),
+        &topology("secondary", false),
+        Some(FIXTURE_DB),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         healthy
             .default_runtime
@@ -489,10 +498,13 @@ async fn no_embed_pack_keeps_main_core_binding_for_both_backend_routes() {
         return;
     }
     for assigned in ["main", "secondary"] {
-        let built =
-            build_registry_for_multi_backend(configured(peers()), &topology(assigned, true), None)
-                .await
-                .unwrap();
+        let built = build_registry_for_multi_backend(
+            configured(peers()),
+            &topology(assigned, true),
+            Some(FIXTURE_DB),
+        )
+        .await
+        .unwrap();
         let state = built.registry.pack_host_state::<Counts>(PACK).unwrap();
         let pack = &built.per_pack_runtimes[PACK];
         let core = pack.core();
@@ -554,7 +566,7 @@ async fn explicitly_empty_hosts_skip_provider_hooks_and_return_empty_bindings() 
     let built = build_registry_for_multi_backend(
         configured(Vec::new()),
         &topology("secondary", false),
-        None,
+        Some(FIXTURE_DB),
     )
     .await
     .unwrap();

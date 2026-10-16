@@ -300,12 +300,12 @@ impl KhiveRuntime {
         let emb_model = model.unwrap_or_default();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let embeddings = match emb_model {
-            EmbeddingModel::BgeSmallEnV15
-            | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => {
-                with_embedding_admission(service.embed(&texts, emb_model)).await
-            }
+        let embeddings = match model {
+            Some(
+                EmbeddingModel::BgeSmallEnV15
+                | EmbeddingModel::BgeBaseEnV15
+                | EmbeddingModel::BgeLargeEnV15,
+            ) => with_embedding_admission(service.embed(&texts, emb_model)).await,
             _ => with_embedding_admission(service.embed_query(&texts, emb_model)).await,
         };
         let out = embeddings?
@@ -560,12 +560,12 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = match emb_model {
-            EmbeddingModel::BgeSmallEnV15
-            | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => {
-                with_embedding_admission(service.embed(texts, emb_model)).await
-            }
+        let out = match model {
+            Some(
+                EmbeddingModel::BgeSmallEnV15
+                | EmbeddingModel::BgeBaseEnV15
+                | EmbeddingModel::BgeLargeEnV15,
+            ) => with_embedding_admission(service.embed(texts, emb_model)).await,
             _ => with_embedding_admission(service.embed_query(texts, emb_model)).await,
         };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);

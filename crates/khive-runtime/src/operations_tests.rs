@@ -12366,7 +12366,7 @@ async fn default_document_embedding_discloses_truncation() {
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     rt.register_embedder(CapturingVecProvider {
         provider_name: model.to_string(),
-        dims: 4,
+        dims: model.dimensions(),
         captured: Arc::clone(&captured),
     });
     let content = "x".repeat(MAX_TEXT_BYTES + 1);
