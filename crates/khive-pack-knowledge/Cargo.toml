@@ -24,6 +24,7 @@ khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde"
 khive-brain-core = { version = "0.13.0", path = "../khive-brain-core" }
 khive-runtime = { version = "0.13.0", path = "../khive-runtime" }
 khive-storage = { version = "0.13.0", path = "../khive-storage" }
+khive-fs = { version = "0.13.0", path = "../khive-fs" }
 khive-fold = { version = "0.13.0", path = "../khive-fold" }
 khive-fusion = { version = "0.13.0", path = "../khive-fusion" }
 khive-retrieval = { version = "0.13.0", path = "../khive-retrieval", default-features = false, features = ["ann"] }
@@ -41,7 +42,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.13.0", path = "../khive-pack-kg" }
