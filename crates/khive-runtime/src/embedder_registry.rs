@@ -1601,6 +1601,41 @@ mod tests {
     }
 
     #[test]
+    fn bound_engine_list_is_fixed_once_bound() {
+        let engine = |name: &str, dims: Option<i64>| crate::engine_config::EngineConfig {
+            name: name.to_owned(),
+            weight: 1.0,
+            dims,
+        };
+        let mut reg = EmbedderRegistry::new();
+        for (name, dimensions) in [("bound-a", 8), ("bound-b", 4)] {
+            reg.register(ConstVecProvider::new(name, dimensions))
+                .expect("unique registration should succeed");
+        }
+        let bound = vec![engine("bound-a", Some(8)), engine("bound-b", None)];
+        reg.bind_engines(&bound)
+            .expect("first binding should succeed");
+        reg.bind_engines(&bound)
+            .expect("binding the same ordered list again is idempotent");
+
+        // Another order, a shorter list and a changed field are each a different list.
+        for different in [
+            vec![engine("bound-b", None), engine("bound-a", Some(8))],
+            vec![engine("bound-a", Some(8))],
+            vec![engine("bound-a", Some(8)), engine("bound-b", Some(4))],
+        ] {
+            let error = reg
+                .bind_engines(&different)
+                .expect_err("a bound registry must refuse a different list");
+            assert!(
+                matches!(&error, RuntimeError::InvalidInput(message) if message.contains("different ordered list")),
+                "{error:?}"
+            );
+            assert_eq!(reg.bound_engines(), Some(bound.as_slice()));
+        }
+    }
+
+    #[test]
     fn names_preserve_registration_order_across_calls() {
         let mut reg = EmbedderRegistry::new();
         for (name, dimensions) in [("e", 5), ("b", 4), ("d", 3), ("a", 2), ("c", 1)] {

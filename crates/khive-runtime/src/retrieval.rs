@@ -258,8 +258,9 @@ impl KhiveRuntime {
     /// Embed a query string for retrieval using the named model.
     ///
     /// Applies the pre-0.6 query-role behavior. E5 and Qwen models retain
-    /// their query instructions, while BGE and custom providers receive the
-    /// original unprefixed query text.
+    /// their query instructions and BGE receives the original unprefixed query
+    /// text. A custom provider receives the original text through its
+    /// query-role method and owns its own query preparation.
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
