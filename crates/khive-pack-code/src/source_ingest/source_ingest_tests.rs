@@ -319,10 +319,11 @@ async fn stamp_skips_non_object_properties_without_rebuilding() {
         ModuleScan {
             source_project: "fixture".to_string(),
             imports: Vec::new(),
+            source_reads: Vec::new(),
         },
     );
     let mut report = CodeSourceIngestReport::default();
-    stamp_import_scan_coverage(&rt, &token, module_scans, &mut report)
+    stamp_import_scan_coverage(&rt, &token, module_scans, &BTreeMap::new(), &mut report)
         .await
         .expect("stamp path completes");
 

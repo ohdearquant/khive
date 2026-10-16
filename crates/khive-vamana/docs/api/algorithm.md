@@ -86,7 +86,7 @@ at production scale (n>=250, 384-dim normalized vectors) shows the two-pass
 adjacency diverging from a single alpha=1.0 pass, for both `build` and
 `build_sq8`
 (`build_alpha_one_two_passes_are_not_idempotent_at_scale` and
-`build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale` in `graph.rs`);
+`build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale` in `graph_tests.rs`);
 an earlier revision skipped the second pass on the assumption that it was a
 no-op at `config.alpha == 1.0` and was reverted once this was disproven.
 
@@ -94,10 +94,13 @@ no-op at `config.alpha == 1.0` and was reverted once this was disproven.
 
 ## Greedy search
 
-`greedy_search_inner` maintains a candidate frontier (`Vec<Candidate>`) sorted
-by distance. At each step the unexpanded nearest candidate is expanded; its
-neighbors enter the frontier. The frontier is bounded to `max(k, search_list_size)`
-to cap memory. A generation-based `VisitedSet` avoids revisiting nodes in O(1)
+`greedy_search_inner` maintains a candidate frontier (`Frontier`, in
+`graph/frontier.rs`) kept sorted by `(distance, node id)` and bounded to
+`max(k, search_list_size)` to cap memory. At each step the unexpanded nearest
+candidate is expanded; its neighbors enter the frontier. A neighbor is placed by
+binary search and is dropped when it would rank beyond the bound, and the next
+candidate to expand is the first unexpanded entry, tracked by a cursor rather than
+found by scanning. A generation-based `VisitedSet` avoids revisiting nodes in O(1)
 per query.
 
 Result set: top-k candidates from the frontier, sorted by distance, ties broken
@@ -179,10 +182,12 @@ ordering the prune pool):
   corpus before calling it.
 - `greedy_search_inner_sq8` re-scores every frontier candidate with exact f32 L2²
   before final top-k selection (SQ8 for acquisition, exact f32 for final ranking).
-  Frontier ties on equal SQ8 codes are broken with exact f32 distance, since distinct
-  f32 vectors can map to the same u8 code (clamped or low-resolution dimensions).
+  Frontier ties on equal SQ8 distances are broken by node id, not by exact f32 distance:
+  distinct f32 vectors can map to the same u8 code (clamped or low-resolution
+  dimensions), and the exact f32 re-score of the final frontier decides which of them
+  are returned.
 - `robust_prune_inner_sq8` scores and orders candidates with SQ8, tiebreaking equal
-  codes with exact f32 to match the search ordering — but the alpha diversity predicate
+  codes with exact f32 — but the alpha diversity predicate
   itself always uses exact f32 distances on both sides (node→candidate and
   selected→candidate). This is deliberate: if node and candidate collide in code space
   (e.g. both map to code 0), the SQ8 distance is 0, which would make

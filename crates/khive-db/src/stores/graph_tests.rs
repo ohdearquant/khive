@@ -1272,290 +1272,7 @@ async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
     );
 }
 
-// `#[serial(neighbor_select_count)]`: shares the key with the tests that
-// assert on the process-wide `NEIGHBOR_SELECT_COUNT` so a concurrent
-// `neighbors()` call from this test can't corrupt their count.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn test_neighbors_outbound() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4();
-    let d = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(a, c, EdgeRelation::DependsOn, 0.7))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(d, a, EdgeRelation::Extends, 0.5))
-        .await
-        .unwrap();
-
-    let query = NeighborQuery {
-        direction: Direction::Out,
-        relations: None,
-        limit: None,
-        min_weight: None,
-    };
-
-    let hits = store.neighbors(a, query).await.unwrap();
-    assert_eq!(hits.len(), 2);
-
-    let neighbor_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
-    assert!(neighbor_ids.contains(&b));
-    assert!(neighbor_ids.contains(&c));
-    assert!(!neighbor_ids.contains(&d));
-}
-
-/// Regression guard (ADR-089 context-verb review): a
-/// `limit` narrower than the neighbor set must keep the highest-weight edges,
-/// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
-/// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
-/// a high-weight one purely by insertion order.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn test_neighbors_limit_keeps_highest_weight_not_insertion_order() {
-    let store = setup_memory_store();
-
-    let centre = Uuid::new_v4();
-    let low = Uuid::new_v4();
-    let mid = Uuid::new_v4();
-    let high = Uuid::new_v4();
-
-    // Insert lowest-weight edge FIRST so insertion order and weight order
-    // disagree — if LIMIT ignores ORDER BY, the low-weight edge can win.
-    store
-        .upsert_edge(make_edge(centre, low, EdgeRelation::Extends, 0.1))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, mid, EdgeRelation::Extends, 0.5))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, high, EdgeRelation::Extends, 0.9))
-        .await
-        .unwrap();
-
-    let query = NeighborQuery {
-        direction: Direction::Out,
-        relations: None,
-        limit: Some(2),
-        min_weight: None,
-    };
-
-    let hits = store.neighbors(centre, query).await.unwrap();
-    assert_eq!(hits.len(), 2, "limit=2 must return exactly 2 neighbors");
-
-    let neighbor_ids: HashSet<Uuid> = hits.iter().map(|h| h.node_id).collect();
-    assert!(
-        neighbor_ids.contains(&high),
-        "highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        neighbor_ids.contains(&mid),
-        "second-highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        !neighbor_ids.contains(&low),
-        "lowest-weight neighbor must be the one dropped by limit"
-    );
-
-    // Weight-descending, node_id-ascending-tiebreak ordering must also hold
-    // for the returned rows themselves (ADR-089's neighbor-ordering contract).
-    assert!((hits[0].weight - 0.9).abs() < 1e-9);
-    assert!((hits[1].weight - 0.5).abs() < 1e-9);
-}
-
-/// Correctness parity (ADR-089 context-verb optimization): `neighbors_both_directions`
-/// must return exactly the union of a separate `Out` call and a separate `In`
-/// call — same node/edge/relation/weight set, same direction tag per hit, and
-/// the same global weight-descending/node_id-ascending order — while doing it
-/// in one storage query instead of two. Outgoing and incoming weights
-/// interleave (0.9, 0.6, 0.3 outgoing vs 0.8, 0.4 incoming) so the assertion
-/// proves global post-union ordering, not per-branch order.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn test_neighbors_both_directions_matches_two_separate_calls_and_order() {
-    let store = setup_memory_store();
-
-    let centre = Uuid::new_v4();
-    let out_hi = Uuid::new_v4();
-    let out_mid = Uuid::new_v4();
-    let out_lo = Uuid::new_v4();
-    let in_hi = Uuid::new_v4();
-    let in_mid = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(centre, out_hi, EdgeRelation::Extends, 0.9))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(in_hi, centre, EdgeRelation::Extends, 0.8))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, out_mid, EdgeRelation::Extends, 0.6))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(in_mid, centre, EdgeRelation::Extends, 0.4))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, out_lo, EdgeRelation::Extends, 0.3))
-        .await
-        .unwrap();
-
-    let directed = store
-        .neighbors_both_directions(
-            centre,
-            NeighborQuery {
-                direction: Direction::Both,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    // Global weight-descending order across BOTH directions, not per-branch:
-    // 0.9(out) > 0.8(in) > 0.6(out) > 0.4(in) > 0.3(out).
-    let got: Vec<(Uuid, f64, Direction)> = directed
-        .iter()
-        .map(|d| (d.hit.node_id, d.hit.weight, d.direction.clone()))
-        .collect();
-    assert_eq!(
-        got,
-        vec![
-            (out_hi, 0.9, Direction::Out),
-            (in_hi, 0.8, Direction::In),
-            (out_mid, 0.6, Direction::Out),
-            (in_mid, 0.4, Direction::In),
-            (out_lo, 0.3, Direction::Out),
-        ],
-        "neighbors_both_directions must interleave by global weight DESC, tagging each hit's real direction"
-    );
-
-    // Parity: the same result set must be reconstructable from two separate
-    // direction-scoped `neighbors()` calls (the pre-optimization behavior).
-    let out_hits = store
-        .neighbors(
-            centre,
-            NeighborQuery {
-                direction: Direction::Out,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-    let in_hits = store
-        .neighbors(
-            centre,
-            NeighborQuery {
-                direction: Direction::In,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    let directed_out: HashSet<(Uuid, Uuid)> = directed
-        .iter()
-        .filter(|d| d.direction == Direction::Out)
-        .map(|d| (d.hit.node_id, d.hit.edge_id))
-        .collect();
-    let directed_in: HashSet<(Uuid, Uuid)> = directed
-        .iter()
-        .filter(|d| d.direction == Direction::In)
-        .map(|d| (d.hit.node_id, d.hit.edge_id))
-        .collect();
-    let plain_out: HashSet<(Uuid, Uuid)> =
-        out_hits.iter().map(|h| (h.node_id, h.edge_id)).collect();
-    let plain_in: HashSet<(Uuid, Uuid)> = in_hits.iter().map(|h| (h.node_id, h.edge_id)).collect();
-    assert_eq!(
-        directed_out, plain_out,
-        "outgoing subset must match a separate Out call"
-    );
-    assert_eq!(
-        directed_in, plain_in,
-        "incoming subset must match a separate In call"
-    );
-}
-
-/// Tight `fanout`/`limit` parity: with a narrowing limit, `neighbors_both_directions`
-/// must keep the same top-K set (by global weight) that the pre-optimization
-/// two-call-then-merge-then-truncate approach kept.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn test_neighbors_both_directions_limit_keeps_global_top_k() {
-    let store = setup_memory_store();
-
-    let centre = Uuid::new_v4();
-    let out_hi = Uuid::new_v4();
-    let in_hi = Uuid::new_v4();
-    let out_lo = Uuid::new_v4();
-    let in_lo = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(centre, out_hi, EdgeRelation::Extends, 0.95))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(in_hi, centre, EdgeRelation::Extends, 0.85))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, out_lo, EdgeRelation::Extends, 0.2))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(in_lo, centre, EdgeRelation::Extends, 0.1))
-        .await
-        .unwrap();
-
-    let directed = store
-        .neighbors_both_directions(
-            centre,
-            NeighborQuery {
-                direction: Direction::Both,
-                relations: None,
-                limit: Some(2),
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        directed.len(),
-        2,
-        "limit=2 must cap at 2 across both directions"
-    );
-    let ids: Vec<Uuid> = directed.iter().map(|d| d.hit.node_id).collect();
-    assert_eq!(
-        ids,
-        vec![out_hi, in_hi],
-        "the two globally-highest-weight neighbors must survive, in weight-descending order"
-    );
-    assert_eq!(directed[0].direction, Direction::Out);
-    assert_eq!(directed[1].direction, Direction::In);
-}
+include!("graph_tests/neighbor_direction_and_weight_tests.rs");
 
 /// Count-falsifiable A/B proof (ADR-089 context-verb optimization): a
 /// `direction="both"` neighbor fetch issues exactly ONE storage `neighbors`
@@ -1785,253 +1502,7 @@ async fn test_neighbors_both_directions_direction_then_edge_id_is_a_forward_cont
     );
 }
 
-#[tokio::test]
-async fn test_traverse_depth_2() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4();
-    let d = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(b, c, EdgeRelation::Extends, 2.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 3.0))
-        .await
-        .unwrap();
-
-    let request = TraversalRequest {
-        roots: vec![a],
-        options: TraversalOptions::new(2).with_direction(Direction::Out),
-        include_roots: true,
-        include_properties: false,
-        execution_budget: Default::default(),
-    };
-
-    let paths = store.traverse(request).await.unwrap();
-    assert_eq!(paths.len(), 1);
-
-    let path = &paths[0];
-    let node_ids: Vec<Uuid> = path.nodes.iter().map(|n| n.node_id).collect();
-    assert!(node_ids.contains(&a));
-    assert!(node_ids.contains(&b));
-    assert!(node_ids.contains(&c));
-    assert!(!node_ids.contains(&d));
-}
-
-/// Diamond graph: A→B, A→C, B→D, C→D.
-/// D is reachable via two paths at depth 2.  After the fix it must appear
-/// exactly once in the result.
-#[tokio::test]
-async fn test_traverse_dedups_multipath_node() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4();
-    let d = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(a, c, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(b, d, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-
-    let request = TraversalRequest {
-        roots: vec![a],
-        options: TraversalOptions::new(3).with_direction(Direction::Out),
-        include_roots: false,
-        include_properties: false,
-        execution_budget: Default::default(),
-    };
-
-    let paths = store.traverse(request).await.unwrap();
-    assert_eq!(paths.len(), 1);
-    let nodes = &paths[0].nodes;
-
-    // D must appear exactly once despite being reachable via both B and C.
-    let d_count = nodes.iter().filter(|n| n.node_id == d).count();
-    assert_eq!(d_count, 1, "D must appear exactly once (dedup multi-path)");
-
-    // B and C must each appear once as well.
-    assert_eq!(nodes.iter().filter(|n| n.node_id == b).count(), 1);
-    assert_eq!(nodes.iter().filter(|n| n.node_id == c).count(), 1);
-}
-
-/// First-visit BFS keeps the shallowest occurrence of a node, and the
-/// `via_edge` recorded for it is the one from that first-visited path.
-///
-/// Graph: A→B (depth 1), A→C (depth 1), B→D (depth 2), C→D (depth 2).
-/// D appears at depth 2 via B or C. Whichever same-depth frontier path the
-/// backend enumerates first is the keeper. The test
-/// asserts that D has exactly one entry with a non-None `via_edge` — we
-/// do NOT assert *which* edge wins because SQLite row order within the
-/// same depth level is non-deterministic, but we DO assert stability:
-/// running twice gives the same count.
-#[tokio::test]
-async fn test_traverse_preserves_first_path_metadata() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4();
-    let d = Uuid::new_v4();
-
-    store
-        .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(a, c, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(b, d, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-
-    let make_request = || TraversalRequest {
-        roots: vec![a],
-        options: TraversalOptions::new(3).with_direction(Direction::Out),
-        include_roots: false,
-        include_properties: false,
-        execution_budget: Default::default(),
-    };
-
-    let paths1 = store.traverse(make_request()).await.unwrap();
-    let paths2 = store.traverse(make_request()).await.unwrap();
-
-    // Both runs must return the same total node count (dedup is stable).
-    let count1 = paths1[0].nodes.len();
-    let count2 = paths2[0].nodes.len();
-    assert_eq!(
-        count1, count2,
-        "traverse result count must be stable across calls"
-    );
-
-    // D must appear exactly once and carry a via_edge (it was not a root).
-    let d_nodes: Vec<_> = paths1[0].nodes.iter().filter(|n| n.node_id == d).collect();
-    assert_eq!(d_nodes.len(), 1, "D deduped to one entry");
-    assert!(
-        d_nodes[0].via_edge.is_some(),
-        "kept entry must have a via_edge"
-    );
-    assert_eq!(d_nodes[0].depth, 2, "D lives at depth 2");
-}
-
-/// Multi-root traversal: two independent chains A→B→C and D→E→F.
-/// Each root must produce its own GraphPath with the correct node set.
-#[tokio::test]
-async fn test_traverse_multi_root_independent_chains() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4();
-    let d = Uuid::new_v4();
-    let e = Uuid::new_v4();
-    let f = Uuid::new_v4();
-
-    for (src, tgt) in [(a, b), (b, c), (d, e), (e, f)] {
-        store
-            .upsert_edge(make_edge(src, tgt, EdgeRelation::Extends, 1.0))
-            .await
-            .unwrap();
-    }
-
-    let request = TraversalRequest {
-        roots: vec![a, d],
-        options: TraversalOptions::new(2).with_direction(Direction::Out),
-        include_roots: true,
-        include_properties: false,
-        execution_budget: Default::default(),
-    };
-
-    let paths = store.traverse(request).await.unwrap();
-    assert_eq!(paths.len(), 2, "one GraphPath per root");
-
-    // Locate paths by root_id.
-    let path_a = paths
-        .iter()
-        .find(|p| p.root_id == a)
-        .expect("path for root A");
-    let path_d = paths
-        .iter()
-        .find(|p| p.root_id == d)
-        .expect("path for root D");
-
-    let ids_a: HashSet<Uuid> = path_a.nodes.iter().map(|n| n.node_id).collect();
-    assert!(ids_a.contains(&a), "root A in its own path");
-    assert!(ids_a.contains(&b), "depth-1 B in A's path");
-    assert!(ids_a.contains(&c), "depth-2 C in A's path");
-    assert!(!ids_a.contains(&d), "root D must not appear in A's path");
-
-    let ids_d: HashSet<Uuid> = path_d.nodes.iter().map(|n| n.node_id).collect();
-    assert!(ids_d.contains(&d), "root D in its own path");
-    assert!(ids_d.contains(&e), "depth-1 E in D's path");
-    assert!(ids_d.contains(&f), "depth-2 F in D's path");
-    assert!(!ids_d.contains(&a), "root A must not appear in D's path");
-}
-
-/// Multi-root with a shared neighbor: A→C and B→C.  C must appear in BOTH
-/// A's path and B's path (per-root isolation, not global dedup).
-#[tokio::test]
-async fn test_traverse_multi_root_shared_neighbor_appears_in_both() {
-    let store = setup_memory_store();
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let c = Uuid::new_v4(); // shared neighbor
-
-    for (src, tgt) in [(a, c), (b, c)] {
-        store
-            .upsert_edge(make_edge(src, tgt, EdgeRelation::Extends, 1.0))
-            .await
-            .unwrap();
-    }
-
-    let request = TraversalRequest {
-        roots: vec![a, b],
-        options: TraversalOptions::new(1).with_direction(Direction::Out),
-        include_roots: false,
-        include_properties: false,
-        execution_budget: Default::default(),
-    };
-
-    let paths = store.traverse(request).await.unwrap();
-    assert_eq!(paths.len(), 2, "one GraphPath per root");
-
-    for path in &paths {
-        let node_ids: HashSet<Uuid> = path.nodes.iter().map(|n| n.node_id).collect();
-        assert!(
-            node_ids.contains(&c),
-            "shared node C must appear in each root's path; root={:?}",
-            path.root_id
-        );
-    }
-}
+include!("graph_tests/traversal_path_and_root_tests.rs");
 
 /// A 15-node binary tree at max_depth=3 must retain every shallowest node
 /// exactly once under level-synchronous BFS.
@@ -2544,511 +2015,9 @@ fn neighbor_edge_multiset(hits: &[(Uuid, NeighborHit)]) -> HashMap<(Uuid, Uuid),
     grouped
 }
 
-#[tokio::test]
-async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
-    let store = setup_memory_store();
-    let root_a = Uuid::new_v4();
-    let root_b = Uuid::new_v4();
-    let root_without_edges = Uuid::new_v4();
-    let joined = make_edge(root_a, root_b, EdgeRelation::Extends, 0.9);
-    let self_loop = make_edge(root_b, root_b, EdgeRelation::DependsOn, 0.8);
-    let joined_id = Uuid::from(joined.id);
-    let self_loop_id = Uuid::from(self_loop.id);
-    for edge in [joined, self_loop] {
-        store.upsert_edge(edge).await.unwrap();
-    }
+include!("graph_tests/batch_neighbor_grouping_and_filter_tests.rs");
 
-    let sources = [root_a, root_b, root_without_edges];
-    let outgoing_hits = store
-        .batch_neighbors(
-            &sources,
-            NeighborQuery {
-                direction: Direction::Out,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        neighbor_edge_multiset(&outgoing_hits),
-        HashMap::from([((root_a, joined_id), 1), ((root_b, self_loop_id), 1),])
-    );
-
-    let incoming_hits = store
-        .batch_neighbors(
-            &sources,
-            NeighborQuery {
-                direction: Direction::In,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        neighbor_edge_multiset(&incoming_hits),
-        HashMap::from([((root_b, joined_id), 1), ((root_b, self_loop_id), 1),])
-    );
-
-    let both_hits = store
-        .batch_neighbors(
-            &sources,
-            NeighborQuery {
-                direction: Direction::Both,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        neighbor_edge_multiset(&both_hits),
-        HashMap::from([
-            ((root_a, joined_id), 1),
-            ((root_b, joined_id), 1),
-            ((root_b, self_loop_id), 2),
-        ])
-    );
-    assert!(
-        both_hits
-            .iter()
-            .all(|(origin, _)| *origin != root_without_edges),
-        "the requested zero-edge root must not acquire another root's rows"
-    );
-}
-
-#[tokio::test]
-async fn batch_neighbors_preserves_duplicate_requested_sources() {
-    let store = setup_memory_store();
-    let root = Uuid::new_v4();
-    let target = Uuid::new_v4();
-    let edge = make_edge(root, target, EdgeRelation::Extends, 1.0);
-    let edge_id = Uuid::from(edge.id);
-    store.upsert_edge(edge).await.unwrap();
-
-    let hits = store
-        .batch_neighbors(
-            &[root, root],
-            NeighborQuery {
-                direction: Direction::Out,
-                relations: None,
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        neighbor_edge_multiset(&hits),
-        HashMap::from([((root, edge_id), 2)]),
-        "the optimized override must match the trait default's per-occurrence output"
-    );
-}
-
-/// PARITY REGRESSION GUARD — the critical bug (HIGH).
-/// For Direction::Both + limit=Some(1), batch_neighbors must return AT MOST
-/// `limit` hits per source, not up to 2× (one per direction).
-/// Before the fix, Both ran Out and In separately and concatenated, so a node
-/// with ≥1 outgoing AND ≥1 incoming edge would yield 2 hits when limit=1.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_both_limit_matches_single_source_neighbors() {
-    let store = setup_memory_store();
-    // 2 outgoing, 2 incoming from centre
-    let (centre, out_nodes, in_nodes) = build_star(&store, 2, 2).await;
-
-    let q_both_limit1 = NeighborQuery {
-        direction: Direction::Both,
-        relations: None,
-        limit: Some(1),
-        min_weight: None,
-    };
-
-    // single-source neighbors() — ground truth
-    let single_hits = store
-        .neighbors(centre, q_both_limit1.clone())
-        .await
-        .unwrap();
-    // batch_neighbors with the same query
-    let batch_hits = store
-        .batch_neighbors(&[centre], q_both_limit1.clone())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        batch_hits.len(),
-        single_hits.len(),
-        "batch_neighbors Both+limit=1 must return same count as neighbors() \
-         (was 2× before fix)"
-    );
-
-    // Sanity: single-source also returns 1 when limit=1
-    assert_eq!(single_hits.len(), 1, "neighbors() must respect limit=1");
-
-    // Ensure the returned node is one of the actual neighbours.
-    let all_neighbours: HashSet<Uuid> = out_nodes.iter().chain(in_nodes.iter()).copied().collect();
-    let batch_node_ids: HashSet<Uuid> = batch_hits.iter().map(|(_, h)| h.node_id).collect();
-    for nid in &batch_node_ids {
-        assert!(
-            all_neighbours.contains(nid),
-            "batch result must be a real neighbour of centre"
-        );
-    }
-}
-
-/// PARITY: set equality for Out direction, with and without limit.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_out_parity_with_neighbors() {
-    let store = setup_memory_store();
-    let (centre, out_nodes, _) = build_star(&store, 3, 2).await;
-
-    let q_out = NeighborQuery {
-        direction: Direction::Out,
-        relations: None,
-        limit: None,
-        min_weight: None,
-    };
-
-    let single: HashSet<Uuid> =
-        single_neighbour_set(&store.neighbors(centre, q_out.clone()).await.unwrap());
-    let batch: HashSet<Uuid> = neighbour_set(
-        &store
-            .batch_neighbors(&[centre], q_out.clone())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(batch, single, "Out: batch must equal single-source set");
-
-    let expected: HashSet<Uuid> = out_nodes.iter().copied().collect();
-    assert_eq!(
-        batch, expected,
-        "Out: must return exactly the out-neighbours"
-    );
-}
-
-/// PARITY: set equality for In direction.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_in_parity_with_neighbors() {
-    let store = setup_memory_store();
-    let (centre, _, in_nodes) = build_star(&store, 2, 3).await;
-
-    let q_in = NeighborQuery {
-        direction: Direction::In,
-        relations: None,
-        limit: None,
-        min_weight: None,
-    };
-
-    let single: HashSet<Uuid> =
-        single_neighbour_set(&store.neighbors(centre, q_in.clone()).await.unwrap());
-    let batch: HashSet<Uuid> = neighbour_set(
-        &store
-            .batch_neighbors(&[centre], q_in.clone())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(batch, single, "In: batch must equal single-source set");
-
-    let expected: HashSet<Uuid> = in_nodes.iter().copied().collect();
-    assert_eq!(batch, expected, "In: must return exactly the in-neighbours");
-}
-
-/// PARITY: set equality for Both direction, no limit.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_both_parity_no_limit() {
-    let store = setup_memory_store();
-    let (centre, out_nodes, in_nodes) = build_star(&store, 2, 3).await;
-
-    let q_both = NeighborQuery {
-        direction: Direction::Both,
-        relations: None,
-        limit: None,
-        min_weight: None,
-    };
-
-    let single: HashSet<Uuid> =
-        single_neighbour_set(&store.neighbors(centre, q_both.clone()).await.unwrap());
-    let batch: HashSet<Uuid> = neighbour_set(
-        &store
-            .batch_neighbors(&[centre], q_both.clone())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(batch, single, "Both: batch must equal single-source set");
-
-    let expected: HashSet<Uuid> = out_nodes.iter().chain(in_nodes.iter()).copied().collect();
-    assert_eq!(batch, expected, "Both: must return all neighbours");
-}
-
-/// PARITY: relations filter applies correctly across directions.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_relations_filter_parity() {
-    let store = setup_memory_store();
-    let centre = Uuid::new_v4();
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    // outgoing: one Extends, one DependsOn
-    store
-        .upsert_edge(make_edge(centre, a, EdgeRelation::Extends, 1.0))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, b, EdgeRelation::DependsOn, 1.0))
-        .await
-        .unwrap();
-
-    let q = NeighborQuery {
-        direction: Direction::Out,
-        relations: Some(vec![EdgeRelation::Extends]),
-        limit: None,
-        min_weight: None,
-    };
-
-    let single: HashSet<Uuid> =
-        single_neighbour_set(&store.neighbors(centre, q.clone()).await.unwrap());
-    let batch: HashSet<Uuid> = neighbour_set(&store.batch_neighbors(&[centre], q).await.unwrap());
-
-    assert_eq!(batch, single, "relations filter: batch must match single");
-    assert!(
-        batch.contains(&a),
-        "filtered result must include Extends target"
-    );
-    assert!(
-        !batch.contains(&b),
-        "filtered result must exclude DependsOn target"
-    );
-}
-
-/// PARITY: min_weight filter applies correctly.
-// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
-#[tokio::test]
-#[serial(neighbor_select_count)]
-async fn batch_neighbors_min_weight_filter_parity() {
-    let store = setup_memory_store();
-    let centre = Uuid::new_v4();
-    let heavy = Uuid::new_v4();
-    let light = Uuid::new_v4();
-    store
-        .upsert_edge(make_edge(centre, heavy, EdgeRelation::Extends, 0.9))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre, light, EdgeRelation::Extends, 0.3))
-        .await
-        .unwrap();
-
-    let q = NeighborQuery {
-        direction: Direction::Out,
-        relations: None,
-        limit: None,
-        min_weight: Some(0.5),
-    };
-
-    let single: HashSet<Uuid> =
-        single_neighbour_set(&store.neighbors(centre, q.clone()).await.unwrap());
-    let batch: HashSet<Uuid> = neighbour_set(&store.batch_neighbors(&[centre], q).await.unwrap());
-
-    assert_eq!(batch, single, "min_weight filter: batch must match single");
-    assert!(
-        batch.contains(&heavy),
-        "must include edge above weight threshold"
-    );
-    assert!(
-        !batch.contains(&light),
-        "must exclude edge below weight threshold"
-    );
-}
-
-/// Regression guard (issue #589): a `limit` narrower than an origin's full
-/// neighbor set must keep that origin's highest-weight edges, not an
-/// arbitrary SQLite row-order subset. Before the fix, the `ROW_NUMBER()
-/// OVER (PARTITION BY origin_id)` window had no `ORDER BY`, so a low-weight
-/// neighbor could win over a high-weight one purely by insertion order —
-/// and because this is per-origin, one origin's row order could disagree
-/// with another's, so the test uses two origins with the low/mid/high
-/// insertion order reversed between them.
-#[tokio::test]
-async fn batch_neighbors_limit_keeps_highest_weight_per_origin_not_insertion_order() {
-    let store = setup_memory_store();
-
-    let centre_a = Uuid::new_v4();
-    let a_low = Uuid::new_v4();
-    let a_mid = Uuid::new_v4();
-    let a_high = Uuid::new_v4();
-
-    let centre_b = Uuid::new_v4();
-    let b_low = Uuid::new_v4();
-    let b_mid = Uuid::new_v4();
-    let b_high = Uuid::new_v4();
-
-    // centre_a: insert lowest-weight edge FIRST (insertion order disagrees
-    // with weight order).
-    store
-        .upsert_edge(make_edge(centre_a, a_low, EdgeRelation::Extends, 0.1))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre_a, a_mid, EdgeRelation::Extends, 0.5))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre_a, a_high, EdgeRelation::Extends, 0.9))
-        .await
-        .unwrap();
-
-    // centre_b: insert highest-weight edge FIRST — the reverse of centre_a —
-    // so a single global insertion-order artifact cannot accidentally pass
-    // both origins.
-    store
-        .upsert_edge(make_edge(centre_b, b_high, EdgeRelation::Extends, 0.9))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre_b, b_mid, EdgeRelation::Extends, 0.5))
-        .await
-        .unwrap();
-    store
-        .upsert_edge(make_edge(centre_b, b_low, EdgeRelation::Extends, 0.1))
-        .await
-        .unwrap();
-
-    let query = NeighborQuery {
-        direction: Direction::Out,
-        relations: None,
-        limit: Some(2),
-        min_weight: None,
-    };
-
-    let hits = store
-        .batch_neighbors(&[centre_a, centre_b], query)
-        .await
-        .unwrap();
-
-    let a_hits: Vec<&NeighborHit> = hits
-        .iter()
-        .filter(|(origin, _)| *origin == centre_a)
-        .map(|(_, h)| h)
-        .collect();
-    let b_hits: Vec<&NeighborHit> = hits
-        .iter()
-        .filter(|(origin, _)| *origin == centre_b)
-        .map(|(_, h)| h)
-        .collect();
-
-    assert_eq!(
-        a_hits.len(),
-        2,
-        "centre_a: per-origin limit=2 must return exactly 2 neighbors"
-    );
-    assert_eq!(
-        b_hits.len(),
-        2,
-        "centre_b: per-origin limit=2 must return exactly 2 neighbors"
-    );
-
-    let a_ids: HashSet<Uuid> = a_hits.iter().map(|h| h.node_id).collect();
-    assert!(
-        a_ids.contains(&a_high),
-        "centre_a: highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        a_ids.contains(&a_mid),
-        "centre_a: second-highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        !a_ids.contains(&a_low),
-        "centre_a: lowest-weight neighbor must be the one dropped by limit"
-    );
-
-    let b_ids: HashSet<Uuid> = b_hits.iter().map(|h| h.node_id).collect();
-    assert!(
-        b_ids.contains(&b_high),
-        "centre_b: highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        b_ids.contains(&b_mid),
-        "centre_b: second-highest-weight neighbor must survive a narrowing limit"
-    );
-    assert!(
-        !b_ids.contains(&b_low),
-        "centre_b: lowest-weight neighbor must be the one dropped by limit"
-    );
-}
-
-// ---- get_edges direct SQLite tests ----
-
-/// get_edges must return all requested edges regardless of request order.
-#[tokio::test]
-async fn get_edges_order_independent() {
-    let store = setup_memory_store();
-
-    let edges: Vec<Edge> = (0..5)
-        .map(|i| {
-            make_edge(
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                EdgeRelation::Extends,
-                i as f64,
-            )
-        })
-        .collect();
-    let ids: Vec<LinkId> = edges.iter().map(|e| e.id).collect();
-    for e in edges {
-        store.upsert_edge(e).await.unwrap();
-    }
-
-    // Request in reversed order
-    let mut reversed = ids.clone();
-    reversed.reverse();
-
-    let result = store.get_edges(&reversed).await.unwrap();
-    let result_ids: HashSet<LinkId> = result.iter().map(|e| e.id).collect();
-    let expected_ids: HashSet<LinkId> = ids.iter().copied().collect();
-    assert_eq!(
-        result_ids, expected_ids,
-        "get_edges must return all edges regardless of request order"
-    );
-}
-
-/// Soft-deleted or nonexistent IDs are silently omitted.
-#[tokio::test]
-async fn get_edges_omits_deleted_and_missing() {
-    let store = setup_memory_store();
-
-    let live = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
-    let soft = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::DependsOn, 0.5);
-    let ghost_id = LinkId::from(Uuid::new_v4()); // never inserted
-
-    let live_id = live.id;
-    let soft_id = soft.id;
-
-    store.upsert_edge(live).await.unwrap();
-    store.upsert_edge(soft).await.unwrap();
-    // Soft-delete the second edge
-    store.delete_edge(soft_id, DeleteMode::Soft).await.unwrap();
-
-    let result = store
-        .get_edges(&[live_id, soft_id, ghost_id])
-        .await
-        .unwrap();
-
-    assert_eq!(result.len(), 1, "only the live edge must be returned");
-    assert_eq!(result[0].id, live_id, "returned edge must be the live one");
-}
+include!("graph_tests/ranked_neighbors_and_bulk_edge_reads_tests.rs");
 
 /// get_edges with more than 900 IDs (chunk boundary) returns all live edges.
 #[tokio::test]
@@ -5496,4 +4465,184 @@ async fn endpoint_base_counts_separate_structure_from_provenance() {
         after.total(),
         store.count_edges(EdgeFilter::default()).await.unwrap()
     );
+}
+
+/// The combined relation and endpoint-base aggregate that `stats` reads must
+/// equal the three single-purpose counts it replaces. The fixture covers the
+/// ways they could disagree: one relation spread over several buckets, one
+/// bucket fed by several relations, unresolved endpoints, a soft-deleted edge,
+/// a tombstoned endpoint, a second namespace, a namespace outside the request,
+/// a namespace listed twice, and enough empty namespaces to split the request
+/// into more than one chunk.
+#[tokio::test]
+async fn combined_relation_and_endpoint_base_counts_equal_the_separate_counts() {
+    let (pool, store_a) = setup_memory_store_with_substrates();
+    let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "combined-b");
+    let store_c = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "combined-c");
+
+    let (e1, e2, e3, e4, e_dead) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [e1, e2, e3, e4, e_dead] {
+        insert_live_entity(&pool, id);
+    }
+    soft_delete_entity(&pool, e_dead);
+    let (n1, n2, n3, n_dead) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [n1, n2, n3, n_dead] {
+        insert_note(&pool, id, false);
+    }
+    soft_delete_note(&pool, n_dead);
+    let (ghost_a, ghost_b) = (Uuid::new_v4(), Uuid::new_v4());
+    // An id held in both tables: the entity base wins, as in the single-purpose count.
+    let both = Uuid::new_v4();
+    insert_live_entity(&pool, both);
+    insert_note(&pool, both, false);
+
+    for edge in [
+        make_edge(e1, e2, EdgeRelation::Contains, 1.0),
+        make_edge(e3, e4, EdgeRelation::Contains, 1.0),
+        make_edge(e1, e3, EdgeRelation::DependsOn, 1.0),
+        make_edge(n1, e1, EdgeRelation::Annotates, 1.0),
+        make_edge(e2, n2, EdgeRelation::Annotates, 1.0),
+        make_edge(n2, n3, EdgeRelation::Supports, 1.0),
+        make_edge(both, e3, EdgeRelation::Supports, 1.0),
+        make_edge(ghost_a, ghost_b, EdgeRelation::DependsOn, 1.0),
+        // Tombstoned endpoints, entity and note: out of every count.
+        make_edge(e1, e_dead, EdgeRelation::Contains, 1.0),
+        make_edge(n_dead, e1, EdgeRelation::Annotates, 1.0),
+    ] {
+        store_a.upsert_edge(edge).await.unwrap();
+    }
+    // Soft-deleted edge, the only `extends` edge: the relation must not appear.
+    let deleted = make_edge(e2, e4, EdgeRelation::Extends, 1.0);
+    let deleted_id = deleted.id;
+    store_a.upsert_edge(deleted).await.unwrap();
+    assert!(store_a
+        .delete_edge(deleted_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    for (source, target, relation) in [
+        (e1, e4, EdgeRelation::Contains),
+        (n3, e3, EdgeRelation::Annotates),
+        (ghost_a, e1, EdgeRelation::Annotates),
+    ] {
+        let mut edge = make_edge(source, target, relation, 1.0);
+        edge.namespace = "combined-b".to_string();
+        store_b.upsert_edge(edge).await.unwrap();
+    }
+    // Outside the requested namespaces.
+    let mut outside = make_edge(e1, e2, EdgeRelation::Contains, 1.0);
+    outside.namespace = "combined-c".to_string();
+    store_c.upsert_edge(outside).await.unwrap();
+
+    let mut namespaces = vec![
+        "default".to_string(),
+        "combined-b".to_string(),
+        "default".to_string(),
+    ];
+    namespaces.extend((0..999).map(|i| format!("combined-empty-{i}")));
+
+    let rows = store_a
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&namespaces)
+        .await
+        .unwrap();
+    let combined: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = rows.iter().copied().collect();
+    assert_eq!(combined.len(), rows.len(), "one row per relation: {rows:?}");
+
+    // Expected values, so two equally wrong answers cannot agree.
+    let expected: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = [
+        (
+            EdgeRelation::Contains,
+            EdgeEndpointBaseCounts {
+                entity_entity: 3,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::DependsOn,
+            EdgeEndpointBaseCounts {
+                entity_entity: 1,
+                unresolved: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::Annotates,
+            EdgeEndpointBaseCounts {
+                entity_note: 1,
+                note_entity: 2,
+                unresolved: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            EdgeRelation::Supports,
+            EdgeEndpointBaseCounts {
+                entity_entity: 1,
+                note_note: 1,
+                ..Default::default()
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(combined, expected);
+
+    let by_relation: HashMap<EdgeRelation, u64> = combined
+        .iter()
+        .map(|(relation, counts)| (*relation, counts.total()))
+        .collect();
+    assert_eq!(
+        store_a
+            .count_edges_by_relation_in_namespaces(&namespaces)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        by_relation,
+        "summing each relation's buckets must give its relation count"
+    );
+
+    let mut by_base = EdgeEndpointBaseCounts::default();
+    for counts in combined.values() {
+        by_base.entity_entity += counts.entity_entity;
+        by_base.entity_note += counts.entity_note;
+        by_base.note_entity += counts.note_entity;
+        by_base.note_note += counts.note_note;
+        by_base.unresolved += counts.unresolved;
+    }
+    assert_eq!(
+        store_a
+            .count_edges_by_endpoint_base_in_namespaces(&namespaces)
+            .await
+            .unwrap(),
+        by_base,
+        "summing the buckets across relations must give the endpoint-base counts"
+    );
+
+    let total = store_a
+        .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(total, 11);
+    assert_eq!(
+        by_base.total(),
+        total,
+        "the groups must partition the total"
+    );
+
+    assert!(store_a
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&[])
+        .await
+        .unwrap()
+        .is_empty());
 }

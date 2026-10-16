@@ -262,6 +262,38 @@ pub fn screen(input: &ScreeningInput) -> Result<ScreeningOutcome, ScreeningError
     })
 }
 
+/// Screen parsed MIME, using the existing HTML text conversion only for opt-out detection.
+pub fn screen_message(message: &Message<'_>) -> Result<ScreeningOutcome, ScreeningError> {
+    let input = ScreeningInput::from_message(message);
+    let mut outcome = screen(&input)?;
+    if !outcome.opt_out && input.plain_parts.is_empty() {
+        let extracted = (0..message.text_body_count())
+            .filter_map(|pos| message.body_text(pos))
+            .map(|text| text.into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let paragraph = first_paragraph(extracted.lines());
+        if !paragraph.is_empty() {
+            if let Some(rule) = rules()?
+                .rules
+                .iter()
+                .find(|rule| rule.family == Family::OptOut)
+            {
+                if rule.terms.iter().any(|term| {
+                    let needle = normalize(term);
+                    !needle.is_empty() && paragraph.contains(&needle)
+                }) {
+                    // HTML quotation false positives intentionally run toward suppression.
+                    outcome.opt_out = true;
+                    outcome.rule_ids.push(rule.id.clone());
+                    outcome.families.push(Family::OptOut);
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 fn disposition_for(families: &[Family]) -> Disposition {
     if families.contains(&Family::ExecutableAttachment) {
         return Disposition::QuarantineScreened;
@@ -327,19 +359,35 @@ fn opt_out_matches(rules: &[Rule], input: &ScreeningInput) -> bool {
         return false;
     };
     let subject = normalize(&input.subject);
-    let first_line = input
-        .plain_parts
-        .iter()
-        .flat_map(|part| part.lines())
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('>'))
-        .map(normalize)
-        .unwrap_or_default();
+    let paragraph = first_paragraph(input.plain_parts.iter().flat_map(|part| part.lines()));
 
     rule.terms.iter().any(|term| {
         let needle = normalize(term);
-        !needle.is_empty() && (subject.contains(&needle) || first_line.contains(&needle))
+        !needle.is_empty() && (subject.contains(&needle) || paragraph.contains(&needle))
     })
+}
+
+/// The first non-quoted paragraph, normalized: the lines from the first
+/// non-empty line that does not start with `>` up to the next empty or quoted
+/// line, joined with one space. A mail client wraps a sentence across lines,
+/// so a phrase split by the wrap still matches; quoted text and anything
+/// after the first blank line never enter the window.
+fn first_paragraph<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for line in lines.map(str::trim) {
+        let in_window = !line.is_empty() && !line.starts_with('>');
+        if !in_window {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    normalize(&out)
 }
 
 /// Case-fold and collapse ASCII whitespace runs to a single space.
@@ -639,6 +687,9 @@ fn is_executable_attachment(attachment: &AttachmentInput) -> bool {
         .iter()
         .any(|magic| bytes.starts_with(magic))
 }
+
+#[cfg(test)]
+mod reply_fixtures_tests;
 
 #[cfg(test)]
 mod tests {

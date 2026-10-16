@@ -130,3 +130,69 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         );
     }
 }
+
+// ---- db_diagnostics: backend selection and the shared read deadline ----
+
+#[tokio::test]
+async fn db_diagnostics_returns_a_partial_report_once_the_deadline_has_passed() {
+    let pack = pack();
+
+    let report = khive_storage::scope_request_read_deadline(
+        std::time::Duration::ZERO,
+        pack.dispatch("db_diagnostics", json!({})),
+    )
+    .await
+    .expect("a passed deadline must return the partial report, not fail the verb");
+
+    assert_eq!(report["complete"], json!(false), "{report}");
+    let databases = report["databases"].as_array().expect("databases array");
+    assert!(!databases.is_empty(), "{report}");
+    for database in databases {
+        assert!(database["diagnostics"].is_null(), "{database}");
+        let error = database["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("not inspected: request deadline"),
+            "{database}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn db_diagnostics_without_a_deadline_is_complete() {
+    let pack = pack();
+
+    let report = pack
+        .dispatch("db_diagnostics", json!({}))
+        .await
+        .expect("db_diagnostics must succeed against an in-memory backend");
+
+    assert_eq!(report["complete"], json!(true), "{report}");
+    assert!(report["databases"][0]["error"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn db_diagnostics_backend_selects_one_opened_backend_and_rejects_unknown_names() {
+    let pack = pack();
+
+    let report = pack
+        .dispatch("db_diagnostics", json!({"backend": "main"}))
+        .await
+        .expect("main is always opened");
+    let databases = report["databases"].as_array().expect("databases array");
+    assert_eq!(databases.len(), 1, "{report}");
+    assert_eq!(databases[0]["backend_names"], json!(["main"]));
+
+    let err = pack
+        .dispatch("db_diagnostics", json!({"backend": "no-such-backend"}))
+        .await
+        .expect_err("an unknown backend name must be refused");
+    let message = invalid_input_message(&err);
+    assert!(message.contains("\"no-such-backend\""), "{message}");
+    assert!(message.contains("main"), "{message}");
+
+    let err = pack
+        .dispatch("db_diagnostics", json!({"size_composition": "no"}))
+        .await
+        .expect_err("size_composition must be a boolean");
+    assert!(is_invalid_input(&err), "{err:?}");
+}

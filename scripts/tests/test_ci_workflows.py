@@ -494,13 +494,15 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # The push guard has its own eligibility predicate. The documentation-lane
-    # jobs carry exactly DOCS_LANE_PREDICATE and skip on a change that touches
-    # only Markdown no code names. always() admits a job after failed
+    # The push guard has its own eligibility predicate. The lane jobs carry
+    # exactly DOCS_LANE_PREDICATE and skip on a change that touches only
+    # Markdown no code names, and on an own codex/ pull request that changes
+    # crate source and Markdown only. always() admits a job after failed
     # dependencies; it is not such a predicate.
     CONDITIONAL_JOBS = {"automerge-push-guard"}
     FORGIVEN_SKIPS = {"automerge-push-guard"}
-    DOCS_LANE_PREDICATE = "needs.changed-paths.outputs.docs_only != 'true'"
+    DOCS_LANE_PREDICATE = ("needs.changed-paths.outputs.docs_only != 'true'"
+                           " && needs.changed-paths.outputs.integration_only != 'true'")
     DOCS_LANE_JOBS = {
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
@@ -521,12 +523,12 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results, docs_only="false", classifier=None):
+    def run_gate(self, results, docs_only="false", classifier=None, integration_only="false"):
         needs = {job: {"result": result} for job, result in results.items()}
         if "changed-paths" in needs:
             if classifier is not None:
                 needs["changed-paths"]["result"] = classifier
-            needs["changed-paths"]["outputs"] = {"docs_only": docs_only}
+            needs["changed-paths"]["outputs"] = {"docs_only": docs_only, "integration_only": integration_only}
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
             env={**os.environ, "NEEDS": json.dumps(needs)},
@@ -576,15 +578,21 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     def test_gate_forgives_docs_lane_skips_only_after_a_successful_docs_only_classification(self):
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
-                for docs_only, classifier in (("true", "success"), ("false", "success"),
-                                              ("true", "failure"), ("true", "skipped"),
-                                              ("TRUE", "success"), ("", "success")):
-                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only, classifier=classifier):
+                for docs_only, integration_only, classifier in (
+                        ("true", "false", "success"), ("false", "false", "success"),
+                        ("true", "false", "failure"), ("true", "false", "skipped"),
+                        ("TRUE", "false", "success"), ("", "false", "success"),
+                        ("false", "true", "success"), ("false", "true", "failure"),
+                        ("false", "true", "skipped"), ("false", "TRUE", "success"),
+                        ("false", "", "success"), ("", "", "success")):
+                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only,
+                                      integration_only=integration_only, classifier=classifier):
                         results = dict.fromkeys(self.needs, "success")
                         results[job] = outcome
                         classifier_result = outcome if job == "changed-paths" else classifier
-                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result)
-                        lane = docs_only == "true" and classifier_result == "success"
+                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result,
+                                               integration_only=integration_only)
+                        lane = classifier_result == "success" and "true" in (docs_only, integration_only)
                         accepted = classifier_result == "success" and (outcome == "success" or (
                             outcome == "skipped" and (
                                 job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS))
@@ -647,7 +655,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
 
 class CiConcurrencyWorkflowTests(unittest.TestCase):
-    def test_main_pushes_run_newest_commit_without_cancelling_running_run(self):
+    def test_main_pushes_run_newest_commit_and_cancel_superseded_runs(self):
         concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
         self.assertEqual(
             mapping_entries(concurrency),
@@ -656,11 +664,12 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
                 "github.event_name == 'pull_request' && github.ref || "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main' "
                 "&& github.ref || github.run_id }}",
-                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                "(github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
             },
-            "Main pushes must share one group whose running run is never "
-            "cancelled and whose waiting run is replaced by the newest push "
-            "(the default single-slot queue); PRs retain ref-scoped "
+            "Main pushes must share one group in which the newest push cancels "
+            "the running run and replaces the waiting one, so a burst of merges "
+            "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
 
@@ -770,6 +779,14 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_trend_points_are_nightly_and_per_release_not_per_merge(self):
+        on = indented_block(workflow_text("bench-track.yml"), "on", 0)
+        self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
+        self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
+        push = indented_block(on, "push", 2)
+        self.assertNotIn("branches", push, "a push to a branch must not record a trend point")
+        self.assertIn('tags: ["v*"]', push)
+
     def test_publish_failure_is_advisory_and_records_incident(self):
         for workflow_name, publish_name in (
             ("bench-component.yml", "Publish ledger to perf-data branch"),
@@ -931,7 +948,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
             "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
         ):
             self.assertIn(evidence_path, step(artifact_name))
-        self.assertIn("github.event_name == 'push'", step(publish_name))
+        publish_if = step(publish_name)
+        self.assertIn("github.event_name != 'pull_request'", publish_if)
+        self.assertIn("github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')", publish_if)
 
         # Execute the workflow's real shell and real recorder. Only the native
         # benchmark, remote publisher and upload service are fixture boundaries.
@@ -2221,14 +2240,16 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
-        # One job-level predicate is admitted: the documentation lane. A job it
-        # skips is reported under its unevaluated name, which is neither a
-        # required check name nor an ordinary job name, so the replay
-        # distinction holds; CI gate and the secret scan never carry it, and
-        # the gate accepts those skips only on a successful docs_only=true
-        # classification (AggregateGateWorkflowTests). Gating the same jobs per
-        # step would still start every runner, the macOS one included.
-        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
+        # One job-level predicate is admitted: the documentation and
+        # integration lanes. A job it skips is reported under its unevaluated
+        # name, which is neither a required check name nor an ordinary job
+        # name, so the replay distinction holds; CI gate and the secret scan
+        # never carry it, and the gate accepts those skips only on a successful
+        # docs_only=true or integration_only=true classification
+        # (AggregateGateWorkflowTests). Gating the same jobs per step would
+        # still start every runner, the macOS one included.
+        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                     " && needs.changed-paths.outputs.integration_only != 'true'")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
@@ -2618,7 +2639,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         verdict, reasons = self.classify(base, self.commit("guide"))
         self.assertEqual(verdict, "false", reasons)
 
-    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None):
+    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
+                     head_repository=None):
+        """Runs the Classify step and returns its docs_only line; the integration_only value lands in
+        self.integration_only. head_ref and head_repository are left unset unless given, as on a push."""
         workflow = workflow_text("ci.yml")
         job = indented_block(workflow, "changed-paths", 2)
         step = job.split("- name: Classify\n", 1)[1]
@@ -2627,6 +2651,8 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         script = textwrap.dedent(match.group(1))
         (self.repo / "scripts").mkdir(exist_ok=True)
         shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts" / "ci-integration-only.sh",
+                    self.repo / "scripts" / "ci-integration-only.sh")
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -2638,15 +2664,23 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             gh.chmod(0o755)
         output = pathlib.Path(self.temp.name) / "output"
         output.write_text("")
+        pull = {key: value for key, value in (("HEAD_REF", head_ref), ("HEAD_REPOSITORY", head_repository))
+                if value is not None}
         completed = subprocess.run(
             ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
             env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x"},
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", **pull},
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        return output.read_text().strip(), completed.stdout + completed.stderr
+        lines = output.read_text().splitlines()
+        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only", "integration_only"], lines)
+        self.integration_only = lines[1].split("=", 1)[1]
+        self.assertIn(self.integration_only, ["true", "false"])
+        if event_name != "pull_request":
+            self.assertEqual(self.integration_only, "false", f"{event_name} is never on the integration lane")
+        return lines[0], completed.stdout + completed.stderr
 
     def merge_ref(self, path, text):
         self.git("checkout", "-q", "-b", "topic")
@@ -2665,6 +2699,34 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+        self.assertEqual(self.integration_only, "false")
+
+    def test_job_own_codex_pull_request_with_crate_source_takes_the_integration_lane(self):
+        head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
+        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
+        self.assertEqual((verdict, self.integration_only), ("docs_only=false", "true"), log)
+        self.assertIn("integration lane: crates/k/src/lib.rs", log)
+
+    def test_job_integration_lane_needs_an_own_codex_branch_and_crate_source(self):
+        head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
+        for head_ref, head_repository in (("codex/change", "fork/r"), ("codex/change", ""),
+                                          ("codex/change", None), ("feature/codex/x", "o/r"),
+                                          ("batch/1", "o/r"), ("", "o/r"), (None, None)):
+            with self.subTest(head_ref=head_ref, head_repository=head_repository):
+                verdict, log = self.classify_job("pull_request", head, head_ref=head_ref,
+                                                 head_repository=head_repository)
+                self.assertEqual((verdict, self.integration_only), ("docs_only=false", "false"), log)
+
+    def test_job_own_codex_pull_request_changing_a_ci_script_runs_the_full_suite(self):
+        head = self.merge_ref("scripts/ci.sh", "echo changed\n")
+        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
+        self.assertEqual((verdict, self.integration_only), ("docs_only=false", "false"), log)
+        self.assertIn("outside crate source: scripts/ci.sh", log)
+
+    def test_job_documentation_lane_takes_precedence_over_the_integration_lane(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
+        self.assertEqual((verdict, self.integration_only), ("docs_only=true", "false"), log)
 
     def gh_listing(self, run_sha, shard_conclusion):
         return (
@@ -2704,6 +2766,204 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                                 ("push", "refs/heads/integration/train-1")):
             with self.subTest(event_name=event_name, ref=ref):
                 self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
+
+
+class IntegrationOnlyClassifierTests(unittest.TestCase):
+    """scripts/ci-integration-only.sh on real temporary repositories."""
+
+    CLASSIFIER = REPO_ROOT / "scripts" / "ci-integration-only.sh"
+    TREE = {
+        "crates/k/src/lib.rs": "pub fn f() {}\n",
+        "crates/k/build.rs": "fn main() {}\n",
+        "crates/k/tests/t.rs": "#[test]\nfn t() {}\n",
+        "crates/k/README.md": "# k\n",
+        "crates/k/Cargo.toml": "[package]\nname = \"k\"\n",
+        "crates/Cargo.toml": "[workspace]\n",
+        "crates/Cargo.lock": "version = 4\n",
+        "crates/k/Cargo.lock": "version = 4\n",
+        "crates/.cargo/config.toml": "[build]\n",
+        "crates/.config/nextest.toml": "[profile.default]\n",
+        "crates/rust-toolchain.toml": "[toolchain]\n",
+        "crates/deny.toml": "[bans]\n",
+        "crates/k/clippy.toml": "msrv = \"1.85\"\n",
+        "crates/rustfmt.toml": "edition = \"2021\"\n",
+        "docs/guide.md": "# Guide\n",
+        "docs/diagram.svg": "<svg/>\n",
+        ".github/workflows/ci.yml": "name: CI\n",
+        ".github/actions/a/action.yml": "name: a\n",
+        "scripts/ci.sh": "echo ci\n",
+        "python/pkg/__init__.py": "\n",
+        "tests/contract.py": "\n",
+        "Makefile": "ci:\n",
+        "rust-toolchain.toml": "[toolchain]\n",
+    }
+    LANE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs", "crates/k/README.md",
+            "docs/guide.md"}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.git("init", "-q", "-b", "main")
+        for path, text in self.TREE.items():
+            self.write(path, text)
+        self.base = self.commit("base")
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify(self, base, head):
+        completed = subprocess.run(
+            ["bash", str(self.CLASSIFIER), base, head], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
+        return completed.stdout.strip(), completed.stderr
+
+    def test_each_path_alone(self):
+        # Every path in the fixture is classified on its own; the lane set is the allow-list.
+        for path in sorted(self.TREE):
+            with self.subTest(path=path):
+                self.git("checkout", "-q", "--detach", self.base)
+                self.write(path, self.TREE[path] + "\n")
+                verdict, reasons = self.classify(self.base, self.commit(path))
+                self.assertEqual(verdict, "true" if path in self.LANE else "false", reasons)
+
+    def test_one_full_suite_path_beside_crate_source_runs_the_full_suite(self):
+        self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
+        self.write("docs/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(self.base, self.commit("source and docs"))
+        self.assertEqual(verdict, "true", reasons)
+        self.write("crates/k/Cargo.toml", "[package]\nname = \"k\"\nversion = \"0.1.0\"\n")
+        verdict, reasons = self.classify(self.base, self.commit("and a manifest"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("manifest or lockfile: crates/k/Cargo.toml", reasons)
+
+    def test_new_and_deleted_paths_are_classified_by_their_own_names(self):
+        self.write("crates/k/src/new.rs", "pub fn n() {}\n")
+        verdict, reasons = self.classify(self.base, self.commit("new source"))
+        self.assertEqual(verdict, "true", reasons)
+        self.git("rm", "-q", "scripts/ci.sh")
+        verdict, reasons = self.classify(self.base, self.commit("removed script"))
+        self.assertEqual(verdict, "false")
+        # A move out of crates/ is a deletion plus an addition, and the addition is outside crate source.
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "crates/k/src/lib.rs", "scripts/lib.rs")
+        verdict, reasons = self.classify(self.base, self.commit("moved"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("outside crate source: scripts/lib.rs", reasons)
+
+    def test_no_change_an_unknown_revision_and_a_submodule_run_the_full_suite(self):
+        verdict, reasons = self.classify(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("no changed paths", reasons)
+        verdict, reasons = self.classify("0" * 40, self.base)
+        self.assertEqual(verdict, "false")
+        self.assertIn("git diff", reasons)
+        self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
+        self.git("add", "-A")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},crates/vendored")
+        self.git("commit", "-q", "-m", "submodule")
+        verdict, reasons = self.classify(self.base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("has a submodule", reasons)
+
+
+class OptionalWorkflowCodexSkipTests(unittest.TestCase):
+    """Optional pull-request workflows skip own codex/ pull requests and still run on the merged tree."""
+
+    SKIP = ("${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') "
+            "&& github.event.pull_request.head.repo.full_name == github.repository) }}")
+    JOBS = {
+        "bench-pipeline.yml": "pipeline-gate",
+        "tz-database-audit.yml": "tz-database-audit",
+        "sqlite-capacity.yml": "sqlite-capacity",
+        "bench-1m.yml": "ann-ci-gate",
+        "bench-track.yml": "changes",
+    }
+    # Each of these has a pull_request trigger with paths and a push trigger on integration/** with the same paths.
+    INTEGRATION_PUSH = ("bench-pipeline.yml", "tz-database-audit.yml", "sqlite-capacity.yml", "bench-1m.yml")
+
+    def evaluate(self, event_name, head_ref, head_repo, repository="ohdearquant/khive"):
+        expression = self.SKIP.removeprefix("${{ ").removesuffix(" }}")
+        for name, local in {
+            "github.event.pull_request.head.repo.full_name": "head_repo",
+            "github.event_name": "event_name",
+            "github.head_ref": "head_ref",
+            "github.repository": "repository",
+        }.items():
+            expression = expression.replace(name, local)
+        expression = expression.replace("!(", "not (").replace("startsWith(", "starts_with(")
+        expression = expression.replace("&&", " and ")
+        self.assertNotRegex(expression, r"github\.|!", "an unmapped name or operator is left in the expression")
+
+        def starts_with(value, prefix):
+            # GitHub's startsWith is case-insensitive and treats null as "".
+            return (value or "").lower().startswith(prefix.lower())
+
+        scope = {"starts_with": starts_with, "event_name": event_name, "head_ref": head_ref,
+                 "head_repo": head_repo, "repository": repository}
+        return eval(expression, {"__builtins__": {}}, scope)
+
+    def trigger(self, text, event):
+        return indented_block(indented_block(text, "on", 0), event, 2)
+
+    def paths(self, block):
+        return [line.strip() for line in indented_block(block, "paths", 4).splitlines()
+                if line.strip().startswith("- ")]
+
+    def test_each_optional_job_carries_the_codex_skip(self):
+        for workflow, job in self.JOBS.items():
+            with self.subTest(workflow=workflow):
+                block = indented_block(workflow_text(workflow), job, 2)
+                self.assertEqual(re.findall(r"(?m)^    if: (.+)$", block), [self.SKIP])
+
+    def test_the_skip_applies_to_own_codex_pull_requests_only(self):
+        self.assertFalse(self.evaluate("pull_request", "codex/change", "ohdearquant/khive"))
+        self.assertFalse(self.evaluate("pull_request", "Codex/change", "ohdearquant/khive"))
+        for event_name, head_ref, head_repo in (
+                ("pull_request", "codex/change", "contributor/khive"),
+                ("pull_request", "codex/change", None),
+                ("pull_request", "feature/codex/x", "ohdearquant/khive"),
+                ("pull_request", "batch/1", "ohdearquant/khive"),
+                ("push", "", None), ("workflow_dispatch", "", None)):
+            with self.subTest(event_name=event_name, head_ref=head_ref, head_repo=head_repo):
+                self.assertTrue(self.evaluate(event_name, head_ref, head_repo))
+
+    def test_skipped_workflows_run_on_integration_pushes_with_their_pull_request_paths(self):
+        for workflow in self.INTEGRATION_PUSH:
+            with self.subTest(workflow=workflow):
+                text = workflow_text(workflow)
+                push = self.trigger(text, "push")
+                branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+                self.assertIsNotNone(branches)
+                self.assertIn('"integration/**"', branches.group(1))
+                self.assertTrue(self.paths(push))
+                self.assertEqual(self.paths(push), self.paths(self.trigger(text, "pull_request")))
+
+    def test_bench_track_publishes_from_main_only(self):
+        # Its push jobs write the performance ledger, so an integration branch must never trigger it.
+        push = self.trigger(workflow_text("bench-track.yml"), "push")
+        self.assertNotIn("integration", push)
 
 
 if __name__ == "__main__":

@@ -940,6 +940,7 @@ async fn extract_links(
                     expected_blob_ref: source_content_ref.to_owned(),
                 }),
                 edges: guards,
+                statement_guards: Vec::new(),
             },
             existing.retractions.clone(),
         )

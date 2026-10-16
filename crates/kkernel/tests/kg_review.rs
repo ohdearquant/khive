@@ -323,3 +323,6 @@ fn uncovered_update_rules_fail_closed_in_partial_view() {
     assert_eq!(report["review_gate"]["status"], "blocked_by_findings");
     assert_eq!(report["review_gate"]["approval_ready"], false);
 }
+
+#[path = "kg_review/configurable_tiers.rs"]
+mod configurable_tiers;

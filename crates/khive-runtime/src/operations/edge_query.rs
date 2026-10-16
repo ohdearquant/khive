@@ -189,30 +189,7 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
-        let mut reader = self.sql().reader().await?;
-        let record_ns = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT namespace FROM graph_edges \
-                      WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
-                params: vec![SqlValue::Text(edge_id.to_string())],
-                label: Some("get_edge_namespace".into()),
-            })
-            .await?;
-
-        let Some(SqlValue::Text(record_ns)) = record_ns else {
-            return Ok(None);
-        };
-        // Route the storage fetch through the record's own namespace — the token is
-        // just the caller context; by-ID ops cross namespace boundaries.
-        let record_tok = NamespaceToken::for_namespace(
-            khive_types::Namespace::parse(&record_ns)
-                .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
-        );
-        Ok(self
-            .graph(&record_tok)?
-            .get_edge(LinkId::from(edge_id))
-            .await?)
+        self.get_edge_by_id_inner(edge_id, false).await
     }
 
     /// Read live edges by ID in input order, without a visibility predicate.
@@ -377,12 +354,32 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
+        self.get_edge_by_id_inner(edge_id, true).await
+    }
+
+    async fn get_edge_by_id_inner(
+        &self,
+        edge_id: Uuid,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Edge>> {
+        let (sql, label) = if include_deleted {
+            (
+                "SELECT namespace FROM graph_edges WHERE id = ?1 LIMIT 1",
+                "get_edge_including_deleted_namespace",
+            )
+        } else {
+            (
+                "SELECT namespace FROM graph_edges \
+                 WHERE id = ?1 AND deleted_at IS NULL LIMIT 1",
+                "get_edge_namespace",
+            )
+        };
         let mut reader = self.sql().reader().await?;
         let record_ns = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT namespace FROM graph_edges WHERE id = ?1 LIMIT 1".into(),
+                sql: sql.into(),
                 params: vec![SqlValue::Text(edge_id.to_string())],
-                label: Some("get_edge_including_deleted_namespace".into()),
+                label: Some(label.into()),
             })
             .await?;
 
@@ -394,10 +391,14 @@ impl KhiveRuntime {
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
-        Ok(self
-            .graph(&record_tok)?
-            .get_edge_including_deleted(LinkId::from(edge_id))
-            .await?)
+        let graph = self.graph(&record_tok)?;
+        Ok(if include_deleted {
+            graph
+                .get_edge_including_deleted(LinkId::from(edge_id))
+                .await?
+        } else {
+            graph.get_edge(LinkId::from(edge_id)).await?
+        })
     }
 
     /// Fetch an edge by natural key (namespace, canonical source/target, relation)
@@ -735,6 +736,64 @@ impl KhiveRuntime {
                     totals.unresolved = totals.unresolved.saturating_add(counts.unresolved);
                 }
                 Ok(totals)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Return the live edge total, its relation counts and its endpoint-base
+    /// counts for `stats`.
+    ///
+    /// The three describe one population: live edges with live endpoints in
+    /// the caller's visible namespaces. A backend with the combined aggregate
+    /// answers all of them from one grouped read, and the total is the sum of
+    /// its groups, so the invariants `stats` reports on (relation counts and
+    /// endpoint-base buckets each summing to the total) hold by construction.
+    /// A backend without it gets the three single-purpose counts.
+    pub async fn edge_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<super::EdgeStatsCounts> {
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_by_relation_and_endpoint_base_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(groups) => {
+                let mut counts = super::EdgeStatsCounts::default();
+                for (relation, by_base) in groups {
+                    let relation_total = by_base.total();
+                    counts.edges = counts.edges.saturating_add(relation_total);
+                    let slot = counts
+                        .edges_by_relation
+                        .entry(relation.to_string())
+                        .or_insert(0);
+                    *slot = slot.saturating_add(relation_total);
+                    let totals = &mut counts.edges_by_endpoint_base;
+                    totals.entity_entity =
+                        totals.entity_entity.saturating_add(by_base.entity_entity);
+                    totals.entity_note = totals.entity_note.saturating_add(by_base.entity_note);
+                    totals.note_entity = totals.note_entity.saturating_add(by_base.note_entity);
+                    totals.note_note = totals.note_note.saturating_add(by_base.note_note);
+                    totals.unresolved = totals.unresolved.saturating_add(by_base.unresolved);
+                }
+                Ok(counts)
+            }
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_relation_and_endpoint_base_in_namespaces" =>
+            {
+                Ok(super::EdgeStatsCounts {
+                    edges: self
+                        .count_edges(token, crate::curation::EdgeListFilter::default())
+                        .await?,
+                    edges_by_relation: self.count_edges_by_relation(token).await?,
+                    edges_by_endpoint_base: self.count_edges_by_endpoint_base(token).await?,
+                })
             }
             Err(error) => Err(error.into()),
         }

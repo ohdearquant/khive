@@ -1,6 +1,6 @@
 # ADR-140: Add a bounded graph payload to context responses
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 
 ## Context
@@ -15,7 +15,7 @@ ADR-089 already bounds expansion by `hops` and a per-node neighbor cap (`fanout`
 
 ## Decision
 
-Upon acceptance, this ADR amends ADR-089 so that the `context` response adds a top-level `edges` array — a sibling of `anchors`, `truncated`, and `dropped` — containing the graph relationships selected for the returned context. (Source: [ADR-089](ADR-089-context-verb.md), §Response shape.)
+This ADR amends ADR-089 so that the `context` response adds a top-level `edges` array — a sibling of `anchors`, `truncated`, and `dropped` — containing the graph relationships selected for the returned context. (Source: [ADR-089](ADR-089-context-verb.md), §Response shape.)
 
 ### Edge-row schema
 
@@ -103,7 +103,7 @@ Every `edges` row is the edge that discovered the corresponding neighbor record 
 
 Emission is atomic per discovered node: the budget walk appends a neighbor record and its corresponding `edges` row together, as one unit, in that walk position. A neighbor is never emitted without its edge, and an edge is never emitted without its neighbor. Consequently `dropped.edges` is defined to equal `dropped.neighbors` under this rule — both count the same set of budget-cut discovery steps — and a client can rely on the two counts staying equal without reconciling them independently.
 
-Upon acceptance, the concrete two-pass rule below replaces ADR-089 §Semantics item 5's generic global-stop prose. That prose is not used as authority for a different assembly order; ADR-089 remains Accepted and unchanged while this ADR is Proposed.
+The concrete two-pass rule below replaces ADR-089 §Semantics item 5's generic global-stop prose, and ADR-089 item 5 points here. That prose is not used as authority for a different assembly order.
 
 1. First admit the longest fitting prefix of anchor entity records in selection order. If the next anchor does not fit, stop this pass; do not substitute a later anchor.
 2. For each admitted anchor in that order, admit the longest fitting prefix of its neighbor/edge pairs. If its next pair does not fit, stop only that anchor's neighbor pass and continue with the next admitted anchor. Do not skip an oversized pair to admit a later pair under the same anchor.
@@ -114,7 +114,7 @@ The existing effective-budget bounds, clamp indicator, anchor priority, fanout l
 
 ## Acceptance and implementation gate
 
-This ADR remains **Proposed**. The endpoint-record/null-name decisions, pair costing, and explicit replacement of ADR-089's generic budget prose require architecture acceptance before dependent implementation merges. A source-prepared implementation may reference issue #4970 for review; preparation does not accept this ADR or establish issue closure.
+This ADR is **Accepted**. The endpoint-record/null-name decisions, pair costing, and the replacement of ADR-089's generic budget prose are in force, and the `context` handler implements them (issue #4970).
 
 ## Consequences
 
@@ -135,3 +135,35 @@ The additional endpoint names consume response budget, so a budget-constrained r
 4. **Add a second unbounded graph payload.** This was rejected because ADR-089 makes deterministic budget enforcement part of the `context` contract. (Source: [ADR-089](ADR-089-context-verb.md), §Semantics.)
 
 5. **Emit `edges` and `neighbors` as independently budgeted lists.** This was rejected because independent truncation could return a neighbor without its edge or an edge without its neighbor, making `dropped.edges` incomparable to `dropped.neighbors` and the response internally inconsistent about what context was actually returned.
+
+## Amendment 1 (2026-10-13): anchor edges share the response budget
+
+**Status:** Proposed. The parent ADR's architecture acceptance gate remains in force.
+
+`anchor_edges` is an always-present response array for stored edges discovered by the
+existing hop-1 walk whose two endpoints were selected anchors. Records are deduplicated by
+stored edge ID and ordered by that ID. Each has `source_id`, `source_name`, `target_id`,
+`target_name`, `relation`, and `weight`, with the same endpoint orientation and scoped
+metadata policy as the existing graph payload. Anchor-to-anchor hits remain excluded from
+nested neighbors and hop-2 parents. This array adds no traversal or hydration.
+
+After the existing anchor pass and neighbor/edge-pair pass, scan anchor-edge records in
+their existing order. Admit a record only if both endpoint anchors were admitted and its
+compact JSON Unicode-scalar length fits within the remaining effective budget. Exact fits
+are admitted; after an excluded record, continue checking later records. Envelopes,
+separators and container punctuation remain outside the record-cost model.
+
+Every candidate excluded because an endpoint anchor was cut or because its cost does not
+fit increases `dropped.anchor_edges` by one and sets `truncated`. Missing scoped endpoint
+metadata remains a pre-budget omission and does not increase that count. Large budgets
+retain the existing anchor-edge records and ordering, with `dropped.anchor_edges: 0`.
+
+This final pass cannot displace an earlier record. For every effective budget, `anchors`,
+their nested `neighbors`, `edges`, `dropped.anchors`, `dropped.neighbors`, and
+`dropped.edges` retain the existing two-pass result. All prior drop fields keep their
+meaning. A budget-cut anchor is never named by a returned anchor edge.
+
+Acceptance covers exact-fit and partial anchor-edge budgets, a budget-cut endpoint,
+Unicode-scalar rather than byte cost, unchanged earlier assembly, and the full-budget
+result. Restoring uncharged anchor edges must fail the record-budget assertion; removing
+the endpoint admission check must fail the endpoint assertion.

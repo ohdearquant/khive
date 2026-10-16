@@ -19,6 +19,10 @@ use khive_types::{HandlerDef, IdResolutionMode};
 mod auto_feedback;
 mod event_page;
 
+#[cfg(test)]
+#[path = "handlers/event_counts_read_budget_tests.rs"]
+mod event_counts_read_budget_tests;
+
 use crate::event::interpret;
 pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
 use crate::event_read_scope::event_actor_read_scope;
@@ -126,7 +130,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             allowlist. The window covers exactly one namespace: the caller's own, or the one named \
             by an explicit `namespace=` argument. The result's `scope` states which namespace the \
             answer covered and which others this caller may ask for the same way; rows written to \
-            any other namespace are absent from these counts rather than counted as zero.",
+            any other namespace are absent from these counts rather than counted as zero. \
+            Counts consume KHIVE_REQUEST_READ_TIMEOUT_SECS (default 30s, maximum 86400s), \
+            retaining any earlier request deadline across both stores and events-daemon IPC. \
+            The daemon stops and settles the count when the caller's budget expires and the \
+            connection closes; it does not enforce an independent deadline. A typed storage \
+            timeout names the budget; no partial successful window_event_total is returned.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -928,15 +937,10 @@ impl BrainPack {
     // shapes; a second, public verb name keeps both surfaces intact.
 
     /// Cap on events aggregated by a single `brain.event_counts` window query.
-    /// `EventStore` has no SQL-side grouped-count primitive today (`count_events`
-    /// returns one scalar per filter, not a GROUP BY), so this verb fetches a
-    /// bounded page via `query_events` and aggregates by kind/actor/verb/profile
-    /// in the handler. A window wider than this cap still returns counts up to the
-    /// cap and sets `truncated: true` plus the true `window_event_total` rather
-    /// than silently reporting a partial total as complete. At current event
-    /// volumes this bound is not expected to bind in practice; widening the
-    /// storage trait with a grouped-count method was intentionally deferred
-    /// rather than contorting `EventStore` for a case that is not yet load-bearing.
+    /// Initial window totals use storage-side Kind grouping. Payload-derived
+    /// profile, cross and cost aggregates still fold the admitted rows. A window
+    /// wider than this cap sets `truncated: true` and keeps `window_event_total`
+    /// separate from the page-scoped aggregates.
     const MAX_WINDOW_EVENTS: u32 = 50_000;
     const EXHAUSTIVE_PAGE_SIZE: u32 = 10_000;
     const MAX_EXHAUSTIVE_EVENTS: u64 = 40 * Self::MAX_WINDOW_EVENTS as u64;
@@ -944,10 +948,8 @@ impl BrainPack {
     /// Issue #14: when the window's aggregation ran over a bounded page
     /// rather than the full window (`truncated`), a bare scalar total next
     /// to complete-looking `counts_by_*` maps reads as authoritative even
-    /// though it is only a page-scoped estimate. The interim fix (the
-    /// primary fix -- a SQL-side grouped-count primitive on `EventStore` --
-    /// requires widening a trait owned by the upstream OSS `khive-storage`
-    /// crate, out of scope here): when truncated, the misleading key is
+    /// though it is only a page-scoped estimate. Storage-side admission totals
+    /// do not make the admitted-row aggregates complete: when truncated, the misleading key is
     /// never emitted; the same page-scoped value is returned under an
     /// explicitly incomplete name instead. A missing `total` gets noticed;
     /// a `total` that is wrong by an order of magnitude does not.
@@ -971,6 +973,40 @@ impl BrainPack {
     }
 
     pub(crate) async fn handle_event_counts(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let allowance = khive_storage::request_read_timeout_from_env();
+        let deadline = khive_storage::effective_request_read_deadline(
+            khive_storage::RequestReadDeadline::after(allowance),
+        );
+        khive_storage::scope_request_read_deadline_at(deadline, async {
+            let operation = format!(
+                "brain.event_counts (operator read budget {}s; earlier caller deadline retained)",
+                allowance.as_secs()
+            );
+            if khive_storage::request_read_is_cancelled() {
+                return Err(RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout {
+                        operation: operation.into(),
+                    },
+                ));
+            }
+            let result = self.handle_event_counts_in_read_scope(token, params).await;
+            if result.is_ok() && khive_storage::request_read_is_cancelled() {
+                return Err(RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout {
+                        operation: operation.into(),
+                    },
+                ));
+            }
+            result
+        })
+        .await
+    }
+
+    async fn handle_event_counts_in_read_scope(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -2158,7 +2194,7 @@ impl BrainPack {
         {
             Ok(summary) => summary,
             Err(e) => {
-                eprintln!("[brain] serve ledger batch write failed (non-fatal): {e}");
+                tracing::warn!("[brain] serve ledger batch write failed (non-fatal): {e}");
                 crate::serve_ledger::ServeLedgerBatchSummary::default()
             }
         };
@@ -2753,8 +2789,7 @@ impl BrainPack {
 /// applies to the unfiltered default view: a caller who already passed `kind`
 /// has no crowding to fix (the single query is already scoped to one kind).
 ///
-/// Returns the concatenated items, the true total matching the filter (exact,
-/// via `Page::total`'s unbounded `COUNT(*)` — see `khive-db`'s `query_events`),
+/// Returns the concatenated items, the independent Kind-grouped window total,
 /// and whether either half was truncated against its own `page_limit`.
 /// Transport-safe per-request page bound for every event read this module
 /// issues. The events-split daemon refuses `QueryEvents` pages above its cap
@@ -2764,6 +2799,29 @@ impl BrainPack {
 /// at most this many rows at `offset: 0`, never by one wide request.
 pub(crate) const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
 
+fn event_counts_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    match error {
+        error @ (khive_storage::StorageError::Timeout { .. }
+        | khive_storage::StorageError::AdmissionTimeout { .. }) => RuntimeError::Storage(error),
+        other => RuntimeError::InvalidInput(other.to_string()),
+    }
+}
+
+/// Read one grouped total; row walks and boundary completeness reads remain
+/// independent live observations. Unsupported grouped stores refuse directly.
+async fn grouped_window_total(
+    store: &dyn khive_storage::event::EventStore,
+    filter: &EventFilter,
+) -> Result<u64, RuntimeError> {
+    Ok(store
+        .count_events_grouped(filter.clone(), khive_storage::event::EventGroupBy::Kind)
+        .await
+        .map_err(event_counts_storage_error)?
+        .values()
+        .copied()
+        .sum())
+}
+
 pub(crate) async fn fetch_event_counts_window(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
@@ -2771,10 +2829,7 @@ pub(crate) async fn fetch_event_counts_window(
     page_limit: u32,
 ) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
     if !unfiltered {
-        let window_event_total = store
-            .count_events(base_filter.clone())
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let window_event_total = grouped_window_total(store, base_filter).await?;
         let items = collect_events_cursor_walk(
             store,
             base_filter,
@@ -2800,14 +2855,27 @@ pub(crate) async fn fetch_event_counts_window(
         ..base_filter.clone()
     };
 
-    let audit_total = store
-        .count_events(audit_filter.clone())
+    // Preserve the old closed-kind union: unknown stored kinds belong to
+    // neither half of this unfiltered bounded view.
+    let totals = store
+        .count_events_grouped(
+            EventFilter {
+                kinds: khive_types::EventKind::ALL.to_vec(),
+                ..base_filter.clone()
+            },
+            khive_storage::event::EventGroupBy::Kind,
+        )
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-    let non_audit_total = store
-        .count_events(non_audit_filter.clone())
-        .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(event_counts_storage_error)?;
+    let audit_total = totals
+        .get(khive_types::EventKind::Audit.name())
+        .copied()
+        .unwrap_or(0);
+    let non_audit_total: u64 = khive_types::EventKind::ALL
+        .iter()
+        .filter(|kind| **kind != khive_types::EventKind::Audit)
+        .map(|kind| totals.get(kind.name()).copied().unwrap_or(0))
+        .sum();
     let audit_items = collect_events_cursor_walk(
         store,
         &audit_filter,
@@ -2929,21 +2997,17 @@ pub(crate) async fn fold_event_counts_window_exhaustive(
 
 /// #21: full-window aggregation for `brain.event_counts(exhaustive=true)`.
 ///
-/// `EventStore` has no SQL-side grouped-count primitive (`count_events` returns
-/// one scalar per filter, not a GROUP BY) — that would live in `khive-storage`/
-/// `khive-db`, outside this crate. Exact per-verb/kind/actor counts over an
-/// arbitrarily large window are achievable without one: paginate `query_events`
-/// with a fixed page size until exhausted, folding every page instead of
-/// stopping at a single bounded page. The caller still makes exactly ONE
+/// Kind-grouped storage counts establish the admission total. Payload-derived
+/// aggregates still paginate `query_events` with a fixed page size until
+/// exhausted, folding every page instead of stopping at a bounded page.
+/// The caller still makes exactly ONE
 /// `brain.event_counts` call — the pagination loop is internal to this
 /// function — so a coverage panel that needed 19 stitched sampled windows
 /// becomes one exhaustive call.
 ///
-/// `window_event_total` comes from a single `count_events` call: the SQL
-/// `COUNT(*)` for a given `WHERE` clause is invariant to `LIMIT`/`OFFSET`, so
-/// it is already exact regardless of how many pages the loop below walks —
-/// cheaper than trusting the last page's `Page::total` and doesn't require
-/// the loop to complete.
+/// `window_event_total` sums one Kind-grouped count read with the same filter.
+/// It is independent of pagination and does not require the walk to complete.
+/// The subsequent row reads remain a best-effort live view, not a snapshot.
 ///
 /// `max_events` is a safety bound, not a design limit: without one,
 /// a caller could open a pathological (multi-year, unfiltered) window and this
@@ -2960,10 +3024,7 @@ async fn visit_event_counts_window_exhaustive<F: FnMut(Event)>(
     max_events: u64,
     visit: F,
 ) -> Result<(u64, u64, bool), RuntimeError> {
-    let window_event_total = store
-        .count_events(base_filter.clone())
-        .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    let window_event_total = grouped_window_total(store, base_filter).await?;
     if window_event_total > max_events {
         return Err(RuntimeError::InvalidInput(format!(
             "brain.event_counts window exceeds the exhaustive limit of {max_events} events \
@@ -3155,14 +3216,14 @@ fn route_via_fann(context: &[f32]) -> Vec<f32> {
     {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("[brain] lattice-router: network build failed (non-fatal): {e}");
+            tracing::warn!("[brain] lattice-router: network build failed (non-fatal): {e}");
             return Vec::new();
         }
     };
     match network.forward(context) {
         Ok(weights) => weights.to_vec(),
         Err(e) => {
-            eprintln!("[brain] lattice-router: forward failed (non-fatal): {e}");
+            tracing::warn!("[brain] lattice-router: forward failed (non-fatal): {e}");
             Vec::new()
         }
     }

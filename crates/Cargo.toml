@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "khive-lion-core",
     "khive-types",
+    "khive-rule-evaluator",
     "khive-changeset",
     "khive-graph-diff",
     "khive-score",
@@ -63,7 +65,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 # The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
 # unstable; the workspace MSRV is the CI toolchain, 1.95.
@@ -104,9 +106,9 @@ iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.11.1"
-lattice-inference = { version = "=0.11.1", default-features = false }
-lattice-fann = "=0.11.1"
+lattice-embed = "=0.12.0"
+lattice-inference = { version = "=0.12.0", default-features = false }
+lattice-fann = "=0.12.0"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.8"
 rand_distr = "0.4"
@@ -139,6 +141,9 @@ rmcp = "2.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"
+# SA_SIGINFO actions registered beside tokio's own signal handlers (the
+# daemon exit record names the sender of its shutdown signal).
+signal-hook-registry = "1.4"
 proptest = "1"
 crossbeam-queue = "0.3"
 sqlite-vec = { version = "0.1.9" }

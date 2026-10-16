@@ -48,10 +48,39 @@ Callers can supply an explicit directory through `PoolConfig.volume_lock_dir`,
 `StorageBackend::sqlite_with_volume_lock_dir`, or the constructor accepting both
 captured policies. Test callers use private fixture directories.
 
+Headless and containerized deployments must provide a writable home directory
+for the service user, or set `KHIVE_VOLUME_LOCK_DIR` to an absolute directory
+that every cooperating khive process of the deployment can write. For example:
+
+```sh
+export KHIVE_VOLUME_LOCK_DIR=/var/lib/khive/volume-locks
+```
+
+Provision that directory so the service processes can create and open its lock
+files. Processes admitting writes on the same physical volume must share the
+same underlying lock directory, including when their database files have
+different parent directories. Containers must share the backing directory,
+rather than each using a private directory at the same path.
+
+If the resolved directory cannot be created or its lock file cannot be opened,
+the next lease acquisition fails closed with a `lock`-phase refusal naming the
+attempted directory or file and the underlying I/O error. This can occur during
+database initialization; an existing writable database with its database id
+already installed can open successfully and encounter the refusal on its first
+write instead.
+
+Correct the directory's access or configure a writable shared absolute directory
+before retrying. `KHIVE_VOLUME_LOCK_DIR` applies to the default directory resolver.
+When a caller supplies `PoolConfig.volume_lock_dir`, an explicit backend directory,
+or a migration write policy, change that caller's setting. There is no automatic
+fallback to the database's parent: separate database parents on one volume would
+select different lock directories and stop sharing the cooperative admission
+lease required by ADR-154.
+
 Within one process, requests for a volume slot are queued in the order they
 enter its registry mutex. Only the front waiter can acquire a free slot; a new
 arrival cannot overtake queued requests. An expired waiter removes itself and
-retains the same `CapacityUnavailable` lock-phase error and deadline. The FIFO
+returns `CapacityUnavailable` with phase `lock_contended` at its guard deadline. The FIFO
 order does not extend to separate processes competing for the advisory file
 lock. Same-thread re-entry still refuses immediately, and detached leases retain
 exclusion until their eventual release.
@@ -160,9 +189,12 @@ handles cannot prove ownership or actual close and are outside this API contract
 ## Refusals and limits
 
 `sqlite_capacity_refused` carries available, reserve and required-headroom bytes.
-`sqlite_capacity_unavailable` distinguishes `identity`, `lock` and `probe` phases.
-Neither asks for automatic retry. An operator may recover space or complete a
-checkpoint and then make a new explicit attempt. Native `SQLITE_FULL` retains its
+`sqlite_capacity_unavailable` distinguishes `identity`, `lock`, `lock_contended`
+and `probe` phases. Only `lock_contended`, where the guard deadline elapsed waiting
+for the volume lease, is retryable within the caller's bounded retry budget. Every
+retried attempt still takes the lease before sampling capacity. Floor refusal and
+the other unavailable phases remain non-retryable; an operator may recover space
+or complete a checkpoint and then make a new explicit attempt. Native `SQLITE_FULL` retains its
 SQLite primary and extended result codes and separate escalation; it is never
 reported as a preflight floor refusal. Its best-effort incident sink does not write
 back to the guarded SQLite database.

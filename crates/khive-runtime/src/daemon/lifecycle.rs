@@ -310,6 +310,48 @@ pub fn pid_path() -> PathBuf {
     path_override(PID_PATH_ENV).unwrap_or_else(default_pid_path)
 }
 
+/// The two halves of the daemon rendezvous when exactly one of
+/// `KHIVE_SOCKET` / `KHIVE_PID` is set: the variable that was set, the one
+/// that was not, and the socket and PID file that would be used together.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendezvousSplit {
+    /// The override that is set.
+    pub set: &'static str,
+    /// The override that is not set.
+    pub unset: &'static str,
+    /// The socket path this process resolves.
+    pub socket: PathBuf,
+    /// The PID-file path this process resolves.
+    pub pid_file: PathBuf,
+}
+
+/// `Some` when exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set.
+///
+/// The one predicate for a split rendezvous: the daemon refuses to boot on it
+/// (`ensure_rendezvous_overrides_paired`, #2656) and a client refuses
+/// lifecycle recovery on it (ADR-185 Amendment 5), because recovery reads a
+/// supervisor marker derived from the socket and signals the process named by
+/// the PID file, and with a split rendezvous those belong to different daemons.
+#[cfg(unix)]
+pub fn rendezvous_split() -> Option<RendezvousSplit> {
+    match (path_override(SOCKET_PATH_ENV), path_override(PID_PATH_ENV)) {
+        (Some(socket), None) => Some(RendezvousSplit {
+            set: SOCKET_PATH_ENV,
+            unset: PID_PATH_ENV,
+            socket,
+            pid_file: default_pid_path(),
+        }),
+        (None, Some(pid_file)) => Some(RendezvousSplit {
+            set: PID_PATH_ENV,
+            unset: SOCKET_PATH_ENV,
+            socket: default_socket_path(),
+            pid_file,
+        }),
+        _ => None,
+    }
+}
+
 /// Refuse to boot when exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set
 /// (#2656).
 ///
@@ -328,8 +370,13 @@ pub fn pid_path() -> PathBuf {
 /// (the default rendezvous) are both unchanged.
 #[cfg(unix)]
 pub(super) fn ensure_rendezvous_overrides_paired() -> anyhow::Result<()> {
-    match (path_override(SOCKET_PATH_ENV), path_override(PID_PATH_ENV)) {
-        (Some(socket), None) => anyhow::bail!(
+    match rendezvous_split() {
+        Some(RendezvousSplit {
+            set: SOCKET_PATH_ENV,
+            socket,
+            pid_file,
+            ..
+        }) => anyhow::bail!(
             "refusing to start: {SOCKET_PATH_ENV} is set to {} but {PID_PATH_ENV} is not set. \
              The socket and the PID file are two halves of one daemon rendezvous and must move \
              together: with only {SOCKET_PATH_ENV} set, this daemon would bind a private socket \
@@ -337,21 +384,23 @@ pub(super) fn ensure_rendezvous_overrides_paired() -> anyhow::Result<()> {
              served on {}. Set {PID_PATH_ENV} to a private path beside the socket, or unset \
              {SOCKET_PATH_ENV} to share the default rendezvous.",
             socket.display(),
-            default_pid_path().display(),
+            pid_file.display(),
             default_socket_path().display(),
         ),
-        (None, Some(pid)) => anyhow::bail!(
+        Some(RendezvousSplit {
+            socket, pid_file, ..
+        }) => anyhow::bail!(
             "refusing to start: {PID_PATH_ENV} is set to {} but {SOCKET_PATH_ENV} is not set. \
              The socket and the PID file are two halves of one daemon rendezvous and must move \
              together: with only {PID_PATH_ENV} set, this daemon would write a private PID file \
              while binding the shared socket at {}, the default rendezvous whose owner is \
              recorded in {}. Set {SOCKET_PATH_ENV} to a private path beside the PID file, or \
              unset {PID_PATH_ENV} to share the default rendezvous.",
-            pid.display(),
-            default_socket_path().display(),
+            pid_file.display(),
+            socket.display(),
             default_pid_path().display(),
         ),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -397,16 +446,7 @@ pub const SUPERVISOR_CLAIM_ENV: &str = "KHIVE_SUPERVISOR_CLAIM";
 #[cfg(unix)]
 pub(super) fn read_supervisor_marker_claim() -> Option<(u32, String)> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(supervisor_marker_path())
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
+    let file = khive_fs::opened_file::open_regular_file_nofollow(&supervisor_marker_path()).ok()?;
     let mut marker = String::new();
     file.take(4097).read_to_string(&mut marker).ok()?;
     if marker.len() > 4096 {

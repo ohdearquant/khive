@@ -4,6 +4,10 @@
 mod write_transaction;
 use write_transaction::run_graph_mutation_transaction;
 
+#[path = "graph/guarded_insert.rs"]
+mod guarded_insert;
+use guarded_insert::{check_statement_guards, insert_edge_if_absent};
+
 #[path = "graph/symmetric_update.rs"]
 mod symmetric_update;
 pub use symmetric_update::{
@@ -23,7 +27,8 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, EdgeInsertIfAbsentOutcome,
+    GraphStatementGuard, GraphStatementGuardFailure, SymmetricEdgeUpdateOutcome,
     SymmetricEdgeUpdateRequest,
 };
 use khive_storage::types::{
@@ -549,6 +554,30 @@ pub fn edge_soft_delete_statement(id: Uuid, now: i64) -> SqlStatement {
     }
 }
 
+/// Rewire a merge edge without changing its other fields or adding revision guards.
+/// The caller owns conflict checks and the transaction; `namespace` is the edge's
+/// stored attribution, which may differ from either merge participant's namespace.
+pub fn edge_merge_rewire_statement(
+    namespace: &str,
+    id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    updated_at: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+        vec![
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+        ],
+    )
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_edge(Hard)` issues.
 pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     SqlStatement {
@@ -558,10 +587,37 @@ pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     }
 }
 
+/// A common table expression `edge_ns(namespace)` holding every namespace
+/// present in `graph_edges`, read with one index seek per namespace
+/// (`min(namespace)` above the previous one), followed by a final NULL row.
+///
+/// Every `graph_edges` index leads with `namespace`, so a lookup by endpoint
+/// alone (`source_id = ? OR target_id = ?`) cannot seek and reads every edge.
+/// Joined to this walk (`edge_ns CROSS JOIN graph_edges`, which keeps the walk
+/// as the outer loop) the same lookup seeks `(namespace, source_id, ...)` and
+/// `(namespace, target_id, ...)` once per namespace, so its cost follows the
+/// number of namespaces and incident edges instead of the size of the table.
+pub(crate) const EDGE_NAMESPACES_CTE: &str = "WITH RECURSIVE edge_ns(namespace) AS ( \
+     SELECT (SELECT min(namespace) FROM graph_edges) \
+     UNION ALL \
+     SELECT (SELECT min(namespace) FROM graph_edges WHERE namespace > edge_ns.namespace) \
+     FROM edge_ns WHERE edge_ns.namespace IS NOT NULL)";
+
 /// The exact cascade `DELETE` this store's `purge_incident_edges` issues.
+///
+/// Removes every edge whose source or target is `node_id`, in any namespace,
+/// found by walking the namespaces present in `graph_edges` and seeking each
+/// one. A self-loop matches both arms and is deleted once.
 pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
     SqlStatement {
-        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1".to_string(),
+        sql: format!(
+            "DELETE FROM graph_edges WHERE id IN ({EDGE_NAMESPACES_CTE} \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.source_id = ?1 \
+             UNION ALL \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.target_id = ?1)"
+        ),
         params: vec![SqlValue::Text(node_id.to_string())],
         label: Some("edge-purge-incident".to_string()),
     }
@@ -792,6 +848,7 @@ pub struct GraphEdgeSnapshotGuard {
 pub struct GraphMutationPreconditions {
     pub document: Option<GraphDocumentGuard>,
     pub edges: Vec<GraphEdgeSnapshotGuard>,
+    pub statement_guards: Vec<GraphStatementGuard>,
 }
 
 /// Internal seam for khive-runtime; no compatibility promise.
@@ -807,6 +864,9 @@ pub enum GraphMutationRequest {
         requests: Vec<EdgeUpsertRequest>,
         guard_endpoints: bool,
     },
+    InsertIfAbsent {
+        edge: Edge,
+    },
     CommitAnnotation {
         edge: Edge,
         guard: CommitAnnotationGuard,
@@ -820,6 +880,10 @@ pub enum GraphMutationRequest {
 pub enum GraphMutationOutcome {
     Single(GuardedEdgeUpsertOutcome),
     Batch(GuardedEdgeBatchUpsertOutcome),
+    /// This arm carries only Created, ExistingLive or Tombstoned. Statement
+    /// guard refusals use the top-level arm for every mutation request kind.
+    InsertIfAbsent(EdgeInsertIfAbsentOutcome),
+    GuardFailed(GraphStatementGuardFailure),
     CommitAnnotation(CommitAnnotationInsertOutcome),
 }
 
@@ -838,6 +902,7 @@ fn count_graph_mutation_events(outcome: &GraphMutationEventOutcome) {
     let written = match &outcome.mutation {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
         GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => 0,
     };
@@ -1035,6 +1100,12 @@ where
         });
     }
     check_graph_mutation_preconditions(conn, &preconditions, &retirements)?;
+    if let Some(failure) = check_statement_guards(conn, &preconditions.statement_guards)? {
+        return Ok(GraphMutationEventOutcome {
+            mutation: GraphMutationOutcome::GuardFailed(failure),
+            retired: Vec::new(),
+        });
+    }
     let mutation = match mutation {
         GraphMutationRequest::Single {
             request,
@@ -1056,6 +1127,21 @@ where
             }
             GraphMutationOutcome::Batch(outcome)
         }
+        GraphMutationRequest::InsertIfAbsent { edge } => {
+            if edge.deleted_at.is_some() {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Graph,
+                    operation: GRAPH_MUTATION_EVENTS_OP.into(),
+                    message: "expected a live edge for create-only insertion".into(),
+                });
+            }
+            #[cfg(test)]
+            statement_guard_tests::after_guards(&edge);
+            GraphMutationOutcome::InsertIfAbsent(
+                insert_edge_if_absent(conn, edge)
+                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+            )
+        }
         GraphMutationRequest::CommitAnnotation { edge, guard } => {
             if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
                 return Err(StorageError::InvalidInput {
@@ -1073,6 +1159,7 @@ where
     let written = match &mutation {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
         GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => {
             return Ok(GraphMutationEventOutcome {
@@ -3411,6 +3498,82 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader(
+            "count_edges_by_relation_and_endpoint_base_in_namespaces",
+            move |conn| {
+                let mut totals: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = HashMap::new();
+                for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                    let (where_clause, params) =
+                        build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                    // One lookup per endpoint per table answers both questions the
+                    // single-purpose counts ask with separate correlated subqueries:
+                    // liveness as in [`LIVE_ENDPOINTS_CONDITION`] (an endpoint is
+                    // excluded only when present and tombstoned) and the base as in
+                    // [`endpoint_base_case`] (entity first, then note, else none). `id`
+                    // is the primary key of both tables, so each LEFT JOIN matches at
+                    // most one row and never multiplies an edge. The edge filter runs
+                    // in the inner select, where its unqualified columns resolve
+                    // against graph_edges alone.
+                    let sql = format!(
+                        "SELECT e.relation, \
+                         CASE WHEN se.id IS NOT NULL THEN 'entity' \
+                         WHEN sn.id IS NOT NULL THEN 'note' ELSE 'none' END AS source_base, \
+                         CASE WHEN te.id IS NOT NULL THEN 'entity' \
+                         WHEN tn.id IS NOT NULL THEN 'note' ELSE 'none' END AS target_base, \
+                         COUNT(*) \
+                         FROM (SELECT relation, source_id, target_id \
+                         FROM graph_edges{where_clause}) e \
+                         LEFT JOIN entities se ON se.id = e.source_id \
+                         LEFT JOIN notes sn ON sn.id = e.source_id \
+                         LEFT JOIN entities te ON te.id = e.target_id \
+                         LEFT JOIN notes tn ON tn.id = e.target_id \
+                         WHERE se.deleted_at IS NULL AND sn.deleted_at IS NULL \
+                         AND te.deleted_at IS NULL AND tn.deleted_at IS NULL \
+                         GROUP BY e.relation, source_base, target_base"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                        let relation: String = row.get(0)?;
+                        let source: String = row.get(1)?;
+                        let target: String = row.get(2)?;
+                        let count: i64 = row.get(3)?;
+                        Ok((relation, source, target, count))
+                    })?;
+                    for row in rows {
+                        let (relation_str, source, target, count) = row?;
+                        let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        fold_endpoint_base_row(
+                            totals.entry(relation).or_default(),
+                            &source,
+                            &target,
+                            count as u64,
+                        );
+                    }
+                }
+                Ok(totals.into_iter().collect())
+            },
+        )
+        .await
+    }
+
     async fn query_edges_after(
         &self,
         filter: EdgeFilter,
@@ -3828,9 +3991,17 @@ mod annotation_tests;
 mod tests;
 
 #[cfg(test)]
+#[path = "incident_edge_plan_tests.rs"]
+mod incident_edge_plan_tests;
+
+#[cfg(test)]
 #[path = "graph_index_repair_tests.rs"]
 mod index_repair_tests;
 
 #[cfg(test)]
 #[path = "graph_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "graph/statement_guard_tests.rs"]
+mod statement_guard_tests;

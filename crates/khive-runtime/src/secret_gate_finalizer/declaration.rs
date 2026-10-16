@@ -338,7 +338,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.claim",
-        site: "khive-mcp/src/pending_events/receipt.rs::claim_pending_event",
+        site: "khive-mcp/src/pending_events/receipt.rs::claim_pending_event_inner",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -507,7 +507,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "schedule.cancel",
-        site: "khive-pack-schedule/src/handlers.rs::cancel_pending_event",
+        site: "khive-pack-schedule/src/handlers.rs::handle_cancel",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,

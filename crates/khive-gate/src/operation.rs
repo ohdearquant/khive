@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v13";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v17";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +78,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("comm.thread", OperationAccess::Read),
     ("comm.transport_status", OperationAccess::Read),
     ("comm.unread", OperationAccess::Read),
+    ("comm.withheld_body", OperationAccess::Write),
     ("context", OperationAccess::Read),
     ("count", OperationAccess::Read),
     ("create", OperationAccess::Write),
@@ -131,6 +132,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("knowledge.import", OperationAccess::Write),
     ("knowledge.index", OperationAccess::Write),
     ("knowledge.learn", OperationAccess::Write),
+    ("knowledge.lint", OperationAccess::Write),
     ("knowledge.list", OperationAccess::Read),
     ("knowledge.search", OperationAccess::Read),
     ("knowledge.stats", OperationAccess::Read),
@@ -169,6 +171,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("schedule.cancel", OperationAccess::Write),
     ("schedule.remind", OperationAccess::Write),
     ("schedule.schedule", OperationAccess::Write),
+    ("schema", OperationAccess::Read),
     ("search", OperationAccess::Read),
     ("session.export", OperationAccess::Read),
     ("session.list", OperationAccess::Read),
@@ -220,3 +223,7 @@ pub fn classify_operation(verb: &str) -> Option<OperationAccess> {
         .ok()
         .map(|index| CLASSIFIED_OPERATIONS[index].1)
 }
+
+#[cfg(test)]
+#[path = "operation_lint_tests.rs"]
+mod lint_tests;

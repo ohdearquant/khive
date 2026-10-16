@@ -1369,6 +1369,133 @@ fn allows_token_count_high_entropy() {
     );
 }
 
+// ── `*_token` credential labels (issue: access_token-labelled UUIDs passed) ──
+// A label ending in `_token` is a credential label unless it is one of the
+// position labels in POSITION_TOKEN_LABELS or the receipt labels in
+// RECEIPT_TOKEN_LABELS, matched as the whole label.
+
+#[test]
+fn blocks_uuid_under_access_token_label_in_both_forms() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    for content in [
+        format!("access_token: {uuid}"),
+        format!("{{\"access_token\":\"{uuid}\"}}"),
+    ] {
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("uuid-near-trigger"),
+            "a UUID assigned to access_token must be blocked like one assigned to token: {content:?}"
+        );
+    }
+}
+
+#[test]
+fn blocks_values_under_credential_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in [
+        "access_token",
+        "refresh_token",
+        "session_token",
+        "github_token",
+        "stale_next_token",
+    ] {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{label}={value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_some(),
+                    "a value assigned to credential label {label} must be blocked: {content:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn allows_values_under_position_and_receipt_token_labels() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+    for label in POSITION_TOKEN_LABELS.iter().chain(RECEIPT_TOKEN_LABELS) {
+        for value in [uuid, opaque] {
+            for content in [
+                format!("{label}: {value}"),
+                format!("{label}={value}"),
+                format!("{{\"{label}\": \"{value}\"}}"),
+            ] {
+                assert!(
+                    scan(&content).is_none(),
+                    "label {label} must not make its value a credential; fired: {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn token_label_rule_fails_closed_on_unlisted_names() {
+    // Documented contract: an unlisted `*_token` name is a credential label
+    // even when it names no secret, and one inside the trigger window counts
+    // even when it labels a different value.
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    for label in [
+        "skip_token",
+        "delta_token",
+        "idempotency_token",
+        "lease_token",
+        "cancel_token",
+    ] {
+        let content = format!("{label}: {uuid}");
+        assert!(
+            scan(&content).is_some(),
+            "unlisted label {label} must be a credential label: {content:?}"
+        );
+    }
+    let content = format!("chars_per_token: 4 for profile {uuid}");
+    assert!(
+        scan(&content).is_some(),
+        "a *_token label in the window counts: {content:?}"
+    );
+}
+
+#[test]
+fn allows_a_quoted_sealed_remember_response() {
+    // The shape `memory.remember` returns when sealing is on: the receipt is
+    // URL-safe base64 under `visibility_token`.
+    let response = "{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"kind\":\"memory\",\
+                    \"salience\":0.5,\"memory_type\":\"episodic\",\
+                    \"visibility_token\":\"Ab3kQ9-x_Zr7TmP2wLs8VnYc4HdJ6uE1gKoF5iRtB0qWzXyM\"}"; // gitleaks:allow
+    assert!(
+        scan(response).is_none(),
+        "a quoted sealed remember response must pass; fired: {:?}",
+        scan(response)
+    );
+}
+
+#[test]
+fn blocks_revision_urls_under_credential_token_labels() {
+    // A repository revision URL is exempt from trigger proximity but not from
+    // a direct credential label; every credential token label is one.
+    let url = "https://github.com/acme/widgets/blob/0123456789abcdef0123456789abcdef01234567/src/runtime/mod.rs";
+    for label in ["token", "access_token", "github_token"] {
+        let content = format!("{label}: {url}");
+        assert!(
+            scan(&content).is_some(),
+            "a revision URL assigned to credential label {label} must be blocked: {content:?}"
+        );
+    }
+    let content = format!("next_page_token: {url}");
+    assert!(
+        scan(&content).is_none(),
+        "a position label does not make a revision URL a credential; fired: {:?}",
+        scan(&content)
+    );
+}
+
 // ── Hex allowlist is not applied when trigger context is present ────────
 // Pure hex tops out at log2(16) = 4.0 bits/char, below ENTROPY_THRESHOLD (4.5), so
 // the entropy heuristic alone never flags it. The hex allowlist must only apply
@@ -4843,4 +4970,109 @@ fn block_message_shape_guidance_names_effective_boundary() {
         rendered.contains("sentence") || rendered.contains("paragraph"),
         "shape-based detector guidance must name an effective context boundary: {rendered}"
     );
+}
+
+#[test]
+fn allows_head_and_equals_revision_markers_near_auth_prose() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    for reference in [
+        format!("head={revision}"),
+        format!("head {revision}"),
+        format!("head:{revision}"),
+        format!("sha={revision}"),
+        format!("commit={revision}"),
+        format!("revision={revision}"),
+        format!("rev={revision}"),
+        format!("HEAD={}", revision.to_ascii_uppercase()),
+        format!("[head={revision}]"),
+        format!("`sha={revision}`"),
+    ] {
+        let content = format!("auth review uses {reference}");
+        assert!(
+            check(&content).is_ok(),
+            "an explicit Git revision in ordinary auth prose must pass: {content:?}, got {:?}",
+            scan(&content)
+        );
+        assert_eq!(mask_secrets(&content), content);
+    }
+}
+
+#[test]
+fn head_and_equals_revision_markers_do_not_hide_credential_labels() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    for label in ["key", "auth", "token"] {
+        let content = format!("{label}={revision}");
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "direct credential assignments must stay blocked: {content:?}"
+        );
+        assert!(!mask_secrets(&content).contains(revision));
+    }
+    for label in ["api key value is", "auth value is", "token value is"] {
+        for marker in ["head", "sha"] {
+            for separator in [" ", "=", ":"] {
+                let content = format!("{label} {marker}{separator}{revision}");
+                assert_eq!(
+                    scan(&content).map(|matched| matched.detector),
+                    Some("hex-credential-token"),
+                    "a VCS marker must not shield the same-clause credential label: {content:?}"
+                );
+                assert!(!mask_secrets(&content).contains(revision));
+            }
+        }
+    }
+}
+
+#[test]
+fn revision_marker_exemption_requires_exactly_forty_hex_digits() {
+    // These lengths retain the existing detector policy; neither receives
+    // the exact-40-hex VCS exemption, regardless of its marker syntax.
+    for length in [39, 41] {
+        let value = "a".repeat(length);
+        for marker in ["head", "sha"] {
+            for separator in ["=", ":"] {
+                let content = format!("{marker}{separator}{value}");
+                assert!(!is_git_revision_reference(&content, 0, &content));
+            }
+            let content = format!("{marker} {value}");
+            assert!(!is_vcs_marker_before_hex(
+                &content,
+                &content[..marker.len()]
+            ));
+            let offset = marker.len() + 1;
+            assert!(!is_git_revision_reference(
+                &content,
+                offset,
+                &content[offset..]
+            ));
+        }
+    }
+}
+
+#[test]
+fn head_revision_marker_preserves_sentence_and_known_prefix_rules() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    let content = format!("rotate the api key. the fix is head={revision}");
+    assert!(check(&content).is_ok());
+    assert_eq!(mask_secrets(&content), content);
+
+    let provider = "AKIAFAKEKEY1234567890";
+    let content = format!("auth review uses head={revision} and {provider}");
+    assert_eq!(scan(&content).unwrap().detector, "aws-access-key-id");
+    assert!(!mask_secrets(&content).contains(provider));
+}
+
+#[test]
+fn head_marker_does_not_exempt_a_split_credential() {
+    let first = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    let second = "0123456789abcdef01234567";
+    let content = format!("api token context: head {first}\u{200B}{second}");
+    assert_eq!(
+        scan(&content).map(|matched| matched.detector),
+        Some("hex-credential-token")
+    );
+    let masked = mask_secrets(&content);
+    assert!(!masked.contains(first));
+    assert!(!masked.contains(second));
 }

@@ -106,6 +106,26 @@ async fn symmetric_update_default_refuses_without_upserting() {
     );
 }
 
+/// The runtime's `stats` read falls back to the three single-purpose edge
+/// counts only on this exact operation name, so a backend without the combined
+/// aggregate must report it under that name.
+#[tokio::test]
+async fn combined_edge_count_default_refuses_by_name() {
+    let store = TraitDefaultOnlyGraphStore::new(Vec::new());
+    let error = store
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&["default".to_string()])
+        .await
+        .expect_err("a backend without the combined aggregate must report Unsupported");
+    assert!(matches!(
+        error,
+        StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation,
+            ..
+        } if operation == "count_edges_by_relation_and_endpoint_base_in_namespaces"
+    ));
+}
+
 #[async_trait]
 impl GraphStore for TraitDefaultOnlyGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()> {

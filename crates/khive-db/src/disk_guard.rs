@@ -16,6 +16,9 @@ use crate::error::SqliteError;
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SYMLINK_DEPTH: usize = 40;
+const LOCK_DIRECTORY_ADVICE: &str = "configure another absolute directory, writable by and \
+    shared by every khive process of this deployment; set KHIVE_VOLUME_LOCK_DIR when using \
+    the default directory resolver, or change the caller-supplied volume-lock directory setting";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum VolumeKey {
@@ -48,8 +51,21 @@ impl Hash for VolumeIdentity {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESOLVES_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`VolumeIdentity::resolve`] has run on the calling thread.
+#[cfg(test)]
+pub(crate) fn resolves_on_this_thread() -> usize {
+    RESOLVES_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 impl VolumeIdentity {
     pub(crate) fn resolve(db_path: &Path) -> Result<Self, SqliteError> {
+        #[cfg(test)]
+        RESOLVES_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
         let probe_path = nearest_existing_canonical_ancestor(db_path)
             .map_err(|error| identity_error(format!("cannot resolve database volume: {error}")))?;
         let (key, volume_root) = volume_key(&probe_path)
@@ -63,6 +79,28 @@ impl VolumeIdentity {
             probe_path,
             volume_root,
         })
+    }
+
+    /// Whether `db_path` is still on this volume, answered as
+    /// `VolumeIdentity::resolve(db_path)? == *self` would answer it.
+    ///
+    /// Equality reads only the volume key. On Unix the key of a path that
+    /// exists is the device id one `stat` returns, and `stat` follows symlinks
+    /// as canonicalization does. `resolve` also canonicalizes the path and
+    /// stats every ancestor to find the volume root, which this comparison
+    /// never reads, and the write path asks it several times per write unit.
+    /// A path that cannot be stat'ed, such as a database file not created yet
+    /// or a dangling symlink, takes the full `resolve`, so those cases and
+    /// every error keep their existing outcome.
+    pub(crate) fn still_identifies(&self, db_path: &Path) -> Result<bool, SqliteError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(metadata) = fs::metadata(db_path) {
+                return Ok(VolumeKey::UnixDevice(metadata.dev()) == self.key);
+            }
+        }
+        Ok(Self::resolve(db_path)? == *self)
     }
 
     pub(crate) fn diagnostic_key(&self) -> String {
@@ -160,7 +198,7 @@ impl VolumeIdentity {
             .ok_or_else(|| LeaseRefusal::Refused(lock_error("volume lease deadline overflow")))?;
         fs::create_dir_all(lock_dir).map_err(|error| {
             LeaseRefusal::Refused(lock_error(format!(
-                "cannot create volume-lock directory: {error}"
+                "cannot create volume-lock directory {lock_dir:?}: {error}; {LOCK_DIRECTORY_ADVICE}"
             )))
         })?;
         let lock_path = lock_dir.join(self.lock_filename());
@@ -176,12 +214,14 @@ impl VolumeIdentity {
             .truncate(false)
             .open(&lock_path)
             .map_err(|error| {
-                LeaseRefusal::Refused(lock_error(format!("cannot open volume-lock file: {error}")))
+                LeaseRefusal::Refused(lock_error(format!(
+                    "cannot open volume-lock file {lock_path:?}: {error}; {LOCK_DIRECTORY_ADVICE}"
+                )))
             })?;
         #[cfg(any(unix, windows))]
         loop {
             if Instant::now() >= deadline {
-                return Err(LeaseRefusal::TimedOut(lock_error(format!(
+                return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
                     "timed out after {} ms waiting for volume lease",
                     timeout.as_millis()
                 ))));
@@ -199,7 +239,7 @@ impl VolumeIdentity {
                 Err(fs4::TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Err(LeaseRefusal::TimedOut(lock_error(format!(
+                        return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
                             "timed out after {} ms waiting for volume lease",
                             timeout.as_millis()
                         ))));
@@ -439,7 +479,7 @@ fn acquire_process_slot(
     let current = std::thread::current().id();
     let mut slots = registry.slots.lock();
     if Instant::now() >= deadline {
-        return Err(LeaseRefusal::TimedOut(lock_error(
+        return Err(LeaseRefusal::TimedOut(lock_contended_error(
             "timed out waiting for in-process volume lease",
         )));
     }
@@ -479,7 +519,7 @@ fn acquire_process_slot(
             }
             drop(slots);
             registry.available.notify_all();
-            return Err(LeaseRefusal::TimedOut(lock_error(
+            return Err(LeaseRefusal::TimedOut(lock_contended_error(
                 "timed out waiting for in-process volume lease",
             )));
         }
@@ -594,6 +634,13 @@ fn lock_error(message: impl Into<String>) -> SqliteError {
     }
 }
 
+fn lock_contended_error(message: impl Into<String>) -> SqliteError {
+    SqliteError::CapacityUnavailable {
+        phase: CapacityUnavailablePhase::LockContended,
+        message: message.into(),
+    }
+}
+
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
@@ -677,7 +724,7 @@ mod tests {
         assert!(matches!(
             error,
             SqliteError::CapacityUnavailable {
-                phase: CapacityUnavailablePhase::Lock,
+                phase: CapacityUnavailablePhase::LockContended,
                 ..
             }
         ));
@@ -685,6 +732,122 @@ mod tests {
         second
             .acquire_in(Duration::from_millis(100), &lock_dir)
             .expect("dropping the first lease releases both lock layers");
+    }
+
+    #[test]
+    fn missing_lock_directory_is_refused_without_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = VolumeIdentity::resolve(&dir.path().join("a.db")).unwrap();
+        let error = identity
+            .acquire(Duration::from_millis(100), None)
+            .err()
+            .expect("a missing configured lock directory cannot attempt a lease");
+        assert!(
+            matches!(
+                &error,
+                LeaseRefusal::Refused(SqliteError::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::Lock,
+                    message,
+                }) if message == "writable SQLite pool has no configured volume-lock directory"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn unusable_lock_directory_refusal_names_attempted_path_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("a.db");
+        let identity = VolumeIdentity::resolve(&database_path).unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"keep this file").unwrap();
+
+        for lock_dir in [blocked.clone(), blocked.join("nested").join("locks")] {
+            let cause = fs::create_dir_all(&lock_dir).unwrap_err();
+            let error = identity
+                .acquire(Duration::from_millis(100), Some(&lock_dir))
+                .err()
+                .expect("an unusable lock directory must refuse the lease");
+            match error {
+                LeaseRefusal::Refused(SqliteError::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::Lock,
+                    message,
+                }) => {
+                    assert!(
+                        message.contains("cannot create volume-lock directory"),
+                        "{message}"
+                    );
+                    assert!(message.contains(&format!("{lock_dir:?}")), "{message}");
+                    assert!(message.contains(&cause.to_string()), "{message}");
+                    assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                    assert!(message.contains("default directory resolver"), "{message}");
+                    assert!(message.contains("caller-supplied"), "{message}");
+                    assert!(message.contains("another absolute directory"), "{message}");
+                    assert!(
+                        message.contains("writable by and shared by every khive process"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected a non-contention lock refusal, got {other:?}"),
+            }
+            assert_eq!(fs::read(&blocked).unwrap(), b"keep this file");
+            assert!(
+                !database_path.exists(),
+                "refusal must not create a database"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_file_open_refusal_names_path_and_setting_and_releases_process_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("a.db");
+        let mut identity = VolumeIdentity::resolve(&database_path).unwrap();
+        identity.key = isolated_test_key(7);
+        let lock_dir = dir.path().join("caller-locks");
+        let lock_path = lock_dir.join(identity.lock_filename());
+        fs::create_dir_all(&lock_path).unwrap();
+        let cause = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap_err();
+        let error = identity
+            .acquire(Duration::from_millis(100), Some(&lock_dir))
+            .err()
+            .expect("an existing directory at the lock-file path must refuse the lease");
+        match error {
+            LeaseRefusal::Refused(SqliteError::CapacityUnavailable {
+                phase: CapacityUnavailablePhase::Lock,
+                message,
+            }) => {
+                assert!(
+                    message.contains("cannot open volume-lock file"),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{lock_path:?}")), "{message}");
+                assert!(message.contains(&cause.to_string()), "{message}");
+                assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                assert!(message.contains("default directory resolver"), "{message}");
+                assert!(message.contains("caller-supplied"), "{message}");
+                assert!(
+                    message.contains("writable by and shared by every khive process"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a non-contention lock refusal, got {other:?}"),
+        }
+        assert!(lock_path.is_dir(), "refusal must preserve the obstruction");
+        assert!(
+            !database_path.exists(),
+            "refusal must not create a database"
+        );
+        fs::remove_dir(&lock_path).unwrap();
+        identity
+            .acquire_in(Duration::from_millis(100), &lock_dir)
+            .expect("failed file open must release the in-process lease slot");
     }
 
     // MUST-FAIL: keying the in-process slot by the volume alone under the test
@@ -746,7 +909,7 @@ mod tests {
             matches!(
                 &error,
                 SqliteError::CapacityUnavailable {
-                    phase: CapacityUnavailablePhase::Lock,
+                    phase: CapacityUnavailablePhase::LockContended,
                     message,
                 } if message.contains("in-process")
             ),
@@ -819,7 +982,7 @@ mod tests {
             "timeout" => assert!(matches!(
                 result,
                 Err(SqliteError::CapacityUnavailable {
-                    phase: CapacityUnavailablePhase::Lock,
+                    phase: CapacityUnavailablePhase::LockContended,
                     ..
                 })
             )),
@@ -902,6 +1065,54 @@ mod tests {
         let aliased = VolumeIdentity::resolve(&source.join("alias.db")).unwrap();
         let direct = VolumeIdentity::resolve(&target.join("new.db")).unwrap();
         assert_eq!(aliased.probe_path(), direct.probe_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn still_identifies_answers_as_a_fresh_resolve_and_resolves_only_unstatable_paths() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let database = fixture.path().join("existing.db");
+        fs::write(&database, []).unwrap();
+        let alias = fixture.path().join("alias.db");
+        symlink(&database, &alias).unwrap();
+        let dangling = fixture.path().join("dangling.db");
+        symlink(fixture.path().join("absent/target.db"), &dangling).unwrap();
+        let missing = fixture.path().join("missing/new.db");
+
+        // (path, the path can be stat'ed)
+        for (path, statable) in [
+            (&database, true),
+            (&alias, true),
+            (&dangling, false),
+            (&missing, false),
+        ] {
+            let identity = VolumeIdentity::resolve(path).unwrap();
+            let other = identity.different_volume_for_test();
+            for (expected, same) in [(&identity, true), (&other, false)] {
+                let before = super::resolves_on_this_thread();
+                let answer = expected.still_identifies(path).unwrap();
+                let resolves = super::resolves_on_this_thread() - before;
+                assert_eq!(answer, same, "{}", path.display());
+                assert_eq!(
+                    answer,
+                    VolumeIdentity::resolve(path).unwrap() == *expected,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(resolves, usize::from(!statable), "{}", path.display());
+            }
+        }
+
+        // An identity captured before the database file existed still
+        // identifies the file once it is created.
+        let fresh = fixture.path().join("fresh.db");
+        let captured = VolumeIdentity::resolve(&fresh).unwrap();
+        fs::write(&fresh, []).unwrap();
+        let before = super::resolves_on_this_thread();
+        assert!(captured.still_identifies(&fresh).unwrap());
+        assert_eq!(super::resolves_on_this_thread(), before);
     }
 }
 

@@ -260,6 +260,16 @@ impl GraphStore for StorageBackend {
             .await
     }
 
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>> {
+        self.graph()
+            .map_err(|error| map_open_error(error, StorageCapability::Graph, "graph"))?
+            .count_edges_by_relation_and_endpoint_base_in_namespaces(namespaces)
+            .await
+    }
+
     async fn query_edges_after(
         &self,
         filter: EdgeFilter,
