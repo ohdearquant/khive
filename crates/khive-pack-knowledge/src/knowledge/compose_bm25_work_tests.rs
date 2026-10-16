@@ -81,7 +81,7 @@ fn baseline_score_sections(
     for (section, &bm25_unnorm) in flat.iter().zip(bm25_raw.iter()) {
         khive_storage::ensure_request_read_active("knowledge.compose")?;
         let sec_cos = match &section.embedding {
-            Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb).max(0.0),
+            Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb, true).max(0.0),
             _ => 0.0,
         };
 
