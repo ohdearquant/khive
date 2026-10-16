@@ -229,6 +229,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-199](ADR-199-shared-score-arithmetic.md)                           | Shared Score Arithmetic                                                                                    |
 | [ADR-200](ADR-200-external-email-policy.md)                             | External Email Policy: Sender Scope, Suppression, Unsubscribe and Screened Inbound Delivery                |
 | [ADR-201](ADR-201-brain-module-boundaries.md)                           | Brain module boundaries and shared event readers                                                           |
+| [ADR-203](ADR-203-khive-apps-on-the-base.md)                            | khive Apps on the Base: Manifest, Lifecycle Verbs, Store Classes, Registration and Supervision             |
 
 <!-- END GENERATED ADR CATALOG -->
 
