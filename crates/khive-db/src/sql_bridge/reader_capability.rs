@@ -5,6 +5,27 @@ use super::{
     StorageCapability, StorageError,
 };
 
+/// Admit only SELECT and WITH followed by SELECT for enlisted graph guards.
+/// SQLite still validates syntax and the executable tail during preparation.
+/// This is a statement-shape check, not a sandbox against caller-provided UDFs.
+pub(crate) fn statement_guard_select_admits(sql: &str) -> Result<(), String> {
+    let rest = skip_sqlite_empty_prefix(sql.as_bytes());
+    let admitted = match next_sqlite_token(rest) {
+        Some((head, _)) if head.eq_ignore_ascii_case(b"SELECT") => true,
+        Some((head, tail)) if head.eq_ignore_ascii_case(b"WITH") => {
+            skip_common_table_expressions(tail)
+                .and_then(next_sqlite_token)
+                .is_some_and(|(head, _)| head.eq_ignore_ascii_case(b"SELECT"))
+        }
+        _ => false,
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err("graph statement guards require SELECT or WITH followed by SELECT".into())
+    }
+}
+
 /// SQLite's prepared-statement classifier is authoritative for the safety
 /// boundary. Row-producing DML (`UPDATE ... RETURNING`) and transaction
 /// control may be called through `SqlReader`, but they are admitted writes and
