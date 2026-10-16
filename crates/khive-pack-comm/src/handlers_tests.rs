@@ -81,6 +81,78 @@ async fn post_commit_delete_detaches_original_even_if_followup_read_would_fail()
 }
 
 #[tokio::test]
+async fn detach_refuses_an_original_replaced_after_the_owner_read() {
+    use std::sync::Arc;
+
+    use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+    use tokio::sync::Barrier;
+
+    let runtime = Arc::new(super::KhiveRuntime::memory().expect("runtime"));
+    let note_id = uuid::Uuid::new_v4();
+    let original = ContentRef::from_hex("a".repeat(64)).expect("original ref");
+    let replacement = ContentRef::from_hex("c".repeat(64)).expect("replacement ref");
+    let owner = |content_ref: ContentRef| {
+        Attachment::from_new(
+            note_id,
+            AttachmentSubstrate::Note,
+            NewAttachment {
+                role: "quarantine-original".into(),
+                content_ref,
+                media_type: None,
+                size_bytes: None,
+            },
+            1,
+        )
+    };
+    let attachments = runtime.core().attachments().expect("main attachments");
+    assert!(attachments
+        .try_insert_attachment(owner(original.clone()))
+        .await
+        .expect("seed original owner"));
+
+    let arrived = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let detach = {
+        let runtime = Arc::clone(&runtime);
+        let expected = original.to_string();
+        tokio::spawn(super::race_seam::AFTER_QUARANTINE_ROLE_READ.scope(
+            (Arc::clone(&arrived), Arc::clone(&resume)),
+            async move {
+                super::detach_deleted_legacy_original(&runtime, note_id, Some(expected.as_str()))
+                    .await
+            },
+        ))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived.wait())
+        .await
+        .expect("detach must reach the post-read pause");
+    attachments
+        .upsert_attachment(owner(replacement.clone()))
+        .await
+        .expect("competing writer replaces the original");
+    resume.wait().await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), detach)
+        .await
+        .expect("detach must finish")
+        .expect("detach task");
+    assert!(
+        matches!(
+            &result,
+            Err(khive_runtime::RuntimeError::Internal(message))
+                if message.contains("original owner changed during cleanup")
+        ),
+        "a replaced original must refuse the detach: {result:?}"
+    );
+    let survivor = attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("owner lookup")
+        .expect("the replacement survives");
+    assert_eq!(survivor.content_ref, replacement);
+}
+
+#[tokio::test]
 async fn routed_cleanup_preserves_post_commit_error_after_detaching_original() {
     use std::sync::Arc;
 
@@ -1509,9 +1581,9 @@ fn read_response_err_preserves_stored_null_properties() {
 fn read_response_side_effects_unknown_reports_unknown_not_failed() {
     let original = json!({ "direction": "inbound", "read": false });
     let patched = json!({ "direction": "inbound", "read": true });
-    let err = StorageError::WriterTaskTerminated {
-        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-    };
+    let err = StorageError::writer_task_terminated(
+        khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+    );
     let err_text = err.to_string();
     let resp = read_response(
         "abc123".to_string(),
@@ -1541,9 +1613,9 @@ fn read_response_side_effects_unknown_reports_unknown_not_failed() {
 fn read_response_writer_task_terminated_rolled_back_still_reports_failed() {
     let original = json!({ "direction": "inbound", "read": false });
     let patched = json!({ "direction": "inbound", "read": true });
-    let err = StorageError::WriterTaskTerminated {
-        request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
-    };
+    let err = StorageError::writer_task_terminated(
+        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+    );
     let resp = read_response(
         "abc123".to_string(),
         "full-uuid".to_string(),

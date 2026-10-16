@@ -1,5 +1,57 @@
 use super::*;
 
+/// Select once at the exact precision that is persisted for recovery. The raw
+/// source trigger remains untouched until the claim CAS has won.
+pub(super) fn select_catch_up_occurrence(
+    properties: &Value,
+    source_trigger_at: &str,
+    now: DateTime<Utc>,
+    max_lateness: i64,
+) -> std::result::Result<Option<CatchUpOccurrence>, String> {
+    let decision_at = now.timestamp_micros();
+    let now = DateTime::<Utc>::from_timestamp_micros(decision_at)
+        .ok_or("catch-up decision time is not representable")?;
+    let current = source_trigger_at
+        .parse::<DateTime<FixedOffset>>()
+        .map_err(|_| "catch-up source trigger is malformed")?
+        .with_timezone(&Utc);
+    if current > now {
+        return Ok(None);
+    }
+    let latest = match properties.get("repeat") {
+        None | Some(Value::Null) => current,
+        Some(value) => {
+            let text = value.as_str().ok_or(INVALID_STORED_REPEAT)?;
+            let repeat = khive_pack_schedule::repeat::parse_repeat(text)?;
+            let anchor = if matches!(repeat, khive_pack_schedule::repeat::Repeat::Monthly) {
+                let anchor = match properties.get("repeat_anchor") {
+                    None => current,
+                    Some(value) => value
+                        .as_str()
+                        .ok_or(INVALID_MONTHLY_ANCHOR)?
+                        .parse::<DateTime<Utc>>()
+                        .map_err(|_| INVALID_MONTHLY_ANCHOR)?,
+                };
+                if anchor > current {
+                    return Err(INVALID_MONTHLY_ANCHOR.to_string());
+                }
+                Some(anchor)
+            } else {
+                None
+            };
+            repeat
+                .latest_at_or_before(current, now, anchor)
+                .ok_or(UNADVANCEABLE_REPEAT)?
+        }
+    };
+    Ok(Some(CatchUpOccurrence {
+        source_trigger_at: source_trigger_at.to_string(),
+        scheduled_for: latest,
+        decision_at,
+        effective_max_lateness: max_lateness,
+    }))
+}
+
 /// Compute the next `trigger_at` for a repeating event, given the current
 /// `trigger_at` and the `repeat` spec.
 ///

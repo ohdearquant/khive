@@ -266,7 +266,12 @@ async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
         })
         .await;
     assert!(
-        matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
+        matches!(
+            result
+                .as_ref()
+                .map_err(StorageError::without_sqlite_write_stage),
+            Err(StorageError::WriterTaskBusy { .. })
+        ),
         "precondition: the request must actually be refused busy, got {result:?}"
     );
 
@@ -368,7 +373,12 @@ async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention
         .await;
 
     assert!(
-        matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
+        matches!(
+            result
+                .as_ref()
+                .map_err(StorageError::without_sqlite_write_stage),
+            Err(StorageError::WriterTaskBusy { .. })
+        ),
         "precondition: the request must actually be refused busy, got {result:?}"
     );
     // Against a lock that is never released, SQLite's busy handler spends
@@ -491,6 +501,7 @@ async fn queued_request_probes_after_begin_rolls_back_and_task_recovers() {
             false,
             false,
             false,
+            SubmitLabels::None,
         )
         .await
         .expect("second request must be queued while first holds the lease");

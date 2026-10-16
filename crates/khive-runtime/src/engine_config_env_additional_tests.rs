@@ -8,11 +8,12 @@ fn env_additional_only_keeps_builtin_primary() {
     );
     assert_eq!(cfg.engines.len(), 2);
     let default_engine = cfg.default_engine().expect("a default engine");
-    assert_eq!(default_engine.model, "all-minilm-l6-v2");
+    assert_eq!(default_engine.name, "all-minilm-l6-v2");
     assert!(
         cfg.engines
             .iter()
-            .any(|e| !e.default && e.model == "paraphrase-multilingual-minilm-l12-v2"),
+            .skip(1)
+            .any(|e| e.name == "paraphrase-multilingual-minilm-l12-v2"),
         "additional model must be a non-default secondary engine"
     );
 }
@@ -25,7 +26,7 @@ fn env_explicit_primary_stays_primary() {
     );
     assert_eq!(cfg.engines.len(), 1);
     assert_eq!(
-        cfg.default_engine().expect("default").model,
+        cfg.default_engine().expect("default").name,
         "paraphrase-multilingual-minilm-l12-v2"
     );
 }
@@ -34,5 +35,5 @@ fn env_explicit_primary_stays_primary() {
 fn env_additional_restating_primary_is_deduped() {
     let cfg = super::config_from_env_parts(None, vec!["all-minilm-l6-v2".to_string()]);
     assert_eq!(cfg.engines.len(), 1);
-    assert!(cfg.engines[0].default);
+    assert_eq!(cfg.engines[0].name, "all-minilm-l6-v2");
 }

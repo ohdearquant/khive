@@ -21,6 +21,16 @@ use crate::vocab::SESSION_KIND;
 
 pub(crate) use khive_runtime::deser_params as deser;
 
+/// Resolve the shared inclusive limit range; callers retain their error wording.
+pub(crate) fn validate_limit(requested: Option<u32>, default: u32, max: u32) -> Result<u32, u32> {
+    let limit = requested.unwrap_or(default);
+    if (1..=max).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(limit)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionRecord {
     pub id: String,

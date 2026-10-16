@@ -188,3 +188,73 @@ fn the_disk_policy_segment_is_parsed_apart_from_the_fields_before_it() {
     assert_eq!(fields.display_timezone, "UTC");
     assert_eq!(fields.pack_backends, Some("kg=main"));
 }
+
+fn with_engine_peers(id: &str, hash: char) -> String {
+    id.replacen(
+        ";fresh_tail=",
+        &format!(";engine_peers={};fresh_tail=", hash.to_string().repeat(64)),
+        1,
+    )
+}
+
+#[test]
+fn different_peer_fingerprints_cannot_use_legacy_extra_subset_compatibility() {
+    let client = with_engine_peers(&config_id("p", "a"), 'a');
+    let daemon = with_engine_peers(&config_id("p", "a,b"), 'b');
+    assert!(!super::config_ids_compatible(&client, &daemon));
+    assert_eq!(
+        super::first_config_mismatch_field(&client, Some(&daemon)),
+        "engine_peers"
+    );
+    assert_eq!(
+        super::config_id_extra_embedder_exclusions(&client, &daemon),
+        None
+    );
+
+    let same_hash_different_projection = with_engine_peers(&config_id("p", "a,b"), 'a');
+    assert!(!super::config_ids_compatible(
+        &client,
+        &same_hash_different_projection
+    ));
+    assert_eq!(
+        super::config_id_extra_embedder_exclusions(&client, &same_hash_different_projection),
+        None
+    );
+}
+
+#[test]
+fn missing_peer_fingerprints_refuse_cross_version_daemon_reuse() {
+    let legacy = config_id("p", "a");
+    let modern = with_engine_peers(&legacy, 'a');
+    for (client, daemon) in [(&legacy, &modern), (&modern, &legacy)] {
+        assert!(!super::config_ids_compatible(client, daemon));
+        assert_eq!(
+            super::first_config_mismatch_field(client, Some(daemon)),
+            "engine_peers"
+        );
+        assert_eq!(
+            super::config_id_extra_embedder_exclusions(client, daemon),
+            None
+        );
+    }
+}
+
+#[test]
+fn peer_fingerprint_is_separate_from_fresh_tail_and_trailing_policies() {
+    let modern = with_engine_peers(&config_id("p", "a"), 'a');
+    let routed = with_disk_policy(&format!("{modern}{ROUTING}"), 7);
+    let hash = "a".repeat(64);
+    for id in [&modern, &routed] {
+        let fields = super::parse_config_id(id).expect("ordered peer id parses");
+        assert_eq!(fields.engine_peers, Some(hash.as_str()));
+        assert_eq!(fields.display_timezone, "UTC");
+        let changed = id.replace(";fresh_tail=true;", ";fresh_tail=false;");
+        assert!(!super::config_ids_compatible(id, &changed));
+        assert_eq!(
+            super::first_config_mismatch_field(id, Some(&changed)),
+            "fresh_tail"
+        );
+    }
+    let malformed = modern.replace(";fresh_tail=", ";unexpected=value;fresh_tail=");
+    assert!(super::parse_config_id(&malformed).is_none());
+}

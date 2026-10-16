@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 const MODEL: EmbeddingModel = EmbeddingModel::AllMiniLmL6V2;
 const CONSUMER: &str = "knowledge:knowledge.atom";
-const REPLAY_POINT_SQL: &str = "SELECT namespace, embedding_model, field, embedding FROM vec_all_minilm_l6_v2 WHERE subject_id = ?1";
+// This harness disables search reranking, so scoped vector reads belong to replay.
+const REPLAY_POINT_SQL: &str = "SELECT embedding FROM vec_all_minilm_l6_v2 WHERE subject_id = ?1 AND namespace = ?2 AND field = ?3 AND embedding_model = ?4";
 const FINAL_STATES_SQL: &str = "SELECT subject_id, op, MAX(seq) AS seq FROM ann_write_log WHERE namespace = ?1 AND embedding_model = ?2 AND field = 'knowledge.atom' AND seq > ?3 GROUP BY subject_id";
 
 #[derive(Clone, Copy, Debug)]

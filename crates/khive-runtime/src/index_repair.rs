@@ -74,25 +74,18 @@ enum Publication {
     Occupied,
 }
 
-fn statement(sql: String, params: Vec<SqlValue>) -> SqlStatement {
-    SqlStatement {
-        sql,
-        params,
-        label: Some("record-index-repair".into()),
-    }
-}
-
 fn vector_checks(record: &Record, doc: &TextDocument, model: &str) -> (SqlStatement, SqlStatement) {
     let table = format!("vec_{}", crate::config::sanitize_key(model));
-    let healthy = statement(format!("SELECT 1 FROM {table} WHERE subject_id=?1 AND namespace=?2 AND kind=?3 AND field=?4 AND embedding_model=?5"), vec![
+    let healthy = SqlStatement::new(format!("SELECT 1 FROM {table} WHERE subject_id=?1 AND namespace=?2 AND kind=?3 AND field=?4 AND embedding_model=?5"), vec![
         SqlValue::Text(doc.subject_id.to_string()), SqlValue::Text(doc.namespace.clone()), SqlValue::Text(doc.kind.to_string()), SqlValue::Text(record.tables().2.into()), SqlValue::Text(model.into()),
-    ]);
+    ]).labelled("record-index-repair");
     // Even a mismatched identity may occupy the vec0 subject primary key.
     // Repair preserves it instead of silently replacing an existing vector.
-    let occupied = statement(
+    let occupied = SqlStatement::new(
         format!("SELECT 1 FROM {table} WHERE subject_id=?1"),
         vec![SqlValue::Text(doc.subject_id.to_string())],
-    );
+    )
+    .labelled("record-index-repair");
     (healthy, occupied)
 }
 
@@ -311,7 +304,7 @@ impl KhiveRuntime {
         let (_, table, _) = record.tables();
         let canonical = khive_db::stores::text::insert_document_statement(table, doc);
         let map = khive_db::stores::text::rowid_map_table(table);
-        let healthy = statement(
+        let healthy = SqlStatement::new(
             format!(
                 "SELECT 1 FROM {table} AS t JOIN {map} AS m ON m.rowid=t.rowid \
             WHERE m.subject_id=?1 AND m.namespace=?6 AND t.subject_id=?1 AND t.kind=?2 \
@@ -319,7 +312,8 @@ impl KhiveRuntime {
             AND t.metadata IS ?7 AND t.updated_at=?8 AND t.record_kind IS ?9"
             ),
             canonical.params,
-        );
+        )
+        .labelled("record-index-repair");
         let statements = khive_db::stores::text::delete_document_statements(
             table,
             &doc.namespace,
@@ -360,7 +354,7 @@ impl KhiveRuntime {
         occupied: Option<SqlStatement>,
         statements: Vec<SqlStatement>,
     ) -> RuntimeResult<Publication> {
-        let source = statement(
+        let source = SqlStatement::new(
             format!(
                 "SELECT version FROM {} WHERE id=?1 AND namespace=?2 AND deleted_at IS NULL",
                 record.tables().0
@@ -369,7 +363,8 @@ impl KhiveRuntime {
                 SqlValue::Text(doc.subject_id.to_string()),
                 SqlValue::Text(doc.namespace.clone()),
             ],
-        );
+        )
+        .labelled("record-index-repair");
         let version = record.version();
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {

@@ -403,3 +403,54 @@ taxonomy cannot silently diverge from the compiled one.
   `base_entity_endpoint_rules()`
 - `crates/khive-runtime/src/operations.rs` -- `BASE_ENTITY_ENDPOINT_RULES`
 - `crates/khive-types/src/pack.rs` -- `ParamDef` / `HandlerDef` (phase-1 test substrate)
+
+## Proposed implementation clarification (2026-10-10)
+
+This clarification remains **Proposed**. Source preparation for `schema` does not
+accept this ADR or establish completed conformance validation. The dated deferred
+status above records the earlier baseline; architectural acceptance and driven
+implementation validation remain pending. This section clarifies §2 only; it does
+not implement the other verb-surface or generated-document rules in this ADR.
+
+`schema()` accepts no filters. Normal registry Gate admission, namespace argument
+validation and configured dispatch audit behavior apply. The handler projects only
+the loaded registry's declarations; it performs no graph read, graph write, model
+initialization or network lookup. An explicit namespace affects admission, not the
+metadata selected. The operation is an explicit `Read` under ADR-129 Amendment 3,
+which does not exempt it from ordinary incidental audit behavior.
+
+The response retains `entity_kinds`, `note_kinds`, `edge_relations`,
+`endpoint_rules`, `packs_loaded` and `contract_version`. A `counts` object contains
+the length of each of the first five arrays. The closed relation array is drawn
+from `EdgeRelation::ALL`; the historical example's 17 names are not a fixed count.
+Kind and pack-name arrays are lexicographically sorted and deduplicated; relation
+spellings are lexicographically sorted.
+
+Endpoint rows retain string `source`, `relation`, `target` and `origin` fields.
+`source_substrate` and `target_substrate` are each `entity` or `note`.
+`source_entity_type` and `target_entity_type` are omitted when no subtype is
+specified. For `EntityOfType`, the kind stays in `source` or `target` and the exact
+subtype appears in the corresponding optional field; no joined string syntax or
+lossy flattening is introduced. Base rows have origin `base`, both substrates
+`entity`, and no subtype fields. Their literal `*` means any entity kind, not any
+substrate. Pack rows have origin `pack:<name>` from captured registry attribution.
+
+Rows contain exactly the base entity endpoint table and installed pack endpoint
+declarations. They do not replace link validation, including live-endpoint,
+self-loop, direction and other semantic checks. Sort rows by
+`(origin, source_substrate, source, source_entity_type, relation, target_substrate,
+target, target_entity_type)`, with absent subtypes before present ones. Retain all
+duplicate declarations, including repeated rows from one owner.
+
+`contract_version` is lowercase 64-character BLAKE3 hex over the canonical JSON
+payload excluding only `contract_version` itself, including counts and empty
+arrays. Canonicalization uses `khive_types::canonical_json_bytes`: recursive object
+key sorting with array order and scalar values preserved, not RFC 8785 numeric or
+Unicode normalization. This is a content version, not an authorization signature.
+
+The registered schema handler uses the existing `AlwaysVerbose` presentation
+policy so an Agent request retains the complete hash-bearing payload, including
+empty vocabulary arrays. The existing table renderer emits every endpoint row and
+all vocabulary, pack, count and hash siblings; it does not filter the matrix or
+substitute a shorter summary. Table escaping remains display behavior. No new
+presentation policy or format is introduced.

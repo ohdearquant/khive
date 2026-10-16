@@ -17,10 +17,16 @@ TRIGGERS = (
     "execute_atomic_ops_file(", "run_reindex(",
     "run_reindex_without_embeddings(", "run_reindex_offline(",
 )
+# Concern files `exec_tests.rs` pulls in with `include!`. They are read from the parent so a new part joins
+# the census without an edit here; a part dropped from the parent lowers the count below its floor.
+EXEC_TEST_PARTS = tuple(re.findall(r'(?m)^include!\("(exec_tests/[^"]+)"\);$',
+                                   (SOURCE / "exec_tests.rs").read_text()))
 MODULES = ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "cli.rs", "code_ingest.rs",
-           "reindex.rs", "pack_introspect.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs")
+           "reindex/tests/mod.rs", "pack_introspect.rs", "atomic_apply.rs", "atomic_apply_tests.rs",
+           "atomic_apply_validate_atomic_args_tests.rs", "atomic_project_origin_tests.rs") + EXEC_TEST_PARTS
 # Test files included at column zero rather than as an inline module.
-COLUMN_ZERO = ("exec_tests.rs", "exec_atomic_result_shape_tests.rs")
+COLUMN_ZERO = ("exec_tests.rs", "exec_atomic_result_shape_tests.rs", "reindex/tests/mod.rs",
+               "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs") + EXEC_TEST_PARTS
 
 
 def functions(source, indent="    "):
@@ -29,8 +35,9 @@ def functions(source, indent="    "):
     for match in re.finditer(r"(?m)^" + re.escape(indent) + r"(?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
         end = source.index("\n" + indent + "}", match.end())
         start = source.index("{", match.end(), end) + 1
+        # The first function of a file has neither boundary above it; its attributes start at offset 0.
         before = max(source.rfind("\n" + indent + "}", 0, match.start()),
-                     source.rfind("\n" + indent + "//", 0, match.start()))
+                     source.rfind("\n" + indent + "//", 0, match.start()), 0)
         yield match.group(1), source[before:match.start()], source[start:end]
 
 
@@ -71,6 +78,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
     def test_atomic_execution_callers_enter_exact_children(self):
         count = 0
         for filename in ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "atomic_apply.rs",
+                         "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs",
                          "atomic_project_origin_tests.rs"):
             for name, attributes, body in module_functions(filename):
                 if "#[tokio::test" not in attributes or "execute_atomic_ops_file(" not in body:
@@ -78,7 +86,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
                 count += 1
                 self.assertTrue(body.strip().startswith(isolation(filename)),
                                 f"{filename}:{name} atomic caller must enter exact child")
-        self.assertEqual(count, 22, "all direct atomic execution witnesses must be counted")
+        self.assertEqual(count, 24, "all direct atomic execution witnesses must be counted")
 
     def test_reindex_command_cases_choose_explicit_offline_setup(self):
         zero_model_cases = {
@@ -87,7 +95,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
             "reindex_fts_fixture_clears_primary_and_additional_models",
         }
         count = 0
-        for name, attributes, body in module_functions("reindex.rs"):
+        for name, attributes, body in module_functions("reindex/tests/mod.rs"):
             if "#[tokio::test" not in attributes:
                 continue
             if not re.search(r"\brun_reindex(?:_without_embeddings|_offline)?\(", body):
@@ -97,12 +105,12 @@ class KkernelTestIsolationTests(unittest.TestCase):
                                 f"{name} must choose an explicit offline reindex fixture")
             expected = "run_reindex_without_embeddings(" if name in zero_model_cases else "run_reindex_offline("
             self.assertIn(expected, body, f"{name} must preserve its intended embedding mode")
-            self.assertTrue(body.strip().startswith(ISOLATION),
+            self.assertTrue(body.strip().startswith(isolation("reindex/tests/mod.rs")),
                             f"{name} must enter exact child before reindex setup")
         self.assertEqual(count, 9, "all reindex command witnesses must be counted")
 
     def test_reindex_offline_setup_replaces_each_configured_provider(self):
-        body = function("reindex.rs", "run_reindex_offline")
+        body = function("reindex/tests/mod.rs", "run_reindex_offline")
         self.assertIn("for name in runtime.registered_embedding_model_names()", body)
         self.assertIn("runtime.register_embedder(FixedReindexEmbedder { name, dimensions })", body,
                       "offline reindex fixture must replace every native provider")

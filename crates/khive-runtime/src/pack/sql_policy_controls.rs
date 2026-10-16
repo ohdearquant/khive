@@ -405,6 +405,45 @@ const Q: &str = "SELECT production FROM notes";
     }
 
     #[test]
+    fn named_keep_opts_in_only_its_unconverted_source_and_remains_exact() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/query.rs");
+        let original = r#"const Q: &str = "SELECT id FROM notes";"#;
+        let mut sources = BTreeMap::from([
+            (path.clone(), original.into()),
+            (
+                root.join("demo/src/unconverted.rs"),
+                r#"const Q: &str = "SELECT unrelated FROM notes";"#.into(),
+            ),
+        ]);
+        let keep = || Keep {
+            name: "one_dynamic_query",
+            path: "demo/src/query.rs",
+            sql: "SELECT id FROM notes",
+            reason: "Opt one source into the policy before converting its crate.",
+        };
+        assert!(inline_errors(&sources, &root, &[], &[keep()]).is_empty());
+        sources.insert(
+            path.clone(),
+            format!("{original}\nconst EXTRA: &str = \"SELECT extra FROM notes\";"),
+        );
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline SQL: demo/src/query.rs: SELECT extra FROM notes"]
+        );
+        sources.insert(path.clone(), format!("{original}\n{original}"));
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline keep one_dynamic_query expected once, found 2"]
+        );
+        sources.remove(&path);
+        assert_eq!(
+            inline_errors(&sources, &root, &[], &[keep()]),
+            vec!["inline keep one_dynamic_query expected once, found 0"]
+        );
+    }
+
+    #[test]
     fn named_keeps_are_exact_live_single_statement_exceptions() {
         let root = PathBuf::from("/crates");
         let path = root.join("demo/src/lib.rs");
@@ -440,6 +479,234 @@ const Q: &str = "SELECT production FROM notes";
             assert!(
                 !inline_errors(&sources, &root, &["demo"], &[keep()]).is_empty(),
                 "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_and_unquoted_sql_literals_require_exact_live_keeps() {
+        let root = PathBuf::from("/crates");
+        let relative = "fixture/src/literals.rs";
+        let path = root.join(relative);
+        for (name, table, source, expected) in [
+            (
+                "quoted_notes",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "quoted_entities",
+                "entities",
+                r#"const PREFIX: &str = "UPDATE \"entities\" SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE \"entities\" SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "unquoted_notes",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE notes SET properties = json_set(COALESCE(properties, '{}')";"#,
+                "UPDATE notes SET properties = json_set(COALESCE(properties, '{}')",
+            ),
+            (
+                "literal_backslash_before_n",
+                "notes",
+                r#"const PREFIX: &str = "UPDATE notes SET content = 'path\\name'";"#,
+                "UPDATE notes SET content = 'path\\name'",
+            ),
+        ] {
+            let keep = Keep {
+                name,
+                path: relative,
+                sql: expected,
+                reason: "Fixture-only exact literal spelling control.",
+            };
+            let keeps = std::slice::from_ref(&keep);
+            let sources = BTreeMap::from([(path.clone(), source.to_owned())]);
+            assert_eq!(sql_literals(source), vec![expected.to_owned()]);
+            assert!(inline_errors(&sources, &root, &[], keeps).is_empty());
+            assert_eq!(
+                inline_errors(&sources, &root, &["fixture"], &[]),
+                vec![format!("inline SQL: {relative}: {expected}")]
+            );
+
+            let changed_source = source.replace(table, "other_table");
+            let changed_sql = expected.replace(table, "other_table");
+            let changed = BTreeMap::from([(path.clone(), changed_source)]);
+            assert_eq!(
+                inline_errors(&changed, &root, &[], keeps),
+                vec![
+                    format!("inline SQL: {relative}: {changed_sql}"),
+                    format!("inline keep {name} expected once, found 0"),
+                ]
+            );
+
+            let missing = BTreeMap::from([(path.clone(), String::new())]);
+            assert_eq!(
+                inline_errors(&missing, &root, &[], keeps),
+                vec![format!("inline keep {name} expected once, found 0")]
+            );
+            let duplicate = BTreeMap::from([(path.clone(), format!("{source}\n{source}"))]);
+            assert_eq!(
+                inline_errors(&duplicate, &root, &[], keeps),
+                vec![format!("inline keep {name} expected once, found 2")]
+            );
+
+            let moved_relative = "fixture/src/moved.rs";
+            let moved = BTreeMap::from([(root.join(moved_relative), source.to_owned())]);
+            assert_eq!(
+                inline_errors(&moved, &root, &["fixture"], keeps),
+                vec![
+                    format!("inline SQL: {moved_relative}: {expected}"),
+                    format!("inline keep {name} expected once, found 0"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn aliased_scalar_select_renderings_trip_the_inline_sql_control_without_matching_prose() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for (sql, detected) in [
+            ("SELECT last_insert_rowid()\nAS row_id", true),
+            ("SELECT changes()\nAS affected", true),
+            ("SELECT a source\nas the active option", false),
+            ("SELECT changes()\nto inspect the last write", false),
+            ("SELECT an empty argument list ()\nbefore submitting", false),
+            ("SELECT value\nAS alias", false),
+            ("select last_insert_rowid()\nAS row_id", false),
+        ] {
+            let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = if detected { vec![flat.clone()] } else { vec![] };
+            for rendered in [
+                format!("\"{flat}\""),
+                format!("\"{}\"", sql.replace('\n', "\\n")),
+                format!("\"{}\"", sql.replace('\n', " \\\n            ")),
+                format!("r#\"{sql}\"#"),
+            ] {
+                let source = format!("const Q: &str = {rendered};");
+                assert_eq!(sql_literals(&source), expected, "{source}");
+                let sources = BTreeMap::from([(path.clone(), source)]);
+                let errors = expected
+                    .iter()
+                    .map(|statement| format!("inline SQL: demo/src/lib.rs: {statement}"))
+                    .collect::<Vec<_>>();
+                assert_eq!(inline_errors(&sources, &root, &["demo"], &[]), errors);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "parse Rust source for inline SQL policy")]
+    fn unterminated_quoted_sql_literal_still_fails_closed() {
+        let root = PathBuf::from("/crates");
+        let source = r#"const PREFIX: &str = "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')"#;
+        let keep = Keep {
+            name: "quoted_notes",
+            path: "fixture/src/literals.rs",
+            sql: "UPDATE \"notes\" SET properties = json_set(COALESCE(properties, '{}')",
+            reason: "Fixture-only malformed Rust source control.",
+        };
+        let sources = BTreeMap::from([(root.join(keep.path), source.to_owned())]);
+        let _ = inline_errors(&sources, &root, &[], std::slice::from_ref(&keep));
+    }
+
+    #[test]
+    fn with_materialization_renderings_trip_the_inline_sql_control() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for (sql, expected) in [
+            (
+                "WITH t AS (SELECT 1)\nSELECT * FROM t",
+                "WITH t AS (SELECT 1) SELECT * FROM t",
+            ),
+            (
+                "WITH t AS\nMATERIALIZED (SELECT 1)\nSELECT * FROM t",
+                "WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t",
+            ),
+            (
+                "WITH t AS\nNOT MATERIALIZED (SELECT 1)\nSELECT * FROM t",
+                "WITH t AS NOT MATERIALIZED (SELECT 1) SELECT * FROM t",
+            ),
+            (
+                "WITH t AS (SELECT 1),\nu AS (SELECT * FROM t)\nSELECT * FROM u",
+                "WITH t AS (SELECT 1), u AS (SELECT * FROM t) SELECT * FROM u",
+            ),
+            (
+                "WITH t AS\nMATERIALIZED (SELECT 1),\nu AS\nMATERIALIZED (SELECT * FROM t)\nSELECT * FROM u",
+                "WITH t AS MATERIALIZED (SELECT 1), u AS MATERIALIZED (SELECT * FROM t) SELECT * FROM u",
+            ),
+            (
+                "WITH t AS\nNOT MATERIALIZED (SELECT 1),\nu AS\nNOT MATERIALIZED (SELECT * FROM t)\nSELECT * FROM u",
+                "WITH t AS NOT MATERIALIZED (SELECT 1), u AS NOT MATERIALIZED (SELECT * FROM t) SELECT * FROM u",
+            ),
+        ] {
+            for rendered in [
+                format!("\"{expected}\""),
+                format!("\"{}\"", sql.replace('\n', "\\n")),
+                format!("\"{}\"", sql.replace('\n', " \\\n            ")),
+                format!("r#\"{sql}\"#"),
+            ] {
+                let source = format!("const Q: &str = {rendered};");
+                assert_eq!(sql_literals(&source), vec![expected.to_owned()], "{source}");
+                let sources = BTreeMap::from([(path.clone(), source)]);
+                assert_eq!(
+                    inline_errors(&sources, &root, &["demo"], &[]),
+                    vec![format!("inline SQL: demo/src/lib.rs: {expected}")],
+                );
+                let keep = Keep {
+                    name: "rendering_control",
+                    path: "demo/src/lib.rs",
+                    sql: expected,
+                    reason: "Synthetic statement for the must-fail rendering control.",
+                };
+                assert!(inline_errors(&sources, &root, &["demo"], &[keep]).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn materialized_keeps_still_require_one_exact_path_and_statement() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for sql in [
+            "WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t",
+            "WITH t AS NOT MATERIALIZED (SELECT 1) SELECT * FROM t",
+        ] {
+            let source = format!("const Q: &str = \"{sql}\";");
+            let keep = || Keep {
+                name: "hinted_statement",
+                path: "demo/src/lib.rs",
+                sql,
+                reason: "Synthetic exact-keep control.",
+            };
+            let duplicate = BTreeMap::from([(path.clone(), format!("{source}\n{source}"))]);
+            assert_eq!(
+                inline_errors(&duplicate, &root, &["demo"], &[keep()]),
+                vec!["inline keep hinted_statement expected once, found 2"],
+            );
+            let missing = BTreeMap::from([(path.clone(), String::new())]);
+            assert_eq!(
+                inline_errors(&missing, &root, &["demo"], &[keep()]),
+                vec!["inline keep hinted_statement expected once, found 0"],
+            );
+            let moved = BTreeMap::from([(root.join("demo/src/other.rs"), source)]);
+            assert_eq!(
+                inline_errors(&moved, &root, &["demo"], &[keep()]),
+                vec![
+                    format!("inline SQL: demo/src/other.rs: {sql}"),
+                    "inline keep hinted_statement expected once, found 0".to_owned(),
+                ],
+            );
+            let changed = sql.replace("SELECT 1", "SELECT 2");
+            let changed_sources =
+                BTreeMap::from([(path.clone(), format!("const Q: &str = \"{changed}\";"))]);
+            assert_eq!(
+                inline_errors(&changed_sources, &root, &["demo"], &[keep()]),
+                vec![
+                    format!("inline SQL: demo/src/lib.rs: {changed}"),
+                    "inline keep hinted_statement expected once, found 0".to_owned(),
+                ],
             );
         }
     }

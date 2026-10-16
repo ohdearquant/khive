@@ -22,10 +22,10 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::fd_relative::{c_name, open_dir_at, stat_at};
 
@@ -77,34 +77,64 @@ impl fmt::Display for BudgetExhausted {
 
 impl std::error::Error for BudgetExhausted {}
 
-/// Open `/` (absolute) or `.` (relative) as the starting descriptor of a walk.
-fn open_anchor(absolute: bool) -> io::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options
+/// Open a directory read-only with a close-on-exec descriptor and final-component no-follow.
+///
+/// Earlier symlinks are resolved normally; a trailing slash or `/.` makes the preceding
+/// component an ancestor. This applies the kernel's `O_NOFOLLOW` semantics, not a containment
+/// or ancestor-trust policy. A non-directory is refused by the open itself.
+pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
+    std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options.open(if absolute { "/" } else { "." })
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map(OwnedFd::from)
 }
 
-/// `readlinkat` of `name` relative to `parent`, byte-exact.
-fn read_link_at(parent: &File, name: &OsStr) -> io::Result<OsString> {
+/// Open `/` (absolute) or `.` (relative) as the starting descriptor of a walk.
+fn open_anchor(absolute: bool) -> io::Result<File> {
+    open_dir_nofollow(Path::new(if absolute { "/" } else { "." })).map(File::from)
+}
+
+/// Read a symlink target relative to a held directory, preserving its bytes.
+///
+/// `name` has the single-component contract of [`c_name`]. OS errors, including EINVAL for
+/// a non-link, pass through unchanged. The buffer grows up to `PATH_MAX`; a target filling
+/// that ceiling is refused as InvalidData, never returned as potentially truncated success.
+/// Repeated reads do not prove the link stayed unchanged; callers own identity rechecks.
+pub fn read_link_at(parent: &File, name: &OsStr) -> io::Result<PathBuf> {
     let name = c_name(name)?;
-    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: `parent` is a live descriptor, `name` is NUL-terminated for the call, and `buffer`
-    // is a writable region of its declared length.
-    let length = unsafe {
-        libc::readlinkat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
-    if length < 0 {
-        return Err(io::Error::last_os_error());
+    let ceiling = libc::PATH_MAX as usize;
+    let mut capacity = 128.min(ceiling);
+    loop {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
+        buffer.resize(capacity, 0u8);
+        // SAFETY: parent is live, name is NUL-terminated, and buffer is writable for the call.
+        let length = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (length as usize) < capacity {
+            buffer.truncate(length as usize);
+            return Ok(PathBuf::from(OsString::from_vec(buffer)));
+        }
+        if capacity == ceiling {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symlink target fills PATH_MAX buffer",
+            ));
+        }
+        capacity = capacity.checked_mul(2).unwrap_or(ceiling).min(ceiling);
     }
-    buffer.truncate(length as usize);
-    Ok(OsString::from_vec(buffer))
 }
 
 /// The names `path` asks the walk to open, in order.
@@ -174,7 +204,7 @@ pub fn walk_to_directory<P: LinkPolicy>(
         budget -= 1;
         let link_target = read_link_at(&current, &name)?;
         policy.after_read(&context)?;
-        let target = Path::new(&link_target);
+        let target = link_target.as_path();
         if target.is_absolute() {
             let anchor = open_anchor(true)?;
             pinned.push(std::mem::replace(&mut current, anchor));

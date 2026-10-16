@@ -48,6 +48,7 @@ async fn fixture_with_gate(gate: khive_runtime::GateRef) -> Fixture {
             "comm".into(),
             PackConfig {
                 backend: "comm".into(),
+                verbs_disabled: Vec::new(),
                 no_embed: true,
             },
         )]),
@@ -367,7 +368,7 @@ async fn issue2992_public_reads_preserve_backend_failure_and_reject_non_kg_targe
         .unwrap_err();
         if verb == "get" {
             assert!(
-                matches!(error, RuntimeError::Storage(_) | RuntimeError::Sqlite(_)),
+                matches!(error, RuntimeError::Storage(_)),
                 "must preserve backend failure: {error}"
             );
         } else {

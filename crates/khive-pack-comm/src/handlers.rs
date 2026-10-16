@@ -1,7 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All eleven public verbs (`send`, `delivered`, `transport_status`, `inbox`, `unread`,
-//! `read`, `mark_read`, `reply`, `thread`, `health`, `probe`) store or query comm state.
+//! All fifteen public comm verbs store or query comm state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -13,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::embedding_warning::add_embedding_truncation_warning;
 use khive_runtime::{
     is_valid_mailbox_actor_label, EmailMessageIdDomains, KhiveRuntime, MailboxView, NamespaceToken,
     RuntimeError,
@@ -24,8 +24,8 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
-    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, short_id,
+    validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
     COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
@@ -52,8 +52,10 @@ mod probe_cursor;
 mod quarantine_heartbeat;
 mod read_marking;
 mod reply;
+mod suppression;
 mod thread;
 mod validation;
+mod withheld_body;
 #[doc(hidden)]
 pub use probe_cursor::PROBE_SQL;
 pub(crate) use probe_cursor::{handle_cursor_commit, handle_cursor_get, handle_probe};
@@ -70,6 +72,7 @@ pub(crate) use inbox::{handle_inbox, handle_unread};
 #[cfg(test)]
 use ingest::committed_ingest_degradations;
 pub(crate) use ingest::handle_ingest;
+pub use ingest::{resolve_ingest_correlation, ResolvedInboundThread, ThreadUuidProof};
 
 pub(crate) use parameter_aliases::{handle_delivered, handle_mark_read};
 
@@ -87,6 +90,14 @@ use read_marking::{
 };
 
 pub(crate) use reply::handle_reply;
+pub(crate) use suppression::{
+    handle_suppression_add, handle_suppression_list, handle_suppression_remove,
+};
+pub use suppression::{
+    load_inbound_email_suppressions, load_outbound_email_suppressions,
+    record_mailto_unsubscribe_suppression, record_reply_opt_out_suppression,
+};
+pub(crate) use withheld_body::handle_withheld_body;
 
 use validation::{
     addressed_recipient, caller_inherits_legacy_pool, canonicalize_ingest_sent_at,
@@ -94,21 +105,6 @@ use validation::{
     require_existing_thread_root, send_response_thread_id, thread_id_query_spellings,
     validate_actor_label, validate_inbox_substring,
 };
-
-fn add_embedding_truncation_warning(
-    response: &mut Value,
-    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
-) {
-    if !report.any_truncated() {
-        return;
-    }
-    if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "warnings".to_string(),
-            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
-        );
-    }
-}
 
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).

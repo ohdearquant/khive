@@ -4,6 +4,29 @@
 storage capability trait. This document covers the classifier predicates whose
 full rationale does not fit inline in the rustdoc contract.
 
+## Capacity admission
+
+`CapacityFloor` refuses a write that would violate the sampled free-space floor.
+It is not automatically retryable. `CapacityUnavailable` identifies the step
+that could not establish admission safety:
+
+| Phase            | Meaning                                                        | `is_retryable()` |
+| ---------------- | -------------------------------------------------------------- | ---------------- |
+| `identity`       | The physical volume could not be resolved or verified           | `false`          |
+| `lock`           | The cooperative lease could not be attempted or was refused     | `false`          |
+| `lock_contended` | The guard deadline elapsed while waiting for the volume lease   | `true`           |
+| `probe`          | Available capacity could not be established                     | `false`          |
+
+Only lease contention is transient: a retry can acquire the released lease and
+then sample capacity again. Each attempt remains bounded by
+`disk_guard_deadline_ms`, and a caller must bound its retry count or total budget.
+Neither error retries an operation itself. SQLite reports both unavailable lock
+phases as `sqlite_capacity_unavailable`; native `SQLITE_FULL` remains separate.
+
+`CapacityUnavailablePhase` is a public closed enum. Downstream exhaustive matches
+must add the `LockContended` variant; its stable display value is
+`lock_contended`.
+
 ## `WriterTaskNoRuntime`
 
 Returned instead of panicking: a caller that constructs a store from a plain,
@@ -14,16 +37,16 @@ when `PoolConfig::write_queue_enabled` is set.
 
 ## Writer-request finality
 
-`WriterTaskTerminated { request_state }` is the public error returned when a
+`WriterTaskTerminated { request_state, sqlite_full_codes }` is the public error returned when a
 single-writer request cannot complete because its writer-task instance has terminated or the
 legacy pool-mutex writer has been retired after a terminal transaction fault. The state reports
 what the execution seam can prove about the individual request:
 
-| State                   | Meaning                                                                                                                 |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure            |
-| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed       |
-| `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                    |
+| State                   | Meaning                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure        |
+| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed |
+| `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                |
 
 A top-level operation has no enclosing transaction, so a panic is always
 `SideEffectsUnknown`. An unexpected loss of the typed reply for an accepted
@@ -64,13 +87,70 @@ whether the writer seam terminated. MCP serializes that context with stable
 `request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
 request-failed versus task-terminated disposition and reconstructs the matching storage variant.
 
+A terminal operation or COMMIT failure caused by native SQLite FULL retains its
+primary and extended codes in `sqlite_full_codes`. Other terminal outcomes carry
+`None`; `StorageError::writer_task_terminated(request_state)` constructs that
+evidence-free form. The pair is not an error source and does not repeat the
+original cause's FULL escalation. It changes neither request finality nor retry
+policy. A native FULL that automatically ended SQLite's transaction still
+reports `SideEffectsUnknown` and retires the writer.
+
+Runtime projection recognizes only a nonnegative extended code whose low byte
+equals the supplied `SQLITE_FULL` primary code. It reports `sqlite_disk_full`
+with both codes, `capability: sql`, and the same terminal-state fields; the
+storage variant's `capability()` remains `None`. The events socket carries the
+optional pair, while frames without it keep the historical terminal projection.
+A COMMIT failure followed by a proven rollback still uses the existing
+`WriterTaskRequestFailed` / pool-error representation; this terminal repair
+does not change that path or domain-specific ambiguous-outcome adapters.
+
 The rendered forms remain stable:
 
 - `writer task request failed (request_state=<state>): <source>`
 - `writer task terminated (request_state=<state>)`
 
 `StorageError` is a public enum without `#[non_exhaustive]`, so
-`WriterTaskRequestFailed` is a Rust source-compatibility change for downstream exhaustive matches.
+`WriterTaskRequestFailed` and the added terminal evidence field are Rust
+source-compatibility changes for downstream exhaustive patterns or literal
+constructors. Use the terminal factory for outcomes without native evidence and
+`..` in patterns that inspect only request state.
+
+## Native SQLite write evidence (ADR-135 F6)
+
+`StorageError::SqliteWrite { failure, source }` preserves a native SQLite failure alongside the
+original storage error. `SqliteWriteFailure` carries `stage`, `primary_code`, `extended_code`, and
+`settlement_unknown`. The wrapper delegates Display, capability, retryability and specialized
+classifiers to its source. `sqlite_write_failure()` finds evidence through request-finality wrappers;
+`without_sqlite_write_stage()` borrows the original error without removing request finality.
+
+| Stage                      | Boundary                                                                                 |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| `sqlite_begin_busy`        | SQLite failed to begin the write transaction, including non-BUSY native BEGIN errors     |
+| `sqlite_statement_failure` | A statement failed after writer acquisition                                              |
+| `sqlite_commit_failure`    | COMMIT failed and existing settlement evidence permits a definite-failure classification |
+
+Runtime/MCP adds `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code`. A definite
+native failure also supplies its stage as caller-facing `code` and `stage`. Existing terminal or
+`side_effects_unknown` outcomes retain their caller-facing code/stage, while the separate
+`sqlite_write_stage` identifies the boundary that produced the original cause. Native FULL retains
+`sqlite_disk_full` precedence. These fields change neither request state nor retry policy, and retained
+terminal evidence has no original native error source that could duplicate FULL escalation.
+
+`settlement_unknown: true` records an already-observed cleanup failure, including a standalone poisoned
+batch. That evidence prevents a COMMIT cause from being reported as a definite commit failure. The
+serde default `false` means only that this evidence was not supplied; it does not prove rollback and
+cannot override an existing unknown or terminal outcome. Opaque migration scripts retain script-level
+statement attribution; no per-statement transaction boundary is inferred inside arbitrary SQL text.
+
+The events socket adds optional `sqlite_write_failure` evidence to its error frame. Frames without
+it retain the previous behavior; frames carrying it retain the existing request-failed versus
+terminated distinction and reconstruct the original retry policy. Existing domain-specific adapters
+that turn ambiguous errors into recovery guidance or degraded read results retain those policies.
+
+These are Rust source-compatibility changes: downstream exhaustive matches must handle the new
+`StorageError::SqliteWrite` and `khive_db::SqliteError::{Write, WriteSettlementUnknown}` variants.
+`EventsResponse::Error` literal constructors need the new optional field; new `SqliteWriteFailure`
+literals must include all fields. Use `..` in patterns that inspect only existing fields.
 
 ## Bounded blob read failures
 
@@ -128,12 +208,12 @@ until the connection's configured busy timeout expired. The writer task never
 invoked the request operation, so retrying that one failed operation is safe.
 The variant is capability-neutral and `is_retryable()` returns `true`.
 
-MCP preserves this proof with `code`/`stage` set to
-`writer_task_begin_busy`, `operation: "writer_task_begin"`, and
-`retryable: true`. Its `scope` and `retry_after_ms` are null: unlike
+MCP preserves this proof with `operation: "writer_task_begin"` and `retryable: true`.
+Without native evidence its `code`/`stage` remains `writer_task_begin_busy`; a native
+BEGIN refusal uses `sqlite_begin_busy` and the native code fields described above. Its `scope` and `retry_after_ms` are null: unlike
 `writer_queue_saturated`, the queue did accept this request, and no separate
-backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
-pool error and are not promoted by rendered-message matching.
+backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the original pool error's policy and gain native
+stage/code evidence when available; no promotion relies on rendered-message matching.
 
 ## Typed storage-admission timeout
 
@@ -160,7 +240,7 @@ budgets are capability-neutral and no separate backoff policy is defined.
 `pool_identity: Option<String>` identifies the database of the refusing pool when
 known. MCP includes a `pool_identity` string only for `Some`; `None` leaves the
 existing wire fields and message unchanged. When present, Display appends
-` (pool: {identity})` without changing `operation`. A `ConnectionPool` supplies
+`(pool: {identity})` preceded by a space, without changing `operation`. A `ConnectionPool` supplies
 only the canonical file name (lossy for non-UTF-8 names), or `:memory:` for an
 in-memory database. No directory is reported, including on local stdio servers.
 When distinct canonical paths with the same rendered file name are open in the

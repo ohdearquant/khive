@@ -1,137 +1,34 @@
 //! Hand-written recursive descent parser for GQL subset.
 
+use super::lexer::Cursor;
 use crate::ast::*;
 use crate::error::QueryError;
+use crate::language::{read_only_error, DEFAULT_HOP_CAP, GQL_WRITE_KEYWORDS};
 use std::collections::HashMap;
 
 struct Parser {
-    input: Vec<char>,
-    pos: usize,
+    cursor: Cursor,
+}
+
+impl std::ops::Deref for Parser {
+    type Target = Cursor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cursor
+    }
+}
+
+impl std::ops::DerefMut for Parser {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cursor
+    }
 }
 
 impl Parser {
     fn new(input: &str) -> Self {
         Self {
-            input: input.chars().collect(),
-            pos: 0,
+            cursor: Cursor::new(input),
         }
-    }
-
-    fn err(&self, msg: impl Into<String>) -> QueryError {
-        QueryError::Parse {
-            position: self.pos,
-            message: msg.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
-    }
-
-    fn advance(&mut self) -> Option<char> {
-        let c = self.input.get(self.pos).copied();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn expect_char(&mut self, expected: char) -> Result<(), QueryError> {
-        self.skip_whitespace();
-        match self.advance() {
-            Some(c) if c == expected => Ok(()),
-            Some(c) => Err(self.err(format!("expected '{expected}', got '{c}'"))),
-            None => Err(self.err(format!("expected '{expected}', got end of input"))),
-        }
-    }
-
-    fn try_keyword(&mut self, kw: &str) -> bool {
-        self.skip_whitespace();
-        let start = self.pos;
-        let kw_upper = kw.to_uppercase();
-        for expected_char in kw_upper.chars() {
-            match self.advance() {
-                Some(c) if c.to_uppercase().next() == Some(expected_char) => {}
-                _ => {
-                    self.pos = start;
-                    return false;
-                }
-            }
-        }
-        if let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.pos = start;
-                return false;
-            }
-        }
-        true
-    }
-
-    fn expect_keyword(&mut self, kw: &str) -> Result<(), QueryError> {
-        if !self.try_keyword(kw) {
-            Err(self.err(format!("expected keyword '{kw}'")))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn parse_ident(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected identifier"));
-        }
-        Ok(self.input[start..self.pos].iter().collect())
-    }
-
-    fn parse_number(&mut self) -> Result<usize, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected number"));
-        }
-        let s: String = self.input[start..self.pos].iter().collect();
-        s.parse()
-            .map_err(|_| self.err(format!("invalid number: {s}")))
-    }
-
-    fn parse_string_literal(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let quote = match self.advance() {
-            Some(c @ ('\'' | '"')) => c,
-            _ => return Err(self.err("expected string literal")),
-        };
-        let start = self.pos;
-        while let Some(c) = self.advance() {
-            if c == quote {
-                return Ok(self.input[start..self.pos - 1].iter().collect());
-            }
-        }
-        Err(self.err("unterminated string literal"))
     }
 
     fn parse_value(&mut self) -> Result<ConditionValue, QueryError> {
@@ -145,9 +42,7 @@ impl Parser {
                 }
                 // Enforce digits on both sides; `f64::parse` would accept `1.` and `-.5`.
                 let int_start = self.pos;
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.advance();
-                }
+                self.skip_ascii_digits();
                 if self.pos == int_start {
                     return Err(self.err("expected digit after '-'"));
                 }
@@ -156,9 +51,7 @@ impl Parser {
                     has_frac = true;
                     self.advance();
                     let frac_start = self.pos;
-                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                        self.advance();
-                    }
+                    self.skip_ascii_digits();
                     if self.pos == frac_start {
                         return Err(self.err(
                             "float literal must have digits after '.' (e.g. '1.0', not '1.')",
@@ -349,7 +242,7 @@ impl Parser {
                 }
             } else {
                 min_hops = 1;
-                max_hops = 5; // default unbounded cap
+                max_hops = DEFAULT_HOP_CAP; // default unbounded cap
             }
         }
 
@@ -593,19 +486,9 @@ impl Parser {
             0
         };
 
-        let limit = if self.try_keyword("LIMIT") {
-            Some(self.parse_number()?)
-        } else {
-            None
-        };
+        let limit = self.parse_limit()?;
 
-        self.skip_whitespace();
-        if self.pos < self.input.len() {
-            return Err(self.err(format!(
-                "unexpected trailing input: '{}'",
-                self.input[self.pos..].iter().collect::<String>()
-            )));
-        }
+        self.expect_end()?;
 
         Ok(GqlQuery {
             pattern,
@@ -632,437 +515,13 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// Deliberately rejects GQL/Cypher writes before the read grammar runs.
 fn reject_gql_write(input: &str) -> Result<(), QueryError> {
     let first = input.split_whitespace().next().unwrap_or("").to_uppercase();
-    match first.as_str() {
-        "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE" => {
-            Err(QueryError::Unsupported(
-                "the query verb is read-only; \
-                 to mutate the graph use: create, update, link, merge, delete"
-                    .into(),
-            ))
-        }
-        _ => Ok(()),
+    if GQL_WRITE_KEYWORDS.contains(&first.as_str()) {
+        Err(read_only_error(QueryError::Unsupported))
+    } else {
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn simple_two_node_pattern() {
-        let q = parse("MATCH (a:concept)-[e:introduced_by]->(b:paper) RETURN a, e, b").unwrap();
-        assert_eq!(q.pattern.elements.len(), 3);
-        assert_eq!(
-            q.return_items,
-            vec![
-                ReturnItem::Variable("a".into()),
-                ReturnItem::Variable("e".into()),
-                ReturnItem::Variable("b".into()),
-            ]
-        );
-
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].kind.as_deref(), Some("concept"));
-        assert_eq!(nodes[1].kind.as_deref(), Some("paper"));
-
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].relations, vec!["introduced_by"]);
-        assert_eq!(edges[0].direction, EdgeDirection::Out);
-    }
-
-    #[test]
-    fn variable_length_with_multiple_relations() {
-        let q = parse("MATCH (a {name: 'LoRA'})-[:extends|variant_of*1..3]->(b) RETURN b LIMIT 20")
-            .unwrap();
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(
-            nodes[0].properties.get("name").unwrap(),
-            &ConditionValue::String("LoRA".into())
-        );
-
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].relations, vec!["extends", "variant_of"]);
-        assert_eq!(edges[0].min_hops, 1);
-        assert_eq!(edges[0].max_hops, 3);
-        assert_eq!(q.offset, 0);
-        assert_eq!(q.limit, Some(20));
-    }
-
-    #[test]
-    fn skip_and_limit_parse_as_page_window() {
-        let q = parse("MATCH (a:concept) RETURN a SKIP 500 LIMIT 200").unwrap();
-        assert_eq!(q.offset, 500);
-        assert_eq!(q.limit, Some(200));
-    }
-
-    #[test]
-    fn skip_without_limit_is_supported() {
-        let q = parse("MATCH (a:concept) RETURN a SKIP 500").unwrap();
-        assert_eq!(q.offset, 500);
-        assert_eq!(q.limit, None);
-    }
-
-    #[test]
-    fn negative_skip_is_rejected() {
-        let err = parse("MATCH (a:concept) RETURN a SKIP -1").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Parse { .. }),
-            "negative SKIP must be a parse error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn skip_after_limit_is_rejected() {
-        let err = parse("MATCH (a:concept) RETURN a LIMIT 20 SKIP 10").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Parse { .. }),
-            "SKIP must precede LIMIT, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn sql_offset_keyword_remains_outside_gql() {
-        let err = parse("MATCH (a:concept) RETURN a OFFSET 10").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Parse { .. }),
-            "GQL paging uses SKIP rather than OFFSET, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn where_clause() {
-        let q = parse(
-            "MATCH (a)-[e:implements]->(b:project) WHERE b.name = 'lattice-inference' RETURN a LIMIT 10"
-        ).unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 1);
-        assert_eq!(conds[0].variable, "b");
-        assert_eq!(conds[0].property, PropertyRef::Field("name".into()));
-    }
-
-    #[test]
-    fn where_json_property_path_is_explicit_in_ast() {
-        let q = parse("MATCH (n) WHERE n.properties.finding.severity = 'high' RETURN n").unwrap();
-        let cond = q.where_clause.conditions().next().unwrap();
-        assert_eq!(
-            cond.property,
-            PropertyRef::JsonPath(vec!["finding".into(), "severity".into()])
-        );
-    }
-
-    #[test]
-    fn where_nested_path_rejects_non_properties_root() {
-        let err = parse("MATCH (n) WHERE n.finding.severity = 'high' RETURN n").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("invalid WHERE property path root 'finding'"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn where_clause_and() {
-        let q = parse(
-            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' AND b.kind = 'concept' RETURN a, b"
-        ).unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 2, "AND should produce two leaf conditions");
-        assert!(
-            matches!(&q.where_clause, WhereExpr::And(_, _)),
-            "should be And node"
-        );
-    }
-
-    #[test]
-    fn where_clause_or() {
-        let q = parse(
-            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN a",
-        )
-        .unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 2, "OR should produce two leaf conditions");
-        assert!(
-            matches!(&q.where_clause, WhereExpr::Or(_, _)),
-            "should be Or node"
-        );
-    }
-
-    #[test]
-    fn where_clause_and_or() {
-        let q = parse(
-            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
-        ).unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 3);
-        assert!(
-            matches!(&q.where_clause, WhereExpr::Or(_, _)),
-            "top-level should be Or"
-        );
-    }
-
-    #[test]
-    fn where_clause_extended_operators() {
-        let q = parse(
-            "MATCH (n:entity) WHERE n.name CONTAINS '%_' AND n.name STARTS WITH 'pre' \
-             AND n.kind IN ['concept', 'document'] AND n.properties.domain IS NOT NULL RETURN n",
-        )
-        .unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 4);
-        assert_eq!(conds[0].op, CompareOp::Contains);
-        assert_eq!(conds[0].value, ConditionValue::String("%_".into()));
-        assert_eq!(conds[1].op, CompareOp::StartsWith);
-        assert_eq!(conds[2].op, CompareOp::In);
-        assert_eq!(
-            conds[2].value,
-            ConditionValue::List(vec![
-                ConditionValue::String("concept".into()),
-                ConditionValue::String("document".into()),
-            ])
-        );
-        assert_eq!(conds[3].op, CompareOp::IsNotNull);
-        assert_eq!(conds[3].value, ConditionValue::Null);
-    }
-
-    #[test]
-    fn where_clause_is_null() {
-        let q = parse("MATCH (n:entity) WHERE n.properties.domain IS NULL RETURN n").unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 1);
-        assert_eq!(conds[0].op, CompareOp::IsNull);
-        assert_eq!(conds[0].value, ConditionValue::Null);
-    }
-
-    #[test]
-    fn where_clause_is_null_and_is_not_null_together() {
-        let q = parse(
-            "MATCH (n:entity) WHERE n.name IS NOT NULL AND n.properties.domain IS NULL RETURN n",
-        )
-        .unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(conds.len(), 2);
-        assert_eq!(conds[0].op, CompareOp::IsNotNull);
-        assert_eq!(conds[1].op, CompareOp::IsNull);
-    }
-
-    #[test]
-    fn where_in_accepts_scalar_list_and_empty_list() {
-        let q = parse(
-            "MATCH (n) WHERE n.properties.value IN ['x', 1, 2.5, true] \
-             OR n.properties.value IN [] RETURN n",
-        )
-        .unwrap();
-        let conds: Vec<_> = q.where_clause.conditions().collect();
-        assert_eq!(
-            conds[0].value,
-            ConditionValue::List(vec![
-                ConditionValue::String("x".into()),
-                ConditionValue::Integer(1),
-                ConditionValue::Number(2.5),
-                ConditionValue::Bool(true),
-            ])
-        );
-        assert_eq!(conds[1].value, ConditionValue::List(vec![]));
-    }
-
-    #[test]
-    fn contains_and_starts_with_require_strings() {
-        let contains = parse("MATCH (n) WHERE n.name CONTAINS 1 RETURN n").unwrap_err();
-        assert!(contains.to_string().contains("require a string literal"));
-
-        let starts = parse("MATCH (n) WHERE n.name STARTS WITH true RETURN n").unwrap_err();
-        assert!(starts.to_string().contains("require a string literal"));
-    }
-
-    #[test]
-    fn inbound_edge() {
-        let q = parse("MATCH (a:paper)<-[e:introduced_by]-(b:concept) RETURN a, b").unwrap();
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].direction, EdgeDirection::In);
-    }
-
-    #[test]
-    fn undirected_edge() {
-        let q = parse("MATCH (a)-[e:competes_with]-(b) RETURN a, b").unwrap();
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].direction, EdgeDirection::Both);
-    }
-
-    #[test]
-    fn three_node_chain() {
-        let q = parse(
-            "MATCH (a:concept)-[:introduced_by]->(p:paper)-[:introduced_by]->(c:concept) RETURN a, c"
-        ).unwrap();
-        assert_eq!(q.pattern.elements.len(), 5);
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes.len(), 3);
-    }
-
-    #[test]
-    fn comma_separated_match_patterns_name_unsupported_construct() {
-        let err = parse("MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b").unwrap_err();
-        assert!(
-            matches!(&err, QueryError::Unsupported(_)),
-            "multiple MATCH patterns must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("comma-separated MATCH patterns"),
-            "error must name the unsupported construct; got: {msg}"
-        );
-        assert!(
-            msg.contains("e.id") && msg.contains("e.relation"),
-            "error must preserve edge identity in its alternative; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn return_aliases_name_unsupported_construct() {
-        for query in [
-            "MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5",
-            "MATCH (a) RETURN a as node",
-            "MATCH (a)-[e]->(b) RETURN a.name, b.name aS dst",
-        ] {
-            let err = parse(query).unwrap_err();
-            assert!(
-                matches!(&err, QueryError::Unsupported(_)),
-                "RETURN alias must return Unsupported for {query:?}; got {err:?}"
-            );
-            assert!(
-                err.to_string().contains("aliases (`AS`)"),
-                "error must name AS for {query:?}; got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn documented_single_path_parallel_edge_audit_parses() {
-        let q = parse("MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id").unwrap();
-        assert_eq!(
-            q.return_items,
-            vec![
-                ReturnItem::Property("a".into(), "id".into()),
-                ReturnItem::Property("e".into(), "id".into()),
-                ReturnItem::Property("e".into(), "relation".into()),
-                ReturnItem::Property("b".into(), "id".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn gql_dialect_reference_matches_parser_contract() {
-        const DOCS: &str = include_str!("../../docs/api/parsing.md");
-        const SUPPORTED: &str = "MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id";
-        const MULTI_PATTERN: &str = "MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b";
-        const ALIAS: &str = "MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5";
-
-        for query in [SUPPORTED, MULTI_PATTERN, ALIAS] {
-            assert!(
-                DOCS.contains(query),
-                "dialect reference must include contract example: {query}"
-            );
-        }
-
-        parse(SUPPORTED).expect("documented single-path alternative must parse");
-        for (query, feature) in [
-            (MULTI_PATTERN, "comma-separated MATCH patterns"),
-            (ALIAS, "aliases (`AS`)"),
-        ] {
-            let err = parse(query).unwrap_err();
-            assert!(
-                matches!(&err, QueryError::Unsupported(_)),
-                "documented unsupported form must return Unsupported; got {err:?}"
-            );
-            assert!(
-                err.to_string().contains(feature),
-                "documented error must name {feature:?}; got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn node_pattern_entity_type_lifted_from_properties() {
-        let q = parse("MATCH (n:document {entity_type: 'paper'}) RETURN n").unwrap();
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(
-            nodes[0].entity_type.as_deref(),
-            Some("paper"),
-            "entity_type must be lifted into NodePattern.entity_type"
-        );
-        assert!(
-            !nodes[0].properties.contains_key("entity_type"),
-            "entity_type must be removed from the properties map after lifting"
-        );
-    }
-
-    #[test]
-    fn gql_create_rejected_with_readonly_message() {
-        let err = parse("CREATE (n:concept {name: 'X'}) RETURN n").unwrap_err();
-        assert!(
-            matches!(err, crate::error::QueryError::Unsupported(_)),
-            "GQL CREATE must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("read-only"),
-            "error must mention 'read-only'; got: {msg}"
-        );
-        assert!(
-            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
-            "error must name the mutation verbs; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn gql_delete_rejected_with_readonly_message() {
-        let err = parse("DELETE (n) WHERE n.kind = 'concept'").unwrap_err();
-        assert!(
-            matches!(err, crate::error::QueryError::Unsupported(_)),
-            "GQL DELETE must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn gql_set_rejected_with_readonly_message() {
-        let err = parse("SET (n:concept) RETURN n").unwrap_err();
-        assert!(
-            matches!(err, crate::error::QueryError::Unsupported(_)),
-            "GQL SET must return Unsupported; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn gql_merge_rejected_with_readonly_message() {
-        let err = parse("MERGE (n:concept {name: 'X'}) RETURN n").unwrap_err();
-        assert!(
-            matches!(err, crate::error::QueryError::Unsupported(_)),
-            "GQL MERGE must return Unsupported; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn gql_match_still_compiles_after_write_guard() {
-        let q = parse("MATCH (a:concept)-[:extends]->(b) RETURN a").unwrap();
-        assert!(!q.pattern.elements.is_empty(), "valid MATCH must parse");
-    }
-
-    #[test]
-    fn gql_detach_delete_rejected() {
-        let err = parse("DETACH DELETE (n)").unwrap_err();
-        assert!(
-            matches!(err, crate::error::QueryError::Unsupported(_)),
-            "DETACH DELETE must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("read-only"),
-            "error must mention 'read-only'; got: {msg}"
-        );
-        assert!(
-            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
-            "error must name the mutation verbs; got: {msg}"
-        );
-    }
-}
+#[path = "gql_tests.rs"]
+mod tests;

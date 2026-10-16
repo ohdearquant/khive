@@ -434,6 +434,15 @@ pub struct KhiveError {
 impl KhiveError {
     // ---- constructors ----
 
+    fn prefixed(kind: ErrorKind, prefix: &str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: alloc::format!("{prefix}: {}", message.into()),
+            code: None,
+            details: None,
+        }
+    }
+
     /// Create a `NotFound` error for a missing resource identified by `id`.
     pub fn not_found(resource: impl fmt::Display, id: impl fmt::Display) -> Self {
         Self {
@@ -446,52 +455,27 @@ impl KhiveError {
 
     /// Create an `InvalidInput` error with the given message.
     pub fn invalid_input(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::InvalidInput,
-            message: alloc::format!("invalid input: {}", message.into()),
-            code: None,
-            details: None,
-        }
+        Self::prefixed(ErrorKind::InvalidInput, "invalid input", message)
     }
 
     /// Create an `Unauthorized` error with the given message.
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::Unauthorized,
-            message: alloc::format!("unauthorized: {}", message.into()),
-            code: None,
-            details: None,
-        }
+        Self::prefixed(ErrorKind::Unauthorized, "unauthorized", message)
     }
 
     /// Create a `Conflict` error with the given message.
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::Conflict,
-            message: alloc::format!("conflict: {}", message.into()),
-            code: None,
-            details: None,
-        }
+        Self::prefixed(ErrorKind::Conflict, "conflict", message)
     }
 
     /// Create an `Unavailable` error with the given message.
     pub fn unavailable(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::Unavailable,
-            message: alloc::format!("unavailable: {}", message.into()),
-            code: None,
-            details: None,
-        }
+        Self::prefixed(ErrorKind::Unavailable, "unavailable", message)
     }
 
     /// Create an `Internal` error with the given message.
     pub fn internal(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::Internal,
-            message: alloc::format!("internal: {}", message.into()),
-            code: None,
-            details: None,
-        }
+        Self::prefixed(ErrorKind::Internal, "internal", message)
     }
 
     // ---- builder methods ----

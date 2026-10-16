@@ -8,7 +8,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
+use khive_storage::entity::{Entity, EntityFilter, EntityTombstones, EntityTypeCounts};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -217,6 +217,29 @@ pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     }
 }
 
+/// Preserve merge provenance when tombstoning a live source in its existing namespace.
+pub fn entity_merge_tombstone_statement(
+    namespace: &str,
+    from_id: Uuid,
+    into_id: Uuid,
+    merge_event_id: Uuid,
+    now: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE entities \
+             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1, version = version + 1 \
+             WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
+        vec![
+            SqlValue::Integer(now),
+            SqlValue::Text(into_id.to_string()),
+            SqlValue::Text(merge_event_id.to_string()),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(from_id.to_string()),
+        ],
+    )
+    .labelled("entity-merge-tombstone")
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_entity(Hard)` issues
 /// (no `deleted_at` predicate — purges live and already-tombstoned rows).
 pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
@@ -314,7 +337,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -327,6 +350,7 @@ impl SqlEntityStore {
                 .map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn())
                 .map_err(|e| map_err(e, op))
+                .map_err(crate::error::statement_failure)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
@@ -343,7 +367,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|error| map_err(error, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|error| map_err(error, op)), op)
                 .await;
         }
 
@@ -420,6 +444,11 @@ impl SqlEntityStore {
         mode: EntityPageMode,
     ) -> Result<Page<Entity>, StorageError> {
         let operation = mode.operation();
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            operation,
+        )?;
         let namespace = namespace.to_string();
         let skip_total = mode == EntityPageMode::CountFree || is_complete_id_lookup(&filter, &page);
         let limit_i64 = i64::from(page.limit);
@@ -744,7 +773,12 @@ fn build_entity_where_with_mode(
             )
         };
 
-    let mut conditions: Vec<String> = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut conditions: Vec<String> = vec![ns_condition];
+    match filter.tombstones {
+        EntityTombstones::Live => conditions.push("deleted_at IS NULL".into()),
+        EntityTombstones::All => {}
+        EntityTombstones::Only => conditions.push("deleted_at IS NOT NULL".into()),
+    }
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if !filter.ids.is_empty() {
@@ -888,6 +922,12 @@ fn build_entity_where_with_mode(
         ));
     }
 
+    super::append_json_equalities(
+        &mut conditions,
+        &mut params,
+        "properties",
+        &filter.property_equalities,
+    );
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -951,7 +991,9 @@ fn build_entity_page_query_from_source(
 /// Keep selective names/kinds/tags and legacy JSON paths free to choose their
 /// own access paths. Explicit IDs always keep the bounded primary-key plan.
 fn entity_list_source(filter: &EntityFilter) -> &'static str {
-    if !filter.ids.is_empty()
+    if filter.tombstones != EntityTombstones::Live
+        || !filter.property_equalities.is_empty()
+        || !filter.ids.is_empty()
         || !filter.kinds.is_empty()
         || !filter.entity_types_by_kind.is_empty()
         || filter.legacy_entity_type_fallback
@@ -995,6 +1037,9 @@ fn has_one_distinct_value(values: &[String]) -> bool {
 /// Other predicates remain row-local residual filters, so the page can stop
 /// after its limit without materializing the complete matching ID set.
 fn entity_count_free_source(filter: &EntityFilter) -> &'static str {
+    if filter.tombstones != EntityTombstones::Live {
+        return entity_read_source(filter);
+    }
     if !is_entity_streaming_page(filter) {
         return entity_list_source(filter);
     }
@@ -1136,6 +1181,7 @@ fn build_entity_cursor_query(
 
 fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
+        && filter.property_equalities.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
         && filter.entity_types_by_kind.is_empty()
@@ -1229,10 +1275,13 @@ impl EntityStore for SqlEntityStore {
         // closure would violate SQLite's nested-transaction rule).
         if let Some(writer_task) = self.current_writer_task("upsert_entities")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_entities(conn, &entities, attempted)
-                        .map_err(|e| map_err(e, "upsert_entities"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_upsert_entities(conn, &entities, attempted)
+                            .map_err(|e| map_err(e, "upsert_entities"))
+                    },
+                    "upsert_entities",
+                )
                 .await;
         }
 
@@ -1368,6 +1417,11 @@ impl EntityStore for SqlEntityStore {
         after: Option<SeekCursor>,
         limit: u32,
     ) -> Result<SeekPage<Entity>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "query_entities_after",
+        )?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -1470,6 +1524,11 @@ impl EntityStore for SqlEntityStore {
         namespace: &str,
         filter: EntityFilter,
     ) -> Result<u64, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "count_entities",
+        )?;
         let namespace = namespace.to_string();
 
         let index = entity_list_index(&filter);
@@ -1545,3 +1604,7 @@ mod direct_busy_tests;
 #[cfg(test)]
 #[path = "entity_list_plan_tests.rs"]
 mod entity_list_plan_tests;
+
+#[cfg(test)]
+#[path = "entity_merge_tombstone_tests.rs"]
+mod entity_merge_tombstone_tests;

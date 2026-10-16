@@ -43,20 +43,9 @@ impl KgPack {
                     let target =
                         resolve_uuid_unfiltered(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
-                    // Canonicalize only the duplicate-detection key. Runtime validation
-                    // must see caller order so a rejected symmetric relation reports the
-                    // legal set for the requested ordered pair; `build_edge` canonicalizes
-                    // the accepted edge before persistence.
-                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
-                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
-                    if !seen.insert(key) {
-                        skipped += 1;
-                        continue;
-                    }
                     let weight = validate_weight(entry.weight)?;
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
-                    entry_indices.push(idx);
-                    specs.push(LinkSpec {
+                    let spec = LinkSpec {
                         namespace: Some(token.namespace().as_str().to_owned()),
                         source_id: source,
                         target_id: target,
@@ -64,7 +53,41 @@ impl KgPack {
                         weight,
                         metadata,
                         resurrect: entry.resurrect.unwrap_or(false),
-                    });
+                    };
+                    // Canonicalize only the duplicate-detection key. Runtime validation
+                    // must see caller order so a rejected symmetric relation reports the
+                    // legal set for the requested ordered pair; `build_edge` canonicalizes
+                    // the accepted edge before persistence.
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        // Selected entries reach the batch validators below. A discarded
+                        // duplicate must still pass the same hook and edge preflight.
+                        registry
+                            .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
+                            .await?;
+                        match self.runtime.build_edge(token, &spec).await {
+                            Ok(_) => {}
+                            Err(RuntimeError::InvalidInput(ref msg))
+                                if msg.contains("not in the base endpoint allowlist") =>
+                            {
+                                let enriched = enrich_bulk_atomic_allowlist_error(
+                                    msg,
+                                    &self.runtime,
+                                    token,
+                                    std::slice::from_ref(&spec),
+                                    std::slice::from_ref(&idx),
+                                )
+                                .await;
+                                return Err(RuntimeError::InvalidInput(enriched));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        skipped += 1;
+                        continue;
+                    }
+                    entry_indices.push(idx);
+                    specs.push(spec);
                 }
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
@@ -159,14 +182,6 @@ impl KgPack {
                             continue;
                         }
                     };
-                    // Keep caller order for validation/diagnostics; only the dedup key
-                    // needs UUID-canonical endpoints. `link` canonicalizes on success.
-                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
-                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
-                    if !seen.insert(key) {
-                        skipped += 1;
-                        continue;
-                    }
                     let weight = match validate_weight(entry.weight) {
                         Ok(w) => w,
                         Err(e) => {
@@ -198,6 +213,33 @@ impl KgPack {
                         error_list.push(json!({"index": idx, "error": format!("{e}")}));
                         continue;
                     }
+                    // Only successful entries reserve a natural key. Failed validation
+                    // or a refused write must not suppress a later valid entry.
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
+                    if seen.contains(&key) {
+                        match self.runtime.build_edge(token, &spec).await {
+                            Ok(_) => skipped += 1,
+                            Err(RuntimeError::InvalidInput(ref msg))
+                                if msg.contains("not in the base endpoint allowlist") =>
+                            {
+                                let enriched = enrich_allowlist_error(
+                                    msg,
+                                    &self.runtime,
+                                    token,
+                                    source,
+                                    target,
+                                    relation,
+                                )
+                                .await;
+                                error_list.push(json!({"index": idx, "error": enriched}));
+                            }
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}))
+                            }
+                        }
+                        continue;
+                    }
                     match self
                         .runtime
                         .link_observed(
@@ -212,6 +254,7 @@ impl KgPack {
                         .await
                     {
                         Ok(row) => {
+                            seen.insert(key);
                             match row.disposition {
                                 khive_storage::EdgeUpsertDisposition::Created => created += 1,
                                 khive_storage::EdgeUpsertDisposition::Updated => updated += 1,

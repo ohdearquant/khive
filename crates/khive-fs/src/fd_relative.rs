@@ -10,8 +10,10 @@
 //! through `errno`, and every platform spells the accessor differently.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fmt;
 use std::fs::File;
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
@@ -73,6 +75,41 @@ pub fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
+/// Device and inode identity in the unsigned representation used by Unix `MetadataExt`.
+///
+/// Equality compares the object observed by each call, not its contents. It does not
+/// prevent later replacement, inode reuse, or changes to the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    /// Read identity from the open handle using the standard library's metadata path.
+    pub fn of(file: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Read identity relative to `parent`, identifying a final symlink itself.
+    ///
+    /// Name validation and errors are those of [`stat_at`], including its native
+    /// `fstatat` representation limits. No path containment policy is added.
+    #[allow(clippy::unnecessary_cast)] // The native field widths and signedness vary by Unix target.
+    pub fn at(parent: &File, name: &OsStr) -> io::Result<Self> {
+        let stat = stat_at(parent, name)?;
+        Ok(Self {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        })
+    }
+}
+
 /// Open `name` read-only relative to `parent`, refusing a symlink at the final component.
 ///
 /// The open is close-on-exec and non-blocking. With `directory` set it also requires the
@@ -90,6 +127,112 @@ pub fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File>
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` was just returned by a successful `openat` and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Remove a file or symlink entry relative to `parent`; directories are refused.
+///
+/// The name follows [`c_name`]'s single-component policy. A symlink target is
+/// never removed. This does not sync the directory after the removal.
+pub fn unlink_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: parent is live and the validated name is NUL-terminated for the call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Rename an entry between independently held directory handles.
+///
+/// Both names pass [`c_name`] before any mutation. The kernel's ordinary rename
+/// replacement and error semantics apply; this neither follows a final symlink
+/// nor syncs either directory after the rename.
+pub fn rename_at(
+    from_parent: &File,
+    from_name: &OsStr,
+    to_parent: &File,
+    to_name: &OsStr,
+) -> io::Result<()> {
+    let from_name = c_name(from_name)?;
+    let to_name = c_name(to_name)?;
+    // SAFETY: both parents are live and both validated names remain NUL-terminated.
+    let rc = unsafe {
+        libc::renameat(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Creation policy for a descriptor-relative writable open.
+#[derive(Debug, Clone, Copy)]
+pub enum Create {
+    /// Open an existing entry; do not create one.
+    No,
+    /// Create the entry if it is missing, preserving existing contents otherwise.
+    IfMissing,
+    /// Create a new entry, refusing any existing entry.
+    Exclusive,
+}
+
+/// Options for [`open_file_at`]. Opens never truncate existing contents.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFileOptions {
+    /// Open read-write when true, or write-only when false.
+    pub read_write: bool,
+    pub create: Create,
+    /// Add `O_NONBLOCK` to the open.
+    pub nonblock: bool,
+    /// Creation permissions, filtered by the process umask; ignored for existing entries.
+    pub mode: u32,
+}
+
+/// Open one writable entry relative to a borrowed directory descriptor.
+///
+/// Always uses `O_NOFOLLOW | O_CLOEXEC`. The name passes through [`c_name`], with
+/// an additional refusal of `.` and `..`; the older read/directory helpers keep
+/// their existing dot-component policy. This does not require a regular file.
+pub fn open_file_at(
+    parent: BorrowedFd<'_>,
+    name: impl AsRef<OsStr>,
+    opts: OpenFileOptions,
+) -> io::Result<File> {
+    let name = c_name(name.as_ref())?;
+    if matches!(name.to_bytes(), b"." | b"..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dot components are not writable names",
+        ));
+    }
+    let access = if opts.read_write {
+        libc::O_RDWR
+    } else {
+        libc::O_WRONLY
+    };
+    let create = match opts.create {
+        Create::No => 0,
+        Create::IfMissing => libc::O_CREAT,
+        Create::Exclusive => libc::O_CREAT | libc::O_EXCL,
+    };
+    let flags = access
+        | create
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if opts.nonblock { libc::O_NONBLOCK } else { 0 };
+    // SAFETY: parent is borrowed and live, the validated name is NUL-terminated,
+    // and mode is passed as the promoted unsigned integer required by openat's varargs.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, opts.mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful openat returned a new descriptor owned by this File.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -206,34 +349,200 @@ impl Drop for DirStream {
 /// before every `readdir`, so a NULL return with a nonzero `errno` is reported as an error
 /// instead of ending the listing early.
 pub fn list_names(directory: &File) -> io::Result<Vec<OsString>> {
-    let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
+    read_names(directory, None).map_err(|error| match error {
+        ListNamesError::Io(source) => source,
+        error => io::Error::other(error),
+    })
+}
+
+/// A directory read failed or encountered more entries than the caller permits.
+#[derive(Debug)]
+pub enum ListNamesError {
+    Io(io::Error),
+    LimitExceeded { max: usize },
+}
+
+impl fmt::Display for ListNamesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(formatter),
+            Self::LimitExceeded { max } => {
+                write!(formatter, "directory entry limit {max} exceeded")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ListNamesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::LimitExceeded { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for ListNamesError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// List sorted UTF-8 names, refusing rather than truncating above `max` entries.
+///
+/// Every non-dot entry counts before conversion, including hidden names, links and
+/// non-UTF-8 names. Non-UTF-8 names are omitted from the successful String result.
+/// Zero permits only an empty directory. The caller's directory position is unchanged.
+pub fn list_names_bounded(directory: &File, max: usize) -> Result<Vec<String>, ListNamesError> {
+    Ok(list_names_raw_bounded(directory, max)?
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .collect())
+}
+
+pub(crate) fn list_names_raw_bounded(
+    directory: &File,
+    max: usize,
+) -> Result<Vec<OsString>, ListNamesError> {
+    read_names(directory, Some(max))
+}
+
+fn read_names(directory: &File, max: Option<usize>) -> Result<Vec<OsString>, ListNamesError> {
+    read_names_detailed(directory, max).map_err(|error| match error.kind {
+        DetailedListErrorKind::Io(source) => ListNamesError::Io(source),
+        DetailedListErrorKind::LimitExceeded { max, .. } => ListNamesError::LimitExceeded { max },
+    })
+}
+
+/// Private progress needed by reported discovery, without changing the old listing errors.
+#[derive(Debug)]
+pub(crate) struct DetailedListError {
+    pub(crate) observed: usize,
+    pub(crate) kind: DetailedListErrorKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum DetailedListErrorKind {
+    Io(io::Error),
+    LimitExceeded { max: usize, excess: OsString },
+}
+
+pub(crate) fn read_names_detailed(
+    directory: &File,
+    max: Option<usize>,
+) -> Result<Vec<OsString>, DetailedListError> {
+    let setup_error = |source| DetailedListError {
+        observed: 0,
+        kind: DetailedListErrorKind::Io(source),
+    };
+    let fd = open_at(directory, OsStr::new("."), true)
+        .map_err(setup_error)?
+        .into_raw_fd();
     // SAFETY: `fd` is uniquely owned and `fdopendir` takes ownership of it on success.
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
         // SAFETY: `fdopendir` failed, so ownership of `fd` remains here.
         unsafe { libc::close(fd) };
-        return Err(error);
+        return Err(setup_error(error));
     }
     let stream = DirStream(stream);
-    let mut result = Vec::new();
-    loop {
-        clear_errno();
-        // SAFETY: `stream` holds a live `DIR*` until this function returns.
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(0) {
-                return Err(error);
+    collect_names_detailed(
+        || {
+            clear_errno();
+            // SAFETY: `stream` holds a live `DIR*` until collection returns.
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() != Some(0) {
+                    Err(error)
+                } else {
+                    Ok(None)
+                };
             }
-            break;
+            // SAFETY: `d_name` is NUL-terminated and copied before the next readdir.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            Ok(Some(OsString::from_vec(name.to_vec())))
+        },
+        max,
+    )
+}
+
+// Keep accounting on the production collection path. A supplied next observation also
+// lets tests deterministically cover a read error after progress, without a second reader.
+fn collect_names_detailed(
+    mut next: impl FnMut() -> io::Result<Option<OsString>>,
+    max: Option<usize>,
+) -> Result<Vec<OsString>, DetailedListError> {
+    let mut result = Vec::new();
+    while let Some(name) = next().map_err(|source| DetailedListError {
+        observed: result.len(),
+        kind: DetailedListErrorKind::Io(source),
+    })? {
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
         }
-        // SAFETY: `d_name` is NUL-terminated and is copied out before the next `readdir`.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            result.push(OsString::from_vec(name.to_vec()));
+        if let Some(max) = max {
+            if result.len() == max {
+                return Err(DetailedListError {
+                    observed: result.len().saturating_add(1),
+                    kind: DetailedListErrorKind::LimitExceeded { max, excess: name },
+                });
+            }
         }
+        result.push(name);
     }
     result.sort();
     Ok(result)
+}
+
+#[cfg(test)]
+mod detailed_listing_tests {
+    use super::*;
+
+    #[test]
+    fn partial_native_error_retains_raw_progress_and_stops_reading() {
+        let mut observations = [
+            Ok(OsString::from(".")),
+            Ok(OsString::from(".hidden")),
+            Ok(OsString::from_vec(b"raw-\xff".to_vec())),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            Ok(OsString::from("must-not-read")),
+        ]
+        .into_iter();
+        let error = collect_names_detailed(|| observations.next().transpose(), None).unwrap_err();
+        assert_eq!(error.observed, 2);
+        let DetailedListErrorKind::Io(source) = error.kind else {
+            panic!("partial native read failure must remain an I/O error");
+        };
+        assert_eq!(source.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            observations.next().unwrap().unwrap(),
+            OsStr::new("must-not-read")
+        );
+    }
+
+    #[test]
+    fn excess_witness_is_the_native_observation_and_stops_before_sorting() {
+        let mut observations = ["z", "a", "b", "must-not-read"].into_iter();
+        let error = collect_names_detailed(|| Ok(observations.next().map(OsString::from)), Some(2))
+            .unwrap_err();
+        assert_eq!(error.observed, 3);
+        assert!(
+            matches!(error.kind, DetailedListErrorKind::LimitExceeded { max: 2, excess }
+            if excess == OsStr::new("b"))
+        );
+        assert_eq!(observations.next(), Some("must-not-read"));
+    }
+
+    #[test]
+    fn exact_cap_sorts_only_a_complete_listing_and_dot_names_do_not_count() {
+        let mut observations = ["z", ".", "..", "a"].into_iter();
+        let names = collect_names_detailed(|| Ok(observations.next().map(OsString::from)), Some(2))
+            .unwrap();
+        assert_eq!(names, [OsString::from("a"), OsString::from("z")]);
+        assert!(collect_names_detailed(|| Ok(None), Some(0))
+            .unwrap()
+            .is_empty());
+    }
 }

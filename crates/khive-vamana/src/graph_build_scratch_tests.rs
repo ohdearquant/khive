@@ -1,4 +1,4 @@
-//! Allocation accounting for the actual visited-set constructor on dedicated workers.
+//! Allocation accounting for Vamana's visited-set construction factory on dedicated workers.
 
 use super::*;
 

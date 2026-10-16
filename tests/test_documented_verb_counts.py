@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
 from documented_verb_counts import (
     RegistryCounts,
+    _published_files,
+    is_published_markdown,
     registry_counts,
     scan_document,
     scan_repository,
@@ -443,6 +446,44 @@ After persisting a reminder, the other three schedule verbs do not require `comm
             adr.write_text("1 verb across 1 pack\n", encoding="utf-8")
             counts = RegistryCounts(total_verbs=28, pack_verbs=PACK_COUNTS)
             self.assertEqual(scan_repository(root, counts), [])
+
+    def assert_predicate_matches_scan(self, root: Path, markdown: set[str]) -> None:
+        scanned = {
+            path.relative_to(root).as_posix()
+            for path in _published_files(root, [])
+            if path.suffix == ".md"
+        }
+        predicted = {path for path in markdown if is_published_markdown(path)}
+        self.assertEqual(predicted, scanned & markdown)
+        self.assertTrue(predicted, "the population must contain scanned files")
+        self.assertTrue(markdown - predicted, "the population must contain unscanned files")
+
+    def test_published_markdown_predicate_matches_the_scanned_files(self) -> None:
+        # ci-docs-only.sh asks this predicate about one changed path; the scan walks the
+        # tree with the same globs. Paths the globs treat differently are all present.
+        paths = {
+            "README.md", "CONTRIBUTING.md", "npm/README.md", "npm/CHANGES.md",
+            "docs/guide.md", "docs/guide/deep/counts.md", "docs/adr/ADR-001-x.md",
+            "docs/adrx/notes.md", "marketplace/a/b/skill.md", "scripts/notes.md",
+            "crates/README.md", "crates/khive-db/README.md", "crates/khive-db/docs/a/b.md",
+            "crates/khive-db/notes.md", "crates/docs/top.md", "notes/guide.md", ".github/x.md",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for path in paths:
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text("# x\n", encoding="utf-8")
+            self.assert_predicate_matches_scan(root, paths)
+
+    def test_published_markdown_predicate_matches_the_repository(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "--", "*.md"], cwd=root, capture_output=True,
+            text=True, timeout=30, check=True,
+        ).stdout
+        tracked = {path for path in listed.split("\0") if path}
+        self.assertIn("docs/adr/README.md", tracked)
+        self.assert_predicate_matches_scan(root, tracked)
 
 
 if __name__ == "__main__":

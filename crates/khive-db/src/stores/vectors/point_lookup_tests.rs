@@ -102,7 +102,7 @@ impl Fixture {
                         vector.model,
                         vector.kind,
                         vector.field,
-                        f32_slice_as_bytes(&vector.embedding),
+                        encode_f32_native(&vector.embedding),
                     ])
                     .expect("seed vector");
                 provenance
@@ -110,7 +110,7 @@ impl Fixture {
                         MODEL,
                         vector.id.to_string(),
                         vector.namespace,
-                        blake3::hash(f32_slice_as_bytes(&vector.embedding))
+                        blake3::hash(&encode_f32_native(&vector.embedding))
                             .to_hex()
                             .to_string(),
                     ])

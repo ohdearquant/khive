@@ -1,7 +1,9 @@
 //! SPARQL-inspired syntax parser producing the same AST as the GQL parser.
 
+use super::lexer::Cursor;
 use crate::ast::*;
 use crate::error::QueryError;
+use crate::language::{read_only_error, DEFAULT_HOP_CAP, SPARQL_WRITE_KEYWORDS};
 use std::collections::{BTreeMap, HashMap};
 
 struct Triple {
@@ -59,139 +61,34 @@ enum Object {
 }
 
 struct SparqlParser {
-    input: Vec<char>,
-    pos: usize,
+    cursor: Cursor,
+}
+
+impl std::ops::Deref for SparqlParser {
+    type Target = Cursor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cursor
+    }
+}
+
+impl std::ops::DerefMut for SparqlParser {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cursor
+    }
 }
 
 impl SparqlParser {
     fn new(input: &str) -> Self {
         Self {
-            input: input.chars().collect(),
-            pos: 0,
+            cursor: Cursor::new(input),
         }
-    }
-
-    fn err(&self, msg: impl Into<String>) -> QueryError {
-        QueryError::Parse {
-            position: self.pos,
-            message: msg.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
-    }
-
-    fn advance(&mut self) -> Option<char> {
-        let c = self.input.get(self.pos).copied();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn expect_char(&mut self, expected: char) -> Result<(), QueryError> {
-        self.skip_whitespace();
-        match self.advance() {
-            Some(c) if c == expected => Ok(()),
-            Some(c) => Err(self.err(format!("expected '{expected}', got '{c}'"))),
-            None => Err(self.err(format!("expected '{expected}', got end of input"))),
-        }
-    }
-
-    fn try_keyword(&mut self, kw: &str) -> bool {
-        self.skip_whitespace();
-        let start = self.pos;
-        let kw_upper = kw.to_uppercase();
-        for expected_char in kw_upper.chars() {
-            match self.advance() {
-                Some(c) if c.to_uppercase().next() == Some(expected_char) => {}
-                _ => {
-                    self.pos = start;
-                    return false;
-                }
-            }
-        }
-        if let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.pos = start;
-                return false;
-            }
-        }
-        true
-    }
-
-    fn expect_keyword(&mut self, kw: &str) -> Result<(), QueryError> {
-        if !self.try_keyword(kw) {
-            Err(self.err(format!("expected keyword '{kw}'")))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn parse_ident(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected identifier"));
-        }
-        Ok(self.input[start..self.pos].iter().collect())
     }
 
     fn parse_var(&mut self) -> Result<String, QueryError> {
         self.skip_whitespace();
         self.expect_char('?')?;
         self.parse_ident()
-    }
-
-    fn parse_number(&mut self) -> Result<usize, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected number"));
-        }
-        let s: String = self.input[start..self.pos].iter().collect();
-        s.parse()
-            .map_err(|_| self.err(format!("invalid number: {s}")))
-    }
-
-    fn parse_string_literal(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let quote = match self.advance() {
-            Some(c @ ('\'' | '"')) => c,
-            _ => return Err(self.err("expected string literal")),
-        };
-        let start = self.pos;
-        while let Some(c) = self.advance() {
-            if c == quote {
-                return Ok(self.input[start..self.pos - 1].iter().collect());
-            }
-        }
-        Err(self.err("unterminated string literal"))
     }
 
     fn parse_predicate(&mut self) -> Result<Predicate, QueryError> {
@@ -219,7 +116,7 @@ impl SparqlParser {
         let (min_hops, max_hops) = match self.peek() {
             Some('+') => {
                 self.advance();
-                (1, 5)
+                (1, DEFAULT_HOP_CAP)
             }
             Some('*') => {
                 // The CTE cannot emit depth zero; treating `*` as `+` would lose matches.
@@ -337,19 +234,9 @@ impl SparqlParser {
             triples.push(self.parse_triple()?);
         }
 
-        let limit = if self.try_keyword("LIMIT") {
-            Some(self.parse_number()?)
-        } else {
-            None
-        };
+        let limit = self.parse_limit()?;
 
-        self.skip_whitespace();
-        if self.pos < self.input.len() {
-            return Err(self.err(format!(
-                "unexpected trailing input: '{}'",
-                self.input[self.pos..].iter().collect::<String>()
-            )));
-        }
+        self.expect_end()?;
 
         triples_to_ast(triples, return_items, limit)
     }
@@ -625,14 +512,10 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// Rejects SPARQL Update after skipping comments and an optional prologue.
 fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
     let keyword = leading_keyword(input);
-    match keyword.as_str() {
-        "INSERT" | "DELETE" | "WITH" | "LOAD" | "CLEAR" | "CREATE" | "DROP" | "COPY" | "MOVE"
-        | "ADD" => Err(QueryError::Unsupported(
-            "the query verb is read-only; \
-             to mutate the graph use: create, update, link, merge, delete"
-                .into(),
-        )),
-        _ => Ok(()),
+    if SPARQL_WRITE_KEYWORDS.contains(&keyword.as_str()) {
+        Err(read_only_error(QueryError::Unsupported))
+    } else {
+        Ok(())
     }
 }
 
@@ -669,345 +552,5 @@ pub(crate) fn leading_keyword(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn simple_two_node() {
-        let q = parse("SELECT ?a ?b WHERE { ?a a :concept . ?a :extends ?b . } LIMIT 10").unwrap();
-        assert_eq!(
-            q.return_items,
-            vec![
-                ReturnItem::Variable("a".into()),
-                ReturnItem::Variable("b".into())
-            ]
-        );
-        assert_eq!(q.offset, 0);
-        assert_eq!(q.limit, Some(10));
-
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].kind.as_deref(), Some("concept"));
-        assert_eq!(nodes[0].variable.as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn variable_length_plus() {
-        let q = parse("SELECT ?b WHERE { ?a :name 'LoRA' . ?a :extends+ ?b . }").unwrap();
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(
-            nodes[0].properties.get("name").unwrap(),
-            &ConditionValue::String("LoRA".into())
-        );
-
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].min_hops, 1);
-        assert_eq!(edges[0].max_hops, 5);
-    }
-
-    #[test]
-    fn explicit_range() {
-        let q = parse("SELECT ?a ?b WHERE { ?a :extends{1,3} ?b . }").unwrap();
-        let edges: Vec<_> = q.pattern.edges().collect();
-        assert_eq!(edges[0].min_hops, 1);
-        assert_eq!(edges[0].max_hops, 3);
-    }
-
-    #[test]
-    fn three_node_chain() {
-        let q =
-            parse("SELECT ?a ?c WHERE { ?a :extends ?b . ?b :introduced_by ?c . ?c a :paper . }")
-                .unwrap();
-        assert_eq!(q.pattern.elements.len(), 5); // 3 nodes + 2 edges
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes.len(), 3);
-        assert_eq!(nodes[2].kind.as_deref(), Some("paper"));
-    }
-
-    #[test]
-    fn property_filter() {
-        let q =
-            parse("SELECT ?a WHERE { ?a a :concept . ?a :domain 'attention' . ?a :extends+ ?b . }")
-                .unwrap();
-        let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(
-            nodes[0].properties.get("domain").unwrap(),
-            &ConditionValue::String("attention".into())
-        );
-    }
-
-    #[test]
-    fn conflicting_repeated_kind_constraint_is_rejected() {
-        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a a :person . ?a :extends ?b . }")
-            .unwrap_err();
-        assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
-        assert!(err.to_string().contains("conflicting kind"), "{err}");
-    }
-
-    #[test]
-    fn substrate_and_granular_kinds_constrain_the_same_node_in_both_orders() {
-        for kinds in [":entity . ?a a :concept", ":concept . ?a a :entity"] {
-            let query = parse(&format!(
-                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
-            ))
-            .unwrap();
-            let start = query.pattern.nodes().next().unwrap();
-            assert_eq!(start.kind.as_deref(), Some("entity"));
-            let conditions: Vec<_> = query.where_clause.conditions().collect();
-            assert_eq!(conditions.len(), 1);
-            assert_eq!(conditions[0].variable, "a");
-            assert_eq!(conditions[0].property, PropertyRef::Field("kind".into()));
-            assert_eq!(
-                conditions[0].value,
-                ConditionValue::String("concept".into())
-            );
-        }
-    }
-
-    #[test]
-    fn conflicting_substrate_kinds_are_rejected_in_both_orders() {
-        for kinds in [":entity . ?a a :note", ":note . ?a a :entity"] {
-            let err = parse(&format!(
-                "SELECT ?a WHERE {{ ?a a {kinds} . ?a :extends ?b . }}"
-            ))
-            .unwrap_err();
-            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
-            assert!(err.to_string().contains("conflicting kind"), "{err}");
-        }
-    }
-
-    #[test]
-    fn conflicting_repeated_string_or_kind_literal_is_rejected() {
-        for input in [
-            "SELECT ?a WHERE { ?a :name 'x' . ?a :name 'y' . ?a :extends ?b . }",
-            "SELECT ?a WHERE { ?a :domain :attention . ?a :domain 'vision' . ?a :extends ?b . }",
-        ] {
-            let err = parse(input).unwrap_err();
-            assert!(matches!(err, QueryError::Parse { .. }), "{err:?}");
-            assert!(err.to_string().contains("conflicting constraints"), "{err}");
-        }
-    }
-
-    #[test]
-    fn identical_repeated_kind_and_string_constraints_are_idempotent() {
-        let query = parse(
-            "SELECT ?a WHERE { ?a a :concept . ?a a :concept . \
-             ?a :name 'x' . ?a :name 'x' . ?a :extends ?b . }",
-        )
-        .expect("identical repeated triples remain valid");
-        let start = query.pattern.nodes().next().expect("start node");
-        assert_eq!(start.kind.as_deref(), Some("concept"));
-        assert_eq!(
-            start.properties.get("name"),
-            Some(&ConditionValue::String("x".into()))
-        );
-    }
-
-    #[test]
-    fn numeric_property_filter_is_explicit_json_path_in_ast() {
-        let q = parse("SELECT ?a WHERE { ?a :score 1.5 . ?a :extends ?b . }").unwrap();
-        let cond = q.where_clause.conditions().next().unwrap();
-        assert_eq!(cond.property, PropertyRef::JsonPath(vec!["score".into()]));
-    }
-
-    #[test]
-    fn repeated_numeric_property_values_remain_conjunctive() {
-        let query = parse("SELECT ?a WHERE { ?a :score 1 . ?a :score 2 . ?a :extends ?b . }")
-            .expect("distinct numeric triples are valid conjuncts");
-        assert!(matches!(&query.where_clause, WhereExpr::And(_, _)));
-        let conditions: Vec<_> = query.where_clause.conditions().collect();
-        assert_eq!(
-            conditions.len(),
-            2,
-            "neither numeric triple may be discarded"
-        );
-        for (condition, value) in conditions.into_iter().zip([1, 2]) {
-            assert_eq!(condition.variable, "a");
-            assert_eq!(
-                condition.property,
-                PropertyRef::JsonPath(vec!["score".into()])
-            );
-            assert_eq!(condition.op, CompareOp::Eq);
-            assert_eq!(condition.value, ConditionValue::Integer(value));
-        }
-        let compiled = crate::compile(&query, &crate::CompileOptions::default())
-            .expect("both conjuncts compile");
-        assert_eq!(
-            compiled
-                .sql
-                .matches("json_extract(n0.properties, '$.score') = ?")
-                .count(),
-            2,
-            "SQL must test the scalar JSON property against both values"
-        );
-    }
-
-    #[test]
-    fn disconnected_triples_rejected() {
-        let err = parse("SELECT ?a ?d WHERE { ?a :extends ?b . ?c :implements ?d . }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn branched_triples_rejected() {
-        let err =
-            parse("SELECT ?a ?b ?c WHERE { ?a :extends ?b . ?a :implements ?c . }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn disconnected_kind_constraint_rejected() {
-        let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c a :concept . }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported for disconnected kind constraint, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn disconnected_property_constraint_rejected() {
-        let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c :name 'LoRA' . }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported for disconnected property constraint, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_trailing_input_after_limit() {
-        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a :extends ?b . } LIMIT 10 GARBAGE")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("unexpected trailing input"),
-            "expected trailing-input parse error, got {err}"
-        );
-    }
-
-    #[test]
-    fn sparql_offset_remains_outside_the_dialect() {
-        let err = parse("SELECT ?a WHERE { ?a :extends ?b . } LIMIT 10 OFFSET 10").unwrap_err();
-        assert!(
-            err.to_string().contains("unexpected trailing input"),
-            "SPARQL OFFSET must not leak in through the shared AST, got {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_trailing_input_without_limit() {
-        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a :extends ?b . } and then some")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("unexpected trailing input"),
-            "expected trailing-input parse error, got {err}"
-        );
-    }
-
-    #[test]
-    fn sparql_insert_data_rejected_with_readonly_message() {
-        let err = parse("INSERT DATA { <a> :extends <b> }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "INSERT DATA must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("read-only"),
-            "error must mention 'read-only'; got: {msg}"
-        );
-        assert!(
-            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
-            "error must name the mutation verbs; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn sparql_delete_data_rejected_with_readonly_message() {
-        let err = parse("DELETE DATA { <a> :extends <b> }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "DELETE DATA must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn sparql_delete_where_rejected_with_readonly_message() {
-        let err = parse("DELETE WHERE { ?s :extends ?o }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "DELETE WHERE must return Unsupported; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn sparql_load_rejected_with_readonly_message() {
-        let err = parse("LOAD <http://example.org/graph>").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "LOAD must return Unsupported; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn sparql_select_still_compiles_after_write_guard() {
-        let q = parse("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
-        assert!(!q.pattern.elements.is_empty(), "valid SELECT must parse");
-    }
-
-    #[test]
-    fn sparql_with_delete_where_rejected() {
-        let err = parse("WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "WITH … DELETE … must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("read-only"),
-            "error must mention 'read-only'; got: {msg}"
-        );
-        assert!(
-            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
-            "error must name the mutation verbs; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn sparql_prefixed_insert_data_rejected() {
-        let err =
-            parse("PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:b ex:c }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "prefixed INSERT DATA must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn sparql_clear_graph_rejected() {
-        let err = parse("CLEAR GRAPH <http://example.org/graph>").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "CLEAR GRAPH must return Unsupported; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn sparql_prefixed_select_write_guard_passes_through() {
-        let err =
-            parse("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ?p ?o }").unwrap_err();
-        assert!(
-            !matches!(err, QueryError::Unsupported(_)),
-            "prefixed SELECT must not be rejected by the write guard; got {err:?}"
-        );
-    }
-}
+#[path = "sparql_tests.rs"]
+mod tests;

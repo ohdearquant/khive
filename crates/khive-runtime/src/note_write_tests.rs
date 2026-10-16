@@ -500,10 +500,13 @@ async fn ann_deletes(runtime: &KhiveRuntime, id: uuid::Uuid) -> i64 {
         .reader()
         .await
         .unwrap()
-        .query_scalar(crate::note_write::statement(
-            "SELECT COUNT(*) FROM ann_write_log WHERE subject_id=?1 AND op='delete'",
-            vec![khive_storage::SqlValue::Text(id.to_string())],
-        ))
+        .query_scalar(
+            khive_storage::SqlStatement::new(
+                "SELECT COUNT(*) FROM ann_write_log WHERE subject_id=?1 AND op='delete'",
+                vec![khive_storage::SqlValue::Text(id.to_string())],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -545,15 +548,18 @@ async fn note_sidecar_count(runtime: &KhiveRuntime, note: &Note) -> i64 {
         .reader()
         .await
         .unwrap()
-        .query_scalar(crate::note_write::statement(
-            "SELECT COUNT(*) FROM vector_provenance \
+        .query_scalar(
+            khive_storage::SqlStatement::new(
+                "SELECT COUNT(*) FROM vector_provenance \
              WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
-            vec![
-                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
-                khive_storage::SqlValue::Text(note.namespace.clone()),
-                khive_storage::SqlValue::Text(note.id.to_string()),
-            ],
-        ))
+                vec![
+                    khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                    khive_storage::SqlValue::Text(note.namespace.clone()),
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     let Some(khive_storage::SqlValue::Integer(count)) = result else {
@@ -568,15 +574,18 @@ async fn note_sidecar_snapshot(runtime: &KhiveRuntime, note: &Note) -> serde_jso
         .reader()
         .await
         .unwrap()
-        .query_all(crate::note_write::statement(
-            "SELECT model_key, subject_id, namespace, embedding_digest, \
+        .query_all(
+            khive_storage::SqlStatement::new(
+                "SELECT model_key, subject_id, namespace, embedding_digest, \
                     text_fingerprint, updated_at \
              FROM vector_provenance WHERE model_key=?1 AND subject_id=?2",
-            vec![
-                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
-                khive_storage::SqlValue::Text(note.id.to_string()),
-            ],
-        ))
+                vec![
+                    khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     serde_json::to_value(rows).unwrap()
@@ -588,14 +597,17 @@ async fn note_vector_blob_hex(runtime: &KhiveRuntime, note: &Note) -> String {
         .reader()
         .await
         .unwrap()
-        .query_scalar(crate::note_write::statement(
-            "SELECT hex(embedding) FROM vec_note_version_test \
+        .query_scalar(
+            khive_storage::SqlStatement::new(
+                "SELECT hex(embedding) FROM vec_note_version_test \
              WHERE namespace=?1 AND subject_id=?2",
-            vec![
-                khive_storage::SqlValue::Text(note.namespace.clone()),
-                khive_storage::SqlValue::Text(note.id.to_string()),
-            ],
-        ))
+                vec![
+                    khive_storage::SqlValue::Text(note.namespace.clone()),
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     let Some(khive_storage::SqlValue::Text(blob)) = result else {
@@ -665,13 +677,16 @@ async fn atomic_message_subject_only_move_clears_old_namespace_provenance() {
         .reader()
         .await
         .unwrap()
-        .query_scalar(crate::note_write::statement(
-            format!("SELECT COUNT(*) FROM {table} WHERE namespace=?1 AND subject_id=?2"),
-            vec![
-                khive_storage::SqlValue::Text("other".into()),
-                khive_storage::SqlValue::Text(note.id.to_string()),
-            ],
-        ))
+        .query_scalar(
+            khive_storage::SqlStatement::new(
+                format!("SELECT COUNT(*) FROM {table} WHERE namespace=?1 AND subject_id=?2"),
+                vec![
+                    khive_storage::SqlValue::Text("other".into()),
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     assert!(matches!(moved, Some(khive_storage::SqlValue::Integer(1))));
@@ -702,10 +717,13 @@ async fn version_guarded_vector_publication_canonicalizes_builtin_aliases() {
         .reader()
         .await
         .unwrap()
-        .query_scalar(crate::note_write::statement(
-            "SELECT embedding_model FROM ann_write_log WHERE subject_id=?1 AND op='upsert'",
-            vec![khive_storage::SqlValue::Text(note.id.to_string())],
-        ))
+        .query_scalar(
+            khive_storage::SqlStatement::new(
+                "SELECT embedding_model FROM ann_write_log WHERE subject_id=?1 AND op='upsert'",
+                vec![khive_storage::SqlValue::Text(note.id.to_string())],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     assert!(
@@ -783,10 +801,13 @@ async fn version_creation_compensation_preserves_or_removes_attachments_with_rev
             .reader()
             .await
             .unwrap()
-            .query_scalar(crate::note_write::statement(
-                "SELECT COUNT(*) FROM attachments WHERE record_uuid=?1",
-                vec![khive_storage::SqlValue::Text(note.id.to_string())],
-            ))
+            .query_scalar(
+                khive_storage::SqlStatement::new(
+                    "SELECT COUNT(*) FROM attachments WHERE record_uuid=?1",
+                    vec![khive_storage::SqlValue::Text(note.id.to_string())],
+                )
+                .labelled("note-write-guard"),
+            )
             .await
             .unwrap();
         assert!(
@@ -867,26 +888,32 @@ async fn note_vector_purge_scopes_sidecar_to_model_and_namespace() {
     // are outside the local purge's authority.
     let mut writer = runtime.sql().writer().await.unwrap();
     writer
-        .execute(crate::note_write::statement(
-            "UPDATE vector_provenance SET namespace='foreign' \
+        .execute(
+            khive_storage::SqlStatement::new(
+                "UPDATE vector_provenance SET namespace='foreign' \
              WHERE model_key=?1 AND subject_id=?2",
-            vec![
-                khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
-                khive_storage::SqlValue::Text(note.id.to_string()),
-            ],
-        ))
+                vec![
+                    khive_storage::SqlValue::Text(crate::config::sanitize_key(MODEL)),
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     writer
-        .execute(crate::note_write::statement(
-            "INSERT INTO vector_provenance \
+        .execute(
+            khive_storage::SqlStatement::new(
+                "INSERT INTO vector_provenance \
              (model_key, subject_id, namespace, embedding_digest, text_fingerprint, updated_at) \
              VALUES ('unrelated_model', ?1, 'local', ?2, NULL, NULL)",
-            vec![
-                khive_storage::SqlValue::Text(note.id.to_string()),
-                khive_storage::SqlValue::Text("0".repeat(64)),
-            ],
-        ))
+                vec![
+                    khive_storage::SqlValue::Text(note.id.to_string()),
+                    khive_storage::SqlValue::Text("0".repeat(64)),
+                ],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     drop(writer);
@@ -901,11 +928,14 @@ async fn note_vector_purge_scopes_sidecar_to_model_and_namespace() {
         .reader()
         .await
         .unwrap()
-        .query_all(crate::note_write::statement(
-            "SELECT model_key, namespace FROM vector_provenance WHERE subject_id=?1 \
+        .query_all(
+            khive_storage::SqlStatement::new(
+                "SELECT model_key, namespace FROM vector_provenance WHERE subject_id=?1 \
              ORDER BY model_key",
-            vec![khive_storage::SqlValue::Text(note.id.to_string())],
-        ))
+                vec![khive_storage::SqlValue::Text(note.id.to_string())],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     assert_eq!(remaining.len(), 2);
@@ -1385,10 +1415,10 @@ async fn assert_writer_time_embedding_inheritance(retired: bool) {
     apply_post_commit_effects_with_report(&runtime, &token, post_commit)
         .await
         .unwrap();
-    let stored = runtime.sql().reader().await.unwrap().query_scalar(crate::note_write::statement(
+    let stored = runtime.sql().reader().await.unwrap().query_scalar(khive_storage::SqlStatement::new(
         "SELECT vec_to_json(embedding) FROM vec_note_version_test WHERE namespace=?1 AND subject_id=?2",
         vec![khive_storage::SqlValue::Text("local".into()), khive_storage::SqlValue::Text(note.id.to_string())],
-    )).await.unwrap().unwrap();
+    ).labelled("note-write-guard")).await.unwrap().unwrap();
     let khive_storage::SqlValue::Text(stored) = stored else {
         panic!("vector JSON")
     };
@@ -1559,10 +1589,13 @@ async fn version_guard_observes_a_write_after_prepare_without_timestamp_change()
         .writer()
         .await
         .unwrap()
-        .execute(crate::note_write::statement(
-            "UPDATE notes SET properties='{}' WHERE id=?1",
-            vec![khive_storage::SqlValue::Text(note.id.to_string())],
-        ))
+        .execute(
+            khive_storage::SqlStatement::new(
+                "UPDATE notes SET properties='{}' WHERE id=?1",
+                vec![khive_storage::SqlValue::Text(note.id.to_string())],
+            )
+            .labelled("note-write-guard"),
+        )
         .await
         .unwrap();
     let current = runtime

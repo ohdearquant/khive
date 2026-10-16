@@ -57,8 +57,15 @@ Each node record: `degree: u32` followed by `degree` neighbor IDs as `u32`.
 
 ### `vectors.bin`
 
-Raw `f32` values in little-endian IEEE 754 format, row-major:
-`num_vectors × dimensions × 4` bytes. Loaded via `memmap2` as a read-only mapping.
+Raw `f32` values in the host's native byte order, row-major:
+`num_vectors × dimensions × 4` bytes. Directory checkpoints are loaded via
+`memmap2` as a read-only native-float mapping; their payload and corpus hashes
+are not a cross-endian format. This applies to both v1 and v2 directories.
+
+The portable `to_bytes` / `from_bytes` container instead encodes its vector
+segment as little-endian IEEE 754 values. Reframing a directory without decoding
+its native payload does not convert its byte order. Existing directory payloads,
+mmap readers and fingerprints are unchanged.
 
 ---
 
@@ -130,6 +137,16 @@ and saves a fresh generation. The guarantee is integrity with rebuild fallback, 
 continuous availability of the previous snapshot. See
 [ADR-052 Amendment 1](../../../../docs/adr/ADR-052-ann-production-lifecycle.md#amendment-1-2026-09-27-v2-segment-promotion-after-metadata)
 and [ADR-079 Amendment 3](../../../../docs/adr/ADR-079-ann-persistence-warm-path-integration.md#amendment-3-2026-09-27-interrupted-v2-save-can-require-coldrebuild).
+
+The checkpoint directory owns this publication boundary. On Unix it publishes
+metadata through the shared descriptor-relative atomic helper with the existing
+stale-entry refusal policy, including file sync, rename and directory sync, then
+promotes the four already-staged segments in vectors/graph/lifecycle/codes order
+and syncs the directory again. The caller holds `.checkpoint.lock` across all
+staging and publication. If promotion fails partway through, retrying
+`save_atomic` stages all four segments again before publishing a fresh commit;
+the private publication method does not resume an incomplete generation. Windows
+retains its existing handle-relative metadata staging and publication sequence.
 
 File-backed commits append a 16-byte random publication nonce after the existing
 41-byte watermark/codes trailer. Readers accept all three layouts: the original base

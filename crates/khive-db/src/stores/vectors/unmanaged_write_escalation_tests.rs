@@ -43,11 +43,20 @@ async fn vector_unmanaged_writer_escalates_sqlite_full() {
         })
         .await
         .expect_err("direct vector write must preserve the SQLite failure");
-    assert!(matches!(error,
+    assert_eq!(
+        error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_FULL,
+            extended_code: rusqlite::ffi::SQLITE_FULL,
+            settlement_unknown: false,
+        })
+    );
+    assert!(matches!(&error,
         StorageError::WriterTaskRequestFailed {
             request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
             source,
-        } if matches!(*source, StorageError::Driver { .. })
+        } if matches!(source.without_sqlite_write_stage(), StorageError::Driver { .. })
     ));
     assert!(
         receiver.try_iter().any(|db| db == expected_db),

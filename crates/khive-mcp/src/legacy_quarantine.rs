@@ -42,6 +42,9 @@ pub(crate) struct RepairReport {
     pub(crate) inserted: u64,
     pub(crate) after_live_originals: u64,
     pub(crate) after_unowned: u64,
+    /// Passes over the whole roster: 1 when the first census finds nothing to
+    /// repair, 3 when it repairs (census, repair, confirming census).
+    pub(crate) scans: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -85,13 +88,26 @@ pub(crate) async fn repair_legacy_quarantine(
             before.unowned
         );
     }
-    let (_, inserted) = scan(&main, &unique, Mode::Repair).await?;
-    let (after, _) = scan(&main, &unique, Mode::Inspect).await?;
-    ensure!(
-        after.unowned == 0,
-        "legacy quarantine repair left {} originals without a matching main attachment",
-        after.unowned
-    );
+    // The census already verified every live original it found is published
+    // and owned, so with nothing unowned a repair pass and a confirming census
+    // would walk every message row twice more to change nothing.
+    // Nothing creates a new unowned original: ingest publishes a quarantined
+    // message and its owner attachment in one transaction
+    // (`try_create_note_as_trusted_ingest_with_attachment`). A clean first
+    // census therefore stays clean, and the repair and confirming passes add
+    // nothing.
+    let (after, inserted, scans) = if before.unowned == 0 {
+        (before, 0, 1)
+    } else {
+        let (_, inserted) = scan(&main, &unique, Mode::Repair).await?;
+        let (after, _) = scan(&main, &unique, Mode::Inspect).await?;
+        ensure!(
+            after.unowned == 0,
+            "legacy quarantine repair left {} originals without a matching main attachment",
+            after.unowned
+        );
+        (after, inserted, 3)
+    };
     let report = RepairReport {
         backends: unique.len(),
         before_live_originals: before.live_originals,
@@ -99,10 +115,12 @@ pub(crate) async fn repair_legacy_quarantine(
         inserted,
         after_live_originals: after.live_originals,
         after_unowned: after.unowned,
+        scans,
     };
     tracing::info!(
         target: "khive.boot",
         backends = report.backends,
+        scans = report.scans,
         before_live_originals = report.before_live_originals,
         before_unowned = report.before_unowned,
         inserted = report.inserted,
@@ -122,6 +140,31 @@ pub(crate) async fn repair_legacy_quarantine(
         );
     }
     Ok(report)
+}
+
+/// Boot entry for [`repair_legacy_quarantine`]. A process that forwards its
+/// requests to the daemon skips it: the daemon runs this repair at its own boot
+/// before it serves, while the census reads every message row on every
+/// backend, which costs a client seconds and pulls the stores through the page
+/// cache on each start. A store that only forwarding clients ever open keeps
+/// its legacy originals unowned until the daemon, a daemonless host or
+/// `kkernel exec` opens it; the repair only adds owner attachments and never
+/// changes or removes a note.
+pub(crate) async fn repair_legacy_quarantine_at_boot(
+    main_runtime: &KhiveRuntime,
+    sources: &[(&str, &StorageBackend)],
+    forwarding_client: bool,
+) -> Result<Option<RepairReport>> {
+    if forwarding_client {
+        tracing::info!(
+            target: "khive.boot",
+            "legacy slugless quarantine original repair skipped: the daemon runs it"
+        );
+        return Ok(None);
+    }
+    repair_legacy_quarantine(main_runtime, sources)
+        .await
+        .map(Some)
 }
 
 async fn scan(
@@ -311,6 +354,7 @@ mod tests {
         assert_eq!(first.before_unowned, 1);
         assert_eq!(first.inserted, 1);
         assert_eq!(first.after_unowned, 0);
+        assert_eq!(first.scans, 3);
         let owner = runtime
             .attachments()
             .unwrap()
@@ -344,6 +388,54 @@ mod tests {
         assert_eq!(second.before_unowned, 0);
         assert_eq!(second.inserted, 0);
         assert_eq!(second.after_unowned, 0);
+        assert_eq!(second.before_live_originals, 1);
+        assert_eq!(second.after_live_originals, 1);
+        assert_eq!(
+            second.scans, 1,
+            "nothing unowned: one census and no repair pass"
+        );
+    }
+
+    async fn original_owner(runtime: &KhiveRuntime, id: Uuid) -> Option<Attachment> {
+        runtime
+            .attachments()
+            .unwrap()
+            .get_attachment(id, ORIGINAL_ROLE)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn boot_entry_skips_the_repair_only_for_a_forwarding_client() {
+        let (_root, runtime, blob) = fixture().await;
+        let original = blob.put(b"client boot original".to_vec()).await.unwrap();
+        let id = seed(
+            runtime.backend(),
+            "mail-archive",
+            json!({"quarantined": true, "quarantine_content_ref": original.to_string()}),
+            false,
+        )
+        .await;
+        let skipped =
+            repair_legacy_quarantine_at_boot(&runtime, &[("main", runtime.backend())], true)
+                .await
+                .unwrap();
+        assert_eq!(skipped, None);
+        assert!(
+            original_owner(&runtime, id).await.is_none(),
+            "a forwarding client writes nothing"
+        );
+
+        let report =
+            repair_legacy_quarantine_at_boot(&runtime, &[("main", runtime.backend())], false)
+                .await
+                .unwrap()
+                .expect("a store-owning process runs the repair");
+        assert_eq!(report.inserted, 1);
+        assert_eq!(
+            original_owner(&runtime, id).await.unwrap().content_ref,
+            original
+        );
     }
 
     #[tokio::test]
@@ -583,6 +675,7 @@ mod tests {
                 "comm".into(),
                 PackConfig {
                     backend: "old-comm".into(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             )]

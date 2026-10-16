@@ -385,12 +385,14 @@ delayed execution does not grant access to internal subhandlers.
 
 #### Four verbs
 
-| Verb                | Speech act (ADR-025) | Args                       | What it does                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------- | -------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schedule.remind`   | commissive           | `content`, `at`, `repeat?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                                                                                                                                                                                                                          |
-| `schedule.schedule` | commissive           | `action`, `at`, `repeat?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload — a single, exactly-registered pack-prefixed verb call with only literal args and all required args present (issue #461; stricter than plain request-DSL parseability, since it must survive trigger-time replay unmodified). `at` and `repeat` are as above.                  |
-| `schedule.agenda`   | assertive            | `from?`, `to?`, `limit?`   | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`. On the MCP surface, the loop-owning host additionally decorates the result with process-local `ticker.last_tick_at` under [ADR-106 Amendment D](ADR-106-schedule-pack-executor.md); the pack handler itself remains intent-only. |
-| `schedule.cancel`   | declaration          | `id`                       | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                                                                                                                                                                                                                    |
+| Verb                | Speech act (ADR-025) | Args                                                           | What it does                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------- | -------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schedule.remind`   | commissive           | `content`, `at`, `repeat?`, `misfire_policy?`, `max_lateness?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                                                                                                                                                                                                                          |
+| `schedule.schedule` | commissive           | `action`, `at`, `repeat?`, `misfire_policy?`, `max_lateness?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload — a single, exactly-registered pack-prefixed verb call with only literal args and all required args present (issue #461; stricter than plain request-DSL parseability, since it must survive trigger-time replay unmodified). `at` and `repeat` are as above.                  |
+| `schedule.agenda`   | assertive            | `from?`, `to?`, `limit?`                                       | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`. On the MCP surface, the loop-owning host additionally decorates the result with process-local `ticker.last_tick_at` under [ADR-106 Amendment D](ADR-106-schedule-pack-executor.md); the pack handler itself remains intent-only. |
+| `schedule.cancel`   | declaration          | `id`                                                           | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                                                                                                                                                                                                                    |
+
+Per-event missed-occurrence arguments follow [ADR-106 Amendment H](ADR-106-schedule-pack-executor.md#amendment-h-per-event-missed-schedule-policy-2026-09-29): omitted `misfire_policy` means `"skip"`, preserving global grace. `"catch_up_once"` requires explicit positive integer `max_lateness` seconds for both one-shot and repeating events, with equality admitted; there is no period-derived default. Supplying the bound with `"skip"` or omitted policy, unknown policy, null, wrong types, zero, negative or unrepresentable bounds is rejected before note creation.
 
 #### Recurrence specification
 
@@ -1450,3 +1452,32 @@ row check, writes rows on one copy only, or writes rows after the commit.
   delivered message lacks its attachments, and a failure there has no clean recovery.
 - **Let `comm.send` read a server file by path.** Rejected. It would add a second path-reading
   surface. Uploading through the blob verbs keeps one confined surface.
+
+## Amendment (proposed): cancellation revision guard (2026-10-13)
+
+Status: Proposed.
+
+`schedule.cancel` validates one caller-visible, live `scheduled_event` note with
+`properties.status="pending"`, then persists the cancellation through
+`NoteStore::replace_note_if_unchanged`. The expected `updated_at` and `deleted_at`
+come from that same validated snapshot. No later reread substitutes a newer
+pending snapshot before persistence.
+
+A missed guard returns the typed conflict error: the event changed after it was
+read, and the caller must read fresh state before retrying. This includes an
+intervening edit, fire, cancellation or deletion. A note already non-pending at
+the initial read still returns the existing invalid-input error. Namespace, kind,
+malformed-property and reserved-property refusals remain in place.
+
+The replacement preserves all other note fields and properties, changing only
+the cancellation properties and `updated_at`; storage advances the note's
+`version` as on any matched update. `updated_at` is strictly newer than the
+validated snapshot even when that timestamp is ahead of the clock. An exhausted
+`i64::MAX` timestamp fails before persistence. Backends without guarded note
+replacement fail closed rather than falling back to an unconditional upsert.
+
+Acceptance requires the public cancellation race regressions for pending content
+edits, concurrent firing and deletion without a revision advance, plus timestamp
+monotonicity and exhaustion checks. Existing short-ID, non-pending, malformed
+properties and reserved-property regressions must continue to pass. This
+amendment does not change trigger execution or introduce schedule-owned SQL.

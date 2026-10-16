@@ -1,12 +1,17 @@
 // REASON: format_args! inlining would break compatibility with older Rust toolchains in CI
 #![allow(clippy::uninlined_format_args)]
+// REASON: field_reassign_with_default is needed by the shadow-validation builder pattern in persist
+#![allow(clippy::field_reassign_with_default)]
 // REASON: benchmark helpers use hand-tuned constants close to Rust built-ins (e.g. 1.0/3.0)
 #![allow(clippy::approx_constant)]
 
 //! Hybrid search and ranking with deterministic scoring for khive.
 //!
-//! Combines HNSW vector search, BM25 keyword search, and RRF fusion into a unified
-//! retrieval layer. All scores use `DeterministicScore` for cross-platform consistency.
+//! Combines vector search and keyword search behind composable traits, with rank fusion
+//! (RRF by default), into a unified retrieval layer, and holds the checkpoint helpers that
+//! the memory and knowledge packs share for their khive-vamana ANN indexes. The optional
+//! `hnsw` and `bm25` features re-export those standalone index crates.
+//! All scores use `DeterministicScore` for cross-platform consistency.
 //! See `docs/architecture.md` for module layout, design principles, ID bridging
 //! strategies, and trait composition guide.
 
@@ -23,9 +28,18 @@ pub mod eval;
 pub mod hit;
 pub mod hybrid;
 pub mod materialization;
+pub mod metrics;
+#[cfg(feature = "persist")]
+pub mod persist;
 pub mod policy;
+pub mod query_ir;
+pub mod query_variants;
+#[cfg(feature = "persist")]
+pub mod replay;
 pub mod search_config;
 pub mod timeout;
+#[cfg(feature = "persist")]
+pub mod weights;
 
 // Re-export adapter types
 #[cfg(feature = "storage-adapters")]
@@ -48,8 +62,9 @@ pub use khive_hnsw::{
 };
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
-    fuse_search_results, fuse_search_results_checked, HybridConfig, HybridSearcher,
-    IdentityReranker, KeywordSearch, Query, Reranker, VectorSearch,
+    fuse_search_results, fuse_search_results_checked, fuse_two_stage, DualIndexConfig,
+    DualIndexRouter, DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker,
+    KeywordSearch, Query, Reranker, VectorSearch,
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
@@ -65,7 +80,19 @@ pub use materialization::{
     MAX_MATERIALIZATION_DIAGNOSTICS, MAX_MATERIALIZATION_DROP_REASONS,
     MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
 };
+pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
+#[cfg(feature = "persist")]
+pub use persist::{
+    PersistError, PersistenceStats, RetrievalPersistence, ShadowMetrics, ShadowValidationConfig,
+    ShadowValidationResult,
+};
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
+pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_variants::{
+    merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
+    QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,
+    VariantAttribution, VariantRankedList, VariantSource,
+};
 pub use search_config::SearchConfig;
 pub use timeout::{
     search_with_cancellation, search_with_deadline, search_with_optional_timeout,

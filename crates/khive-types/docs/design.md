@@ -83,6 +83,11 @@ types for proposals, events, and namespace isolation.
   separately.
 - `Entity.entity_type` holds the pack-governed subtype token; ontology type
   strings must not be stored raw in `properties`.
+- `EntityTypeRegistry::check_extra_collisions` rejects a normalized,
+  kind-qualified alias that selects two different canonical subtypes, including
+  an alias/canonical collision within one pack, in either declaration order.
+  Repeated declarations by the same owner of the same canonical subtype remain
+  allowed; different entity kinds have separate alias keys.
 
 ### Edge Ontology (ADR-002)
 

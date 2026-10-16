@@ -1,4 +1,4 @@
-use khive_runtime::{split_stamped_label, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use serde_json::Value;
 
 pub(super) fn caller_actor(token: &NamespaceToken) -> String {
@@ -20,52 +20,21 @@ impl ActorScope {
         actor: Option<&str>,
         all_actors: bool,
     ) -> Result<Self, RuntimeError> {
-        if all_actors && actor.is_some() {
-            return Err(super::invalid(
-                "all_actors=true cannot be combined with actor",
-            ));
-        }
-        if all_actors {
-            if !runtime
-                .config()
-                .brain
-                .fleet_readers
-                .contains(&token.actor().id)
-            {
-                return Err(super::invalid(format!(
-                    "actor {:?} is not a configured fleet reader",
-                    token.actor().id
-                )));
-            }
-            return Ok(Self { actors: None });
-        }
-        if let Some(actor) = actor {
-            super::label("actor", actor)?;
-            let (identity, is_self) = match split_stamped_label(actor) {
-                Some((kind, id)) => (
-                    if kind == "actor" { id } else { actor },
-                    token.actor().kind == kind && token.actor().id == id,
-                ),
-                None => (actor, is_caller(token, actor)),
-            };
-            if !is_self && !token.visible_namespace_strs().contains(&identity) {
-                return Err(super::invalid(format!(
-                    "actor {identity:?} is not visible to this caller"
-                )));
+        // Keep telemetry's label validation before visibility checks, but let the
+        // shared resolver report an all_actors/actor conflict before label errors.
+        if !all_actors {
+            if let Some(actor) = actor {
+                super::label("actor", actor)?;
             }
         }
-        let actors = match actor {
-            Some(actor) if split_stamped_label(actor).is_some() => vec![actor.to_string()],
-            Some(actor) => vec![actor.to_string(), format!("actor:{actor}")],
-            None if token.actor().kind == "actor"
-                && split_stamped_label(&token.actor().id).is_none() =>
-            {
-                vec![token.actor().id.clone(), caller_actor(token)]
-            }
-            None => vec![caller_actor(token)],
-        };
+        let scope = khive_runtime::resolve_event_actor_read_scope(
+            token,
+            &runtime.config().brain.fleet_readers,
+            actor,
+            all_actors,
+        )?;
         Ok(Self {
-            actors: Some(actors),
+            actors: (!all_actors).then_some(scope.actors),
         })
     }
 

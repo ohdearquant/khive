@@ -17,15 +17,16 @@ name: Bench Trend Tracking
 #     work while leaving the PR change-detection check visible.
 
 on:
+  # The trend ledger takes one data point per day at the main head, plus one per
+  # release tag. A data point per merge had no reader during a merge burst and held
+  # runners that pull request checks were waiting for. Dispatch on main records an
+  # extra point on demand; dispatch from any other ref runs the benches without
+  # publishing.
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
   push:
-    branches: [main]
     tags: ["v*"]
-    paths:
-      - "crates/**"
-      - "scripts/perf/**"
-      - "scripts/bench_1m.sh"
-      - ".github/workflows/bench-track.yml"
-      - ".github/workflows/bench-component.yml"
   # Do not path-filter the workflow itself: a required selector check must be
   # created even when every component resolves to skipped.
   pull_request:
@@ -44,8 +45,8 @@ env:
   BENCH_BOT_EMAIL: khive-bench-bot@users.noreply.github.com
 
 concurrency:
-  # A main/release push owns a SHA-specific group so a merge burst cannot
-  # replace an older pending data point. The publisher already retries
+  # A scheduled, dispatched or release run owns a SHA-specific group so one
+  # cannot replace another's pending data point. The publisher already retries
   # perf-data push races. Exhausted races are advisory incidents. PR runs
   # stay ref-grouped and superseded measurements may be cancelled to avoid
   # wasting runners.
@@ -62,8 +63,11 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   changes:
     name: Select changed benchmark components
+    # Pull requests from this repository's codex/ branches skip this job, and with it every
+    # component job; the push run on main benchmarks every component after they merge.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -153,7 +157,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name == 'push' || needs.changes.outputs.scoring_retrieval == 'true')
+      (github.event_name != 'pull_request' || needs.changes.outputs.scoring_retrieval == 'true')
     permissions:
       contents: write
       issues: write
@@ -167,7 +171,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name == 'push' || needs.changes.outputs.ann_query == 'true')
+      (github.event_name != 'pull_request' || needs.changes.outputs.ann_query == 'true')
     permissions:
       contents: write
       issues: write
@@ -181,7 +185,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name == 'push' || needs.changes.outputs.storage_brain == 'true')
+      (github.event_name != 'pull_request' || needs.changes.outputs.storage_brain == 'true')
     permissions:
       contents: write
       issues: write
@@ -195,7 +199,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name == 'push' || needs.changes.outputs.packs == 'true')
+      (github.event_name != 'pull_request' || needs.changes.outputs.packs == 'true')
     permissions:
       contents: write
       issues: write
@@ -216,7 +220,7 @@ jobs:
   e2e:
     name: E2E benches (pipeline + bench-1m synthetic)
     runs-on: ubuntu-latest
-    if: vars.BENCH_TRACK_DISABLED != 'true' && github.event_name == 'push'
+    if: vars.BENCH_TRACK_DISABLED != 'true' && github.event_name != 'pull_request'
     timeout-minutes: 20
     permissions:
       contents: write
@@ -236,6 +240,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v5
 
@@ -305,7 +310,7 @@ jobs:
 
       - name: Publish ledgers to perf-data branch
         id: publish
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
         continue-on-error: true
         run: bash scripts/perf/publish_ledger.sh bench-data/pipeline.jsonl bench-data/bench-1m.jsonl
 

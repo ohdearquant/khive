@@ -1,5 +1,5 @@
 use super::{
-    run_prepared_stream_batch, statement, StreamAppendSpec, StreamBatchMember, StreamObservation,
+    run_prepared_stream_batch, StreamAppendSpec, StreamBatchMember, StreamObservation,
     StreamWriteSpec,
 };
 use crate::note_write::{NoteFence, NoteFences};
@@ -299,10 +299,13 @@ async fn stream_batch_write_tags_and_embedding_transitions_use_canonical_plans()
         .reader()
         .await
         .unwrap()
-        .query_scalar(statement(
-            "SELECT COUNT(*) FROM ann_write_log WHERE subject_id=?1 AND op='delete'",
-            vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
-        ))
+        .query_scalar(
+            SqlStatement::new(
+                "SELECT COUNT(*) FROM ann_write_log WHERE subject_id=?1 AND op='delete'",
+                vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            )
+            .labelled("stream"),
+        )
         .await
         .unwrap();
     assert!(matches!(deletes, Some(SqlValue::Integer(count)) if count > 0));
@@ -542,10 +545,10 @@ async fn stream_store_snapshot(runtime: &KhiveRuntime) -> Value {
         ("sqlite_sequence", "name"),
     ] {
         let rows = reader
-            .query_all(statement(
-                &format!("SELECT * FROM {table} ORDER BY {order}"),
-                vec![],
-            ))
+            .query_all(
+                SqlStatement::new(format!("SELECT * FROM {table} ORDER BY {order}"), vec![])
+                    .labelled("stream"),
+            )
             .await
             .unwrap();
         snapshot.insert(table.into(), serde_json::to_value(rows).unwrap());
@@ -676,9 +679,7 @@ impl SqlAccess for OutcomeAccess {
             assert_eq!(outcome.is_ok(), self.expect_success);
         }
         if self.terminate {
-            Err(StorageError::WriterTaskTerminated {
-                request_state: self.state,
-            })
+            Err(StorageError::writer_task_terminated(self.state))
         } else {
             Err(StorageError::WriterTaskRequestFailed {
                 request_state: self.state,
@@ -744,7 +745,9 @@ async fn stream_batch_recovers_failure_slot_only_after_confirmed_rollback() {
             assert_eq!(error["details"]["next_seq"], "1");
         } else {
             match outcome.expect_err("preserve the outer storage failure") {
-                RuntimeError::Storage(StorageError::WriterTaskTerminated { request_state }) => {
+                RuntimeError::Storage(StorageError::WriterTaskTerminated {
+                    request_state, ..
+                }) => {
                     assert!(terminate);
                     assert_eq!(request_state, state);
                 }
@@ -806,6 +809,7 @@ async fn stream_batch_commit_ack_failure_returns_no_executable_effects() {
         outcome,
         Err(RuntimeError::Storage(StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
+            ..
         }))
     ));
     assert_eq!(*callback.lock().unwrap(), Some(true));
@@ -836,13 +840,16 @@ async fn stream_batch_fence_rechecks_after_writer_admission() {
     let access = AdmissionChange {
         inner: runtime.sql().clone(),
         changer: peer.sql(),
-        change: Mutex::new(Some(statement(
-            "UPDATE notes SET content=?1 WHERE id=?2",
-            vec![
-                SqlValue::Text("{\"revision\":1}".into()),
-                SqlValue::Text(fence["id"].as_str().unwrap().into()),
-            ],
-        ))),
+        change: Mutex::new(Some(
+            SqlStatement::new(
+                "UPDATE notes SET content=?1 WHERE id=?2",
+                vec![
+                    SqlValue::Text("{\"revision\":1}".into()),
+                    SqlValue::Text(fence["id"].as_str().unwrap().into()),
+                ],
+            )
+            .labelled("stream"),
+        )),
     };
     let result = run_prepared_stream_batch(
         &access,
@@ -881,13 +888,16 @@ async fn stream_batch_observation_rechecks_cross_connection_change_at_admission(
     let access = AdmissionChange {
         inner: runtime.sql(),
         changer: peer.sql(),
-        change: Mutex::new(Some(statement(
-            "UPDATE notes SET content=?1 WHERE id=?2",
-            vec![
-                SqlValue::Text("{\"revision\":1}".into()),
-                SqlValue::Text(observed["id"].as_str().unwrap().into()),
-            ],
-        ))),
+        change: Mutex::new(Some(
+            SqlStatement::new(
+                "UPDATE notes SET content=?1 WHERE id=?2",
+                vec![
+                    SqlValue::Text("{\"revision\":1}".into()),
+                    SqlValue::Text(observed["id"].as_str().unwrap().into()),
+                ],
+            )
+            .labelled("stream"),
+        )),
     };
     let result = run_prepared_stream_batch(
         &access,
@@ -953,13 +963,16 @@ async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission
     let access = AdmissionChange {
         inner: runtime.sql(),
         changer: peer.sql(),
-        change: Mutex::new(Some(statement(
-            "UPDATE notes SET content=?1 WHERE id=?2",
-            vec![
-                SqlValue::Text("{\"revision\":1}".into()),
-                SqlValue::Text(renewed["id"].as_str().unwrap().into()),
-            ],
-        ))),
+        change: Mutex::new(Some(
+            SqlStatement::new(
+                "UPDATE notes SET content=?1 WHERE id=?2",
+                vec![
+                    SqlValue::Text("{\"revision\":1}".into()),
+                    SqlValue::Text(renewed["id"].as_str().unwrap().into()),
+                ],
+            )
+            .labelled("stream"),
+        )),
     };
     let result = run_prepared_stream_batch(
         &access,
@@ -1077,12 +1090,15 @@ impl SqlAccess for TraceAccess {
         Ok(Box::new(self.clone()))
     }
     async fn atomic_unit(&self, op: AtomicUnitOp) -> StorageResult<Box<dyn Any + Send>> {
-        self.0.lock().unwrap().push(statement("BEGIN", vec![]));
+        self.0
+            .lock()
+            .unwrap()
+            .push(SqlStatement::new("BEGIN", vec![]).labelled("stream"));
         let result = op(&mut self.clone()).await;
-        self.0.lock().unwrap().push(statement(
-            if result.is_ok() { "COMMIT" } else { "ROLLBACK" },
-            vec![],
-        ));
+        self.0.lock().unwrap().push(
+            SqlStatement::new(if result.is_ok() { "COMMIT" } else { "ROLLBACK" }, vec![])
+                .labelled("stream"),
+        );
         result
     }
 }

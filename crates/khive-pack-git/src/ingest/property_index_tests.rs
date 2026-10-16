@@ -909,7 +909,10 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
     let mut reader = runtime.sql().reader().await.unwrap();
     let statement = SqlStatement {
         sql: annotation.into(),
-        params: sha_params("missing"),
+        params: vec![
+            SqlValue::Text("local".into()),
+            SqlValue::Text(json!(["missing"]).to_string()),
+        ],
         label: Some("legacy_annotation_refusal".into()),
     };
     let before = reader

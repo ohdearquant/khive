@@ -855,7 +855,7 @@ mod tests {
     fn upload_put_and_commit_share_the_publish_routine() {
         // This is a construction assertion required alongside the executed
         // barrier tests: an independently copied rename cannot satisfy it.
-        let blob = include_str!("blob.rs");
+        let blob = include_str!("blob/publish.rs");
         let put = blob
             .split_once("fn put_blocking_from_root_handle(")
             .unwrap()

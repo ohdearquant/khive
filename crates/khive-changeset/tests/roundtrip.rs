@@ -513,3 +513,73 @@ fn update_entity_type_congruence_rejects_mismatched_preimage() {
         "an unchanged entity_type with a preimage value must be rejected"
     );
 }
+
+fn edge_weight_update(weight: Option<f64>, prior: Option<f64>) -> Result<UpdateOp, String> {
+    UpdateOp::new(
+        Id128::from_u128(1),
+        UpdatePatch::Edge(EdgePatch {
+            relation: None,
+            weight,
+        }),
+        UpdatePreimage::Edge(EdgePreimage {
+            relation: None,
+            weight: prior,
+        }),
+    )
+}
+
+#[test]
+fn checked_edge_updates_reject_invalid_new_weights() {
+    for weight in [-0.01, 1.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let error = edge_weight_update(Some(weight), Some(0.5))
+            .expect_err("the checked constructor must not create an undecodable edge update");
+        let expected = if weight.is_finite() {
+            format!("EdgePatch weight must be in [0.0, 1.0], got {weight}")
+        } else {
+            format!("EdgePatch weight must be finite, got {weight}")
+        };
+        assert_eq!(error, expected);
+        if weight.is_finite() {
+            let wire = serde_json::json!({
+                "target_id": "00000000-0000-0000-0000-000000000001",
+                "patch": {"target": "edge", "weight": weight},
+                "preimage": {"target": "edge", "weight": 0.5}
+            });
+            let wire_error = serde_json::from_value::<UpdateOp>(wire).unwrap_err();
+            assert!(wire_error.to_string().contains(&error));
+        }
+    }
+}
+
+#[test]
+fn valid_checked_edge_weights_keep_exact_ndjson_roundtrips() {
+    for weight in [None, Some(0.0), Some(-0.0), Some(0.5), Some(1.0)] {
+        let update = edge_weight_update(weight, weight.map(|_| 0.5)).unwrap();
+        let cs = ChangeSet::new(
+            Envelope::new("agent:test", "family:test", Timestamp::from_secs(1)),
+            vec![Op::Update(update)],
+        );
+        assert_roundtrips_byte_identical(&cs);
+        let wire = serde_json::to_value(&cs.ops[0]).unwrap();
+        assert_eq!(
+            wire["patch"].get("weight"),
+            weight.map(serde_json::Value::from).as_ref()
+        );
+    }
+}
+
+#[test]
+fn edge_constructor_preserves_preimage_diagnostic_precedence() {
+    assert_eq!(
+        edge_weight_update(Some(1.5), None).unwrap_err(),
+        "UpdateOp preimage is missing `weight`, which the patch sets or clears"
+    );
+    assert_eq!(
+        edge_weight_update(None, Some(0.5)).unwrap_err(),
+        "UpdateOp preimage carries `weight`, which the patch leaves unchanged"
+    );
+    assert_eq!(
+        edge_weight_update(Some(1.5), Some(-0.5)).unwrap_err(),
+        "UpdateOp edge preimage weight must be finite and in [0.0, 1.0], got -0.5"
+    );
+}

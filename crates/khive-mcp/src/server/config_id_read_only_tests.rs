@@ -52,6 +52,7 @@ fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
             "knowledge".to_string(),
             PackConfig {
                 backend: "archive".to_string(),
+                verbs_disabled: Vec::new(),
                 no_embed: false,
             },
         )]),

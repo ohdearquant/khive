@@ -9,7 +9,10 @@ use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::EdgeRelation;
-use khive_vcs_adapters::{EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter};
+use khive_vcs_adapters::{
+    BibtexFormatAdapter, CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord,
+    FormatAdapter, JsonFormatAdapter,
+};
 use uuid::Uuid;
 
 use super::types::{ExportArgs, ImportArgs, ImportFormat};
@@ -57,62 +60,213 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
     }
-    // Write through a temp sibling + atomic rename so a symlinked --output is
-    // replaced rather than followed into the source DB. The temp is created with
-    // O_EXCL (create_new): a pre-existing temp path — including a planted symlink
-    // to the DB — fails the create rather than being followed, closing the whole
-    // symlink-overwrite class, not just --output itself.
     use std::io::Write as _;
-    let mut tmp_name = args.output.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".{}.inprogress", std::process::id()));
-    let tmp = args.output.with_file_name(tmp_name);
-    let mut f = std::fs::OpenOptions::new()
+    publish_export_with(&args.output, |file| file.write_all(json.as_bytes()))
+        .with_context(|| format!("publish export {}", args.output.display()))
+}
+
+fn export_temporary_name(output: &Path) -> std::ffi::OsString {
+    let mut name = output.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.inprogress", std::process::id()));
+    name
+}
+
+/// Both original errors remain owned; the primary I/O error stays in the chain.
+#[derive(Debug)]
+struct ExportCleanupFailure {
+    primary: std::io::Error,
+    cleanup: std::io::Error,
+}
+
+impl std::fmt::Display for ExportCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; cleanup of owned export temporary also failed: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for ExportCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+fn owned_export_error(primary: std::io::Error, cleanup: std::io::Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => anyhow::Error::new(primary),
+        Err(cleanup) => anyhow::Error::new(ExportCleanupFailure { primary, cleanup }),
+    }
+}
+
+#[cfg(unix)]
+fn publish_export_with(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use khive_fs::atomic_publish::{publish_atomic_at_detailed, AtomicPublishOptions, StaleTmp};
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Preserve existing parent symlink resolution while holding one directory for
+    // creation, rename, cleanup and the final directory sync.
+    let dir = std::fs::File::open(parent)
+        .with_context(|| format!("open export directory {}", parent.display()))?;
+    let tmp_name = export_temporary_name(output);
+    publish_atomic_at_detailed(
+        &dir,
+        &tmp_name,
+        output.file_name().unwrap_or_default(),
+        AtomicPublishOptions {
+            stale: StaleTmp::RefuseExisting,
+            mode: 0o666,
+        },
+        writer,
+    )
+    .map_err(|error| {
+        let phase = error.phase();
+        finish_unix_export_error(&dir, &tmp_name, phase, error.into_source())
+    })
+}
+
+#[cfg(unix)]
+fn finish_unix_export_error(
+    dir: &std::fs::File,
+    tmp_name: &std::ffi::OsStr,
+    phase: khive_fs::atomic_publish::AtomicPublishPhase,
+    source: std::io::Error,
+) -> anyhow::Error {
+    use khive_fs::atomic_publish::AtomicPublishPhase;
+    let error = match phase {
+        AtomicPublishPhase::WriteTmp | AtomicPublishPhase::SyncTmp | AtomicPublishPhase::Rename => {
+            owned_export_error(source, khive_fs::fd_relative::unlink_at(dir, tmp_name))
+        }
+        // Before creation the entry belongs to someone else. After rename there
+        // is no owned temporary; a later writer may already have reused its name.
+        _ => anyhow::Error::new(source),
+    };
+    error.context(format!("export publication failed during {phase:?}"))
+}
+
+#[cfg(not(unix))]
+#[derive(Default)]
+struct ExportSync {
+    #[cfg(test)]
+    file: Option<fn(&std::fs::File) -> std::io::Result<()>>,
+}
+
+#[cfg(not(unix))]
+impl ExportSync {
+    fn sync(&self, file: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(sync) = self.file {
+            return sync(file);
+        }
+        file.sync_all()
+    }
+}
+
+#[cfg(not(unix))]
+fn publish_export_with(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    publish_export_portable(output, writer, ExportSync::default())
+}
+
+#[cfg(not(unix))]
+fn publish_export_portable(
+    output: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    sync: ExportSync,
+) -> Result<()> {
+    let tmp = output.with_file_name(export_temporary_name(output));
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .with_context(|| format!("create temp {}", tmp.display()))?;
-    f.write_all(json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    f.sync_all().ok();
-    drop(f);
-    std::fs::rename(&tmp, &args.output)
-        .with_context(|| format!("finalize {}", args.output.display()))?;
+        .with_context(|| format!("create export temporary {}", tmp.display()))?;
+    let written = writer(&mut file).and_then(|()| sync.sync(&file));
+    // Windows must release the file before remove_file or rename.
+    drop(file);
+    if let Err(source) = written {
+        return Err(owned_export_error(source, std::fs::remove_file(&tmp))
+            .context(format!("write or sync export temporary {}", tmp.display())));
+    }
+    if let Err(source) = std::fs::rename(&tmp, output) {
+        return Err(owned_export_error(source, std::fs::remove_file(&tmp))
+            .context(format!("finalize export {}", output.display())));
+    }
+    // Parent-directory synchronization is provided by the Unix path.
     Ok(())
 }
 
 pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let ns = Namespace::parse(&args.namespace)?;
-    let source = std::fs::read_to_string(&args.source)
-        .with_context(|| format!("read {}", args.source.display()))?;
+    let format = args.format.unwrap_or_else(|| {
+        match args
+            .source
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some(extension) if extension.eq_ignore_ascii_case("csv") => ImportFormat::Csv,
+            Some(extension) if extension.eq_ignore_ascii_case("tsv") => ImportFormat::Tsv,
+            Some(extension) if extension.eq_ignore_ascii_case("bib") => ImportFormat::Bibtex,
+            _ => ImportFormat::Archive,
+        }
+    });
+    let source = if format == ImportFormat::Bibtex {
+        String::new()
+    } else {
+        std::fs::read_to_string(&args.source)
+            .with_context(|| format!("read {}", args.source.display()))?
+    };
 
-    // Discover the merged pack vocabulary against an in-memory runtime. This
-    // deliberately happens before the target runtime exists: deterministic
-    // source failures must not create or migrate `--db` as a side effect.
+    // Discover the merged pack vocabulary before the target runtime exists.
     let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
     let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
-    let archive = match args.format {
+    if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
+        bail!("--default-kind is only supported for CSV/TSV input");
+    }
+    let mut bibtex_stats = None;
+    let archive = match format {
+        ImportFormat::Bibtex => {
+            let file = std::fs::File::open(&args.source)
+                .with_context(|| format!("read {}", args.source.display()))?;
+            let adapter = BibtexFormatAdapter::from_reader(std::io::BufReader::new(file))
+                .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            bibtex_stats = Some(adapter.stats());
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+        }
         ImportFormat::Archive => serde_json::from_str(&source)
             .with_context(|| format!("parse archive {}", args.source.display()))?,
         ImportFormat::Json | ImportFormat::Ndjson => {
-            let input = match args.format {
-                ImportFormat::Json => source,
-                ImportFormat::Ndjson => ndjson_to_json_array(&source)?,
-                ImportFormat::Archive => unreachable!(),
+            let input = if format == ImportFormat::Ndjson {
+                ndjson_to_json_array(&source)?
+            } else {
+                source
             };
-            let mut adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
+            let adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
                 .with_context(|| format!("parse adapter input {}", args.source.display()))?;
-            if args.verbose {
-                for warning in adapter.warnings() {
-                    eprintln!("warning: {warning}");
-                }
-            }
-            let entities: Vec<EntityRecord> = adapter
-                .entities()
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let edges: Vec<EdgeRecord> = adapter
-                .edges()
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            adapter_records_to_archive(&args.namespace, entities, edges)?
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+        }
+        ImportFormat::Csv | ImportFormat::Tsv => {
+            let delimiter = if format == ImportFormat::Csv {
+                DelimitedFormat::Csv
+            } else {
+                DelimitedFormat::Tsv
+            };
+            let adapter = CsvFormatAdapter::new(
+                &source,
+                delimiter,
+                args.default_kind.as_deref(),
+                &valid_entity_kinds,
+            )
+            .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            archive_from_adapter(&args.namespace, adapter, args.verbose)?
         }
     };
     validate_archive_deterministic(&archive, &valid_entity_kinds)?;
@@ -133,9 +287,39 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         .await
         .with_context(|| format!("import {}", args.source.display()))?;
 
-    let json = serde_json::to_string(&summary).expect("serialize ImportSummary");
+    let json = if let Some(stats) = bibtex_stats {
+        let mut value = serde_json::to_value(&summary).context("serialize ImportSummary")?;
+        value["adapter"] = serde_json::json!({
+            "format": "bibtex",
+            "entries": stats.entries,
+            "skipped": stats.skipped,
+            "warnings": stats.warnings,
+        });
+        serde_json::to_string(&value).context("serialize BibTeX import summary")?
+    } else {
+        serde_json::to_string(&summary).expect("serialize ImportSummary")
+    };
     println!("{json}");
     Ok(())
+}
+
+fn archive_from_adapter(
+    namespace: &str,
+    mut adapter: impl FormatAdapter,
+    verbose: bool,
+) -> Result<KgArchive> {
+    if verbose {
+        for warning in adapter.warnings() {
+            eprintln!("warning: {warning}");
+        }
+    }
+    let entities = adapter
+        .entities()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let edges = adapter
+        .edges()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    adapter_records_to_archive(namespace, entities, edges)
 }
 
 fn ndjson_to_json_array(source: &str) -> Result<String> {
@@ -473,12 +657,7 @@ where
 }
 
 fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> Result<chrono::DateTime<Utc>> {
-    let Some(raw) = value else {
-        return Ok(fallback);
-    };
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+    khive_runtime::portability::parse_archive_timestamp(value, fallback)
 }
 
 #[cfg(test)]
@@ -492,6 +671,10 @@ mod tests {
 
     #[tokio::test]
     async fn export_creates_archive_json() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let output_path = tmp.path().join("archive.json");
@@ -539,6 +722,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn export_refuses_symlinked_output_to_db() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("working.db");
 
@@ -588,6 +775,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn export_refuses_symlinked_temp_to_db() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("working.db");
 
@@ -638,6 +829,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_roundtrip() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-test.db");
         let entity_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -652,7 +847,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -673,6 +869,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-resource.db");
         let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
@@ -687,7 +887,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -721,6 +922,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-json-resource.db");
         let entity_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
@@ -734,7 +939,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -758,6 +964,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_ndjson_adapter_accepts_resource_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-ndjson-resource.db");
         let entity_id = "abababab-abab-abab-abab-abababababab";
@@ -771,7 +981,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Ndjson,
+            format: Some(ImportFormat::Ndjson),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args)
@@ -795,6 +1006,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_rejects_unregistered_entity_kind() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("import-unknown-kind.db");
         let entity_id = "12345678-1234-1234-1234-123456789012";
@@ -808,7 +1023,8 @@ mod tests {
             source: source_path,
             db: db_path,
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         assert!(
@@ -819,6 +1035,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_imports_entities() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-json.db");
         let e1_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -834,7 +1054,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -855,6 +1076,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_ndjson_adapter_imports_entity() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-ndjson.db");
         let entity_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
@@ -868,7 +1093,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Ndjson,
+            format: Some(ImportFormat::Ndjson),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1003,6 +1229,10 @@ mod tests {
     /// + import-time `Utc::now()`.
     #[tokio::test]
     async fn import_json_adapter_preserves_entity_type_and_timestamps() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-adr020.db");
         let entity_id = "77777777-7777-7777-7777-777777777777";
@@ -1017,7 +1247,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1051,6 +1282,10 @@ mod tests {
     /// was a warning that skipped just the bad element and kept going.
     #[tokio::test]
     async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-488.db");
         let baseline_id = "88888888-8888-8888-8888-888888888888";
@@ -1064,7 +1299,8 @@ mod tests {
             source: baseline_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1085,7 +1321,8 @@ mod tests {
             source: bad_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1121,6 +1358,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_json_adapter_rejects_malformed_timestamp_without_db_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("adapter-malformed-time.db");
         let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1138,7 +1379,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Json,
+            format: Some(ImportFormat::Json),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1174,6 +1416,10 @@ mod tests {
 
     #[tokio::test]
     async fn import_archive_rejects_malformed_edge_timestamp_without_creating_target() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("archive-malformed-edge-time.db");
         let source = Uuid::new_v4();
@@ -1192,7 +1438,8 @@ mod tests {
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
-            format: ImportFormat::Archive,
+            format: Some(ImportFormat::Archive),
+            default_kind: None,
             verbose: false,
         })
         .await
@@ -1221,5 +1468,243 @@ mod tests {
             err.to_string().contains("outside the valid range"),
             "expected range error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_publication_tests {
+    use super::*;
+    use std::io::{self, Write};
+    use tempfile::TempDir;
+
+    fn temporary(output: &Path) -> std::path::PathBuf {
+        let mut name = output.file_name().unwrap().to_os_string();
+        name.push(format!(".{}.inprogress", std::process::id()));
+        output.with_file_name(name)
+    }
+
+    fn primary_io(error: &anyhow::Error) -> &io::Error {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn actual_export_refuses_incumbent_regular_temporary() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        std::fs::write(temporary(&output), b"incumbent").unwrap();
+        let error = cmd_export(ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(primary_io(&error).kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert_eq!(std::fs::read(temporary(&output)).unwrap(), b"incumbent");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn actual_export_refuses_temp_symlink_and_replaces_output_symlink() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        let target = scratch.path().join("precious");
+        std::fs::write(&target, b"target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &output).unwrap();
+        std::os::unix::fs::symlink(&target, temporary(&output)).unwrap();
+        let args = || ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        };
+        assert!(cmd_export(args()).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target bytes");
+        assert!(std::fs::symlink_metadata(temporary(&output))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(temporary(&output)).unwrap();
+        cmd_export(args()).await.unwrap();
+        assert!(!std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let archive: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(archive["format"], "khive-kg");
+        assert_eq!(std::fs::read(&target).unwrap(), b"target bytes");
+        assert!(!temporary(&output).exists());
+    }
+
+    // Needs a non-UTF-8 file name, which APFS refuses (EILSEQ), so this runs where such names
+    // exist.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn actual_export_accepts_non_utf8_output_name() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = TempDir::new().unwrap();
+        let output = scratch
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"archive-\xff.json"));
+        cmd_export(ExportArgs {
+            output: output.clone(),
+            db: scratch.path().join("working.db"),
+            namespace: "test-ns".into(),
+        })
+        .await
+        .unwrap();
+        let archive: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(archive["format"], "khive-kg");
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    fn writer_failure_removes_only_its_owned_temporary_on_every_target() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        let error = publish_export_with(&output, |file| {
+            file.write_all(b"partial archive")?;
+            #[cfg(unix)]
+            {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "original writer failure",
+                ))
+            }
+        })
+        .unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        #[cfg(not(unix))]
+        {
+            assert_eq!(primary_io(&error).kind(), io::ErrorKind::WriteZero);
+            assert_eq!(primary_io(&error).to_string(), "original writer failure");
+        }
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    fn real_rename_failure_removes_owned_temporary() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("child"), b"incumbent child").unwrap();
+        let error = publish_export_with(&output, |file| file.write_all(b"archive")).unwrap_err();
+        assert!(primary_io(&error).raw_os_error().is_some());
+        assert_eq!(
+            std::fs::read(output.join("child")).unwrap(),
+            b"incumbent child"
+        );
+        assert!(!temporary(&output).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detailed_failure_finalizer_cleans_sync_tmp_but_keeps_postrename_output() {
+        use khive_fs::atomic_publish::AtomicPublishPhase;
+        let scratch = TempDir::new().unwrap();
+        let dir = std::fs::File::open(scratch.path()).unwrap();
+        let output = scratch.path().join("archive.json");
+        let temp = temporary(&output);
+        std::fs::write(&output, b"old destination").unwrap();
+        std::fs::write(&temp, b"partial archive").unwrap();
+        // Inject the detailed phase at the actual private finalizer. Shared helper
+        // tests separately establish that real sync refusal produces this phase.
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::SyncTmp,
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
+        assert!(!temp.exists());
+        std::fs::write(&temp, b"new archive").unwrap();
+        std::fs::rename(&temp, &output).unwrap();
+        std::fs::write(&temp, b"reused name").unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::SyncDirectory,
+            io::Error::from_raw_os_error(libc::EIO),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::EIO));
+        assert_eq!(std::fs::read(&output).unwrap(), b"new archive");
+        assert_eq!(std::fs::read(&temp).unwrap(), b"reused name");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detailed_creation_refusal_preserves_incumbent_and_cleanup_failure_retains_both_errors() {
+        use khive_fs::atomic_publish::AtomicPublishPhase;
+        let scratch = TempDir::new().unwrap();
+        let dir = std::fs::File::open(scratch.path()).unwrap();
+        let temp = scratch.path().join("tmp");
+        std::fs::write(&temp, b"incumbent").unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::CreateTmp,
+            io::Error::from_raw_os_error(libc::EEXIST),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(std::fs::read(&temp).unwrap(), b"incumbent");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let error = finish_unix_export_error(
+            &dir,
+            temp.file_name().unwrap(),
+            AtomicPublishPhase::WriteTmp,
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert_eq!(primary_io(&error).raw_os_error(), Some(libc::ENOSPC));
+        let combined = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ExportCleanupFailure>())
+            .unwrap();
+        assert!(combined.cleanup.raw_os_error().is_some());
+        assert!(format!("{error:#}").contains("cleanup"));
+        assert!(temp.is_dir());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn portable_sync_failure_closes_file_before_owned_cleanup() {
+        let scratch = TempDir::new().unwrap();
+        let output = scratch.path().join("archive.json");
+        std::fs::write(&output, b"old destination").unwrap();
+        let error = publish_export_portable(
+            &output,
+            |file| file.write_all(b"archive"),
+            ExportSync {
+                file: Some(|_| Err(io::Error::new(io::ErrorKind::Other, "sync refused"))),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(primary_io(&error).to_string(), "sync refused");
+        assert!(!temporary(&output).exists());
+        assert_eq!(std::fs::read(&output).unwrap(), b"old destination");
     }
 }

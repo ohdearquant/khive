@@ -67,6 +67,15 @@ pub trait PackFactory: Send + Sync + 'static {
     /// Canonical lowercase name for this pack (e.g. `"kg"`, `"gtd"`).
     fn name(&self) -> &'static str;
 
+    /// Version reported by this factory for introspection.
+    ///
+    /// The compatibility default is the version of `khive-runtime`, where
+    /// this trait is defined. Independently versioned pack crates should
+    /// override this method with their own `env!("CARGO_PKG_VERSION")`.
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     /// Names of packs that must be loaded before this one.
     ///
     /// Defaults to empty so pack crates that have no dependencies compile
@@ -297,6 +306,9 @@ impl PackRegistry {
                     .runtime
                     .accept_channel_ingest_capability(ChannelIngestCapability { _sealed: () });
             }
+            builder
+                .pack_versions
+                .insert(install.runtime.name().to_owned(), factory.version());
             builder.register_boxed(install.runtime);
             if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);
@@ -447,6 +459,9 @@ impl PackRegistry {
                     .runtime
                     .accept_channel_ingest_capability(ChannelIngestCapability { _sealed: () });
             }
+            builder
+                .pack_versions
+                .insert(install.runtime.name().to_owned(), factory.version());
             builder.register_boxed(install.runtime);
             if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);

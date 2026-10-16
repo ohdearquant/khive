@@ -6,7 +6,7 @@ use khive_storage::{SqlReader, SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
 use super::schema::AtomWrite;
-use super::util::{row_i64, row_str, sql_err};
+use super::util::{has_domain_mirror_tag, row_i64, row_str, sql_err};
 
 /// Existing atom ID, or no row for a new slug. Reads never allocate a new identity.
 pub(super) async fn target(
@@ -40,10 +40,7 @@ pub(super) async fn target(
                 .await
                 .map_err(|error| sql_err("upsert_atoms id lookup", error))?
                 .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id}")))?;
-            if row_str(&row, "tags")
-                .unwrap_or_default()
-                .contains("type:domain")
-            {
+            if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
                 return Err(RuntimeError::InvalidInput(
                     "properties-only target is a domain mirror; use domain verbs instead".into(),
                 ));
@@ -67,10 +64,7 @@ pub(super) async fn target(
     let Some(row) = existing else {
         return Ok(None);
     };
-    if row_str(&row, "tags")
-        .unwrap_or_default()
-        .contains("type:domain")
-    {
+    if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
         return Err(RuntimeError::InvalidInput(format!(
             "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
         )));

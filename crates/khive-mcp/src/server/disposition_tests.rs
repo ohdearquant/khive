@@ -1007,8 +1007,8 @@ impl ErrorConstructorCensus {
             && self.function_depth == 1
     }
     fn central_entry_builder(&self) -> bool {
-        self.root_function("khive-mcp/src/server.rs", "failure_entry")
-            || self.root_function("khive-mcp/src/server.rs", "aborted_entry")
+        self.root_function("khive-mcp/src/server/batch_types.rs", "failure_entry")
+            || self.root_function("khive-mcp/src/server/batch_types.rs", "aborted_entry")
     }
     fn inspect_json(&mut self, parsed: &JsonSyntax) {
         let summary = ["total", "succeeded", "failed", "aborted"]
@@ -1125,7 +1125,13 @@ impl ErrorConstructorCensus {
                 } else {
                     name.ident == "error_with_disposition"
                         && path.path.segments.len() == 1
-                        && self.source == "khive-mcp/src/server.rs"
+                        && matches!(
+                            self.source.as_str(),
+                            "khive-mcp/src/server.rs"
+                                | "khive-mcp/src/server/batch_types.rs"
+                                | "khive-mcp/src/server/bridge.rs"
+                                | "khive-mcp/src/server/rendering.rs"
+                        )
                         && self.modules.is_empty()
                 }
             }
@@ -1146,11 +1152,17 @@ impl ErrorConstructorCensus {
             // carrier. An arbitrary object named error_detail is no proof.
             syn::Expr::Field(field) => {
                 matches!(&field.member, syn::Member::Named(name) if name == "error_detail")
-                    && (self.root_function("khive-mcp/src/daemon.rs", "daemon_mcp_error")
-                        || self.root_function("khive-mcp/src/daemon.rs", "protocol_mismatch_error")
-                        || self.root_function("khive-mcp/src/daemon.rs", "request_too_large_error")
+                    && (self.root_function("khive-mcp/src/daemon/forward.rs", "daemon_mcp_error")
                         || self.root_function(
-                            "khive-runtime/src/daemon.rs",
+                            "khive-mcp/src/daemon/forward.rs",
+                            "protocol_mismatch_error",
+                        )
+                        || self.root_function(
+                            "khive-mcp/src/daemon/forward.rs",
+                            "request_too_large_error",
+                        )
+                        || self.root_function(
+                            "khive-runtime/src/daemon/connection.rs",
                             "handle_conn_with_lifecycle",
                         ))
             }
@@ -1198,8 +1210,43 @@ impl ErrorConstructorCensus {
 const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
     (
         "khive-mcp/src/server.rs",
+        "execution",
+        "khive-mcp/src/server/execution.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "request_dispatch",
+        "khive-mcp/src/server/request_dispatch.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "dispatch_helpers",
+        "khive-mcp/src/server/dispatch_helpers.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "rendering",
+        "khive-mcp/src/server/rendering.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "bridge",
+        "khive-mcp/src/server/bridge.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "batch_execution",
+        "khive-mcp/src/server/batch_execution.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
         "search_diagnostics",
         "khive-mcp/src/server/search_diagnostics.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "batch_types",
+        "khive-mcp/src/server/batch_types.rs",
     ),
     (
         "khive-mcp/src/server.rs",
@@ -1212,6 +1259,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server/disk_policy.rs",
     ),
     (
+        "khive-mcp/src/server.rs",
+        "server_core",
+        "khive-mcp/src/server/server_core.rs",
+    ),
+    (
         "khive-mcp/src/daemon.rs",
         "executable",
         "khive-mcp/src/daemon/executable.rs",
@@ -1222,6 +1274,41 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/daemon/dispatch.rs",
     ),
     (
+        "khive-mcp/src/daemon.rs",
+        "fallback",
+        "khive-mcp/src/daemon/fallback.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "forward",
+        "khive-mcp/src/daemon/forward.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "launch",
+        "khive-mcp/src/daemon/launch.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "liveness",
+        "khive-mcp/src/daemon/liveness.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "forward_or_spawn",
+        "khive-mcp/src/daemon/forward_or_spawn.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "self_heal",
+        "khive-mcp/src/daemon/self_heal.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "recovery",
+        "khive-mcp/src/daemon/recovery.rs",
+    ),
+    (
         "khive-runtime/src/daemon.rs",
         "load_limits",
         "khive-runtime/src/daemon/load_limits.rs",
@@ -1230,6 +1317,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-runtime/src/daemon.rs",
         "config_id",
         "khive-runtime/src/daemon/config_id.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "locks",
+        "khive-runtime/src/daemon/locks.rs",
     ),
     (
         "khive-runtime/src/daemon.rs",
@@ -1245,6 +1337,46 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-runtime/src/daemon.rs",
         "supervisor_marker",
         "khive-runtime/src/daemon/supervisor_marker.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "exit_record",
+        "khive-runtime/src/daemon/exit_record.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "lifecycle",
+        "khive-runtime/src/daemon/lifecycle.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "wire_frames",
+        "khive-runtime/src/daemon/wire_frames.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "dispatch_trait",
+        "khive-runtime/src/daemon/dispatch_trait.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "connection",
+        "khive-runtime/src/daemon/connection.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "run_daemon",
+        "khive-runtime/src/daemon/run_daemon.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "process_files",
+        "khive-runtime/src/daemon/process_files.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "boot_guard",
+        "khive-runtime/src/daemon/boot_guard.rs",
     ),
 ];
 
@@ -1331,10 +1463,11 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
                     // The sole copy-through is search_incomplete's existing
                     // error, bound from entry.get("error") in this transform.
                     // New raw branches here still have to use the normalizer.
-                    let preserved = self
-                        .root_function("khive-mcp/src/server.rs", "frame_budget_omission")
-                        && (self.classified_data(&call.args[1])
-                            || matches!(&call.args[1], syn::Expr::MethodCall(copy)
+                    let preserved = self.root_function(
+                        "khive-mcp/src/server/rendering.rs",
+                        "frame_budget_omission",
+                    ) && (self.classified_data(&call.args[1])
+                        || matches!(&call.args[1], syn::Expr::MethodCall(copy)
                             if copy.method == "clone" && copy.args.is_empty() &&
                                 matches!(copy.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("error"))));
                     if !self.central_entry_builder() && !preserved {
@@ -1400,7 +1533,7 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
                     && self.impl_type.as_deref() == Some("DaemonDispatchError"))
         }) {
             self.constructors_seen += 1;
-            let normalizer = self.source == "khive-runtime/src/daemon.rs"
+            let normalizer = self.source == "khive-runtime/src/daemon/wire_frames.rs"
                 && self.modules.is_empty()
                 && self.impl_type.as_deref() == Some("DaemonDispatchError")
                 && self.function == "new"
@@ -1519,17 +1652,17 @@ fn a3_constructor_census_limits_normalized_carrier_to_lifecycle_owner() {
     let frame = r#"DaemonResponseFrame { ok: false, error: Some(error.message), error_detail: Some(error.error_detail) }"#;
     for (source, body, allowed) in [
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("fn handle_conn_with_lifecycle() {{ let error = DaemonDispatchError::new(error.message, Some(error.error_detail)); {frame}; }}"),
             true,
         ),
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("fn handle_conn_with_shutdown() {{ {frame}; }}"),
             false,
         ),
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("mod unchecked {{ fn handle_conn_with_lifecycle() {{ {frame}; }} }}"),
             false,
         ),
@@ -1597,15 +1730,26 @@ fn a3_constructor_census_rejects_new_raw_sites_and_unclassified_variants() {
         r#"fn added() { DaemonResponseFrame { ok: false, error: Some("lost"), error_detail: Some(json!({"message":"lost"})) }; }"#,
         r#"mod unscanned_envelope_builders;"#,
     ] {
-        let mut census = ErrorConstructorCensus {
-            source: "khive-mcp/src/server.rs".into(),
-            ..Default::default()
-        };
-        census.visit_file(&syn::parse_file(mutation).expect("valid mutation fixture"));
-        assert!(
-            !census.offenders.is_empty(),
-            "scanner accepted unclassified mutation: {mutation}"
-        );
+        for source in [
+            "khive-mcp/src/server.rs",
+            "khive-mcp/src/server/batch_types.rs",
+            "khive-mcp/src/server/execution.rs",
+            "khive-mcp/src/server/request_dispatch.rs",
+            "khive-mcp/src/server/dispatch_helpers.rs",
+            "khive-mcp/src/server/rendering.rs",
+            "khive-mcp/src/server/bridge.rs",
+            "khive-mcp/src/server/batch_execution.rs",
+        ] {
+            let mut census = ErrorConstructorCensus {
+                source: source.into(),
+                ..Default::default()
+            };
+            census.visit_file(&syn::parse_file(mutation).expect("valid mutation fixture"));
+            assert!(
+                !census.offenders.is_empty(),
+                "scanner accepted unclassified mutation in {source}: {mutation}"
+            );
+        }
     }
     let mut census = ErrorConstructorCensus::default();
     census.visit_file(&syn::parse_file(r#"

@@ -80,76 +80,8 @@ impl HookQueue {
 }
 
 #[cfg(test)]
-mod hook_queue_tests {
-    use super::*;
-    use khive_runtime::{Namespace, PackRuntime, VerbRegistryBuilder};
-    use serde_json::json;
-
-    #[test]
-    fn hook_queue_worker_status_tracks_election_and_drain() {
-        let queue = HookQueue::new();
-        assert!(!queue.worker_running());
-        assert!(queue.enqueue("local".to_string(), BrainSignal::Irrelevant));
-        assert!(queue.worker_running());
-        assert_eq!(queue.take_batch_or_stop().unwrap().len(), 1);
-        assert!(
-            queue.worker_running(),
-            "worker remains elected until empty check"
-        );
-        assert!(queue.take_batch_or_stop().is_none());
-        assert!(!queue.worker_running());
-    }
-
-    #[tokio::test]
-    async fn hook_queue_caps_pending_signals_and_reports_drops() {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        let brain = BrainPack::new(runtime);
-        for index in 0..(MAX_DEFERRED_HOOK_SIGNALS + 3) {
-            brain
-                .hook_queue
-                .enqueue(format!("namespace-{index}"), BrainSignal::Irrelevant);
-        }
-
-        let state = brain.handle_state(json!({})).await.expect("brain state");
-        assert_eq!(
-            state["dispatch_counters"]["contended_hook_signals_dropped"],
-            json!(3)
-        );
-        let pending = brain
-            .hook_queue
-            .take_batch_or_stop()
-            .expect("pending batch");
-        assert_eq!(pending.len(), MAX_DEFERRED_HOOK_SIGNALS);
-        assert_eq!(pending.first().unwrap().0, "namespace-3");
-        assert_eq!(
-            pending.last().unwrap().0,
-            format!("namespace-{}", MAX_DEFERRED_HOOK_SIGNALS + 2)
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_dispatch_applies_queued_cold_signal_before_handler_reads_state() {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        let brain = BrainPack::new(runtime.clone());
-        // Model a contended hook after worker election but before the worker
-        // acquires the dispatch gate. The brain dispatch wins that gate.
-        assert!(brain
-            .hook_queue
-            .enqueue("local".into(), BrainSignal::RecallMiss));
-
-        let registry = VerbRegistryBuilder::new()
-            .build()
-            .expect("minimal registry");
-        let token = runtime.authorize(Namespace::local()).expect("local token");
-        brain
-            .dispatch("brain.profiles", json!({}), &registry, &token)
-            .await
-            .expect("promote local namespace");
-
-        assert_eq!(brain.snapshot().balanced_recall.total_events, 1);
-        assert!(brain.hook_queue.drain_pending().is_empty());
-    }
-}
+#[path = "pack/hook_queue_tests.rs"]
+mod hook_queue_tests;
 
 fn apply_hook_signal(
     persistence: &Mutex<persist::PersistenceTracker>,
@@ -440,10 +372,10 @@ impl khive_runtime::PackFactory for BrainPackFactory {
 /// Forwards the full `PackRuntime` surface to the shared inner `BrainPack`
 /// instance so the pack registry's runtime and the registered dispatch hook
 /// (see `create_install`) observe the same state and persistence tracker.
-struct BrainPackRuntime(std::sync::Arc<BrainPack>);
+struct BrainPackRuntime<P = BrainPack>(std::sync::Arc<P>);
 
 #[async_trait::async_trait]
-impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
+impl<P: khive_runtime::pack::PackRuntime> khive_runtime::pack::PackRuntime for BrainPackRuntime<P> {
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -492,12 +424,20 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.entity_types()
     }
 
+    fn note_property_policies(&self) -> &'static [khive_types::NotePropertyPolicySpec] {
+        self.0.note_property_policies()
+    }
+
     fn note_embedding_policies(&self) -> &'static [khive_types::NoteEmbeddingPolicySpec] {
         self.0.note_embedding_policies()
     }
 
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn khive_runtime::KindHook>> {
         self.0.kind_hook(kind)
+    }
+
+    fn context_contributor(&self) -> Option<Arc<dyn khive_runtime::ContextContributor>> {
+        self.0.context_contributor()
     }
 
     fn schema_plan(&self) -> khive_runtime::SchemaPlan {
@@ -529,6 +469,69 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.warm().await
     }
 
+    fn host_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.0.host_state()
+    }
+
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        self.0.validate_config()
+    }
+
+    fn input_schema(&self, verb: &str) -> Option<serde_json::Value> {
+        self.0.input_schema(verb)
+    }
+
+    fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
+        self.0.accept_channel_ingest_capability(capability)
+    }
+
+    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
+        self.0.register_entity_type_validator(runtime)
+    }
+
+    fn register_note_mutation_hook(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_mutation_hook(runtime)
+    }
+
+    fn register_note_search_ann_provider(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_search_ann_provider(runtime)
+    }
+
+    fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
+        self.0.register_note_write_validator(runtime)
+    }
+
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.0.registered_embedding_model_names()
+    }
+
+    fn mounted_namespace(&self) -> Option<&str> {
+        self.0.mounted_namespace()
+    }
+
+    fn mounted_catalog_snapshot(&self) -> Vec<khive_runtime::mounted_verb::MountedVerb> {
+        self.0.mounted_catalog_snapshot()
+    }
+
+    async fn mounted_catalog(
+        &self,
+    ) -> Result<Vec<khive_runtime::mounted_verb::MountedVerb>, RuntimeError> {
+        self.0.mounted_catalog().await
+    }
+
+    async fn dispatch_mounted(
+        &self,
+        definition: &khive_runtime::mounted_verb::MountedVerb,
+        verb: &str,
+        params: serde_json::Value,
+        registry: &khive_runtime::VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.0
+            .dispatch_mounted(definition, verb, params, registry, token)
+            .await
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
@@ -541,3 +544,7 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
 }
 
 inventory::submit! { khive_runtime::PackRegistration(&BrainPackFactory) }
+
+#[cfg(test)]
+#[path = "pack_runtime_tests.rs"]
+mod pack_runtime_tests;

@@ -13,12 +13,16 @@ extern crate alloc;
 extern crate std;
 
 pub mod agent;
+pub mod app;
 #[cfg(feature = "serde")]
 pub mod canonical_json;
 pub mod edge;
+pub mod edge_rules;
 pub mod email_address;
 pub mod entity;
 pub mod entity_type;
+#[cfg(feature = "std")]
+pub mod env;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -34,30 +38,40 @@ pub mod pack;
 pub mod refusal;
 pub mod sql_like;
 pub mod substrate;
+#[cfg(feature = "serde")]
+pub mod tag_match;
 pub mod timestamp;
 pub mod vector;
 
 pub use agent::{AgentRecord, AgentState, TerminalReason};
+pub use app::{
+    AppManifest, AppVerb, InstallRefusal, LifecycleClass, OwnedNames, Residency, RightsClass,
+    RowSubstrate, RowTypeDecl,
+};
 #[cfg(feature = "serde")]
 pub use canonical_json::canonical_json_bytes;
 pub use edge::{EdgeCategory, EdgeRelation};
-pub use entity::{Entity, EntityKind, Link, PropertyValue};
+pub use edge_rules::{
+    base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
+    BASE_ENTITY_ENDPOINT_RULES,
+};
+pub use entity::{validate_edge_weight, Entity, EntityKind, Link, PropertyValue};
 pub use entity_type::{
     to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
 };
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
-    ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload, ToolCheckDecidedPayload,
+    EventSink, ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload,
+    ProposalWithdrawnPayload, RerankExecutedPayload, RerankerKind, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
     EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch,
 };
-pub use hash::Hash32;
+pub use hash::{fnv1a_64, Hash32};
 pub use header::Header;
-pub use id::{Id128, ParseIdError};
+pub use id::{is_lowercase_hex, Id128, ParseIdError};
 #[cfg(feature = "serde")]
 pub use json_type::json_type_name;
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
@@ -70,13 +84,15 @@ pub use note::{Note, NoteStatus};
 pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteEmbeddingPolicy,
-    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, Pack, PackColumnAddition,
-    PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
-    RESERVED_ENVELOPE_ARGS,
+    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, NotePropertyPolicySpec, Pack,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, PropertyPolicy, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use sql_like::escape_like_literal;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
+#[cfg(feature = "serde")]
+pub use tag_match::tag_contains;
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
 

@@ -334,3 +334,56 @@ fn initialize_in_isolated_child() -> bool {
     unsafe { khive_db::pool::initialize_claimed_file_observer().unwrap() };
     false
 }
+
+#[test]
+fn parent_directory_creation_errors_identify_backend_and_failed_path() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    for implicit in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked-parent");
+        let sentinel = b"parent is a regular file";
+        std::fs::write(&parent, sentinel).unwrap();
+        let path = parent.join("main.db");
+        let locks = dir.path().join("volume-locks");
+        let expected_backend = if implicit { "main" } else { "archive" };
+        let error = if implicit {
+            let mut config = RuntimeConfig {
+                db_path: Some(path.clone()),
+                volume_lock_dir: Some(locks.clone()),
+                disk_guard_config: Some(khive_db::EffectiveDiskGuardConfig::default()),
+                wal_ceiling_bytes: 0,
+                wal_ceiling_configured_bytes: 0,
+                wal_ceiling_source: khive_runtime::WalCeilingSource::BackendField,
+                wal_ceiling_env_raw: None,
+                ..RuntimeConfig::no_embeddings()
+            };
+            open_single_backend(&mut config, Some(1), None)
+        } else {
+            let mut backend = declared(&path, false);
+            backend.name = expected_backend.into();
+            open_backend(
+                &backend,
+                Some(1),
+                khive_db::WalCeilingPolicy::default(),
+                None,
+                Some(khive_db::EffectiveDiskGuardConfig::default()),
+                Some(&locks),
+            )
+        }
+        .err()
+        .expect("a regular file cannot become the database parent directory");
+        let message = error.to_string();
+        assert!(message.contains("cannot create"), "{message}");
+        assert!(
+            message.contains(&format!("backend {expected_backend}")),
+            "{message}"
+        );
+        assert!(message.contains(&parent.display().to_string()), "{message}");
+        assert_eq!(std::fs::read(&parent).unwrap(), sentinel);
+        assert!(!path.exists());
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(!path.with_extension("db-shm").exists());
+    }
+}

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_retrieval::hybrid::{combine_best_ranked_evidence, fuse_labelled, HitLabel};
+use khive_retrieval::DEFAULT_RRF_K;
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
     RuntimeError, SearchHit, SearchSource,
@@ -21,6 +22,7 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+use super::search_profile;
 
 #[cfg(test)]
 #[path = "message_search_scope_tests.rs"]
@@ -653,7 +655,7 @@ impl SubstrateCoordinator {
 
     /// Broadcast a validated KG search request to all registered backends in
     /// parallel. One selected backend passes its ranking evidence through;
-    /// multiple selected backends use outer RRF (k=60). Every filter in the
+    /// multiple selected backends use outer RRF (shared default k). Every filter in the
     /// request reaches the matching runtime search method on every backend.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
@@ -690,11 +692,15 @@ impl SubstrateCoordinator {
         namespace: &Namespace,
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(request, namespace, extra_visible, None)
             .await;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
             .await;
+        search_profile::stage("finalize", started, &[]);
         (entity_hits, note_hits, per_backend)
     }
 
@@ -712,6 +718,7 @@ impl SubstrateCoordinator {
                 .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
                 .await;
         }
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(
                 request,
@@ -720,8 +727,11 @@ impl SubstrateCoordinator {
                 Some((token, args)),
             )
             .await;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
             .await;
+        search_profile::stage("finalize", started, &[]);
         (entity_hits, note_hits, per_backend)
     }
 
@@ -987,6 +997,7 @@ impl SubstrateCoordinator {
         #[cfg(not(test))]
         let delay_backend: Option<(String, Duration)> = None;
 
+        let fan_out_started = search_profile::start();
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
             let q = query.clone();
@@ -1192,6 +1203,10 @@ impl SubstrateCoordinator {
                     }
                 }
             };
+            let finished_at = fan_out_started.map(|_| match &joined {
+                Ok(Ok((_, completed_at))) => *completed_at,
+                _ => tokio::time::Instant::now(),
+            });
             match joined {
                 Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
@@ -1268,12 +1283,19 @@ impl SubstrateCoordinator {
                     });
                 }
             }
+            if let (Some(started), Some(finished_at), Some(result)) =
+                (fan_out_started, finished_at, per_backend.last())
+            {
+                search_profile::backend(result, finished_at.duration_since(started));
+            }
         }
 
+        let started = search_profile::start();
         let merged_entities =
             rrf_merge_entity_hits_filtered(entity_ranked_lists, usize::MAX, request.source());
         let merged_notes =
             rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
+        search_profile::stage("merge", started, &[]);
         (merged_entities, merged_notes, per_backend)
     }
 }
@@ -1327,7 +1349,7 @@ fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
 
 // ---- RRF merge ----
 
-/// Fuse ranked lists with reciprocal rank fusion (k=60), keep the hits whose fused source passes
+/// Fuse ranked lists with RRF (shared default k), keep hits whose fused source passes
 /// `source_filter`, then cut the filtered order to `limit`.
 ///
 /// Each list is one arm and each hit carries its position in its own list. Later copies of an id
@@ -1338,15 +1360,13 @@ fn merge_labelled(
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<(Uuid, DeterministicScore, HitLabel)> {
-    const K: usize = 60;
-
-    let mut fused = fuse_labelled(arms, K, combine_best_ranked_evidence);
+    let mut fused = fuse_labelled(arms, DEFAULT_RRF_K, combine_best_ranked_evidence);
     fused.retain(|(_, _, label)| source_filter.is_none_or(|want| label.source == want));
     fused.truncate(limit);
     fused
 }
 
-/// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked entity hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     rrf_merge_entity_hits_filtered(lists, limit, None)
@@ -1389,7 +1409,7 @@ pub(super) fn rrf_merge_entity_hits_filtered(
     merged
 }
 
-/// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked note hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_note_hits(
     lists: Vec<Vec<NoteSearchHit>>,

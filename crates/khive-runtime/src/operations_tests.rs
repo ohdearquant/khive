@@ -156,6 +156,63 @@ async fn resolve_prefix_query_plan_uses_primary_key_range_seeks() {
     );
 }
 
+#[tokio::test]
+async fn resolve_prefix_query_plan_seeks_id_range_with_namespace_filter() {
+    let rt = rt();
+    let mut reader = rt.sql().reader().await.expect("prefix plan reader");
+    let mut plans = Vec::new();
+    let (lower, upper) = super::uuid_prefix_bounds("0b6cf134").expect("valid compact UUID prefix");
+    let namespaces = vec!["local".to_string(), "other".to_string()];
+
+    // The index each table must seek: the primary-key/rowid autoindex for the
+    // TEXT-PRIMARY-KEY tables, and the unique id index for `graph_edges` whose
+    // PRIMARY KEY is `(namespace, id)`.
+    for (table, has_deleted_at, expected_index) in [
+        ("entities", true, "sqlite_autoindex_entities_1"),
+        ("notes", true, "sqlite_autoindex_notes_1"),
+        ("events", false, "sqlite_autoindex_events_1"),
+        ("graph_edges", false, "idx_graph_edges_id_unique"),
+    ] {
+        let rows = reader
+            .explain(super::resolve_prefix_statement(
+                table,
+                has_deleted_at,
+                false,
+                Some(namespaces.as_slice()),
+                &lower,
+                &upper,
+            ))
+            .await
+            .expect("explain prefix query");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        plans.push((table, expected_index, details));
+    }
+
+    assert!(
+        plans.iter().all(|(table, expected_index, details)| {
+            details.iter().any(|detail| {
+                detail.contains(&format!("SEARCH {table} USING INDEX {expected_index}"))
+                    && detail.contains("id>?")
+                    && detail.contains("id<?")
+            }) && !details
+                .iter()
+                .any(|detail| detail.contains(&format!("SCAN {table}")))
+                && !details
+                    .iter()
+                    .any(|detail| detail.contains("idx_entities_namespace")
+                        || detail.contains("idx_notes_namespace")
+                        || detail.contains("idx_events_ns_created_id"))
+        }),
+        "a namespace-scoped short-id lookup must seek the id range, not a namespace index: {plans:?}"
+    );
+}
+
 #[test]
 fn fts_fault_arm_disarms_namespace_when_scope_panics() {
     let ns = format!("fault-arm-drop-{}", uuid::Uuid::new_v4().as_simple());
@@ -1087,7 +1144,7 @@ async fn update_edge_symmetric_absorption_refuses_stale_snapshot_when_survivor_e
     assert_eq!(
         stale_deleted_at_micros, None,
         "fixture premise: the stale snapshot must be of a LIVE edge, otherwise \
-             `deleted_at IS ?14` would refuse and this stops being an isolating fixture"
+             `deleted_at IS ?4` would refuse and this stops being an isolating fixture"
     );
     let survivor_before = rt.get_edge(&tok, survivor_id).await.unwrap().expect(
         "fixture premise: the survivor must already own the canonical natural key \
@@ -1105,28 +1162,24 @@ async fn update_edge_symmetric_absorption_refuses_stale_snapshot_when_survivor_e
         "fixture premise: the survivor and the stale writer's edge must be distinct rows"
     );
 
-    // Reproduce the exact DML `update_edge` runs for the stale writer,
-    // using the snapshot it captured BEFORE the concurrent write above.
-    let pool = rt.backend().pool_arc();
-    let guard = pool.writer().expect("writer guard");
+    // Exercise the same storage capability as the runtime with its stale snapshot.
     let (canon_src, canon_tgt) = canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
-    let outcome = guard
-        .transaction(|conn| {
-            KhiveRuntime::update_edge_symmetric_dml(
-                conn,
-                "local",
-                &e_id.to_string(),
-                &canon_src.to_string(),
-                &canon_tgt.to_string(),
-                "competes_with",
-                0.9,
-                None,
-                stale_updated_at_micros,
-                stale_deleted_at_micros,
-            )
+    let outcome = rt
+        .graph(&tok)
+        .unwrap()
+        .update_symmetric_edge_if_unchanged(SymmetricEdgeUpdateRequest {
+            namespace: "local".into(),
+            id: e.id,
+            source_id: canon_src,
+            target_id: canon_tgt,
+            relation: EdgeRelation::CompetesWith,
+            weight: 0.9,
+            metadata: None,
+            expected_updated_at_micros: stale_updated_at_micros,
+            expected_deleted_at_micros: stale_deleted_at_micros,
         })
-        .expect("dml call must not error");
-    drop(guard);
+        .await
+        .expect("guarded update must not error");
     assert!(
         matches!(outcome, SymmetricEdgeUpdateOutcome::Stale),
         "a stale writer must be refused, not silently absorbed into the survivor: {outcome:?}"
@@ -2697,9 +2750,9 @@ async fn search_notes_with_residual_fts5_char_now_sanitized() {
 /// exhaustion or connection timeout on the text-search backend — is not a
 /// bad query and must propagate as `Err`, not be silently swallowed into
 /// an empty (falsely "successful") result set. `search_notes`,
-/// `hybrid_search`, and `collect_recall_text_hits` all share the same
-/// `is_fts5_syntax_error()` gate on `StorageError`, so this case
-/// generalizes to all three call sites.
+/// `hybrid_search`, `hybrid_search_with_strategy`, and
+/// `collect_recall_text_hits` all share the same `is_fts5_syntax_error()`
+/// gate on `StorageError`, so this case generalizes to all four call sites.
 #[tokio::test]
 async fn search_notes_propagates_non_parser_fts_error() {
     let rt = rt();

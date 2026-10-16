@@ -237,15 +237,19 @@ exists for this workspace) keep the prior pathname-based
 `remove_dir_all_retrying` behavior — no fd-relative directory API is stable
 there yet.
 
-## `unix_fd` / `is_owned_entry_via_fd`
+## Shared filesystem primitives / `is_owned_entry_via_fd`
 
-The cache takes its descriptor-relative `openat`, `fstatat` and `fstat` calls
-(`open_dir_at`, `stat_at`, `stat_fd`) from the shared `fd_relative` module of
+The cache takes its descriptor-relative `openat`, `fstatat`, `fstat` and `renameat` calls
+(`open_dir_at`, `stat_at`, `stat_fd`, `rename_at`) from the shared `fd_relative` module of
 the `khive-fs` crate (`crates/khive-fs/src/fd_relative.rs`): every operation
 after the initial `open`/`openat` is relative to a handle the kernel resolved
 once, immune to the original pathname being swapped out from under it
-afterward. `unix_fd` is the small private module of what that module does not
-cover: the path-based `open_dir_nofollow` and `renameat`.
+afterward. The path-based `directory_walk::open_dir_nofollow` opens the initial
+directory handle. Its final component must be a directory rather than a symlink;
+ancestor symlinks and group-writable parents keep their previous behavior. The
+cache does not add the ancestor ownership, writable-parent or ACL policy of
+`walk_to_directory`. Returned descriptors are converted to owned `File` handles
+before the existing descriptor-relative checks and mutations.
 `is_owned_entry_via_fd` is `is_owned_entry`'s fd-relative mirror, used by
 `delete_verified_owned_entry` right before it acts.
 

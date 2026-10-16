@@ -118,9 +118,9 @@ async fn proven_append_refusal_drops_in_gap_and_propagates_in_stop() {
 #[test]
 fn unknown_append_outcome_preserves_exact_error_and_stop_propagates() {
     fn source() -> RuntimeError {
-        RuntimeError::Storage(StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        })
+        RuntimeError::Storage(StorageError::writer_task_terminated(
+            WriterTaskRequestState::SideEffectsUnknown,
+        ))
     }
     let expected = runtime_error_value(source(), DomainDisposition::Unknown);
     let value = append_response(

@@ -34,6 +34,7 @@ fn declarations() -> Vec<Declared> {
     let mut rows = vec![
         declared::<khive_pack_blob::BlobPack>(),
         declared::<khive_pack_brain::BrainPack>(),
+        declared::<khive_pack_charter::CharterPack>(),
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
         declared::<khive_pack_exec::ExecPack>(),
@@ -405,6 +406,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
     );
     let mut expected: BTreeSet<String> = RuntimeConfig::built_in_packs().into_iter().collect();
     expected.insert("template".into());
+    expected.insert("charter".into());
     for (name, enabled) in [
         ("agent", cfg!(feature = "pack-agent")),
         ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -416,7 +418,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 15
+    let expected_count = 16
         + [
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),

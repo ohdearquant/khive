@@ -51,7 +51,7 @@ pub(super) fn is_stop(w: &str) -> bool {
 
 // ─── content hash and validation ─────────────────────────────────────────────
 
-/// Minimum section content length in bytes.
+/// Minimum section content length in Unicode scalar values.
 pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
 
 /// Minimum atom content length in words.
@@ -83,11 +83,11 @@ pub(super) fn content_hash(content: &str) -> String {
 
 /// Validate that section content meets the 80-character minimum.
 pub(super) fn validate_section_content(content: &str) -> Result<(), RuntimeError> {
-    if content.len() < MIN_SECTION_CONTENT_LEN {
+    let character_count = content.chars().count();
+    if character_count < MIN_SECTION_CONTENT_LEN {
         return Err(RuntimeError::InvalidInput(format!(
             "section content must be at least {} characters (got {})",
-            MIN_SECTION_CONTENT_LEN,
-            content.len()
+            MIN_SECTION_CONTENT_LEN, character_count
         )));
     }
     Ok(())
@@ -143,22 +143,22 @@ pub(super) fn tags_to_json(tags: Option<&Vec<String>>) -> String {
     }
 }
 
+/// Classify valid stored tag arrays by exact element, retaining the historical
+/// guard for malformed or non-array legacy tag text.
+pub(super) fn has_domain_mirror_tag(tags: &str) -> bool {
+    khive_types::tag_contains(tags, "type:domain")
+}
+
 pub(super) fn row_str(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
-    match row.get(col) {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
+    row.text_or_none(col).map(str::to_owned)
 }
 
 pub(super) fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
-    match row.get(col) {
-        Some(SqlValue::Integer(n)) => Some(*n),
-        _ => None,
-    }
+    row.i64_or_none(col)
 }
 
 pub(super) fn row_bool(row: &khive_storage::types::SqlRow, col: &str) -> bool {
-    matches!(row.get(col), Some(SqlValue::Integer(1)))
+    row.i64_or_none(col) == Some(1)
 }
 
 pub(crate) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
@@ -409,14 +409,14 @@ pub(super) async fn compute_embedding_coverage(
         .await
         .map_err(|e| sql_err("stats embedding coverage reader", e))?;
 
-    let count = reader
-        .query_scalar(SqlStatement {
+    let atoms_with_vector = reader
+        .count(SqlStatement {
             sql: format!(
                 "SELECT COUNT(DISTINCT a.id) \
                  FROM knowledge_atoms a \
                  WHERE a.namespace = ?1 \
                    AND a.deleted_at IS NULL \
-                   AND a.tags NOT LIKE '%type:domain%' \
+                   AND NOT khive_tag_contains(a.tags, 'type:domain') \
                    AND a.id IN ( \
                        SELECT v.subject_id FROM {table_name} v \
                        WHERE v.namespace = ?1 \
@@ -430,89 +430,9 @@ pub(super) async fn compute_embedding_coverage(
         .await
         .map_err(|e| sql_err("stats embedding coverage", e))?;
 
-    let atoms_with_vector = match count {
-        Some(SqlValue::Integer(n)) => n,
-        Some(other) => {
-            return Err(RuntimeError::Internal(format!(
-                "stats embedding coverage returned non-integer count: {other:?}"
-            )));
-        }
-        None => 0,
-    };
-
     Ok(atoms_with_vector as f64 / total_atoms as f64)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn knowledge_sql_err_message_is_context_and_error() {
-        match sql_err("insert atom", "boom") {
-            RuntimeError::Internal(message) => {
-                assert_eq!(message, "insert atom: boom");
-            }
-            other => panic!("expected RuntimeError::Internal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn servable_section_predicate_excludes_every_retired_spelling() {
-        let whitespace = (0..=u32::from(char::MAX))
-            .filter_map(char::from_u32)
-            .filter(|c| c.is_whitespace())
-            .map(|c| u32::from(c).to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let spellings = khive_brain_core::SectionType::RETIRED_SPELLINGS
-            .iter()
-            .map(|(spelling, _)| format!("'{spelling}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert_eq!(
-            SERVABLE_SECTION,
-            format!(
-                "lower(replace(replace(trim(section_type, char({whitespace})), \
-                 '-', '_'), ' ', '_')) NOT IN ({spellings})"
-            )
-        );
-    }
-
-    #[test]
-    fn servable_section_normalization_equals_normalize_name() {
-        let (expression, _) = SERVABLE_SECTION
-            .split_once(" NOT IN ")
-            .expect("the predicate compares a normalized value");
-        let sql = format!("SELECT {}", expression.replacen("section_type", "?1", 1));
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let mut inputs = vec![
-            "References".to_string(),
-            "See-Also".to_string(),
-            "see also".to_string(),
-            "FURTHER-reading".to_string(),
-            "Core Model".to_string(),
-            "Boundary-Conditions".to_string(),
-            "Example".to_string(),
-            "pitfall".to_string(),
-            "Ré-Sumé Notes".to_string(),
-            "a\tb".to_string(),
-            String::new(),
-            " \t\n".to_string(),
-        ];
-        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
-            if c.is_whitespace() {
-                inputs.push(format!("{c}See-Also{c}"));
-                inputs.push(format!("{c}{c}Notes {c}"));
-            }
-        }
-        for input in &inputs {
-            let normalized: String = conn.query_row(&sql, [input], |row| row.get(0)).unwrap();
-            assert_eq!(
-                normalized,
-                khive_brain_core::SectionType::normalize_name(input),
-                "{input:?}"
-            );
-        }
-    }
-}
+#[path = "util_tests.rs"]
+mod tests;

@@ -241,12 +241,9 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::{
-                ffi::CString,
-                os::fd::{AsRawFd as _, FromRawFd as _},
-            };
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             // SAFETY: the pinned directory descriptor and validated name live
             // through this call. O_NOFOLLOW rejects a planted final symlink.
             let fd = unsafe {
@@ -290,68 +287,14 @@ impl CheckpointDirectory {
     pub(crate) fn stage(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         {
-            use std::{
-                ffi::CString,
-                io::Write as _,
-                os::fd::{AsRawFd as _, FromRawFd as _},
-            };
-            let name = component_name(name)?;
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let dir_fd = self.dir.as_raw_fd();
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: pointers and descriptor are live. AT_SYMLINK_NOFOLLOW
-            // inspects the directory entry itself rather than its target.
-            let rc = unsafe {
-                libc::fstatat(
-                    dir_fd,
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc == 0 {
-                // SAFETY: fstatat succeeded and initialized the structure.
-                let stat = unsafe { stat.assume_init() };
-                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "checkpoint staging entry is not a regular file",
-                    ));
-                }
-                // A stale regular staging inode is safe to replace. An entry
-                // swapped in after fstatat is only unlinked, never followed.
-                // SAFETY: the name and descriptor remain live.
-                if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            } else {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
-                }
-            }
-            // SAFETY: O_EXCL and O_NOFOLLOW prevent a concurrent planted link
-            // from being opened. The returned descriptor has one owner.
-            let fd = unsafe {
-                libc::openat(
-                    dir_fd,
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o644 as libc::c_uint,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: fd was freshly returned by openat.
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(bytes)?;
-            file.sync_all()
+            use khive_fs::atomic_publish::{stage_atomic_at_detailed, StaleTmp};
+            use std::io::Write as _;
+
+            component_name(name)?;
+            stage_atomic_at_detailed(&self.dir, name, StaleTmp::Refuse, |file| {
+                file.write_all(bytes)
+            })
+            .map_err(checkpoint_publication_error)
         }
         #[cfg(windows)]
         {
@@ -373,16 +316,12 @@ impl CheckpointDirectory {
         component_name(to)?;
         #[cfg(unix)]
         {
-            use std::{ffi::CString, os::fd::AsRawFd as _};
-            let from =
-                CString::new(from).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let to = CString::new(to).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let dir_fd = self.dir.as_raw_fd();
-            // SAFETY: both names and the pinned directory descriptor are live.
-            if unsafe { libc::renameat(dir_fd, from.as_ptr(), dir_fd, to.as_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            khive_fs::fd_relative::rename_at(
+                &self.dir,
+                std::ffi::OsStr::new(from),
+                &self.dir,
+                std::ffi::OsStr::new(to),
+            )
         }
         #[cfg(windows)]
         {
@@ -396,6 +335,42 @@ impl CheckpointDirectory {
                 "secure checkpoint rename unsupported",
             ))
         }
+    }
+
+    /// Commit metadata before promoting the four segments already staged by
+    /// the caller. Callers hold `.checkpoint.lock` across staging and this
+    /// boundary. An interrupted promotion requires restaging all four segments
+    /// before retrying; this method does not resume a partial generation.
+    pub(crate) fn publish_v2(&self, metadata: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use khive_fs::atomic_publish::{publish_atomic_at_detailed, StaleTmp};
+            use std::io::Write as _;
+
+            publish_atomic_at_detailed(
+                &self.dir,
+                "metadata.bin.tmp",
+                "metadata.bin",
+                StaleTmp::Refuse,
+                |file| file.write_all(metadata),
+            )
+            .map_err(checkpoint_publication_error)?;
+        }
+        #[cfg(not(unix))]
+        {
+            self.stage("metadata.bin.tmp", metadata)?;
+            self.rename("metadata.bin.tmp", "metadata.bin")?;
+            self.sync()?;
+        }
+
+        // Metadata is durable before any segment promotion. A subsequent
+        // failure can leave mixed live segments; checksums refuse that state
+        // and load_or_build can rebuild it from the caller's corpus.
+        self.rename("vectors.bin.v2new", "vectors.bin")?;
+        self.rename("graph.bin.v2new", "graph.bin")?;
+        self.rename("lifecycle.bin.v2new", "lifecycle.bin")?;
+        self.rename("codes.bin.v2new", "codes.bin")?;
+        self.sync()
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
@@ -416,9 +391,9 @@ impl CheckpointDirectory {
         component_name(name)?;
         #[cfg(unix)]
         {
-            use std::{ffi::CString, os::fd::AsRawFd as _};
-            let name =
-                CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            use std::os::fd::AsRawFd as _;
+            let name = khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             // SAFETY: the name and pinned directory descriptor are live. Unlinking
             // a planted link removes only that directory entry.
             if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
@@ -449,9 +424,22 @@ pub fn write_auxiliary_sidecar_atomic(path: &Path, name: &str, bytes: &[u8]) -> 
     component_name(name)?;
     let checkpoint = CheckpointDirectory::open(path)?;
     let staged = format!("{name}.tmp");
-    checkpoint.stage(&staged, bytes)?;
-    checkpoint.rename(&staged, name)?;
-    checkpoint.sync()
+    #[cfg(unix)]
+    {
+        use khive_fs::atomic_publish::{publish_atomic_at_detailed, StaleTmp};
+        use std::io::Write as _;
+
+        publish_atomic_at_detailed(&checkpoint.dir, &staged, name, StaleTmp::Refuse, |file| {
+            file.write_all(bytes)
+        })
+        .map_err(checkpoint_publication_error)
+    }
+    #[cfg(not(unix))]
+    {
+        checkpoint.stage(&staged, bytes)?;
+        checkpoint.rename(&staged, name)?;
+        checkpoint.sync()
+    }
 }
 
 /// Remove an obsolete pack-owned sidecar after a full segment publication.
@@ -477,15 +465,157 @@ pub fn remove_auxiliary_sidecars(path: &Path, names: &[String]) -> io::Result<()
     first_error.map_or(Ok(()), Err)
 }
 
+#[cfg(unix)]
+fn checkpoint_publication_error(error: khive_fs::atomic_publish::AtomicPublishError) -> io::Error {
+    if error.phase() == khive_fs::atomic_publish::AtomicPublishPhase::RefuseTmp {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint staging entry is not a regular file",
+        )
+    } else {
+        error.into_source()
+    }
+}
+
 fn component_name(name: &str) -> io::Result<&str> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-    {
+    if matches!(name, "." | "..") || name.contains('\\') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    #[cfg(unix)]
+    khive_fs::fd_relative::c_name(std::ffi::OsStr::new(name))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    #[cfg(not(unix))]
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     Ok(name)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::CheckpointDirectory;
+    use std::{collections::BTreeMap, fs, io, os::unix::fs::symlink, path::Path};
+
+    const SEGMENTS: [(&str, &str, &[u8]); 4] = [
+        ("vectors.bin.v2new", "vectors.bin", b"new vectors"),
+        ("graph.bin.v2new", "graph.bin", b"new graph"),
+        ("lifecycle.bin.v2new", "lifecycle.bin", b"new lifecycle"),
+        ("codes.bin.v2new", "codes.bin", b"new codes"),
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Entry {
+        File(Vec<u8>),
+        Directory,
+        Link(std::path::PathBuf),
+    }
+
+    // Capture every entry, its type, and all regular-file bytes. A refusal or
+    // partial promotion must not hide a change behind a count-only assertion.
+    fn snapshot(path: &Path) -> BTreeMap<std::path::PathBuf, Entry> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<std::path::PathBuf, Entry>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_owned();
+                let kind = entry.file_type().unwrap();
+                let value = if kind.is_symlink() {
+                    Entry::Link(fs::read_link(&path).unwrap())
+                } else if kind.is_dir() {
+                    visit(root, &path, entries);
+                    Entry::Directory
+                } else {
+                    assert!(kind.is_file());
+                    Entry::File(fs::read(&path).unwrap())
+                };
+                entries.insert(relative, value);
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(path, path, &mut entries);
+        entries
+    }
+
+    fn seed_and_stage(path: &Path, checkpoint: &CheckpointDirectory) {
+        fs::write(path.join("metadata.bin"), b"old metadata").unwrap();
+        for (staged, live, bytes) in SEGMENTS {
+            fs::write(path.join(live), format!("old {live}")).unwrap();
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+    }
+
+    fn committed_snapshot(
+        mut before: BTreeMap<std::path::PathBuf, Entry>,
+    ) -> BTreeMap<std::path::PathBuf, Entry> {
+        before.insert("metadata.bin".into(), Entry::File(b"new metadata".to_vec()));
+        for (staged, live, bytes) in SEGMENTS {
+            before.remove(Path::new(staged));
+            before.insert(live.into(), Entry::File(bytes.to_vec()));
+        }
+        before
+    }
+
+    #[test]
+    fn v2_partial_promotion_preserves_exact_state_and_retries_after_complete_restage() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = CheckpointDirectory::open(dir.path()).unwrap();
+        seed_and_stage(dir.path(), &checkpoint);
+        // A real rename obstruction after vectors have been promoted.
+        fs::remove_file(dir.path().join("graph.bin")).unwrap();
+        fs::create_dir(dir.path().join("graph.bin")).unwrap();
+        fs::write(dir.path().join("graph.bin/child"), b"precious graph entry").unwrap();
+        let mut expected = snapshot(dir.path());
+        expected.insert("metadata.bin".into(), Entry::File(b"new metadata".to_vec()));
+        expected.insert("vectors.bin".into(), Entry::File(b"new vectors".to_vec()));
+        expected.remove(Path::new("vectors.bin.v2new"));
+
+        let error = checkpoint.publish_v2(b"new metadata").unwrap_err();
+        assert!(
+            error.raw_os_error().is_some(),
+            "retain the rename's native cause"
+        );
+        assert_eq!(snapshot(dir.path()), expected);
+
+        fs::remove_file(dir.path().join("graph.bin/child")).unwrap();
+        fs::remove_dir(dir.path().join("graph.bin")).unwrap();
+        // The vectors staging entry was consumed. Production retries by
+        // staging all four segments again, never by resuming this boundary.
+        for (staged, _, bytes) in SEGMENTS {
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+        let expected = committed_snapshot(snapshot(dir.path()));
+        checkpoint.publish_v2(b"new metadata").unwrap();
+        assert_eq!(snapshot(dir.path()), expected);
+    }
+
+    #[test]
+    fn v2_metadata_refusal_preserves_all_live_and_staged_entries_before_any_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        fs::write(&target, b"outside bytes").unwrap();
+        let checkpoint = CheckpointDirectory::open(dir.path()).unwrap();
+        seed_and_stage(dir.path(), &checkpoint);
+        symlink(&target, dir.path().join("metadata.bin.tmp")).unwrap();
+        let before = snapshot(dir.path());
+        let outside_before = snapshot(outside.path());
+
+        let error = checkpoint.publish_v2(b"new metadata").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "checkpoint staging entry is not a regular file"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(snapshot(outside.path()), outside_before);
+
+        fs::remove_file(dir.path().join("metadata.bin.tmp")).unwrap();
+        for (staged, _, bytes) in SEGMENTS {
+            checkpoint.stage(staged, bytes).unwrap();
+        }
+        let expected = committed_snapshot(snapshot(dir.path()));
+        checkpoint.publish_v2(b"new metadata").unwrap();
+        assert_eq!(snapshot(dir.path()), expected);
+        assert_eq!(snapshot(outside.path()), outside_before);
+    }
 }

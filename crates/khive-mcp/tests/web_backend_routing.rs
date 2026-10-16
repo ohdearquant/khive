@@ -126,6 +126,7 @@ async fn web_pack_assigned_to_a_declared_backend_writes_there_only() {
         "web".to_string(),
         PackConfig {
             backend: "web".to_string(),
+            verbs_disabled: Vec::new(),
             no_embed: false,
         },
     );

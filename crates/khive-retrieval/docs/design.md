@@ -25,14 +25,28 @@
 - `HybridSearcher` is blanket-implemented for types that provide both `VectorSearch` and
   `KeywordSearch`.
 - Namespace enforcement is the responsibility of the runtime layer, not this crate.
+  Historical weight and event readers take an explicit namespace; they do not provide
+  an engine-backed search or general-purpose namespace filtering API.
 
 ### Feature Flag Policy (ADR-030)
 
-- `Cargo.toml` uses `default = []`, as specified by ADR-030. Consumers opt into the
-  additional engine, checkpoint, adapter, policy and embedding implementation surfaces
-  they need.
+- The `persist` feature enables historical weight reconstruction (`weights_as_of`),
+  rank history (`rank_history`), and the `atom_rank_variance` and
+  `adjustment_rate_per_day` metrics. Their SQLite readers and public report types remain.
+- The unreachable replay integration and its `EmbeddedEngine` placeholder are removed.
+  Cargo never declared its `engine` feature; there is no supported engine-backed replay,
+  temporal query diff, regression check, or rolling Jaccard API in this crate.
+- Feature flags in this crate deviate from ADR-030 defaults: `checkpoint`, `persist`,
+  `embed`, and `storage-adapters` are not default-on. This deviation is tracked pending
+  an ADR-030 amendment.
 
 ## Consistency Notes
 
+- **Feature default deviation (ADR-030)**: ADR-030 marks `checkpoint`, `persist`, `embed`,
+  and `storage-adapters` as default-on, but `Cargo.toml` has `default = []`. An ADR-030
+  amendment is needed to reflect the actual shipping defaults.
 - **Graph module removed**: The legacy `graph-legacy` `LinkStore`-based traversal module was
   deleted (#58). Traversal lives in `khive-runtime` over `khive-storage`'s `GraphStore`.
+- **Replay surface**: the supported historical readers remain behind `persist`. Public
+  report types are retained, while the private diff calculation remains only for its
+  existing unit tests. No undeclared feature or placeholder engine is retained.

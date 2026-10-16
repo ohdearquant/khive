@@ -864,8 +864,19 @@ class MakefileGateContractTests(unittest.TestCase):
     def _extract_local_recipe(makefile_text: str) -> list[str]:
         """Return the shell commands make would run for `local:`, expanded."""
         variables = dict(
-            re.findall(r"^([A-Z_][A-Z0-9_]*)\s*:=\s*(.*)$", makefile_text, re.M)
+            re.findall(r"^([A-Z_][A-Z0-9_]*)\s*:=\s*(.*)$", makefile_text, re.MULTILINE)
         )
+        # A `define` block holds recipe lines shared between targets. Its body
+        # is spliced back in as the recipe lines it replaced: one leading tab
+        # off each line, joined with newlines, exactly as the lines below are.
+        for name, value in re.findall(
+            r"^define ([A-Z_][A-Z0-9_]*)\n(.*?)\nendef$",
+            makefile_text,
+            re.MULTILINE | re.DOTALL,
+        ):
+            variables[name] = "\n".join(
+                line.removeprefix("\t") for line in value.split("\n")
+            )
         body = makefile_text[makefile_text.index("local: verify-local-artifact") :]
         body = body[body.index("\n") + 1 :]
 
@@ -1275,6 +1286,19 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertIn("LOCAL_VERB_FLOOR := 98", self.makefile)
 
         local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
+        # The install half lives in a define shared with install-artifact; read
+        # `local` with that body back in place, so every ordering below is the
+        # order `local` actually runs.
+        shared = re.search(
+            r"^define INSTALL_VERIFIED_ARTIFACT\n(.*?)\nendef$",
+            self.makefile,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(shared, "INSTALL_VERIFIED_ARTIFACT define not found")
+        self.assertIn("\t$(INSTALL_VERIFIED_ARTIFACT)\n", local_recipe)
+        local_recipe = local_recipe.replace(
+            "$(INSTALL_VERIFIED_ARTIFACT)", shared.group(1), 1
+        )
         self.assertNotIn("cargo build", local_recipe)
         stamp_check = local_recipe.index(
             '--inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"'
@@ -1373,6 +1397,11 @@ class MakefileGateContractTests(unittest.TestCase):
             "$(LOCAL_VERB_FLOOR)",
             "$(LOCAL_BUILD_RECEIPT)",
             "$(CARGO)",
+            "$(FLEET_ARTIFACT)",
+            "$(EXPECTED_SHA256)",
+            "$(EXPECTED_REVISION)",
+            "$(PIN_DIR)",
+            "$(SUPERVISOR_LABEL)",
         )
         recipe_lines = [
             line
@@ -2275,6 +2304,129 @@ class MakeLocalMarkerContractTests(unittest.TestCase):
                     marker.exists(),
                     "unconditional removal control did not remove the foreign marker",
                 )
+
+
+class InstallArtifactRefusalTests(unittest.TestCase):
+    """`make install-artifact` refuses before its first write on every bad input.
+
+    Each case runs the real Makefile under a sandbox HOME with a stand-in
+    artifact (a script that prints a `--version` line) and checks that the
+    installed binary is byte-identical afterwards and that no pin was written.
+    The last case is the control: valid inputs pass both identity checks and
+    reach the pack probe, which the stand-in fails, so the refusals above are
+    the checks speaking rather than the harness failing early.
+    """
+
+    REVISION = "0123456789abcdef0123456789abcdef01234567"
+    INSTALLED = b"installed binary\n"
+
+    def _run(
+        self,
+        *,
+        omit: tuple[str, ...] = (),
+        expected_sha256: str | None = None,
+        expected_revision: str | None = None,
+        artifact_revision: str | None = None,
+        existing_pin: bytes | None = None,
+    ) -> tuple[int, str, bytes, bytes | None, bool]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "workspace"
+            (work / "scripts").mkdir(parents=True)
+            shutil.copy(MAKEFILE, work / "Makefile")
+            shutil.copy(VERIFY_SCRIPT, work / "scripts" / VERIFY_SCRIPT.name)
+            home = root / "home"
+            installed = home / ".cargo" / "bin" / "kkernel"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(self.INSTALLED)
+            artifact = root / "artifact" / "kkernel"
+            artifact.parent.mkdir()
+            artifact.write_text(
+                "#!/bin/sh\n"
+                f"echo 'kkernel 0.0.0 (revision {artifact_revision or self.REVISION}, "
+                "built 2026-01-01T00:00:00Z)'\n",
+                encoding="utf-8",
+            )
+            artifact.chmod(0o755)
+            pin_dir = root / "pins"
+            if existing_pin is not None:
+                pin_dir.mkdir()
+                (pin_dir / "kkernel").write_bytes(existing_pin)
+            args = {
+                "FLEET_ARTIFACT": str(artifact),
+                "EXPECTED_SHA256": expected_sha256
+                or hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "EXPECTED_REVISION": expected_revision or self.REVISION,
+                "PIN_DIR": str(pin_dir),
+            }
+            for name in omit:
+                del args[name]
+            env = {k: v for k, v in os.environ.items() if not k.startswith("KHIVE_")}
+            env["HOME"] = str(home)
+            proc = subprocess.run(
+                ["make", "-f", "Makefile", "install-artifact"]
+                + [f"{name}={value}" for name, value in args.items()],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            pin = pin_dir / "kkernel"
+            staged = (home / ".cargo" / "bin" / "kkernel.new").exists()
+            return (
+                proc.returncode,
+                proc.stdout + proc.stderr,
+                installed.read_bytes(),
+                pin.read_bytes() if pin.exists() else None,
+                staged,
+            )
+
+    def _assert_refused(self, result, message: str, *, pin: bytes | None = None) -> None:
+        rc, output, installed, pin_bytes, staged = result
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn(message, output)
+        self.assertEqual(installed, self.INSTALLED, output)
+        self.assertEqual(pin_bytes, pin, output)
+        self.assertFalse(staged, output)
+
+    def test_refuses_without_an_artifact(self) -> None:
+        self._assert_refused(self._run(omit=("FLEET_ARTIFACT",)), "FLEET_ARTIFACT is required")
+
+    def test_refuses_without_a_pin_directory(self) -> None:
+        self._assert_refused(self._run(omit=("PIN_DIR",)), "PIN_DIR is required")
+
+    def test_refuses_a_malformed_expected_sha256(self) -> None:
+        self._assert_refused(
+            self._run(expected_sha256="abc"), "EXPECTED_SHA256 must be the artifact's sha256"
+        )
+
+    def test_refuses_a_malformed_expected_revision(self) -> None:
+        self._assert_refused(
+            self._run(expected_revision="main"), "EXPECTED_REVISION must be a git revision"
+        )
+
+    def test_refuses_an_artifact_whose_sha256_differs(self) -> None:
+        self._assert_refused(self._run(expected_sha256="0" * 64), "is not EXPECTED_SHA256")
+
+    def test_refuses_an_artifact_reporting_another_revision(self) -> None:
+        self._assert_refused(
+            self._run(artifact_revision="f" * 40), "not EXPECTED_REVISION " + self.REVISION
+        )
+
+    def test_never_overwrites_an_existing_pin(self) -> None:
+        self._assert_refused(
+            self._run(existing_pin=b"earlier pin\n"),
+            "a pin is never overwritten",
+            pin=b"earlier pin\n",
+        )
+
+    def test_valid_inputs_reach_the_pack_probe_and_install_nothing_when_it_fails(self) -> None:
+        result = self._run()
+        self._assert_refused(result, "the artifact failed the pack probe; nothing was installed")
+        output = result[1]
+        self.assertIn("Artifact sha256 matches EXPECTED_SHA256", output)
+        self.assertIn("Artifact revision matches EXPECTED_REVISION (" + self.REVISION + ")", output)
 
 
 if __name__ == "__main__":

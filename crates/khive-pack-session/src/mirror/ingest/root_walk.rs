@@ -7,16 +7,17 @@
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use khive_fs::directory_walk::{
-    walk_to_directory, AncestorLinkCondition, AncestorLinkPolicy, AncestorLinkRefusal,
-    AncestorWalkEndpoint, BudgetExhausted, LinkContext, LinkPolicy, ANCESTOR_LINK_BUDGET,
+    read_link_at, walk_to_directory, AncestorLinkCondition, AncestorLinkPolicy,
+    AncestorLinkRefusal, AncestorWalkEndpoint, BudgetExhausted, LinkContext, LinkPolicy,
+    ANCESTOR_LINK_BUDGET,
 };
+use khive_fs::fd_relative::open_dir_at;
 #[cfg(test)]
 use khive_fs::fd_relative::stat_at;
-use khive_fs::fd_relative::{c_name, open_dir_at};
 
 struct MirrorAncestorLinks {
     shared: AncestorLinkPolicy,
@@ -59,25 +60,21 @@ impl LinkPolicy for MirrorAncestorLinks {
     }
 }
 
-/// The length `readlinkat` reports for the link `name` inside `parent`, read into a buffer of
-/// `PATH_MAX` bytes.
+/// Read the link length through the shared byte-preserving helper, retaining the mirror's
+/// refusal for a target that fills the `PATH_MAX` ceiling.
 fn read_link_length(parent: &File, name: &OsStr) -> std::io::Result<usize> {
-    let name = c_name(name)?;
-    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: `parent` is a live descriptor, `name` is NUL-terminated for the call, and `buffer`
-    // is a writable region of its declared length.
-    let length = unsafe {
-        libc::readlinkat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
-    if length < 0 {
-        return Err(std::io::Error::last_os_error());
+    match read_link_at(parent, name) {
+        Ok(target) => Ok(target.as_os_str().as_bytes().len()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidData
+                && error.raw_os_error().is_none() =>
+        {
+            Err(std::io::Error::other(
+                "mirror source root ancestor symlink target is empty or too long",
+            ))
+        }
+        Err(error) => Err(error),
     }
-    Ok(length as usize)
 }
 
 /// Word the walk's own errors the way the mirror reports them.

@@ -44,12 +44,7 @@ impl InterleavingTailReader {
     }
 
     fn embedding(values: &[f32]) -> SqlValue {
-        SqlValue::Blob(
-            values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-        )
+        SqlValue::Blob(khive_storage::encode_f32_native(values))
     }
 }
 
@@ -2200,7 +2195,7 @@ async fn ensure_ann_for_model_restart_detects_vector_only_reindex() {
     {
         let table_name = format!("vec_{}", sanitize_model_key(MODEL));
         let replacement: Vec<f32> = (0..DIMS).map(|i| (i as f32 + 100.0) / 7.0).collect();
-        let bytes: Vec<u8> = replacement.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes = khive_storage::encode_f32_native(&replacement);
         let sql = rt.sql();
         let mut w = sql.writer().await.expect("writer");
         w.execute(SqlStatement {
@@ -2507,7 +2502,7 @@ async fn maybe_check_durable_epoch_detects_reindex_from_a_separate_warm_daemon()
     {
         let table_name = format!("vec_{}", sanitize_model_key(MODEL));
         let replacement: Vec<f32> = (0..DIMS).map(|i| (i as f32 + 100.0) / 7.0).collect();
-        let bytes: Vec<u8> = replacement.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes = khive_storage::encode_f32_native(&replacement);
         let sql = rt2.sql();
         let mut w = sql.writer().await.expect("writer");
         w.execute(SqlStatement {
