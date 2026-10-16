@@ -338,6 +338,10 @@ async fn explicit_sql_reader_transaction_blocks_retirement_without_writer_hold()
 #[tokio::test(start_paused = true)]
 #[serial(background_tasks, tx_registry, active_phases)]
 async fn unsettled_named_worker_blocks_idle_without_resetting_clock() {
+    // Unrelated tests must not contribute process-wide transaction spans.
+    if crate::test_process::run_in_child() {
+        return;
+    }
     let (release, pending) = tokio::sync::oneshot::channel::<()>();
     let task = spawn_named_tracked_task("idle-test-worker", async move {
         pending.await.unwrap();

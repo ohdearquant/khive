@@ -687,6 +687,12 @@ impl EmbedderProvider for LatticeEmbedderProvider {
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let native = Arc::new(NativeEmbeddingService::with_model(self.model));
         native.ensure_loaded().await?;
+        // Embedder loading frees transient heap that glibc would otherwise retain.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: malloc_trim has no preconditions. Its 0/1 release status is intentionally ignored.
+        unsafe {
+            libc::malloc_trim(0);
+        }
         Ok(cached_blocking_service(native))
     }
 }

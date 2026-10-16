@@ -457,9 +457,170 @@ pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Op
     }
 }
 
+/// Observe header presence without making either header family trusted.
+/// Prefer the topmost plain header, whose family the attribution gate uses.
+pub(crate) fn observed_auth_header<'a>(
+    plain_headers: &'a [String],
+    headers: &'a HashMap<String, String>,
+    raw_bytes: &[u8],
+) -> Option<(&'static str, Option<&'a str>)> {
+    let plain = plain_headers
+        .first()
+        .map(String::as_str)
+        .or_else(|| headers.get("authentication-results").map(String::as_str));
+    if plain.is_some() || raw_header_present(raw_bytes, b"authentication-results") {
+        return Some(("authentication-results", plain));
+    }
+    let arc = headers
+        .get("arc-authentication-results")
+        .map(String::as_str);
+    if arc.is_some() || raw_header_present(raw_bytes, b"arc-authentication-results") {
+        return Some(("arc-authentication-results", arc));
+    }
+    None
+}
+
+/// The parser can omit an empty header value. This name-only fallback stops at
+/// the header/body boundary and never supplies a value to the trust selector.
+fn raw_header_present(raw_bytes: &[u8], expected: &[u8]) -> bool {
+    for line in raw_bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            if line[..colon].eq_ignore_ascii_case(expected) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ObservedAuthservId {
+    Present { value: String, truncated: bool },
+    NoAuthservId,
+    Unparseable,
+}
+
+/// Extract only an observed identifier; method verdicts never leave this helper.
+/// ARC's instance prefix is removed for disclosure, never for attribution.
+pub(crate) fn observed_authserv_id(raw: Option<&str>, arc: bool) -> ObservedAuthservId {
+    let Some(raw) = raw else {
+        return ObservedAuthservId::Unparseable;
+    };
+    let segments = split_top_level_segments(raw);
+    let segment = if arc {
+        let Some(instance) = segments.first() else {
+            return ObservedAuthservId::Unparseable;
+        };
+        let instance = normalize_delimiter_cfws(instance, false);
+        let valid_instance = instance
+            .trim()
+            .split_once('=')
+            .is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("i")
+                    && !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u32>().is_ok_and(|instance| instance > 0)
+            });
+        if !valid_instance {
+            return ObservedAuthservId::Unparseable;
+        }
+        segments.get(1)
+    } else {
+        segments.first()
+    };
+    let Some(segment) = segment else {
+        return ObservedAuthservId::Unparseable;
+    };
+    let segment = normalize_delimiter_cfws(segment, false);
+    let Some(token) = split_top_level_ws(&segment).into_iter().next() else {
+        return ObservedAuthservId::Unparseable;
+    };
+    if contains_unquoted(&token, '=') {
+        return ObservedAuthservId::NoAuthservId;
+    }
+    let mut value = String::new();
+    for character in token.chars() {
+        let printable = character.escape_default().to_string();
+        if value.len() + printable.len() > 128 {
+            return ObservedAuthservId::Present {
+                value,
+                truncated: true,
+            };
+        }
+        value.push_str(&printable);
+    }
+    ObservedAuthservId::Present {
+        value,
+        truncated: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_authserv_ids_are_bounded_printable_and_never_select_arc() {
+        let long = format!("{}; dmarc=pass", "x".repeat(300));
+        assert_eq!(
+            observed_authserv_id(Some(&long), false),
+            ObservedAuthservId::Present {
+                value: "x".repeat(128),
+                truncated: true
+            }
+        );
+        let quoted = "\"m\u{e9}x\u{1}id\" 1; dmarc=pass";
+        let ObservedAuthservId::Present { value, truncated } =
+            observed_authserv_id(Some(quoted), false)
+        else {
+            panic!("quoted identifier should be observed")
+        };
+        assert!(value.is_ascii() && value.bytes().all(|byte| byte.is_ascii_graphic()));
+        assert!(value.contains("\\u{e9}") && value.contains("\\u{1}"));
+        assert!(!truncated && value.len() <= 128);
+        assert_eq!(
+            observed_authserv_id(Some("i=2; mx.microsoft.com 1; dmarc=pass"), true),
+            ObservedAuthservId::Present {
+                value: "mx.microsoft.com".into(),
+                truncated: false
+            }
+        );
+        assert_eq!(
+            observed_authserv_id(Some("i=bad; mx.example.com"), true),
+            ObservedAuthservId::Unparseable
+        );
+        assert_eq!(
+            observed_authserv_id(Some("spf=pass smtp.mailfrom=example.com"), false),
+            ObservedAuthservId::NoAuthservId
+        );
+        assert_eq!(
+            observed_authserv_id(Some(""), false),
+            ObservedAuthservId::Unparseable
+        );
+        assert!(select_trusted(&[], &TrustAnchor::AuthservId("mx.microsoft.com".into())).is_none());
+    }
+
+    #[test]
+    fn observed_header_presence_stops_at_body_and_ignores_continuation_names() {
+        let empty = HashMap::new();
+        assert_eq!(
+            observed_auth_header(
+                &[],
+                &empty,
+                b"Authentication-Results:\r\nFrom: a@example.com\r\n\r\nbody"
+            ),
+            Some(("authentication-results", None))
+        );
+        assert_eq!(
+            observed_auth_header(&[], &empty, b"ARC-Authentication-Results:\r\n\r\nbody"),
+            Some(("arc-authentication-results", None))
+        );
+        assert_eq!(observed_auth_header(&[], &empty, b"Subject: text\r\n Authentication-Results: forged\r\n\r\nARC-Authentication-Results: body"), None);
+    }
 
     #[test]
     fn parse_header_extracts_authserv_id_and_dmarc_pass() {
