@@ -215,6 +215,17 @@ impl EmailChannel {
         self
     }
 
+    /// Whether this channel admits authenticated mail from senders other than the maintainer as
+    /// external inbound: a host is wired that reports external inbound enabled, and inbound
+    /// routing is attached (ADR-200 sections 7 and 8.2).
+    pub fn external_inbound_enabled(&self) -> bool {
+        self.external_inbound.is_some()
+            && self
+                .external_host
+                .as_deref()
+                .is_some_and(|host| host.external_inbound_enabled())
+    }
+
     /// The configured mailbox address (e.g. `mailbox@example.com`).
     ///
     /// Used by the outbox delivery loop to derive the sender address and
@@ -351,7 +362,7 @@ impl EmailChannel {
     /// Run the domain-authentication-then-allowlist gate: ADR-200 §7's steps 3 through 7.
     ///
     /// Steps 1 and 2 (malformed, and the mailto unsubscribe) are decided before this is reached.
-    /// Step 6: once a sender authenticates and the external-sender configuration is on,
+    /// Step 6: once a sender authenticates and external inbound is enabled,
     /// an `inbound` suppression entry matching the sender's address or its exact domain quarantines
     /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
     /// any failing step quarantines it (never partially attributed).
@@ -369,12 +380,12 @@ impl EmailChannel {
             return Ok(EmailAttribution::Maintainer);
         }
         // Step 4 (maintainer) is the allowlist passing above and is unchanged. The sender is not
-        // the maintainer, so it is external: step 5 keeps today's outcome while external senders
-        // are unset, and step 6 consults the inbound list only once they are configured.
+        // the maintainer, so it is external: step 5 keeps today's outcome while external inbound
+        // is disabled, and step 6 consults the inbound list only once it is enabled.
         if self
             .external_host
             .as_deref()
-            .is_some_and(|host| host.external_senders_configured())
+            .is_some_and(|host| host.external_inbound_enabled())
         {
             // "the authenticated `From:` address" is a single well-formed From: a message with
             // zero or several is unauthorized on its face, not a candidate for the block list.
@@ -826,13 +837,12 @@ impl EmailChannel {
     /// Load the `inbound` suppression check for one poll.
     ///
     /// Loaded once per poll (ADR-200 §7 step 6) and shared across the page's messages. When the
-    /// channel has no host, or external senders are unset, no read happens -- matching today's
-    /// behaviour with `KHIVE_EMAIL_EXTERNAL_SENDERS` unset.
+    /// channel has no host, or external inbound is disabled, no read happens.
     async fn load_inbound_suppression(&self) -> Result<Option<InboundSuppression>, ChannelError> {
         let host = self
             .external_host
             .as_deref()
-            .filter(|host| host.external_senders_configured());
+            .filter(|host| host.external_inbound_enabled());
         match host {
             Some(host) => host.inbound_suppression().await.map(Some),
             None => Ok(None),
