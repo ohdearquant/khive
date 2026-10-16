@@ -3,8 +3,9 @@
 //! Five fixtures are ordinary developer replies that the rules must deliver, including one that
 //! suggests installing a package, one that asks for a trial key, and one that describes a server
 //! endpoint. One fixture is a hostile control addressed to an automated reader that two families
-//! must quarantine. A decline whose wording is not in the opt-out phrase list is delivered without
-//! the opt-out label, so nothing suppresses the sender automatically.
+//! must quarantine. A decline that asks for no more email is delivered with the opt-out label even
+//! though the phrase is split across a wrapped line (ADR-200 Amendment 2); an engaged reply that
+//! asks us to email something is delivered without it.
 
 use mail_parser::MessageParser;
 
@@ -41,6 +42,14 @@ fn reply_fixture(name: &str) -> &'static [u8] {
         "reply-pricing-question" => {
             mod recorded {
                 include!("../../tests/fixtures/external-inbound/reply-pricing-question.eml.rs");
+            }
+            recorded::MIME
+        }
+        "reply-engaged-email-me-docs" => {
+            mod recorded {
+                include!(
+                    "../../tests/fixtures/external-inbound/reply-engaged-email-me-docs.eml.rs"
+                );
             }
             recorded::MIME
         }
@@ -83,6 +92,24 @@ fn assert_delivered_without_opt_out(name: &str) {
     );
 }
 
+fn assert_delivered_with_opt_out(name: &str) {
+    let outcome = screen_fixture(name);
+    assert_eq!(
+        outcome.disposition,
+        Disposition::DeliverMarked,
+        "{name}: families {:?}, rules {:?}",
+        outcome.families,
+        outcome.rule_ids
+    );
+    assert!(outcome.opt_out, "{name}: rules {:?}", outcome.rule_ids);
+    assert_eq!(outcome.families, vec![Family::OptOut], "{name}");
+    assert_eq!(
+        outcome.rule_ids,
+        vec!["opt_out.unsubscribe".to_string()],
+        "{name}"
+    );
+}
+
 #[test]
 fn a15_reply_suggesting_a_package_install_is_delivered() {
     assert_delivered_without_opt_out("reply-engaged-install");
@@ -99,8 +126,13 @@ fn a15_reply_describing_a_server_endpoint_is_delivered() {
 }
 
 #[test]
-fn a15_decline_outside_the_opt_out_phrase_list_is_delivered_unlabelled() {
-    assert_delivered_without_opt_out("reply-decline-unlisted-opt-out");
+fn a15_decline_asking_for_no_more_email_is_delivered_with_the_opt_out_label() {
+    assert_delivered_with_opt_out("reply-decline-unlisted-opt-out");
+}
+
+#[test]
+fn a15_reply_asking_us_to_email_the_docs_is_delivered_without_the_opt_out_label() {
+    assert_delivered_without_opt_out("reply-engaged-email-me-docs");
 }
 
 #[test]

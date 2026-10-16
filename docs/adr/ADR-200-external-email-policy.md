@@ -5,7 +5,7 @@
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
-- **Amendments**: Amendment 1 (proposed 2026-10-14), at the end of this record
+- **Amendments**: Amendment 1 (proposed 2026-10-14) and Amendment 2 (proposed 2026-10-16), at the end of this record
 
 ## Context
 
@@ -402,3 +402,33 @@ screening rules, outcomes and labels of §8.3 and §8.4 are unchanged.
 
 Realistic replies from developers that ask the reader to install, run or connect something are A15 fixtures, and the
 change that adds them reports how many each screening family catches.
+
+## Amendment 2 (2026-10-16) -- The opt-out window is the first non-quoted paragraph, and the phrase list names asks for no more email
+
+**Trigger.** A recorded decline ends its first paragraph with "Please don't email me about this again", and the
+sending client wraps that sentence onto a second line. §8.4 reads the subject and the first non-quoted line, so the
+phrase is never seen, and the phrase list does not contain it. Under 15 U.S.C. 7704(a)(3) and (a)(4) a reply to the
+sender's return address asking for no more mail is an opt-out request the sender has ten business days to honour,
+whatever its wording, and a missed one is a second send to a person who asked us to stop. The two errors are not
+symmetric: a false label suppresses a person who wrote "don't email me", which is never wrong.
+
+**Decisions (amending §8.4).**
+
+1. The opt-out window is the subject or the **first non-quoted paragraph** of the plain text: the lines from the
+   first non-empty line that does not start with `>` up to the next empty or quoted line, joined with one space
+   before matching. Quoted text and everything after the first blank line stay outside the window, so a top-posted
+   reply above our own message, and a reply that quotes it, match only on what the person wrote. The HTML-only
+   path reads the same paragraph of the extracted text.
+2. The phrase list gains the plain asks for no more email: "stop contacting", "don't email me" (straight and curly
+   apostrophe), "dont email me", "do not email me", "don't contact me" (both apostrophes), "do not contact me",
+   "no more emails". The bare words "email me" are not a phrase.
+3. Outcome and entry point are unchanged: the label still never changes the delivery outcome, and §5.4 entry
+   point 3 still writes the suppression.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                | Required behaviour                                                                                                                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A20 wrapped opt-out | A recorded decline whose "don't email me" sentence is wrapped onto the second line of its first paragraph is delivered marked with the opt-out label and no other family.                                         |
+| A21 email-me decoy  | A recorded engaged reply containing "email me" twice ("can you email me the setup docs", "you can email me at") is delivered without the opt-out label; a widening to the bare words would turn this fixture red. |
+| A22 quoted opt-out  | A reply whose only opt-out phrase is on a quoted line, followed by an unquoted line, is delivered without the label (existing fixture, unchanged).                                                                |
