@@ -20,21 +20,21 @@ fn decode_embedding_rejects_misaligned_blob() {
 #[test]
 fn cosine_similarity_identical_vectors() {
     let v = vec![1.0f32, 0.0, 0.0];
-    assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    assert!((cosine_similarity(&v, &v, true) - 1.0).abs() < 1e-6);
 }
 
 #[test]
 fn cosine_similarity_orthogonal_vectors() {
     let a = vec![1.0f32, 0.0];
     let b = vec![0.0f32, 1.0];
-    assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    assert!(cosine_similarity(&a, &b, true).abs() < 1e-6);
 }
 
 #[test]
 fn cosine_similarity_mismatched_lengths_returns_zero() {
     let a = vec![1.0f32, 2.0];
     let b = vec![1.0f32];
-    assert_eq!(cosine_similarity(&a, &b), 0.0);
+    assert_eq!(cosine_similarity(&a, &b, true), 0.0);
 }
 
 #[test]

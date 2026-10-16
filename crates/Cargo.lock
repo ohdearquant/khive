@@ -2980,6 +2980,7 @@ dependencies = [
  "criterion",
  "khive-fs",
  "khive-quant",
+ "khive-score",
  "khive-types",
  "libc",
  "memmap2",
