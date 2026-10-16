@@ -62,12 +62,20 @@ same underlying lock directory, including when their database files have
 different parent directories. Containers must share the backing directory,
 rather than each using a private directory at the same path.
 
-If the resolved directory cannot be created, database opening fails closed with
-a `lock`-phase refusal naming the attempted path and `KHIVE_VOLUME_LOCK_DIR`.
-There is no automatic fallback to the database's parent: separate database
-parents on one volume would select different lock directories and stop sharing
-the cooperative admission lease required by ADR-154. Correct the directory's
-access or configure the shared absolute override before trying again.
+If the resolved directory cannot be created or its lock file cannot be opened,
+the next lease acquisition fails closed with a `lock`-phase refusal naming the
+attempted directory or file and the underlying I/O error. This can occur during
+database initialization; an existing writable database with its database id
+already installed can open successfully and encounter the refusal on its first
+write instead.
+
+Correct the directory's access or configure a writable shared absolute directory
+before retrying. `KHIVE_VOLUME_LOCK_DIR` applies to the default directory resolver.
+When a caller supplies `PoolConfig.volume_lock_dir`, an explicit backend directory,
+or a migration write policy, change that caller's setting. There is no automatic
+fallback to the database's parent: separate database parents on one volume would
+select different lock directories and stop sharing the cooperative admission
+lease required by ADR-154.
 
 Within one process, requests for a volume slot are queued in the order they
 enter its registry mutex. Only the front waiter can acquire a free slot; a new
