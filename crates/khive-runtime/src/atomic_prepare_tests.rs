@@ -1627,6 +1627,10 @@ async fn atomic_link_persists_explicit_dependency_kind_and_infers_when_absent() 
         )
         .await
         .expect("prepare link");
+        let AtomicOpPlan::Link(ref link) = plan else {
+            panic!("expected a link plan");
+        };
+        assert_eq!(link.dependency_kind_inference_hint(), None);
         let json_str = metadata_json(&plan);
         assert!(
             json_str.contains(r#""dependency_kind":"artifact""#),
@@ -1654,11 +1658,128 @@ async fn atomic_link_persists_explicit_dependency_kind_and_infers_when_absent() 
         )
         .await
         .expect("prepare link");
+        let AtomicOpPlan::Link(ref link) = plan else {
+            panic!("expected a link plan");
+        };
+        assert_eq!(
+            link.dependency_kind_inference_hint(),
+            Some("dependency_kind was inferred as \"runtime\" from endpoint kinds.")
+        );
         let json_str = metadata_json(&plan);
         assert!(
             json_str.contains(r#""dependency_kind":"runtime""#),
             "inferred dependency_kind for (service, service) must persist: {json_str}"
         );
+    }
+}
+
+#[tokio::test]
+async fn atomic_document_link_captures_hint_without_persisting_it() {
+    let runtime = scratch_runtime();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let entities = runtime.entities(&token).unwrap();
+    let left = khive_storage::Entity::new("local", "document", "Hint source");
+    let right = khive_storage::Entity::new("local", "document", "Hint target");
+    let (left_id, right_id) = (left.id, right.id);
+    entities.upsert_entity(left).await.unwrap();
+    entities.upsert_entity(right).await.unwrap();
+
+    for supplied in [
+        json!(null),
+        json!({}),
+        json!({"optional": false, "note": "keep"}),
+    ] {
+        let mut expected = supplied.as_object().cloned().unwrap_or_default();
+        expected.insert("dependency_kind".into(), json!("normative"));
+        let expected = Value::Object(expected);
+        let plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": left_id.to_string(),
+                "target_id": right_id.to_string(),
+                "relation": "depends_on",
+                "metadata": supplied.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let AtomicOpPlan::Link(ref link) = plan else {
+            panic!("expected a link plan");
+        };
+        let hint = link.dependency_kind_inference_hint().unwrap().to_owned();
+        assert_eq!(
+            Some(hint.clone()),
+            crate::operations::dependency_kind_inference_hint(
+                EdgeRelation::DependsOn,
+                Some(&supplied),
+                Some(&expected),
+            )
+        );
+        assert!(hint.contains("normative") && hint.contains("links_to"));
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let (_, _, metadata, _) =
+            probe_edge_natural_key(&runtime, "local", left_id, right_id, "depends_on").await;
+        let persisted: Value = serde_json::from_str(metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            persisted, expected,
+            "only the existing inferred metadata is stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn atomic_link_explicit_metadata_and_unmatched_pairs_have_no_hint() {
+    let runtime = scratch_runtime();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let entities = runtime.entities(&token).unwrap();
+    for (source_kind, target_kind, extra) in [
+        (
+            "document",
+            "document",
+            json!({
+                "metadata": {"dependency_kind": "normative"},
+                "dependency_kind": "build",
+            }),
+        ),
+        ("service", "project", json!({})),
+    ] {
+        let source = khive_storage::Entity::new("local", source_kind, "Explicit source");
+        let target = khive_storage::Entity::new("local", target_kind, "Explicit target");
+        let (source_id, target_id) = (source.id, target.id);
+        let expected_metadata = extra.get("metadata").cloned();
+        let mut args = json!({
+            "source_id": source.id.to_string(),
+            "target_id": target.id.to_string(),
+            "relation": "depends_on",
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        entities.upsert_entity(source).await.unwrap();
+        entities.upsert_entity(target).await.unwrap();
+        let plan = prepare_link(&runtime, &token, &args).await.unwrap();
+        let AtomicOpPlan::Link(ref link) = plan else {
+            panic!("expected a link plan");
+        };
+        assert_eq!(link.dependency_kind_inference_hint(), None);
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let (_, _, metadata, _) =
+            probe_edge_natural_key(&runtime, "local", source_id, target_id, "depends_on").await;
+        let persisted = metadata.map(|raw| serde_json::from_str::<Value>(&raw).unwrap());
+        assert_eq!(persisted, expected_metadata);
     }
 }
 
@@ -1675,7 +1796,11 @@ async fn atomic_link_rejects_malformed_metadata_before_inference() {
     entities.upsert_entity(left).await.expect("seed left");
     entities.upsert_entity(right).await.expect("seed right");
 
-    for metadata in [json!(false), json!({"optional": "false"})] {
+    for (metadata, expected_message) in [
+        (json!(false), "metadata"),
+        (json!({"optional": "false"}), "metadata"),
+        (json!({"dependency_kind": null}), "dependency_kind"),
+    ] {
         let error = prepare_link(
             &runtime,
             &token,
@@ -1688,7 +1813,7 @@ async fn atomic_link_rejects_malformed_metadata_before_inference() {
         )
         .await
         .expect_err("malformed metadata cannot produce a link plan");
-        assert!(format!("{error}").contains("metadata"), "{error}");
+        assert!(format!("{error}").contains(expected_message), "{error}");
     }
 }
 
