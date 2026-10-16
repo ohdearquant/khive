@@ -746,6 +746,16 @@ pub(crate) async fn handle_ingest(
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| p.to.trim().to_string());
+    // ADR-200 Amendment 1 Decision 6: a message the channel quarantines, whatever its reason, is
+    // addressed to the maintainer (the runtime's configured actor), so the mailbox recipient check
+    // (inbox, thread, read, get, search) keeps the record and its `quarantine_content_ref` out of
+    // other actors' mailbox reads. This is decided here at ingest only: a record stored before
+    // this rule keeps the actor it was written with. A runtime with no configured actor keeps the
+    // landing actor chosen above.
+    let to_actor = match runtime.config().actor_id.as_deref() {
+        Some(maintainer) if is_quarantined && !maintainer.is_empty() => maintainer.to_string(),
+        _ => to_actor,
+    };
 
     let mut props = json!({
         "comm_schema_version": COMM_SCHEMA_VERSION,
