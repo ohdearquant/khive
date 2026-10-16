@@ -46,7 +46,7 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
         match sql.reader().await {
             Ok(mut reader) => reader
                 .query_all(SqlStatement {
-                    sql: khive_runtime::sql!("knowledge_legacy_snapshot_namespaces").into(),
+                    sql: ::khive_runtime::sql!("knowledge_legacy_snapshot_namespaces").into(),
                     params: vec![SqlValue::Text("%::vamana::%".into())],
                     label: None,
                 })

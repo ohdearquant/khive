@@ -16,7 +16,7 @@ pub(super) async fn fetch_final_states(
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: khive_runtime::sql!("knowledge_ann_final_states").into(),
+            sql: ::khive_runtime::sql!("knowledge_ann_final_states").into(),
             params: vec![
                 SqlValue::Text(ns.to_owned()),
                 SqlValue::Text(model.to_owned()),

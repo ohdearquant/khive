@@ -175,7 +175,7 @@ pub(super) async fn try_load_snapshot(
     let mut reader = sql.reader().await.ok()?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: khive_runtime::sql!("knowledge_legacy_snapshot_load").into(),
+            sql: ::khive_runtime::sql!("knowledge_legacy_snapshot_load").into(),
             params: vec![SqlValue::Text(key), SqlValue::Text("vamana".into())],
             label: None,
         })
