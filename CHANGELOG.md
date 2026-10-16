@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ingested after the upgrade: a quarantine record already stored keeps the landing actor it
   was written with, and nothing re-addresses it. A runtime with no configured actor keeps the
   landing actor.
+- The email opt-out label (ADR-200 Amendment 2) now reads the first non-quoted paragraph of a
+  reply rather than its first line, so a phrase a mail client wrapped onto the second line still
+  counts, and the phrase list gains the plain asks for no more email ("don't email me",
+  "do not contact me", "no more emails" and their spellings). The bare words "email me" are not a
+  phrase: a reply asking us to email the docs is delivered without the label.
+
 ### Fixed
 
 - An authenticated opt-out in a message that screening quarantines as `screened` now records
