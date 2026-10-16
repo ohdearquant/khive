@@ -90,6 +90,7 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
 /// any name were re-added to the allowlist.
 const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "comm.suppression_list",
+    "comm.withheld_body",
     "db_diagnostics",
     "git.checkout",
     "git.diff",

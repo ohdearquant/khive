@@ -1,5 +1,17 @@
 use super::*;
 
+/// The unit's error for a step that failed with `error`. A storage error keeps its
+/// type, so a request deadline or an admission refusal reaches the caller as a
+/// timeout; any other failure is reported as a driver error naming the step.
+pub(super) fn unit_err(step: &'static str, error: RuntimeError) -> khive_storage::StorageError {
+    match error {
+        RuntimeError::Storage(error) => error,
+        other => {
+            khive_storage::StorageError::driver(khive_storage::StorageCapability::Sql, step, other)
+        }
+    }
+}
+
 /// Revalidate and commit every feedback side effect against one rebased snapshot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_feedback_state_mutation(
@@ -32,7 +44,11 @@ pub(crate) async fn persist_feedback_state_mutation(
                 local_version,
                 local_snapshot,
                 entity_capacity,
-                "brain_feedback",
+                (
+                    "brain_feedback_load_snapshot_version",
+                    "brain_feedback_load_snapshot",
+                ),
+                unit_err,
             )
             .await?;
 
@@ -67,15 +83,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                 FeedbackEventWrite::Direct(event) => {
                     let mut event = attribution_for_op.stamp(event);
                     event.created_at = commit_at_us;
-                    khive_db::stores::event::append_event_on_writer(writer, &event)
-                        .await
-                        .map_err(|e| {
-                            khive_storage::StorageError::driver(
-                                khive_storage::StorageCapability::Sql,
-                                "brain_feedback_append_public_event",
-                                e,
-                            )
-                        })?;
+                    khive_db::stores::event::append_event_on_writer(writer, &event).await?;
                     event
                 }
                 FeedbackEventWrite::Graded {
@@ -91,28 +99,14 @@ pub(crate) async fn persist_feedback_state_mutation(
                         commit_at_us,
                     )
                     .await
-                    .map_err(|e| {
-                        khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Sql,
-                            "brain_feedback_claim_scorer_dedup",
-                            e,
-                        )
-                    })?;
+                    .map_err(|e| unit_err("brain_feedback_claim_scorer_dedup", e))?;
                     if !claimed {
                         return Ok(Box::new(FeedbackMutationOutcome::Deduped)
                             as Box<dyn std::any::Any + Send>);
                     }
                     let mut event = attribution_for_op.stamp(event);
                     event.created_at = commit_at_us;
-                    khive_db::stores::event::append_event_on_writer(writer, &event)
-                        .await
-                        .map_err(|e| {
-                            khive_storage::StorageError::driver(
-                                khive_storage::StorageCapability::Sql,
-                                "brain_feedback_append_public_event",
-                                e,
-                            )
-                        })?;
+                    khive_db::stores::event::append_event_on_writer(writer, &event).await?;
                     crate::serve_ledger::backfill_grade_on_writer(
                         writer,
                         &serve_ledger_id,
@@ -121,13 +115,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                         &scorer_run_id,
                     )
                     .await
-                    .map_err(|e| {
-                        khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Sql,
-                            "brain_feedback_backfill_grade",
-                            e,
-                        )
-                    })?;
+                    .map_err(|e| unit_err("brain_feedback_backfill_grade", e))?;
                     event
                 }
                 FeedbackEventWrite::Gated {
@@ -171,13 +159,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Sql,
-                            "brain_feedback_gate_and_append",
-                            e,
-                        )
-                    })?;
+                    .map_err(|e| unit_err("brain_feedback_gate_and_append", e))?;
                     match outcome {
                         crate::fold_gate::GateAndAppendOutcome::Deduped => {
                             return Ok(Box::new(FeedbackMutationOutcome::Deduped)
@@ -206,13 +188,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                 commit_at_us,
             )
             .await
-            .map_err(|e| {
-                khive_storage::StorageError::driver(
-                    khive_storage::StorageCapability::Sql,
-                    "brain_feedback_append_private_event",
-                    e,
-                )
-            })?;
+            .map_err(|e| unit_err("brain_feedback_append_private_event", e))?;
             let snapshot_json = proposed.to_snapshot_json().map_err(|e| {
                 khive_storage::StorageError::driver(
                     khive_storage::StorageCapability::Sql,
@@ -222,13 +198,7 @@ pub(crate) async fn persist_feedback_state_mutation(
             })?;
             upsert_snapshot_json_on_writer(writer, &namespace_for_op, snapshot_json, commit_at_us)
                 .await
-                .map_err(|e| {
-                    khive_storage::StorageError::driver(
-                        khive_storage::StorageCapability::Sql,
-                        "brain_feedback_upsert_snapshot",
-                        e,
-                    )
-                })?;
+                .map_err(|e| unit_err("brain_feedback_upsert_snapshot", e))?;
 
             Ok(Box::new(FeedbackMutationOutcome::Committed {
                 event,

@@ -37,6 +37,8 @@ pub mod extension;
 #[cfg(any(unix, windows))]
 pub mod file_identity;
 mod fts_maintenance;
+/// Read predicates and transaction assertions for the graph-lint caller.
+pub mod graph_lint;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).
@@ -109,9 +111,10 @@ pub use khive_storage::{
     DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
 pub use migrations::{
-    inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
-    run_migrations, run_migrations_with_policy, EmbeddingModelRegistryRecord, Migration,
-    MigrationWritePolicy, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    inspect_integrity, inspect_page_accounting, inspect_schema_is_current, inspect_schema_version,
+    query_embedding_models, read_schema_version, run_migrations, run_migrations_with_policy,
+    EmbeddingModelRegistryRecord, Migration, MigrationWritePolicy, PageAccounting,
+    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,

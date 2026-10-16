@@ -114,6 +114,12 @@ pub struct KhiveMcpServer {
     /// Shared by server clones but never persisted, so a replacement process
     /// cannot inherit a plausible-looking heartbeat from its predecessor.
     pub(super) schedule_ticker_last_tick_micros: Arc<AtomicI64>,
+    /// Startup gate for the events daemon this server's daemon supervises
+    /// (ADR-170), installed when supervision starts. Shared by clones, so the
+    /// accept loop's dispatcher sees the gate the start callback installed.
+    #[cfg(unix)]
+    pub(super) events_readiness:
+        Arc<std::sync::OnceLock<khive_runtime::events_split::EventsReadiness>>,
     /// Per-verb-runtime write admission for email and Telegram background
     /// tasks. CLI daemon role is necessary but not sufficient: snapshot
     /// runtimes must never poll into a failing ingest path or send externally

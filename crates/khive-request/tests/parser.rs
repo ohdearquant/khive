@@ -2,7 +2,7 @@
 //!
 //! All tests exercise the public API (`parse_request`, public types). Tests that
 //! require access to `pub(crate)` helpers (`check_write_key_conflicts`) live in
-//! `src/conflict.rs` under `#[cfg(test)] mod tests`.
+//! `src/conflict_tests.rs`, registered by `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
     parse_request as parse_request_unplanned, parse_typed_json_batch, plan_request, ArgValue,

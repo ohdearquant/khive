@@ -574,6 +574,8 @@ pub enum BlobConfig {
     Fs {
         #[serde(default)]
         root: Option<String>,
+        /// Free-space floor in bytes. Absent: 2% of the volume holding the
+        /// root, at least 5 GiB (ADR-111 Amendment 6); `0` disables it.
         #[serde(default)]
         floor_bytes: Option<u64>,
     },
