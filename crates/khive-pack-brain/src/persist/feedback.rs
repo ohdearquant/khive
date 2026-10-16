@@ -38,40 +38,19 @@ pub(crate) async fn persist_feedback_state_mutation(
     let profile_id_for_op = profile_id;
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
-            let previous_updated_at = load_snapshot_version_on_reader(writer, &namespace_for_op)
-                .await
-                .map_err(|e| unit_err("brain_feedback_load_snapshot_version", e))?;
-            let base_snapshot = match previous_updated_at {
-                Some(updated_at) if local_version == Some(updated_at) => local_snapshot,
-                Some(updated_at) => {
-                    let (durable_snapshot, reloaded_updated_at) =
-                        load_latest_snapshot_on_reader(writer, &namespace_for_op, entity_capacity)
-                            .await
-                            .map_err(|e| unit_err("brain_feedback_load_snapshot", e))?
-                            .ok_or_else(|| {
-                                khive_storage::StorageError::driver(
-                                    khive_storage::StorageCapability::Sql,
-                                    "brain_feedback_load_snapshot",
-                                    std::io::Error::other(
-                                        "snapshot disappeared inside the write transaction",
-                                    ),
-                                )
-                            })?;
-                    if reloaded_updated_at != updated_at {
-                        return Err(khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Sql,
-                            "brain_feedback_load_snapshot",
-                            std::io::Error::other(format!(
-                                "snapshot generation changed inside the write transaction: \
-                                 expected {updated_at}, got {reloaded_updated_at}"
-                            )),
-                        ));
-                    }
-                    durable_snapshot
-                }
-                None => local_snapshot,
-            };
-            let mut proposed = BrainState::from_snapshot(base_snapshot, entity_capacity);
+            let (mut proposed, previous_updated_at) = rebase_snapshot_on_writer(
+                writer,
+                &namespace_for_op,
+                local_version,
+                local_snapshot,
+                entity_capacity,
+                (
+                    "brain_feedback_load_snapshot_version",
+                    "brain_feedback_load_snapshot",
+                ),
+                unit_err,
+            )
+            .await?;
 
             match proposed.profiles.get(&profile_id_for_op) {
                 None => {
@@ -248,7 +227,6 @@ pub(crate) async fn persist_feedback_state_mutation(
                 Some(current) if current > snapshot_version
             ) {
                 *state.lock().unwrap() = *proposed;
-                tracker.reset_dirty(&namespace);
                 tracker.mark_loaded_at(namespace, Some(snapshot_version));
             }
             Ok(Some(event))

@@ -87,18 +87,14 @@ fn list_items(response: &Value) -> &[Value] {
 
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
-// ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
-// handler count from 11 to 14, then 15 with verbs introspection, then 16
-// with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
-// db_diagnostics (ADR-091 operator surface), then restore, then scan.
+// KG includes the schema introspection verb and the four stream verbs.
 #[test]
-fn pack_verbs_returns_twenty_seven() {
+fn pack_verbs_returns_twenty_eight() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        27,
-        "KgPack must expose exactly 27 verbs including grouped event count"
+        28,
+        "KgPack must expose exactly 28 verbs including grouped event count"
     );
 }
 
@@ -124,6 +120,7 @@ fn pack_verbs_names_are_correct() {
         "review",
         "withdraw",
         "verbs",
+        "schema",
         "context",
         "resolve",
         "whoami",

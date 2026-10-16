@@ -4,21 +4,18 @@
 //! full preimage against the writable store; it never blindly replaces a row
 //! changed since the scan. Stop other writers while taking the filesystem copy.
 
-use crate::sql::sql;
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use khive_runtime::curation::EntityPatch;
 use khive_runtime::pack::{IngestAuditStore, PackRegistry, VerbRegistry};
 use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{KhiveRuntime, NamespaceToken};
-use khive_storage::entity::{Entity, EntityFilter};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
 use khive_types::{to_snake_case, EntityKind, EntityTypeError, EntityTypeRegistry};
 use serde::Serialize;
 use uuid::Uuid;
@@ -154,18 +151,20 @@ fn validate_args(args: &EntityTypeBackfillArgs) -> Result<()> {
 }
 
 async fn nullable_count(runtime: &KhiveRuntime, namespace: &str) -> Result<u64> {
-    let mut reader = runtime.sql().reader().await?;
-    match reader
-        .query_scalar(SqlStatement {
-            sql: sql!("entities_untyped_count").into(),
-            params: vec![SqlValue::Text(namespace.into())],
-            label: Some("entity-type-backfill nullable census".into()),
-        })
-        .await?
-    {
-        Some(SqlValue::Integer(count)) if count >= 0 => Ok(count as u64),
-        _ => bail!("entity-type-backfill census did not return a nonnegative integer"),
-    }
+    let counts = runtime
+        .backend()
+        .entities()?
+        .count_entities_by_type(&[namespace.to_owned()])
+        .await?;
+    nullable_count_from_groups(counts)
+}
+
+fn nullable_count_from_groups(counts: Option<EntityTypeCounts>) -> Result<u64> {
+    let counts = counts.context("entity-type-backfill entity type census is unavailable")?;
+    Ok(counts
+        .into_iter()
+        .find_map(|(entity_type, count)| entity_type.is_none().then_some(count))
+        .unwrap_or(0))
 }
 
 async fn scan(
