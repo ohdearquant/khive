@@ -11,8 +11,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 #[cfg(test)]
+use khive_runtime::hex_prefix_to_uuid_pattern;
+#[cfg(test)]
 use khive_runtime::Namespace;
-use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_score::vector::cosine_similarity;
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};

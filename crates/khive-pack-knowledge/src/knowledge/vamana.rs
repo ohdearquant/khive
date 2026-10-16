@@ -2347,10 +2347,8 @@ async fn scan_corpus_raw(
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
     let scan_watermark = rows
         .first()
-        .and_then(|row| match row.get("log_s") {
-            Some(SqlValue::Integer(n)) => u64::try_from(*n).ok(),
-            _ => None,
-        })
+        .and_then(|row| row.i64_or_none("log_s"))
+        .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0);
 
     for row in &rows {
