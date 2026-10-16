@@ -677,6 +677,9 @@ fn is_executable_attachment(attachment: &AttachmentInput) -> bool {
 }
 
 #[cfg(test)]
+mod reply_fixtures_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
