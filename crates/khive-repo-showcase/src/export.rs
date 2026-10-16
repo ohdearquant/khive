@@ -451,11 +451,7 @@ fn validate_edge_weight(edge_id: &str, weight: f64) -> Result<(), ExportError> {
 }
 
 fn validate_full_sha(value: &str, record: &str, field: &str) -> Result<(), ExportError> {
-    if value.len() != 40
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if value.len() != 40 || !khive_types::is_lowercase_hex(value) {
         return Err(ExportError::InvalidData(format!(
             "{record} {field} must be a 40-character lowercase hexadecimal commit id, got {value:?}"
         )));
@@ -465,9 +461,7 @@ fn validate_full_sha(value: &str, record: &str, field: &str) -> Result<(), Expor
 
 fn validate_short_sha(short: &str, sha: &str, record: &str) -> Result<(), ExportError> {
     if !(7..=40).contains(&short.len())
-        || !short
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !khive_types::is_lowercase_hex(short)
         || !sha.starts_with(short)
     {
         return Err(ExportError::InvalidData(format!(

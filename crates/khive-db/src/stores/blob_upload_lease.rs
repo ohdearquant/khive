@@ -163,15 +163,7 @@ pub(super) fn publish(
         drop(file);
         // Close the file before replacement on platforms that restrict open renames.
         #[cfg(unix)]
-        let rename = || {
-            use std::os::fd::AsRawFd;
-            rename_entry_at(
-                directory.as_raw_fd(),
-                &temp,
-                directory.as_raw_fd(),
-                &format!("{id}.lease"),
-            )
-        };
+        let rename = || rename_entry_at(directory, &temp, directory, &format!("{id}.lease"));
         #[cfg(not(unix))]
         let rename = || fs::rename(directory.join(&temp), directory.join(format!("{id}.lease")));
         step(context, "lease_replace", rename)?;

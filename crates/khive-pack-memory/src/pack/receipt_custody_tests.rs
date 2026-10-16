@@ -163,8 +163,7 @@ fn runtime(mut config: RuntimeConfig) -> KhiveRuntime {
     config.wal_ceiling_configured_bytes = 0;
     config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
     config.wal_ceiling_env_raw = None;
-    config.embedding_model = None;
-    config.additional_embedding_models.clear();
+    config.disable_embedding_models();
     config.packs = vec!["kg".into()];
     config.brain_profile = None;
     config.actor_id = None;

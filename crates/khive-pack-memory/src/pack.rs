@@ -195,7 +195,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results. include_timings=true adds a timings field to whichever shape applies, wrapping an array as {results, timings}.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -266,7 +266,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "fusion_strategy",
                 param_type: "string",
                 required: false,
-                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config.",
+                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values and the RRF constant come from pack config. keyword_only runs only the text search (no query embedding, no vector search, so it never reports degraded; under a session fence it still waits for the fence's ANN watermark); vector_only runs only the vector search.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -306,6 +306,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "boolean",
                 required: false,
                 description: "Include per-component score breakdowns in results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_timings",
+                param_type: "boolean",
+                required: false,
+                description: "When true the response carries timings: total_us, the retrieval stage wall times embed_us, fts_us, ann_us, fresh_tail_us and hydrate_us (null when the stage did not run; FTS and the vector search run concurrently, so they do not add up), retrieval_rounds, and rounds[] with each round's candidate_limit, text_hits, vector_hits, hydrated and eligible counts and stage times. An array response becomes {results, timings}; an object response gains timings. Default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -578,7 +585,7 @@ impl PackRuntime for MemoryPack {
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
             "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
-            "memory.recall_rerank" => self.handle_recall_rerank(params).await,
+            "memory.recall_rerank" => self.handle_recall_rerank(token, params).await,
             "memory.recall_score" => self.handle_recall_score(params).await,
             "memory.prune" => self.handle_prune(token, params).await,
             "memory.vacuum" => self.handle_vacuum(params).await,
@@ -594,7 +601,7 @@ impl MemoryPack {
     ///
     /// Timeout returns `DeadlineExceeded` without claiming to cancel runtime-owned storage
     /// work. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
-    async fn handle_recall_with_deadline(
+    pub(crate) async fn handle_recall_with_deadline(
         &self,
         token: &NamespaceToken,
         params: Value,
@@ -607,12 +614,13 @@ impl MemoryPack {
         let start = std::time::Instant::now();
         // `handle_recall` is a large state machine: its text/vector fan-out
         // contains several cancellation-aware select/join branches. Keep that
-        // generator behind one heap pointer at the deadline boundary so it is
+        // generator (inside its profiling wrapper `handle_recall_profiled`)
+        // behind one heap pointer at the deadline boundary so it is
         // not embedded again in this future, `PackRuntime::dispatch`, and the
         // MCP request stack. Inlining it here can overflow Tokio's worker stack
         // even though the pipeline has no recursive call cycle.
         let hard_deadline = start.checked_add(std::time::Duration::from_millis(budget_ms));
-        let recall = Box::pin(self.handle_recall(token, params, registry, hard_deadline));
+        let recall = Box::pin(self.handle_recall_profiled(token, params, registry, hard_deadline));
         match tokio::time::timeout(std::time::Duration::from_millis(budget_ms), recall).await {
             Ok(result) => result,
             Err(_) => {
@@ -639,60 +647,8 @@ impl MemoryPack {
 }
 
 #[cfg(test)]
-mod recall_future_footprint_tests {
-    use super::*;
-
-    use khive_runtime::{Namespace, VerbRegistryBuilder};
-
-    #[test]
-    #[serial_test::serial(config_ledger)]
-    fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
-        // Measure on an explicitly roomy stack so the regression reports the
-        // historical inline footprint instead of aborting the test process.
-        let (pipeline_bytes, deadline_bytes) = std::thread::Builder::new()
-            .name("recall-future-footprint".to_string())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-                let token = runtime
-                    .authorize(Namespace::local())
-                    .expect("authorize local");
-                let registry = VerbRegistryBuilder::new().build().expect("empty registry");
-                let pack = MemoryPack::new(runtime);
-
-                let pipeline_bytes = std::mem::size_of_val(&pack.handle_recall(
-                    &token,
-                    serde_json::json!({"query": "future footprint probe"}),
-                    &registry,
-                    None,
-                ));
-                let deadline_bytes = std::mem::size_of_val(&pack.handle_recall_with_deadline(
-                    &token,
-                    serde_json::json!({"query": "future footprint probe"}),
-                    &registry,
-                ));
-                (pipeline_bytes, deadline_bytes)
-            })
-            .expect("spawn footprint measurement")
-            .join()
-            .expect("footprint measurement panicked");
-
-        assert!(
-            deadline_bytes < pipeline_bytes,
-            "the deadline wrapper must hold the recall pipeline behind a pointer: \
-             wrapper={deadline_bytes}B pipeline={pipeline_bytes}B"
-        );
-        // On the 64-bit CI target the unboxed candidate collector made this
-        // future 8,968 bytes; boxing that 6,792-byte child reduces it to 4,888
-        // bytes. Seven KiB leaves ample platform/layout headroom while still
-        // catching either candidate await being inlined again.
-        assert!(
-            pipeline_bytes < 7 * 1024,
-            "the recall pipeline re-embedded its candidate fan-out: \
-             pipeline={pipeline_bytes}B"
-        );
-    }
-}
+#[path = "pack/recall_future_footprint_tests.rs"]
+mod recall_future_footprint_tests;
 
 /// Parse an optional positive per-request deadline; null or absence means fallback.
 pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u64>, RuntimeError> {
@@ -826,198 +782,14 @@ async fn fts_population_guard(rt: &KhiveRuntime) {
 mod receipt_custody_tests;
 
 #[cfg(test)]
-mod read_only_warm_tests {
-    use super::*;
-
-    use crate::test_support::HashVecProvider;
-    use khive_runtime::RuntimeConfig;
-    use khive_storage::types::{SqlStatement, SqlValue};
-
-    #[tokio::test]
-    async fn read_only_warm_keeps_ann_lifecycle_out_of_the_writer_plane() {
-        const MODEL: &str = "read-only-warm-model";
-        const DIMS: usize = 8;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("read-only-memory-warm.db");
-        let cfg = RuntimeConfig {
-            db_path: Some(path),
-            ..RuntimeConfig::no_embeddings()
-        };
-
-        let writable = KhiveRuntime::new(cfg.clone()).expect("writable snapshot source");
-        writable.register_embedder(HashVecProvider {
-            model_name: MODEL.to_owned(),
-            dims: DIMS,
-        });
-        let token = writable
-            .authorize(khive_runtime::Namespace::local())
-            .expect("authorize local");
-        writable
-            .vectors_for_model(&token, MODEL)
-            .expect("materialize optional vector table");
-        let mut writer = writable.sql().writer().await.expect("seed writer");
-        writer
-            .execute(SqlStatement {
-                sql: "INSERT INTO ann_consumer_watermark \
-                      (consumer, namespace, embedding_model, watermark) \
-                      VALUES (?1, ?2, ?3, 0)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text("memory-notes:note.content".into()),
-                    SqlValue::Text("*".into()),
-                    SqlValue::Text(MODEL.into()),
-                ],
-                label: Some("seed_read_only_warm_consumer".into()),
-            })
-            .await
-            .expect("seed active consumer");
-        drop(writer);
-
-        // `vectors_for_model` and `SqlAccess::writer` lazily spawn the
-        // file-backed pool's shared writer task. Own its one-shot join before
-        // dropping the runtime, then wait for the queue and close-time WAL
-        // work to settle before reopening the same file read-only. Otherwise
-        // this regression can observe fixture teardown instead of the
-        // read-only warm path it is meant to discriminate.
-        let writer_join = writable.backend().pool().take_writer_task_join();
-        drop(token);
-        drop(writable);
-        if let Some(join) = writer_join {
-            tokio::time::timeout(std::time::Duration::from_secs(5), join)
-                .await
-                .expect("writable fixture writer task must drain before read-only reopen")
-                .expect("writable fixture writer task must not panic");
-        }
-
-        let read_only = KhiveRuntime::new_readonly(cfg).expect("read-only snapshot runtime");
-        read_only.register_embedder(HashVecProvider {
-            model_name: MODEL.to_owned(),
-            dims: DIMS,
-        });
-        let before = read_only.backend().pool().writer_acquisition_snapshot();
-
-        let pack = MemoryPack::new(read_only.clone());
-        pack.warm().await;
-        let read_token = read_only
-            .authorize(khive_runtime::Namespace::local())
-            .expect("authorize read-only local");
-        assert!(
-            !crate::ann::ensure_ann_background(&read_only, &read_token, &pack.ann, MODEL).await,
-            "a read-only recall cache miss must not enqueue a writer-bearing ANN task"
-        );
-
-        assert_eq!(
-            read_only.backend().pool().writer_acquisition_snapshot(),
-            before,
-            "daemon warm must not acquire a writer for ANN registration, checkpoint, or \
-             optional-table inspection on a read-only runtime"
-        );
-    }
-}
+#[path = "pack/read_only_warm_tests.rs"]
+mod read_only_warm_tests;
 
 // ── MAJ-1 regression test: second recall routes through warm ANN ──────────────
 
 #[cfg(test)]
-mod ann_route_tests {
-    use super::*;
-
-    use khive_pack_kg::KgPack;
-    use khive_runtime::{Namespace, RuntimeConfig, VerbRegistryBuilder};
-    use serial_test::serial;
-
-    use crate::test_support::HashVecProvider;
-
-    /// The second recall uses the installed ANN index, measured by its route counter.
-    /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
-    #[tokio::test]
-    #[serial(background_tasks)]
-    #[serial_test::serial(config_ledger)]
-    async fn recall_second_call_uses_warm_ann_route() {
-        let tmp = tempfile::Builder::new()
-            .prefix("khive-memory-ann-route-")
-            .tempdir_in(std::env::temp_dir())
-            .expect("temp /tmp db dir");
-        let db_path = tmp.path().join("khive-graph.db");
-
-        const MODEL: &str = "ann-route-test-model";
-        const DIMS: usize = 32;
-
-        let rt = KhiveRuntime::new(RuntimeConfig {
-            db_path: Some(db_path),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            ..RuntimeConfig::default()
-        })
-        .expect("runtime");
-        rt.register_embedder(HashVecProvider {
-            model_name: MODEL.to_owned(),
-            dims: DIMS,
-        });
-
-        let ns = Namespace::parse("local").expect("local namespace");
-        let token = rt.authorize(ns).expect("authorize local");
-
-        // Create notes with embedding_model: None so the runtime auto-detects
-        // the registered custom provider (resolve_embedding_model only handles
-        // lattice aliases; custom provider names must go through the auto-detect path).
-        for i in 0..32u32 {
-            rt.create_note_with_decay_for_embedding_model(
-                &token,
-                "memory",
-                None,
-                &format!("ann warm route note {i}"),
-                Some(0.7),
-                0.01,
-                None,
-                vec![],
-                None,
-            )
-            .await
-            .expect("create note");
-        }
-
-        let pack = MemoryPack::new(rt.clone());
-        let ann = pack.ann_for_test();
-
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(KgPack::new(rt.clone()));
-        builder.register(pack);
-        let registry = builder.build().expect("registry");
-
-        // First recall: triggers synchronous ANN build on cache miss.
-        // No explicit embedding_model — auto-detects ann-route-test-model.
-        registry
-            .dispatch(
-                "memory.recall",
-                serde_json::json!({
-                    "query": "ann warm route note 7",
-                    "limit": 10
-                }),
-            )
-            .await
-            .expect("first recall");
-
-        ann.reset_warm_route_count();
-
-        // Second recall: index is already loaded — must go through warm ANN.
-        registry
-            .dispatch(
-                "memory.recall",
-                serde_json::json!({
-                    "query": "ann warm route note 7",
-                    "limit": 10
-                }),
-            )
-            .await
-            .expect("second recall");
-
-        assert!(
-            ann.warm_route_count() > 0,
-            "second recall must route through warm ANN, not exact sqlite-vec fallback"
-        );
-    }
-}
+#[path = "pack/ann_route_tests.rs"]
+mod ann_route_tests;
 
 /// Pack-level lifecycle coverage for `start_rotation_watcher`'s production
 /// wiring (issue #2340): the rotation unit tests call the private
@@ -1033,441 +805,11 @@ mod ann_route_tests {
 /// the test because the watcher is a tracked task: while it runs it moves
 /// that counter for the tests in this crate that read it under the same key.
 #[cfg(test)]
-mod rotation_watcher_lifecycle_tests {
-    use super::*;
-
-    use khive_runtime::RuntimeConfig;
-    use serial_test::serial;
-
-    #[tokio::test(start_paused = true)]
-    #[serial(background_tasks)]
-    async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = RuntimeConfig {
-            db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            ..RuntimeConfig::default()
-        };
-        let rt = KhiveRuntime::new(config).expect("writable runtime");
-        let pack = MemoryPack::new(rt);
-        let ann = pack.ann_for_test();
-
-        pack.warm().await;
-        assert!(
-            crate::ann::rotation_watch_started_for_test(&ann),
-            "a writable warm must start the rotation watcher"
-        );
-        let watcher = crate::ann::take_rotation_watch_handle_for_test(&ann)
-            .expect("a writable warm must retain its rotation watcher task");
-        assert!(
-            !watcher.is_finished(),
-            "the rotation watcher must be running after warm"
-        );
-
-        // A repeated warm must not start a second watcher: the one-shot guard
-        // is already claimed, so no new task handle is retained.
-        pack.warm().await;
-        assert!(
-            crate::ann::take_rotation_watch_handle_for_test(&ann).is_none(),
-            "a repeated warm must be idempotent and not start a second watcher"
-        );
-
-        // The watcher retains only a Weak<AnnState>; dropping every strong
-        // reference lets its next tick observe the failed upgrade and exit.
-        let ann_weak = std::sync::Arc::downgrade(&ann);
-        drop(ann);
-        drop(pack);
-        assert!(
-            ann_weak.upgrade().is_none(),
-            "dropping the pack and the test's own clone must drop the last strong ANN reference"
-        );
-
-        tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        let limit = std::time::Duration::from_secs(30);
-        let exited = tokio::time::timeout(limit, watcher).await;
-        assert!(
-            matches!(exited, Ok(Ok(()))),
-            "the watcher must exit once its ANN state is dropped: {exited:?}"
-        );
-    }
-}
+#[path = "pack/rotation_watcher_lifecycle_tests.rs"]
+mod rotation_watcher_lifecycle_tests;
 
 /// Mutation-hook tests assert ANN generation staleness directly after corpus changes.
 /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
 #[cfg(test)]
-mod note_mutation_hook_tests {
-    use super::*;
-    use crate::ann;
-    use khive_pack_kg::KgPack;
-    use khive_runtime::VerbRegistryBuilder;
-    use serde_json::json;
-    use serial_test::serial;
-    use uuid::Uuid;
-
-    #[test]
-    #[serial_test::serial(config_ledger)]
-    fn prune_description_publishes_optional_effective_salience_schema() {
-        use khive_runtime::{RuntimeConfig, WalCeilingSource};
-
-        let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: None,
-            additional_embedding_models: Vec::new(),
-            wal_ceiling_bytes: 0,
-            wal_ceiling_configured_bytes: 0,
-            wal_ceiling_source: WalCeilingSource::Default,
-            wal_ceiling_env_raw: None,
-            disk_guard_environment: Default::default(),
-            disk_guard_config: None,
-            volume_lock_dir: None,
-            credentials: Vec::new(),
-            visibility_receipts: None,
-            mounts: Vec::new(),
-            events_split: None,
-            actor_id: None,
-            brain_profile: None,
-            brain: Default::default(),
-            packs: vec!["kg".into(), "memory".into()],
-            ..RuntimeConfig::default()
-        })
-        .expect("isolated memory runtime");
-        assert!(runtime.config().db_path.is_none());
-        assert!(runtime.backend().pool().config().path.is_none());
-        assert!(runtime.backend_data_dir().is_none());
-        assert!(runtime.backend_ann_root().is_none());
-        assert!(runtime.registered_embedding_model_names().is_empty());
-
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(KgPack::new(runtime.clone()));
-        builder.register(MemoryPack::new(runtime));
-        // This uses the production description renderer without activating packs.
-        let registry = builder.build_metadata().expect("metadata registry");
-        assert!(registry.has_verb("memory.prune"));
-        let description = registry
-            .describe_verb("memory.prune")
-            .expect("prune description");
-        assert_eq!(description["verb"], "memory.prune");
-        assert_eq!(description["pack"], "memory");
-        assert_eq!(description["category"], "Commissive");
-
-        let params = description["params"].as_array().expect("parameter list");
-        assert_eq!(params.len(), 5);
-        let schema = &description["input_schema"];
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], true);
-        assert!(schema["required"]
-            .as_array()
-            .expect("required list")
-            .is_empty());
-        let properties = schema["properties"].as_object().expect("schema properties");
-        assert_eq!(properties.len(), 6);
-        assert_eq!(properties["help"]["type"], "boolean");
-
-        for (name, param_type) in [
-            ("min_salience", "number"),
-            ("min_effective_salience", "number"),
-            ("before", "integer"),
-            ("namespace", "string"),
-            ("dry_run", "boolean"),
-        ] {
-            let matching: Vec<_> = params
-                .iter()
-                .filter(|param| param["name"].as_str() == Some(name))
-                .collect();
-            assert_eq!(matching.len(), 1, "exactly one declaration for {name}");
-            assert_eq!(matching[0]["type"], param_type, "help type for {name}");
-            assert_eq!(matching[0]["required"], false, "optional help field {name}");
-            assert_eq!(
-                properties[name]["type"], param_type,
-                "schema type for {name}"
-            );
-        }
-    }
-
-    const FR1_MODEL: &str = "fr1-mutation-hook-model";
-
-    /// Builds a registry with the production note-mutation hook and returns its ANN state.
-    fn build_note_hook_registry(rt: &KhiveRuntime) -> (khive_runtime::VerbRegistry, SharedAnn) {
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(KgPack::new(rt.clone()));
-        let memory_pack = MemoryPack::new(rt.clone());
-        let ann = memory_pack.ann_for_test();
-        builder.register(memory_pack);
-        let registry = builder.build().expect("registry builds");
-        registry.call_register_note_mutation_hooks(rt);
-        (registry, ann)
-    }
-
-    fn mutation_hook_ann_key() -> ann::AnnKey {
-        ann::AnnKey::new(FR1_MODEL)
-    }
-
-    /// Seeds one note, warms ANN through recall, and verifies the pre-mutation state.
-    async fn seed_and_warm_ann(
-        rt: &KhiveRuntime,
-        registry: &khive_runtime::VerbRegistry,
-        ann: &SharedAnn,
-        content: &str,
-        salience: f64,
-    ) -> Uuid {
-        rt.register_embedder(Fr1FixedVecProvider {
-            model_name: FR1_MODEL.to_string(),
-            vector: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        });
-        let id = registry
-            .dispatch(
-                "memory.remember",
-                json!({"content": content, "salience": salience}),
-            )
-            .await
-            .expect("seed remember")["id"]
-            .as_str()
-            .expect("id")
-            .parse::<Uuid>()
-            .expect("valid uuid");
-
-        registry
-            .dispatch(
-                "memory.recall",
-                json!({
-                    "query": content,
-                    "namespace": "local",
-                    "fusion_strategy": "vector_only",
-                    "embedding_model": FR1_MODEL,
-                }),
-            )
-            .await
-            .expect("warm recall");
-
-        ann::wait_until_warm_idle(ann, &mutation_hook_ann_key()).await;
-        assert!(
-            ann::is_current(ann, &mutation_hook_ann_key()).await,
-            "precondition: completed ANN warm-up must leave the cache current \
-             before testing mutation invalidation"
-        );
-        id
-    }
-
-    #[tokio::test]
-    #[serial(background_tasks)]
-    #[serial_test::serial(config_ledger)]
-    async fn prune_invalidates_warm_ann_without_subsequent_remember() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = build_note_hook_registry(&rt);
-
-        seed_and_warm_ann(&rt, &registry, &ann, "fr1 prune target content", 0.9).await;
-
-        // `min_salience: 1.0` is strictly above the seeded note's 0.9
-        // salience, so it is the one candidate. No `memory.remember` call
-        // follows.
-        let pruned = registry
-            .dispatch(
-                "memory.prune",
-                json!({ "min_salience": 1.0, "namespace": "local" }),
-            )
-            .await
-            .expect("prune");
-        assert_eq!(
-            pruned["pruned"], 1,
-            "the seeded note must be the one candidate pruned: {pruned:?}"
-        );
-
-        assert!(
-            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
-            "memory.prune deleting a candidate must invalidate the warm ANN \
-             generation for affected models (#750)"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(background_tasks)]
-    #[serial_test::serial(config_ledger)]
-    async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = build_note_hook_registry(&rt);
-
-        let id = seed_and_warm_ann(&rt, &registry, &ann, "fr1 update target content", 0.7).await;
-
-        // KG's generic `update` verb — NOT `memory.remember` — changes the
-        // note's content. Same call shape `khive-pack-kg/src/handlers/
-        // update.rs` dispatches through `KhiveRuntime::update_note`; no
-        // `kind` param needed, the UUID resolves the substrate.
-        registry
-            .dispatch(
-                "update",
-                json!({ "id": id.to_string(), "content": "entirely different rewritten content" }),
-            )
-            .await
-            .expect("kg update on memory-kind note");
-
-        assert!(
-            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
-            "a KG `update` that changes a memory-kind note's content must \
-             invalidate the warm ANN generation (#750)"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(background_tasks)]
-    #[serial_test::serial(config_ledger)]
-    async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = build_note_hook_registry(&rt);
-
-        let id = seed_and_warm_ann(&rt, &registry, &ann, "fr1 delete target content", 0.7).await;
-
-        // KG's generic `delete` verb (soft delete by default) — NOT any
-        // memory-pack verb.
-        let deleted = registry
-            .dispatch("delete", json!({ "id": id.to_string() }))
-            .await
-            .expect("kg delete on memory-kind note");
-        assert_eq!(
-            deleted["deleted"].as_bool(),
-            Some(true),
-            "delete must report success: {deleted:?}"
-        );
-
-        assert!(
-            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
-            "a KG `delete` on a memory-kind note must invalidate the warm \
-             ANN generation (#750)"
-        );
-    }
-
-    /// A real merge invalidates an index warmed only after both notes were seeded.
-    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
-    #[tokio::test]
-    #[serial(background_tasks)]
-    #[serial_test::serial(config_ledger)]
-    async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = build_note_hook_registry(&rt);
-
-        rt.register_embedder(Fr1FixedVecProvider {
-            model_name: FR1_MODEL.to_string(),
-            vector: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        });
-
-        let into_id = registry
-            .dispatch(
-                "memory.remember",
-                json!({"content": "fr2 merge into content", "salience": 0.7}),
-            )
-            .await
-            .expect("seed into-note")["id"]
-            .as_str()
-            .expect("id")
-            .parse::<Uuid>()
-            .expect("valid uuid");
-        let from_id = registry
-            .dispatch(
-                "memory.remember",
-                json!({"content": "fr2 merge from content", "salience": 0.7}),
-            )
-            .await
-            .expect("seed from-note")["id"]
-            .as_str()
-            .expect("id")
-            .parse::<Uuid>()
-            .expect("valid uuid");
-
-        // ONE warm-up recall, after BOTH notes exist.
-        registry
-            .dispatch(
-                "memory.recall",
-                json!({
-                    "query": "fr2 merge into content",
-                    "namespace": "local",
-                    "fusion_strategy": "vector_only",
-                    "embedding_model": FR1_MODEL,
-                }),
-            )
-            .await
-            .expect("warm recall");
-        // Trust freshness only after all single-flight rebuilds release the warm guard.
-        ann::wait_until_warm_idle(&ann, &mutation_hook_ann_key()).await;
-        assert!(
-            ann::is_current(&ann, &mutation_hook_ann_key()).await,
-            "sanity: warm-up recall must leave the ANN cache current before \
-             the merge under test"
-        );
-        let generation_before = ann::generation_for_test(&ann, &mutation_hook_ann_key()).await;
-
-        registry
-            .dispatch(
-                "merge",
-                json!({
-                    "into_id": into_id.to_string(),
-                    "from_id": from_id.to_string(),
-                    "kind": "memory",
-                }),
-            )
-            .await
-            .expect("kg merge on memory-kind notes");
-
-        assert!(
-            ann::generation_for_test(&ann, &mutation_hook_ann_key()).await > generation_before,
-            "a KG `merge` of two memory-kind notes must invalidate the warm \
-             ANN generation (#750)"
-        );
-        ann::wait_until_warm_idle(&ann, &mutation_hook_ann_key()).await;
-        assert!(
-            ann::is_current(&ann, &mutation_hook_ann_key()).await,
-            "the mutation-triggered background rebuild must converge on the \
-             post-merge generation without another recall"
-        );
-    }
-
-    struct Fr1FixedVecProvider {
-        model_name: String,
-        vector: [f32; 8],
-    }
-
-    #[async_trait::async_trait]
-    impl khive_runtime::EmbedderProvider for Fr1FixedVecProvider {
-        fn name(&self) -> &str {
-            &self.model_name
-        }
-
-        fn dimensions(&self) -> usize {
-            8
-        }
-
-        async fn build(
-            &self,
-        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
-            Ok(std::sync::Arc::new(Fr1FixedVecService {
-                vector: self.vector,
-            }))
-        }
-    }
-
-    struct Fr1FixedVecService {
-        vector: [f32; 8],
-    }
-
-    #[async_trait::async_trait]
-    impl lattice_embed::EmbeddingService for Fr1FixedVecService {
-        async fn embed(
-            &self,
-            texts: &[String],
-            _model: lattice_embed::EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-            // Every text maps to the SAME fixed vector — deterministic
-            // cosine=1.0 between any query and any seeded content under this
-            // provider, so ANN warming/hit behavior is fully controlled by
-            // this test module, not by real embedding semantics.
-            Ok(texts.iter().map(|_| self.vector.to_vec()).collect())
-        }
-
-        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "fr1-fixed-vec"
-        }
-    }
-}
+#[path = "pack/note_mutation_hook_tests.rs"]
+mod note_mutation_hook_tests;

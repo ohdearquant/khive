@@ -51,14 +51,14 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "DELETE",
         "{table}",
         1,
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "INSERT",
         "{table}",
         1,
@@ -148,7 +148,7 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
     // Database identity bootstrap writes one fixed metadata table, never a
     // vec0 or note table. Keep the dynamic DML site visible to this census.
     (
-        "khive-db/src/pool.rs",
+        "khive-db/src/pool/identity.rs",
         "initialize_database_id_with_admission",
         "INSERT",
         "main.{DATABASE_ID_TABLE}",
@@ -364,7 +364,7 @@ const TEST_SUPPORT: &[(&str, &str, &str, &str, usize)] = &[
 ];
 
 const DELETE_VECTOR_CALLERS: &[(&str, &str, usize)] = &[(
-    "khive-db/src/stores/vectors.rs",
+    "khive-db/src/stores/vectors/vector_store_impl.rs",
     "VectorStore for SqliteVecStore::delete",
     1,
 )];
@@ -718,9 +718,11 @@ fn raw_vec0_writer_census_pins_test_support_fixture() {
 
 #[test]
 fn raw_vec0_writer_census_rejects_new_builder_caller() {
-    let source = include_str!("../src/stores/vectors.rs");
-    let relative = "khive-db/src/stores/vectors.rs";
-    assert!(source.contains("pub(crate) fn delete_vector_statement("));
+    let source = include_str!("../src/stores/vectors/vector_store_impl.rs");
+    let relative = "khive-db/src/stores/vectors/vector_store_impl.rs";
+    assert!(
+        include_str!("../src/stores/vectors.rs").contains("pub(crate) fn delete_vector_statement(")
+    );
     let mutant = format!(
         "{source}\n#[cfg(test)]\nmod unclassified_caller {{\n \
          use super::*;\n \

@@ -5,6 +5,19 @@ use khive_runtime::{
     AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder,
 };
 
+fn assert_busy_mark_details(result: &serde_json::Value) {
+    let details = &result["mark_error_details"];
+    assert_eq!(details["code"], "sqlite_statement_failure");
+    assert_eq!(details["stage"], "sqlite_statement_failure");
+    assert_eq!(details["sqlite_write_stage"], "sqlite_statement_failure");
+    assert_eq!(details["sqlite_primary_code"], 5);
+    let extended = details["sqlite_extended_code"]
+        .as_i64()
+        .expect("native SQLite extended code");
+    assert_eq!(extended & 0xff, 5, "SQLite busy primary-code family");
+    assert_eq!(details["domain_disposition"], "not_committed");
+}
+
 #[tokio::test]
 async fn lock_contention_reports_failed_mark_read_statuses() {
     let dir = tempfile::tempdir().expect("temporary database directory");
@@ -78,6 +91,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         })
         .collect();
     assert_eq!(ids.len(), 2);
+    let first_id = ids[0].clone();
 
     {
         let writer = runtime
@@ -110,6 +124,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         .is_some_and(|error| error.contains("locked")));
     assert!(single.get("content").is_none());
     assert!(single.get("subject").is_none());
+    assert_busy_mark_details(&single);
 
     let bulk_read = registry
         .dispatch("comm.read", serde_json::json!({ "ids": ids.clone() }))
@@ -122,6 +137,9 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         .expect("bulk read result array")
         .iter()
         .all(|result| result.get("content").is_none() && result.get("subject").is_none()));
+    for result in bulk_read["results"].as_array().expect("bulk read results") {
+        assert_busy_mark_details(result);
+    }
 
     let bulk = registry
         .dispatch("comm.mark_read", serde_json::json!({ "ids": ids }))
@@ -135,8 +153,35 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         .expect("bulk result array")
         .iter()
         .all(|result| result["status"] == "failed" && result["read"] == false));
+    for result in bulk["results"].as_array().expect("bulk mark results") {
+        assert_busy_mark_details(result);
+    }
+
+    let still_unread = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 2 }),
+        )
+        .await
+        .expect("failed marks leave both messages unread");
+    assert_eq!(
+        still_unread["messages"]
+            .as_array()
+            .expect("unread messages")
+            .len(),
+        2
+    );
 
     holder
         .execute_batch("ROLLBACK")
         .expect("release the SQLite writer lock");
+
+    let retried = registry
+        .dispatch("comm.read", serde_json::json!({ "id": first_id }))
+        .await
+        .expect("mark succeeds after lock release");
+    assert_eq!(retried["status"], "success");
+    assert_eq!(retried["read"], true);
+    assert!(retried.get("mark_error").is_none());
+    assert!(retried.get("mark_error_details").is_none());
 }

@@ -13,6 +13,10 @@ LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 FLEET_ARTIFACT ?=
+EXPECTED_SHA256 ?=
+EXPECTED_REVISION ?=
+PIN_DIR ?=
+SUPERVISOR_LABEL ?=
 # Every variable below can be overridden on the command line (`make VAR=...`)
 # and plain `:=`/`?=` loses to command-line assignments. Make performs no
 # shell escaping on `$(VAR)`, so a caller-controlled value spliced directly
@@ -44,8 +48,20 @@ export LOCAL_BUILD_RECEIPT_VALUE
 override CARGO_VALUE := $(value CARGO)
 unexport CARGO
 export CARGO_VALUE
+override EXPECTED_SHA256_VALUE := $(value EXPECTED_SHA256)
+unexport EXPECTED_SHA256
+export EXPECTED_SHA256_VALUE
+override EXPECTED_REVISION_VALUE := $(value EXPECTED_REVISION)
+unexport EXPECTED_REVISION
+export EXPECTED_REVISION_VALUE
+override PIN_DIR_VALUE := $(value PIN_DIR)
+unexport PIN_DIR
+export PIN_DIR_VALUE
+override SUPERVISOR_LABEL_VALUE := $(value SUPERVISOR_LABEL)
+unexport SUPERVISOR_LABEL
+export SUPERVISOR_LABEL_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check tz-audit
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local install-artifact check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check tz-audit
 
 check:
 	cd crates && cargo check --workspace
@@ -186,18 +202,13 @@ hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
 	cd crates && cargo test -p khive-pack-comm --test hold_time_regression -- --nocapture
 
-# Python's fcntl.flock uses the same flock(2) lock as the daemon on macOS and Linux.
-local: verify-local-artifact
-	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
-	  --build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
-	  --inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified" \
-	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE"); then \
-	  exit 1; \
-	fi; \
-	if ! eval "$$VERIFIED_ASSIGNMENTS"; then \
-	  echo "==> ERROR: could not load verified-artifact fields"; \
-	  exit 1; \
-	fi; \
+# The install half of `local`, shared with `install-artifact` so the two targets
+# cannot drift: staging, codesign, the signed-bytes probe, the atomic move, the
+# daemon stop/start and the post-move hash checks. It runs in the caller's shell
+# and reads three values the caller has already established: SRC (the artifact
+# to install), VERIFIED_SHA256 (its sha256 as probed) and VERIFIED_VERBS (the
+# verb count the probe saw).
+define INSTALL_VERIFIED_ARTIFACT
 	DEST=$$HOME/.cargo/bin/kkernel; \
 	if [ ! -f "$$SRC" ]; then echo "==> ERROR: build artifact $$SRC missing"; exit 1; fi; \
 	SRC_SHA256=$$({ shasum -a 256 "$$SRC" 2>/dev/null || sha256sum "$$SRC"; } | awk '{print $$1}'); \
@@ -382,4 +393,102 @@ local: verify-local-artifact
 	fi; \
 	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERIFIED_VERBS verified verbs)"; \
 	"$$DEST" --version
+endef
+
+# Python's fcntl.flock uses the same flock(2) lock as the daemon on macOS and Linux.
+local: verify-local-artifact
+	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
+	  --build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
+	  --inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified" \
+	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE"); then \
+	  exit 1; \
+	fi; \
+	if ! eval "$$VERIFIED_ASSIGNMENTS"; then \
+	  echo "==> ERROR: could not load verified-artifact fields"; \
+	  exit 1; \
+	fi; \
+	$(INSTALL_VERIFIED_ARTIFACT)
 	@echo "==> Done. Run /mcp in Claude Code to reconnect."
+
+# Install a kkernel artifact that was built and verified elsewhere, for example
+# on another machine of the same platform, without rebuilding it here:
+#   make install-artifact FLEET_ARTIFACT=<path> EXPECTED_SHA256=<64 hex> \
+#     EXPECTED_REVISION=<40 hex> PIN_DIR=<directory> [SUPERVISOR_LABEL=<label>]
+# EXPECTED_SHA256 is the artifact's sha256 as built, before codesign rewrites
+# it. EXPECTED_REVISION is the git revision the binary reports in --version and
+# the restarted daemon reports through whoami(). PIN_DIR receives a copy of the
+# currently installed binary before it is replaced; an existing pin there is
+# never overwritten. Every check runs before the first write, and the install
+# itself is the body `local` runs. With SUPERVISOR_LABEL set, no daemon is
+# started here and the launchd service is kickstarted after the install, because
+# a supervisor that reads a clean exit as a deliberate stop does not start the
+# daemon again on its own, and a second daemon started beside it would race it
+# for the socket.
+install-artifact: validate-make-inputs
+	@SRC=$$FLEET_ARTIFACT_VALUE; \
+	if [ -z "$$SRC" ]; then echo "==> ERROR: FLEET_ARTIFACT is required"; exit 1; fi; \
+	if [ ! -f "$$SRC" ]; then echo "==> ERROR: FLEET_ARTIFACT $$SRC is not a file"; exit 1; fi; \
+	if ! printf '%s' "$$EXPECTED_SHA256_VALUE" | grep -Eq '^[0-9a-f]{64}$$'; then \
+	  echo "==> ERROR: EXPECTED_SHA256 must be the artifact's sha256 as 64 lowercase hex digits"; exit 1; \
+	fi; \
+	if ! printf '%s' "$$EXPECTED_REVISION_VALUE" | grep -Eq '^[0-9a-f]{40}$$'; then \
+	  echo "==> ERROR: EXPECTED_REVISION must be a git revision as 40 lowercase hex digits"; exit 1; \
+	fi; \
+	if [ -z "$$PIN_DIR_VALUE" ]; then \
+	  echo "==> ERROR: PIN_DIR is required: the installed binary is copied there before it is replaced"; exit 1; \
+	fi; \
+	PIN="$$PIN_DIR_VALUE/kkernel"; \
+	if [ -e "$$PIN" ]; then echo "==> ERROR: $$PIN already exists; a pin is never overwritten"; exit 1; fi; \
+	ARTIFACT_SHA256=$$({ shasum -a 256 "$$SRC" 2>/dev/null || sha256sum "$$SRC"; } | awk '{print $$1}'); \
+	if [ "$$ARTIFACT_SHA256" != "$$EXPECTED_SHA256_VALUE" ]; then \
+	  echo "==> ERROR: artifact sha256 $$ARTIFACT_SHA256 is not EXPECTED_SHA256 $$EXPECTED_SHA256_VALUE"; exit 1; \
+	fi; \
+	echo "==> Artifact sha256 matches EXPECTED_SHA256 ($$ARTIFACT_SHA256)"; \
+	ARTIFACT_REVISION=$$("$$SRC" --version 2>/dev/null | sed -n 's/.*(revision \([0-9a-f]\{40\}\)[,)].*/\1/p'); \
+	if [ "$$ARTIFACT_REVISION" != "$$EXPECTED_REVISION_VALUE" ]; then \
+	  echo "==> ERROR: artifact reports revision '$$ARTIFACT_REVISION', not EXPECTED_REVISION $$EXPECTED_REVISION_VALUE"; exit 1; \
+	fi; \
+	echo "==> Artifact revision matches EXPECTED_REVISION ($$ARTIFACT_REVISION)"; \
+	if ! PROBE=$$(python3 scripts/verify_local_artifact.py \
+	  --artifact "$$SRC" \
+	  --packs "$$FULL_PACKS_VALUE" \
+	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE"); then \
+	  echo "==> ERROR: the artifact failed the pack probe; nothing was installed"; exit 1; \
+	fi; \
+	echo "$$PROBE"; \
+	VERIFIED_VERBS=$$(printf '%s\n' "$$PROBE" | sed -n 's/.*, \([0-9][0-9]*\) verbs across .*/\1/p' | tail -1); \
+	if [ -z "$$VERIFIED_VERBS" ]; then echo "==> ERROR: could not read the verb count from the pack probe"; exit 1; fi; \
+	VERIFIED_SHA256=$$ARTIFACT_SHA256; \
+	INSTALLED=$$HOME/.cargo/bin/kkernel; \
+	mkdir -p "$$PIN_DIR_VALUE" || { echo "==> ERROR: could not create PIN_DIR $$PIN_DIR_VALUE"; exit 1; }; \
+	if [ -f "$$INSTALLED" ]; then \
+	  cp -p "$$INSTALLED" "$$PIN" && chmod a-w "$$PIN" || { echo "==> ERROR: could not pin $$INSTALLED to $$PIN"; exit 1; }; \
+	  PIN_SHA256=$$({ shasum -a 256 "$$PIN" 2>/dev/null || sha256sum "$$PIN"; } | awk '{print $$1}'); \
+	  INSTALLED_SHA256=$$({ shasum -a 256 "$$INSTALLED" 2>/dev/null || sha256sum "$$INSTALLED"; } | awk '{print $$1}'); \
+	  if [ "$$PIN_SHA256" != "$$INSTALLED_SHA256" ]; then \
+	    echo "==> ERROR: pin $$PIN ($$PIN_SHA256) differs from the installed binary ($$INSTALLED_SHA256)"; exit 1; \
+	  fi; \
+	  echo "==> Pinned the installed binary to $$PIN ($$PIN_SHA256)"; \
+	else \
+	  echo "==> No installed binary at $$INSTALLED; nothing to pin"; \
+	fi; \
+	if [ -n "$$SUPERVISOR_LABEL_VALUE" ]; then KHIVE_LOCAL_NO_START=1; fi; \
+	$(INSTALL_VERIFIED_ARTIFACT); \
+	if [ -n "$$SUPERVISOR_LABEL_VALUE" ]; then \
+	  echo "==> launchctl kickstart gui/$$(id -u)/$$SUPERVISOR_LABEL_VALUE"; \
+	  launchctl kickstart "gui/$$(id -u)/$$SUPERVISOR_LABEL_VALUE" || { echo "==> ERROR: launchctl kickstart failed"; exit 1; }; \
+	fi; \
+	if [ -n "$$KHIVE_LOCAL_NO_START" ] && [ -z "$$SUPERVISOR_LABEL_VALUE" ]; then \
+	  echo "==> KHIVE_LOCAL_NO_START set and no SUPERVISOR_LABEL: no daemon was started, so no revision read-back"; \
+	  exit 0; \
+	fi; \
+	i=0; DAEMON_REVISION=""; \
+	while [ $$i -lt 60 ]; do \
+	  DAEMON_REVISION=$$("$$DEST" exec 'whoami()' 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)["results"][0]["result"]["build"]["revision"])' 2>/dev/null); \
+	  if [ "$$DAEMON_REVISION" = "$$EXPECTED_REVISION_VALUE" ]; then break; fi; \
+	  i=$$((i+1)); sleep 1; \
+	done; \
+	if [ "$$DAEMON_REVISION" != "$$EXPECTED_REVISION_VALUE" ]; then \
+	  echo "==> ERROR: the serving daemon reports revision '$$DAEMON_REVISION' after 60s, not EXPECTED_REVISION $$EXPECTED_REVISION_VALUE. Restore: the pin at $$PIN"; exit 1; \
+	fi; \
+	echo "==> The serving daemon reports revision $$DAEMON_REVISION"

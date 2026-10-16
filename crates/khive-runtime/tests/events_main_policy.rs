@@ -232,10 +232,11 @@ async fn secondary_case(root: &Path, case: &str) {
             .expect("events must apply MAIN's nonzero policy to the writable lane");
         assert!(matches!(
             actual,
-            RuntimeError::Sqlite(SqliteError::WalCapacityUnavailable {
-                bytes: actual_bytes,
-                capability: actual_capability,
-            }) if actual_bytes == bytes && actual_capability == capability
+            RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })
+                if matches!(source.downcast_ref(), Some(SqliteError::WalCapacityUnavailable {
+                    bytes: actual_bytes,
+                    capability: actual_capability,
+                }) if *actual_bytes == bytes && *actual_capability == capability)
         ));
         assert_eq!(runtime.diagnostic_backends().len(), 1);
     } else if case.starts_with("secondary_sql") {

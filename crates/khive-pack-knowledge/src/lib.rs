@@ -3,9 +3,11 @@
 mod feedback;
 pub(crate) mod handlers;
 pub(crate) mod knowledge;
+mod lint;
 mod pack;
 mod vocab;
 
+pub use knowledge::snapshot_invalidation::invalidate_legacy_vamana_snapshots;
 pub use pack::KnowledgePack;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};

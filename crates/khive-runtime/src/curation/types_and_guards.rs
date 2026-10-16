@@ -4,22 +4,22 @@ use super::{
     SubstrateKind, Uuid, Value,
 };
 
-pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
+fn stale_snapshot_error(substrate: &str, id: Uuid) -> RuntimeError {
     RuntimeError::Khive(KhiveError::conflict(format!(
-        "note {id} changed concurrently after it was read; retry with fresh state"
+        "{substrate} {id} changed concurrently after it was read; retry with fresh state"
     )))
+}
+
+pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
+    stale_snapshot_error("note", id)
 }
 
 pub(crate) fn stale_entity_snapshot_error(id: Uuid) -> RuntimeError {
-    RuntimeError::Khive(KhiveError::conflict(format!(
-        "entity {id} changed concurrently after it was read; retry with fresh state"
-    )))
+    stale_snapshot_error("entity", id)
 }
 
 pub(crate) fn stale_edge_snapshot_error(id: Uuid) -> RuntimeError {
-    RuntimeError::Khive(KhiveError::conflict(format!(
-        "edge {id} changed concurrently after it was read; retry with fresh state"
-    )))
+    stale_snapshot_error("edge", id)
 }
 
 /// Immutable embedding-registry view for one logical write.
@@ -690,6 +690,36 @@ pub(super) enum MergeSqlError {
     Refusal(RuntimeError),
 }
 
+impl MergeSqlError {
+    pub(super) fn into_storage_error(
+        self,
+        capability: khive_storage::StorageCapability,
+        operation: &'static str,
+    ) -> khive_storage::StorageError {
+        let failure = match &self {
+            Self::Sqlite(SqliteError::Rusqlite(error)) => match error {
+                rusqlite::Error::SqliteFailure(code, _)
+                | rusqlite::Error::SqlInputError { error: code, .. } => {
+                    Some(khive_storage::error::SqliteWriteFailure {
+                        stage: khive_storage::error::SqliteWriteStage::Statement,
+                        primary_code: code.extended_code & 0xff,
+                        extended_code: code.extended_code,
+                        settlement_unknown: false,
+                    })
+                }
+                _ => None,
+            },
+            Self::Sqlite(error) => error.write_failure(),
+            Self::Refusal(_) => None,
+        };
+        let error = khive_storage::StorageError::driver(capability, operation, self);
+        match failure {
+            Some(failure) => error.with_sqlite_write_failure(failure),
+            None => error,
+        }
+    }
+}
+
 impl std::fmt::Display for MergeSqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -808,7 +838,14 @@ fn recover_rolled_back_merge_refusal(
     })
 }
 
-pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+fn map_merge_storage_error(
+    error: khive_storage::StorageError,
+    map_sqlite: impl FnOnce(
+        khive_storage::StorageCapability,
+        std::borrow::Cow<'static, str>,
+        SqliteError,
+    ) -> RuntimeError,
+) -> RuntimeError {
     let error = match recover_rolled_back_merge_refusal(error) {
         Ok(refusal) => return refusal,
         Err(error) => error,
@@ -820,7 +857,7 @@ pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError)
             source,
         } => match source.downcast::<MergeSqlError>() {
             Ok(error) => match *error {
-                MergeSqlError::Sqlite(error) => RuntimeError::Sqlite(error),
+                MergeSqlError::Sqlite(error) => map_sqlite(capability, operation, error),
                 MergeSqlError::Refusal(error) => error,
             },
             Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
@@ -833,30 +870,15 @@ pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError)
     }
 }
 
+pub(super) fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> RuntimeError {
+    map_merge_storage_error(error, |_, _, error| RuntimeError::from(error))
+}
+
 pub(super) fn map_merge_note_storage_error(error: khive_storage::StorageError) -> RuntimeError {
-    let error = match recover_rolled_back_merge_refusal(error) {
-        Ok(refusal) => return refusal,
-        Err(error) => error,
-    };
-    match error {
-        khive_storage::StorageError::Driver {
-            capability,
-            operation,
-            source,
-        } => match source.downcast::<MergeSqlError>() {
-            Ok(error) => match *error {
-                MergeSqlError::Refusal(error) => error,
-                // Preserve the existing note route's storage error envelope.
-                MergeSqlError::Sqlite(error) => RuntimeError::Storage(
-                    khive_storage::StorageError::driver(capability, operation, error),
-                ),
-            },
-            Err(source) => RuntimeError::Storage(khive_storage::StorageError::Driver {
-                capability,
-                operation,
-                source,
-            }),
-        },
-        error => RuntimeError::Storage(error),
-    }
+    // Preserve the existing note route's storage error envelope.
+    map_merge_storage_error(error, |capability, operation, error| {
+        RuntimeError::Storage(khive_storage::StorageError::driver(
+            capability, operation, error,
+        ))
+    })
 }

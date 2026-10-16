@@ -7,7 +7,7 @@ on:
       - "scripts/test-sqlite-capacity-linux.sh"
       - ".github/workflows/sqlite-capacity.yml"
   push:
-    branches: [main]
+    branches: [main, "integration/**"]
     paths:
       - "crates/khive-db/tests/capacity_floor_real_fs.rs"
       - "scripts/test-sqlite-capacity-linux.sh"
@@ -22,6 +22,9 @@ env:
 jobs:
   sqlite-capacity:
     name: SQLite capacity acceptance
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -35,6 +38,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the capacity test outside the namespace
         shell: bash
         run: |

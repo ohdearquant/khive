@@ -7,7 +7,7 @@ use khive_gate::{AllowAllGate, GateRef};
 use khive_storage::EventStore;
 #[cfg(doc)]
 use khive_storage::EventView;
-use khive_types::Namespace;
+use khive_types::{Namespace, NotePropertyPolicySpec};
 use serde_json::Value;
 
 use crate::error::{
@@ -28,6 +28,7 @@ use super::{PackFactory, PackRegistry};
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    pub(super) pack_versions: HashMap<String, &'static str>,
     /// Parallel to `packs`: whether the composition root vouches for the
     /// pack at the same index, recorded by the registration method the
     /// *caller* chose rather than anything the pack reports about itself.
@@ -39,6 +40,7 @@ pub struct VerbRegistryBuilder {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc for why
     /// `pack.name()` alone cannot be trusted for this decision.
     pack_trusted: Vec<bool>,
+    disabled_verbs: HashMap<String, Vec<String>>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     pub(super) kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
@@ -83,7 +85,9 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            pack_versions: HashMap::new(),
             pack_trusted: Vec::new(),
+            disabled_verbs: HashMap::new(),
             resolvers: Vec::new(),
             kg_read_resolver: None,
             gate: std::sync::Arc::new(AllowAllGate),
@@ -96,6 +100,12 @@ impl VerbRegistryBuilder {
             dispatch_hook: None,
             audit_batch_config: None,
         }
+    }
+
+    /// Disable public handlers owned by a loaded pack; validated when the registry builds.
+    pub fn with_disabled_verbs(&mut self, pack: &str, verbs: &[String]) -> &mut Self {
+        self.disabled_verbs.insert(pack.to_owned(), verbs.to_vec());
+        self
     }
 
     /// Set the operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -448,6 +458,38 @@ impl VerbRegistryBuilder {
         validate_unique_entity_types(&ordered_packs)?;
         validate_entity_type_note_kind_collisions(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        let mut disabled_verbs = HashSet::new();
+        let mut policies: Vec<_> = self.disabled_verbs.iter().collect();
+        policies.sort_by_key(|(pack, _)| *pack);
+        for (name, verbs) in policies {
+            if verbs.is_empty() {
+                continue;
+            }
+            let pack = ordered_packs
+                .iter()
+                .find(|pack| pack.name() == name.as_str())
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!(
+                        "packs.{name}.verbs_disabled: pack is not loaded"
+                    ))
+                })?;
+            for verb in verbs {
+                let handler = pack
+                    .handlers()
+                    .iter()
+                    .find(|handler| {
+                        handler.name == verb.as_str()
+                            && matches!(handler.visibility, Visibility::Verb)
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                    "packs.{name}.verbs_disabled: {verb:?} is not a public verb owned by this pack"
+                ))
+                    })?;
+                disabled_verbs.insert(handler.name);
+            }
+        }
+        let note_property_policies = collect_note_property_policies(&ordered_packs)?;
         if activate {
             for pack in &ordered_packs {
                 pack.validate_config()?;
@@ -457,7 +499,9 @@ impl VerbRegistryBuilder {
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
             .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .filter(|h| {
+                matches!(h.visibility, Visibility::Verb) && !disabled_verbs.contains(h.name)
+            })
             .map(|h| h.name)
             .collect();
 
@@ -551,8 +595,23 @@ impl VerbRegistryBuilder {
             )
         });
 
+        // Snapshot ownership before flattening rules for runtime installation.
+        // Keep declaration order and duplicate rules, including identical rules
+        // contributed by different packs.
+        let attributed_edge_rules = ordered_packs
+            .iter()
+            .flat_map(|pack| {
+                pack.edge_rules()
+                    .iter()
+                    .map(move |rule| (pack.name().to_owned(), *rule))
+            })
+            .collect();
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
+            attributed_edge_rules: Arc::new(attributed_edge_rules),
+            pack_versions: Arc::new(self.pack_versions),
+            note_property_policies: Arc::new(note_property_policies),
             resolvers: Arc::new(self.resolvers),
             kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
@@ -563,6 +622,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            disabled_verbs: Arc::new(disabled_verbs),
             handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
@@ -570,6 +630,37 @@ impl VerbRegistryBuilder {
             audit_batch,
         })
     }
+}
+
+/// Validate and capture property metadata in topological pack/declaration order.
+fn collect_note_property_policies(
+    packs: &[Box<dyn PackRuntime>],
+) -> Result<Vec<NotePropertyPolicySpec>, RuntimeError> {
+    let mut policies = Vec::new();
+    let mut seen = HashSet::new();
+    for pack in packs {
+        let owned_kinds = pack.note_kinds();
+        for spec in pack.note_property_policies() {
+            if !owned_kinds.contains(&spec.kind) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares property policy for unowned note kind {:?}, key {:?}",
+                    pack.name(),
+                    spec.kind,
+                    spec.key
+                )));
+            }
+            if !seen.insert((spec.kind, spec.key)) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares duplicate property policy for note kind {:?}, key {:?}",
+                    pack.name(),
+                    spec.kind,
+                    spec.key
+                )));
+            }
+            policies.push(*spec);
+        }
+    }
+    Ok(policies)
 }
 
 /// Validate that no two packs declare the same note kind.
@@ -793,6 +884,11 @@ impl PackMetadataRegistry {
         self.registry.pack_names()
     }
 
+    /// Factory-reported version, if this pack was registered through a factory.
+    pub fn pack_version(&self, name: &str) -> Option<&'static str> {
+        self.registry.pack_version(name)
+    }
+
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
         self.registry.pack_requires(name)
     }
@@ -819,5 +915,10 @@ impl PackMetadataRegistry {
 
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
         self.registry.all_edge_rules()
+    }
+
+    /// Pack ownership for every declared endpoint rule, in installation order.
+    pub fn all_edge_rules_with_packs(&self) -> Vec<(&str, EdgeEndpointRule)> {
+        self.registry.all_edge_rules_with_packs()
     }
 }

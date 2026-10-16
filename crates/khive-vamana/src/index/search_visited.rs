@@ -32,7 +32,7 @@ impl SearchVisitedPool {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CachedVisited {
                     nodes,
-                    visited: VisitedSet::new(nodes),
+                    visited: crate::graph::new_visited_set(nodes),
                 }
             }
         };

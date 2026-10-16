@@ -6,6 +6,7 @@ pub mod agent;
 pub mod attachment;
 pub mod blob;
 pub mod capability;
+pub mod embedding_space;
 pub mod entity;
 mod env;
 pub mod error;
@@ -34,6 +35,7 @@ pub use blob::{
     MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
+pub use embedding_space::{EmbeddingSpaceIdentity, EmbeddingSpaceIdentityError, EmbeddingSpaceKey};
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use env::read_env_number;
 pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
@@ -41,7 +43,13 @@ pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
 pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
-pub use graph::GraphStore;
+pub use graph::{
+    EdgeInsertIfAbsentOutcome, GraphGuardValueKind, GraphStatementGuard,
+    GraphStatementGuardFailure, GraphStatementGuardFailureReason, GraphStore,
+};
+pub use khive_types::vector::{
+    decode_f32_le, decode_f32_native, encode_f32_le, encode_f32_native, VectorCodecError,
+};
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, NoteVisibility, SortDir};
 pub use request_context::{
     await_request_read_phase, capture_request_read_context, effective_request_read_deadline,
@@ -51,7 +59,7 @@ pub use request_context::{
     wait_for_request_read_cancellation, RequestReadContext, RequestReadDeadline,
     RequestReadStopReason, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
-pub use sparse::SparseStore;
+pub use sparse::{SparseStore, SparseStoreFactory};
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter, TopLevelMaintenance};
 pub use telemetry::{
     ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
@@ -59,9 +67,9 @@ pub use telemetry::{
     CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent, PhaseCancelledPayload,
     PhaseCompletedPayload, PhaseStartedPayload,
 };
-pub use text::TextSearch;
+pub use text::{TextSearch, TextSearchFactory};
 pub use types::StorageResult;
-pub use vectors::VectorStore;
+pub use vectors::{VectorStore, VectorStoreFactory};
 
 pub use types::{
     BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,
@@ -76,11 +84,11 @@ pub use types::{
     TextDocument, TextFilter, TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit,
     TextSearchOptions, TextSearchRequest, TextTermStats, TextTermStatsRequest, TimeRange,
     TraversalExecutionBudget, TraversalOptions, TraversalRequest, VectorIndexKind,
-    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
-    MAX_TRAVERSAL_WORK,
+    VectorMetadataFilter, VectorRecord, VectorScanEntry, VectorScanPage, VectorScanRequest,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS,
+    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

@@ -58,11 +58,11 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 26 verbs: the bare names (no dot prefix) `create`, `get`,
-  `list`, `stats`, `update`, `delete`, `restore`, `search`, `link`, `neighbors`, `traverse`,
-  `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
+- The kg substrate pack owns 28 verbs: the bare names (no dot prefix) `create`, `get`,
+  `list`, `count`, `stats`, `update`, `delete`, `restore`, `search`, `link`, `neighbors`, `traverse`,
+  `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `schema`, `context`
   (ADR-089), `whoami`, `scan`, `db_diagnostics` (ADR-091), plus its one documented
-  sub-namespace, `stream.append` / `stream.read` / `stream.stat` (ADR-174 §2).
+  sub-namespace, `stream.append` / `stream.read` / `stream.stat` / `stream.batch` (ADR-174 §2).
 - Every other pack must prefix verbs with `<pack>.` (e.g. `memory.recall`).
 - Sub-variants use underscore, not nested dots: `memory.recall_embed`, not
   `memory.recall.embed`.
@@ -89,7 +89,7 @@
   input/schema/identity/reference/taxonomy checks plus warning-severity sort order. A conditional
   error-severity note-kind check also runs when `notes.ndjson` is present. Configurable rules from
   `rules.toml` run afterward.
-- `kkernel kg init` creates `.khive/kg/` and writes `khive.toml` with defaults.
+- `kkernel kg init` creates `.khive/kg/` and writes `.khive/config.toml` with the default engine.
 - See `docs/kg-rules.md` for the rule TOML format.
 
 ### KG status and fetch/sync alias (ADR-036, ADR-037)
@@ -136,7 +136,7 @@
 
 ### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
 
-`exec.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
+`exec/ops_file_apply.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
 whose reader or model resources cannot safely serve multiple handlers at once.
 The complete source is first validated into the same byte-bounded stable
 snapshot, including a whole-snapshot typed-JSON structural preflight, before
@@ -297,7 +297,7 @@ delete/update at all.
 
 ### `exec` local-dispatch fallback server (ADR-067, ADR-028 §8)
 
-`build_local_fallback_server` (`src/exec.rs`) is the server constructor for both of
+`build_local_fallback_server` (`src/exec/run.rs`) is the server constructor for both of
 `kkernel exec`'s non-daemon dispatch paths: the daemon-unreachable/mismatch fallback inside
 `run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path (which deliberately
 never attempts the daemon fast path at all — bulk apply needs cross-op atomicity the daemon
@@ -333,7 +333,7 @@ raw request paths continue to call `parse_request` and retain the 1 MiB limit.
 They do not forward through, stop, or lease a live daemon. If that daemon has the same SQLite
 file open, the CLI runtime is a second process with an independent connection pool. ADR-067's
 writer task and `KHIVE_WRITE_QUEUE=1` serialize writes only inside one pool/process; they do not
-coordinate the CLI process with the daemon. The boot/recovery guard in `exec.rs` protects runtime
+coordinate the CLI process with the daemon. The boot/recovery guard in `exec/run.rs` protects runtime
 construction and schema initialization only and is dropped before request execution.
 
 Cross-process writes therefore use SQLite's WAL writer lock as their only serialization seam.
@@ -394,17 +394,15 @@ operations known to be idempotent.
   operator could start a no-actor daemon, then run strict-mode `kkernel exec`, which would
   forward through it and exit 0 — bypassing the gate. The fix moves the check before the
   daemon block.
-- `atomic_update_null_and_type_semantics_match_canonical_no_op_behavior`: atomic `update`
-  null/type semantics must match canonical's actually-reachable behavior. Empirically
-  verified against live `handle_update` that `name=null`/`description=null` are canonical
-  no-ops, not rejections — canonical's field type is `Option<Value>`, and serde's derived
-  `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the outer `Option`
-  boundary and maps it straight to `None` regardless of the inner type, so canonical's own
-  literal-null branches in `string_value`/`description_patch` are unreachable through normal
-  struct deserialization. This test deliberately does NOT implement the naive expectation
-  ("`update(name=null)` REJECTED") since that doesn't match the live system. What canonical
-  DOES still reject is a non-null, non-string `name` (e.g. `name: 123`) — pre-fix, atomic
-  silently treated that as absent too, reporting success for an invalid update.
+- `atomic_update_null_and_type_semantics_match_canonical_behavior`: canonical MCP dispatch
+  and atomic execution preserve the same description patch states. An explicit
+  `description: null` clears the entity description, omission leaves it unchanged, and
+  an empty string remains a concrete value. Null `name`, `properties`, and `tags` retain
+  their existing no-op behavior. Non-string description values are refused with the
+  record unchanged, as is any present description on a note or edge, including null.
+  Present nullable note-only fields (`salience` and `decay_factor`) are also refused on
+  entity and edge targets, including null, before any sibling patch field changes.
+  Valid note-content and edge-weight updates remain available after those refusals.
 
 ### `reindex` memory Vamana epoch protocol (#812, ADR-107 §4)
 

@@ -92,6 +92,7 @@ fn embedding_runtime_config(extras: &[lattice_embed::EmbeddingModel]) -> Runtime
     let mut config = memory_runtime_config();
     config.default_namespace = Namespace::parse("test").unwrap();
     config.packs = vec!["kg".to_string(), "memory".to_string()];
+    config.engines = None;
     config.embedding_model = Some(PRIMARY_MODEL);
     config.additional_embedding_models = extras.to_vec();
     config
@@ -200,8 +201,8 @@ async fn stop_embedding_daemon(daemon: tokio::task::JoinHandle<()>) {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_omits_vectors_for_undeclared_extra_models() {
-    let (_dir, daemon, runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+async fn daemon_refuses_an_unconfigured_extra_peer_before_dispatch() {
+    let (_dir, daemon, _runtime, server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
     let client_config = embedding_runtime_config(&[]);
     let client_id = crate::server::compute_config_id(&client_config, None);
     let response = exchange(
@@ -212,16 +213,11 @@ async fn daemon_omits_vectors_for_undeclared_extra_models() {
         ),
     )
     .await;
-    let namespace = created_namespace(&response);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1,
-        "the client's primary model must receive the note vector"
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        0,
-        "a daemon-only extra must not receive the note vector"
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
     assert_eq!(
         server.config_id(),
@@ -233,8 +229,8 @@ async fn daemon_omits_vectors_for_undeclared_extra_models() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_uses_only_client_declared_extra_models() {
-    let (_dir, daemon, runtime, _server, socket) =
+async fn daemon_refuses_a_different_peer_subset_before_dispatch() {
+    let (_dir, daemon, _runtime, _server, socket) =
         start_embedding_daemon(&[EXTRA_MODEL, SECOND_EXTRA_MODEL]).await;
     let client_config = embedding_runtime_config(&[EXTRA_MODEL]);
     let client_id = crate::server::compute_config_id(&client_config, None);
@@ -246,19 +242,11 @@ async fn daemon_uses_only_client_declared_extra_models() {
         ),
     )
     .await;
-    let namespace = created_namespace(&response);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &SECOND_EXTRA_MODEL.to_string()).await,
-        0,
-        "the daemon's second extra is outside the client's declaration"
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
 
     stop_embedding_daemon(daemon).await;
@@ -298,47 +286,22 @@ async fn equal_configuration_keeps_the_daemons_full_embedder_set() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn daemon_treats_an_undeclared_explicit_model_as_unknown() {
-    let (_dir, daemon, runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
+async fn explicit_model_request_cannot_override_peer_config_mismatch() {
+    let (_dir, daemon, _runtime, _server, socket) = start_embedding_daemon(&[EXTRA_MODEL]).await;
     let client_id = crate::server::compute_config_id(&embedding_runtime_config(&[]), None);
     let response = exchange(
         &socket,
         &embedding_request_frame(
             "memory.remember(content=\"outside the client model set\", memory_type=\"semantic\", embedding_model=\"bge-small-en-v1.5\")",
-            client_id.clone(),
-        ),
-    )
-    .await;
-    assert!(response.ok, "MCP dispatch failed: {:?}", response.error);
-    let result: serde_json::Value =
-        serde_json::from_str(response.result.as_deref().expect("remember response"))
-            .expect("JSON response");
-    let entry = &result["results"][0];
-    assert_eq!(entry["ok"], false, "{result}");
-    assert!(
-        entry
-            .to_string()
-            .contains("unknown embedding model: bge-small-en-v1.5"),
-        "the explicit model must have the in-process unknown-model result: {entry}"
-    );
-    // A declared write through the same client lands one primary vector, so
-    // the counts below read the namespace this client's writes use.
-    let anchor = exchange(
-        &socket,
-        &embedding_request_frame(
-            "create(kind=\"observation\", content=\"declared model anchor\")",
             client_id,
         ),
     )
     .await;
-    let namespace = created_namespace(&anchor);
+    assert!(!response.ok && response.config_mismatch, "{response:?}");
+    assert!(response.result.is_none(), "no verb result may be produced");
     assert_eq!(
-        vector_count(&runtime, &namespace, &PRIMARY_MODEL.to_string()).await,
-        1
-    );
-    assert_eq!(
-        vector_count(&runtime, &namespace, &EXTRA_MODEL.to_string()).await,
-        0
+        response.error_detail.as_ref().unwrap()["domain_disposition"],
+        khive_runtime::DomainDisposition::NotCommitted.as_str()
     );
     stop_embedding_daemon(daemon).await;
 }
@@ -718,6 +681,13 @@ mod handover {
                 "protocol" => {
                     assert!(matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }))
                 }
+                // A read timeout after a full write is its own outcome and,
+                // like a malformed response, is never replayed: the peer
+                // asserts no second connection arrives.
+                "timeout" => assert!(
+                    matches!(outcome, ForwardOutcome::ResponseTimeout { .. }),
+                    "{outcome:?}"
+                ),
                 _ => assert!(matches!(outcome, ForwardOutcome::ParseFailure)),
             }
             assert_eq!(budget.remaining, 1);
@@ -1078,7 +1048,11 @@ fn disposition_legacy_and_lost_responses_are_unknown() {
     let legacy = map_response(frame_err(Some("legacy failure")), CFG, NS)
         .unwrap()
         .unwrap_err();
-    for error in [legacy, ambiguous_forward_error()] {
+    for error in [
+        legacy,
+        post_write_error(PostWriteFailure::ConnectionLost),
+        post_write_error(PostWriteFailure::ParseFailure),
+    ] {
         let detail = error.data.unwrap();
         assert_eq!(detail["domain_disposition"], "unknown");
         assert!(detail.get("domain_result").is_none());
@@ -1495,8 +1469,16 @@ fn fallback_total_sums_all_reason_counters() {
 // an `Illegitimate` reason bumps it if and only if strict mode is on; every
 // other reason/mode combination must never bump it.
 
+/// Run `f` with `KHIVE_DAEMON_STRICT` set as given and the socket and PID
+/// paths pointed into an empty directory, so an unset value reads "no
+/// rendezvous" whatever daemon the host running the tests has.
 fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     let prev = std::env::var("KHIVE_DAEMON_STRICT").ok();
+    let prev_socket = std::env::var_os("KHIVE_SOCKET");
+    let prev_pid = std::env::var_os("KHIVE_PID");
+    let rendezvous = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("KHIVE_SOCKET", rendezvous.path().join("khived.sock"));
+    std::env::set_var("KHIVE_PID", rendezvous.path().join("khived.pid"));
     match value {
         Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
         None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
@@ -1505,6 +1487,12 @@ fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     match prev {
         Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
         None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+    }
+    for (name, prev) in [("KHIVE_SOCKET", prev_socket), ("KHIVE_PID", prev_pid)] {
+        match prev {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
     }
     result
 }
@@ -3227,11 +3215,30 @@ async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
         response.served_config_id.as_deref(),
         Some(daemon_config_id.as_str())
     );
+
+    // The daemon's socket is on disk, so a client that leaves
+    // KHIVE_DAEMON_STRICT unset is strict and is refused with the reason.
+    let copy = serde_json::from_value::<DaemonResponseFrame>(
+        serde_json::to_value(&response).expect("serialize response"),
+    )
+    .expect("copy response");
+    std::env::remove_var("KHIVE_DAEMON_STRICT");
+    match map_response(copy, &revoked_config_id, "test") {
+        Some(Err(error)) => {
+            let data = error.data.expect("strict rejection carries data");
+            assert_eq!(data["reason"], "config_mismatch", "{data}");
+            assert_eq!(data[STRICT_FALLBACK_MARKER], true, "{data}");
+        }
+        other => panic!("strict-by-default clients must refuse the mismatch, got {other:?}"),
+    }
+
+    std::env::set_var("KHIVE_DAEMON_STRICT", "0");
     assert!(
         map_response(response, &revoked_config_id, "test").is_none(),
         "non-strict clients must take the established config-mismatch fallback path"
     );
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+    std::env::remove_var("KHIVE_DAEMON_STRICT");
+    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 2);
 
     handle.abort();
     let _ = handle.await;
@@ -4235,7 +4242,7 @@ async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
 #[tokio::test]
 #[serial]
 #[serial_test::serial(config_ledger)]
-async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure() {
+async fn try_forward_inner_read_timeout_after_full_write_returns_response_timeout() {
     if crate::test_isolation::rerun_with_private_home() {
         return;
     }
@@ -4301,10 +4308,16 @@ async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure()
         .expect("try_forward_inner must return within the ceiling plus margin");
     let elapsed = started.elapsed();
 
+    let ForwardOutcome::ResponseTimeout { elapsed_ms } = outcome else {
+        panic!(
+            "a read timeout after a completed write must be ResponseTimeout (terminal \
+             ambiguity, reason daemon_slow); got a different variant: {outcome:?}"
+        );
+    };
     assert!(
-        matches!(outcome, ForwardOutcome::ParseFailure),
-        "a read timeout after a completed write must stay ParseFailure (terminal \
-             ambiguity) — got a different variant: {outcome:?}"
+        elapsed_ms > 0 && u128::from(elapsed_ms) <= elapsed.as_millis(),
+        "elapsed_ms must be the response wait, bounded by the call's own wall time: \
+         elapsed_ms {elapsed_ms}, call {elapsed:?}"
     );
     assert!(
         elapsed < elapsed_limit,
@@ -4535,7 +4548,8 @@ async fn recovery_requires_incumbent_exit_before_spawning() {
         | Err(
             RecoveryError::Spawn(_)
             | RecoveryError::RequestExpired
-            | RecoveryError::PidFileDirectoryUntrusted(_),
+            | RecoveryError::PidFileDirectoryUntrusted(_)
+            | RecoveryError::SupervisedDaemonUnresponsive { .. },
         ) => None,
     };
     let live_pid_file_preserved = pid_file.exists();

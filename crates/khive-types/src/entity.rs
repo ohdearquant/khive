@@ -167,12 +167,19 @@ pub struct Link {
     pub deleted_at: Option<Timestamp>,
 }
 
+/// Return whether an edge weight is finite and within `[0.0, 1.0]`.
+///
+/// Both endpoints and signed zero are accepted; NaN and infinities are rejected.
+pub fn validate_edge_weight(weight: f64) -> bool {
+    weight.is_finite() && (0.0..=1.0).contains(&weight)
+}
+
 impl Link {
     /// Return `true` if all numeric fields carry finite, domain-valid values.
     ///
     /// - `weight` must be finite and in `[0.0, 1.0]`.
     pub fn is_valid(&self) -> bool {
-        self.weight.is_finite() && self.weight >= 0.0 && self.weight <= 1.0
+        validate_edge_weight(self.weight)
     }
 }
 
@@ -289,6 +296,22 @@ mod tests {
     use crate::{Namespace, Timestamp};
     #[cfg(feature = "serde")]
     use alloc::string::ToString;
+
+    #[test]
+    fn edge_weight_validation_covers_numeric_boundaries() {
+        for weight in [-0.0, 0.0, f64::from_bits(1), 0.5, 1.0] {
+            assert!(crate::validate_edge_weight(weight), "{weight:?}");
+        }
+        for weight in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -f64::from_bits(1),
+            1.0 + f64::EPSILON,
+        ] {
+            assert!(!crate::validate_edge_weight(weight), "{weight:?}");
+        }
+    }
 
     #[test]
     fn entity_with_properties() {

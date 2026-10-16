@@ -118,8 +118,8 @@ fn wal_constructor_child() {
         assert!(!path.exists());
     } else if raw.as_deref() == Some("abc") {
         assert!(
-            matches!(result, Err(RuntimeError::Sqlite(SqliteError::InvalidConfig(ref message)))
-                if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES")),
+            matches!(result, Err(RuntimeError::Storage(khive_storage::StorageError::Driver { ref source, .. }))
+                if matches!(source.downcast_ref(), Some(SqliteError::InvalidConfig(message)) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))),
             "INVALID_CAPTURED_WAL_ENV: malformed captured environment must be a typed refusal"
         );
         if !readonly {
@@ -129,10 +129,8 @@ fn wal_constructor_child() {
         assert!(
             matches!(
                 result,
-                Err(RuntimeError::Sqlite(SqliteError::WalCapacityUnavailable {
-                    bytes: 8192,
-                    ..
-                }))
+                Err(RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. }))
+                    if matches!(source.downcast_ref(), Some(SqliteError::WalCapacityUnavailable { bytes: 8192, .. }))
             ),
             "FILE_WAL_CAPACITY_REFUSAL: an enabled file policy must reach the real pool refusal"
         );

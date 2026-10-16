@@ -43,7 +43,7 @@ Episodic memories default to salience `0.3` and decay factor `0.02` (about 35 da
 
 `validate()` requires positive limits and multipliers and rejects inconsistent options. `effective_gather_limit(candidate_limit)` uses an explicit gather limit or saturating multiplication by the multiplier. `to_search_options(candidate_limit)` returns the storage-layer options.
 
-Selection rules are original order, lowest document frequency, and highest IDF. Gather modes mirror the database ranked and rank-within-cap modes.
+Selection rules are original order, lowest document frequency, and highest IDF. The gather mode is the storage layer's `TextGatherMode` (ranked, unranked, rank-within-cap); `RecallFtsGatherMode` re-exports it.
 
 ## `BrainProfileHint`
 

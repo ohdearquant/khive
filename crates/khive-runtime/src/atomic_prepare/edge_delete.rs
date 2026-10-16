@@ -68,7 +68,7 @@ pub(super) async fn prepare_update_edge(
         changed_fields.push("relation");
     }
     if let Some(w) = weight {
-        if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+        if !khive_types::validate_edge_weight(w) {
             return Err(RuntimeError::InvalidInput(format!(
                 "edge weight must be a finite value in [0.0, 1.0]; got {w}"
             )));

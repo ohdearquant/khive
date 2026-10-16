@@ -14,7 +14,12 @@ The operation's fields are private so this constructor is the only in-memory con
 
 `EntityPatch` can change name, nullable description, nullable `entity_type`, properties, and tags. `NotePatch` can change content, nullable salience/decay factor, properties, and tags. `EdgePatch` can change relation and weight.
 
-An edge patch weight, when present, must be finite and within `[0.0, 1.0]`; custom deserialization enforces the same constraint as link creation and the live edge model.
+An edge patch weight, when present, must be finite and within `[0.0, 1.0]`.
+Both custom deserialization and `UpdateOp::new` enforce this constraint, including
+when a Rust caller constructs the public `EdgePatch` fields directly. The
+constructor checks substrate, field presence and captured values before the new
+weight; deserialization validates the patch as it reads it. Valid boundary values
+and an omitted weight preserve their existing NDJSON representation.
 
 ## `UpdatePreimage`
 

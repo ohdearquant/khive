@@ -389,7 +389,7 @@ impl Fts5TextSearch {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -1138,10 +1138,13 @@ impl TextSearch for Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task("fts_upsert")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    upsert_document_dml(conn, &table2, &document)
-                        .map_err(|e| map_err(e, "fts_upsert"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        upsert_document_dml(conn, &table2, &document)
+                            .map_err(|e| map_err(e, "fts_upsert"))
+                    },
+                    "fts_upsert",
+                )
                 .await;
         }
 
@@ -1169,10 +1172,13 @@ impl TextSearch for Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task("fts_upsert_batch")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_documents_dml(conn, &table2, &documents, attempted)
-                        .map_err(|e| map_err(e, "fts_upsert_batch"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_upsert_documents_dml(conn, &table2, &documents, attempted)
+                            .map_err(|e| map_err(e, "fts_upsert_batch"))
+                    },
+                    "fts_upsert_batch",
+                )
                 .await;
         }
 
@@ -1213,10 +1219,13 @@ impl TextSearch for Fts5TextSearch {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    delete_document_dml(conn, &table2, &namespace2, subject_id)
-                        .map_err(|e| map_sqlite_err(e, "fts_delete"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        delete_document_dml(conn, &table2, &namespace2, subject_id)
+                            .map_err(|e| map_sqlite_err(e, "fts_delete"))
+                    },
+                    "fts_delete",
+                )
                 .await;
         }
 
@@ -1871,10 +1880,13 @@ impl Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task("fts_rename_namespace")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
-                        .map_err(|e| map_err(e, "fts_rename_namespace"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
+                            .map_err(|e| map_err(e, "fts_rename_namespace"))
+                    },
+                    "fts_rename_namespace",
+                )
                 .await;
         }
 

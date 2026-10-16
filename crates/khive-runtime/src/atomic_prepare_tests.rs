@@ -1042,15 +1042,18 @@ async fn note_vectors_embed_false_purge_clears_provenance_across_models() {
     async fn provenance_count(runtime: &KhiveRuntime, subject_id: Uuid, model: &str) -> i64 {
         let mut reader = runtime.sql().reader().await.expect("sql reader");
         let count = reader
-            .query_scalar(crate::note_write::statement(
-                "SELECT COUNT(*) FROM vector_provenance \
+            .query_scalar(
+                khive_storage::SqlStatement::new(
+                    "SELECT COUNT(*) FROM vector_provenance \
                      WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
-                vec![
-                    SqlValue::Text(crate::config::sanitize_key(model)),
-                    SqlValue::Text("local".into()),
-                    SqlValue::Text(subject_id.to_string()),
-                ],
-            ))
+                    vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(subject_id.to_string()),
+                    ],
+                )
+                .labelled("note-write-guard"),
+            )
             .await
             .expect("read physical provenance row count");
         let Some(SqlValue::Integer(count)) = count else {
@@ -1062,15 +1065,18 @@ async fn note_vectors_embed_false_purge_clears_provenance_across_models() {
     async fn ann_delete_count(runtime: &KhiveRuntime, subject_id: Uuid, model: &str) -> i64 {
         let mut reader = runtime.sql().reader().await.expect("sql reader");
         let count = reader
-            .query_scalar(crate::note_write::statement(
-                "SELECT COUNT(*) FROM ann_write_log \
+            .query_scalar(
+                khive_storage::SqlStatement::new(
+                    "SELECT COUNT(*) FROM ann_write_log \
                      WHERE namespace=?1 AND embedding_model=?2 AND subject_id=?3 AND op='delete'",
-                vec![
-                    SqlValue::Text("local".into()),
-                    SqlValue::Text(model.into()),
-                    SqlValue::Text(subject_id.to_string()),
-                ],
-            ))
+                    vec![
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(model.into()),
+                        SqlValue::Text(subject_id.to_string()),
+                    ],
+                )
+                .labelled("note-write-guard"),
+            )
             .await
             .expect("read ANN delete log");
         let Some(SqlValue::Integer(count)) = count else {

@@ -29,12 +29,39 @@ Bulk and singleton links use the same key builder so equivalent entries collide.
 
 ## Relation and endpoint canonicalization
 
-Relation keys are lowercased, hyphens become underscores, and other non-ASCII-alphanumeric/non-underscore characters are removed. The aliases `competeswith` and `composedwith` normalize to their underscored forms.
+Known relations use `khive_types::EdgeRelation` to canonicalize accepted spellings and symmetric endpoints. Case-insensitive names, hyphenated names and supported squashed aliases therefore share the stored snake_case key.
 
-The local symmetric set is deliberately conservative: only `competes_with` and `composed_with`. For those relations, endpoints are lexicographically ordered so `A→B` and `B→A` yield one key. Directional relations retain endpoint order. Keeping this small table local avoids making `khive-request` depend on the full domain-type registry.
+Unknown relation strings still contribute a key: their original spelling and endpoint order are retained. Relation validation remains the handler's responsibility. The key builder uses the existing `khive-types` dependency and has no local relation table.
 
 ## Batch preflight boundary
 
-Sequential chains may repeat a key because execution order is defined. Parallel conflict detection records the first tool claiming each key and reports the second as `DslError::WriteKeyConflict`.
+Sequential chains may repeat a key because execution order is defined. The test-only batch checker records the first tool claiming each key and reports the second as `DslError::WriteKeyConflict`. Production uses the public key extractor and participant helpers below to retain per-entry refusals without changing parser admission.
 
-The batch-scanning helper is currently test-only; the production integration surface is the public per-op extractor. This distinction keeps parser output transport-agnostic while allowing an execution layer to choose envelope or whole-batch conflict policy.
+## Conflict participants
+
+`write_key_conflict_ops` returns one sorted, unique index list per operation in a
+flat batch. Each list contains every operation sharing one of that operation's
+conflicting keys, including the operation itself. For example, operations 0 and 2
+claiming the same key both report `[0, 2]`. The union is direct: keys A, A+B, B
+produce `[0, 1]`, `[0, 1, 2]`, `[1, 2]`, not a transitive group for every entry.
+Existing flat admission also refuses a key repeated inside a single operation;
+its unique diagnostic is `[i]`.
+
+`unit_write_key_conflict_ops` uses the parser's unit ranges for a parallel batch
+of chains. A key must occur in different units to conflict; once it does, every
+leaf claiming it participates, including repeated claims inside one unit. All
+indexes refer to the flattened request, never positions local to a chain.
+
+MCP adds `conflict_ops` to entries refused by this preflight. An innocent leaf
+aborted with a conflicting unit reports `[]`; directly conflicting leaves retain
+their participant lists even when their existing entry is marked `aborted`.
+Failure/abort positions, messages and `not_committed` dispositions are unchanged.
+Unrelated results and ordinary chain failures omit the field. Ordered top-level
+chains and transactional atomic execution do not acquire parallel admission.
+The local ops-file serial scheduler still uses flat batch admission; its indexes
+are relative to the dispatched chunk, unlike its separate global `op_index`.
+
+`DslError::WriteKeyConflict` carries the sorted owners of its reported key and
+keeps its existing display message. Its batch-scanning constructor remains
+test-only: parsing does not reject a whole request because of a conflict. MCP
+preserves this typed field when converting such an error to structured data.

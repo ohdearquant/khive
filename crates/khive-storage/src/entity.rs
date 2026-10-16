@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::attachment::Attachment;
 use crate::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, StorageResult,
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlValue, StorageResult,
 };
 
 /// Storage-level entity record. Flat SQL-friendly representation.
@@ -54,8 +54,21 @@ impl Entity {
         name: impl Into<String>,
     ) -> Self {
         let now = chrono::Utc::now().timestamp_micros();
+        Self::minimal(Uuid::new_v4(), namespace, kind, name, now, now)
+    }
+
+    /// Create an entity with supplied identity and microsecond timestamps.
+    /// Optional payload, revision, and tombstone fields use the same defaults as `new`.
+    pub fn minimal(
+        id: Uuid,
+        namespace: impl Into<String>,
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id,
             namespace: namespace.into(),
             kind: kind.into(),
             entity_type: None,
@@ -63,8 +76,8 @@ impl Entity {
             description: None,
             properties: None,
             tags: Vec::new(),
-            created_at: now,
-            updated_at: now,
+            created_at,
+            updated_at,
             version: 1,
             deleted_at: None,
             merged_into: None,
@@ -98,11 +111,33 @@ impl Entity {
     }
 }
 
+/// Entity liveness selected by an [`EntityFilter`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityTombstones {
+    /// Only rows without a deletion timestamp.
+    #[default]
+    Live,
+    /// Both live and tombstoned rows.
+    All,
+    /// Only rows with a deletion timestamp.
+    Only,
+}
+
 /// Entity filter for query operations.
+///
+/// New fields deserialize to defaults for older serialized filters. Complete
+/// external Rust struct literals must specify them or use `..Default::default()`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EntityFilter {
     pub ids: Vec<Uuid>,
     pub kinds: Vec<String>,
+    /// ANDed SQL JSON equalities; see [`EntityFilter::property_eq`].
+    #[serde(default)]
+    pub property_equalities: Vec<(String, SqlValue)>,
+    /// Live-only by default. Liveness builders replace this selection.
+    #[serde(default)]
+    pub tombstones: EntityTombstones,
     /// Filter by exact `entity_type` value. Multiple values are ORed.
     pub entity_types: Vec<String>,
     /// Kind-qualified accepted subtype spellings. Groups are ORed; each group
@@ -142,6 +177,32 @@ pub struct EntityFilter {
     /// instead of issuing a separate count.
     #[serde(default)]
     pub names_ci: Vec<String>,
+}
+
+impl EntityFilter {
+    /// Require SQL `json_extract(properties, path) = value` equality.
+    ///
+    /// Paths must be `$.field[.subfield]` with nonempty ASCII alphanumeric or
+    /// underscore segments; queries reject other paths. Calls are ANDed.
+    /// SQL NULL matches neither a missing field nor explicit JSON null.
+    /// JSON booleans compare as 0/1, including numeric coercion. JSON objects
+    /// and arrays compare their serialized SQL text, not structural JSON equality.
+    pub fn property_eq(mut self, path: impl Into<String>, value: SqlValue) -> Self {
+        self.property_equalities.push((path.into(), value));
+        self
+    }
+
+    /// Include live and tombstoned rows, replacing a previous liveness choice.
+    pub fn include_tombstones(mut self) -> Self {
+        self.tombstones = EntityTombstones::All;
+        self
+    }
+
+    /// Include only tombstoned rows, replacing a previous liveness choice.
+    pub fn tombstoned_only(mut self) -> Self {
+        self.tombstones = EntityTombstones::Only;
+        self
+    }
 }
 
 /// Exact nullable stored entity types and their live row counts.

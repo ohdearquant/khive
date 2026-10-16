@@ -4,8 +4,10 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use khive_types::NotePropertyPolicySpec;
 use serde_json::Value;
 
+use crate::context::ContextContributor;
 use crate::error::RuntimeError;
 use crate::operations::{LinkSpec, Resolved};
 use crate::runtime::NamespaceToken;
@@ -17,8 +19,8 @@ use super::request_identity::extract_table_names;
 use super::VerbPresentationPolicy;
 use super::{
     EdgeEndpointRule, EntityTypeDef, HandlerDef, KindHook, NoteEmbeddingPolicySpec, NoteKindSpec,
-    PackByIdResolver, PackColumnAddition, SchemaPlan, VerbCategory, VerbRegistry, Visibility,
-    GENERIC_CRUD_PACK,
+    PackByIdResolver, PackColumnAddition, PackRuntime, SchemaPlan, VerbCategory, VerbRegistry,
+    Visibility, GENERIC_CRUD_PACK,
 };
 
 impl VerbRegistry {
@@ -192,7 +194,19 @@ impl VerbRegistry {
     /// guaranteed-failed `dispatch` (and its audit write) when an optional
     /// pack is absent can probe first and skip the call entirely.
     pub fn has_verb(&self, verb: &str) -> bool {
-        self.handler_by_name.contains_key(verb)
+        self.handler_by_name.contains_key(verb) && !self.is_verb_disabled(verb)
+    }
+
+    /// Whether operator policy disables this registered public handler.
+    pub fn is_verb_disabled(&self, verb: &str) -> bool {
+        self.disabled_verbs.contains(verb)
+    }
+
+    pub(crate) fn unknown_verb_error(&self, verb: &str) -> RuntimeError {
+        RuntimeError::UnknownVerb(format!(
+            "unknown verb {verb:?}; available: {}",
+            self.available_verbs.join(", ")
+        ))
     }
 
     /// Advisory metadata for synchronous planning and MCP initialization.
@@ -243,14 +257,13 @@ impl VerbRegistry {
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
-    /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
+    /// Disabled verbs and subhandlers (`Visibility::Subhandler`) are excluded — subhandlers are internal
     /// pipeline steps not surfaced on the MCP wire. Returned with `'static`
     /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
+        self.registered_handlers()
+            .map(|(_, handler)| handler)
+            .filter(|handler| self.is_enabled_verb(handler))
             .collect()
     }
 
@@ -261,34 +274,53 @@ impl VerbRegistry {
     /// Use `all_handlers_with_names` when internal handlers must
     /// also be enumerated (e.g. runtime introspection).
     pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
-            .filter(|(_, h)| matches!(h.visibility, Visibility::Verb))
+        self.registered_handlers()
+            .map(|(pack, handler)| (pack.name(), handler))
+            .filter(|(_, handler)| self.is_enabled_verb(handler))
             .collect()
     }
 
-    /// All handler definitions across all registered packs, including subhandlers.
+    /// All handler definitions across all registered packs, including disabled verbs and subhandlers.
     ///
     /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
     /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
     /// the complete handler surface.
     pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.registered_handlers()
+            .map(|(pack, handler)| (pack.name(), handler))
+            .collect()
+    }
+
+    fn registered_handlers(
+        &self,
+    ) -> impl Iterator<Item = (&dyn PackRuntime, &'static HandlerDef)> + '_ {
+        self.packs.iter().flat_map(|pack| {
+            let pack = pack.as_ref();
+            pack.handlers().iter().map(move |handler| (pack, handler))
+        })
+    }
+
+    fn is_enabled_verb(&self, handler: &HandlerDef) -> bool {
+        matches!(handler.visibility, Visibility::Verb) && !self.is_verb_disabled(handler.name)
+    }
+
+    /// Collect declared kinds once, retaining their first-seen registration order.
+    fn collect_pack_kinds(
+        &self,
+        select: impl Fn(&dyn PackRuntime) -> &'static [&'static str],
+    ) -> Vec<&'static str> {
+        let mut seen = std::collections::HashSet::new();
         self.packs
             .iter()
-            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
+            .flat_map(|pack| select(pack.as_ref()).iter().copied())
+            .filter(|kind| seen.insert(*kind))
             .collect()
     }
 
     /// Merged set of note kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_note_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.note_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.note_kinds())
     }
 
     /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
@@ -321,23 +353,13 @@ impl VerbRegistry {
     /// Merged set of entity kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_entity_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.entity_kinds().iter().copied())
-            .filter(|k| seen.insert(*k))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.entity_kinds())
     }
 
     /// Merged set of brain profile consumer kinds requested by registered
     /// packs (deduplicated, first-seen order preserved).
     pub fn all_brain_consumer_kinds(&self) -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        self.packs
-            .iter()
-            .flat_map(|p| p.brain_consumer_kinds().iter().copied())
-            .filter(|kind| seen.insert(*kind))
-            .collect()
+        self.collect_pack_kinds(|pack| pack.brain_consumer_kinds())
     }
 
     /// Names of packs in topological load order.
@@ -348,20 +370,20 @@ impl VerbRegistry {
     /// Borrow a registered pack's shared host state without reconstructing
     /// that pack. Missing packs, absent state, and type mismatches return None.
     pub fn pack_host_state<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
-        self.packs
-            .iter()
-            .find(|pack| pack.name() == name)?
-            .host_state()?
-            .downcast::<T>()
-            .ok()
+        self.find_pack(name)?.host_state()?.downcast::<T>().ok()
+    }
+
+    /// Factory-reported version for a registered pack.
+    ///
+    /// Returns `None` for unknown packs and packs registered directly without
+    /// a factory; their package version is not available to the registry.
+    pub fn pack_version(&self, name: &str) -> Option<&'static str> {
+        self.pack_versions.get(name).copied()
     }
 
     /// Declared dependencies for a registered pack.
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.requires())
+        self.find_pack(name).map(|pack| pack.requires())
     }
 
     /// Note kinds owned by a specific registered pack.
@@ -369,10 +391,7 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. The slice is
     /// the pack's `NOTE_KINDS` constant — `'static` lifetime, no allocation.
     pub fn pack_note_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.note_kinds())
+        self.find_pack(name).map(|pack| pack.note_kinds())
     }
 
     /// Entity kinds owned by a specific registered pack.
@@ -380,10 +399,7 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. The slice is
     /// the pack's `ENTITY_KINDS` constant — `'static` lifetime, no allocation.
     pub fn pack_entity_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
-        self.packs
-            .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.entity_kinds())
+        self.find_pack(name).map(|pack| pack.entity_kinds())
     }
 
     /// Handlers declared by a specific registered pack.
@@ -391,10 +407,32 @@ impl VerbRegistry {
     /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
     /// carries name + description + visibility — sufficient for introspection clients.
     pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
+        self.find_pack(name).map(|pack| pack.handlers())
+    }
+
+    fn find_pack(&self, name: &str) -> Option<&dyn PackRuntime> {
         self.packs
             .iter()
-            .find(|p| p.name() == name)
-            .map(|p| p.handlers())
+            .find(|pack| pack.name() == name)
+            .map(|pack| pack.as_ref())
+    }
+
+    /// Collect pack items in registration order without filtering or deduplication.
+    fn collect_pack_items<T, I>(&self, select: impl Fn(&dyn PackRuntime) -> I) -> Vec<T>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.packs
+            .iter()
+            .flat_map(|pack| select(pack.as_ref()))
+            .collect()
+    }
+
+    /// Optional context sources in the registry's topological pack order.
+    ///
+    /// Omits packs returning `None`, without caching, deduplicating or invoking contributors.
+    pub fn context_contributors(&self) -> Vec<Arc<dyn ContextContributor>> {
+        self.collect_pack_items(|pack| pack.context_contributor())
     }
 
     /// All pack-declared edge endpoint rules across registered packs.
@@ -403,9 +441,22 @@ impl VerbRegistry {
     /// validation only checks membership, and an exact-duplicate rule is a
     /// harmless restatement.
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
-        self.packs
+        self.attributed_edge_rules
             .iter()
-            .flat_map(|p| p.edge_rules().iter().copied())
+            .map(|(_, rule)| *rule)
+            .collect()
+    }
+
+    /// Pack-declared endpoint rules paired with their owning pack names.
+    ///
+    /// Ownership is captured when the registry is built. Order and duplicate
+    /// declarations match [`Self::all_edge_rules`] exactly; built-in substrate
+    /// rules are excluded from both accessors. Names borrow the immutable
+    /// registry snapshot, so registry clones retain the same attribution.
+    pub fn all_edge_rules_with_packs(&self) -> Vec<(&str, EdgeEndpointRule)> {
+        self.attributed_edge_rules
+            .iter()
+            .map(|(pack, rule)| (pack.as_str(), *rule))
             .collect()
     }
 
@@ -416,28 +467,26 @@ impl VerbRegistry {
     /// Consumers compose this with `EntityTypeRegistry::builtin()` via
     /// `EntityTypeRegistry::with_extra` to get the boot-time composed registry.
     pub fn all_entity_types(&self) -> Vec<EntityTypeDef> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.entity_types().iter().cloned())
-            .collect()
+        self.collect_pack_items(|pack| pack.entity_types().iter().cloned())
     }
 
     /// Collect all `NoteKindSpec` declarations from every loaded pack.
     ///
     /// Used by the runtime for lifecycle introspection and future enforcement.
     pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.note_kind_specs().iter())
-            .collect()
+        self.collect_pack_items(|pack| pack.note_kind_specs().iter())
+    }
+
+    /// Copy the validated boot snapshot in topological pack/declaration order.
+    ///
+    /// This metadata-only accessor never calls packs or changes write enforcement.
+    pub fn all_note_property_policies(&self) -> Vec<NotePropertyPolicySpec> {
+        self.note_property_policies.as_ref().clone()
     }
 
     /// Collect pack-declared embedding policies for registered note kinds.
     pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
-        self.packs
-            .iter()
-            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
-            .collect()
+        self.collect_pack_items(|pack| pack.note_embedding_policies().iter().copied())
     }
 
     /// All pack-contributed validation rules across registered packs.
@@ -446,10 +495,7 @@ impl VerbRegistry {
     /// beyond the outer `Vec`. Rule IDs are namespaced by pack; callers can
     /// group by `rule.id.split_once('/')` to attribute rules to their packs.
     pub fn all_validation_rules(&self) -> Vec<&'static ValidationRule> {
-        self.packs
-            .iter()
-            .flat_map(|p| p.validation_rules().iter())
-            .collect()
+        self.collect_pack_items(|pack| pack.validation_rules().iter())
     }
 
     /// Pack-auxiliary schema plans for all registered packs.

@@ -11,6 +11,7 @@
 pub mod corpus;
 pub mod registry;
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -18,6 +19,51 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+/// Merge tail operations into candidates using the caller's score type and policy.
+///
+/// Empty operations leave the input unchanged. Each upsert is scored in input order;
+/// the first scoring error is returned. Upserts replace prior candidates and the last
+/// upsert for an id wins; a delete removes prior candidates but does not erase an upsert.
+/// Nonempty operations sort descending by partial score, breaking equal or incomparable
+/// scores by ascending id. Untouched duplicate candidates are retained.
+#[doc(hidden)]
+pub fn merge_fresh_tail<S, E>(
+    candidates: Vec<(Uuid, S)>,
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    mut score: impl FnMut(&[f32]) -> Result<S, E>,
+) -> Result<Vec<(Uuid, S)>, E>
+where
+    S: PartialOrd,
+{
+    if ops.is_empty() {
+        return Ok(candidates);
+    }
+    let mut deletes: HashSet<Uuid> = HashSet::new();
+    let mut upserts: HashMap<Uuid, S> = HashMap::new();
+    for (uuid, op) in ops {
+        match op {
+            None => {
+                deletes.insert(uuid);
+            }
+            Some(embedding) => {
+                upserts.insert(uuid, score(&embedding)?);
+            }
+        }
+    }
+    let mut merged: Vec<(Uuid, S)> = candidates
+        .into_iter()
+        .filter(|(uuid, _)| !deletes.contains(uuid) && !upserts.contains_key(uuid))
+        .collect();
+    merged.extend(upserts);
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(merged)
+}
 
 /// Name of the lock file taken inside a checkpoint directory.
 const CHECKPOINT_LOCK_FILE: &str = ".bridge-checkpoint.lock";
@@ -59,6 +105,50 @@ pub async fn acquire_checkpoint_lock_async(
     tokio::task::spawn_blocking(move || acquire_checkpoint_lock(&dir, prefix))
         .await
         .map_err(|error| format!("{prefix} lock task failed: {error}"))?
+}
+
+/// Claim a one-shot watcher synchronously and return its unpolled future.
+///
+/// The caller keeps backend selection and task spawning. The watcher retains only
+/// a weak ANN reference between ticks; `refresh` receives an owned handle for one
+/// tick and must not capture another strong handle to the ANN. Dropping the future
+/// does not reset `started`. Timing and cancellation follow [`rotation_watch_loop`].
+#[doc(hidden)]
+pub fn rotation_watch_future<T, F, Fut>(
+    ann: &std::sync::Arc<T>,
+    started: &std::sync::atomic::AtomicBool,
+    ann_root: PathBuf,
+    interval: Duration,
+    shutdown: CancellationToken,
+    mut refresh: F,
+) -> Option<impl Future<Output = ()> + Send + 'static>
+where
+    T: Send + Sync + 'static,
+    F: FnMut(std::sync::Arc<T>, PathBuf) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    if started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let ann = std::sync::Arc::downgrade(ann);
+    let tick = move || {
+        let ann = ann.upgrade();
+        let ann_root = ann_root.clone();
+        let refresh = ann.map(|ann| refresh(ann, ann_root));
+        async move {
+            let Some(refresh) = refresh else {
+                return ControlFlow::Break(());
+            };
+            refresh.await;
+            ControlFlow::Continue(())
+        }
+    };
+    Some(rotation_watch_loop(interval, shutdown, tick))
 }
 
 /// Call `tick` every `interval` until `shutdown` is cancelled or `tick` returns

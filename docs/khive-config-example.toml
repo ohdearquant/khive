@@ -161,10 +161,9 @@ fleet_readers = []
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 #
-# The [[engines]] array registers the embedding models available at runtime.
-# When [[engines]] entries are present they are authoritative: each engine's
-# `model` sets the embedding model used for entity indexing and retrieval. When
-# no [[engines]] block is configured — whether or not a config file is loaded —
+# The [[engines]] array declares peers in participation order. Built-in aliases
+# resolve to their canonical provider and existing index names. When
+# no engine list is configured — whether or not a config file is loaded —
 # khive falls back to the legacy two-tier env pair (KHIVE_EMBEDDING_MODEL +
 # KHIVE_ADDITIONAL_EMBEDDING_MODELS; see the env reference at the end), and to
 # the built-in default models when those env vars are unset.
@@ -174,42 +173,35 @@ fleet_readers = []
 # block is configured, no warning is logged — the env vars (or built-in
 # defaults) simply apply, as described above.
 
-# Exactly one [[engines]] entry must set `default = true`.
-# That engine becomes the primary embedding model used for entity indexing
-# and single-model retrieval paths.
+# The first peer is used by single-engine compatibility APIs. An explicit
+# top-level engines = [] disables vector participation; omission keeps fallback.
+# Custom names parse, but startup binding to host providers is not available yet.
 
 [[engines]]
-name = "default"
-model = "all-minilm-l6-v2"
-default = true
-# fusion_weight is reserved for future per-engine fusion. Setting it currently
-# fails config load because retrieval would otherwise ignore the value.
-# dims is optional — for documentation only. The actual dimension is derived
-# from the model via EmbeddingModel::dimensions(). A mismatch produces a
-# warning, not an error.
-# dims = 384
+name = "all-minilm-l6-v2"
+weight = 1.0
+# Optional positive dimensionality assertion; mismatch fails startup.
+dims = 384
 
 [[engines]]
-name = "paraphrase"
-model = "paraphrase-multilingual-minilm-l12-v2"
+name = "paraphrase-multilingual-minilm-l12-v2"
 # dims = 384
 
 # Additional examples (uncomment to activate):
 
 # [[engines]]
-# name = "bge-small"
-# model = "bge-small-en-v1.5"
+# name = "bge-small-en-v1.5"
 
 # [[engines]]
-# name = "bge-base"
-# model = "bge-base-en-v1.5"
+# name = "bge-base-en-v1.5"
 
-# ── Notes on fusion_weight ─────────────────────────────────────────────────────
+# ── Weights and legacy input ───────────────────────────────────────────────────
 #
-# ADR-031 specifies per-engine weighted RRF as a future integration target.
-# Current RuntimeConfig retains only engine models, and retrieval does not read
-# EngineConfig.fusion_weight. KhiveConfig::load rejects any explicit value so
-# an operator cannot mistake a validated but ignored setting for active tuning.
+# Weight defaults to 1.0 and must be finite and strictly positive. Values other
+# than 1.0 remain refused until every activated retrieval path applies them.
+# Legacy model/default/fusion_weight lists migrate as a whole: the single old
+# default moves first, canonical model identities replace decorative names,
+# and remaining order is retained. Mixed legacy/canonical entries are errors.
 
 # ── [[backends]] — named storage backends (ADR-028) ──────────────────────────────
 #
@@ -250,6 +242,14 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 # rows get FTS + metadata only (no vec_* rows, no ANN). Writes the pack routes
 # through core() still embed with the main runtime's embedders. Flipping the
 # flag changes the config_id (daemon restart required).
+
+# Optional `verbs_disabled` hides registered public handlers from the capability
+# catalog and refuses their dispatch. Names must belong to this loaded pack;
+# unknown, foreign, unloaded-pack, and internal-handler names refuse boot.
+# Operator introspection still lists all handlers. This policy changes config_id.
+# A policy-only entry may omit backend (defaults to "main"):
+# [packs.memory]
+# verbs_disabled = ["memory.remember", "memory.prune"]
 
 # [packs.knowledge]
 # backend = "knowledge"
@@ -303,7 +303,7 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #                                line" inbox. Default: off. Only the literal "1" enables it.
 #
 # ── Session transcript mirror (pack `session`, ADR-080) ──────────────────────────
-#   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes.
+#   KHIVE_MIRROR_ENABLED=false   Enable the Claude Code (*.jsonl) transcript mirror. true = 1/true/yes/on.
 #   KHIVE_MIRROR_PROJECTS_DIR=~/.claude/projects   Root scanned for Claude Code transcripts.
 #   KHIVE_MIRROR_CODEX_ENABLED=false   Enable the Codex CLI mirror (independent of the above).
 #   KHIVE_MIRROR_CODEX_DIR=~/.codex/sessions   Root scanned for Codex transcripts.
@@ -331,6 +331,23 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.
+#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the four variables
+#   below are read only when it is set and are ignored while it is unset.
+#   KHIVE_EMAIL_EXTERNAL_SENDERS=lambda:example
+#                                Comma-separated actor ids allowed to send to external recipients.
+#   KHIVE_EMAIL_EXTERNAL_DAILY_CAP=200
+#                                Required with EXTERNAL_SENDERS. Positive integer; bounds fresh
+#                                external admissions in any trailing 24 hours.
+#   KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY=            Hex key material (>= 32 bytes). Secret.
+#                                Recipient-key secret; the key is HMAC-SHA256(addr) under it.
+#   KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS=0:<hex>,1:<hex>
+#                                Comma-separated id:key pairs (id 0-255, unique, key >= 32 bytes
+#                                hex). Highest id mints tokens; retired ids keep verifying. Secret.
+#   KHIVE_EMAIL_EXTERNAL_FOOTER_FILE=/etc/khive/footer.txt
+#                                Text file appended to every external message. Must be readable and
+#                                contain {unsubscribe}, replaced with the mailto opt-out sentence.
+#                                External admission is refused while it is unset, unreadable or
+#                                missing the placeholder.
 #   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
 #   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
 #   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.
@@ -379,6 +396,8 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   An unparseable numeric value here is treated as unset (falls back to the default).
 #   KHIVE_BUSY_TIMEOUT_SECS=30           SQLite busy_timeout per connection.
 #   KHIVE_CHECKOUT_TIMEOUT_SECS=5        Max wait to check out a pooled reader connection.
+#   KHIVE_READER_MAX_AGE_SECS=300        Close and replace a pooled reader older than this on return (0 = every return).
+#   KHIVE_READER_MAX_OPS=5000            Close and replace a pooled reader after more than this many checkouts (0 = every return).
 #   WAL autocheckpoint is not configurable: disabled where the dedicated checkpoint task runs
 #   (it owns routine passes), bounded at 4000 pages on pools without one.
 #   KHIVE_WAL_HIGH_WATER_PAGES=6000      WAL size that logs a high-pressure warning. Must be > 0.
@@ -396,6 +415,8 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_RECALL_FTS_GATHER_LIMIT=        Explicit row cap for rank_subset mode (> 0). Default: derived.
 #   KHIVE_RECALL_FTS_CJK_BYPASS=true      CJK queries bypass term-K selection. Accepts 1/true/0/false.
 #   KHIVE_RECALL_PROFILE=1                Emit per-stage recall timing JSON to stderr (presence = on).
+#   KHIVE_SEARCH_PROFILE=1                Emit per-stage timing JSON for searches that fan out across
+#                                        [[backends]] to stderr (presence = on; kkernel).
 #   ANN_OVERFETCH_MAX_ROUNDS=3           Max ANN over-fetch retry rounds when post-filtering drops
 #                                        candidates below the requested limit (un-prefixed; pack `memory`).
 #

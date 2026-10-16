@@ -7,6 +7,16 @@ set -euo pipefail
 # Usage:
 #   ./publish.sh          # preflight (default) — see scope below
 #   ./publish.sh --live   # actual publish
+#   NO_VERIFY=1 ./publish.sh --live
+#                         # actual publish with `cargo publish --no-verify` per
+#                         # crate, for a machine that only packages and uploads
+#                         # after `cargo publish --dry-run --locked --workspace`
+#                         # verified every crate at the same commit elsewhere
+#   KHIVE_PUBLISH_SEMVER_CHECKED_AT=<commit> ./publish.sh --live
+#                         # skip the SemVer gate on this machine because it
+#                         # already ran at exactly this commit elsewhere; the
+#                         # value must be HEAD's full sha and the tree clean,
+#                         # otherwise the gate runs as usual
 #
 # Preflight scope (default mode):
 #   `cargo package --list --allow-dirty` is run per crate, then
@@ -42,11 +52,16 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/publish_guard.sh
 source "$SCRIPT_DIR/lib/publish_guard.sh"
+VERIFY_MODE=$(publish_verify_mode "${NO_VERIFY-}")
+if $LIVE_MODE && [[ "$VERIFY_MODE" == no-verify ]]; then
+    echo "    NO_VERIFY=1: each crate is published with --no-verify (no verification build on this machine)"
+fi
 
 cd "$SCRIPT_DIR/../crates"
 
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
+    khive-lion-core      # copied kernel; no khive-* dependencies
     khive-types
     khive-score
     khive-quant
@@ -69,6 +84,8 @@ CRATES=(
     khive-runtime
     khive-vcs-adapters
     khive-changeset      # needs khive-types (above)
+    khive-rule-evaluator # pure rules; needs khive-types and khive-changeset (above), used by kkernel
+    khive-graph-diff     # needs khive-types (above); pure graph-state diff
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
@@ -89,14 +106,15 @@ CRATES=(
     khive-pack-knowledge
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
+    khive-pack-charter   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-template
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
     khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
-    khive-mounts         # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-mounts         # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-web       # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-mcp
-    khive-repo-showcase    # no khive-* dependencies; normal dep of kkernel, so publish first
+    khive-repo-showcase    # needs khive-types (above); normal dep of kkernel, so publish first
     kkernel
 )
 
@@ -136,48 +154,64 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # scripts/lib/semver_excludes.txt (#568), also consumed by release.yml so the two
 # gates cannot drift out of sync with each other.
 echo ""
-echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
-if ! command -v cargo-semver-checks >/dev/null 2>&1; then
-    echo "ERROR: cargo-semver-checks is required for the publish SemVer gate." >&2
-    echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
-    exit 1
+# The gate rebuilds every crate's rustdoc against its crates.io baseline. When it
+# already ran at this exact commit on another machine (the release dry run), the
+# publishing machine may skip it by naming that commit; see semver_gate_mode.
+PUBLISH_HEAD=$(git rev-parse --verify -q HEAD || true)
+PUBLISH_TREE=dirty
+if [[ -n "$PUBLISH_HEAD" ]] && PUBLISH_STATUS=$(git status --porcelain) && [[ -z "$PUBLISH_STATUS" ]]; then
+    PUBLISH_TREE=clean
 fi
-SEMVER_CHECKER_VERSION=$(cargo-semver-checks --version 2>&1)
-RUSTC_VERSION=$(rustc --version)
-if ! python3 "$SCRIPT_DIR/lib/semver_gate.py" check-version "$SEMVER_CHECKER_VERSION"; then
-    echo "       Upgrade with: cargo install cargo-semver-checks --locked --force" >&2
-    exit 1
+SEMVER_GATE_MODE=$(semver_gate_mode "${KHIVE_PUBLISH_SEMVER_CHECKED_AT-}" "$PUBLISH_HEAD" "$PUBLISH_TREE")
+if [[ "$SEMVER_GATE_MODE" == skip ]]; then
+    echo "--- SemVer gate skipped: it already ran at this commit ($PUBLISH_HEAD) on another machine (KHIVE_PUBLISH_SEMVER_CHECKED_AT) ---"
+else
+    if [[ -n "${KHIVE_PUBLISH_SEMVER_CHECKED_AT-}" ]]; then
+        echo "    KHIVE_PUBLISH_SEMVER_CHECKED_AT does not name a clean checkout of HEAD (${PUBLISH_HEAD:-no git HEAD}, tree $PUBLISH_TREE); running the SemVer gate"
+    fi
+    echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
+    if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+        echo "ERROR: cargo-semver-checks is required for the publish SemVer gate." >&2
+        echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
+        exit 1
+    fi
+    SEMVER_CHECKER_VERSION=$(cargo-semver-checks --version 2>&1)
+    RUSTC_VERSION=$(rustc --version)
+    if ! python3 "$SCRIPT_DIR/lib/semver_gate.py" check-version "$SEMVER_CHECKER_VERSION"; then
+        echo "       Upgrade with: cargo install cargo-semver-checks --locked --force" >&2
+        exit 1
+    fi
+    echo "    Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION"
+    SEMVER_EXCLUDE_ARGS=()
+    while IFS= read -r crate; do
+        [[ "$crate" =~ ^[[:space:]]*(#|$) ]] && continue
+        SEMVER_EXCLUDE_ARGS+=(--exclude "$crate")
+    done <"$SCRIPT_DIR/lib/semver_excludes.txt"
+    SEMVER_LOG=$(mktemp)
+    set +e
+    set -o pipefail
+    CARGO_TERM_COLOR=never cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}" 2>&1 | tee "$SEMVER_LOG"
+    SEMVER_STATUS=${PIPESTATUS[0]}
+    set +o pipefail
+    set -e
+    if ((SEMVER_STATUS != 0)); then
+        case "$SEMVER_STATUS" in
+            100)
+                echo "ERROR: SemVer API violations reported (checker exit 100)." >&2
+                ;;
+            101)
+                echo "ERROR: cargo-semver-checks could not complete (checker exit 101)." >&2
+                echo "       This is a checker/toolchain/build/network failure, not a clean API result." >&2
+                echo "       Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION" >&2
+                ;;
+            *)
+                echo "ERROR: cargo-semver-checks failed with unexpected exit $SEMVER_STATUS." >&2
+                ;;
+        esac
+        exit "$SEMVER_STATUS"
+    fi
+    python3 "$SCRIPT_DIR/lib/semver_gate.py" summarize "$SEMVER_LOG"
 fi
-echo "    Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION"
-SEMVER_EXCLUDE_ARGS=()
-while IFS= read -r crate; do
-    [[ "$crate" =~ ^[[:space:]]*(#|$) ]] && continue
-    SEMVER_EXCLUDE_ARGS+=(--exclude "$crate")
-done <"$SCRIPT_DIR/lib/semver_excludes.txt"
-SEMVER_LOG=$(mktemp)
-set +e
-set -o pipefail
-CARGO_TERM_COLOR=never cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}" 2>&1 | tee "$SEMVER_LOG"
-SEMVER_STATUS=${PIPESTATUS[0]}
-set +o pipefail
-set -e
-if ((SEMVER_STATUS != 0)); then
-    case "$SEMVER_STATUS" in
-        100)
-            echo "ERROR: SemVer API violations reported (checker exit 100)." >&2
-            ;;
-        101)
-            echo "ERROR: cargo-semver-checks could not complete (checker exit 101)." >&2
-            echo "       This is a checker/toolchain/build/network failure, not a clean API result." >&2
-            echo "       Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION" >&2
-            ;;
-        *)
-            echo "ERROR: cargo-semver-checks failed with unexpected exit $SEMVER_STATUS." >&2
-            ;;
-    esac
-    exit "$SEMVER_STATUS"
-fi
-python3 "$SCRIPT_DIR/lib/semver_gate.py" summarize "$SEMVER_LOG"
 
 for crate in "${CRATES[@]}"; do
     echo ""
@@ -196,7 +230,11 @@ for crate in "${CRATES[@]}"; do
     fi
 
     if $LIVE_MODE; then
-        cargo publish -p "$crate"
+        if [[ "$VERIFY_MODE" == no-verify ]]; then
+            cargo publish -p "$crate" --no-verify
+        else
+            cargo publish -p "$crate"
+        fi
         echo "    Waiting ${DELAY}s for crates.io index propagation..."
         sleep "$DELAY"
     else

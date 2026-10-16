@@ -4,12 +4,14 @@ pub(crate) mod matching;
 pub(crate) mod schema;
 pub(crate) mod scoring;
 pub(crate) mod section_feedback;
+pub(crate) mod snapshot_invalidation;
 pub(crate) mod vamana;
 
 mod atom_validation;
 mod compose;
 mod crud;
 mod eval;
+mod export;
 mod fold_handler;
 pub(crate) mod index_handler;
 mod lexical_timeout;

@@ -76,6 +76,7 @@ fn assert_unknown(error: StorageError) {
         error,
         StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
+            ..
         }
     ));
 }

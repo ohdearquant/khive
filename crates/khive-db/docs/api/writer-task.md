@@ -69,8 +69,10 @@ checkpoint/VACUUM distinction.
 Volume-lease acquisition uses `disk_guard_deadline_ms` (backend override, then
 `KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms; valid range 100–10,000 ms).
 It does not reuse the queue-only `write_admission_deadline_ms` governed by
-ADR-131. `CapacityUnavailable` identifies `identity`, `lock` and `probe` failures;
-like `CapacityFloor`, it is not automatically retryable. Same-thread nesting
+ADR-131. `CapacityUnavailable` identifies `identity`, `lock`, `lock_contended` and
+`probe` phases. Only `lock_contended`, a lease wait that reached its deadline,
+is retryable within the caller's bounded retry budget. `CapacityFloor` and the
+other unavailable phases remain non-retryable. Same-thread nesting
 returns `VolumeLeaseReentry` immediately with both call sites instead of waiting
 as ordinary contention. A manual atomic unit's lease is detached from the thread
 that took it, so a later request from that thread waits as ordinary contention.
@@ -84,6 +86,15 @@ admission, so later writes are refused before starting (`WriterPoisoned`,
 projected as `NotStarted`). The task preserves its terminal reply and closes and
 fails the queued requests without restarting. A cleanup failure does not turn an
 unknown outcome into an ordinary capacity refusal.
+
+When native `SQLITE_FULL` automatically ends an admitted transaction, the
+shared finalizer retains its primary and extended codes on the terminal outcome.
+The request remains `SideEffectsUnknown`, the writer still retires, and caller
+projection reports `sqlite_disk_full` rather than a capacity refusal. The
+original operation or COMMIT error is escalated once before it is discarded;
+the retained code pair is not an error source, so the outer sink hook does not
+emit it again. Ordinary terminal failures carry no pair. COMMIT failures whose
+rollback succeeds keep their existing request-failed pool-error representation.
 
 The two migration bootstrap writes happen before a migration transaction exists:
 `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and

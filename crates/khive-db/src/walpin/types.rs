@@ -193,14 +193,7 @@ pub fn sidecar_dir_for(db_path: &Path) -> PathBuf {
 /// (on for file-backed, off for in-memory); `KHIVE_WALPIN_SIDECAR` overrides
 /// either way when it parses as a recognized boolean.
 pub fn sidecar_enabled(is_file_backed: bool) -> bool {
-    match std::env::var("KHIVE_WALPIN_SIDECAR") {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => is_file_backed,
-        },
-        Err(_) => is_file_backed,
-    }
+    crate::env::env_flag("KHIVE_WALPIN_SIDECAR", is_file_backed)
 }
 
 #[cfg(any(windows, test))]

@@ -5,6 +5,22 @@ use crate::error::QueryError;
 use crate::parsers;
 use crate::parsers::sparql::leading_keyword;
 
+pub(crate) const GQL_WRITE_KEYWORDS: &[&str] = &[
+    "CREATE", "DELETE", "DETACH", "SET", "REMOVE", "MERGE", "INSERT", "UPDATE",
+];
+pub(crate) const SPARQL_WRITE_KEYWORDS: &[&str] = &[
+    "INSERT", "DELETE", "WITH", "LOAD", "CLEAR", "CREATE", "DROP", "COPY", "MOVE", "ADD",
+];
+pub(crate) const DEFAULT_HOP_CAP: usize = 5;
+
+pub(crate) fn read_only_error(constructor: fn(String) -> QueryError) -> QueryError {
+    constructor(
+        "the query verb is read-only; \
+         to mutate the graph use: create, update, link, merge, delete"
+            .into(),
+    )
+}
+
 /// Which query language the input is written in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryLanguage {
@@ -59,108 +75,16 @@ pub fn parse_auto_with_language(input: &str) -> Result<(QueryLanguage, GqlQuery)
 
 /// Rejects GQL/Cypher mutations and SPARQL Update before dialect dispatch.
 fn reject_write(input: &str) -> Result<(), QueryError> {
-    match leading_keyword(input).as_str() {
-        "CREATE" | "DELETE" | "DETACH" | "SET" | "REMOVE" | "MERGE" | "INSERT" | "UPDATE"
-        | "WITH" | "LOAD" | "CLEAR" | "DROP" | "COPY" | "MOVE" | "ADD" => {
-            Err(QueryError::Unsupported(
-                "the query verb is read-only; \
-                 to mutate the graph use: create, update, link, merge, delete"
-                    .into(),
-            ))
-        }
-        _ => Ok(()),
+    let keyword = leading_keyword(input);
+    if GQL_WRITE_KEYWORDS.contains(&keyword.as_str())
+        || SPARQL_WRITE_KEYWORDS.contains(&keyword.as_str())
+    {
+        Err(read_only_error(QueryError::Unsupported))
+    } else {
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::error::QueryError;
-
-    #[test]
-    fn parse_auto_with_delete_rejected() {
-        let err = parse_auto("WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "WITH … DELETE must return Unsupported on the public path; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-        assert!(
-            msg.contains("create") && msg.contains("update") && msg.contains("delete"),
-            "error must name the mutation verbs; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_auto_prefixed_insert_data_rejected() {
-        let err = parse_auto("PREFIX ex: <http://e/> INSERT DATA { ex:a ex:b ex:c }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "prefixed INSERT DATA must return Unsupported on the public path; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_auto_prefixed_with_delete_rejected() {
-        let err = parse_auto(
-            "PREFIX ex: <http://e/> WITH <http://g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "PREFIX + WITH … DELETE must return Unsupported on the public path; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_auto_detach_delete_rejected() {
-        let err = parse_auto("DETACH DELETE (n)").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "DETACH DELETE must return Unsupported on the public path; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_auto_gql_match_not_rejected() {
-        let q = parse_auto("MATCH (a:concept) RETURN a").unwrap();
-        assert!(!q.pattern.elements.is_empty(), "valid GQL MATCH must parse");
-    }
-
-    #[test]
-    fn parse_auto_sparql_select_not_rejected() {
-        let q = parse_auto("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
-        assert!(
-            !q.pattern.elements.is_empty(),
-            "valid SPARQL SELECT must parse"
-        );
-    }
-
-    #[test]
-    fn parse_auto_with_language_reports_selected_parser() {
-        let (gql_language, _) = parse_auto_with_language("MATCH (a:concept) RETURN a").unwrap();
-        assert_eq!(gql_language, QueryLanguage::Gql);
-
-        let (sparql_language, _) =
-            parse_auto_with_language("SELECT ?a WHERE { ?a :extends ?b . }").unwrap();
-        assert_eq!(sparql_language, QueryLanguage::Sparql);
-    }
-
-    #[test]
-    fn parse_auto_load_rejected() {
-        let err = parse_auto("LOAD <http://e/data>").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "LOAD must return Unsupported on the public path; got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "got: {msg}");
-    }
-}
+#[path = "language_tests.rs"]
+mod tests;

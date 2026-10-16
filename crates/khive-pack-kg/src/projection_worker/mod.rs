@@ -2,8 +2,12 @@
 
 mod helpers;
 
+#[cfg(test)]
+#[path = "conditional_event_tests.rs"]
+mod conditional_event_tests;
+
 use crate::sql::sql;
-use helpers::build_conditional_event_insert;
+use helpers::build_conditional_event_inserts;
 
 use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
@@ -16,6 +20,19 @@ use uuid::Uuid;
 /// Worker that maintains the `proposals_open` projection table from proposal events.
 pub struct ProposalsProjectionWorker {
     runtime: KhiveRuntime,
+}
+
+/// Status change and approval/rejection counter deltas for one review decision.
+/// A comment retains the current status and changes neither counter.
+pub(crate) fn review_decision_effect(
+    decision: ProposalDecision,
+) -> (Option<&'static str>, i64, i64) {
+    match decision {
+        ProposalDecision::Approve => (Some("approved"), 1, 0),
+        ProposalDecision::Reject => (Some("rejected"), 0, 1),
+        ProposalDecision::Comment => (None, 0, 0),
+        ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
+    }
 }
 
 impl ProposalsProjectionWorker {
@@ -68,13 +85,8 @@ impl ProposalsProjectionWorker {
         let ns = token.namespace().as_str().to_owned();
         let proposal_id = Uuid::from_u128(payload.proposal_id.to_u128());
 
-        let (new_status_opt, approve_delta, reject_delta): (Option<&str>, i64, i64) =
-            match payload.decision {
-                ProposalDecision::Approve => (Some("approved"), 1, 0),
-                ProposalDecision::Reject => (Some("rejected"), 0, 1),
-                ProposalDecision::Comment => (None, 0, 0),
-                ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
-            };
+        let (new_status_opt, approve_delta, reject_delta) =
+            review_decision_effect(payload.decision);
 
         let last_decision_str = payload.decision.as_str();
 
@@ -145,23 +157,14 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<bool, RuntimeError> {
-        let now = chrono::Utc::now().timestamp_micros();
-        let ns = token.namespace().as_str().to_owned();
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let rows = writer
-            .execute(SqlStatement {
-                sql: sql!("proposals_mark_applying").to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("projection_worker.proposals_open.pre_apply_cas".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
-        Ok(rows == 1)
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_mark_applying"),
+            "projection_worker.proposals_open.pre_apply_cas",
+            |rows| rows == 1,
+        )
+        .await
     }
 
     /// Called after a `ProposalWithdrawn` event is emitted.
@@ -170,23 +173,14 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<bool, RuntimeError> {
-        let now = chrono::Utc::now().timestamp_micros();
-        let ns = token.namespace().as_str().to_owned();
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let rows = writer
-            .execute(SqlStatement {
-                sql: sql!("proposals_mark_withdrawn").to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("projection_worker.proposals_open.withdrawn".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
-        Ok(rows == 1)
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_mark_withdrawn"),
+            "projection_worker.proposals_open.withdrawn",
+            |rows| rows == 1,
+        )
+        .await
     }
 
     /// Revert status from `applying` back to `approved` on KG failure.
@@ -195,23 +189,43 @@ impl ProposalsProjectionWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
     ) -> Result<(), RuntimeError> {
+        self.execute_status_transition(
+            token,
+            proposal_id,
+            sql!("proposals_revert_to_approved"),
+            "projection_worker.proposals_open.revert_applying",
+            |_| (),
+        )
+        .await
+    }
+
+    /// Execute one existing status transition, preserving its caller-owned SQL guard.
+    /// Decode the affected count before releasing the writer, as the wrappers did.
+    async fn execute_status_transition<T>(
+        &self,
+        token: &NamespaceToken,
+        proposal_id: Uuid,
+        sql_text: &str,
+        label: &str,
+        finish: fn(u64) -> T,
+    ) -> Result<T, RuntimeError> {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        writer
+        let rows = writer
             .execute(SqlStatement {
-                sql: sql!("proposals_revert_to_approved").to_string(),
+                sql: sql_text.to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(proposal_id.to_string()),
                     SqlValue::Text(ns),
                 ],
-                label: Some("projection_worker.proposals_open.revert_applying".into()),
+                label: Some(label.into()),
             })
             .await
             .map_err(RuntimeError::Storage)?;
-        Ok(())
+        Ok(finish(rows))
     }
 
     /// Atomically run the reviewed CAS UPDATE and `ProposalReviewed` event INSERT.
@@ -227,13 +241,8 @@ impl ProposalsProjectionWorker {
         let proposal_id = Uuid::from_u128(payload.proposal_id.to_u128());
         let event = EventAttribution::from_token(token).stamp(event);
 
-        let (new_status_opt, approve_delta, reject_delta): (Option<&str>, i64, i64) =
-            match payload.decision {
-                ProposalDecision::Approve => (Some("approved"), 1, 0),
-                ProposalDecision::Reject => (Some("rejected"), 0, 1),
-                ProposalDecision::Comment => (None, 0, 0),
-                ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
-            };
+        let (new_status_opt, approve_delta, reject_delta) =
+            review_decision_effect(payload.decision);
         let last_decision_str = payload.decision.as_str();
 
         let projection_stmt = if let Some(new_status) = new_status_opt {
@@ -301,19 +310,18 @@ impl ProposalsProjectionWorker {
         projection_stmt: SqlStatement,
         event: Event,
     ) -> Result<bool, RuntimeError> {
-        let event_stmt = build_conditional_event_insert(&event);
+        let mut statements = build_conditional_event_inserts(&event)?;
+        statements.insert(0, projection_stmt);
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let result = writer
-            .execute_batch(vec![projection_stmt, event_stmt])
-            .await;
+        let result = writer.execute_batch(statements).await;
         khive_storage::usage::account_event_write(
             result
                 .as_ref()
-                .map(|total_rows| u64::from(*total_rows == 2)),
+                .map(|total_rows| u64::from(*total_rows >= 2)),
         );
         let total_rows = result.map_err(RuntimeError::Storage)?;
-        let event_inserted = total_rows == 2;
+        let event_inserted = total_rows >= 2;
         Ok(event_inserted)
     }
 
@@ -337,27 +345,9 @@ impl ProposalsProjectionWorker {
 
         Ok(row.map(|r| {
             let get_text = |name: &str| -> String {
-                r.get(name)
-                    .and_then(|v| {
-                        if let SqlValue::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
+                r.text_or_none(name).map(str::to_owned).unwrap_or_default()
             };
-            let get_int = |name: &str| -> i64 {
-                r.get(name)
-                    .and_then(|v| {
-                        if let SqlValue::Integer(i) = v {
-                            Some(*i)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0)
-            };
+            let get_int = |name: &str| -> i64 { r.i64_or_none(name).unwrap_or(0) };
             ProposalRow {
                 proposal_id: get_text("proposal_id"),
                 proposer: get_text("proposer"),

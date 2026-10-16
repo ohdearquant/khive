@@ -31,6 +31,39 @@ pub enum WriterTaskRequestState {
     SideEffectsUnknown,
 }
 
+/// The SQLite boundary that returned a native write failure, independently of settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteWriteStage {
+    #[serde(rename = "sqlite_begin_busy")]
+    Begin,
+    #[serde(rename = "sqlite_statement_failure")]
+    Statement,
+    #[serde(rename = "sqlite_commit_failure")]
+    Commit,
+}
+
+impl SqliteWriteStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "sqlite_begin_busy",
+            Self::Statement => "sqlite_statement_failure",
+            Self::Commit => "sqlite_commit_failure",
+        }
+    }
+}
+
+/// Native evidence only; the enclosing error still owns retry and settlement policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SqliteWriteFailure {
+    pub stage: SqliteWriteStage,
+    pub primary_code: i32,
+    pub extended_code: i32,
+    /// Existing cleanup evidence; false does not prove rollback or any final outcome.
+    #[serde(default)]
+    pub settlement_unknown: bool,
+}
+
 impl fmt::Display for WriterTaskRequestState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -46,6 +79,7 @@ impl fmt::Display for WriterTaskRequestState {
 pub enum CapacityUnavailablePhase {
     Identity,
     Lock,
+    LockContended,
     Probe,
 }
 
@@ -54,6 +88,7 @@ impl CapacityUnavailablePhase {
         match self {
             Self::Identity => "identity",
             Self::Lock => "lock",
+            Self::LockContended => "lock_contended",
             Self::Probe => "probe",
         }
     }
@@ -68,6 +103,12 @@ impl fmt::Display for CapacityUnavailablePhase {
 /// Unified error type for all storage operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("{source}")]
+    SqliteWrite {
+        failure: SqliteWriteFailure,
+        #[source]
+        source: Box<StorageError>,
+    },
     #[error("{capability:?} resource not found: {resource} ({key})")]
     NotFound {
         capability: StorageCapability,
@@ -264,6 +305,9 @@ pub enum StorageError {
     #[error("writer task terminated (request_state={request_state})")]
     WriterTaskTerminated {
         request_state: WriterTaskRequestState,
+        /// Original SQLITE_FULL primary/extended codes, when the terminal cause supplied them.
+        /// Evidence only: it does not change finality, retryability or the error source chain.
+        sqlite_full_codes: Option<(i32, i32)>,
     },
 
     /// An internal storage failure not attributable to a specific storage
@@ -306,6 +350,44 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Return native write evidence through a request-finality envelope.
+    pub fn sqlite_write_failure(&self) -> Option<SqliteWriteFailure> {
+        match self {
+            Self::SqliteWrite { failure, .. } => Some(*failure),
+            Self::WriterTaskRequestFailed { source, .. } => source.sqlite_write_failure(),
+            _ => None,
+        }
+    }
+
+    /// Borrow the original policy error without discarding any request-finality envelope.
+    pub fn without_sqlite_write_stage(&self) -> &Self {
+        match self {
+            Self::SqliteWrite { source, .. } => source.without_sqlite_write_stage(),
+            _ => self,
+        }
+    }
+
+    /// Attach native evidence once; the original error still owns Display and retry policy.
+    pub fn with_sqlite_write_failure(self, failure: SqliteWriteFailure) -> Self {
+        if self.sqlite_write_failure().is_some() {
+            self
+        } else {
+            Self::SqliteWrite {
+                failure,
+                source: Box::new(self),
+            }
+        }
+    }
+    /// Construct a terminal writer outcome without native SQLite evidence.
+    ///
+    /// The request state and existing retry policy are unchanged.
+    pub fn writer_task_terminated(request_state: WriterTaskRequestState) -> Self {
+        Self::WriterTaskTerminated {
+            request_state,
+            sqlite_full_codes: None,
+        }
+    }
+
     /// Construct a `Driver` error wrapping a backend-specific error source.
     pub fn driver(
         capability: StorageCapability,
@@ -335,7 +417,9 @@ impl StorageError {
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
-            Self::WriterTaskRequestFailed { source, .. } => source.capability(),
+            Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } => {
+                source.capability()
+            }
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::AdmissionTimeout { .. }
@@ -352,7 +436,9 @@ impl StorageError {
 
     /// Whether this error is transient and the operation may succeed on retry.
     pub fn is_retryable(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_retryable();
         }
         matches!(
@@ -365,6 +451,10 @@ impl StorageError {
                 | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }
+                | Self::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::LockContended,
+                    ..
+                }
         )
     }
 
@@ -384,7 +474,9 @@ impl StorageError {
     /// "successful" search (issue #389).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_fts5_syntax_error`.
     pub fn is_fts5_syntax_error(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_fts5_syntax_error();
         }
         let Self::Driver {
@@ -419,7 +511,9 @@ impl StorageError {
     /// also hide genuine write failures (disk full, corruption).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_unique_constraint_violation`.
     pub fn is_unique_constraint_violation(&self) -> bool {
-        if let Self::WriterTaskRequestFailed { source, .. } = self {
+        if let Self::WriterTaskRequestFailed { source, .. } | Self::SqliteWrite { source, .. } =
+            self
+        {
             return source.is_unique_constraint_violation();
         }
         let Self::Driver {
@@ -444,285 +538,5 @@ impl StorageError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fmt;
-
-    #[derive(Debug)]
-    struct FakeSource(String);
-
-    impl fmt::Display for FakeSource {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
-        }
-    }
-
-    impl StdError for FakeSource {}
-
-    fn driver_err(operation: &'static str, message: &str) -> StorageError {
-        StorageError::driver(
-            StorageCapability::Text,
-            operation,
-            FakeSource(message.into()),
-        )
-    }
-
-    #[test]
-    fn writer_task_request_state_display_is_stable() {
-        assert_eq!(
-            WriterTaskRequestState::NotStarted.to_string(),
-            "not_started"
-        );
-        assert_eq!(
-            WriterTaskRequestState::TransactionRolledBack.to_string(),
-            "transaction_rolled_back"
-        );
-        assert_eq!(
-            WriterTaskRequestState::SideEffectsUnknown.to_string(),
-            "side_effects_unknown"
-        );
-    }
-
-    #[test]
-    fn writer_task_busy_is_retryable_without_claiming_queue_rejection() {
-        let error = StorageError::WriterTaskBusy { timeout_ms: 175 };
-        assert!(error.is_retryable());
-        assert_eq!(
-            error.to_string(),
-            "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
-        );
-        assert_eq!(error.capability(), None);
-    }
-
-    #[test]
-    fn writer_task_request_failure_preserves_source_policy_and_rollback_state() {
-        let error = StorageError::WriterTaskRequestFailed {
-            request_state: WriterTaskRequestState::TransactionRolledBack,
-            source: Box::new(StorageError::Pool {
-                operation: "writer_task_commit".into(),
-                message: "commit refused".into(),
-            }),
-        };
-
-        assert_eq!(error.capability(), None);
-        assert!(
-            error.is_retryable(),
-            "rollback finality must not discard the source error's retry policy"
-        );
-        assert_eq!(
-            error.to_string(),
-            "writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused"
-        );
-        assert_eq!(
-            StdError::source(&error).map(ToString::to_string),
-            Some("pool failure during writer_task_commit: commit refused".to_string()),
-            "the original typed storage error must remain the public source"
-        );
-    }
-
-    #[test]
-    fn writer_task_request_failure_does_not_invent_retryability() {
-        let error = StorageError::WriterTaskRequestFailed {
-            request_state: WriterTaskRequestState::TransactionRolledBack,
-            source: Box::new(StorageError::InvalidInput {
-                capability: StorageCapability::Notes,
-                operation: "append_note".into(),
-                message: "deterministic refusal".into(),
-            }),
-        };
-
-        assert!(!error.is_retryable());
-        assert_eq!(error.capability(), Some(StorageCapability::Notes));
-    }
-
-    #[test]
-    fn writer_task_terminated_is_uncapability_scoped_and_not_retryable() {
-        for request_state in [
-            WriterTaskRequestState::NotStarted,
-            WriterTaskRequestState::TransactionRolledBack,
-            WriterTaskRequestState::SideEffectsUnknown,
-        ] {
-            let error = StorageError::WriterTaskTerminated { request_state };
-            assert_eq!(error.capability(), None);
-            assert!(!error.is_retryable());
-            assert_eq!(
-                error.to_string(),
-                format!("writer task terminated (request_state={request_state})")
-            );
-        }
-    }
-
-    #[test]
-    fn blob_integrity_errors_are_blob_scoped_and_not_retryable() {
-        let requested = crate::blob::ContentRef::from_hex("a".repeat(64)).unwrap();
-        let actual = crate::blob::ContentRef::from_hex("b".repeat(64)).unwrap();
-        let errors = [
-            StorageError::BlobTooLarge {
-                content_ref: requested.clone(),
-                max_bytes: 8,
-                observed_at_least: 9,
-            },
-            StorageError::BlobSizeMismatch {
-                content_ref: requested.clone(),
-                metadata_bytes: 7,
-                actual_bytes: 8,
-            },
-            StorageError::BlobDigestMismatch {
-                expected: requested,
-                actual,
-            },
-        ];
-
-        for error in errors {
-            assert_eq!(error.capability(), Some(StorageCapability::Blob));
-            assert!(!error.is_retryable());
-        }
-    }
-
-    #[test]
-    fn fts5_syntax_error_at_fts_search_is_classified_as_syntax_error() {
-        let e = driver_err("fts_search", "fts5: syntax error near \"@\"");
-        assert!(e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn fts5_parser_stack_overflow_is_classified_as_syntax_error() {
-        let e = driver_err("fts_search", "fts5: parser stack overflow");
-        assert!(e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn fts5_unsupported_column_query_is_classified_as_syntax_error() {
-        let e = driver_err(
-            "fts_search",
-            "fts5: column queries are not supported (detail=none)",
-        );
-        assert!(e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn timeout_is_not_classified_as_syntax_error() {
-        let e = StorageError::Timeout {
-            operation: "fts_search".into(),
-        };
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn pool_failure_is_not_classified_as_syntax_error() {
-        let e = StorageError::Pool {
-            operation: "fts_search".into(),
-            message: "pool exhausted".into(),
-        };
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn driver_error_at_non_search_operation_is_not_classified_as_syntax_error() {
-        let e = driver_err("open_fts_reader", "fts5: syntax error near \"@\"");
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn driver_error_with_unrelated_message_is_not_classified_as_syntax_error() {
-        let e = driver_err("fts_search", "disk I/O error");
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn fts5_phrase_detail_query_is_classified_as_syntax_error() {
-        let e = driver_err(
-            "fts_search",
-            "fts5: phrase queries are not supported (detail!=full)",
-        );
-        assert!(e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn fts5_near_detail_query_is_classified_as_syntax_error() {
-        let e = driver_err(
-            "fts_search",
-            "fts5: NEAR queries are not supported (detail!=full)",
-        );
-        assert!(e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn unprefixed_detail_message_is_not_classified_as_syntax_error() {
-        let e = driver_err(
-            "fts_search",
-            "phrase queries are not supported (detail!=full)",
-        );
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn fts5_shadow_table_corruption_is_not_classified_as_syntax_error() {
-        let e = driver_err(
-            "fts_search",
-            "fts5: error creating shadow table notes_content: no such table",
-        );
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    #[test]
-    fn non_text_capability_is_not_classified_as_syntax_error() {
-        let e = StorageError::Driver {
-            capability: StorageCapability::Vectors,
-            operation: "fts_search".into(),
-            source: Box::new(FakeSource("fts5: syntax error near \"@\"".into())),
-        };
-        assert!(!e.is_fts5_syntax_error());
-    }
-
-    fn driver_err_sql(operation: &'static str, message: &str) -> StorageError {
-        StorageError::driver(
-            StorageCapability::Sql,
-            operation,
-            FakeSource(message.into()),
-        )
-    }
-
-    #[test]
-    fn unique_constraint_failure_at_execute_sql_capability_is_classified() {
-        let e = driver_err_sql(
-            "execute",
-            "UNIQUE constraint failed: brain_serve_ledger.namespace, \
-             brain_serve_ledger.target_id, brain_serve_ledger.query_class, \
-             brain_serve_ledger.served_at",
-        );
-        assert!(e.is_unique_constraint_violation());
-    }
-
-    #[test]
-    fn unique_constraint_failure_at_pool_writer_execute_is_classified() {
-        let e = driver_err_sql("pool_writer.execute", "UNIQUE constraint failed: t.id");
-        assert!(e.is_unique_constraint_violation());
-    }
-
-    #[test]
-    fn unique_constraint_message_at_non_execute_operation_is_not_classified() {
-        let e = driver_err_sql("query_row", "UNIQUE constraint failed: t.id");
-        assert!(!e.is_unique_constraint_violation());
-    }
-
-    #[test]
-    fn non_unique_driver_error_at_execute_is_not_classified() {
-        let e = driver_err_sql("execute", "disk I/O error");
-        assert!(!e.is_unique_constraint_violation());
-    }
-
-    #[test]
-    fn non_sql_capability_is_not_classified_as_unique_violation() {
-        let e = driver_err("execute", "UNIQUE constraint failed: t.id");
-        assert!(!e.is_unique_constraint_violation());
-    }
-
-    #[test]
-    fn timeout_is_not_classified_as_unique_violation() {
-        let e = StorageError::Timeout {
-            operation: "execute".into(),
-        };
-        assert!(!e.is_unique_constraint_violation());
-    }
-}
+#[path = "error_tests.rs"]
+mod tests;

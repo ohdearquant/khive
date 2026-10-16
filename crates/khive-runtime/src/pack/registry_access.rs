@@ -12,8 +12,9 @@ use crate::KhiveRuntime;
 use super::{
     append_audit_event_best_effort, audit_admission_refused_obligation_count,
     audit_admission_refused_obligation_last_at_ms, audit_admission_unresolved_obligation_count,
-    audit_admission_unresolved_obligation_last_at_ms, build_audit_storage_event,
-    fold_audit_obligation, masked_audit_event, VerbRegistry, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    audit_admission_unresolved_obligation_last_at_ms, audit_retry_exhausted_obligation_count,
+    audit_retry_exhausted_obligation_last_at_ms, build_audit_storage_event, fold_audit_obligation,
+    masked_audit_event, VerbRegistry, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 #[cfg(doc)]
 use super::{PackRegistry, RequestIdentity, VerbCategory, VerbRegistryBuilder};
@@ -240,9 +241,11 @@ impl VerbRegistry {
     /// see flush failures and pure-observability degradation instead of the
     /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
     ///
-    /// `admission_refused_obligations` and `admission_unresolved_obligations`
-    /// are sourced separately from [`audit_admission_refused_obligation_count`]
-    /// and [`audit_admission_unresolved_obligation_count`] rather than from
+    /// `admission_refused_obligations`, `retry_exhausted_obligations`,
+    /// and `admission_unresolved_obligations`
+    /// are sourced separately from [`audit_admission_refused_obligation_count`],
+    /// [`audit_retry_exhausted_obligation_count`], and
+    /// [`audit_admission_unresolved_obligation_count`] rather than from
     /// `batch.health_metrics()`: they count a decision made in
     /// `append_audit_event_best_effort` (ADR-103 Amendment 3 / ADR-133
     /// Amendment 1), not a property of the batch itself, so they are
@@ -258,6 +261,9 @@ impl VerbRegistry {
                 admission_refused_obligations: audit_admission_refused_obligation_count(),
                 admission_refused_obligations_last_at_ms:
                     audit_admission_refused_obligation_last_at_ms(),
+                retry_exhausted_obligations: audit_retry_exhausted_obligation_count(),
+                retry_exhausted_obligations_last_at_ms: audit_retry_exhausted_obligation_last_at_ms(
+                ),
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
                 admission_unresolved_obligations_last_at_ms:
                     audit_admission_unresolved_obligation_last_at_ms(),
@@ -265,9 +271,10 @@ impl VerbRegistry {
         })
     }
 
-    /// Test/diagnostic-only accessor for the underlying ADR-133 audit-batch
-    /// seam. `None` when no `EventStore` was configured (the batch is lazily
-    /// constructed from one). Exposed so admission-pressure mechanism tests
+    /// This registry's shared ADR-133 audit-batch seam. The recall handler
+    /// uses this same instance for its best-effort `RecallExecuted` rows.
+    /// `None` when no `EventStore` was configured (the batch is constructed
+    /// from one). Admission-pressure mechanism tests also use it so they
     /// can saturate and drain the SAME instance a real dispatch uses
     /// (#2117, #2147, #2208, #2217) instead of testing a
     /// look-alike.
@@ -330,6 +337,9 @@ impl VerbRegistry {
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
     ///   `git.gates`, `git.status` and `git.log` dispatch that same check,
     ///   so their read results also carry a required decision write.
+    /// - `comm.withheld_body` writes an access audit event on every call;
+    ///   the record of who read a withheld original is the point of the
+    ///   verb, so its accounting row is never droppable.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -403,6 +413,7 @@ impl VerbRegistry {
         ("kg", "get"),
         ("kg", "list"),
         ("kg", "stats"),
+        ("kg", "count"),
         ("kg", "search"),
         ("kg", "neighbors"),
         ("kg", "traverse"),
@@ -410,6 +421,10 @@ impl VerbRegistry {
         ("kg", "query"),
         ("kg", "resolve"),
         ("kg", "whoami"),
+        // schema reports the loaded vocabulary and the declared endpoint
+        // matrix from the registry's in-memory declarations: no store read,
+        // no store write, no event.
+        ("kg", "schema"),
         // scan runs the secret gate over caller-supplied text in process: no
         // store read, no store write, no event.
         ("kg", "scan"),
@@ -419,6 +434,7 @@ impl VerbRegistry {
         // knowledge (ANN-maintaining search/suggest/compose are excluded)
         ("knowledge", "knowledge.get"),
         ("knowledge", "knowledge.list"),
+        ("knowledge", "knowledge.export"),
         ("knowledge", "knowledge.stats"),
         ("knowledge", "knowledge.fold"),
         ("knowledge", "knowledge.topic"),

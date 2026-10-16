@@ -252,9 +252,9 @@ fn decode_cursor(raw: &str) -> RuntimeResult<Cursor> {
     let until_us = parse_time(fields[1])?;
     let created_at_us = parse_time(fields[2])?;
     if !matches!(fields[3].len(), 64 | 72 | 76 | 90)
-        || !lower_hex(fields[3])
+        || !khive_types::is_lowercase_hex(fields[3])
         || fields[4].len() != 64
-        || !lower_hex(fields[4])
+        || !khive_types::is_lowercase_hex(fields[4])
     {
         return Err(invalid_cursor());
     }
@@ -282,12 +282,6 @@ fn decode_cursor(raw: &str) -> RuntimeResult<Cursor> {
         key,
         binding: fields[4].to_owned(),
     })
-}
-
-fn lower_hex(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -5353,7 +5353,7 @@ async fn concurrent_drains_fire_each_row_exactly_once() {
 // `run_pending_events`'s wrapper seam must not misread a default
 // namespace as an explicit actor override. These tests exercise the real
 // config-discovery path (process cwd / `HOME`); the helpers below mirror
-// `serve.rs`'s own equivalents, kept local since they are test-only.
+// `serve_tests.rs`'s own equivalents, kept local since they are test-only.
 
 /// RAII guard: redirects process cwd and `HOME` to isolated locations so
 /// the real machine's global `~/.khive/config.toml` never leaks into a
@@ -5717,7 +5717,7 @@ impl Gate for DenyCommSendWithCredentialGate {
 }
 
 /// Captures `tracing` output for masking assertions. Mirrors
-/// `khive-mcp/src/server.rs`'s `SearchCapturedLog` test helper.
+/// `khive-mcp/src/server_tests.rs`'s `SearchCapturedLog` test helper.
 #[derive(Clone, Default)]
 struct CapturedDrainLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -6320,5 +6320,44 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
     assert!(
         err.to_string().contains(ordinary_malformed_dsl),
         "ordinary DSL text must survive unmasked: {err}"
+    );
+}
+
+/// Without sqlite_stat1, ordering the provenance lookup by the bare columns
+/// lets the planner satisfy `ORDER BY` with the namespace/created_at index
+/// and walk the namespace; the uniqueness `LIMIT 2` is normally never filled,
+/// so that walk reads every event of the namespace. The lookup must seek the
+/// index built for it.
+#[tokio::test]
+async fn creator_provenance_lookup_seeks_its_index_without_statistics() {
+    let (_dir, db_path) = tmp_db();
+    let rt = make_rt(&db_path).await;
+    let mut reader = rt.sql().reader().await.expect("open SQL reader");
+    let rows = reader
+        .explain(creator_provenance_statement(
+            "local",
+            uuid::Uuid::new_v4(),
+            "reminder",
+        ))
+        .await
+        .expect("explain the creator provenance lookup");
+    let details: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row.get("detail") {
+            Some(SqlValue::Text(detail)) => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("idx_schedule_creator_provenance") && detail.contains("target_id=?")
+        }),
+        "creator provenance must seek idx_schedule_creator_provenance: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("idx_events_ns_created")),
+        "creator provenance must not walk the namespace in created_at order: {details:?}"
     );
 }

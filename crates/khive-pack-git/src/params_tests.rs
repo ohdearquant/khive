@@ -485,13 +485,14 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
         "positive control must reach the observed process"
     );
 
-    // Digest retains its default/null/negative/high clamp behavior and its
-    // historical non-string project fallback, through the real registry.
+    // Digest retains its default/null/negative/high clamp behavior through the
+    // real registry. An explicit null project still selects the automatic
+    // anchor; non-string projects are refused (tests/digest_project_type.rs).
     for (budget, expected) in [(Value::Null, 500), (json!(-1), 1), (json!(9000), 2000)] {
         let result = registry
             .dispatch(
                 "git.digest",
-                json!({"source":repo,"include":[],"max_items":budget,"project":false}),
+                json!({"source":repo,"include":[],"max_items":budget,"project":null}),
             )
             .await
             .expect("valid digest compatibility control");

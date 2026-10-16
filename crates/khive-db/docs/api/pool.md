@@ -7,6 +7,12 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+Runtime write-route classification and checkpoint-ownership coordination live in
+`crates/khive-db/src/pool/admission.rs`. The public
+`khive_db::pool::RuntimeWriteOperation` path and the `ConnectionPool` entrypoints
+remain in `pool`; disk-space admission and write units live in
+`crates/khive-db/src/pool/write_units.rs`.
+
 ## Physical database identity
 
 On the first writable open of a new or legacy file-backed database, the pool
@@ -25,6 +31,26 @@ a later installation by another process; on Unix, device/inode checks still
 guard new connections to its opened file. The next writable pool open above
 the reserve installs and pins the UUID. The startup transaction uses the
 configured busy timeout.
+
+## Page cache and memory map
+
+Every pooled connection, reader or writer, keeps its own SQLite page cache on the
+process heap, so a process's ceiling is the per-connection size times its open
+connections. The default is 8 MiB per connection; `KHIVE_SQLITE_CACHE_KIB` sets it
+in KiB, from 512 to 1,048,576. Pages the cache drops are re-read from the operating
+system's file cache, which the kernel reclaims on its own.
+
+Each connection also maps up to 1 GiB of its database file for reads.
+`KHIVE_SQLITE_MMAP_BYTES` sets the window in bytes, from 0 to 2^40, and `0` turns
+memory-mapped reads off. Mapped pages are clean and file-backed, so the kernel can
+drop them under memory pressure without writing them anywhere; reads past the
+window go through the page cache instead, so lowering the window moves those reads
+onto the heap cache, which counts toward the process's own memory footprint.
+
+Both settings are read once per process. A set value that is not an integer inside
+its range, including one that is not valid Unicode, is logged at `warn` and the
+default is used, so a typo cannot stop a store from opening. The SQL bridge's
+standalone writer uses the same two settings.
 
 ## SQLite write reserve
 
@@ -80,8 +106,10 @@ owned-connection settlement.
 Admission compares available space with the reserve plus required headroom. If
 that sum is nonzero, space at or below it returns `CapacityFloor` before the
 logical write runs; addition overflow also refuses. `CapacityUnavailable` distinguishes
-`identity`, `lock` and `probe` failures; neither capacity outcome requests an
-automatic retry. A thread that already holds the same volume lease is refused
+`identity`, `lock`, `lock_contended` and `probe` phases. Only `lock_contended`,
+where the guard deadline elapsed waiting for the lease, is retryable within the
+caller's bounded retry budget. Floor refusal and the other unavailable phases
+remain non-retryable. A thread that already holds the same volume lease is refused
 immediately with `VolumeLeaseReentry`, naming the holder and requester sites.
 Cross-thread contention instead waits within the guard deadline. A manual atomic
 unit's lease is detached from the thread that took it, so a later request from
@@ -263,6 +291,16 @@ seconds) for each reader-admission attempt. One operation can perform several
 sequential reads, and each operation-scoped checkout has its own bounded wait;
 the caller's total wall time can therefore exceed five seconds even though no
 single admission wait does. The timeout never triggers a fresh connection open.
+
+`KHIVE_READER_MAX_AGE_SECS` (default 300) and `KHIVE_READER_MAX_OPS` (default
+5000) configure `reader_max_age` and `reader_max_ops`. A pooled reader connection
+that has lived longer than the age limit, or has served more than the limit of
+successful checkouts, is closed on return and replaced by a fresh connection before
+the slot is reused; the replacement open happens inside the returning request's
+tail. Both comparisons are strict, so a zero value for either key recycles on every
+return. The in-memory pool shares one connection and is never recycled. Each replacement counts
+in `reader_discards` on the acquisition snapshot, and a replacement that fails to
+open counts in `reader_replacement_open_failures`.
 
 ### Synchronous `ReaderGuard::query_row`
 

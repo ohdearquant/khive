@@ -1,10 +1,10 @@
 #[cfg(test)]
 use super::failpoint;
 use super::{
-    f32_slice_as_bytes, non_finite_index, provenance_sidecar_exists, BatchWriteErrorClass,
-    BatchWriteRetryability, BatchWriteSummary, ContentRef, DateTime, OrphanSweepResult, Utc, Uuid,
-    VectorRecord,
+    non_finite_index, provenance_sidecar_exists, BatchWriteErrorClass, BatchWriteRetryability,
+    BatchWriteSummary, ContentRef, DateTime, OrphanSweepResult, Utc, Uuid, VectorRecord,
 };
+use khive_storage::encode_f32_native;
 
 /// One vector row's identity + payload for [`replace_vector_row_dml`] (#546).
 /// `embedding` must already be validated for the target table's dimension
@@ -89,7 +89,7 @@ pub(super) fn replace_vector_row_dml(
         "INSERT INTO {table} (subject_id, namespace, kind, field, embedding_model, embedding) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     );
-    let blob = f32_slice_as_bytes(row.embedding);
+    let blob = encode_f32_native(row.embedding);
     conn.execute(
         &ins_sql,
         rusqlite::params![

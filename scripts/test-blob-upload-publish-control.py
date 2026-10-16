@@ -17,7 +17,7 @@ root, out = args.root.resolve(), args.out.resolve()
 out.mkdir(parents=True, exist_ok=False)
 target = root / "crates/khive-db/src/stores/blob_uploads.rs"
 original = target.read_bytes()
-source = (root / "crates/khive-db/src/stores/blob.rs").read_bytes()
+source = (root / "crates/khive-db/src/stores/blob/publish.rs").read_bytes()
 anchor = b"            publish_blob_at(\n"
 assert original.count(anchor) == 1, "commit call must be unique"
 start = source.index(b"fn publish_blob_at(")

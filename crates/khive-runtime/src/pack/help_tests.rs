@@ -185,355 +185,9 @@ fn build_help_registry(invocations: Arc<AtomicUsize>) -> VerbRegistry {
     builder.build().expect("help registry builds")
 }
 
-/// help=true on `create` returns a schema envelope with the correct verb name,
-/// pack name, description, and at least the required `kind` parameter.
-#[tokio::test]
-async fn test_help_true_returns_schema_for_kg_create() {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let reg = build_help_registry(invocations.clone());
+include!("help_tests/schema_and_identifier_description_tests.rs");
 
-    let result = reg
-        .dispatch("create", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for a known verb");
-
-    // Shape checks.
-    assert_eq!(result["verb"], "create", "envelope must name the verb");
-    assert_eq!(
-        result["pack"], "helptest",
-        "envelope must name the owning pack"
-    );
-    assert!(
-        result["description"].as_str().is_some(),
-        "description must be a string"
-    );
-
-    // Params array must be present and non-empty.
-    let params = result["params"]
-        .as_array()
-        .expect("params must be a JSON array");
-    assert!(!params.is_empty(), "params array must not be empty");
-
-    // The required `kind` param must appear.
-    let kind_param = params.iter().find(|p| p["name"] == "kind");
-    assert!(
-        kind_param.is_some(),
-        "params array must include the 'kind' parameter"
-    );
-    let kind_param = kind_param.unwrap();
-    assert_eq!(
-        kind_param["required"],
-        serde_json::json!(true),
-        "'kind' must be required"
-    );
-    assert_eq!(kind_param["type"], "string", "'kind' type must be 'string'");
-
-    let identifier_help = result["identifier_resolution"]
-        .as_object()
-        .expect("help=true must include the shared identifier contract");
-    assert!(identifier_help["full_uuid"]
-        .as_str()
-        .is_some_and(|text| text.contains("globally unique")));
-    assert!(identifier_help["short_prefix"]
-        .as_str()
-        .is_some_and(|text| text.contains("lookup scope belongs to the consuming parameter")));
-    assert!(identifier_help["parameter_rule"]
-        .as_str()
-        .is_some_and(|text| text.contains("submitted again")));
-}
-
-#[test]
-fn event_target_resolution_metadata_has_a_conditional_contract() {
-    let mode = IdResolutionMode::EdgeOrEventTarget;
-    let text = resolution_mode_contract(mode).unwrap();
-    assert!(text.contains("kind=event accepts only a full subject UUID"));
-    assert!(text.contains("prefixes and names are rejected without graph resolution"));
-    assert!(text.contains("For kind=edge"));
-    assert!(text.contains("prefix or entity name resolves in the primary namespace"));
-    assert_eq!(resolution_mode_key(mode), "edge_or_event_target");
-    assert_eq!(
-        identifier_resolution_help()["resolution_modes"]["edge_or_event_target"],
-        text
-    );
-}
-
-/// `describe_verb` appends `resolution_mode_contract(p.resolution_mode)`
-/// to every uuid-typed parameter's description, so the full-UUID-vs-
-/// short-prefix rule is stated once per mode (in
-/// `resolution_mode_contract`) and inherited by every verb declaring
-/// that mode, rather than requiring each `HandlerDef` to paste its own
-/// explanation — or, worse, one blanket explanation getting appended to
-/// parameters whose actual resolver behaves differently (see
-/// `IdResolutionMode`'s doc comment: this is exactly the bug the mode
-/// field replaced — a single shared string asserted namespace-agnostic
-/// full-UUID acceptance on every uuid param, which was false for
-/// primary-scoped and namespace-filtered resolvers).
-/// This test covers `IdResolutionMode::UnscopedById`; the full mode
-/// enumeration is exercised against real pack definitions by
-/// `kkernel::pack_introspect::tests::
-/// every_uuid_param_across_every_registered_pack_declares_a_resolution_mode`
-/// and its `describe_verb_renders_mode_specific_contract_for_real_handlers`
-/// companion (khive-runtime cannot depend on the pack crates itself
-/// without a circular dependency).
-///
-/// The namespace assertion below is deliberately specific. It first
-/// asserted only `description.contains("namespace")`, which passes
-/// identically whether the contract says prefix resolution *is* or *is
-/// not* namespace-scoped — so it passed while the contract stated the
-/// opposite of what the by-ID verbs do. A test that cannot separate the
-/// two readings protects neither.
-#[tokio::test]
-async fn test_help_true_uuid_param_carries_shared_id_contract() {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let reg = build_help_registry(invocations.clone());
-
-    let result = reg
-        .dispatch("get", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for a known verb");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be a JSON array");
-    let id_param = params
-        .iter()
-        .find(|p| p["name"] == "id")
-        .expect("params array must include the 'id' parameter");
-    let description = id_param["description"]
-        .as_str()
-        .expect("description must be a string");
-
-    // The verb-specific text must still be present...
-    assert!(
-        description.contains("UUID of the record to fetch"),
-        "shared contract must be appended, not replace, the verb-specific text; got: {description}"
-    );
-    // ...and the shared contract must state the ACTUAL by-ID rule, in a
-    // form that separates it from its negation. Must-match and
-    // must-not-match together: either arm alone still admits a contract
-    // that merely mentions namespaces without committing to a rule.
-    assert!(
-        description.contains("no namespace filter"),
-        "id contract must state that by-ID prefix resolution applies NO namespace filter \
-             (ADR-007 Rev 6, `resolve_prefix_unfiltered`); got: {description}"
-    );
-    assert!(
-        !description.contains("namespace-scoped resolution"),
-        "id contract must not claim prefix resolution is namespace-scoped — get/update/\
-             delete/merge resolve prefixes unfiltered; got: {description}"
-    );
-    assert!(
-        description.to_ascii_lowercase().contains("prefix"),
-        "id contract must describe short-prefix semantics; got: {description}"
-    );
-
-    // `link`'s source_id/target_id are `param_type: "uuid"` too (they
-    // resolve through the same unfiltered path as get/update/delete/
-    // merge — see `crates/khive-pack-kg/src/handlers/link.rs`), so the
-    // contract's enumerated verb list must name `link` explicitly, not
-    // just the four record-level by-ID verbs.
-    let link_result = reg
-        .dispatch("link", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for link");
-    let link_params = link_result["params"]
-        .as_array()
-        .expect("link params must be a JSON array");
-    let source_id_param = link_params
-        .iter()
-        .find(|p| p["name"] == "source_id")
-        .expect("link params must include 'source_id'");
-    let source_id_description = source_id_param["description"]
-        .as_str()
-        .expect("description must be a string");
-    assert!(
-        source_id_description.contains("get/update/delete/merge/link"),
-        "id contract's by-ID verb enumeration must include 'link' alongside get/update/\
-             delete/merge, since link's source_id/target_id resolve through the same \
-             unfiltered path; got: {source_id_description}"
-    );
-}
-
-/// help=true on `recall` returns a schema envelope including the `query` param.
-#[tokio::test]
-async fn test_help_true_returns_schema_for_recall() {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let reg = build_help_registry(invocations.clone());
-
-    let result = reg
-        .dispatch("recall", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for recall");
-
-    assert_eq!(result["verb"], "recall");
-    assert_eq!(result["pack"], "helptest");
-
-    let params = result["params"]
-        .as_array()
-        .expect("params must be a JSON array");
-
-    // `query` must be present and required.
-    let query_param = params.iter().find(|p| p["name"] == "query");
-    assert!(query_param.is_some(), "params must include 'query'");
-    let query_param = query_param.unwrap();
-    assert_eq!(
-        query_param["required"],
-        serde_json::json!(true),
-        "'query' must be required"
-    );
-
-    // `limit` must be present and optional.
-    let limit_param = params.iter().find(|p| p["name"] == "limit");
-    assert!(limit_param.is_some(), "params must include 'limit'");
-    let limit_param = limit_param.unwrap();
-    assert_eq!(
-        limit_param["required"],
-        serde_json::json!(false),
-        "'limit' must be optional"
-    );
-}
-
-/// `link(help=true)` (issue #964) surfaces the composed per-relation
-/// endpoint allowlist: the base entity-to-entity table, every loaded
-/// pack's additive `EDGE_RULES`, and the `annotates` note-to-any rule —
-/// so a batch caller can defer to the kernel's own table instead of
-/// re-implementing it.
-#[tokio::test]
-async fn test_link_help_true_exposes_endpoint_rules() {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let reg = build_help_registry(invocations.clone());
-
-    let result = reg
-        .dispatch("link", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for link");
-
-    assert_eq!(result["verb"], "link");
-    let rules = result["endpoint_rules"]
-        .as_array()
-        .expect("link help must include an endpoint_rules array");
-    assert!(!rules.is_empty(), "endpoint_rules must not be empty");
-
-    // A base entity-to-entity rule (khive-runtime's own table) must appear.
-    assert!(
-        rules.iter().any(|r| r["relation"] == "contains"
-            && r["source"] == "entity:concept"
-            && r["target"] == "entity:concept"),
-        "endpoint_rules must include the base 'contains' entity rule; got {rules:#?}"
-    );
-
-    // The pack-declared additive rule (HelpPack's task->task depends_on) must appear.
-    assert!(
-        rules.iter().any(|r| r["relation"] == "depends_on"
-            && r["source"] == "note:task"
-            && r["target"] == "note:task"),
-        "endpoint_rules must include the pack-declared depends_on rule; got {rules:#?}"
-    );
-
-    // The annotates note-to-any special case must appear.
-    assert!(
-        rules
-            .iter()
-            .any(|r| r["relation"] == "annotates" && r["source"] == "note:*"),
-        "endpoint_rules must document the annotates note-to-any rule; got {rules:#?}"
-    );
-
-    // help=true must remain side-effect-free.
-    assert_eq!(
-        invocations.load(Ordering::SeqCst),
-        0,
-        "link(help=true) must not invoke pack dispatch"
-    );
-}
-
-/// `link(help=true)`'s `endpoint_rules` must match, set-for-set, every
-/// endpoint pair `validate_edge_relation_endpoints`
-/// (`crates/khive-runtime/src/operations.rs`) actually accepts for the
-/// three special relations (`supersedes` / `supports` / `refutes`):
-///
-/// - a `note -> note` row for each of the three relations (the
-///   validator's dedicated special-relation branch accepts any
-///   `Resolved::Note(_), Resolved::Note(_)` pair unconditionally,
-///   `operations.rs:1338` / `:1527` — before `pack_rule_allows` is ever
-///   reached);
-/// - the base entity->entity rows for the three relations
-///   (`base_entity_endpoint_rules`, e.g. `concept -[supersedes]-> concept`);
-/// - and, critically, NOT a row for `HelpPack`'s pack-declared
-///   `supersedes` rule on `note:task -> note:task`
-///   (`HELP_EDGE_RULES[1]`) — because the validator's special-relation
-///   branch returns before `pack_rule_allows` is consulted, that pack
-///   rule is never actually enforced, so advertising it would be a false
-///   promise (the exact defect this test guards against, issue #991).
-#[tokio::test]
-async fn test_link_help_true_matches_special_relation_validator_set() {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let reg = build_help_registry(invocations.clone());
-
-    let result = reg
-        .dispatch("link", serde_json::json!({ "help": true }))
-        .await
-        .expect("help=true must succeed for link");
-
-    let rules = result["endpoint_rules"]
-        .as_array()
-        .expect("link help must include an endpoint_rules array");
-
-    for relation in ["supersedes", "supports", "refutes"] {
-        // The unconditional note -> note row must appear.
-        assert!(
-            rules.iter().any(|r| r["relation"] == relation
-                && r["source"] == "note:*"
-                && r["target"] == "note:*"),
-            "endpoint_rules must include the note:*->note:* row for '{relation}' \
-                 (validator accepts any note->note pair unconditionally); got {rules:#?}"
-        );
-
-        // HelpPack's pack-declared rule for this relation on note:task->note:task
-        // (only Supersedes is declared in HELP_EDGE_RULES) must NOT be advertised
-        // as a distinct entity — the validator never reaches pack_rule_allows for
-        // special relations, so no note:task->note:task row should exist for it.
-        assert!(
-            !rules.iter().any(|r| r["relation"] == relation
-                && r["source"] == "note:task"
-                && r["target"] == "note:task"),
-            "endpoint_rules must NOT advertise a pack EDGE_RULES row for special \
-                 relation '{relation}' — validate_edge_relation_endpoints never consults \
-                 pack_rule_allows for supersedes/supports/refutes; got {rules:#?}"
-        );
-    }
-
-    // Base entity->entity rows for the three relations (from
-    // base_entity_endpoint_rules) must still appear alongside the note rows.
-    for (relation, kind) in [
-        ("supersedes", "concept"),
-        ("supports", "concept"),
-        ("refutes", "concept"),
-    ] {
-        assert!(
-            rules.iter().any(|r| r["relation"] == relation
-                && r["source"] == format!("entity:{kind}")
-                && r["target"] == "entity:concept"),
-            "endpoint_rules must include the base entity:{kind}->entity:concept row \
-                 for '{relation}'; got {rules:#?}"
-        );
-    }
-}
-
-#[test]
-fn special_relation_predicate_matches_the_dedicated_validator_set() {
-    for relation in khive_types::EdgeRelation::ALL {
-        assert_eq!(
-            is_special_relation(relation),
-            matches!(
-                relation,
-                khive_types::EdgeRelation::Supersedes
-                    | khive_types::EdgeRelation::Supports
-                    | khive_types::EdgeRelation::Refutes
-            ),
-            "unexpected special-relation classification for {relation}"
-        );
-    }
-}
+include!("help_tests/recall_and_link_description_tests.rs");
 
 /// help=true is intercepted before pack dispatch — the pack's dispatch method
 /// must never be invoked when help=true is in the params.
@@ -950,6 +604,116 @@ fn apply_schema_plans_with_map_collision_is_an_error() {
     assert!(
         msg.contains("collision_table"),
         "collision error must name the table; got: {msg}"
+    );
+}
+
+#[test]
+fn schema_collision_checks_every_statement_before_any_ddl() {
+    let cases: [(
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    ); 2] = [
+        (
+            "shared",
+            &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+            &["CREATE TABLE IF NOT EXISTS first_table (id INTEGER); \
+               CREATE TABLE IF NOT EXISTS shared (id INTEGER);"],
+        ),
+        (
+            "shared;table",
+            &[r#"CREATE TABLE IF NOT EXISTS "shared;table" (id INTEGER)"#],
+            &[r#"
+                ; CREATE TABLE IF NOT EXISTS first_table (id INTEGER);
+                CREATE INDEX IF NOT EXISTS first_index ON first_table(id);
+                /* a comment; between declarations */
+                CREATE TABLE IF NOT EXISTS main."shared;table" (id INTEGER)
+            "#],
+        ),
+    ];
+    for (table, first_pack, second_pack) in cases {
+        let backend = khive_db::StorageBackend::memory().expect("memory backend");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: first_pack,
+            column_additions: &[],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: second_pack,
+            column_additions: &[],
+        }));
+        let registry = builder.build().expect("registry builds");
+        let error = registry
+            .apply_schema_plans_with_map(&HashMap::new(), &backend)
+            .expect_err("later statements must not evade table ownership");
+        assert_eq!(error.pack_a, "pack_alpha");
+        assert_eq!(error.pack_b, "pack_beta");
+        assert_eq!(error.table, table);
+        let table_count: i64 = backend
+            .pool()
+            .reader()
+            .expect("reader")
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN (?1, 'first_table')",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("schema count");
+        assert_eq!(table_count, 0, "collision must precede all pack DDL");
+    }
+}
+
+#[test]
+fn schema_multi_statement_entries_preserve_quoted_and_comment_semicolons() {
+    let backend = khive_db::StorageBackend::memory().expect("memory backend");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register_boxed(Box::new(SchemaPack {
+        pack_name: "pack_alpha",
+        statements: &["CREATE TABLE IF NOT EXISTS shared (id INTEGER)"],
+        column_additions: &[],
+    }));
+    builder.register_boxed(Box::new(SchemaPack {
+        pack_name: "pack_beta",
+        statements: &[r#"
+            ;; CREATE TABLE IF NOT EXISTS "first;table" (
+                id INTEGER,
+                value TEXT DEFAULT 'it''s; CREATE TABLE shared (id INTEGER); still text'
+            );
+            -- ; CREATE TABLE shared (id INTEGER);
+            CREATE INDEX IF NOT EXISTS first_index ON "first;table"(id);
+            /* ; CREATE TABLE shared (id INTEGER); */
+            CREATE TABLE IF NOT EXISTS unique_second (id INTEGER)
+        "#],
+        column_additions: &[],
+    }));
+    let registry = builder.build().expect("registry builds");
+    registry
+        .apply_schema_plans_with_map(&HashMap::new(), &backend)
+        .expect("unique tables must register despite semicolons inside quotes or comments");
+
+    let reader = backend.pool().reader().expect("reader");
+    for table in ["shared", "first;table", "unique_second"] {
+        let table_count: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("schema count");
+        assert_eq!(table_count, 1, "every table must be installed: {table}");
+    }
+    let default_value: String = reader
+        .query_row(
+            "SELECT dflt_value FROM pragma_table_info(?1) WHERE name = 'value'",
+            ["first;table"],
+            |row| row.get(0),
+        )
+        .expect("quoted default");
+    assert_eq!(
+        default_value,
+        "'it''s; CREATE TABLE shared (id INTEGER); still text'"
     );
 }
 

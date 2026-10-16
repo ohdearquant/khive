@@ -89,6 +89,8 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
 /// reintroducing one of them: a category-only census would stay green if
 /// any name were re-added to the allowlist.
 const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
+    "comm.suppression_list",
+    "comm.withheld_body",
     "db_diagnostics",
     "git.checkout",
     "git.diff",
@@ -1685,68 +1687,7 @@ async fn dispatch_unknown_verb_returns_error() {
     assert!(msg.contains("create"));
 }
 
-/// `all_verbs` returns only `Visibility::Verb` entries.
-///
-/// BetaPack's `create` is `Visibility::Subhandler` — it must NOT appear
-/// in `all_verbs()` even though it has the same name as a Verb in AlphaPack.
-#[test]
-fn all_verbs_aggregates_across_packs_excludes_subhandlers() {
-    let reg = build_registry();
-    let verbs: Vec<&str> = reg.all_verbs().iter().map(|v| v.name).collect();
-    // BetaPack's "create" (Subhandler) is absent; only Verb-visibility entries appear.
-    assert_eq!(verbs, vec!["create", "list", "notify"]);
-}
-
-#[test]
-fn all_verbs_with_names_pairs_pack_name_excludes_subhandlers() {
-    let reg = build_registry();
-    let pairs: Vec<(&str, &str)> = reg
-        .all_verbs_with_names()
-        .iter()
-        .map(|(pack, v)| (*pack, v.name))
-        .collect();
-    // BetaPack's "create" is Subhandler and must NOT appear here.
-    assert_eq!(
-        pairs,
-        vec![("alpha", "create"), ("alpha", "list"), ("beta", "notify"),]
-    );
-}
-
-#[test]
-fn all_handlers_with_names_includes_subhandlers() {
-    let reg = build_registry();
-    let pairs: Vec<(&str, &str)> = reg
-        .all_handlers_with_names()
-        .iter()
-        .map(|(pack, v)| (*pack, v.name))
-        .collect();
-    // BetaPack's Subhandler "create" IS present in the full handler list.
-    assert_eq!(
-        pairs,
-        vec![
-            ("alpha", "create"),
-            ("alpha", "list"),
-            ("beta", "notify"),
-            ("beta", "create"),
-        ]
-    );
-}
-
-#[test]
-fn note_kinds_are_ordered() {
-    let reg = build_registry();
-    let kinds = reg.all_note_kinds();
-    assert_eq!(kinds, vec!["memo", "log", "alert"]);
-}
-
-#[test]
-fn brain_consumer_kinds_are_ordered_and_deduplicated() {
-    let reg = build_registry();
-    assert_eq!(
-        reg.all_brain_consumer_kinds(),
-        vec!["recall", "search", "knowledge_compose"]
-    );
-}
+include!("pack_tests/catalog_metadata_tests.rs");
 
 #[test]
 fn brain_consumer_kind_wildcard_is_rejected_at_build_time() {

@@ -10,7 +10,8 @@ use crate::error::RuntimeError;
 use crate::runtime::NamespaceToken;
 
 use super::{
-    DispatchHook, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime, SPECIAL_RELATIONS,
+    DispatchHook, EdgeEndpointRule, EndpointKind, HandlerDef, PackByIdResolver, PackRuntime,
+    SPECIAL_RELATIONS,
 };
 
 /// Immutable registry that dispatches verb calls to registered packs.
@@ -19,6 +20,11 @@ use super::{
 #[derive(Clone)]
 pub struct VerbRegistry {
     pub(super) packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    /// Pack ownership and endpoint rules captured together at registry construction.
+    pub(super) attributed_edge_rules: Arc<Vec<(String, EdgeEndpointRule)>>,
+    pub(super) pack_versions: Arc<HashMap<String, &'static str>>,
+    /// Validated property-policy declarations captured once, before activation.
+    pub(super) note_property_policies: Arc<Vec<khive_types::NotePropertyPolicySpec>>,
     /// Pack-level by-ID resolvers, in registration order.
     pub(super) resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     /// Read-only KG lookup topology; never used to redirect a pack write.
@@ -48,6 +54,7 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     pub(super) available_verbs: Arc<Vec<&'static str>>,
+    pub(super) disabled_verbs: Arc<HashSet<&'static str>>,
     /// Static handler metadata indexed once at build time. Duplicate internal
     /// subhandler names retain the first pack's declaration, as before.
     pub(super) handler_by_name: Arc<HashMap<&'static str, &'static HandlerDef>>,
@@ -237,7 +244,7 @@ impl std::fmt::Display for PackSchemaCollisionError {
 
 impl std::error::Error for PackSchemaCollisionError {}
 
-/// Extract table names from a single DDL statement.
+/// Extract table names from every statement in a DDL entry.
 ///
 /// Handles SQL trivia, SQLite identifier quoting, optional TEMP/VIRTUAL and a
 /// `main.` qualifier. Index and other non-table DDL return no table names.
@@ -312,37 +319,44 @@ pub(super) fn extract_table_names(stmt: &str) -> Vec<String> {
         tokens.push(SqlToken::Bare(token));
     }
 
-    let keyword = |index: usize, word: &str| matches!(tokens.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
-    if !keyword(0, "CREATE") {
-        return Vec::new();
-    }
-    let mut index = 1;
-    if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
-        index += 1;
-    }
-    if keyword(index, "VIRTUAL") {
-        index += 1;
-    }
-    if !keyword(index, "TABLE") {
-        return Vec::new();
-    }
-    index += 1;
-    if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
-        index += 3;
-    }
-    let main_qualifier = matches!(
-        tokens.get(index),
-        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
-    );
-    if main_qualifier && matches!(tokens.get(index + 1), Some(SqlToken::Punctuation('.'))) {
-        index += 2;
-    }
-    match tokens.get(index) {
-        Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
-            vec![name.to_ascii_lowercase()]
-        }
-        _ => Vec::new(),
-    }
+    tokens
+        .split(|token| matches!(token, SqlToken::Punctuation(';')))
+        .filter_map(|statement| {
+            let keyword = |index: usize, word: &str| matches!(statement.get(index), Some(SqlToken::Bare(token)) if token.eq_ignore_ascii_case(word));
+            if !keyword(0, "CREATE") {
+                return None;
+            }
+            let mut index = 1;
+            if keyword(index, "TEMP") || keyword(index, "TEMPORARY") {
+                index += 1;
+            }
+            if keyword(index, "VIRTUAL") {
+                index += 1;
+            }
+            if !keyword(index, "TABLE") {
+                return None;
+            }
+            index += 1;
+            if keyword(index, "IF") && keyword(index + 1, "NOT") && keyword(index + 2, "EXISTS") {
+                index += 3;
+            }
+            let main_qualifier = matches!(
+                statement.get(index),
+                Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if name.eq_ignore_ascii_case("main")
+            );
+            if main_qualifier
+                && matches!(statement.get(index + 1), Some(SqlToken::Punctuation('.')))
+            {
+                index += 2;
+            }
+            match statement.get(index) {
+                Some(SqlToken::Bare(name) | SqlToken::Quoted(name)) if !name.is_empty() => {
+                    Some(name.to_ascii_lowercase())
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Render an [`EndpointKind`] as the `"<substrate>:<kind>"` label used in

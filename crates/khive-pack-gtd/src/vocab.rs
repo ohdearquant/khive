@@ -6,6 +6,25 @@ use khive_types::{
     VerbCategory, Visibility,
 };
 
+const DUPLICATE_OF_PARAM: ParamDef = ParamDef {
+    name: "duplicate_of",
+    param_type: "uuid",
+    required: false,
+    description: "Full UUID or unique 8+ hex prefix of the kept task. Only valid with status=cancelled; any live task status is accepted. Stores properties.duplicate_of; no cycle check.",
+    resolution_mode: IdResolutionMode::UnscopedById,
+};
+
+const IGNORE_DEPENDENCIES_PARAM: ParamDef = ParamDef {
+    name: "ignore_dependencies",
+    param_type: "boolean",
+    required: false,
+    description: "Default false. Explicit true permits completion to done despite \
+                  blocked or broken dependencies, including cancelled, deleted, missing \
+                  or invalid blockers. Other lifecycle validation still applies. \
+                  Cancellation and nonterminal moves do not require this argument.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 /// GTD opts task notes into `depends_on` between tasks. The base contract keeps
 /// `depends_on` as entity→entity for KG semantics; this rule additively extends
 /// it to task→task so blockers are graph-traversable.
@@ -275,13 +294,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
-            ParamDef {
-                name: "duplicate_of",
-                param_type: "uuid",
-                required: false,
-                description: "Full UUID or unique 8+ hex prefix of the kept task. Only valid with status=cancelled; any live task status is accepted. Stores properties.duplicate_of; no cycle check.",
-                resolution_mode: IdResolutionMode::UnscopedById,
-            },
+            DUPLICATE_OF_PARAM,
             ParamDef {
                 name: "id",
                 param_type: "uuid",
@@ -305,16 +318,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 description: "Terminal status: \"done\" (default) or \"cancelled\".",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "ignore_dependencies",
-                param_type: "boolean",
-                required: false,
-                description: "Default false. Explicit true permits completion to done despite \
-                              blocked or broken dependencies, including cancelled, deleted, missing \
-                              or invalid blockers. Other lifecycle validation still applies. \
-                              Cancellation and nonterminal moves do not require this argument.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            IGNORE_DEPENDENCIES_PARAM,
         ],
     },
     // Assertive: retrieves filtered task listing
@@ -417,13 +421,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
-            ParamDef {
-                name: "duplicate_of",
-                param_type: "uuid",
-                required: false,
-                description: "Full UUID or unique 8+ hex prefix of the kept task. Only valid with status=cancelled; any live task status is accepted. Stores properties.duplicate_of; no cycle check.",
-                resolution_mode: IdResolutionMode::UnscopedById,
-            },
+            DUPLICATE_OF_PARAM,
             ParamDef {
                 name: "id",
                 param_type: "uuid",
@@ -450,16 +448,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 description: "Optional note to attach to the transition.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "ignore_dependencies",
-                param_type: "boolean",
-                required: false,
-                description: "Default false. Explicit true permits completion to done despite \
-                              blocked or broken dependencies, including cancelled, deleted, missing \
-                              or invalid blockers. Other lifecycle validation still applies. \
-                              Cancellation and nonterminal moves do not require this argument.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            IGNORE_DEPENDENCIES_PARAM,
         ],
     },
 ];

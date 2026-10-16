@@ -27,10 +27,17 @@ pub(super) fn validate_dispatch_receipt(
     if !receipt.is_object() {
         return Err("dispatch receipt is not an object".to_string());
     }
-    if properties.get("firing_at").and_then(Value::as_i64) != Some(firing_at) {
+    let version = receipt.get("version").and_then(Value::as_u64);
+    if (version != Some(CATCH_UP_RECEIPT_VERSION)
+        || properties.get("status").and_then(Value::as_str) == Some("firing"))
+        && properties.get("firing_at").and_then(Value::as_i64) != Some(firing_at)
+    {
         return Err("dispatch firing claim timestamp is missing or malformed".to_string());
     }
-    if receipt.get("version").and_then(Value::as_u64) != Some(DISPATCH_RECEIPT_VERSION) {
+    if !matches!(
+        version,
+        Some(DISPATCH_RECEIPT_VERSION | CATCH_UP_RECEIPT_VERSION)
+    ) {
         return Err("dispatch receipt version is missing or unsupported".to_string());
     }
 
@@ -71,7 +78,15 @@ pub(super) fn validate_dispatch_receipt(
             "scheduled event trigger_at is malformed during receipt validation".to_string()
         })?
         .with_timezone(&Utc);
-    if occurrence_id != dispatch_occurrence_id(event_id, trigger_at) {
+    let catch_up = if version == Some(CATCH_UP_RECEIPT_VERSION) {
+        Some(validate_catch_up_occurrence(properties, &receipt)?)
+    } else {
+        None
+    };
+    let occurrence_at = catch_up
+        .as_ref()
+        .map_or(trigger_at, |value| value.scheduled_for);
+    if occurrence_id != dispatch_occurrence_id(event_id, occurrence_at) {
         return Err(
             "dispatch receipt occurrence_id does not match the event and scheduled instant"
                 .to_string(),
@@ -165,7 +180,54 @@ pub(super) fn validate_dispatch_receipt(
         invocation_id,
         actor,
         state,
+        catch_up,
     })
+}
+
+fn validate_catch_up_occurrence(
+    properties: &Value,
+    receipt: &Value,
+) -> std::result::Result<CatchUpOccurrence, String> {
+    let source = receipt
+        .get("source_trigger_at")
+        .and_then(Value::as_str)
+        .ok_or("catch-up receipt source_trigger_at is missing or malformed")?;
+    if properties.get("status").and_then(Value::as_str) == Some("firing")
+        && properties.get("trigger_at").and_then(Value::as_str) != Some(source)
+    {
+        return Err("catch-up receipt source_trigger_at does not match the active claim".into());
+    }
+    let decision_at = receipt_timestamp(receipt, "decision_at")?;
+    let decision = DateTime::<Utc>::from_timestamp_micros(decision_at)
+        .ok_or("catch-up receipt decision_at is invalid")?;
+    let bound = receipt
+        .get("effective_max_lateness")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0 && Duration::try_seconds(*value).is_some())
+        .ok_or("catch-up receipt effective_max_lateness is missing or invalid")?;
+    let policy = khive_pack_schedule::misfire::parse_misfire_policy(properties)?;
+    if policy
+        != (khive_pack_schedule::misfire::MisfirePolicy::CatchUpOnce {
+            max_lateness: bound,
+        })
+    {
+        return Err("catch-up receipt does not match the stored misfire policy".into());
+    }
+    let selected = select_catch_up_occurrence(properties, source, decision, bound)?
+        .ok_or("catch-up receipt source trigger is after decision_at")?;
+    if receipt.get("scheduled_for").and_then(Value::as_str)
+        != Some(selected.scheduled_for.to_rfc3339().as_str())
+    {
+        return Err("catch-up receipt scheduled_for is not the canonical latest occurrence".into());
+    }
+    let state = receipt.get("state").and_then(Value::as_str);
+    if selected.is_missed() && matches!(state, Some("invoking" | "succeeded" | "failed")) {
+        return Err("catch-up receipt records invocation outside its lateness bound".into());
+    }
+    if !selected.is_missed() && state == Some("missed") {
+        return Err("catch-up receipt records a miss inside its lateness bound".into());
+    }
+    Ok(selected)
 }
 
 /// CAS-claim a pending scheduled event and atomically persist the occurrence
@@ -193,12 +255,56 @@ pub(super) async fn claim_pending_event(
     actor: &str,
     lease: DispatchLeaseConfig,
 ) -> Result<Option<DispatchClaim>> {
+    claim_pending_event_inner(
+        rt,
+        namespace,
+        id,
+        (occurrence_id, None),
+        expected_trigger_at,
+        actor,
+        lease,
+    )
+    .await
+}
+
+pub(super) async fn claim_pending_catch_up_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    catch_up: CatchUpOccurrence,
+    expected_trigger_at: &str,
+    actor: &str,
+    lease: DispatchLeaseConfig,
+) -> Result<Option<DispatchClaim>> {
+    let occurrence_id = dispatch_occurrence_id(id, catch_up.scheduled_for);
+    claim_pending_event_inner(
+        rt,
+        namespace,
+        id,
+        (occurrence_id, Some(catch_up)),
+        expected_trigger_at,
+        actor,
+        lease,
+    )
+    .await
+}
+
+async fn claim_pending_event_inner(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    occurrence: (uuid::Uuid, Option<CatchUpOccurrence>),
+    expected_trigger_at: &str,
+    actor: &str,
+    lease: DispatchLeaseConfig,
+) -> Result<Option<DispatchClaim>> {
     let updated_at = Utc::now().timestamp_micros();
     let claim = DispatchClaim {
         firing_at: updated_at,
-        occurrence_id,
+        occurrence_id: occurrence.0,
         invocation_id: uuid::Uuid::new_v4(),
         actor: actor.to_string(),
+        catch_up: occurrence.1,
     };
     let lease_expires_at = lease.expires_at(updated_at);
     let receipt = claim.claimed_receipt();
@@ -208,6 +314,13 @@ pub(super) async fn claim_pending_event(
         return Ok(None);
     };
     check_fixed_path_whole_object_snapshot(&snapshot)?;
+    if claim.catch_up.is_some() {
+        let mut current: Value = serde_json::from_str(&snapshot)?;
+        current["status"] = json!("firing");
+        if validate_catch_up_occurrence(&current, &receipt).is_err() {
+            return Ok(None);
+        }
+    }
     let mut writer = rt
         .sql()
         .writer()
@@ -439,7 +552,7 @@ pub(super) async fn persist_dispatch_outcome(
              persisting the masked record anyway"
         );
     }
-    let receipt = json!({
+    let mut receipt = json!({
         "version": DISPATCH_RECEIPT_VERSION,
         "occurrence_id": claim.occurrence_id,
         "invocation_id": claim.invocation_id,
@@ -450,6 +563,9 @@ pub(super) async fn persist_dispatch_outcome(
         "error": error,
         "error_payload": error_payload,
     });
+    if let Some(catch_up) = &claim.catch_up {
+        catch_up.add_to_receipt(&mut receipt);
+    }
     let receipt_json = serde_json::to_string(&receipt)
         .context("pending-events: serialize dispatch outcome receipt")?;
     // A lease renewal may win this exact-properties CAS; retry against its
@@ -577,13 +693,50 @@ pub(super) fn mark_dispatch_receipt_indeterminate(
 }
 
 pub(super) fn final_properties_after_dispatch(
-    mut properties: Value,
+    properties: Value,
     receipt: Value,
     completion: &DispatchCompletion,
     trigger_at: DateTime<Utc>,
     trigger_offset: FixedOffset,
     repeat: &Option<String>,
 ) -> (Value, FinalDisposition) {
+    final_properties_after_dispatch_at(
+        properties,
+        receipt,
+        completion,
+        trigger_at,
+        trigger_offset,
+        repeat,
+        misfire_now(),
+    )
+}
+
+pub(super) fn final_properties_after_dispatch_at(
+    mut properties: Value,
+    receipt: Value,
+    completion: &DispatchCompletion,
+    trigger_at: DateTime<Utc>,
+    trigger_offset: FixedOffset,
+    repeat: &Option<String>,
+    finalized_at: DateTime<Utc>,
+) -> (Value, FinalDisposition) {
+    let catch_up = receipt.get("version").and_then(Value::as_u64) == Some(CATCH_UP_RECEIPT_VERSION);
+    if catch_up
+        && receipt
+            .get("scheduled_for")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+            .is_some_and(|selected| selected > trigger_at)
+    {
+        properties["missed_at"] = json!(receipt["decision_at"]);
+    }
+    let advance = |properties: &mut Value| {
+        if catch_up {
+            advance_repeat_past_missed_for_event(properties, repeat, trigger_at, finalized_at)
+        } else {
+            next_trigger_at_for_event(properties, repeat, trigger_at)
+        }
+    };
     let completed_at = receipt
         .get("completed_at")
         .and_then(Value::as_i64)
@@ -602,7 +755,7 @@ pub(super) fn final_properties_after_dispatch(
                 object.remove(error_at_key);
             }
             properties["fired_at"] = json!(completed_at_rfc);
-            match next_trigger_at_for_event(&mut properties, repeat, trigger_at) {
+            match advance(&mut properties) {
                 Ok(Some(next_at)) => {
                     properties["trigger_at"] =
                         json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
@@ -622,7 +775,18 @@ pub(super) fn final_properties_after_dispatch(
         DispatchCompletion::Failed(error) => {
             properties[error_key] = json!(error.as_str());
             properties[error_at_key] = json!(completed_at_rfc);
-            match next_trigger_at_for_event(&mut properties, repeat, trigger_at) {
+            if catch_up
+                && error
+                    .payload
+                    .as_ref()
+                    .is_some_and(action_error_disposition_may_have_committed)
+            {
+                properties["dispatch_receipt"]["state"] =
+                    json!(DispatchReceiptState::Indeterminate.as_str());
+                properties["status"] = json!("failed");
+                return (properties, FinalDisposition::Indeterminate);
+            }
+            match advance(&mut properties) {
                 Ok(Some(next_at)) => {
                     properties["trigger_at"] =
                         json!(next_at.with_timezone(&trigger_offset).to_rfc3339());

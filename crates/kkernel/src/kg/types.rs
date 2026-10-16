@@ -14,7 +14,7 @@ pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
     Validate(ValidateArgs),
 
-    /// Initialize `.khive/kg/` and write `.khive/khive.toml` with defaults.
+    /// Initialize `.khive/kg/` and write `.khive/config.toml` with defaults.
     Init(InitArgs),
 
     /// Fetch a remote KG archive into `.khive/kg/remotes/<remote>/`.
@@ -23,6 +23,9 @@ pub enum KgCommand {
     /// reaches the same implementation.
     #[command(visible_alias = "sync")]
     Fetch(FetchArgs),
+
+    /// Resolve a remote Git ref and update its commit in `.khive/kg/schema.yaml`.
+    Update(UpdateArgs),
 
     /// Export a namespace-scoped KG archive from a SQLite DB.
     Export(ExportArgs),
@@ -33,6 +36,9 @@ pub enum KgCommand {
     /// Compare DB state against `.khive/kg/{entities,edges}.ndjson`.
     Status(StatusArgs),
 
+    /// Render entity and edge changes in the working tree against a Git commit.
+    Diff(DiffArgs),
+
     /// Manage the pre-commit hook for KG validation.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -42,6 +48,33 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+/// CLI arguments for `kkernel kg update`.
+#[derive(clap::Parser, Debug)]
+pub struct UpdateArgs {
+    /// Remote name in `.khive/kg/schema.yaml`.
+    pub remote: String,
+
+    /// Repository containing `.khive/kg/schema.yaml`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Git ref to resolve; defaults to the remote's `ref`, then its HEAD.
+    #[arg(long = "ref")]
+    pub git_ref: Option<String>,
+}
+
+/// CLI arguments for the read-only `kkernel kg diff` renderer.
+#[derive(clap::Parser, Debug)]
+pub struct DiffArgs {
+    /// Commit, tag or branch to compare the working tree against.
+    #[arg(default_value = "HEAD")]
+    pub reference: String,
+
+    /// Repository containing `.khive/kg/`.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
 }
 
 /// CLI arguments for `kkernel kg validate`.
@@ -174,9 +207,13 @@ pub struct ImportArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Import format. Default is the `KgArchive` JSON envelope.
-    #[arg(long, value_enum, default_value_t = ImportFormat::Archive)]
-    pub format: ImportFormat,
+    /// Import format. Infer CSV, TSV or BibTeX by extension; otherwise use archive JSON.
+    #[arg(long, value_enum)]
+    pub format: Option<ImportFormat>,
+
+    /// Entity kind for CSV/TSV rows with a missing or blank kind.
+    #[arg(long)]
+    pub default_kind: Option<String>,
 
     /// Print adapter warnings to stderr.
     #[arg(long)]
@@ -189,6 +226,9 @@ pub enum ImportFormat {
     Archive,
     Json,
     Ndjson,
+    Csv,
+    Tsv,
+    Bibtex,
 }
 
 /// CLI arguments for `kkernel kg status`.
@@ -420,26 +460,7 @@ pub struct ValidationReport {
     pub summary: ValidationSummary,
 }
 
-/// Result for a single validation rule in a `kkernel kg validate` run.
-#[derive(Debug, Serialize)]
-pub struct RuleResult {
-    pub id: String,
-    pub severity: &'static str,
-    pub passed: bool,
-    pub violations: Vec<Violation>,
-}
-
-/// A single rule violation with location metadata and a fixability flag.
-#[derive(Debug, Serialize)]
-pub struct Violation {
-    pub entity_id: Option<String>,
-    pub entity_name: Option<String>,
-    pub entity_kind: Option<String>,
-    pub rule_id: String,
-    pub severity: &'static str,
-    pub message: String,
-    pub fixable: bool,
-}
+pub use khive_rule_evaluator::{RuleResult, Violation};
 
 /// Aggregate counts from a `kkernel kg validate` run.
 #[derive(Debug, Serialize)]

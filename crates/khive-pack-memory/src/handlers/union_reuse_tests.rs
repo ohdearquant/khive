@@ -127,7 +127,7 @@ fn vector_only_recall_keeps_union_order_scores_and_source_metadata() {
         fuse_strategy: FusionStrategy::VectorOnly,
         ..RecallConfig::default()
     };
-    let hits = fuse_candidates(&candidates, &memory_ids, &config, 10);
+    let hits = fuse_candidates(&candidates, &memory_ids, &config, 10).unwrap();
     assert_eq!(
         hits.iter()
             .map(|hit| (hit.entity_id, hit.score.to_raw()))
@@ -143,7 +143,7 @@ fn vector_only_recall_keeps_union_order_scores_and_source_metadata() {
         assert!(hit.title.is_none());
         assert!(hit.snippet.is_none());
     }
-    let limited = fuse_candidates(&candidates, &memory_ids, &config, 2);
+    let limited = fuse_candidates(&candidates, &memory_ids, &config, 2).unwrap();
     assert_eq!(
         limited.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
         vec![one, two]
@@ -185,7 +185,7 @@ fn two_model_weighted_recall_keeps_text_slot_and_literal_fixed_point_scores() {
         },
         ..RecallConfig::default()
     };
-    let hits = fuse_candidates(&candidates, &memory_ids, &config, 10);
+    let hits = fuse_candidates(&candidates, &memory_ids, &config, 10).unwrap();
     assert_eq!(
         hits.iter()
             .map(|hit| (hit.entity_id, hit.score.to_raw()))
@@ -210,7 +210,7 @@ fn two_model_weighted_recall_keeps_text_slot_and_literal_fixed_point_scores() {
             khive_runtime::RankScoreKind::Weighted
         ));
     }
-    let limited = fuse_candidates(&candidates, &memory_ids, &config, 3);
+    let limited = fuse_candidates(&candidates, &memory_ids, &config, 3).unwrap();
     assert_eq!(
         limited.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
         vec![two, text_only, three]

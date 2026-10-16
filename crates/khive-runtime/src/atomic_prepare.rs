@@ -112,7 +112,7 @@ mod link_merge;
 use link_merge::{parse_edge_relation, prepare_link, prepare_merge};
 
 mod post_commit;
-use post_commit::apply_one_post_commit_effect;
+pub(crate) use post_commit::apply_one_post_commit_effect;
 pub use post_commit::{apply_post_commit_effects, apply_post_commit_effects_with_report};
 
 mod edge_delete;

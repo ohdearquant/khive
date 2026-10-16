@@ -268,10 +268,12 @@ fn selected_models(
     requested: Option<&str>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     let mut engines = Vec::new();
-    if let Some(config) = config.filter(|config| !config.engines.is_empty()) {
+    if let Some(config) =
+        config.filter(|config| config.engines_declared || !config.engines.is_empty())
+    {
         for engine in &config.engines {
             let model = rt
-                .resolve_embedding_model(Some(&engine.model))
+                .resolve_embedding_model(Some(&engine.name))
                 .map_err(|error| anyhow!("{error}"))?
                 .to_string();
             engines.push((engine.name.clone(), model));

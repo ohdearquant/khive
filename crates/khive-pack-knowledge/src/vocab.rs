@@ -1,4 +1,4 @@
-//! Static handler descriptor table for the knowledge pack (19 verbs + 1 subhandler).
+//! Static handler descriptor table for the knowledge pack (21 verbs + 1 subhandler).
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
@@ -12,7 +12,7 @@ pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
     khive_runtime::sql!("knowledge_eval_runs_ns_run_at_index"),
 ];
 
-pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -77,6 +77,19 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
+    },
+    HandlerDef {
+        name: "knowledge.export",
+        description: "Export the selected namespace's live corpus rows as deterministic JSONL data with atom/domain/section counts. Includes domain mirror atoms, every lifecycle status and retired sections; excludes vectors and sections of deleted atoms. Does not write a file or export the KG graph.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "format",
+            param_type: "string",
+            required: false,
+            description: "Output format: jsonl (the default and only supported value)",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
     },
     HandlerDef {
         name: "knowledge.list",
@@ -706,6 +719,29 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
         ],
     },
+    HandlerDef {
+        name: "knowledge.lint",
+        description: "Inspect the caller-visible graph with thirteen built-in hygiene rules and complete pre-fix statistics. fix=true requests three guarded repair families with per-action committed/conflict/unsupported receipts; partial failures retain confirmed effects and typed settlement evidence. Corpus atoms and sections are separate from graph records. Classified Write, including inspection and stats-only.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "rules", param_type: "array of string", required: false,
+                description: "Omit for all thirteen built-ins, or a nonempty array of exact IDs: orphan-entity, dangling-edge, min-edge-density, direction-violation, missing-entity-type, missing-introduced-by, missing-implements, duplicate-name, superseded-not-marked, concept-no-parent, paper-missing-metadata, low-weight-edge, note-no-annotates. Repeated IDs run once. Sole stats-only returns exactly {stats} and cannot combine with fix=true. Nulls and unknown IDs refuse.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "fix", param_type: "boolean", required: false,
+                description: "Default false. True prepares every reported fix candidate before any mutation, then checks each observed revision/witness in its owning database. Ordinary create/update/delete gates still apply. Adds fixes and summary.fixed (confirmed commits only); never automatically merges duplicate entities. Wrong types and null refuse.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "severity", param_type: "string", required: false,
+                description: "Exact error | warn | info, default warn. Minimum reported severity; statistics always cover the full visible observation before fixes. Does not change rule severity. Invalid spellings, wrong types and null refuse.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     // ── feedback tier ─────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.feedback",
@@ -738,193 +774,5 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
 ];
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn find_handler(name: &str) -> &'static HandlerDef {
-        KNOWLEDGE_HANDLERS
-            .iter()
-            .find(|h| h.name == name)
-            .unwrap_or_else(|| panic!("handler {name:?} not found in KNOWLEDGE_HANDLERS"))
-    }
-
-    /// knowledge.edit sections param must document the closed section_type enum (8 values) and
-    /// the 80-character content minimum (#160).
-    #[test]
-    fn knowledge_edit_sections_documents_enum_and_content_minimum() {
-        let h = find_handler("knowledge.edit");
-        let sections = h
-            .params
-            .iter()
-            .find(|p| p.name == "sections")
-            .expect("knowledge.edit must have a sections param");
-        assert!(
-            sections.description.contains("80"),
-            "knowledge.edit sections description must document the 80-character content minimum"
-        );
-        // Every member of the closed enum is listed, and the retired names are not.
-        for name in khive_brain_core::SectionType::NAMES {
-            assert!(
-                sections.description.contains(name),
-                "knowledge.edit sections description must list '{name}' as a valid section_type"
-            );
-        }
-        for retired in khive_brain_core::SectionType::RETIRED_NAMES {
-            assert!(
-                !sections.description.contains(retired),
-                "knowledge.edit sections description must not list the retired '{retired}'"
-            );
-        }
-        // Verify the description calls out the closed-enum nature so callers know unrecognized
-        // values are rejected (not silently coerced).
-        assert!(
-            sections.description.contains("closed enum"),
-            "knowledge.edit sections description must state that section_type is a closed enum"
-        );
-    }
-
-    /// Parameter-parity guard (cross-model tooling evaluation, "compose budget
-    /// discoverability"): the top-level field names each handler's `#[derive(Deserialize)]`
-    /// params struct actually accepts, hand-kept in sync with
-    /// `src/knowledge/schema.rs` and `src/handlers.rs`. Every verb's entry here must be
-    /// exactly the set of top-level param names advertised in `KNOWLEDGE_HANDLERS` for
-    /// that verb (order-independent) -- so a field added to a params struct without a
-    /// matching `ParamDef` (or a stale `ParamDef` for a removed field) fails this test
-    /// instead of silently drifting from the actual accepted request shape.
-    ///
-    /// Nested/child structs (e.g. `AtomInput` within `upsert_atoms.atoms`,
-    /// `FoldCandidate` within `fold.candidates`) are documented in prose inside the
-    /// parent `ParamDef.description` rather than as separate top-level entries here.
-    fn expected_params() -> &'static [(&'static str, &'static [&'static str])] {
-        &[
-            (
-                "knowledge.upsert_atoms",
-                &["atoms", "chunk_size", "dry_run"],
-            ),
-            ("knowledge.upsert_domains", &["domains"]),
-            ("knowledge.get", &["id", "include_sections"]),
-            (
-                "knowledge.list",
-                &[
-                    "type",
-                    "limit",
-                    "offset",
-                    "after",
-                    "fields",
-                    "status",
-                    "exclude_status",
-                ],
-            ),
-            ("knowledge.delete_atoms", &["ids", "cascade"]),
-            ("knowledge.stats", &[]),
-            ("knowledge.eval_retrieval", &["query_set"]),
-            (
-                "knowledge.index",
-                &["ids", "batch_size", "insert_only", "rebuild_ann"],
-            ),
-            (
-                "knowledge.fold",
-                &[
-                    "candidates",
-                    "budget",
-                    "min_score",
-                    "category_weights",
-                    "diversity_bias",
-                    "epistemic_weight",
-                ],
-            ),
-            (
-                "knowledge.search",
-                &[
-                    "query",
-                    "type",
-                    "include_drafts",
-                    "status",
-                    "exclude_status",
-                    "role",
-                    "limit",
-                    "min_score",
-                    "weights",
-                    "decompose",
-                    "decompose_threshold",
-                    "intersection_bonus",
-                    "rerank",
-                    "rerank_alpha",
-                ],
-            ),
-            ("knowledge.suggest", &["query", "role", "limit"]),
-            (
-                "knowledge.compose",
-                &[
-                    "namespace",
-                    "domain_ids",
-                    "atom_ids",
-                    "query",
-                    "blend_kg",
-                    "auto_limit",
-                    "max_tokens",
-                    "explain",
-                ],
-            ),
-            ("knowledge.edit", &["id", "sections"]),
-            ("knowledge.import", &["path", "format", "chunk_strategy"]),
-            (
-                "knowledge.challenge",
-                &["atom_id", "section_type", "content_hash", "reason"],
-            ),
-            (
-                "knowledge.adjudicate",
-                &["atom_id", "section_type", "content_hash", "resolution"],
-            ),
-            (
-                "knowledge.learn",
-                &["name", "description", "domain", "tags"],
-            ),
-            ("knowledge.cite", &["concept_id", "source_id", "weight"]),
-            ("knowledge.topic", &["domain", "query", "limit"]),
-            (
-                "knowledge.feedback",
-                &[
-                    "section_signals",
-                    "target_id",
-                    "signal",
-                    "served_by_profile_id",
-                ],
-            ),
-        ]
-    }
-
-    #[test]
-    fn advertised_params_match_expected_deserialized_fields_for_every_verb() {
-        for (verb, expected) in expected_params() {
-            let h = find_handler(verb);
-            let mut advertised: Vec<&str> = h.params.iter().map(|p| p.name).collect();
-            let mut expected: Vec<&str> = expected.to_vec();
-            advertised.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(
-                advertised, expected,
-                "{verb}: advertised params {advertised:?} do not match the params \
-                 struct's deserialized fields {expected:?} -- update either the \
-                 `ParamDef`s in KNOWLEDGE_HANDLERS or the `expected_params()` table \
-                 in this test (whichever is stale)"
-            );
-        }
-    }
-
-    /// Every verb declared in `KNOWLEDGE_HANDLERS` must have a parity row above --
-    /// otherwise a newly added verb could silently escape this guard.
-    #[test]
-    fn every_handler_has_a_parity_row() {
-        let covered: std::collections::HashSet<&str> =
-            expected_params().iter().map(|(name, _)| *name).collect();
-        for h in KNOWLEDGE_HANDLERS.iter() {
-            assert!(
-                covered.contains(h.name),
-                "{}: no entry in expected_params() -- add one so parameter drift \
-                 on this verb cannot silently return",
-                h.name
-            );
-        }
-    }
-}
+#[path = "vocab_tests.rs"]
+mod tests;

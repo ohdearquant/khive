@@ -11,7 +11,11 @@ description = "The two non-credential keys in the cache lock serialization fixtu
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^(abcdef0123456789|fedcba9876543210)$''']
-paths = ['''^crates/khive-pack-git/src/cache\.rs$''']
+# Keep the original exact path for history scans after moving the fixture.
+paths = [
+  '''^crates/khive-pack-git/src/cache\.rs$''',
+  '''^crates/khive-pack-git/src/cache_tests\.rs$''',
+]
 
 # The secret gate's own tests must contain values the gate refuses, so these two constants are
 # inputs rather than credentials. They are exempted by value and by path, not by fingerprint: a

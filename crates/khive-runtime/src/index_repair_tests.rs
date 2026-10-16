@@ -147,10 +147,10 @@ async fn ann_count(runtime: &KhiveRuntime) -> i64 {
         .reader()
         .await
         .unwrap()
-        .query_scalar(statement(
-            "SELECT COUNT(*) FROM ann_write_log".into(),
-            vec![],
-        ))
+        .query_scalar(
+            SqlStatement::new("SELECT COUNT(*) FROM ann_write_log", vec![])
+                .labelled("record-index-repair"),
+        )
         .await
         .unwrap()
     {
@@ -998,14 +998,17 @@ async fn writer_rechecks_source_revision_and_deletion_before_every_repair() {
                     .writer()
                     .await
                     .unwrap()
-                    .execute(statement(
-                        format!(
-                            "UPDATE {} SET version=version+1{} WHERE id=?1",
-                            record.tables().0,
-                            if deletion { ", deleted_at=1" } else { "" }
-                        ),
-                        vec![SqlValue::Text(id.to_string())],
-                    ))
+                    .execute(
+                        SqlStatement::new(
+                            format!(
+                                "UPDATE {} SET version=version+1{} WHERE id=?1",
+                                record.tables().0,
+                                if deletion { ", deleted_at=1" } else { "" }
+                            ),
+                            vec![SqlValue::Text(id.to_string())],
+                        )
+                        .labelled("record-index-repair"),
+                    )
                     .await
                     .unwrap();
                 barriers.1.wait().await;

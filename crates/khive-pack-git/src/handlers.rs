@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use khive_runtime::error::ResolutionFacts;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
 use crate::cache::{self, CacheError};
 use crate::ingest::{
@@ -216,6 +216,16 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
+        let project = match params.get("project") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(raw)) => Some(raw.as_str()),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "project must be a string when provided".into(),
+                ))
+            }
+        };
+
         // Commits need a repository to walk. Issues and pull requests are
         // source-bound `gh` API reads, so a remote API-only request uses a
         // neutral working directory and never clones unused git history.
@@ -259,7 +269,7 @@ impl GitPack {
         };
 
         // Resolve or auto-create the repo-anchor `project` entity.
-        let resolution = match params.get("project").and_then(Value::as_str) {
+        let resolution = match project {
             Some(raw) => {
                 let id = resolve_project_id(self.runtime(), raw)
                     .await
@@ -418,7 +428,7 @@ async fn resolve_or_create_project(
     let identity = repo_identity(source).await;
     let name = repo_basename(source);
 
-    let slug_matches = find_projects_by_slug(runtime, token, &identity)
+    let slug_matches = find_projects(runtime, token, &identity, PROJECTS_BY_SLUG)
         .await
         .map_err(digest_failure_to_runtime)?;
     if let Some((id, duplicates)) = slug_matches.split_first() {
@@ -447,7 +457,7 @@ async fn resolve_or_create_project(
         });
     }
 
-    let exact_matches = find_projects_by_legacy_repo_url(runtime, token, &repo_url)
+    let exact_matches = find_projects(runtime, token, &repo_url, PROJECTS_BY_LEGACY_REPO_URL)
         .await
         .map_err(digest_failure_to_runtime)?;
     if let Some((id, duplicates)) = exact_matches.split_first() {
@@ -563,38 +573,44 @@ fn append_unique_ids(target: &mut Vec<Uuid>, candidates: impl IntoIterator<Item 
     }
 }
 
+struct ProjectQuery<T> {
+    statement: &'static str,
+    label: &'static str,
+    decode: fn(&SqlRow) -> Option<T>,
+}
+
+async fn find_projects<T>(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    value: &str,
+    query: ProjectQuery<T>,
+) -> anyhow::Result<Vec<T>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: query.statement.into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(value.to_string()),
+            ],
+            label: Some(query.label.into()),
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
+    Ok(rows.iter().filter_map(query.decode).collect())
+}
+
 // Multiple live anchors can carry one slug when two legacy anchors holding
 // different URL spellings of the same repository were each exact-matched and
 // backfilled on separate ingests. Selection must be deterministic (oldest
 // `created_at`, id tie-break) and the condition surfaced as a report warning,
 // never an arbitrary or silent pick (ADR-088 Amendment 2).
-async fn find_projects_by_slug(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    identity: &str,
-) -> anyhow::Result<Vec<Uuid>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_by_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_projects_by_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| match r.get("id") {
-            Some(SqlValue::Uuid(u)) => Some(*u),
-            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-            _ => None,
-        })
-        .collect())
-}
+const PROJECTS_BY_SLUG: ProjectQuery<Uuid> = ProjectQuery {
+    statement: sql!("projects_by_slug_select"),
+    label: "git_digest_find_projects_by_slug",
+    decode: |row| row.uuid("id").ok(),
+};
 
 /// Exact step-2 legacy match (ADR-088 Amendment 2): every live pre-slug
 /// anchor whose stored `repo_url` equals the source spelling verbatim,
@@ -605,116 +621,62 @@ async fn find_projects_by_slug(
 /// route: canonical ones are found by step 1, while differing slugs require
 /// normalized URL evidence below. Raw equality alone never overwrites an
 /// already-derived identity.
-async fn find_projects_by_legacy_repo_url(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    repo_url: &str,
-) -> anyhow::Result<Vec<Uuid>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_by_legacy_repo_url_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(repo_url.to_string()),
-            ],
-            label: Some("git_digest_find_projects_by_legacy_repo_url".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| match r.get("id") {
-            Some(SqlValue::Uuid(u)) => Some(*u),
-            Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-            _ => None,
-        })
-        .collect())
-}
+const PROJECTS_BY_LEGACY_REPO_URL: ProjectQuery<Uuid> = ProjectQuery {
+    statement: sql!("projects_by_legacy_repo_url_select"),
+    label: "git_digest_find_projects_by_legacy_repo_url",
+    decode: |row| row.uuid("id").ok(),
+};
 
 /// Fetch every live `project` anchor whose slug is absent or differs from
 /// the source identity. These are candidates for step-2 normalized URL
 /// reconciliation; exact canonical-slug anchors remain exclusively in the
 /// higher-precedence step-1 lookup. SQL ordering makes candidate selection
 /// deterministic before the async normalization pass (#1708).
-async fn find_projects_without_canonical_slug(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    identity: &str,
-) -> anyhow::Result<Vec<(Uuid, String)>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("projects_without_canonical_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_projects_without_canonical_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            let id = match r.get("id") {
-                Some(SqlValue::Uuid(u)) => Some(*u),
-                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-                _ => None,
-            }?;
-            let url = match r.get("repo_url") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            }?;
-            Some((id, url))
-        })
-        .collect())
-}
+const PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String)> = ProjectQuery {
+    statement: sql!("projects_without_canonical_slug_select"),
+    label: "git_digest_find_projects_without_canonical_slug",
+    decode: |row| {
+        let id = row.uuid("id").ok()?;
+        let url = row.text_or_none("repo_url")?.to_owned();
+        Some((id, url))
+    },
+};
 
 /// Fetch every soft-deleted anchor outside the canonical slug tier and carry
 /// each row's own `deleted_at` so callers can normalize, deduplicate, and
 /// merge-sort tombstones by recency alongside an exact-match set. This is the
 /// tombstone counterpart of the live step-2 candidate scan: both absent and
 /// present-but-noncanonical slugs remain URL-reconciliation candidates.
-async fn find_soft_deleted_projects_without_canonical_slug(
+const SOFT_DELETED_PROJECTS_WITHOUT_CANONICAL_SLUG: ProjectQuery<(Uuid, String, i64)> =
+    ProjectQuery {
+        statement: sql!("soft_deleted_projects_without_canonical_slug_select"),
+        label: "git_digest_find_soft_deleted_projects_without_canonical_slug",
+        decode: |row| {
+            let id = row.uuid("id").ok()?;
+            let deleted_at = row.i64_or_none("deleted_at").unwrap_or(0);
+            let url = row.text_or_none("repo_url")?.to_owned();
+            Some((id, url, deleted_at))
+        },
+    };
+
+// Preserve the historical fixture entry points while every production lookup
+// uses the real parameterized helper above.
+#[cfg(test)]
+async fn find_projects_by_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     identity: &str,
-) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
-    let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let rows = r
-        .query_all(SqlStatement {
-            sql: sql!("soft_deleted_projects_without_canonical_slug_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(identity.to_string()),
-            ],
-            label: Some("git_digest_find_soft_deleted_projects_without_canonical_slug".into()),
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            let id = match r.get("id") {
-                Some(SqlValue::Uuid(u)) => Some(*u),
-                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-                _ => None,
-            }?;
-            let deleted_at = match r.get("deleted_at") {
-                Some(SqlValue::Integer(n)) => *n,
-                _ => 0,
-            };
-            let url = match r.get("repo_url") {
-                Some(SqlValue::Text(s)) => Some(s.clone()),
-                _ => None,
-            }?;
-            Some((id, url, deleted_at))
-        })
-        .collect())
+) -> anyhow::Result<Vec<Uuid>> {
+    find_projects(runtime, token, identity, PROJECTS_BY_SLUG).await
+}
+
+#[cfg(test)]
+async fn find_projects_by_legacy_repo_url(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    repo_url: &str,
+) -> anyhow::Result<Vec<Uuid>> {
+    find_projects(runtime, token, repo_url, PROJECTS_BY_LEGACY_REPO_URL).await
 }
 
 /// Return live anchors outside the canonical slug tier whose own stored
@@ -726,7 +688,8 @@ async fn find_normalized_noncanonical_matches(
     token: &NamespaceToken,
     identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String)>> {
-    let candidates = find_projects_without_canonical_slug(runtime, token, identity).await?;
+    let candidates =
+        find_projects(runtime, token, identity, PROJECTS_WITHOUT_CANONICAL_SLUG).await?;
     let mut matches = Vec::new();
     for (id, candidate_repo_url) in candidates {
         if normalize_stored_repo_url(&candidate_repo_url)
@@ -811,11 +774,7 @@ async fn find_orphaned_anchor(
     let mut dead_projects: Vec<(Uuid, i64)> = rows
         .iter()
         .filter_map(|r| {
-            let id = match r.get("id") {
-                Some(SqlValue::Uuid(u)) => Some(*u),
-                Some(SqlValue::Text(s)) => Uuid::parse_str(s).ok(),
-                _ => None,
-            }?;
+            let id = r.uuid("id").ok()?;
             let deleted_at = match r.get("deleted_at") {
                 Some(SqlValue::Integer(n)) => *n,
                 _ => 0,
@@ -829,8 +788,13 @@ async fn find_orphaned_anchor(
     // same repository (one that would normalize to the same identity).
     // Extend the tombstone scan with the same normalize-and-compare step
     // the live step-2 path already uses, scoped to soft-deleted rows.
-    let normalized_tombstones =
-        find_soft_deleted_projects_without_canonical_slug(runtime, token, identity).await?;
+    let normalized_tombstones = find_projects(
+        runtime,
+        token,
+        identity,
+        SOFT_DELETED_PROJECTS_WITHOUT_CANONICAL_SLUG,
+    )
+    .await?;
     let mut already_matched: std::collections::HashSet<Uuid> =
         dead_projects.iter().map(|(id, _)| *id).collect();
     for (id, candidate_repo_url, deleted_at) in normalized_tombstones {

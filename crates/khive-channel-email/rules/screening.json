@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "description": "Deterministic inbound screening rules (ADR-200 sections 8.3 and 8.4). Phrase terms are matched case-insensitively over whitespace-collapsed text. A rule fires when any of its terms matches. Terms written as a bracketed token (<cf>, <attachment>, <no-text-part>) select a structural matcher rather than a literal phrase.",
+  "families": {
+    "hidden_text": "Unicode format characters (category Cf) outside emoji sequences, or HTML text hidden from a sighted reader while the plain-text part does not carry the same words.",
+    "agent_addressed": "Text addressed to an automated reader: instruction-override phrases, role claims, and requests to reveal or change instructions.",
+    "action_request": "Requests to run, install or execute something, pipe a download into a shell, connect to a server or tool endpoint, or supply a credential, token or password.",
+    "executable_attachment": "An attachment whose declared or sniffed type is executable or a script.",
+    "html_only": "No text/plain part; the message is delivered with text extracted from the HTML.",
+    "opt_out": "Explicit opt-out phrasing in the subject or the first non-quoted paragraph. Drives the unsubscribe entry point and never changes the delivery outcome."
+  },
+  "rules": [
+    {
+      "id": "hidden_text.cf_character",
+      "family": "hidden_text",
+      "description": "A Unicode format (Cf) character that can hide or reorder text for a sighted reader. Emoji zero-width joiners and tag characters inside an emoji sequence are excluded.",
+      "match": [
+        "<cf>"
+      ]
+    },
+    {
+      "id": "hidden_text.html_display_none",
+      "family": "hidden_text",
+      "description": "HTML text whose style sets the display property to none, while the plain-text part does not carry the same text. The property is listed here; the value test lives in the matcher.",
+      "match": [
+        "<html-hidden:display>"
+      ]
+    },
+    {
+      "id": "hidden_text.html_visibility_hidden",
+      "family": "hidden_text",
+      "description": "HTML text whose style sets the visibility property to hidden, while the plain-text part does not carry the same text.",
+      "match": [
+        "<html-hidden:visibility>"
+      ]
+    },
+    {
+      "id": "hidden_text.html_zero_font",
+      "family": "hidden_text",
+      "description": "HTML text whose style sets the font-size property to a zero length, while the plain-text part does not carry the same text.",
+      "match": [
+        "<html-hidden:font-size>"
+      ]
+    },
+    {
+      "id": "hidden_text.html_same_colour",
+      "family": "hidden_text",
+      "description": "HTML text whose colour equals its background colour, while the plain-text part does not carry the same text.",
+      "match": [
+        "<html-hidden:color>"
+      ]
+    },
+    {
+      "id": "agent_addressed.override",
+      "family": "agent_addressed",
+      "description": "An instruction-override phrase addressed to an automated reader.",
+      "match": [
+        "ignore your previous instructions",
+        "ignore all previous instructions",
+        "ignore previous instructions",
+        "ignore the previous instructions",
+        "disregard your previous instructions",
+        "disregard all previous instructions",
+        "disregard previous instructions",
+        "ignore your instructions",
+        "disregard your instructions",
+        "ignore all prior instructions"
+      ]
+    },
+    {
+      "id": "agent_addressed.role_claim",
+      "family": "agent_addressed",
+      "description": "A role claim that reframes the reader as a different actor.",
+      "match": [
+        "you are now in",
+        "you are now a",
+        "you are now an",
+        "you are an ai",
+        "you are a language model",
+        "as an ai assistant",
+        "as the assistant reading"
+      ]
+    },
+    {
+      "id": "agent_addressed.reveal_or_change",
+      "family": "agent_addressed",
+      "description": "A request to reveal or change the reader's instructions or configuration.",
+      "match": [
+        "your system prompt",
+        "your original instructions",
+        "reveal your instructions",
+        "print your instructions",
+        "change your instructions",
+        "repeat your instructions"
+      ]
+    },
+    {
+      "id": "action_request.pipe_to_shell",
+      "family": "action_request",
+      "description": "A download piped into a shell.",
+      "match": [
+        "| sh",
+        "| bash",
+        "| zsh",
+        "|sh",
+        "|bash",
+        "|zsh"
+      ]
+    },
+    {
+      "id": "action_request.install_or_execute",
+      "family": "action_request",
+      "description": "A request to run, install or execute a command, or to connect the reader to a server or tool endpoint.",
+      "match": [
+        "run curl",
+        "run wget",
+        "run the following command",
+        "run this command",
+        "execute the following",
+        "execute this script",
+        "please install",
+        "install the package",
+        "then install",
+        "connect to"
+      ]
+    },
+    {
+      "id": "action_request.credential",
+      "family": "action_request",
+      "description": "A request for the reader's own credential, token or password.",
+      "match": [
+        "stored in your configuration",
+        "stored in your config",
+        "your password",
+        "your api token",
+        "your api key",
+        "your access token",
+        "your secret",
+        "your credentials",
+        "send me your token",
+        "reply with the api token",
+        "reply with your token",
+        "reply with the token"
+      ]
+    },
+    {
+      "id": "executable_attachment.declared_or_sniffed",
+      "family": "executable_attachment",
+      "description": "An attachment whose declared content type, file name extension, or leading bytes mark it as executable or a script (for example a PE image starting with MZ, or a #! script header).",
+      "match": [
+        "<attachment>"
+      ]
+    },
+    {
+      "id": "html_only.no_text_part",
+      "family": "html_only",
+      "description": "No text/plain part; the message is delivered with text extracted from the HTML.",
+      "match": [
+        "<no-text-part>"
+      ]
+    },
+    {
+      "id": "opt_out.unsubscribe",
+      "family": "opt_out",
+      "description": "An explicit opt-out phrase in the subject or the first non-quoted paragraph.",
+      "match": [
+        "unsubscribe",
+        "remove me",
+        "opt out",
+        "opt-out",
+        "take me off",
+        "stop emailing",
+        "stop sending",
+        "stop contacting",
+        "don't email me",
+        "don\u2019t email me",
+        "dont email me",
+        "do not email me",
+        "don't contact me",
+        "don\u2019t contact me",
+        "do not contact me",
+        "no more emails"
+      ]
+    }
+  ]
+}
