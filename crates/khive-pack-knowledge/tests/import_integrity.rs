@@ -91,7 +91,10 @@ async fn import_walk_preserves_hidden_files_case_filter_and_nested_provenance() 
     }
 }
 
-#[cfg(unix)]
+// The fixture needs a file whose name is not valid UTF-8. APFS refuses such
+// names at creation (EILSEQ), so the test runs only where the filesystem
+// accepts them.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn import_checks_all_filename_identities_before_reading_the_first_content() {
     use std::ffi::OsString;
