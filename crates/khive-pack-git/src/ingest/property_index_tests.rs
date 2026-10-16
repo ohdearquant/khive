@@ -7,28 +7,18 @@ use std::sync::Arc;
 
 const SHA_INDEX: &str = "idx_git_notes_live_commit_sha";
 const NUMBER_INDEX: &str = "idx_git_notes_live_number_project";
-const LEGACY_GIT_PROPERTY_INDEXES: &str =
-    include_str!("../../sql/legacy-note-property-indexes-fixture.sql");
-
-// Explicit historical fixture, separate from the current auxiliary-only pack plan.
-fn install_historical_property_indexes(runtime: &KhiveRuntime) {
-    runtime
-        .backend()
-        .pool()
-        .try_writer()
-        .unwrap()
-        .conn()
-        .execute_batch(LEGACY_GIT_PROPERTY_INDEXES)
-        .unwrap();
-}
+const EXPECT_GIT_PROPERTY_INDEXES: bool = true;
+const GIT_CORE_INDEXES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../khive-db/sql/049-git-note-property-indexes.sql"
+));
 
 fn configure_property_indexes(runtime: &KhiveRuntime, indexed: bool) {
     if indexed {
-        install_historical_property_indexes(runtime);
         install(runtime);
     } else {
         runtime.backend().pool().try_writer().unwrap().conn().execute_batch(
-            "DROP INDEX IF EXISTS idx_git_notes_live_commit_sha; DROP INDEX IF EXISTS idx_git_notes_live_number_project; DROP INDEX IF EXISTS idx_git_notes_history_canonical_sha; DROP INDEX IF EXISTS idx_git_notes_history_noncanonical"
+            "DROP INDEX idx_git_notes_live_commit_sha; DROP INDEX idx_git_notes_live_number_project; DROP INDEX idx_git_notes_history_canonical_sha; DROP INDEX idx_git_notes_history_noncanonical"
         ).unwrap();
     }
 }
@@ -49,9 +39,9 @@ fn file_runtime(path: &Path, read_only: bool) -> KhiveRuntime {
         .unwrap()
     };
     if !read_only {
-        // from_backend is assembly only. Prepare the core graph/note tables first;
-        // V49 is a no-op, so indexed tests install the historical fixture explicitly.
-        // Keep the readonly historical-inspection arm raw.
+        // from_backend is assembly only. Core migration 049, including its
+        // indexes and the graph tables used by these real queries, must precede
+        // pack schema loading. Keep the readonly historical-inspection arm raw.
         backend.prepare_core_schema().unwrap();
     }
     let runtime = KhiveRuntime::from_backend(Arc::new(backend), RuntimeConfig::no_embeddings());
@@ -248,16 +238,16 @@ async fn bundled_sqlite_uses_property_indexes_for_exact_production_queries() {
         ];
         for (label, sql, params, index) in &queries {
             let before = plan(&runtime, sql, params.clone()).await;
-            assert!(
-                !uses(&before, index),
-                "fresh core must not install historical git indexes: {before:?}"
+            assert_eq!(
+                uses(&before, index),
+                EXPECT_GIT_PROPERTY_INDEXES,
+                "core migration must index without a loaded pack: {before:?}"
             );
             println!(
                 "PROPERTY_PLAN before {label} count={count} {}",
                 json!(before)
             );
         }
-        install_historical_property_indexes(&runtime);
         install(&runtime);
         for analyze in [false, true] {
             if analyze {
@@ -272,9 +262,10 @@ async fn bundled_sqlite_uses_property_indexes_for_exact_production_queries() {
             }
             for (label, sql, params, index) in &queries {
                 let after = plan(&runtime, sql, params.clone()).await;
-                assert!(
+                assert_eq!(
                     uses(&after, index),
-                    "historical fixture {label}: actual plan {after:?}"
+                    EXPECT_GIT_PROPERTY_INDEXES,
+                    "{label}: actual plan {after:?}"
                 );
                 assert_eq!(query(&runtime, sql, params.clone()).await.len(), 1);
                 println!(
@@ -812,11 +803,10 @@ async fn number_duplicates_retain_unspecified_holder_including_invalid_ids() {
 }
 
 #[tokio::test]
-async fn historical_indexes_reopen_idempotently_and_read_only_store_uses_installed_schema() {
+async fn pack_indexes_reopen_idempotently_and_read_only_store_uses_installed_schema() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reopen.db");
     let runtime = file_runtime(&path, false);
-    install_historical_property_indexes(&runtime);
     let project = Uuid::new_v4();
     let id = Uuid::new_v4();
     insert(
@@ -830,7 +820,7 @@ async fn historical_indexes_reopen_idempotently_and_read_only_store_uses_install
     install(&runtime);
     let sql="SELECT name,sql FROM sqlite_master WHERE type='index' AND name IN ('idx_git_notes_live_commit_sha','idx_git_notes_live_number_project') ORDER BY name";
     let first = query(&runtime, sql, vec![]).await;
-    assert_eq!(first.len(), 2);
+    assert_eq!(first.len(), if EXPECT_GIT_PROPERTY_INDEXES { 2 } else { 0 });
     install(&runtime);
     assert_eq!(
         snapshot(&query(&runtime, sql, vec![]).await),
@@ -870,7 +860,7 @@ async fn historical_indexes_reopen_idempotently_and_read_only_store_uses_install
         number_params("issue", 7, project),
     )
     .await;
-    assert!(uses(&actual, NUMBER_INDEX));
+    assert_eq!(uses(&actual, NUMBER_INDEX), EXPECT_GIT_PROPERTY_INDEXES);
     assert!(readonly.backend().is_read_only());
 }
 
@@ -951,7 +941,7 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
         .try_writer()
         .unwrap()
         .conn()
-        .execute_batch(LEGACY_GIT_PROPERTY_INDEXES)
+        .execute_batch(GIT_CORE_INDEXES)
         .unwrap();
     install(&runtime);
     let pack_indexes = query(
@@ -959,7 +949,10 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
         "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_git_notes_live_commit_sha','idx_git_notes_live_number_project')",
         vec![],
     ).await;
-    assert_eq!(pack_indexes.len(), 2);
+    assert_eq!(
+        pack_indexes.len(),
+        if EXPECT_GIT_PROPERTY_INDEXES { 2 } else { 0 }
+    );
     let mut reader = runtime.sql().reader().await.unwrap();
     let count_after = reader
         .query_all(count_statement)
@@ -983,7 +976,7 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
     }
     let writer = runtime.backend().pool().try_writer().unwrap();
     let invalid_live = writer.conn().execute("INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at) VALUES('invalid-live-after','local','commit','{',1,1)",[]);
-    assert!(invalid_live.is_err());
+    assert_eq!(invalid_live.is_err(), EXPECT_GIT_PROPERTY_INDEXES);
 }
 
 #[tokio::test]
@@ -1004,7 +997,6 @@ async fn current_core_notes_schema_retains_live_json_guards() {
 async fn pack_schema_batch_rolls_back_actual_late_sqlite_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = file_runtime(&dir.path().join("rollback.db"), false);
-    install_historical_property_indexes(&runtime);
     let pack = crate::GitPack::new(runtime.clone());
     let plan = pack.schema_plan();
     let mut statements = plan.statements.to_vec();
@@ -1019,7 +1011,7 @@ async fn pack_schema_batch_rolls_back_actual_late_sqlite_refusal() {
     assert_eq!(
         created.len(),
         2,
-        "preexisting historical live indexes survive: {created:?}"
+        "preexisting core live indexes survive: {created:?}"
     );
     assert!(created.iter().all(|row| matches!(row.get("name"), Some(SqlValue::Text(name)) if name.starts_with("idx_git_notes_live_"))), "no partial auxiliary pack install after real SQLite refusal: {created:?}");
     install(&runtime);

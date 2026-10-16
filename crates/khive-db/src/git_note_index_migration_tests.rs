@@ -71,16 +71,13 @@ fn historical_core(conn: &mut Connection) {
 }
 
 #[test]
-fn full_chain_records_v49_noop_without_installing_git_note_indexes() {
+fn full_chain_without_packs_installs_exact_git_note_indexes_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("core.db");
     let mut conn = Connection::open(&path).unwrap();
     assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_definitions(&conn);
     let before = catalog(&conn);
-    assert!(
-        before.is_empty(),
-        "fresh core must not install pack indexes"
-    );
     let pack_tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('git_receipts','git_mirror_cursor')",
@@ -103,11 +100,12 @@ fn full_chain_records_v49_noop_without_installing_git_note_indexes() {
     let readonly =
         Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     validate_schema_is_current(&readonly).unwrap();
+    assert_definitions(&readonly);
     assert_eq!(catalog(&readonly), before);
 }
 
 #[test]
-fn upgrade_and_replay_preserve_historical_index_definitions_and_btrees_without_ddl() {
+fn upgrade_and_replay_preserve_historical_index_definitions_and_btrees() {
     // Cover a pre-V49 two-index database and a database that already recorded
     // the original V49 with all four indexes. Neither may rebuild or lose them.
     for already_applied in [false, true] {
@@ -138,7 +136,7 @@ fn upgrade_and_replay_preserve_historical_index_definitions_and_btrees_without_d
                 | AuthAction::Reindex { index_name } => Some(index_name),
                 _ => None,
             };
-            if name.is_some_and(|name| INDEXES.contains(&name)) {
+            if name.is_some_and(|name| INDEXES[..count].contains(&name)) {
                 recorded.lock().unwrap().push(name.unwrap().to_string());
                 Authorization::Deny
             } else {
@@ -152,13 +150,16 @@ fn upgrade_and_replay_preserve_historical_index_definitions_and_btrees_without_d
             .unwrap();
         assert!(
             attempted.lock().unwrap().is_empty(),
-            "no index CREATE/DROP/REINDEX attempt"
+            "no held index CREATE/DROP/REINDEX attempt"
         );
-        assert_eq!(
-            catalog(&conn),
-            before,
-            "definitions and rootpages retained exactly"
-        );
+        assert_definitions(&conn);
+        let after = catalog(&conn);
+        for held in &before {
+            assert!(
+                after.contains(held),
+                "held definition and rootpage retained exactly: {held:?}"
+            );
+        }
         let ledger: (String, i64) = conn
             .query_row(
                 "SELECT name,applied_at FROM _schema_migrations WHERE version=49",
@@ -174,6 +175,7 @@ fn upgrade_and_replay_preserve_historical_index_definitions_and_btrees_without_d
         let readonly =
             Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         validate_schema_is_current(&readonly).unwrap();
-        assert_eq!(catalog(&readonly), before);
+        assert_definitions(&readonly);
+        assert_eq!(catalog(&readonly), after);
     }
 }
