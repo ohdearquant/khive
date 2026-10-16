@@ -60,7 +60,8 @@ fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
 #[allow(clippy::too_many_arguments)]
 async fn verify_duplicate_replay(
     runtime: &KhiveRuntime,
-    ns: &str,
+    capability: &khive_runtime::ChannelIngestCapability,
+    token: &NamespaceToken,
     duplicate: &Note,
     attachment: Option<&NewAttachment>,
     channel_kind: Option<&str>,
@@ -115,7 +116,8 @@ async fn verify_duplicate_replay(
     }
     repair_duplicate_quarantine(
         runtime,
-        ns,
+        capability,
+        token,
         duplicate,
         attachment,
         channel_kind,
