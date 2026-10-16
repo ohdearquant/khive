@@ -380,6 +380,33 @@ pub(crate) fn merge_dependency_kind(
     Some(obj)
 }
 
+/// Explain a dependency qualifier added by inference without changing metadata.
+///
+/// Call after metadata validation, with the caller's metadata after merging an
+/// explicit top-level qualifier and the effective metadata after inference.
+/// A present caller key always suppresses the hint. The effective value comes
+/// from the existing inference path rather than a second endpoint-kind table.
+pub fn dependency_kind_inference_hint(
+    relation: EdgeRelation,
+    supplied_metadata: Option<&serde_json::Value>,
+    effective_metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    if relation != EdgeRelation::DependsOn
+        || supplied_metadata.is_some_and(|metadata| metadata.get("dependency_kind").is_some())
+    {
+        return None;
+    }
+    let kind = effective_metadata?
+        .get("dependency_kind")?
+        .as_str()
+        .filter(|kind| VALID_DEPENDENCY_KINDS.contains(kind))?;
+    let mut hint = format!("dependency_kind was inferred as {kind:?} from endpoint kinds.");
+    if kind == "normative" {
+        hint.push_str(" For references that are not normative, use links_to.");
+    }
+    Some(hint)
+}
+
 /// Merge a caller-supplied top-level `dependency_kind` param into an edge's
 /// `metadata` object, filling the key only if `metadata` doesn't already
 /// carry one. This is distinct from `merge_dependency_kind` above (which
