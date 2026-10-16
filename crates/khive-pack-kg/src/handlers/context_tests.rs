@@ -1,5 +1,164 @@
 use super::*;
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn context_anchor_edges_share_the_record_budget_and_keep_admitted_endpoints() {
+    use khive_runtime::{RuntimeConfig, VerbRegistryBuilder};
+
+    let namespace = format!("context-anchor-budget-{}", Uuid::new_v4().simple());
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_default_namespace(namespace.clone());
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    runtime.install_edge_rules(registry.all_edge_rules());
+    registry.call_register_entity_type_validators(&runtime);
+    let mut ids = Vec::new();
+    for label in ["甲", "乙", "丙", "丁"] {
+        let mut create_args = json!({
+            "kind": "concept", "name": label.repeat(40),
+            "namespace": namespace, "skip_dedup_check": true,
+        });
+        // The second anchor's record costs more than one anchor edge, so a budget can cut
+        // that anchor while an edge naming it would still fit.
+        if label == "乙" {
+            create_args["description"] = json!(label.repeat(400));
+        }
+        let entity = registry.dispatch("create", create_args).await.unwrap();
+        ids.push(entity["id"].as_str().unwrap().to_owned());
+    }
+    for (source, target) in [(0, 1), (1, 2), (0, 3)] {
+        registry
+            .dispatch(
+                "link",
+                json!({
+                    "source_id": ids[source], "target_id": ids[target],
+                    "relation": "contains", "weight": 0.8, "namespace": namespace,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let args = json!({
+        "entity_ids": &ids[..3], "hops": 1, "direction": "outgoing",
+        "budget": 65536, "namespace": namespace,
+    });
+    let full = registry.dispatch("context", args.clone()).await.unwrap();
+    let full_anchor_edges = full["anchor_edges"].as_array().unwrap();
+    assert_eq!(full_anchor_edges.len(), 2, "{full}");
+    assert_eq!(full["edges"].as_array().unwrap().len(), 1, "{full}");
+    assert_eq!(full["dropped"]["anchor_edges"], 0);
+
+    let cost = |record: &Value| record.to_string().chars().count();
+    let blocks: Vec<AnchorBlock> = full["anchors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|anchor| AnchorBlock {
+            entity_json: anchor["entity"].clone(),
+            entity_size: cost(&anchor["entity"]),
+            pairs: anchor["neighbors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|neighbor| {
+                    let edge = full["edges"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|edge| {
+                            edge["source_id"] == anchor["entity"]["id"]
+                                && edge["target_id"] == neighbor["id"]
+                        })
+                        .unwrap();
+                    ContextPair::new(neighbor.clone(), edge.clone()).unwrap()
+                })
+                .collect(),
+        })
+        .collect();
+    let earlier_cost: usize = blocks
+        .iter()
+        .map(|block| block.entity_size + block.pairs.iter().map(|pair| pair.size).sum::<usize>())
+        .sum();
+    let first_edge_cost = cost(&full_anchor_edges[0]);
+    let complete_cost = earlier_cost + full_anchor_edges.iter().map(cost).sum::<usize>();
+    assert!(earlier_cost > 256);
+    assert!(full_anchor_edges[0].to_string().len() > first_edge_cost);
+    // Admit the first anchor and exactly one anchor edge's cost: the second anchor is cut, the
+    // first anchor's neighbor pair does not fit, and the edge from the first anchor to the cut
+    // second anchor fits on cost alone, so only endpoint admission keeps it out.
+    assert_eq!(blocks[0].entity_json["id"], ids[0].as_str());
+    assert_eq!(blocks[1].entity_json["id"], ids[1].as_str());
+    let cut_endpoint_edge = full_anchor_edges
+        .iter()
+        .find(|edge| edge["source_id"] == ids[0].as_str() && edge["target_id"] == ids[1].as_str())
+        .unwrap();
+    let cut_endpoint_budget = blocks[0].entity_size + cost(cut_endpoint_edge);
+    assert!(cost(cut_endpoint_edge) < blocks[1].entity_size);
+    assert!(blocks[0]
+        .pairs
+        .iter()
+        .all(|pair| pair.size > cost(cut_endpoint_edge)));
+    for budget in [
+        256,
+        cut_endpoint_budget,
+        earlier_cost,
+        earlier_cost + first_edge_cost - 1,
+        earlier_cost + first_edge_cost,
+        complete_cost,
+    ] {
+        let mut bounded_args = args.clone();
+        bounded_args["budget"] = json!(budget);
+        let bounded = registry.dispatch("context", bounded_args).await.unwrap();
+        let (anchors, edges, _, dropped_anchors, dropped_neighbors, used) =
+            assemble_within_budget(&blocks, budget);
+        assert_eq!(bounded["anchors"], json!(anchors), "budget {budget}");
+        assert_eq!(bounded["edges"], json!(edges), "budget {budget}");
+        assert_eq!(bounded["dropped"]["anchors"], dropped_anchors);
+        assert_eq!(bounded["dropped"]["neighbors"], dropped_neighbors);
+        assert_eq!(bounded["dropped"]["edges"], dropped_neighbors);
+        let admitted: HashSet<&str> = bounded["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|anchor| anchor["entity"]["id"].as_str().unwrap())
+            .collect();
+        let anchor_edges = bounded["anchor_edges"].as_array().unwrap();
+        assert!(anchor_edges.iter().all(|edge| {
+            admitted.contains(edge["source_id"].as_str().unwrap())
+                && admitted.contains(edge["target_id"].as_str().unwrap())
+        }));
+        assert!(used + anchor_edges.iter().map(cost).sum::<usize>() <= budget);
+        assert_eq!(
+            bounded["dropped"]["anchor_edges"],
+            full_anchor_edges.len() - anchor_edges.len()
+        );
+        if anchor_edges.len() < full_anchor_edges.len() {
+            assert_eq!(bounded["truncated"], true);
+        }
+        if budget == cut_endpoint_budget {
+            assert_eq!(
+                bounded["anchors"].as_array().unwrap().len(),
+                1,
+                "budget {budget}"
+            );
+            assert!(anchor_edges.is_empty(), "budget {budget}");
+            assert_eq!(bounded["truncated"], true);
+        }
+        if budget == earlier_cost + first_edge_cost {
+            assert_eq!(anchor_edges, &full_anchor_edges[..1]);
+        }
+        if budget == complete_cost {
+            assert_eq!(bounded["anchor_edges"], full["anchor_edges"]);
+            assert_eq!(bounded["truncated"], false);
+        }
+    }
+}
+
 fn anchor_block(name: &str, entity_size_filler: usize, neighbor_sizes: &[usize]) -> AnchorBlock {
     let entity_json = json!({ "id": name, "filler": "x".repeat(entity_size_filler) });
     let entity_size = compact_len(&entity_json).unwrap();
@@ -46,7 +205,7 @@ fn assemble_within_budget_no_truncation_when_everything_fits() {
         .iter()
         .map(|b| b.entity_size + b.pairs.iter().map(|pair| pair.size).sum::<usize>())
         .sum();
-    let (out, edges, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, total);
+    let (out, edges, truncated, d_anchors, d_neighbors, _) = assemble_within_budget(&blocks, total);
     assert!(!truncated);
     assert_eq!(d_anchors, 0);
     assert_eq!(d_neighbors, 0);
@@ -68,7 +227,7 @@ fn assemble_within_budget_exact_boundary_is_not_truncated() {
     // budget", i.e. a record landing exactly on the boundary still fits.
     let blocks = vec![anchor_block("a1", 4, &[4])];
     let exact_total = blocks[0].entity_size + blocks[0].pairs[0].size;
-    let (out, edges, truncated, d_anchors, d_neighbors) =
+    let (out, edges, truncated, d_anchors, d_neighbors, _) =
         assemble_within_budget(&blocks, exact_total);
     assert!(
         !truncated,
@@ -93,7 +252,8 @@ fn assemble_within_budget_one_char_over_boundary_truncates_the_overflowing_recor
     // Budget fits the anchor entity plus the first neighbor exactly, but not
     // a single Unicode scalar more — the second neighbor must be dropped.
     let budget = entity_size + first_neighbor_size;
-    let (out, edges, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+    let (out, edges, truncated, d_anchors, d_neighbors, _) =
+        assemble_within_budget(&blocks, budget);
     assert!(truncated);
     assert_eq!(d_anchors, 0, "the anchor's entity record itself fit");
     assert_eq!(
@@ -109,7 +269,8 @@ fn assemble_within_budget_anchor_entity_overflow_drops_whole_anchor_and_all_afte
     let blocks = vec![anchor_block("a1", 4, &[4]), anchor_block("a2", 4, &[4])];
     // Budget too small even for the first anchor's entity record.
     let budget = blocks[0].entity_size - 1;
-    let (out, edges, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+    let (out, edges, truncated, d_anchors, d_neighbors, _) =
+        assemble_within_budget(&blocks, budget);
     assert!(truncated);
     assert!(out.is_empty(), "no anchor entity fit at all");
     assert!(edges.is_empty());
@@ -125,7 +286,8 @@ fn assemble_within_budget_first_anchor_bloated_neighbor_no_longer_starves_second
     // that first anchor's oversized neighbor should be dropped.
     let blocks = vec![anchor_block("a1", 4, &[2000]), anchor_block("a2", 4, &[4])];
     let budget = blocks[0].entity_size + blocks[1].entity_size + blocks[1].pairs[0].size;
-    let (out, edges, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
+    let (out, edges, truncated, d_anchors, d_neighbors, _) =
+        assemble_within_budget(&blocks, budget);
     assert!(truncated);
     assert_eq!(
         out.len(),
