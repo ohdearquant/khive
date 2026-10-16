@@ -139,7 +139,10 @@ impl SqlAttachmentStore {
     {
         if let Some(writer_task) = self.current_writer_task(operation)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|error| map_err(error, operation)))
+                .send_bounded_at(
+                    move |conn| f(conn).map_err(|error| map_err(error, operation)),
+                    operation,
+                )
                 .await;
         }
 

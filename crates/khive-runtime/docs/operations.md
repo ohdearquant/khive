@@ -7,14 +7,54 @@ The in-source comments carry only short pointers here.
 
 ## Module layout
 
-`operations.rs` retains the production verb bodies and their public paths. Fault-injection state,
+`operations.rs` retains shared types, endpoint matching and base rules, note creation and search,
+and note restoration. Its other concerns live in private children:
+
+| Module under `operations/` | Responsibility |
+| --- | --- |
+| `read_helpers.rs` | Search result types, UUID prefix helpers, previews and embedding-task collection |
+| `record_ops.rs` | Record reads, counts, event listing and note-plan preparation |
+| `identity_reads.rs` | UUID prefix and substrate resolution |
+| `graph_rules.rs` | Endpoint validation, relation rules and edge metadata |
+| `link_ops.rs` | Single and batch links and edge construction |
+| `traversal.rs` | Neighbors, traversal and graph-result enrichment |
+| `delete_restore.rs` | Atomic hard deletion, entity/edge restoration and record deletion |
+| `edge_query.rs` | Graph queries and edge reads, updates and deletion |
+
+Entity create and claim live in `operations/entity_create.rs`; bulk entity preparation lives in
+`operations/entity_bulk.rs`. `operations/entity_indexes.rs` prepares required indexes and
+attachments before admitted candidates enter the writer. Public method and type paths remain
+unchanged through inherent implementations and parent reexports. Fault-injection state,
 scoped guards and arming helpers live in `src/operations/fault_injection.rs`; the parent re-exports
 the existing public and crate-visible APIs and imports only the private state its operations use.
 The child exposes those internal items to its parent with `pub(super)` access.
 
 Unit tests remain in `src/operations_tests.rs` under the same `operations::tests` module and retain
-access to the parent helpers. Further extraction groups the remaining verb bodies by concern
-(entity, note, edge, search) while preserving their public paths.
+access to the parent helpers. Manifest route tests live separately in
+`secret_gate_finalizer/entity_route_tests.rs` and enter the real runtime methods.
+
+## Entity candidate finalization
+
+`secret_gate_finalizer/entity_admission.rs` captures one immutable manifest snapshot and checks
+the final candidate. Production snapshots are empty. Only namespace-scoped `cfg(test)` fixtures
+can supply a match; there is no caller, configuration or environment switch for admission.
+Ordinary updates preserve the legacy patch-only scan under an empty snapshot. A non-empty
+snapshot scans the complete merged candidate; caller-supplied and carried reserved stamps
+remain refused, including unchanged echoes.
+
+For a match, `entity_transaction.rs` owns the stamped row, conditional insert or revision guard,
+required effects and exemption audit inside the caller's outer atomic unit. Embeddings are
+prepared before acquiring its writer. `Exempted` is observed only after commit acknowledgement.
+Confirmed rollback allows a separate best-effort failure audit; an uncertain acknowledgement
+retains the storage error. Failure-audit errors emit a redacted diagnostic through an independent
+log sink. Cloned plans have independent failure state.
+
+Direct source and finding ingest retain a captured `EntityCandidateContext` through early
+preflight, final preparation and retries. The public facade returns either an untouched legacy
+candidate, a committed admitted candidate, or conditional-write contention. It accepts no SQL,
+manifest installation, caller stamp or audit-verb override. Source ingest keeps its bounded CAS
+rebase; finding ingest keeps its legacy upsert for clean candidates and uses insert-if-absent
+for admitted candidates. Notes, atomic prepare and administrative curation remain reservation-only.
 
 ## Fault-injection arm migration
 
@@ -75,12 +115,27 @@ seen-set from scratch per namespace (quadratic in namespace count). The merge ke
 which tied edge is "more correct"), reorders BFS-style (ascending depth), and re-applies `limit`
 to the merged non-root node count.
 
-### update_edge_symmetric_dml
+### Guarded symmetric-edge updates
 
-This function runs inside an existing transaction on a borrowed `&rusqlite::Connection`, so it
-binds SQL against `rusqlite::params!` rather than the `SqlStatement`/`SqlValue` plan shape used
-elsewhere — see the constants' doc comment in `khive-db` for why a single bridge type isn't used
-for both.
+`update_edge` calls `GraphStore::update_symmetric_edge_if_unchanged` with the record's stored
+namespace, canonical endpoints, patch fields and exact revision/deletion snapshot. The SQLite
+implementation in `khive-db/src/stores/graph/symmetric_update.rs` owns the conflict probe and
+one guarded mutation inside a single writer transaction. It retains the dedicated
+`UpdateSymmetricEdge` route and unbounded-wait `WriterTaskHandle::send` admission; the generic
+graph helper has a different bounded-admission policy. Compatibility fallback retains the
+pooled writer guard's transaction.
+
+The storage result distinguishes an in-place update, absorption into an unchanged live or
+tombstoned survivor, and a stale snapshot. The survivor identifier is returned as stored text
+and parsed by the runtime after commit. Refetch and the separate EdgeUpdated audit append also
+remain after commit; their failures do not undo the graph mutation. The in-place response keeps
+its existing runtime timestamp behavior, while the persisted revision strictly advances.
+
+Backend failures cross the storage capability boundary. On the direct fallback this changes
+`RuntimeError::Sqlite` (and a blocking-task join's `Internal`) to `RuntimeError::Storage`, including
+its reason and rendered prefix. The SQLite source is retained under the storage envelope;
+capacity and unknown writer settlement keep their typed classification. The queue's existing
+confirmed-rollback or unknown-settlement wrapper propagates unchanged.
 
 It binds `khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL` for the probe,
 `EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL` for the absorbed arm, and
@@ -139,3 +194,25 @@ External integration test crates enable it via `khive-runtime = { ..., features 
   table scan, then disarms. Used to prove callers that resolve an id through a prefix (e.g. the
   `get` verb's fallback chain) distinguish a storage fault from a genuine no-match instead of
   reporting both as not-found.
+
+## Guarded create-only links
+
+`KhiveRuntime::link_if_absent_with_guards(token, spec, guards)` validates the
+link's namespace, endpoints, relation and fields through the normal edge builder,
+then evaluates caller-owned statement guards and inserts on one writer
+transaction. `resurrect=true` is rejected because this API never changes an
+existing edge. Registry hook dispatch remains the caller's responsibility, as
+with other direct runtime link helpers.
+
+The result is `EdgeInsertIfAbsentOutcome`: `Created(edge)`, `ExistingLive`,
+`Tombstoned`, or `GuardFailed(failure)`. Only `Created` emits `LinkCreated`, using
+the actual endpoint kinds and the token's event attribution. Other outcomes
+leave edge and event state unchanged. Guard failures carry a caller label and
+a typed predicate/result-shape reason; SQL driver failures remain errors.
+See the [graph composition contract](../../khive-db/docs/api/graph.md#caller-supplied-statement-guards-and-create-only-insertion)
+for ordered guard evaluation and exact boolean-result requirements.
+
+`link_many_guarded_observed` evaluates supplied guards even for an empty
+batch. Its existing tuple-returning API reports a guard refusal as a storage
+conflict containing the label and reason. Existing callers with no statement
+guards retain their prior behavior.

@@ -102,6 +102,88 @@ jobs:
             printf 'Main tip: `%s`\n' "$(git rev-parse refs/remotes/origin/main)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # A change that touches only Markdown files no code names runs the documentation lane: docs formatting,
+  # the ADR lints, the marketplace validator, the data-leak guard and the secret scan. The Rust, Python,
+  # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
+  # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
+  # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
+  # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
+  # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  changed-paths:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      integration_only: ${{ steps.classify.outputs.integration_only }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+      - name: Classify
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docs_only=false
+          integration_only=false
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1")
+            docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
+            base=""
+            runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            while read -r run_id run_sha; do
+              [[ -n "$run_id" ]] || continue
+              shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
+                --jq '[.jobs[] | select(.name == "CI (ubuntu-latest, shard 1/2)" and .conclusion == "success")] | length') || shard=0
+              if [[ "$shard" -ge 1 ]] && git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
+                base=$run_sha
+                break
+              fi
+            done <<< "$runs"
+            if [[ -n "$base" ]]; then
+              echo "Compared with $base, the newest main commit with a completed full run"
+              docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+            else
+              echo "full suite: no main commit with a completed full run was found"
+            fi
+          else
+            echo "full suite: $EVENT_NAME runs on ${REF} always run every job"
+          fi
+          if [[ "$docs_only" != "true" ]]; then
+            docs_only=false
+          fi
+          # A pull request from this repository's own codex/ branches is built and tested before review
+          # and reaches main only through an integration/** branch, whose push run executes every job on
+          # the merged tree. When it changes crate source and Markdown only, its own run keeps the checks
+          # below and skips the build and test jobs. A change to a workflow, a CI script, a manifest, a
+          # lockfile or toolchain configuration keeps the full suite here (scripts/ci-integration-only.sh).
+          if [[ "$EVENT_NAME" == "pull_request" && "$docs_only" != "true" \
+                && "${HEAD_REF:-}" == codex/* && "${HEAD_REPOSITORY:-}" == "$REPOSITORY" ]]; then
+            integration_only=$(bash scripts/ci-integration-only.sh "$base" "$HEAD_SHA")
+          fi
+          if [[ "$integration_only" != "true" ]]; then
+            integration_only=false
+          fi
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+          echo "integration_only=$integration_only" | tee -a "$GITHUB_OUTPUT"
+
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
   automerge-push-guard:
@@ -183,7 +265,8 @@ jobs:
 
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -270,14 +353,23 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          # Only main writes caches. A pull request's cache is scoped to its
+          # own merge ref, so no other pull request can restore it, but it
+          # still counts against the repository's cache quota. Pull request
+          # saves pushed the total past the quota and evicted main's entries
+          # (the macOS entry first), which left later runs compiling every
+          # dependency from scratch. Pull requests restore main's cache and
+          # save nothing.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
-          # Deliberately NOT sharded into the key: both shards of the same OS
-          # build the same workspace, so sharing one key avoids doubling the
-          # cache footprint. The two shards' save-cache calls race at the end
-          # of the job; the first to finish wins and the second is a no-op
-          # (actions/cache skips saving over an existing key), which is fine.
-          key: line-tables
+          # Sharded into the key: the shards build different profiles and
+          # features (the release build runs on shard 1; Clippy, the
+          # forward-deployed checks and the channel feature tests run on
+          # shard 2). With one shared key the first shard to finish saved and
+          # the other's artifacts never reached the cache, so the release
+          # build recompiled every dependency on every run.
+          key: line-tables-shard${{ matrix.shard }}
       # EMBEDDING MODEL CACHE. The embedder fetches its weights from
       # huggingface.co the first time it is built. Fetching per run made this
       # workflow depend on a third-party CDN's rate limiter, which on
@@ -327,27 +419,7 @@ jobs:
       # that runs khive-contract.
       - name: Install khive-contract scan dependency (Linux)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
-        run: |
-          # The runner image carries third-party apt lists this job needs
-          # nothing from, and `apt-get update` exits 100 when any one of them
-          # serves a bad index. Google's chrome list did exactly that on
-          # 2026-09-09 (Hash Sum mismatch) and reddened every full-suite
-          # shard. ripgrep comes from the Ubuntu archive, so disable that list
-          # instead of retrying into the same mismatch. apt reads only .list
-          # and .sources files, so a renamed copy is inert, and the Ubuntu
-          # archive itself lives in ubuntu.sources and is untouched. A different
-          # third-party list failing this way needs its own line here, by
-          # name: this is deliberately not a blanket sweep of the directory.
-          for f in /etc/apt/sources.list.d/google-chrome.list \
-                   /etc/apt/sources.list.d/google-chrome.sources; do
-            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
-          done
-          # Print what still points at the chrome repo: empty is the pass, a
-          # non-empty line says the rename missed a filename this does not know.
-          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
-          rg --version
+        run: ../scripts/ci-install-ripgrep.sh
       - name: Install khive-contract scan dependency (macOS)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'macOS'
         run: |
@@ -449,7 +521,8 @@ jobs:
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -470,6 +543,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: line-tables
       - uses: actions/setup-python@v6
         with:
@@ -523,7 +597,8 @@ jobs:
 
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -608,7 +683,8 @@ jobs:
 
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -650,6 +726,8 @@ jobs:
         run: python3 scripts/tests/test_hook_cargo.py
       - name: Coverage profile forwarder tests
         run: python3 scripts/tests/test_coverage_profile_diagnostics.py
+      - name: Local artifact verifier and install target tests
+        run: python3 scripts/tests/test_verify_local_artifact.py
 
   secret-scan:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
@@ -766,6 +844,15 @@ jobs:
           deno-version: v2.x
       - name: Check markdown formatting
         run: scripts/ci.sh docs-fmt
+      - name: ADR reference and status lints
+        run: scripts/ci.sh adr-lint
+      # The repository-wide identifier ban reads Markdown too, and the documentation lane skips the
+      # contract suite that holds it, so it runs here on every change.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install repository scan dependency
+        run: scripts/ci-install-ripgrep.sh
+      - name: Repository identifier ban
+        run: scripts/ci.sh content-sweeps
 
   marketplace:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Marketplace example validator
@@ -784,7 +871,8 @@ jobs:
 
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -799,14 +887,15 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build docs (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
   dependency-review:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -861,7 +950,8 @@ jobs:
 
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -880,6 +970,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pinned exact version (same rationale as the cargo-deny/gitleaks pins
       # above): a wasm-parity gate's tooling must not silently drift.
       - name: Cache wasmtime
@@ -924,6 +1015,68 @@ jobs:
           fi
           echo "$actual_output"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Rule evaluator wasm32 compile check (ADR-101 D5)
+        run: cargo check --locked -p khive-rule-evaluator --target wasm32-unknown-unknown
+      - name: Rule evaluator native suite and result transcripts
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-native.log
+      - name: Rule evaluator wasm32-wasip1 suite and result transcripts
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator --target wasm32-wasip1 -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-wasm.log
+      - name: Assert full rule-result bytes match on native and wasm32
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          prefix = "RULE_EVALUATOR_GOLDEN:"
+          expected = {"full", "partial"}
+
+          def transcripts(log):
+              rows = [line for line in log.splitlines() if line.startswith(prefix)]
+              if len(rows) != 2:
+                  raise ValueError("expected exactly two nonempty result transcripts")
+              values = {}
+              for line in rows:
+                  label, payload = line[len(prefix):].split(":", 1)
+                  if label in values or label not in expected:
+                      raise ValueError("duplicate or unexpected result transcript")
+                  decoded = json.loads(payload)
+                  if not isinstance(decoded, list) or not decoded:
+                      raise ValueError("empty or invalid result transcript")
+                  values[label] = payload
+              if set(values) != expected:
+                  raise ValueError("missing named result transcript")
+              return values
+
+          def compare(native, wasm):
+              if transcripts(native) != transcripts(wasm):
+                  raise ValueError("native and wasm32 rule-result bytes differ")
+
+          native = Path("/tmp/rules-native.log").read_text()
+          wasm = Path("/tmp/rules-wasm.log").read_text()
+          compare(native, wasm)
+          # Comparator controls: status-only, missing and two-empty captures
+          # must never make a parity gate vacuously pass.
+          changed = native.replace('"passed":false', '"passed":true', 1)
+          if changed == native:
+              raise ValueError("fixture lost its failing-rule positive control")
+          missing = "\n".join(line for line in native.splitlines()
+                              if not line.startswith(prefix + "partial:"))
+          for left, right in [(native, changed), (native, missing), ("", "")]:
+              try:
+                  compare(left, right)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError("parity comparator accepted a negative control")
+          print("native and wasm32: two complete rule-result JSON transcripts match")
+          PY
+
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown
       # ADR-101 D5 requires CI to run the SAME test suite against native and
@@ -956,9 +1109,61 @@ jobs:
           fi
           echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
 
+      # Pure graph-state diff uses the same native/WASM suite, plus a separate
+      # nocapture invocation of its golden fixture for actual result-byte parity.
+      - name: Graph diff wasm32-unknown-unknown build (ADR-101 D5)
+        run: cargo build --locked -p khive-graph-diff --target wasm32-unknown-unknown
+      - name: Graph diff native suite and golden bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff -- --test-threads=1 2>&1 | tee /tmp/graph-diff-native.log
+          cargo test --locked -p khive-graph-diff --test graph_diff parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/graph-diff-native-golden.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/graph-diff-native-golden.log" 1
+      - name: Graph diff wasm32-wasip1 suite and golden bytes
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 -- --test-threads=1 2>&1 | tee /tmp/graph-diff-wasm.log
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/graph-diff-wasm-golden.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/graph-diff-wasm-golden.log" 1
+      - name: Assert graph diff suite and result-byte parity
+        run: |
+          set -euo pipefail
+          for platform in native wasm; do
+            grep -E '^test .* \.\.\. (ok|FAILED)$' "/tmp/graph-diff-${platform}.log" | sort > "/tmp/graph-diff-${platform}.sorted"
+            test -s "/tmp/graph-diff-${platform}.sorted"
+            grep '^GRAPH_DIFF_PARITY:' "$RUNNER_TEMP/graph-diff-${platform}-golden.log" > "/tmp/graph-diff-${platform}.bytes"
+          done
+          diff -u /tmp/graph-diff-native.sorted /tmp/graph-diff-wasm.sorted
+          assert_graph_diff_bytes() {
+            test "$(wc -l < "$1")" -eq 2 || return 1
+            test "$(wc -l < "$2")" -eq 2 || return 1
+            cmp -s "$1" "$2"
+          }
+          assert_graph_diff_bytes /tmp/graph-diff-native.bytes /tmp/graph-diff-wasm.bytes
+          # The exact comparator used above must reject changed result bytes,
+          # missing fixtures and a vacuous pair of empty transcripts.
+          sed '1s/$/ /' /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-mutated.bytes
+          head -n 1 /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-missing.bytes
+          : > /tmp/graph-diff-empty.bytes
+          for invalid in mutated missing empty; do
+            if assert_graph_diff_bytes /tmp/graph-diff-native.bytes "/tmp/graph-diff-${invalid}.bytes"; then
+              echo "graph diff parity accepted ${invalid} fixture bytes" >&2
+              exit 1
+            fi
+          done
+          if assert_graph_diff_bytes /tmp/graph-diff-empty.bytes /tmp/graph-diff-empty.bytes; then
+            echo "graph diff parity accepted empty fixture transcripts" >&2
+            exit 1
+          fi
+
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -975,6 +1180,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: wasm32 core compile check
         run: cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features
       - name: Native sequential and owned-storage tests
@@ -982,7 +1188,8 @@ jobs:
 
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1049,6 +1256,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # MinIO no longer publishes prebuilt server images or binaries that an
       # anonymous CI job can fetch. quay.io answers 401 for minio/minio (its
       # tags and the digest this job used to pin), dl.min.io answers 410 Gone
@@ -1148,7 +1356,8 @@ jobs:
 
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1163,15 +1372,17 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv-1.95
       - name: Check workspace on the declared minimum Rust version
         run: cargo +1.95.0 check --workspace --locked
 
-  # Keep this job outside ci-gate until a week of successful main merges.
+  # Required by ci-gate after the successful main observation week.
   # Sequential feature checks reuse one Linux runner without hiding later failures.
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -1194,6 +1405,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The same embedding model cache the ci job restores, under the same key. With
       # LATTICE_OFFLINE set above, a library test that needs the model fails naming
       # the missing directory instead of fetching from huggingface.co.
@@ -1249,7 +1461,8 @@ jobs:
 
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1264,6 +1477,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
       # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
       # Not (yet) a required check in branch protection — plain `cargo check`
@@ -1322,7 +1536,8 @@ jobs:
 
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1360,6 +1575,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-targets: false
       # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
       # #215 cargo-deny installer pin): a required gate's tooling must not drift.
@@ -1506,9 +1722,9 @@ jobs:
 
   coverage-ratchet:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
-    needs: [resolve-revision, coverage-measurement]
+    needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1557,6 +1773,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - resolve-revision
+      - changed-paths
       - automerge-push-guard
       - ci
       - khive-py
@@ -1574,6 +1791,7 @@ jobs:
       - vamana-portability
       - minio-blob-compat
       - msrv-check
+      - core-only
     if: always()
     steps:
       - name: Check aggregated job results
@@ -1581,14 +1799,29 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # Only the push guard may skip on run shape. Dependency review now
+          # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
-          # inputs fail the ratchet. An unexpected skip must not pass the gate.
+          # inputs fail the ratchet. The lane jobs may skip only when the
+          # classifier succeeded and reported docs_only=true or
+          # integration_only=true. Any other skip fails the gate. On the
+          # integration lane this gate covers the jobs that ran here; the
+          # build and test jobs run in the integration branch's push run.
+          echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
+          echo "$NEEDS" | jq -r '"integration lane: \(.["changed-paths"].result) integration_only=\(.["changed-paths"].outputs.integration_only // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
+            | (if .["changed-paths"].result == "success"
+                  and (.["changed-paths"].outputs.docs_only == "true"
+                       or .["changed-paths"].outputs.integration_only == "true")
+               then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
+                     "dependency-review", "coverage-measurement", "coverage-ratchet",
+                     "wasm-parity", "vamana-portability", "minio-blob-compat",
+                     "msrv-check", "core-only"]
+               else [] end) as $docs_lane_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
-                (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
+                (.value.result != "skipped"
+                  or (($allowed_skips + $docs_lane_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"

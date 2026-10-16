@@ -4,7 +4,9 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    runtime_error_value, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError,
+};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::SqlValue;
 
@@ -132,21 +134,23 @@ pub(super) async fn mark_read_targets_best_effort(
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(read_result_with_body(result, message)),
             Err(error) => {
-                let (status, read) = match &error {
-                    RuntimeError::Storage(storage_error) => {
-                        match classify_mark_read_error(storage_error) {
-                            MarkReadFailure::Unknown => ("unknown", Value::Null),
-                            MarkReadFailure::Failed => ("failed", json!(false)),
-                        }
-                    }
-                    _ => ("failed", json!(false)),
+                let failure = match &error {
+                    RuntimeError::Storage(storage_error) => classify_mark_read_error(storage_error),
+                    _ => MarkReadFailure::Failed,
                 };
+                let (status, read) = match &failure {
+                    MarkReadFailure::Unknown => ("unknown", Value::Null),
+                    MarkReadFailure::Failed => ("failed", json!(false)),
+                };
+                let mark_error = error.to_string();
+                let mark_error_details = mark_read_error_details(error, &failure);
                 results.push(json!({
                     "id": short_id(id),
                     "full_id": id.as_hyphenated().to_string(),
                     "status": status,
                     "read": read,
-                    "mark_error": error.to_string(),
+                    "mark_error": mark_error,
+                    "mark_error_details": mark_error_details,
                     "properties": original_properties,
                 }));
             }
@@ -173,6 +177,11 @@ fn read_message_fields_prepared(note: &Note, attachment_fields: Value) -> Value 
         "direction": message["direction"],
         "created_at": message["created_at"],
     });
+    for key in ["origin", "trust", "labels"] {
+        if let Some(value) = note.properties.as_ref().and_then(|props| props.get(key)) {
+            fields[key] = value.clone();
+        }
+    }
     if let (Some(fields), Value::Object(attachment_fields)) =
         (fields.as_object_mut(), attachment_fields)
     {
@@ -293,8 +302,7 @@ pub(super) async fn validate_read_target(
     let store = runtime.notes(token)?;
     let note = store
         .get_note(id)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
+        .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("read: message {id} not found")))?;
 
     validate_read_note(token, id, note)
@@ -410,6 +418,24 @@ fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFail
     }
 }
 
+fn mark_read_error_details(error: RuntimeError, failure: &MarkReadFailure) -> Value {
+    // Preserve native settlement evidence even when the legacy result shape
+    // cannot express that additional uncertainty.
+    let settlement_unknown = error.writer_task_failure_context().is_some_and(|context| {
+        context.request_state == khive_storage::WriterTaskRequestState::SideEffectsUnknown
+    }) || matches!(
+        error.refusal_source(),
+        RuntimeError::Storage(storage)
+            if storage.sqlite_write_failure().is_some_and(|failure| failure.settlement_unknown)
+    );
+    let disposition = if matches!(failure, MarkReadFailure::Unknown) || settlement_unknown {
+        DomainDisposition::Unknown
+    } else {
+        DomainDisposition::NotCommitted
+    };
+    runtime_error_value(error, disposition)
+}
+
 pub(super) async fn mark_read_target(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -521,13 +547,17 @@ pub(super) fn read_response(
                 "comm mark-read: update failed under writer contention; \
                  degrading (best-effort)"
             );
-            match classify_mark_read_error(&e) {
+            let failure = classify_mark_read_error(&e);
+            let mark_error = e.to_string();
+            let mark_error_details = mark_read_error_details(RuntimeError::Storage(e), &failure);
+            match failure {
                 MarkReadFailure::Unknown => json!({
                     "id": short,
                     "full_id": full,
                     "status": "unknown",
                     "read": Value::Null,
-                    "mark_error": e.to_string(),
+                    "mark_error": mark_error,
+                    "mark_error_details": mark_error_details,
                     "properties": original_properties,
                 }),
                 MarkReadFailure::Failed => json!({
@@ -535,7 +565,8 @@ pub(super) fn read_response(
                     "full_id": full,
                     "status": "failed",
                     "read": false,
-                    "mark_error": e.to_string(),
+                    "mark_error": mark_error,
+                    "mark_error_details": mark_error_details,
                     "properties": original_properties,
                 }),
             }
@@ -567,6 +598,120 @@ mod native_evidence_tests {
                 matches!(classify_mark_read_error(&error), MarkReadFailure::Unknown),
                 state == WriterTaskRequestState::SideEffectsUnknown
             );
+        }
+    }
+
+    #[test]
+    fn structured_mark_errors_preserve_finality_and_native_evidence() {
+        use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+        use khive_storage::{StorageError, WriterTaskRequestState};
+
+        for (state, status, read, disposition) in [
+            (
+                WriterTaskRequestState::NotStarted,
+                "failed",
+                json!(false),
+                "not_committed",
+            ),
+            (
+                WriterTaskRequestState::TransactionRolledBack,
+                "failed",
+                json!(false),
+                "not_committed",
+            ),
+            (
+                WriterTaskRequestState::SideEffectsUnknown,
+                "unknown",
+                Value::Null,
+                "unknown",
+            ),
+        ] {
+            let error = StorageError::writer_task_terminated(state).with_sqlite_write_failure(
+                SqliteWriteFailure {
+                    stage: SqliteWriteStage::Commit,
+                    primary_code: 10,
+                    extended_code: 1034,
+                    settlement_unknown: false,
+                },
+            );
+            let legacy_message = error.to_string();
+            let original = json!({"read": false, "other": "retained"});
+            let response = read_response(
+                "short".into(),
+                Uuid::nil().to_string(),
+                Err(error),
+                Some(original.clone()),
+                Value::Null,
+            );
+            assert_eq!(response["status"], status);
+            assert_eq!(response["read"], read);
+            assert_eq!(response["mark_error"], legacy_message);
+            assert_eq!(response["properties"], original);
+            let details = &response["mark_error_details"];
+            assert_eq!(details["code"], "writer_task_terminated");
+            assert_eq!(details["stage"], "writer_task_terminated");
+            assert_eq!(details["request_state"], state.to_string());
+            assert_eq!(details["domain_disposition"], disposition);
+            assert_eq!(details["sqlite_write_stage"], "sqlite_commit_failure");
+            assert_eq!(details["sqlite_primary_code"], 10);
+            assert_eq!(details["sqlite_extended_code"], 1034);
+        }
+    }
+
+    #[test]
+    fn structured_mark_error_retains_unknown_native_settlement() {
+        use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+        use khive_storage::{StorageCapability, StorageError};
+
+        let error = StorageError::driver(
+            StorageCapability::Notes,
+            "try_patch_note_property",
+            std::io::Error::other("forced unsettled write"),
+        )
+        .with_sqlite_write_failure(SqliteWriteFailure {
+            stage: SqliteWriteStage::Commit,
+            primary_code: 10,
+            extended_code: 1034,
+            settlement_unknown: true,
+        });
+        let legacy_message = error.to_string();
+        let response = read_response(
+            "short".into(),
+            Uuid::nil().to_string(),
+            Err(error),
+            None,
+            Value::Null,
+        );
+        // The additive projection carries evidence without rewriting the
+        // legacy status/read classification or a SQL-NULL properties value.
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["read"], false);
+        assert_eq!(response["properties"], Value::Null);
+        assert_eq!(response["mark_error"], legacy_message);
+        let details = &response["mark_error_details"];
+        assert_eq!(details["domain_disposition"], "unknown");
+        assert_eq!(details["sqlite_write_stage"], "sqlite_commit_failure");
+        assert_eq!(details["sqlite_primary_code"], 10);
+        assert_eq!(details["sqlite_extended_code"], 1034);
+        assert!(details.get("stage").is_none());
+    }
+
+    #[test]
+    fn successful_and_no_row_marks_have_no_storage_error_details() {
+        for outcome in [true, false] {
+            let response = read_response(
+                "short".into(),
+                Uuid::nil().to_string(),
+                Ok(outcome),
+                None,
+                json!({"read": true}),
+            );
+            assert!(response.get("mark_error_details").is_none());
+            if outcome {
+                assert!(response.get("mark_error").is_none());
+            } else {
+                assert_eq!(response["mark_error"], "no live row updated");
+            }
         }
     }
 }

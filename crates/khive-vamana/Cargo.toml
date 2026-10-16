@@ -25,13 +25,14 @@ bytemuck = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std_rng"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 uuid = { workspace = true, optional = true }
-khive-quant = { version = "0.11.0", path = "../khive-quant", default-features = false }
-khive-types = { version = "0.11.0", path = "../khive-types", default-features = false }
+khive-quant = { version = "0.13.0", path = "../khive-quant", default-features = false }
+khive-types = { version = "0.13.0", path = "../khive-types", default-features = false }
+khive-score = { version = "0.13.0", path = "../khive-score", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-khive-fs = { version = "0.11.0", path = "../khive-fs" }
+khive-fs = { version = "0.13.0", path = "../khive-fs" }
 libc = { workspace = true }
 nix = { version = "0.31", features = ["dir"] }
 
@@ -47,7 +48,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }

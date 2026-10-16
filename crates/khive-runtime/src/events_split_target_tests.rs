@@ -196,11 +196,13 @@ async fn grouped_count_protocol_rejects_old_version_before_opening_store() {
         EventsRequest::CountEvents {
             protocol_version: 4,
             namespace: "local".into(),
+            operator_read_budget_secs: None,
             filter: EventFilter::default(),
         },
         EventsRequest::CountEventsGrouped {
             protocol_version: 4,
             namespace: "local".into(),
+            operator_read_budget_secs: None,
             filter: EventFilter::default(),
             group_by: EventGroupBy::Verb,
         },

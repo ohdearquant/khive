@@ -55,19 +55,12 @@ pub(crate) struct AnnBridge {
     search_pause: Option<Arc<TestSearchPause>>,
 }
 
-impl std::ops::Deref for AnnBridge {
-    type Target = AnnBridgeCore;
-
-    fn deref(&self) -> &AnnBridgeCore {
-        &self.core
-    }
-}
-
-impl std::ops::DerefMut for AnnBridge {
-    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
-        &mut self.core
-    }
-}
+khive_vamana::impl_ann_bridge_helpers!(
+    AnnBridge,
+    /// Stamp this bridge with the namespace write-generation its corpus scan
+    /// started at or after (issue #770). Called just before install; see
+    /// `install_if_fresher`.
+);
 
 #[cfg(test)]
 #[derive(Default)]
@@ -836,14 +829,6 @@ impl AnnBridge {
     pub fn build(vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         let core = AnnBridgeCore::build(vectors, dim, id_map)?;
         Ok(Self::from_core(core))
-    }
-
-    /// Stamp this bridge with the namespace write-generation its corpus scan
-    /// started at or after (issue #770). Called just before install; see
-    /// `install_if_fresher`.
-    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
-        self.generation = generation;
-        self
     }
 
     /// Stamp the ann_write_log watermark this bridge's corpus state reflects
@@ -2362,10 +2347,8 @@ async fn scan_corpus_raw(
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
     let scan_watermark = rows
         .first()
-        .and_then(|row| match row.get("log_s") {
-            Some(SqlValue::Integer(n)) => u64::try_from(*n).ok(),
-            _ => None,
-        })
+        .and_then(|row| row.i64_or_none("log_s"))
+        .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0);
 
     for row in &rows {

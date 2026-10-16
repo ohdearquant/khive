@@ -33,6 +33,15 @@ on:
       # result and should not pay for the run.
       - "crates/khive-runtime/src/**"
       - ".github/workflows/tz-database-audit.yml"
+  push:
+    branches: ["integration/**"]
+    paths:
+      - "crates/Cargo.toml"
+      - "crates/Cargo.lock"
+      - "crates/khive-merge/Cargo.lock"
+      - "crates/khive-runtime/Cargo.toml"
+      - "crates/khive-runtime/src/**"
+      - ".github/workflows/tz-database-audit.yml"
 
 # Declared rather than inherited. With no `permissions:` block a workflow gets
 # the repository's default GITHUB_TOKEN scopes, so its actual authority is set
@@ -48,6 +57,9 @@ env:
 jobs:
   tz-database-audit:
     name: Timezone Database Audit
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:

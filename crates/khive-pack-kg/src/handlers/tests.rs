@@ -177,16 +177,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 27 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/scan/db_diagnostics/restore
+// KG pack must expose exactly 28 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/scan/db_diagnostics/restore
 #[test]
-fn kg_pack_exposes_27_handlers() {
+fn kg_pack_exposes_28_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        27,
-        "kg pack must expose 27 handlers including grouped event count"
+        28,
+        "kg pack must expose 28 handlers including grouped event count"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"count"), "count must be in KG_HANDLERS");

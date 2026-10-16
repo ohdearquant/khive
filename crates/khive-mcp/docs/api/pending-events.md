@@ -223,3 +223,41 @@ aliases step one occurrence at a time and terminate because each step is
 strictly later than the last; an interval jumps arithmetically to the first
 phase-locked occurrence after `now`; cron asks the pattern for the next match
 after `now`.
+
+
+## Per-event catch-up policy (ADR-106 Amendment H)
+
+Existing rows and `misfire_policy="skip"` retain the global grace-window policy
+and version-1 receipt semantics. `catch_up_once` requires an explicit positive
+`max_lateness` in seconds. There is no implicit period bound. Malformed policy
+or recurrence values are refused before action invocation and retain a
+`not_invoked` receipt.
+
+For each catch-up row, the executor captures an evaluation clock at epoch
+microsecond precision, rechecks due-ness at that precision, and selects only the
+latest recurrence occurrence `L` at or before that clock. The stored raw trigger
+`T` remains the source for the claim CAS; it is never rewritten to `L` before
+claiming. An off-pattern initial cron trigger is still an occurrence, and monthly
+recurrences use their original anchor. The bound admits equality. A miss invokes
+nothing and writes no `fired_at` (a one-shot keeps it null, a repeat keeps its last
+real fire time), and becomes terminal for a one-shot or re-arms a repeat at the
+first future occurrence. An eligible old-backup row invokes at most
+once per drain, with collapsed older occurrences recorded in `missed_at`.
+
+Catch-up claims use receipt version 2: `source_trigger_at` preserves the raw
+source string; `scheduled_for` is canonical RFC 3339 UTC for `L`; `decision_at`
+is epoch microseconds; `effective_max_lateness` is the explicit stored bound.
+The existing UUIDv5 occurrence identity names the event and `L`; each attempt has
+a fresh invocation UUID. Recovery recomputes `L` from the recorded decision and
+checks its identity and bound. Only an active claim must still match the row's
+source trigger: finalized receipts retain `L` after the row advances.
+
+Success and known failure consume a repeating occurrence and advance past the
+finalization clock, including recovery after a durable outcome. Successful
+completion retains its actual completion timestamp in `fired_at`. A known failed
+one-shot returns pending and receives a fresh bound decision on retry. An expired
+pre-invocation claim may also requeue and reselect. An invoking lease expiry,
+corrupt receipt, or ambiguous result remains terminally indeterminate and never
+replays. Existing creator provenance, renewable leases, exact-property CAS,
+cancellation and rescheduling fences remain in force. No row migration or new
+daemon-wide setting is required.

@@ -84,6 +84,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             vector_tables_ready: Default::default(),
+            text_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })

@@ -35,7 +35,9 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
-use khive_runtime::{entity_fts_document, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
+#[cfg(test)]
+use khive_runtime::entity_fts_document;
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::SqlStatement;
 use khive_storage::{Direction, Edge, Entity, LinkId, NeighborQuery};
 use khive_types::EdgeRelation;
@@ -48,8 +50,18 @@ use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 use crate::safe_source::{self, SourceReadError};
 
+mod direct_entity;
+#[cfg(test)]
+use direct_entity::gate_check;
+use direct_entity::{
+    advancing_entity_revision, candidate_context, gate_check_with_context, mutate_entity,
+    mutate_entity_with_context,
+};
+
 mod file_pending;
 use file_pending::{stamp_l2_declarations, FileReference};
+mod source_reads;
+pub use source_reads::CodeSourceReadReport;
 #[path = "source_ingest/l2_edge_refresh.rs"]
 mod l2_edge_refresh;
 use l2_edge_refresh::refresh_unchanged_l2_edges;
@@ -163,6 +175,10 @@ pub struct CodeSourceIngestReport {
     pub projects_updated: u64,
     pub modules_created: u64,
     pub modules_updated: u64,
+    /// Literal source-input observations from L1.5. These are lexical
+    /// evidence, not a complete read graph or Cargo target classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_reads: Option<CodeSourceReadReport>,
     /// `None` unless L2 was requested (`enable_l2`); present with all-zero
     /// counters for a valid L2 pass over zero Rust files or zero
     /// declarations, so "L2 requested but nothing found" stays
@@ -320,6 +336,7 @@ struct SourceSnapshot {
 struct ModuleScan {
     source_project: String,
     imports: Vec<UnresolvedSpec>,
+    source_reads: Vec<source_reads::SourceReadInput>,
 }
 
 type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
@@ -557,7 +574,7 @@ fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
 fn dependency_scope_for_kind(kind: &str) -> &'static str {
     match kind {
         "dev-dependencies" | "devDependencies" => "dev",
-        "build-dependencies" | "import" => "build",
+        "build-dependencies" | "import" | "source_read" => "build",
         _ => "normal",
     }
 }
@@ -752,28 +769,6 @@ async fn get_entity_opt(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))
 }
 
-/// Runs the runtime secret gate over `entity`'s name, description, and
-/// properties, the same content the gate checks for every other write
-/// (ADR-085 D6 #4). The direct storage-layer call `upsert_entity` wraps does
-/// not run this check on its own path, so callers of this pipeline get no
-/// gate coverage unless it happens here.
-///
-/// `description` is checked because L2 symbols store their exact
-/// documentation text there — L1/L1.5 entities
-/// never set `description`, so this is additive and does not change their
-/// gate coverage.
-fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
-    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
-    secret_gate::check_at(&entity.name, "entity", "name")?;
-    if let Some(description) = &entity.description {
-        secret_gate::check_at(description, "entity", "description")?;
-    }
-    if let Some(properties) = &entity.properties {
-        secret_gate::check_json_at(properties, "entity", "properties")?;
-    }
-    Ok(())
-}
-
 const MAX_ROW_REBASE_ATTEMPTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,55 +785,6 @@ impl RowMutationOutcome {
     }
 }
 
-fn gate_allows_entity(
-    entity: &Entity,
-    file: &str,
-    report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    if let Err(err) = gate_check(entity) {
-        return match err {
-            RuntimeError::SecretDetected(secret) => {
-                report.blocked_count += 1;
-                report.blocked.push(BlockedWrite {
-                    file: file.to_string(),
-                    detector: secret.detector.to_string(),
-                    masked_excerpt: secret.masked,
-                });
-                Ok(false)
-            }
-            other => Err(other.into()),
-        };
-    }
-    Ok(true)
-}
-
-async fn index_entity(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    entity: &Entity,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    rt.text(token)?
-        .upsert_document(entity_fts_document(entity))
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
-    #[cfg(test)]
-    l2_batch_tests::observe_fts_write(entity.id);
-    #[cfg(test)]
-    l2_recovery_tests::observe_fts_write();
-    report.fts_indexed += 1;
-    Ok(())
-}
-
-fn advancing_entity_revision(requested: i64, current: i64) -> Result<i64, CodeSourceIngestError> {
-    let minimum = current.checked_add(1).ok_or_else(|| {
-        CodeSourceIngestError::Storage(format!(
-            "entity revision {current} cannot advance past i64::MAX"
-        ))
-    })?;
-    Ok(requested.max(minimum))
-}
-
 fn advancing_edge_revision(
     requested: DateTime<Utc>,
     current: DateTime<Utc>,
@@ -853,83 +799,6 @@ fn advancing_edge_revision(
     DateTime::from_timestamp_micros(micros).ok_or_else(|| {
         CodeSourceIngestError::Storage(format!("edge revision {micros} is out of range"))
     })
-}
-
-async fn mutate_entity<F>(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    id: Uuid,
-    file: &str,
-    report: &mut CodeSourceIngestReport,
-    mut apply: F,
-) -> Result<RowMutationOutcome, CodeSourceIngestError>
-where
-    F: FnMut(Option<&Entity>) -> Option<Entity>,
-{
-    let store = rt.entities(token)?;
-    for _ in 0..MAX_ROW_REBASE_ATTEMPTS {
-        let current = store
-            .get_entity_including_deleted(id)
-            .await
-            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-        #[cfg(test)]
-        l2_batch_tests::observe_row_read(id);
-        #[cfg(test)]
-        race_seam::pause_after_row_read().await;
-        #[cfg(test)]
-        l2_recovery_tests::after_entity_read(id).await;
-        let Some(mut replacement) = apply(current.as_ref()) else {
-            return Ok(RowMutationOutcome::Unchanged);
-        };
-        if replacement.id != id {
-            return Err(CodeSourceIngestError::Storage(format!(
-                "entity mutation for {id} produced replacement {}",
-                replacement.id
-            )));
-        }
-        replacement.deleted_at = None;
-        secret_gate::reject_reserved_secret_gate_property(replacement.properties.as_ref())?;
-
-        let outcome = if let Some(snapshot) = current.as_ref() {
-            replacement.created_at = snapshot.created_at;
-            replacement.version = snapshot.version;
-            replacement.updated_at =
-                advancing_entity_revision(replacement.updated_at, snapshot.updated_at)?;
-            if !gate_allows_entity(&replacement, file, report)? {
-                return Ok(RowMutationOutcome::Blocked);
-            }
-            store
-                .replace_entity_if_unchanged(
-                    replacement.clone(),
-                    snapshot.updated_at,
-                    snapshot.deleted_at,
-                )
-                .await
-                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                .then_some(RowMutationOutcome::Updated)
-        } else {
-            if !gate_allows_entity(&replacement, file, report)? {
-                return Ok(RowMutationOutcome::Blocked);
-            }
-            store
-                .insert_entity_if_absent(replacement.clone())
-                .await
-                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-                .then_some(RowMutationOutcome::Created)
-        };
-
-        if let Some(outcome) = outcome {
-            #[cfg(test)]
-            l2_batch_tests::observe_row_write(id);
-            #[cfg(test)]
-            l2_recovery_tests::after_entity_commit(&replacement);
-            index_entity(rt, token, &replacement, report).await?;
-            return Ok(outcome);
-        }
-    }
-    Err(CodeSourceIngestError::Storage(format!(
-        "entity {id} changed during all {MAX_ROW_REBASE_ATTEMPTS} code-map rebase attempts"
-    )))
 }
 
 async fn mutate_edge<F>(
@@ -1336,7 +1205,8 @@ async fn record_unresolved_batch(
     // mutation used to be refused before any of them could write. Keep that
     // per-item report behavior without rebuilding and rechecking the growing
     // list K times.
-    if let Err(error) = gate_check(&current) {
+    let context = candidate_context(token.namespace().as_str());
+    if let Err(error) = gate_check_with_context(&context, &current) {
         match error {
             RuntimeError::SecretDetected(secret) => {
                 for item in pending {
@@ -1360,7 +1230,7 @@ async fn record_unresolved_batch(
             continue;
         }
         let candidate = serde_json::to_value(&item.spec).expect("serializes");
-        match secret_gate::check_json_at(&candidate, "entity", "properties") {
+        match context.check_properties(Some(&candidate)) {
             Ok(()) => {
                 staged_seen.insert(item.spec.clone());
                 allowed.push(item);
@@ -1380,36 +1250,44 @@ async fn record_unresolved_batch(
         return Ok(());
     };
     let mut appended = 0usize;
-    let outcome = mutate_entity(rt, token, entity_id, &first.file, report, |current| {
-        let mut entity = current?.clone();
-        let mut list = entity
-            .properties
-            .as_ref()
-            .map(read_unresolved)
-            .unwrap_or_default();
-        let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
-        appended = 0;
-        for item in &allowed {
-            if seen.insert(item.spec.clone()) {
-                list.push(item.spec.clone());
-                appended += 1;
+    let outcome = mutate_entity_with_context(
+        rt,
+        token,
+        &context,
+        entity_id,
+        &first.file,
+        report,
+        |current| {
+            let mut entity = current?.clone();
+            let mut list = entity
+                .properties
+                .as_ref()
+                .map(read_unresolved)
+                .unwrap_or_default();
+            let mut seen: HashSet<UnresolvedSpec> = list.iter().cloned().collect();
+            appended = 0;
+            for item in &allowed {
+                if seen.insert(item.spec.clone()) {
+                    list.push(item.spec.clone());
+                    appended += 1;
+                }
             }
-        }
-        if appended == 0 {
-            return None;
-        }
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(
-            "unresolved_specifiers".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
+            if appended == 0 {
+                return None;
+            }
+            let mut props = entity
+                .properties
+                .clone()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            props.insert(
+                "unresolved_specifiers".into(),
+                serde_json::to_value(&list).expect("serializes"),
+            );
+            entity.properties = Some(Value::Object(props));
+            Some(entity)
+        },
+    )
     .await?;
     if outcome.wrote() {
         report.unresolved_recorded += appended as u64;
@@ -1467,12 +1345,8 @@ fn target_ids_for(source_project: &str, spec: &UnresolvedSpec) -> Vec<Uuid> {
 /// so re-ingest can repair an older import-default scope without retaining a
 /// false production scope.
 ///
-/// The three rebuilt fields — `dependency_kinds`, `dependency_scopes`, and
-/// `language` — are the COMPLETE metadata set these edges carry: this
-/// function (and its Amendment-2 predecessor `merge_dependency_kinds`,
-/// which wrote the subset `{dependency_kinds, language}`) is the only
-/// writer of `depends_on` edge metadata in this pipeline, and B7 dedicates
-/// the map database to it, so no unknown fields exist to preserve.
+/// Source-reader observations share the natural edge with imports. Retain
+/// their revision-qualified evidence when another producer refreshes it.
 fn merge_dependency_metadata(
     existing_metadata: Option<&Value>,
     new_kind: &str,
@@ -1490,11 +1364,15 @@ fn merge_dependency_metadata(
         .unwrap_or_default();
     kinds.insert(new_kind.to_string());
     let scopes = scopes_for_dependency_kinds(&kinds, new_scope);
-    json!({
+    let mut metadata = json!({
         "dependency_kinds": kinds.into_iter().collect::<Vec<_>>(),
         "dependency_scopes": scopes.into_iter().collect::<Vec<_>>(),
         "language": language,
-    })
+    });
+    if let Some(observations) = existing_metadata.and_then(|m| m.get("source_read_observations")) {
+        metadata["source_read_observations"] = observations.clone();
+    }
+    metadata
 }
 
 /// Upserts a `depends_on` edge, merging its evidence kind and normalized
@@ -1740,8 +1618,10 @@ async fn stamp_import_scan_coverage(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     module_scans: HashMap<Uuid, ModuleScan>,
+    source_read_plans: &BTreeMap<Uuid, source_reads::SourceReadPlan>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<BTreeSet<Uuid>, CodeSourceIngestError> {
+    let mut source_reads_stamped = BTreeSet::new();
     for (module_id, scan) in module_scans {
         let mut unresolved_count = 0_u64;
         for spec in &scan.imports {
@@ -1767,13 +1647,22 @@ async fn stamp_import_scan_coverage(
             .unwrap_or_else(|| module_id.to_string());
         let mut row_missing = false;
         let mut invalid_properties = false;
+        let mut source_read_mismatch = false;
         let outcome = mutate_entity(rt, token, module_id, &source_label, report, |current| {
             row_missing = current.is_none();
+            source_read_mismatch = false;
             let mut module = current?.clone();
             let Some(Value::Object(mut props)) = module.properties.clone() else {
                 invalid_properties = true;
                 return None;
             };
+            if let Some(plan) = source_read_plans.get(&module_id) {
+                if !plan.matches(&props) {
+                    source_read_mismatch = true;
+                    return None;
+                }
+                props.insert("source_read_scan".into(), plan.observation.clone());
+            }
             props.insert(
                 "import_scan_status".into(),
                 json!(if unresolved_count == 0 {
@@ -1788,6 +1677,9 @@ async fn stamp_import_scan_coverage(
             Some(module)
         })
         .await?;
+        if outcome.wrote() && source_read_plans.contains_key(&module_id) {
+            source_reads_stamped.insert(module_id);
+        }
         if row_missing {
             report.warnings.push(format!(
                 "module {module_id} from this sweep's scan map was missing at stamp time; \
@@ -1800,11 +1692,16 @@ async fn stamp_import_scan_coverage(
                  coverage stamp skipped (F2 contract violation)"
             ));
             report.coverage_stamps_missed += 1;
+        } else if source_read_mismatch {
+            report.warnings.push(format!(
+                "module {module_id} changed since this invocation's source scan; coverage stamps skipped"
+            ));
+            report.coverage_stamps_missed += 1;
         } else if outcome == RowMutationOutcome::Blocked {
             report.coverage_stamps_missed += 1;
         }
     }
-    Ok(())
+    Ok(source_reads_stamped)
 }
 
 const SOURCE_SKIP_DIRS: &[&str] = &[
@@ -1981,11 +1878,12 @@ fn scan_import_source(
     canonical_root: &Path,
     path: &Path,
     language: &str,
-) -> Result<(String, Vec<String>), SourceReadError> {
+) -> Result<(String, Vec<String>, crate::source_reads::SourceReadScan), SourceReadError> {
     let content = safe_source::read_contained_to_string(canonical_root, path)?;
     Ok((
         content_hash(&content),
         imports::extract_raw_imports(language, &content),
+        source_reads::extract_on_worker(language, content),
     ))
 }
 
@@ -2489,7 +2387,11 @@ pub async fn run_code_ingest(
         .await?;
     }
     if opts.enable_l1_5 {
-        stamp_import_scan_coverage(rt, token, module_scans, &mut report).await?;
+        let plans = source_reads::prepare(&module_scans);
+        let stamped =
+            stamp_import_scan_coverage(rt, token, module_scans, &plans, &mut report).await?;
+        source_reads::persist_edges(rt, token, &plans, &stamped, opts.sweep_time, &mut report)
+            .await?;
     }
 
     // L2: symbol/call-edge persistence (Rust-only; see the module doc
@@ -2658,7 +2560,7 @@ async fn run_import_scan(
 
         let file_for_read = file.clone();
         let root_for_read = canonical_ingest_root.clone();
-        let (hash, raw_imports) =
+        let (hash, raw_imports, source_read_scan) =
             match blocking_io(move || scan_import_source(&root_for_read, &file_for_read, language))
                 .await?
             {
@@ -2765,8 +2667,17 @@ async fn run_import_scan(
         let scan = module_scans.entry(module_id).or_insert_with(|| ModuleScan {
             source_project: proj_name.clone(),
             imports: Vec::new(),
+            source_reads: Vec::new(),
         });
         scan.imports.extend(scan_imports);
+        scan.source_reads.push(source_reads::SourceReadInput {
+            source_path,
+            source_revision: snapshot.revision.clone(),
+            content_hash: hash,
+            language: language.to_string(),
+            sweep_time: sweep_time.to_rfc3339(),
+            scan: source_read_scan,
+        });
     }
     Ok(())
 }
@@ -3408,7 +3319,8 @@ where
         return Ok(false);
     }
     advancing_entity_revision(current.updated_at, current.updated_at)?;
-    if let Err(error) = gate_check(&current) {
+    let context = candidate_context(token.namespace().as_str());
+    if let Err(error) = gate_check_with_context(&context, &current) {
         match error {
             RuntimeError::SecretDetected(secret) => {
                 for item in pending
@@ -3438,11 +3350,9 @@ where
             occurrences.push(item);
             continue;
         }
-        match secret_gate::check_json_at(
+        match context.check_properties(Some(
             &serde_json::to_value(&item.value).expect("serializes"),
-            "entity",
-            "properties",
-        ) {
+        )) {
             Ok(()) => {
                 seen.insert(item.value.clone());
                 allowed.push(item.value.clone());
@@ -3465,29 +3375,37 @@ where
     #[cfg(test)]
     l2_batch_tests::pause_before_batch().await;
     let mut attempted_files = Vec::new();
-    let outcome = mutate_entity(rt, token, id, &pending[0].file, report, |current| {
-        attempted_files.clear();
-        let mut entity = current?.clone();
-        let mut list = read_list(&entity);
-        let present: HashSet<T> = list.iter().cloned().collect();
-        attempted_files.extend(
-            occurrences
-                .iter()
-                .filter(|item| !present.contains(&item.value))
-                .map(|item| item.file.clone()),
-        );
-        if append_l2_pending(&mut list, &allowed) == 0 {
-            return None;
-        }
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
+    let outcome = mutate_entity_with_context(
+        rt,
+        token,
+        &context,
+        id,
+        &pending[0].file,
+        report,
+        |current| {
+            attempted_files.clear();
+            let mut entity = current?.clone();
+            let mut list = read_list(&entity);
+            let present: HashSet<T> = list.iter().cloned().collect();
+            attempted_files.extend(
+                occurrences
+                    .iter()
+                    .filter(|item| !present.contains(&item.value))
+                    .map(|item| item.file.clone()),
+            );
+            if append_l2_pending(&mut list, &allowed) == 0 {
+                return None;
+            }
+            let mut props = entity
+                .properties
+                .clone()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
+            entity.properties = Some(Value::Object(props));
+            Some(entity)
+        },
+    )
     .await?;
     if outcome == RowMutationOutcome::Blocked {
         let refusal = report
@@ -4410,6 +4328,9 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 mod owner_alias_tests;
 
 #[cfg(test)]
+mod direct_entity_tests;
+
+#[cfg(test)]
 #[path = "source_ingest/reresolve_projection_tests.rs"]
 mod reresolve_projection_tests;
 
@@ -4745,10 +4666,11 @@ mod tests {
             ModuleScan {
                 source_project: "fixture".to_string(),
                 imports: Vec::new(),
+                source_reads: Vec::new(),
             },
         );
         let mut report = CodeSourceIngestReport::default();
-        stamp_import_scan_coverage(&rt, &token, module_scans, &mut report)
+        stamp_import_scan_coverage(&rt, &token, module_scans, &BTreeMap::new(), &mut report)
             .await
             .expect("stamp path completes");
 

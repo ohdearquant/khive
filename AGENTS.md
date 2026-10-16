@@ -41,7 +41,7 @@ or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
 [ADR-027](docs/adr/ADR-027-dynamic-pack-loading.md)). Verb semantics and namespace contract are
 defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
-### KG pack — 27 verbs (bare names, no prefix, plus the `stream` sub-namespace)
+### KG pack — 28 verbs (bare names, no prefix, plus the `stream` sub-namespace)
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                          | When to use                                                                 |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -224,22 +224,33 @@ object count once; matches across different objects are ambiguous and rejected. 
 object's non-null `full_id`, when supplied, must be a full UUID and determines canonical
 attribution; otherwise `id` is resolved. Default JSON recall results can be forwarded unchanged and judged
 using either alias. Rank position never supplies a judgment.
+`signal="unjudged"` records a separate `feedback_unjudged` event with available
+serve attribution, query, and candidate ids, without changing posterior state.
+It requires the same uniquely selected target and never fabricates a default
+serving profile. Optional `scorer_run_id` and `serve_ledger_id` must arrive together
+and match the serve. Unjudged preserves their grade/dedup budget: a later eligible
+`useful`, `not_useful`, or `wrong` auto-feedback judgment using that pair commits
+exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 
-### Comm pack — 11 verbs (`comm.` prefix)
+### Comm pack — 15 verbs (`comm.` prefix)
 
-| Verb                    | What it does                                                                                                            | When to use                                                 |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `comm.send`             | Send a message (optionally threaded)                                                                                    | Inter-agent or inter-namespace messaging                    |
-| `comm.delivered`        | Confirm the internal inbound sibling for an outbound UUID                                                               | Resolve an ambiguous atomic-write outcome                   |
-| `comm.transport_status` | Read sender-local transport status for a full outbound UUID                                                             | Inspect pending, recipient receipt, failure or unknown      |
-| `comm.inbox`            | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
-| `comm.unread`           | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
-| `comm.read`             | Fetch one or more **inbound** messages and mark read; `body=false` keeps the acknowledgement-only shape                 | Read and acknowledge received messages                      |
-| `comm.mark_read`        | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
-| `comm.reply`            | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
-| `comm.thread`           | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
-| `comm.health`           | Bounded heartbeat-first channel and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)   | Check channel polls and parked messages                     |
-| `comm.probe`            | Read-only poll for new inbound message metadata and stale unread count                                                  | Cheap wake-up check without a full inbox scan               |
+| Verb                      | What it does                                                                                                                                         | When to use                                                 |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `comm.send`               | Send a message (optionally threaded)                                                                                                                 | Inter-agent or inter-namespace messaging                    |
+| `comm.delivered`          | Confirm the internal inbound sibling for an outbound UUID                                                                                            | Resolve an ambiguous atomic-write outcome                   |
+| `comm.transport_status`   | Read sender-local transport status for a full outbound UUID                                                                                          | Inspect pending, recipient receipt, failure or unknown      |
+| `comm.inbox`              | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields                              | Triage inbox, wait for what's next, or inspect sent history |
+| `comm.unread`             | Count-only view of unread inbound messages (no args, no payloads)                                                                                    | Cheap unread check without listing                          |
+| `comm.read`               | Fetch one or more **inbound** messages and mark read; `body=false` keeps the acknowledgement-only shape                                              | Read and acknowledge received messages                      |
+| `comm.mark_read`          | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                                                         | Clear a supplied inbox set without naming ambiguity         |
+| `comm.reply`              | Reply to a message (threading linkage)                                                                                                               | Respond in-thread                                           |
+| `comm.thread`             | Retrieve full conversation thread                                                                                                                    | Read the whole conversation                                 |
+| `comm.health`             | Bounded heartbeat-first channel and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)                                | Check channel polls and parked messages                     |
+| `comm.probe`              | Read-only poll for new inbound message metadata and stale unread count                                                                               | Cheap wake-up check without a full inbox scan               |
+| `comm.suppression_add`    | Add an email suppression entry (address, exact domain, or recipient key); requires `scope`, `kind`, `value`, `source`                                | Record an opt-out or operator block                         |
+| `comm.suppression_list`   | List live suppression entries, optionally filtered by `scope` and `kind`                                                                             | Audit what is currently suppressed                          |
+| `comm.suppression_remove` | Remove one suppression entry by full UUID; a non-empty `reason` is required, and opt-out sources also need later authenticated same-address evidence | Lift a block with an audit trail                            |
+| `comm.withheld_body`      | Read a delivered withheld external message's original bytes, base64-encoded; open to its recipient actor and the maintainer, every call audited      | Recover what a screening rule withheld                      |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
@@ -288,30 +299,31 @@ caller receives the server-generated UUID.
 | `schedule.agenda`   | List upcoming events and ticker liveness      | "What's on the calendar, and is its ticker running?"          |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
-### Knowledge pack — 20 verbs (`knowledge.` prefix)
+### Knowledge pack — 21 verbs (`knowledge.` prefix)
 
-| Verb                       | What it does                                            | When to use                                  |
-| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
-| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
-| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix  | Read a specific knowledge entry              |
-| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
-| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
-| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
-| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
-| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
-| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
-| `knowledge.export`         | Deterministic JSONL snapshot of one namespace's corpus  | Back up or hand off a corpus                 |
-| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
-| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
-| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
-| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
-| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
-| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
-| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
-| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
-| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
+| Verb                       | What it does                                              | When to use                                  |
+| -------------------------- | --------------------------------------------------------- | -------------------------------------------- |
+| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                          | Ingesting knowledge corpus                   |
+| `knowledge.upsert_domains` | Bulk insert/update domain groupings                       | Organizing atoms into domains                |
+| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix    | Read a specific knowledge entry              |
+| `knowledge.list`           | Paginated listing of atoms or domains                     | Browse the corpus                            |
+| `knowledge.search`         | TF-IDF search with embedding rerank (default on)          | Finding relevant knowledge                   |
+| `knowledge.suggest`        | Orient query against domains for composition              | "Which domains cover topic X?"               |
+| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains   | Build a context briefing for an agent        |
+| `knowledge.edit`           | Upsert sections for an atom                               | Update part of an atom without wiping others |
+| `knowledge.import`         | Ingest markdown files as atoms                            | Batch import from filesystem                 |
+| `knowledge.export`         | Deterministic JSONL snapshot of one namespace's corpus    | Back up or hand off a corpus                 |
+| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                           | Retire stale knowledge                       |
+| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts            | Health check                                 |
+| `knowledge.lint`           | Visible graph hygiene rules, statistics and guarded fixes | Inspect graph health and prepare repairs     |
+| `knowledge.index`          | Backfill embeddings + FTS                                 | After bulk import or reindex                 |
+| `knowledge.fold`           | Budget-constrained knapsack selection                     | Token-aware subset picking                   |
+| `knowledge.challenge`      | Mark a section as disputed                                | Flag incorrect content                       |
+| `knowledge.adjudicate`     | Resolve a disputed section                                | Accept or reject a challenge                 |
+| `knowledge.learn`          | Register a concept entity with domain/tags                | Quick concept creation                       |
+| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)      | Attribution                                  |
+| `knowledge.topic`          | List concepts by domain or free-text                      | Explore the concept graph                    |
+| `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning       | Signal useful/not_useful on compose results  |
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).

@@ -62,6 +62,9 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   changes:
     name: Select changed benchmark components
+    # Pull requests from this repository's codex/ branches skip this job, and with it every
+    # component job; the push run on main benchmarks every component after they merge.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -236,6 +239,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v5
 

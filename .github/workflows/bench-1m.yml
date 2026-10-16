@@ -68,6 +68,9 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   ann-ci-gate:
     name: ANN structural regression gate (synthetic, hermetic)
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -93,6 +96,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v4
         with:
@@ -151,6 +155,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v4
         with:
