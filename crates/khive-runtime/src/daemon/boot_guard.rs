@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use super::*;
 
 /// Run the daemon using a startup lock acquired by the caller *before*

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use super::*;
 
 /// Run the daemon: bind the socket, warm in the background, serve request

@@ -19,10 +19,14 @@ mod run_daemon;
 
 pub use dispatch_trait::*;
 
-pub use connection::*;
+#[cfg(all(unix, feature = "fault-injection"))]
+pub use connection::handle_conn_for_test;
+use connection::*;
 
+#[cfg(unix)]
 pub use run_daemon::*;
 
+#[cfg(unix)]
 pub use boot_guard::*;
 
 #[cfg(all(test, unix))]
