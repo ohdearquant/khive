@@ -224,6 +224,7 @@ async fn daemon_case(root: &Path, raw: Option<&str>) {
     let request = EventsRequest::CountEvents {
         protocol_version: EVENTS_PROTOCOL_VERSION,
         namespace: "local".to_owned(),
+        operator_read_budget_secs: Some(30),
         filter: EventFilter::default(),
     };
     tokio::time::timeout(Duration::from_secs(2), async {

@@ -1,0 +1,230 @@
+use super::*;
+
+#[test]
+fn empty_operation_id_is_rejected_at_deserialization() {
+    // An empty operation id can never be a unique caller-
+    // generated id, so the wire form rejects it. In-memory
+    // construction stays unrestricted (checked below).
+    let err = serde_json::from_str::<OperationId>(r#""""#).unwrap_err();
+    assert!(
+        err.to_string().contains("non-empty"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(OperationId::from(""), OperationId("".to_string()));
+}
+
+#[test]
+fn non_empty_operation_id_round_trips() {
+    let id: OperationId = serde_json::from_str(r#""op-1""#).unwrap();
+    assert_eq!(id, OperationId::from("op-1"));
+    assert_eq!(serde_json::to_string(&id).unwrap(), r#""op-1""#);
+}
+
+#[test]
+fn direct_serde_rejects_every_invalid_wire_shape() {
+    let frames = [
+        Frame::Handshake {
+            version: ProtocolVersion::new(0),
+        },
+        Frame::HandshakeAck {
+            version: ProtocolVersion::new(0),
+        },
+        Frame::Request {
+            id: OperationId::from(""),
+            ops: "stats()".to_string(),
+            deadline_ms: None,
+            namespace: None,
+            actor_id: None,
+            visible_namespaces: None,
+        },
+        Frame::Response {
+            id: OperationId::from(""),
+            result: serde_json::json!({}),
+        },
+        Frame::Error {
+            id: Some(OperationId::from("")),
+            code: crate::error::WireErrorCode::Internal,
+            message: "failure".to_string(),
+            unrecognized_code: None,
+        },
+        Frame::Cancel {
+            id: OperationId::from(""),
+        },
+        Frame::Subscribe {
+            id: OperationId::from(""),
+            topic: "a.b".to_string(),
+            resume_cursor: None,
+        },
+        Frame::SubscribeAck {
+            id: OperationId::from(""),
+            topic: "a.b".to_string(),
+            start_cursor: 0,
+        },
+        Frame::Unsubscribe {
+            id: OperationId::from(""),
+            topic: "a.b".to_string(),
+        },
+        Frame::UnsubscribeAck {
+            id: OperationId::from(""),
+            topic: "a.b".to_string(),
+        },
+        Frame::Error {
+            id: Some(OperationId::from("op-1")),
+            code: crate::error::WireErrorCode::FrameTooLarge,
+            message: "too big".to_string(),
+            unrecognized_code: None,
+        },
+        Frame::Error {
+            id: None,
+            code: crate::error::WireErrorCode::Cancelled,
+            message: "cancelled".to_string(),
+            unrecognized_code: None,
+        },
+        Frame::Error {
+            id: None,
+            code: crate::error::WireErrorCode::Internal,
+            message: "future".to_string(),
+            unrecognized_code: Some("future_code_xyz".to_string()),
+        },
+    ];
+
+    for frame in frames {
+        assert!(
+            serde_json::to_vec(&frame).is_err(),
+            "invalid frame {:?} serialized successfully",
+            frame.kind()
+        );
+    }
+}
+
+#[test]
+fn direct_serde_matches_encode_payload_for_a_valid_frame() {
+    let frame = Frame::Request {
+        id: OperationId::from("op-1"),
+        ops: "stats()".to_string(),
+        deadline_ms: Some(5000),
+        namespace: Some("default".to_string()),
+        actor_id: Some("actor".to_string()),
+        visible_namespaces: Some(vec!["default".to_string()]),
+    };
+    let direct = serde_json::to_vec(&frame).unwrap();
+    let encoded = crate::codec::encode_frame(&frame).unwrap();
+    assert_eq!(direct, &encoded[crate::codec::LENGTH_PREFIX_BYTES..]);
+    assert_eq!(serde_json::from_slice::<Frame>(&direct).unwrap(), frame);
+}
+
+#[test]
+fn unknown_kind_through_direct_serde_is_rejected() {
+    let err = serde_json::from_str::<Frame>(r#"{"kind":"ping"}"#).unwrap_err();
+    assert!(err.to_string().contains("unknown frame kind"));
+}
+
+#[test]
+fn client_to_server_kinds_are_all_frame_kinds() {
+    for kind in CLIENT_TO_SERVER_KINDS {
+        assert!(
+            FRAME_KINDS.contains(kind),
+            "client-to-server kind {kind:?} is missing from FRAME_KINDS"
+        );
+    }
+}
+
+#[test]
+fn direct_serde_rejects_connection_terminal_error_carrying_an_id() {
+    // The id/scope rule is enforced inside the visitor itself, so a
+    // DIRECT serde decode — bypassing `decode_payload` entirely —
+    // cannot represent an inconsistent error frame either.
+    let err = serde_json::from_str::<Frame>(
+        r#"{"kind":"error","id":"op-1","code":"frame_too_large","message":"too big"}"#,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("id/scope rule"),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("frame_too_large"), "error: {message}");
+    assert!(message.contains("op-1"), "error: {message}");
+}
+
+#[test]
+fn direct_serde_rejects_request_terminal_error_without_an_id() {
+    let err = serde_json::from_str::<Frame>(
+        r#"{"kind":"error","code":"cancelled","message":"cancelled"}"#,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("id/scope rule"),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("cancelled"), "error: {message}");
+}
+
+#[test]
+fn direct_serde_accepts_both_consistent_error_scopes() {
+    let connection_terminal: Frame = serde_json::from_str(
+        r#"{"kind":"error","code":"unsupported_version","message":"no common version"}"#,
+    )
+    .unwrap();
+    assert!(matches!(connection_terminal, Frame::Error { id: None, .. }));
+
+    let request_terminal: Frame = serde_json::from_str(
+        r#"{"kind":"error","id":"op-9","code":"deadline_exceeded","message":"too slow"}"#,
+    )
+    .unwrap();
+    match request_terminal {
+        Frame::Error {
+            id,
+            code,
+            unrecognized_code,
+            ..
+        } => {
+            assert_eq!(id, Some(OperationId::from("op-9")));
+            assert_eq!(code, crate::error::WireErrorCode::DeadlineExceeded);
+            assert!(unrecognized_code.is_none());
+        }
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_serde_fills_unrecognized_code_for_an_unknown_wire_code() {
+    // The fallback diagnostic is filled by the visitor, on every
+    // decode path — not only by the codec. The id/scope pairing is NOT
+    // enforced for an unknown code (its true scope is unknown), so
+    // both id shapes decode.
+    for json in [
+        r#"{"kind":"error","id":"op-7","code":"future_code_xyz","message":"from newer peer"}"#,
+        r#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#,
+    ] {
+        let frame: Frame = serde_json::from_str(json).unwrap();
+        match frame {
+            Frame::Error {
+                code,
+                unrecognized_code,
+                ..
+            } => {
+                assert_eq!(code, crate::error::WireErrorCode::Internal);
+                assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn direct_serde_leaves_unrecognized_code_none_for_a_literal_internal() {
+    // `"internal"` is a closed-set member, not a fallback: the
+    // diagnostic must stay `None` so the encode side does not mistake
+    // an honest `internal` for a decoded-fallback frame.
+    let frame: Frame =
+        serde_json::from_str(r#"{"kind":"error","id":"op-1","code":"internal","message":"boom"}"#)
+            .unwrap();
+    match frame {
+        Frame::Error {
+            unrecognized_code, ..
+        } => assert!(unrecognized_code.is_none()),
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+}

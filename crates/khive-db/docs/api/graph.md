@@ -23,6 +23,22 @@ flag-on path it runs inside the WriterTask's own transaction, so a bare
 lookup before falling through this helper. A non-strict `None` records only at
 the actual fallback seam; strict mode never reaches it.
 
+## Guarded symmetric-edge updates
+
+`update_symmetric_edge_if_unchanged` applies a validated, canonical symmetric-edge patch using
+the request's record namespace, independently of the store's routing namespace. Its dedicated
+`UpdateSymmetricEdge` writer route preserves the runtime `update_edge` operation label,
+unbounded-wait `send` admission and compatibility fallback telemetry. It does not use
+`with_writer`. Both the writer task and the pooled-guard fallback wrap the probe and guarded
+mutation in one transaction.
+
+The snapshot revision must have a representable successor before the conflict probe runs.
+A competing natural key, including a tombstone, survives unchanged; only the requested
+noncanonical row is deleted. Otherwise its patch fields are updated with a strictly newer
+revision. Both mutations require the exact snapshot revision and deletion marker. A stale
+snapshot returns `Stale`, and absorption returns the raw survivor ID for post-commit runtime
+parsing. The default storage trait implementation returns `Unsupported`.
+
 ## Observed edge upserts and tombstone policy
 
 `upsert_edge_observed` and the guarded singleton/batch variants determine the

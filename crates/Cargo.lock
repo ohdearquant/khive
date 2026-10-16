@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "khive-bm25"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -1993,13 +1993,14 @@ dependencies = [
 
 [[package]]
 name = "khive-brain-core"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "criterion",
  "hex",
  "khive-runtime",
- "lru 0.18.2",
+ "khive-types",
+ "lru",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -2009,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "khive-changeset"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "khive-types",
  "proptest",
@@ -2020,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2036,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-email"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-imap",
  "async-native-tls",
@@ -2045,9 +2046,11 @@ dependencies = [
  "chrono",
  "futures",
  "khive-channel",
+ "khive-pack-blob",
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",
+ "khive-storage",
  "khive-types",
  "lettre",
  "mail-parser",
@@ -2064,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-telegram"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2079,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2117,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2132,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2140,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -2150,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -2162,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate-rego"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "khive-gate",
  "khive-types",
@@ -2173,8 +2176,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-graph-diff"
+version = "0.13.0"
+dependencies = [
+ "khive-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "khive-hnsw"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2206,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mcp"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2264,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mounts"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2284,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-agent"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2300,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-blob"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2322,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-brain"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2351,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-charter"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2365,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-code"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2393,9 +2406,10 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-comm"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "inventory",
@@ -2418,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-exec"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2444,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-formal"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2457,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-git"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2491,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-gtd"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2512,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-kg"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2540,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-knowledge"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2577,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-memory"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2598,7 +2612,7 @@ dependencies = [
  "khive-types",
  "khive-vamana",
  "lattice-embed",
- "lru 0.18.2",
+ "lru",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2612,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-moodboard"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2642,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-schedule"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2668,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-session"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2690,11 +2704,12 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]
 name = "khive-pack-telemetry"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2711,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-template"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2724,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-tool"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2747,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-web"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2775,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-workspace"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2793,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "khive-quant"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "rand 0.8.7",
@@ -2802,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2812,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "khive-repo-showcase"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2830,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "khive-request"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2841,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2869,8 +2884,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-rule-evaluator"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "khive-changeset",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "khive-runtime"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2905,6 +2932,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2",
+ "signal-hook-registry",
  "syn",
  "tempfile",
  "thiserror 2.0.18",
@@ -2920,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2930,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2947,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "khive-text"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "rust-stemmers",
@@ -2956,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2966,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vamana"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2990,13 +3018,14 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
  "fs4",
  "hex",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
@@ -3004,8 +3033,10 @@ dependencies = [
  "khive-vcs-adapters",
  "libc",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -3015,12 +3046,13 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs-adapters"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "csv",
  "khive-types",
  "serde",
+ "serde_bibtex",
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
@@ -3028,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "khive-wire-protocol"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3037,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "kkernel"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3045,8 +3077,10 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "inventory",
  "khive-changeset",
  "khive-db",
+ "khive-fs",
  "khive-gate-rego",
  "khive-mcp",
  "khive-mounts",
@@ -3074,6 +3108,7 @@ dependencies = [
  "khive-repo-showcase",
  "khive-request",
  "khive-retrieval",
+ "khive-rule-evaluator",
  "khive-runtime",
  "khive-score",
  "khive-storage",
@@ -3082,11 +3117,12 @@ dependencies = [
  "khive-vcs-adapters",
  "lattice-embed",
  "libc",
- "lru 0.18.2",
+ "lru",
  "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "sha2",
  "tempfile",
@@ -3099,18 +3135,18 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
+checksum = "f74253d8eb6650a3a800d25b4689369782e4cb48c3ee68154d1096403a968550"
 dependencies = [
  "async-trait",
- "blake3",
  "chrono",
  "lattice-inference",
- "lru 0.16.4",
+ "lru",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3118,9 +3154,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd766cb81f951cc61af9519fd58c97e383dcb52a8e153069002b2f89f553d328"
+checksum = "261d1d047e5a87f4bfc9ccd5eea9628166ff78a7379dec951ad02d71b6fb4a93"
 dependencies = [
  "rand 0.8.7",
  "rand_distr",
@@ -3130,9 +3166,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
+checksum = "7164d6239a081970afc8c0e38ddff98e76bcbf5d96cb9677126f67d934f1b6a2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3233,15 +3269,6 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
-
-[[package]]
-name = "lru"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
-dependencies = [
- "hashbrown 0.16.1",
-]
 
 [[package]]
 name = "lru"
@@ -4159,7 +4186,7 @@ dependencies = [
  "ipnet",
  "jsonschema",
  "lazy_static",
- "lru 0.18.2",
+ "lru",
  "msvc_spectre_libs",
  "num-bigint",
  "num-traits",
@@ -4273,9 +4300,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "1.8.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
+checksum = "14db48ee17a9ba61810ab1a9c1beb7d06d8136ae39ac25a1137f10d357af01af"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4297,9 +4324,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.8.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aad0035b69380782d78ea95b508327e6deaa2235909053e596eea8f27b5e1d5"
+checksum = "783d787bf21813b285f13019adc49e11af501c658890c1e519f31f937c68b7e3"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -4373,9 +4400,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4565,6 +4592,17 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bibtex"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aca7ae3793a022a1a7eb020ab5a7823a1634f5e96055f86f60991523eeb2bb8"
+dependencies = [
+ "memchr",
+ "serde",
+ "unicase",
 ]
 
 [[package]]
@@ -5198,6 +5236,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5813,6 +5857,34 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.1+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zune-core"

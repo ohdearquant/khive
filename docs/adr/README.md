@@ -226,6 +226,9 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 | [ADR-197](ADR-197-owns-relation.md)                                     | The `owns` Relation                                                                                        |
 | [ADR-198](ADR-198-shared-fs-ancestor-link-policy.md)                    | Shared Filesystem Ancestor Link Policy                                                                     |
+| [ADR-199](ADR-199-shared-score-arithmetic.md)                           | Shared Score Arithmetic                                                                                    |
+| [ADR-200](ADR-200-external-email-policy.md)                             | External Email Policy: Sender Scope, Suppression, Unsubscribe and Screened Inbound Delivery                |
+| [ADR-201](ADR-201-brain-module-boundaries.md)                           | Brain module boundaries and shared event readers                                                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -269,6 +272,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-001 companion: explicit import and VCS snapshot policy boundary](ADR-001-entity-kind-taxonomy.md#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786) (2026-10-10): entry-point boundary for unknown-kind operator import and the existing VCS degradation contract (#4786).
 - [ADR-015 amendment: live entity list indexes](ADR-015-schema-migrations.md#proposed-amendment-live-entity-list-indexes-2026-10-04) (2026-10-04): proposed V50 live entity namespace/order and namespace/type/order indexes, bounded eligible first-page plans, and one unforced retry for a missing index (#3689).
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
 - [ADR-031 Amendment 5](ADR-031-multi-engine-retrieval.md#amendment-5-2026-10-08-ordered-peer-engines-and-explicit-retrieval-strategies) (2026-10-08): proposed ordered peer `[[engines]]`, a per-query retrieval strategy that is always resolved and disclosed, weighted reciprocal rank fusion, and a shared executor in khive-retrieval.
@@ -280,6 +284,7 @@ Amendments to accepted records:
 - [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
 - [ADR-027 Amendment 4](ADR-027-dynamic-pack-loading.md#amendment-4-2026-09-12-installable-pack-distributions-and-what-stays-rejected) (2026-09-12): installable pack distributions, and what stays rejected.
 - [ADR-028 Amendment A3](ADR-028-pack-scoped-backends.md#amendment-a3-backend-route-validation-and-search-runtime-selection-2026-09-14) (2026-09-14): backend route validation and search runtime selection.
+- [ADR-035 amendment: embedding pipeline and import strictness](ADR-035-cli-config-and-auto-embed.md#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786) (2026-10-10): embedding configuration, legacy-key compatibility and unknown-entity-kind import policy (#4785, #4786).
 - [ADR-037 Amendment 2](ADR-037-remote-resolution-and-hash-verification.md#amendment-2-2026-10-10-configuration-bound-remote-entity-reads) (2026-10-10): configuration-bound namespace and project-root contract for cached remote entity reads (#4794).
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14) (2026-09-14): inbox and thread limit disclosure.
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-comm-message-file-attachments-2026-10-02) (2026-10-02): comm message file attachments, with confined `blob.import` and `blob.export`.
@@ -289,6 +294,7 @@ Amendments to accepted records:
 - [ADR-056 amendment: committed ingest indexing failures](ADR-056-channel-transport-layer.md#amendment-2026-10-05----disclose-committed-ingest-indexing-failures) (2026-10-05): committed conditional-ingest indexing diagnostics and successful comm acknowledgements (#1461).
 - [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
 - [ADR-079 Amendment 4](ADR-079-ann-persistence-warm-path-integration.md#amendment-4-2026-10-03-contract-for-a-shared-ann-lifecycle-host) (2026-10-03): contract for a shared ANN lifecycle host: the recovery fence, two generation counters, one tail reader, equal-score order and segment-key disjointness (#3921, #3922).
+- [ADR-079 Amendment 5](ADR-079-ann-persistence-warm-path-integration.md#amendment-5-2026-10-13-the-memory-note-index-is-per-namespace-and-note-class) (2026-10-13): proposed memory note index keyed by namespace, note class and model, with per-namespace registry rows, an empty-key watermark rule and a backfill before the wildcard rows retire.
 - [ADR-081 Amendment 1](ADR-081-recall-retune-driver.md#amendment-1-2026-10-06-declared-recall-event-correlation) (2026-10-06): Proposed caller-declared recall-event correlation, selected-result feedback forwarding and best-effort event identity, without attribution or scorer authority (#1731, #1757).
 - [ADR-021 correlation companion](ADR-021-memory-pack.md#amendment-declared-recall-event-correlation-2026-10-06) (2026-10-06): independently Proposed recall response-field, empty-result and telemetry-durability contract for ADR-081 Amendment 1.
 - [ADR-085 Amendment 13](ADR-085-code-pack.md#amendment-13-2026-09-30-native-routing-for-in-process-code-map-clients) (2026-09-30): proposed code-map ownership boundary, five core opener classes and bidirectional lock acceptance, including the [Proposed Amendment 12 lifetime clarification](ADR-085-code-pack.md#proposed-clarification-guarded-identity-lifetime); architecture fork unchosen. PR #3674 is held, as a merge-sequencing statement that applies when this text lands. The hold releases only when the executed acceptance of this amendment has passed for the full census population under the selected architecture, the `code.ingest` native constructor included, and the amendment is ratified on that executed evidence; a status change without that executed evidence does not release the hold.

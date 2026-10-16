@@ -5,7 +5,7 @@
 //! lengthen each lock hold and correlate failures, so per-shape hold-time
 //! and rollback tests become release requirements" (issue #1609). Rollback
 //! fault-injection coverage for the dual-write unit already exists
-//! (`crates/khive-pack-comm/src/message.rs` inline tests). This file adds
+//! (`crates/khive-pack-comm/src/message_tests.rs`). This file adds
 //! the missing hold-time half: it measures wall-clock latency of each
 //! coalesced write shape and fails the gate if a shape regresses past a
 //! calibrated bound, rather than only reporting a number.

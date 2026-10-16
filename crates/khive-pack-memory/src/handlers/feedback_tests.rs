@@ -1,0 +1,758 @@
+use khive_pack_kg::KgPack;
+use khive_runtime::{Namespace, RuntimeConfig, RuntimeError, VerbRegistryBuilder};
+
+/// Owns a file-backed runtime and removes its database directory after shutdown.
+struct TestRuntime {
+    runtime: khive_runtime::KhiveRuntime,
+    _temp_dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestRuntime {
+    type Target = khive_runtime::KhiveRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+fn build_memory_rt(brain_profile: Option<String>) -> TestRuntime {
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-feedback-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let runtime = khive_runtime::KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string()],
+        brain_profile,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    TestRuntime {
+        runtime,
+        _temp_dir: tmp,
+    }
+}
+
+#[tokio::test]
+async fn feedback_rejects_target_prefix_with_resolution_consequence() {
+    let rt = build_memory_rt(None);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let error = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "target_id": "deadbeef",
+                "signal": "useful",
+            }),
+        )
+        .await
+        .expect_err("a feedback target prefix is not an exact record id");
+    let message = error.to_string();
+    assert!(message.contains("can miss or be ambiguous"), "{message}");
+    assert!(message.contains("one exact recalled record"), "{message}");
+}
+
+/// Tier-3: when no brain pack is loaded and no profile is configured, feedback
+/// updates the global prior without error.
+#[tokio::test]
+async fn feedback_falls_through_to_global_prior() {
+    let rt = build_memory_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "test feedback note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "useful",
+            }),
+        )
+        .await;
+
+    assert!(result.is_ok(), "feedback must not error: {:?}", result);
+    let v = result.unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["target_id"], note_id.id.as_hyphenated().to_string());
+    assert_eq!(v["signal"], "useful");
+}
+
+#[tokio::test]
+async fn feedback_canonicalizes_complete_uuid_spelling() {
+    let rt = build_memory_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "canonical feedback target",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": format!("{{{}}}", note_id.id),
+                "signal": "useful",
+            }),
+        )
+        .await
+        .expect("feedback ok");
+
+    assert_eq!(
+        result["target_id"],
+        note_id.id.as_hyphenated().to_string(),
+        "strict identifier acknowledgements use canonical lowercase dashed UUIDs"
+    );
+}
+
+/// Tier-3: not_useful signal flows through global prior path correctly.
+#[tokio::test]
+async fn feedback_global_prior_not_useful() {
+    let rt = build_memory_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "not useful note",
+            Some(0.5),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let r = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "not_useful",
+            }),
+        )
+        .await
+        .expect("feedback ok");
+
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["signal"], "not_useful");
+}
+
+/// Tier-3: an invalid signal string must be rejected before it reaches
+/// `on_explicit_feedback`, which otherwise silently no-ops and still
+/// returns `ok=true` (AUD-004).
+#[tokio::test]
+async fn feedback_tier3_invalid_signal_is_rejected() {
+    let rt = build_memory_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "invalid signal note",
+            Some(0.5),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let memory_pack = crate::MemoryPack::new(rt.clone());
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(memory_pack);
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "bad_value",
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "invalid signal must be rejected, got {:?}",
+        result
+    );
+    assert!(matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)));
+}
+
+/// Tier-1: explicit brain_profile config routes to brain.feedback (which errors
+/// if brain pack not loaded — that is the expected contract).
+#[tokio::test]
+async fn feedback_explicit_profile_routes_to_brain() {
+    let rt = build_memory_rt(Some("balanced-recall-v1".to_string()));
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "profile routed note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    // No brain pack loaded → brain.feedback not found → error propagates.
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "useful",
+            }),
+        )
+        .await;
+
+    // brain.feedback is not registered → should error (verb not found).
+    assert!(
+        result.is_err(),
+        "explicit profile with no brain pack must error, got {:?}",
+        result
+    );
+}
+
+// ── Three-tier integration tests (kg + memory + brain all loaded) ──────────
+//
+// These tests verify that feedback resolution respects the full tier order.
+// Each test builds a registry with ALL THREE packs registered and inspects
+// `brain.profile` (total_events) to confirm which profile received credit.
+
+fn build_full_rt(brain_profile: Option<String>) -> TestRuntime {
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-3tier-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let runtime = khive_runtime::KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        brain_profile,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    TestRuntime {
+        runtime,
+        _temp_dir: tmp,
+    }
+}
+
+/// Tier-1 wins over tier-2: when an explicit profile is configured AND a
+/// namespace binding exists for consumer_kind="recall", the explicit profile
+/// receives feedback — not the bound profile.
+#[tokio::test]
+async fn feedback_tier1_explicit_wins_over_bound_profile() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt(Some("balanced-recall-v1".to_string()));
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "tier-1 wins note",
+            Some(0.8),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+    builder.with_actor_id(Some("memory-feedback-caller".to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    // Create and activate a secondary profile to act as the "bound" tier-2 profile.
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "alt-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create alt profile");
+
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "alt-recall-v1",
+            }),
+        )
+        .await
+        .expect("activate alt profile");
+
+    // Bind alt-recall-v1 for consumer_kind="recall" in the local namespace.
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "alt-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind alt profile");
+
+    // Send feedback: tier-1 (explicit brain_profile = "balanced-recall-v1") must win.
+    // brain.feedback returns {"emitted": true, ...} when routed through the brain pack.
+    let r = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "useful",
+            }),
+        )
+        .await
+        .expect("feedback ok");
+    assert_eq!(
+        r["emitted"], true,
+        "tier-1 feedback must route to brain pack: {r:?}"
+    );
+
+    // balanced-recall-v1 must have total_events == 1 (received the credit).
+    let default_prof = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "balanced-recall-v1",
+            }),
+        )
+        .await
+        .expect("brain.profile");
+    assert_eq!(
+        default_prof["total_events"].as_u64().unwrap_or(0),
+        1,
+        "tier-1: balanced-recall-v1 must receive the feedback event"
+    );
+
+    // alt-recall-v1 must have total_events == 0 (was NOT credited despite binding).
+    let alt_prof = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "alt-recall-v1",
+            }),
+        )
+        .await
+        .expect("brain.profile alt");
+    assert_eq!(
+        alt_prof["total_events"].as_u64().unwrap_or(0),
+        0,
+        "tier-1 wins: alt-recall-v1 must NOT receive any events when tier-1 is active"
+    );
+}
+
+/// Tier-2 namespace binding: when no explicit profile is configured but a
+/// namespace binding for consumer_kind="recall" exists, that bound profile
+/// receives feedback.
+///
+/// This test FAILS before the consumer_kind fix ("memory.recall" → "recall")
+/// and PASSES after it.
+#[tokio::test]
+async fn feedback_tier2_namespace_bound_profile_credited() {
+    use khive_pack_brain::BrainPack;
+
+    // No explicit brain_profile — tier-2 must kick in.
+    let rt = build_full_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "tier-2 binding note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+    builder.with_actor_id(Some("memory-feedback-caller".to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    // Create a secondary profile and activate it.
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "ns-bound-recall",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create ns-bound profile");
+
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "ns-bound-recall",
+            }),
+        )
+        .await
+        .expect("activate ns-bound profile");
+
+    // Bind ns-bound-recall to the "local" namespace for consumer_kind="recall".
+    // resolve_consumer_profile calls brain.resolve(namespace="local", consumer_kind="recall"),
+    // which must match this binding when the consumer_kind fix is in place.
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "ns-bound-recall",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind ns-bound profile");
+
+    // Verify brain.resolve agrees with the expected binding before calling feedback.
+    let resolve_result = registry
+        .dispatch(
+            "brain.resolve",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("brain.resolve");
+    assert_eq!(
+        resolve_result["resolved_profile_id"],
+        serde_json::json!("ns-bound-recall"),
+        "brain.resolve must return the namespace-bound profile for consumer_kind=recall"
+    );
+
+    // Send feedback — tier-2 must route to ns-bound-recall.
+    // brain.feedback returns {"emitted": true, ...} when routed through the brain pack.
+    let r = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "useful",
+            }),
+        )
+        .await
+        .expect("feedback ok");
+    assert_eq!(
+        r["emitted"], true,
+        "tier-2 feedback must route to brain pack: {r:?}"
+    );
+
+    // ns-bound-recall must have total_events == 1.
+    let bound_prof = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "ns-bound-recall",
+            }),
+        )
+        .await
+        .expect("brain.profile ns-bound");
+    assert_eq!(
+        bound_prof["total_events"].as_u64().unwrap_or(0),
+        1,
+        "tier-2: namespace-bound profile ns-bound-recall must receive the feedback event"
+    );
+}
+
+/// Tier-3 global fallback: when no explicit profile is configured and no explicit
+/// namespace binding exists, feedback falls through to the pack-local global
+/// tuning prior — even when the brain pack is loaded and balanced-recall-v1 is active.
+///
+/// Before the matched_binding fix, resolve_consumer_profile treated the system-default
+/// fallback (balanced-recall-v1 active, no binding rows) as a tier-2 hit. This test
+/// verifies that the deactivation workaround is no longer needed: tier-3 fires in
+/// the normal case (brain loaded, no explicit binding).
+#[tokio::test]
+async fn feedback_tier3_global_fallback_with_brain_loaded() {
+    use khive_pack_brain::BrainPack;
+
+    // No explicit brain_profile configured.
+    let rt = build_full_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "tier-3 global fallback note",
+            Some(0.6),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+    // Load brain pack but do NOT create any explicit bindings.
+    // brain.resolve returns balanced-recall-v1 as system-default (matched_binding=false).
+    // With the fix, resolve_consumer_profile returns None for matched_binding=false,
+    // so tier-2 is skipped and tier-3 fires WITHOUT needing to deactivate the default profile.
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    // Confirm brain.resolve returns a system-default (matched_binding=false) — no explicit binding.
+    let resolve_result = registry
+        .dispatch(
+            "brain.resolve",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("brain.resolve should succeed");
+    assert_eq!(
+        resolve_result["matched_binding"], false,
+        "no explicit binding exists: matched_binding must be false (system default)"
+    );
+
+    // Tier-3: feedback must succeed and echo the signal back (ok=true, signal echoed).
+    // balanced-recall-v1 is still Active, but tier-2 is skipped due to matched_binding=false.
+    let r = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": note_id.id.to_string(),
+                "signal": "not_useful",
+            }),
+        )
+        .await
+        .expect("tier-3 feedback must not error");
+
+    assert_eq!(
+        r["ok"], true,
+        "tier-3 global path must return ok=true: {r:?}"
+    );
+    assert_eq!(
+        r["signal"], "not_useful",
+        "tier-3 path must echo the signal: {r:?}"
+    );
+    // No brain_profile key in the response (tier-3 does not route to brain).
+    assert!(
+        r.get("emitted").is_none(),
+        "tier-3 path must not produce an emitted key: {r:?}"
+    );
+}
+
+/// Brain-tier (route_to_brain): with an active bound profile, a braced,
+/// uppercase target_id must be canonicalized to the lowercase dashed form
+/// BEFORE the registry dispatch, and brain.feedback's ack must echo that
+/// same canonical form — not the caller's spelling.
+#[tokio::test]
+async fn feedback_brain_tier_echoes_canonical_target_id() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt(None);
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note_id = rt
+        .create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "brain-tier canonical ack note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+    let canonical = note_id.id.as_hyphenated().to_string();
+
+    let mut builder = VerbRegistryBuilder::new();
+    // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+    builder.with_actor_id(Some("memory-feedback-caller".to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(rt.clone()));
+    builder.register(BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "canonical-ack-recall",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "canonical-ack-recall",
+            }),
+        )
+        .await
+        .expect("activate profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "canonical-ack-recall",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile");
+
+    // Braced + uppercase input must still be recognized as the full UUID.
+    let r = registry
+        .dispatch(
+            "memory.feedback",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "target_id": format!("{{{}}}", canonical.to_uppercase()),
+                "signal": "useful",
+            }),
+        )
+        .await
+        .expect("brain-tier feedback must succeed with a full-UUID variant");
+
+    assert_eq!(
+        r["emitted"], true,
+        "bound active profile must route feedback to the brain pack: {r:?}"
+    );
+    assert_eq!(
+        r["target_id"], canonical,
+        "the brain-tier ack must echo the canonical lowercase dashed UUID, \
+             not the braced/uppercase input"
+    );
+}
