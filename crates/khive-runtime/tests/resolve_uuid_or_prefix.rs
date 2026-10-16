@@ -231,3 +231,141 @@ async fn invalid_shape_missing_prefix_and_storage_failure_stay_distinct() {
         format!("no record matches prefix: {prefix:?}"),
     );
 }
+
+#[tokio::test]
+async fn verb_context_preserves_passthrough_validation_and_storage_errors() {
+    let runtime = runtime();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    for verb in ["read", "reply", "thread", "cancel"] {
+        for input in [
+            id.to_string(),
+            id.simple().to_string(),
+            id.to_string().to_uppercase(),
+        ] {
+            let _arm = arm_prefix_resolve_fail_scoped(&input);
+            assert_eq!(
+                runtime
+                    .resolve_uuid_or_prefix_for_verb(&token, &input, verb)
+                    .await
+                    .unwrap(),
+                id
+            );
+            assert_prefix_timeout(runtime.resolve_prefix(&token, &input).await.unwrap_err());
+        }
+        for input in [format!("{{{id}}}"), format!("urn:uuid:{id}")] {
+            assert_eq!(
+                runtime
+                    .resolve_uuid_or_prefix_for_verb(&token, &input, verb)
+                    .await
+                    .unwrap(),
+                id
+            );
+        }
+        for input in [
+            "",
+            "1234567",
+            "aabbccdd-1",
+            "aabbccdd%",
+            " aabbccdd",
+            "éabcdef0",
+        ] {
+            assert_invalid(
+                runtime
+                    .resolve_uuid_or_prefix_for_verb(&token, input, verb)
+                    .await
+                    .unwrap_err(),
+                format!("{verb}: invalid id {input:?}; expected full UUID or 8-char hex prefix"),
+            );
+        }
+        let _short_arm = arm_prefix_resolve_fail_scoped("1234567");
+        assert_invalid(
+            runtime
+                .resolve_uuid_or_prefix_for_verb(&token, "1234567", verb)
+                .await
+                .unwrap_err(),
+            format!("{verb}: invalid id \"1234567\"; expected full UUID or 8-char hex prefix"),
+        );
+        assert_prefix_timeout(runtime.resolve_prefix(&token, "1234567").await.unwrap_err());
+        let prefix = "aabbccdd";
+        let _arm = arm_prefix_resolve_fail_scoped(prefix);
+        assert_prefix_timeout(
+            runtime
+                .resolve_uuid_or_prefix_for_verb(&token, prefix, verb)
+                .await
+                .unwrap_err(),
+        );
+        assert_invalid(
+            runtime
+                .resolve_uuid_or_prefix_for_verb(&token, prefix, verb)
+                .await
+                .unwrap_err(),
+            format!("{verb}: no record matches prefix: {prefix:?}"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn verb_context_keeps_primary_namespace_liveness_and_ambiguity() {
+    let runtime = runtime();
+    let primary = Namespace::parse("verb-primary").unwrap();
+    let other = Namespace::parse("verb-other").unwrap();
+    let token = runtime
+        .authorize_with_visibility(primary, vec![other.clone()])
+        .unwrap();
+    let foreign = runtime.authorize(other).unwrap();
+    let first = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+    let second = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
+    let foreign_collision = Uuid::parse_str("aabbccdd-3333-4000-8000-000000000005").unwrap();
+    let hidden = Uuid::parse_str("bbccddee-1111-4000-8000-000000000003").unwrap();
+    let deleted = Uuid::parse_str("ccddeeaa-1111-4000-8000-000000000004").unwrap();
+    seed(&runtime, &token, first, false).await;
+    seed(&runtime, &foreign, foreign_collision, false).await;
+    seed(&runtime, &foreign, hidden, false).await;
+    seed(&runtime, &token, deleted, true).await;
+    for verb in ["read", "reply", "thread", "cancel"] {
+        assert_eq!(
+            runtime
+                .resolve_uuid_or_prefix_for_verb(&token, "AABBCCDD", verb)
+                .await
+                .unwrap(),
+            first
+        );
+        for id in [hidden, deleted] {
+            let compact = id.simple().to_string();
+            let prefix = &compact[..8];
+            assert_invalid(
+                runtime
+                    .resolve_uuid_or_prefix_for_verb(&token, prefix, verb)
+                    .await
+                    .unwrap_err(),
+                format!("{verb}: no record matches prefix: {prefix:?}"),
+            );
+            assert_eq!(
+                runtime
+                    .resolve_uuid_or_prefix_for_verb(&token, &id.to_string(), verb)
+                    .await
+                    .unwrap(),
+                id
+            );
+        }
+    }
+    seed(&runtime, &token, second, false).await;
+    for verb in ["read", "reply", "thread", "cancel"] {
+        match runtime
+            .resolve_uuid_or_prefix_for_verb(&token, "AABBCCDD", verb)
+            .await
+            .unwrap_err()
+        {
+            RuntimeError::AmbiguousPrefix {
+                prefix,
+                mut matches,
+            } => {
+                assert_eq!(prefix, "AABBCCDD");
+                matches.sort();
+                assert_eq!(matches, vec![first, second]);
+            }
+            other => panic!("expected AmbiguousPrefix, got {other:?}"),
+        }
+    }
+}

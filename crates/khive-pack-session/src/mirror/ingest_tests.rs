@@ -22,6 +22,29 @@ fn source_open_refuses_a_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn source_open_preserves_bytes_and_ancestor_links_but_refuses_nonfiles() {
+    let dir = TempDir::new().expect("tempdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).expect("source directory");
+    let source = real.join("source.jsonl");
+    let bytes = b"source\0bytes\xff\n";
+    std::fs::write(&source, bytes).expect("source bytes");
+    let linked = dir.path().join("linked-parent");
+    std::os::unix::fs::symlink(&real, &linked).expect("ancestor link");
+    let mut opened = open_source_file(&linked.join("source.jsonl")).expect("open source");
+    let mut read = Vec::new();
+    opened.read_to_end(&mut read).expect("read source");
+    assert_eq!(read, bytes);
+
+    let error = open_source_file(&real).expect_err("directory is not a source file");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "mirror source is not a regular file");
+    let missing = open_source_file(&real.join("missing")).expect_err("missing source");
+    assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+}
+
+#[cfg(unix)]
+#[test]
 fn scheduled_file_rejects_replaced_parent_symlink_at_probe_and_open() {
     let dir = TempDir::new().expect("tempdir");
     let fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");

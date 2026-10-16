@@ -272,7 +272,7 @@ impl SqliteVecStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -373,23 +373,26 @@ impl SqliteVecStore {
             let model_for_write = embedding_model.clone();
             let embedding_for_write = embedding.clone();
             return writer_task
-                .send_bounded(move |connection| {
-                    vec_upsert_atomic_dml(
-                        connection,
-                        &table_for_write,
-                        dims,
-                        subject_id,
-                        &kind_for_write,
-                        &namespace_for_write,
-                        &field_for_write,
-                        &model_for_write,
-                        &embedding_for_write,
-                        savepoint_name,
-                        record_ann_delta,
-                        failpoint_flag,
-                    )
-                    .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |connection| {
+                        vec_upsert_atomic_dml(
+                            connection,
+                            &table_for_write,
+                            dims,
+                            subject_id,
+                            &kind_for_write,
+                            &namespace_for_write,
+                            &field_for_write,
+                            &model_for_write,
+                            &embedding_for_write,
+                            savepoint_name,
+                            record_ann_delta,
+                            failpoint_flag,
+                        )
+                        .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
@@ -446,6 +449,16 @@ impl SqliteVecStore {
         query_embedding: &[f32],
         candidate_ids: &[Uuid],
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
+        self.score_candidates_with_kind(query_embedding, candidate_ids, None)
+            .await
+    }
+
+    async fn score_candidates_with_kind(
+        &self,
+        query_embedding: &[f32],
+        candidate_ids: &[Uuid],
+        kind: Option<SubstrateKind>,
+    ) -> Result<Vec<VectorSearchHit>, StorageError> {
         let dims = self.dimensions;
         if query_embedding.len() != dims {
             return Err(StorageError::InvalidInput {
@@ -475,6 +488,7 @@ impl SqliteVecStore {
         let namespace = self.namespace.clone();
         let embedding_model = self.embedding_model.clone();
         let query_vec = query_embedding.to_vec();
+        let kind_filter = kind.map(|kind| kind.to_string());
         let ids: Vec<String> = candidate_ids.iter().map(|id| id.to_string()).collect();
 
         self.with_reader("score_candidates", move |conn| {
@@ -484,7 +498,7 @@ impl SqliteVecStore {
                 "SELECT e.subject_id, vec_distance_cosine(e.embedding, ?1) as distance \
                  FROM {table} e \
                  WHERE e.namespace = ?2 AND e.embedding_model = ?3 \
-                   AND e.subject_id = ?4"
+                   AND e.subject_id = ?4 AND (?5 IS NULL OR e.kind = ?5)"
             );
             let mut stmt = conn.prepare(&sql)?;
 
@@ -495,7 +509,13 @@ impl SqliteVecStore {
                 for id in chunk.iter().filter(|id| seen.insert(*id)) {
                     let row: Option<(String, f64)> = stmt
                         .query_row(
-                            rusqlite::params![query_blob, &namespace, &embedding_model, id],
+                            rusqlite::params![
+                                query_blob,
+                                &namespace,
+                                &embedding_model,
+                                id,
+                                &kind_filter
+                            ],
                             |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .optional()?;
@@ -533,6 +553,9 @@ impl SqliteVecStore {
 
 #[cfg(all(test, feature = "vectors"))]
 mod point_lookup_tests;
+
+#[cfg(all(test, feature = "vectors"))]
+mod scan_tests;
 
 #[cfg(test)]
 mod unmanaged_write_escalation_tests;

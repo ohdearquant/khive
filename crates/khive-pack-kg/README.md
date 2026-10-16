@@ -9,13 +9,14 @@ See [event subject history](docs/api/event-target-filter.md) for exact event `ta
 
 ## Verbs
 
-26 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+27 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create`         | Create an entity or note (singleton), or a batch of entities (bulk via `items`)                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `get`            | Fetch any record by UUID (short hex prefix accepted, min 8 chars)                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `list`           | List records with optional filtering                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `count`          | Count events by stored verb, kind or actor across caller-visible namespaces, with optional time and event filters                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `update`         | Patch an entity or edge                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `delete`         | Soft- or hard-delete a record                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `restore`        | Restore a caller-owned soft-deleted entity, note, or edge                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -43,6 +44,14 @@ See [event subject history](docs/api/event-target-filter.md) for exact event `ta
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).
+
+`count(kind="event", group_by="verb")` returns an object such as
+`{"create": 3, "update": 2}`. Group by `kind` or `actor` to use those stored keys
+instead. Optional `since`/`until` are exclusive UTC-microsecond bounds;
+`verb`/`verbs`, `event_kind`/`event_kinds`, `actor`, `substrate`, and `outcome`
+filter before aggregation. Empty results are `{}`. Split-event deployments
+include both stores and require events protocol v5 on both peers. Counts across
+stores and namespaces are sequential reads, not one global snapshot.
 
 ## Vocabulary
 

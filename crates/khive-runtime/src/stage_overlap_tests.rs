@@ -4,7 +4,7 @@
 //! a registered embedder. A barrier of two parties, one in each, releases only when both
 //! stages are in flight at once.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,11 +30,33 @@ const STAGE_WAIT: Duration = Duration::from_secs(10);
 /// How long the vector stage takes before it fails in the error-precedence tests.
 const SLOW_VECTOR: Duration = Duration::from_millis(200);
 
-struct StageEmbeddingService {
-    dimensions: usize,
+/// What the vector stage does on its next query embedding. A test sets it after the fixture
+/// is in place: the registry refuses to replace a provider that has already served, so the
+/// one provider registered before setup stays and changes behaviour instead.
+#[derive(Clone, Default)]
+struct StageBehavior {
     barrier: Option<Arc<Barrier>>,
     delay: Duration,
     fail: bool,
+}
+
+/// Shared handle on the registered provider's behaviour.
+#[derive(Clone, Default)]
+struct StageControl(Arc<Mutex<StageBehavior>>);
+
+impl StageControl {
+    fn set(&self, behavior: StageBehavior) {
+        *self.0.lock().expect("stage behaviour lock") = behavior;
+    }
+
+    fn current(&self) -> StageBehavior {
+        self.0.lock().expect("stage behaviour lock").clone()
+    }
+}
+
+struct StageEmbeddingService {
+    dimensions: usize,
+    control: StageControl,
 }
 
 #[async_trait]
@@ -44,11 +66,16 @@ impl EmbeddingService for StageEmbeddingService {
         texts: &[String],
         _model: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if let Some(barrier) = &self.barrier {
+        let StageBehavior {
+            barrier,
+            delay,
+            fail,
+        } = self.control.current();
+        if let Some(barrier) = barrier {
             barrier.wait().await;
         }
-        tokio::time::sleep(self.delay).await;
-        if self.fail {
+        tokio::time::sleep(delay).await;
+        if fail {
             return Err(EmbedError::ModelInitialization(
                 "injected slow vector stage failure".to_string(),
             ));
@@ -65,24 +92,21 @@ impl EmbeddingService for StageEmbeddingService {
     }
 }
 
-/// An embedder whose query embedding can wait at a barrier, take time, and fail.
+/// An embedder whose query embedding can wait at a barrier, take time, and fail, as its
+/// control says at the time of the call.
 struct StageEmbedderProvider {
     name: String,
     dimensions: usize,
-    barrier: Option<Arc<Barrier>>,
-    delay: Duration,
-    fail: bool,
+    control: StageControl,
 }
 
 impl StageEmbedderProvider {
-    fn healthy() -> Self {
+    fn controlled_by(control: StageControl) -> Self {
         let model = EmbeddingModel::AllMiniLmL6V2;
         Self {
             name: model.to_string(),
             dimensions: model.dimensions(),
-            barrier: None,
-            delay: Duration::ZERO,
-            fail: false,
+            control,
         }
     }
 }
@@ -100,14 +124,13 @@ impl EmbedderProvider for StageEmbedderProvider {
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         Ok(Arc::new(StageEmbeddingService {
             dimensions: self.dimensions,
-            barrier: self.barrier.clone(),
-            delay: self.delay,
-            fail: self.fail,
+            control: self.control.clone(),
         }))
     }
 }
 
-fn runtime() -> KhiveRuntime {
+/// An in-memory runtime whose one embedder starts healthy, with the handle that changes it.
+fn runtime() -> (KhiveRuntime, StageControl) {
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -115,8 +138,9 @@ fn runtime() -> KhiveRuntime {
         ..RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
-    runtime.register_embedder(StageEmbedderProvider::healthy());
-    runtime
+    let control = StageControl::default();
+    runtime.register_embedder(StageEmbedderProvider::controlled_by(control.clone()));
+    (runtime, control)
 }
 
 /// A text stage that waits at `barrier` and then finds nothing.
@@ -151,7 +175,7 @@ fn summary(hits: &[SearchHit]) -> Vec<(Uuid, DeterministicScore, SearchSignals, 
 
 #[tokio::test]
 async fn entity_search_runs_its_text_and_vector_stages_together() {
-    let rt = runtime();
+    let (rt, vector) = runtime();
     let tok = NamespaceToken::local();
     rt.create_entity(
         &tok,
@@ -166,9 +190,9 @@ async fn entity_search_runs_its_text_and_vector_stages_together() {
     .unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
-    rt.register_embedder(StageEmbedderProvider {
+    vector.set(StageBehavior {
         barrier: Some(Arc::clone(&barrier)),
-        ..StageEmbedderProvider::healthy()
+        ..StageBehavior::default()
     });
     let search = rt.hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None);
     let search = TEXT_STAGE_DOUBLE.scope(double_waiting_at(Arc::clone(&barrier)), search);
@@ -183,7 +207,7 @@ async fn entity_search_runs_its_text_and_vector_stages_together() {
 
 #[tokio::test]
 async fn note_search_runs_its_text_and_vector_stages_together() {
-    let rt = runtime();
+    let (rt, vector) = runtime();
     let tok = NamespaceToken::local();
     rt.create_note(
         &tok,
@@ -198,9 +222,9 @@ async fn note_search_runs_its_text_and_vector_stages_together() {
     .unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
-    rt.register_embedder(StageEmbedderProvider {
+    vector.set(StageBehavior {
         barrier: Some(Arc::clone(&barrier)),
-        ..StageEmbedderProvider::healthy()
+        ..StageBehavior::default()
     });
     let search = rt.search_notes(&tok, "FlashAttention", None, 10, None, false, &[], None);
     let search = TEXT_STAGE_DOUBLE.scope(double_waiting_at(Arc::clone(&barrier)), search);
@@ -215,12 +239,12 @@ async fn note_search_runs_its_text_and_vector_stages_together() {
 
 #[tokio::test]
 async fn entity_search_reports_the_text_error_when_the_slow_vector_stage_also_fails() {
-    let rt = runtime();
+    let (rt, vector) = runtime();
     let tok = NamespaceToken::local();
-    rt.register_embedder(StageEmbedderProvider {
+    vector.set(StageBehavior {
         delay: SLOW_VECTOR,
         fail: true,
-        ..StageEmbedderProvider::healthy()
+        ..StageBehavior::default()
     });
     let search = rt.hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None);
 
@@ -236,13 +260,13 @@ async fn entity_search_reports_the_text_error_when_the_slow_vector_stage_also_fa
 
 #[tokio::test]
 async fn note_search_reports_the_text_error_when_the_slow_vector_stage_also_fails() {
-    let rt = runtime();
+    let (rt, vector) = runtime();
     let ns = Namespace::parse("stage-overlap-notes").unwrap();
     let tok = rt.authorize(ns.clone()).unwrap();
-    rt.register_embedder(StageEmbedderProvider {
+    vector.set(StageBehavior {
         delay: SLOW_VECTOR,
         fail: true,
-        ..StageEmbedderProvider::healthy()
+        ..StageBehavior::default()
     });
     arm_fts_search_fail(ns.as_str());
 
@@ -258,7 +282,7 @@ async fn note_search_reports_the_text_error_when_the_slow_vector_stage_also_fail
 
 #[tokio::test]
 async fn entity_search_matches_the_stage_by_stage_search_on_a_fixed_fixture() {
-    let rt = runtime();
+    let (rt, _vector) = runtime();
     let tok = NamespaceToken::local();
     for (name, text) in [
         ("FlashAttention", "IO-aware exact attention using tiling"),
@@ -309,7 +333,7 @@ async fn entity_search_matches_the_stage_by_stage_search_on_a_fixed_fixture() {
 
 #[tokio::test]
 async fn note_search_keeps_the_hits_of_both_stages() {
-    let rt = runtime();
+    let (rt, _vector) = runtime();
     let tok = NamespaceToken::local();
     let note = rt
         .create_note(

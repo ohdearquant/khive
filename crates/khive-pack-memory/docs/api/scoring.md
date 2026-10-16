@@ -52,7 +52,7 @@ Explicit caller `entity_names` take precedence over derived candidates.
 
 ## Query language routing
 
-`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters; it gates only the FTS CJK-bypass tokenizer path (see recall-pipeline.md), not vector engine selection.
+`is_cjk_char` recognizes Unified CJK, Extensions A and B, compatibility ideographs, Hiragana, Katakana, and Hangul syllables. `contains_cjk` returns true when CJK exceeds 15% of all characters; it sets only the FTS CJK bypass, which skips term selection in FTS gather mode (see recall-pipeline.md), and does not affect vector engine selection. `is_cjk_dominant_query` is stricter: it returns true when CJK characters outnumber all other letters (digits, whitespace, and punctuation count for neither side; a tie is false). Recall uses it to leave English-only embedding models out of fusion.
 
 ## `normalize_min_score`
 
@@ -78,9 +78,47 @@ The default weight is `0.3`, making both clamp endpoints reachable at posterior 
 
 ## `weighted_rerank`
 
-`RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, and boolean text/vector membership. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, and `vector_match`.
+`RerankFeatures` exposes fused relevance, decay-adjusted salience, independent temporal recency, boolean text/vector membership, and precomputed graph proximity. Recognized weight keys are `relevance`, `salience`, `temporal`, `text_match`, `vector_match`, and `graph_proximity`. Its `Default` sets numeric features to zero and membership flags to false; direct struct constructors must supply the new `graph_proximity` field or use a default update.
+
+Typed callers can supply a precomputed graph proximity. The recall handlers currently supply zero and do not read a candidate JSON `graph_proximity` field or gather graph neighbors. Graph gathering is separate follow-up work. The default `RecallConfig.reranker_weights` remains empty. Configuring a positive graph weight includes it in normalization even with a zero feature: relevance `0.5` with weights `relevance: 0.6` and `graph_proximity: 0.4` scores `0.3` in the handlers, while a typed caller supplying graph proximity `1.0` scores `0.7`. An absent or zero graph weight leaves the previous weighted result unchanged.
 
 The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value. Finite feature magnitudes are also scaled during accumulation so intermediate sums stay bounded.
+
+### Weighted rerank provenance
+
+`memory.recall_rerank` records a typed `RerankExecuted` event with
+`reranker: "weighted"` in the caller's namespace. It preserves the response's
+input order and `f64` scores. This instruments the explicit subhandler; it does
+not add a native model stage or an event to the separate `memory.recall` pipeline.
+
+The event omits `model_id`, reports no served profile, and sets both hook flags to
+`false`. Optional `query_id` is an opaque caller-supplied string, preserved exactly;
+omission or `null` leaves it absent. It is never generated or required to be a UUID.
+Its `tiers` list includes only positive recognized weights, in the fixed
+order `relevance`, `salience`, `temporal`, `text_match`, `vector_match`, `graph_proximity`.
+`ignored_weights` separately lists every unknown configured key in lexical order,
+including unknown keys with zero weight. The existing response's
+`active_rerankers` continues to include all positive keys, including ignored ones.
+
+`reranked` records raw feature values, not the response's weight-multiplied
+`rerank_scores`; `final_scores` records the weighted result. Event score tuples
+use `f32`, while response scores keep `f64`. Candidate UUIDs are canonicalized
+for the event but echoed unchanged in the response. Missing, non-string, or
+unparseable candidate IDs are counted in `unidentified_candidates` and omitted
+from all three event ID arrays without removing their response entries.
+
+If the final score or any raw feature does not narrow to a finite `f32`, the
+identified candidate remains in `candidates`, but both its `reranked` and
+`final_scores` tuples are omitted. No score is clamped or saturated. The score
+array lengths can therefore differ from the candidate array length. Do not zip
+them by position: score tuples carry their own IDs and retain their relative order.
+The response keeps its existing values.
+The event is still attempted for empty input and calls with no active tiers.
+An append failure is logged and leaves the computed response unchanged.
+
+Legacy events without a `reranker` discriminator decode as `native`. The existing
+DB projection accepts the absent model and derives `Candidate` and `Selected`
+observations from the ordered candidate and final-score arrays.
 
 ## DoS caps and MMR
 

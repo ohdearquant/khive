@@ -169,7 +169,8 @@ impl UpdateOp {
     /// # Errors
     ///
     /// Returns an error for differing substrates or field sets, or for an
-    /// invalid captured salience, decay factor, or edge weight.
+    /// invalid captured salience, decay factor, or edge weight, or an invalid
+    /// new edge weight.
     pub fn new(
         target_id: Id128,
         patch: UpdatePatch,
@@ -292,7 +293,18 @@ impl TryFrom<EdgePatchRaw> for EdgePatch {
     type Error = String;
 
     fn try_from(raw: EdgePatchRaw) -> Result<Self, Self::Error> {
-        if let Some(w) = raw.weight {
+        let patch = EdgePatch {
+            relation: raw.relation,
+            weight: raw.weight,
+        };
+        patch.validate_weight()?;
+        Ok(patch)
+    }
+}
+
+impl EdgePatch {
+    fn validate_weight(&self) -> Result<(), String> {
+        if let Some(w) = self.weight {
             if !w.is_finite() {
                 return Err(format!("EdgePatch weight must be finite, got {w}"));
             }
@@ -300,10 +312,7 @@ impl TryFrom<EdgePatchRaw> for EdgePatch {
                 return Err(format!("EdgePatch weight must be in [0.0, 1.0], got {w}"));
             }
         }
-        Ok(EdgePatch {
-            relation: raw.relation,
-            weight: raw.weight,
-        })
+        Ok(())
     }
 }
 
@@ -463,6 +472,7 @@ fn validate_update_congruence(
                     ));
                 }
             }
+            p.validate_weight()?;
             Ok(())
         }
         _ => Err(format!(

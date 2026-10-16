@@ -82,7 +82,8 @@ fn explicit_direct_policy_refuses_offset_overflow_before_filesystem_access() {
         .expect("overflow must refuse before opening an event backend");
         assert!(matches!(
             error,
-            RuntimeError::Sqlite(SqliteError::WalCeilingOffsetOverflow { bytes: u64::MAX })
+            RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })
+                if matches!(source.downcast_ref(), Some(SqliteError::WalCeilingOffsetOverflow { bytes: u64::MAX }))
         ));
         assert!(!path.parent().unwrap().exists());
     }
@@ -105,9 +106,8 @@ async fn explicit_daemon_policy_refuses_offset_overflow_before_filesystem_access
     .expect_err("overflow must refuse before event daemon path preparation");
     assert!(matches!(
         error.downcast_ref::<RuntimeError>(),
-        Some(RuntimeError::Sqlite(
-            SqliteError::WalCeilingOffsetOverflow { bytes: u64::MAX }
-        ))
+        Some(RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. }))
+            if matches!(source.downcast_ref(), Some(SqliteError::WalCeilingOffsetOverflow { bytes: u64::MAX }))
     ));
     assert!(!db.parent().unwrap().exists());
     assert!(!socket.parent().unwrap().exists());

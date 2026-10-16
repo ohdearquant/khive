@@ -35,6 +35,33 @@ Unknown relation strings still contribute a key: their original spelling and end
 
 ## Batch preflight boundary
 
-Sequential chains may repeat a key because execution order is defined. Parallel conflict detection records the first tool claiming each key and reports the second as `DslError::WriteKeyConflict`.
+Sequential chains may repeat a key because execution order is defined. The test-only batch checker records the first tool claiming each key and reports the second as `DslError::WriteKeyConflict`. Production uses the public key extractor and participant helpers below to retain per-entry refusals without changing parser admission.
 
-The batch-scanning helper is currently test-only; the production integration surface is the public per-op extractor. This distinction keeps parser output transport-agnostic while allowing an execution layer to choose envelope or whole-batch conflict policy.
+## Conflict participants
+
+`write_key_conflict_ops` returns one sorted, unique index list per operation in a
+flat batch. Each list contains every operation sharing one of that operation's
+conflicting keys, including the operation itself. For example, operations 0 and 2
+claiming the same key both report `[0, 2]`. The union is direct: keys A, A+B, B
+produce `[0, 1]`, `[0, 1, 2]`, `[1, 2]`, not a transitive group for every entry.
+Existing flat admission also refuses a key repeated inside a single operation;
+its unique diagnostic is `[i]`.
+
+`unit_write_key_conflict_ops` uses the parser's unit ranges for a parallel batch
+of chains. A key must occur in different units to conflict; once it does, every
+leaf claiming it participates, including repeated claims inside one unit. All
+indexes refer to the flattened request, never positions local to a chain.
+
+MCP adds `conflict_ops` to entries refused by this preflight. An innocent leaf
+aborted with a conflicting unit reports `[]`; directly conflicting leaves retain
+their participant lists even when their existing entry is marked `aborted`.
+Failure/abort positions, messages and `not_committed` dispositions are unchanged.
+Unrelated results and ordinary chain failures omit the field. Ordered top-level
+chains and transactional atomic execution do not acquire parallel admission.
+The local ops-file serial scheduler still uses flat batch admission; its indexes
+are relative to the dispatched chunk, unlike its separate global `op_index`.
+
+`DslError::WriteKeyConflict` carries the sorted owners of its reported key and
+keeps its existing display message. Its batch-scanning constructor remains
+test-only: parsing does not reject a whole request because of a conflict. MCP
+preserves this typed field when converting such an error to structured data.

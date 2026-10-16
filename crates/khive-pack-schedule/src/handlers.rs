@@ -21,52 +21,11 @@ use khive_types::{EventKind, SubstrateKind};
 use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 
 #[cfg(test)]
-mod activation_seam {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
-    tokio::task_local! {
-        pub(super) static AFTER_CREATE: (Arc<Barrier>, Arc<Barrier>);
-    }
-
-    pub(super) async fn pause_after_create() {
-        if let Ok((arrived, resume)) = AFTER_CREATE.try_with(Clone::clone) {
-            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
-                .await
-                .expect("public verb did not reach post-create seam");
-            resume.wait().await;
-        }
-    }
-}
+#[path = "handlers_activation_seam.rs"]
+mod activation_seam;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
-}
-
-/// Resolve a raw id string to a full UUID.
-///
-/// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
-/// The prefix is resolved via `runtime.resolve_prefix` (namespace-scoped).
-async fn resolve_id(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    raw: &str,
-    verb: &str,
-) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = raw.parse::<Uuid>() {
-        return Ok(uuid);
-    }
-    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return match runtime.resolve_prefix(token, raw).await? {
-            Some(uuid) => Ok(uuid),
-            None => Err(RuntimeError::InvalidInput(format!(
-                "{verb}: no record matches prefix: {raw:?}"
-            ))),
-        };
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
-    )))
 }
 
 fn note_to_event_json(note: &Note) -> Value {
@@ -772,6 +731,10 @@ pub(crate) struct RemindParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -781,6 +744,10 @@ pub(crate) struct ScheduleParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -820,6 +787,7 @@ pub(crate) async fn handle_remind(
         ));
     }
 
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -853,6 +821,12 @@ pub(crate) async fn handle_remind(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // The report-returning variant keeps a truncated embedding input from
     // failing the call after the note is committed: the staged event must
@@ -892,6 +866,7 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -936,6 +911,12 @@ pub(crate) async fn handle_schedule(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // See `handle_remind`: activation must follow a committed note even when
     // its embedding input was truncated.
@@ -1126,7 +1107,9 @@ pub(crate) async fn handle_cancel(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: CancelParams = deser(params)?;
-    let id = resolve_id(runtime, token, &p.id, "cancel").await?;
+    let id = runtime
+        .resolve_uuid_or_prefix_for_verb(token, &p.id, "cancel")
+        .await?;
 
     let store = runtime.notes(token)?;
     let note = store

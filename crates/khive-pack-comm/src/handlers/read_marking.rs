@@ -13,7 +13,7 @@ use super::read_cluster_tests;
 use super::validation::{
     addressed_recipient, caller_inherits_legacy_pool, caller_is_addressee, legacy_recipient,
 };
-use crate::message::{note_to_message_json, resolve_id, short_id};
+use crate::message::{note_to_message_json, short_id};
 
 const MAX_BULK_READ_IDS: usize = 500;
 
@@ -173,6 +173,11 @@ fn read_message_fields_prepared(note: &Note, attachment_fields: Value) -> Value 
         "direction": message["direction"],
         "created_at": message["created_at"],
     });
+    for key in ["origin", "trust", "labels"] {
+        if let Some(value) = note.properties.as_ref().and_then(|props| props.get(key)) {
+            fields[key] = value.clone();
+        }
+    }
     if let (Some(fields), Value::Object(attachment_fields)) =
         (fields.as_object_mut(), attachment_fields)
     {
@@ -286,13 +291,14 @@ pub(super) async fn validate_read_target(
     token: &NamespaceToken,
     raw: &str,
 ) -> Result<(Uuid, Note), RuntimeError> {
-    let id = resolve_id(runtime, token, raw, "read").await?;
+    let id = runtime
+        .resolve_uuid_or_prefix_for_verb(token, raw, "read")
+        .await?;
 
     let store = runtime.notes(token)?;
     let note = store
         .get_note(id)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
+        .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("read: message {id} not found")))?;
 
     validate_read_note(token, id, note)
@@ -399,7 +405,7 @@ enum MarkReadFailure {
 /// not be reported as a definite failure. Same match shape as
 /// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
 fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
-    match error {
+    match error.without_sqlite_write_stage() {
         khive_storage::StorageError::WriterTaskTerminated {
             request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
             ..
@@ -537,6 +543,34 @@ pub(super) fn read_response(
                     "properties": original_properties,
                 }),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_does_not_change_mark_read_finality() {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+        for state in [
+            WriterTaskRequestState::NotStarted,
+            WriterTaskRequestState::TransactionRolledBack,
+            WriterTaskRequestState::SideEffectsUnknown,
+        ] {
+            let error = StorageError::writer_task_terminated(state).with_sqlite_write_failure(
+                khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: 10,
+                    extended_code: 1034,
+                    settlement_unknown: false,
+                },
+            );
+            assert_eq!(
+                matches!(classify_mark_read_error(&error), MarkReadFailure::Unknown),
+                state == WriterTaskRequestState::SideEffectsUnknown
+            );
         }
     }
 }

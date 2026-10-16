@@ -5,7 +5,7 @@
 //! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -418,6 +418,7 @@ pub trait EmbedderProvider: Send + Sync {
 pub(crate) struct EmbedderEntry {
     provider: Arc<dyn EmbedderProvider>,
     cell: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+    serving: Arc<AtomicBool>,
     /// Only the runtime's built-in lattice provider has an audited document
     /// preparation path. Pack replacements, even under a built-in name, do not.
     audited_document_preparation: bool,
@@ -428,6 +429,7 @@ impl Clone for EmbedderEntry {
         Self {
             provider: Arc::clone(&self.provider),
             cell: Arc::clone(&self.cell),
+            serving: Arc::clone(&self.serving),
             audited_document_preparation: self.audited_document_preparation,
         }
     }
@@ -442,6 +444,7 @@ impl Clone for EmbedderEntry {
 #[derive(Clone, Default)]
 pub struct EmbedderRegistry {
     entries: HashMap<String, EmbedderEntry>,
+    ordered_names: Vec<String>,
 }
 
 impl EmbedderRegistry {
@@ -449,25 +452,24 @@ impl EmbedderRegistry {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            ordered_names: Vec::new(),
         }
     }
 
-    /// Register a provider.
+    /// Register a provider, preserving its position for later name enumeration.
     ///
-    /// If a provider with the same [`name`](EmbedderProvider::name) already
-    /// exists, it is replaced (last-writer wins) and any cached service is
-    /// discarded, since pack registration order is not guaranteed and packs
-    /// may legitimately override a default model under the same name.
-    /// Callers needing strict collision detection should check
-    /// [`names`](Self::names) before registering.
-    pub fn register<P: EmbedderProvider + 'static>(&mut self, provider: P) {
-        self.insert(provider, false);
+    /// Before a provider is selected for resolution, registration with the same
+    /// name replaces it in place. Once selected, duplicate registration returns
+    /// an error and leaves the serving provider unchanged.
+    pub fn register<P: EmbedderProvider + 'static>(&mut self, provider: P) -> RuntimeResult<()> {
+        self.insert(provider, false)
     }
 
     /// Register the runtime-owned lattice adapter whose passage preparation is
     /// audited. This is deliberately not available to pack providers.
     pub(crate) fn register_builtin(&mut self, provider: LatticeEmbedderProvider) {
-        self.insert(provider, true);
+        self.insert(provider, true)
+            .expect("configured built-in embedding models must have unique names");
     }
 
     /// Test-only attested provider. The wrapper below owns passage preparation,
@@ -479,23 +481,38 @@ impl EmbedderRegistry {
         provider: P,
     ) {
         assert_eq!(provider.name(), model.to_string());
-        self.insert(TestAuditedProvider { provider }, true);
+        self.insert(TestAuditedProvider { provider }, true)
+            .expect("test audited provider names must be unique");
     }
 
     fn insert<P: EmbedderProvider + 'static>(
         &mut self,
         provider: P,
         audited_document_preparation: bool,
-    ) {
+    ) -> RuntimeResult<()> {
         let name = provider.name().to_owned();
-        self.entries.insert(
-            name,
-            EmbedderEntry {
-                provider: Arc::new(provider),
-                cell: Arc::new(OnceCell::new()),
-                audited_document_preparation,
-            },
-        );
+        if self
+            .entries
+            .get(&name)
+            .is_some_and(|entry| entry.serving.load(Ordering::Acquire))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is already serving"
+            )));
+        }
+        let entry = EmbedderEntry {
+            provider: Arc::new(provider),
+            cell: Arc::new(OnceCell::new()),
+            serving: Arc::new(AtomicBool::new(false)),
+            audited_document_preparation,
+        };
+        if self.entries.contains_key(&name) {
+            self.entries.insert(name, entry);
+        } else {
+            self.ordered_names.push(name.clone());
+            self.entries.insert(name, entry);
+        }
+        Ok(())
     }
 
     /// Look up a provider by name.
@@ -508,18 +525,22 @@ impl EmbedderRegistry {
         self.entries.contains_key(name)
     }
 
-    /// Names of all registered providers, in unspecified order.
+    /// Names of all registered providers, in registration order.
     pub fn names(&self) -> Vec<String> {
-        self.entries.keys().cloned().collect()
+        self.ordered_names.clone()
     }
 
     /// Return a cloned entry for `name` without holding any lock.
     ///
     /// The caller can then call [`EmbedderEntry::resolve`] without holding
     /// a lock — this avoids holding a `RwLockGuard` across `await` points.
-    /// Returns `None` if `name` is not registered.
+    /// It marks the provider as selected for serving so registration cannot
+    /// replace it while a request is resolving the service. Returns `None` if
+    /// `name` is not registered.
     pub(crate) fn get_entry(&self, name: &str) -> Option<EmbedderEntry> {
-        self.entries.get(name).cloned()
+        let entry = self.entries.get(name)?;
+        entry.serving.store(true, Ordering::Release);
+        Some(entry.clone())
     }
 
     /// Lazily resolve a registered provider to its live [`EmbeddingService`].
@@ -536,6 +557,7 @@ impl EmbedderRegistry {
             .get(name)
             .ok_or_else(|| RuntimeError::UnknownModel(name.to_string()))?
             .clone();
+        entry.serving.store(true, Ordering::Release);
 
         Ok(entry.resolve().await?.0)
     }
@@ -751,18 +773,21 @@ mod tests {
     }
 
     #[test]
-    fn builtin_input_attestation_stays_with_cloned_entry_after_canonical_name_override() {
+    fn builtin_provider_can_be_replaced_before_resolution_without_reordering() {
         let model = EmbeddingModel::MultilingualE5Small;
         let name = model.to_string();
         let mut registry = EmbedderRegistry::new();
         registry.register_builtin(LatticeEmbedderProvider::new(model));
-        let builtin_entry = registry.get_entry(&name).expect("builtin entry");
-        assert!(builtin_entry.has_audited_document_preparation());
+        let original_names = registry.names();
 
-        registry.register(ConstVecProvider::new(&name, model.dimensions()));
-        let replacement_entry = registry.get_entry(&name).expect("replacement entry");
-        assert!(builtin_entry.has_audited_document_preparation());
-        assert!(!replacement_entry.has_audited_document_preparation());
+        registry
+            .register(ConstVecProvider::new(&name, model.dimensions()))
+            .expect("pre-serving replacement should succeed");
+        assert_eq!(registry.names(), original_names);
+        assert!(!registry
+            .get_entry(&name)
+            .expect("replacement entry")
+            .has_audited_document_preparation());
     }
 
     struct FirstLoadBlockingService {
@@ -1440,7 +1465,8 @@ mod tests {
     #[test]
     fn register_and_get_provider_round_trip() {
         let mut reg = EmbedderRegistry::new();
-        reg.register(ConstVecProvider::new("mock-384", 384));
+        reg.register(ConstVecProvider::new("mock-384", 384))
+            .expect("first registration should succeed");
 
         assert!(reg.contains("mock-384"), "registered name must be present");
         let provider = reg.get_provider("mock-384").expect("provider must exist");
@@ -1448,26 +1474,79 @@ mod tests {
         assert_eq!(provider.dimensions(), 384);
     }
 
-    #[test]
-    fn duplicate_name_last_wins() {
+    #[tokio::test]
+    async fn duplicate_registration_preserves_serving_provider() {
         let mut reg = EmbedderRegistry::new();
-        reg.register(ConstVecProvider::new("shared", 128));
-        reg.register(ConstVecProvider::new("shared", 256));
+        reg.register(ConstVecProvider::new("shared", 128))
+            .expect("first registration should succeed");
+        reg.register(ConstVecProvider::new("other", 64))
+            .expect("unique registration should succeed");
+        reg.get_service("shared")
+            .await
+            .expect("serving provider should build");
+        let error = reg
+            .register(ConstVecProvider::new("shared", 256))
+            .expect_err("duplicate registration should fail");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("shared") && message.contains("serving"))
+        );
 
         let provider = reg.get_provider("shared").expect("provider must exist");
-        assert_eq!(
-            provider.dimensions(),
-            256,
-            "last registration must win; expected dims=256"
+        assert_eq!(provider.dimensions(), 128);
+        assert_eq!(reg.names(), vec!["shared".to_owned(), "other".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn runtime_try_register_embedder_returns_duplicate_error() {
+        let runtime = crate::KhiveRuntime::memory().expect("memory runtime");
+        runtime
+            .try_register_embedder(ConstVecProvider::new("first-custom", 128))
+            .expect("first registration should succeed");
+        runtime
+            .try_register_embedder(ConstVecProvider::new("second-custom", 256))
+            .expect("second registration should succeed");
+
+        let expected = runtime.registered_embedding_model_names();
+        assert!(expected.ends_with(&["first-custom".to_owned(), "second-custom".to_owned()]));
+        for _ in 0..100 {
+            assert_eq!(runtime.registered_embedding_model_names(), expected);
+        }
+        runtime
+            .embedder("first-custom")
+            .await
+            .expect("first custom provider should build");
+
+        let error = runtime
+            .try_register_embedder(ConstVecProvider::new("first-custom", 512))
+            .expect_err("duplicate registration should fail");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("first-custom") && message.contains("serving"))
         );
+    }
+
+    #[test]
+    fn names_preserve_registration_order_across_calls() {
+        let mut reg = EmbedderRegistry::new();
+        for (name, dimensions) in [("e", 5), ("b", 4), ("d", 3), ("a", 2), ("c", 1)] {
+            reg.register(ConstVecProvider::new(name, dimensions))
+                .expect("unique registration should succeed");
+        }
+
+        let expected = ["e", "b", "d", "a", "c"].map(|name| name.to_owned());
+        for _ in 0..100 {
+            assert_eq!(reg.names(), expected);
+        }
     }
 
     #[test]
     fn names_returns_all_registered() {
         let mut reg = EmbedderRegistry::new();
-        reg.register(ConstVecProvider::new("model-a", 64));
-        reg.register(ConstVecProvider::new("model-b", 128));
-        reg.register(ConstVecProvider::new("model-c", 256));
+        reg.register(ConstVecProvider::new("model-a", 64))
+            .expect("unique registration should succeed");
+        reg.register(ConstVecProvider::new("model-b", 128))
+            .expect("unique registration should succeed");
+        reg.register(ConstVecProvider::new("model-c", 256))
+            .expect("unique registration should succeed");
 
         let mut names = reg.names();
         names.sort();
@@ -1494,7 +1573,8 @@ mod tests {
             build_calls: Arc::clone(&counter),
         };
         let mut reg = EmbedderRegistry::new();
-        reg.register(provider);
+        reg.register(provider)
+            .expect("unique registration should succeed");
 
         let _ = reg.get_service("cached-model").await.unwrap();
         let _ = reg.get_service("cached-model").await.unwrap();
@@ -1539,7 +1619,8 @@ mod tests {
             name: "cold-model".to_owned(),
             dims: 8,
             build_calls: Arc::clone(&counter),
-        });
+        })
+        .expect("unique registration should succeed");
         let reg = Arc::new(reg);
 
         let mut callers = Vec::with_capacity(CALLERS);

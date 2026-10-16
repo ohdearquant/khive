@@ -53,6 +53,30 @@ impl lettre::message::header::Header for XKhiveThreadId {
     }
 }
 
+/// Custom MIME header for the RFC 8058/2369 `List-Unsubscribe` value.
+///
+/// Attached to outbound external messages so a recipient's mail client can offer the
+/// `mailto:` opt-out. Absent on policy-recipient messages.
+#[derive(Clone)]
+struct ListUnsubscribe(String);
+
+impl lettre::message::header::Header for ListUnsubscribe {
+    fn name() -> lettre::message::header::HeaderName {
+        lettre::message::header::HeaderName::new_from_ascii_str("List-Unsubscribe")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.trim().to_string()))
+    }
+
+    fn display(&self) -> lettre::message::header::HeaderValue {
+        lettre::message::header::HeaderValue::new(
+            lettre::message::header::HeaderName::new_from_ascii_str("List-Unsubscribe"),
+            self.0.clone(),
+        )
+    }
+}
+
 /// SMTP authentication configuration (basic or OAuth2 XOAUTH2).
 enum SmtpAuthConfig {
     /// Standard username + password credentials.
@@ -81,6 +105,7 @@ pub(crate) trait SmtpConnector: Send + Sync + 'static {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError>;
 }
 
@@ -305,6 +330,7 @@ fn build_message(
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    list_unsubscribe: Option<&str>,
 ) -> Result<Message, ChannelError> {
     let from_mb: Mailbox = from.parse().map_err(|e| {
         ChannelError::InvalidEnvelope(format!("invalid from address {from:?}: {e}"))
@@ -321,6 +347,10 @@ fn build_message(
 
     if let Some(tid) = thread_id_header {
         builder = builder.header(XKhiveThreadId(tid.to_string()));
+    }
+
+    if let Some(value) = list_unsubscribe {
+        builder = builder.header(ListUnsubscribe(reject_crlf(value)?.to_string()));
     }
 
     if let Some(mid) = message_id {
@@ -359,6 +389,7 @@ impl SmtpConnector for LettreSmtp {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError> {
         let msg = build_message(
             from,
@@ -369,6 +400,7 @@ impl SmtpConnector for LettreSmtp {
             message_id,
             in_reply_to,
             references,
+            list_unsubscribe,
         )?;
 
         self.deliver_message_with_connect(msg, || self.connect())
@@ -468,6 +500,7 @@ impl SmtpSender {
     /// Message-ID. `references` is the full ancestor chain to set as `References`
     /// (space-separated angle-bracketed ids); when `in_reply_to` is present but
     /// `references` is `None`, `References` falls back to `in_reply_to` alone.
+    /// `list_unsubscribe`, when present, is set as the `List-Unsubscribe` header verbatim.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
@@ -479,6 +512,7 @@ impl SmtpSender {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError> {
         self.inner
             .deliver(
@@ -490,6 +524,7 @@ impl SmtpSender {
                 message_id,
                 in_reply_to,
                 references,
+                list_unsubscribe,
             )
             .await
     }
@@ -705,6 +740,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         tokio::time::timeout(
@@ -823,6 +859,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -890,6 +927,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -927,6 +965,7 @@ mod tests {
             "recipient@example.com",
             "subject",
             "body",
+            None,
             None,
             None,
             None,
@@ -1174,6 +1213,7 @@ mod tests {
             _message_id: Option<&str>,
             _in_reply_to: Option<&str>,
             _references: Option<&str>,
+            _list_unsubscribe: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push((
                 from.to_string(),
@@ -1196,6 +1236,7 @@ mod tests {
                 "to@example.com",
                 "Hello",
                 "body text",
+                None,
                 None,
                 None,
                 None,
@@ -1283,6 +1324,7 @@ mod tests {
                 _message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.headers
                     .lock()
@@ -1304,6 +1346,7 @@ mod tests {
                 "s",
                 "b",
                 Some("tid-abc"),
+                None,
                 None,
                 None,
                 None,
@@ -1333,6 +1376,7 @@ mod tests {
                 message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1355,6 +1399,7 @@ mod tests {
                 "b",
                 None,
                 Some("<abc123@example.com>"),
+                None,
                 None,
                 None,
             )
@@ -1383,6 +1428,7 @@ mod tests {
                 _message_id: Option<&str>,
                 in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1406,6 +1452,7 @@ mod tests {
                 None,
                 None,
                 Some("<parent123@example.com>"),
+                None,
                 None,
             )
             .await
@@ -1433,6 +1480,7 @@ mod tests {
                 _message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1457,6 +1505,7 @@ mod tests {
                 None,
                 Some("<parent123@example.com>"),
                 Some("<grandparent1@example.com> <parent123@example.com>"),
+                None,
             )
             .await
             .unwrap();
@@ -1495,6 +1544,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1516,6 +1566,7 @@ mod tests {
             "b@example.com",
             "subject",
             "body",
+            None,
             None,
             None,
             None,
@@ -1547,6 +1598,7 @@ mod tests {
             Some("<self123@example.com>"),
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1571,6 +1623,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             Some("<grandparent1@example.com> <grandparent2@example.com> <parent123@example.com>"),
+            None,
         )
         .expect("build_message ok");
 
@@ -1601,6 +1654,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1624,9 +1678,63 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             Some("<evil@example.com>\r\nBcc: attacker@evil.com"),
+            None,
         )
         .expect_err("CRLF in References must be rejected, not silently forwarded");
 
+        assert!(matches!(err, ChannelError::InvalidEnvelope(_)));
+    }
+
+    #[test]
+    fn build_message_sets_list_unsubscribe_when_present_and_rejects_crlf() {
+        let msg = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            Some("<mailto:a@example.com?subject=unsubscribe%20tok>"),
+        )
+        .expect("build_message ok");
+        let formatted = formatted_str(&msg);
+        assert!(
+            formatted
+                .contains("List-Unsubscribe: <mailto:a@example.com?subject=unsubscribe%20tok>"),
+            "formatted message must carry List-Unsubscribe; got:\n{formatted}"
+        );
+        assert!(!formatted.contains("List-Unsubscribe-Post"));
+
+        // No header when the value is absent.
+        let plain = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build_message ok");
+        assert!(!formatted_str(&plain).contains("List-Unsubscribe"));
+
+        // CRLF in the value is rejected.
+        let err = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            Some("<mailto:a@example.com>\r\nBcc: attacker@evil.com"),
+        )
+        .expect_err("CRLF in List-Unsubscribe must be rejected");
         assert!(matches!(err, ChannelError::InvalidEnvelope(_)));
     }
 }

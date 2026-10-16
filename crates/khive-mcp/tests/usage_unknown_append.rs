@@ -144,7 +144,20 @@ impl Lane {
                 Ok(json!({"id": prime_id}))
             }
             Err(error) => {
-                let state = match (&self.outcome, &error) {
+                assert_eq!(
+                    error.sqlite_write_failure(),
+                    Some(khive_storage::error::SqliteWriteFailure {
+                        stage: khive_storage::error::SqliteWriteStage::Commit,
+                        primary_code: rusqlite::ffi::SQLITE_AUTH,
+                        extended_code: rusqlite::ffi::SQLITE_AUTH,
+                        settlement_unknown: matches!(
+                            self.outcome,
+                            Outcome::Unknown | Outcome::UnknownAfterFreeze
+                        ),
+                    }),
+                    "the real COMMIT refusal must retain native evidence: {error:?}"
+                );
+                let state = match (&self.outcome, error.without_sqlite_write_stage()) {
                     (
                         Outcome::RolledBack,
                         StorageError::WriterTaskRequestFailed {
@@ -317,6 +330,19 @@ impl Fixture {
 fn assert_unknown(entry: &Value) {
     assert_eq!(entry["ok"], false, "{entry}");
     assert_eq!(entry["error"]["code"], "writer_task_terminated", "{entry}");
+    assert_eq!(entry["error"]["stage"], "writer_task_terminated", "{entry}");
+    assert_eq!(
+        entry["error"]["sqlite_write_stage"], "sqlite_commit_failure",
+        "{entry}"
+    );
+    assert_eq!(
+        entry["error"]["sqlite_primary_code"],
+        rusqlite::ffi::SQLITE_AUTH
+    );
+    assert_eq!(
+        entry["error"]["sqlite_extended_code"],
+        rusqlite::ffi::SQLITE_AUTH
+    );
     assert_eq!(
         entry["error"]["request_state"], "side_effects_unknown",
         "{entry}"
@@ -420,13 +446,23 @@ async fn clean_rolled_back_appends_retain_measured_partial_usage() {
         let body = fixture.request("usage_append_probe()").await;
         let entry = &body["results"][0];
         assert_eq!(entry["ok"], false, "{entry}");
-        assert_eq!(
-            entry["error"]["code"], "writer_task_request_failed",
-            "{entry}"
-        );
+        assert_eq!(entry["error"]["code"], "sqlite_commit_failure", "{entry}");
         assert_eq!(
             entry["error"]["request_state"], "transaction_rolled_back",
             "{entry}"
+        );
+        assert_eq!(entry["error"]["stage"], "sqlite_commit_failure", "{entry}");
+        assert_eq!(
+            entry["error"]["sqlite_write_stage"], "sqlite_commit_failure",
+            "{entry}"
+        );
+        assert_eq!(
+            entry["error"]["sqlite_primary_code"],
+            rusqlite::ffi::SQLITE_AUTH
+        );
+        assert_eq!(
+            entry["error"]["sqlite_extended_code"],
+            rusqlite::ffi::SQLITE_AUTH
         );
         assert_eq!(entry["error"]["task_terminated"], false, "{entry}");
         assert_eq!(entry["usage"], json!({"event_rows": 1}), "{entry}");

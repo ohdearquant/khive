@@ -700,7 +700,7 @@ async fn resolve_get_prefix(
 /// Of what the resolvers produce today, `resolve_name_async` (in `common.rs`) itself constructs
 /// `Storage`/`NotFound`/`Ambiguous`, and also propagates whatever `runtime.entities(token)?`
 /// yields, so it is not the sole author of its own error type. The only `InvalidInput` the
-/// prefix-resolution path constructs is a prefix-miss. Everything else — `Storage`, `Sqlite`,
+/// prefix-resolution path constructs is a prefix-miss. Everything else — `Storage`,
 /// `Internal`, `Ambiguous`, `AmbiguousPrefix` — is a failure and reaches the caller as itself.
 ///
 /// Both ambiguity variants are failures, for the same reason: no later arm can resolve an
@@ -744,23 +744,15 @@ async fn resolve_id_through_arms(
 }
 
 fn parse_uuid_column(row: &SqlRow, name: &str) -> Result<Uuid, RuntimeError> {
-    Uuid::from_str(
-        &row.text(name)
-            .map(str::to_owned)
-            .map_err(|_| event_column_error(row, name))?,
-    )
-    .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+    row.uuid(name).map_err(|_| event_column_error(row, name))
 }
 
 fn sql_optional_uuid(row: &SqlRow, name: &str) -> Result<Option<Uuid>, RuntimeError> {
-    row.opt_text_or_absent(name)
-        .map(|value| value.map(str::to_owned))
-        .map_err(|_| event_column_error(row, name))?
-        .map(|v| {
-            Uuid::from_str(&v)
-                .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
-        })
-        .transpose()
+    if row.get(name).is_none() {
+        return Ok(None);
+    }
+    row.opt_uuid(name)
+        .map_err(|_| event_column_error(row, name))
 }
 
 fn event_column_error(row: &SqlRow, name: &str) -> RuntimeError {

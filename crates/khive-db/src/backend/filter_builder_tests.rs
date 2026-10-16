@@ -20,9 +20,12 @@ fn memory_backend() -> StorageBackend {
         #[cfg(any(unix, windows))]
         expected_file_identity: None,
         max_readers: 1,
+        reader_max_age: Duration::from_secs(300),
+        reader_max_ops: 5000,
         wal_mode: true,
         busy_timeout: Duration::from_secs(5),
         checkout_timeout: Duration::from_secs(5),
+        reader_checkout_warn_after: Duration::from_secs(10),
         journal_size_limit_bytes: 64 * 1024 * 1024,
         read_only: false,
         wal_ceiling: crate::pool::WalCeilingPolicy::default(),
@@ -39,6 +42,7 @@ fn memory_backend() -> StorageBackend {
         is_file_backed: false,
         path: None,
         vector_tables_ready: Default::default(),
+        text_tables_ready: Default::default(),
         notes_seq_repair_runs: AtomicUsize::new(0),
         store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
     }

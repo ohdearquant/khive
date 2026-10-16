@@ -894,7 +894,8 @@ fn busy_timeout_and_cache_size_changes_do_not_survive_a_dirty_pooled_checkout() 
         "busy_timeout must be restored to the pool's configured baseline"
     );
     assert_eq!(
-        cache_size, -65536,
+        cache_size,
+        sqlite_cache_size_pragma(),
         "cache_size must be restored to the pool's configured baseline"
     );
 }
@@ -1079,6 +1080,7 @@ fn discarded_reader_replacement_open_failure_is_recorded() {
 
     let reader = pool.reader().unwrap();
     reader.discard();
+    assert!(pool.oldest_checkout_age().is_some());
     // The replacement open this triggers on drop must fail deterministically:
     // remove the file a fresh SQLITE_OPEN_READ_ONLY open needs.
     std::fs::remove_file(&path).unwrap();
@@ -1088,6 +1090,7 @@ fn discarded_reader_replacement_open_failure_is_recorded() {
     drop(reader);
 
     let after = pool.reader_acquisition_snapshot();
+    assert_eq!(pool.oldest_checkout_age(), None);
     assert_eq!(
         after.reader_replacement_open_failures - before.reader_replacement_open_failures,
         1,
@@ -3296,4 +3299,290 @@ fn a_checkout_taken_outside_the_resolve_route_reports_no_operation() {
         snapshot.max_completed_hold_operation, None,
         "an unlabelled route must report no operation rather than borrow one"
     );
+}
+
+#[test]
+fn outstanding_reader_age_tracks_each_lease_through_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("checkout-age.db")),
+        max_readers: 2,
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(EffectiveDiskGuardConfig {
+            reserve_bytes: 0,
+            ..Default::default()
+        }),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    assert_eq!(pool.oldest_checkout_age(), None);
+    let first = pool.reader().unwrap();
+    let second = pool.reader().unwrap();
+    let observed_at = Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        pool.oldest_checkout_age_at(observed_at),
+        Some(observed_at.duration_since(first.checked_out_at))
+    );
+    assert!(pool.oldest_checkout_age_at(observed_at).unwrap() > Duration::from_secs(1));
+    drop(first);
+    assert_eq!(
+        pool.oldest_checkout_age_at(observed_at),
+        Some(observed_at.duration_since(second.checked_out_at))
+    );
+    second.discard();
+    drop(second);
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert_eq!(pool.available_readers(), 2);
+}
+
+#[test]
+fn checkout_age_clears_after_query_error_unwind_and_failed_acquisition() {
+    let pool = ConnectionPool::new(PoolConfig {
+        path: None,
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    let reader = pool.reader().unwrap();
+    assert!(reader
+        .query_row::<i64, _, _>("SELECT missing_column", [], |row| row.get(0))
+        .is_err());
+    assert!(
+        pool.oldest_checkout_age().is_some(),
+        "the failed query still owns its checkout"
+    );
+    drop(reader);
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _reader = pool.reader().unwrap();
+        assert!(pool.oldest_checkout_age().is_some());
+        panic!("exercise reader drop during unwinding");
+    }))
+    .is_err());
+    assert_eq!(pool.oldest_checkout_age(), None);
+    assert!(pool.reader_until(|| true).unwrap().is_none());
+    assert_eq!(pool.oldest_checkout_age(), None);
+    pool.sql_bridge_reader_slots.close();
+    assert!(pool.reader().is_err());
+    assert_eq!(pool.oldest_checkout_age(), None);
+}
+
+#[test]
+fn owned_shared_checkout_age_clears_after_rollback_or_poison() {
+    for poison in [false, true] {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        assert!(pool
+            .checkout_shared_reader_transaction(|| true)
+            .unwrap()
+            .is_none());
+        assert_eq!(pool.oldest_checkout_age(), None);
+        let reader = pool
+            .checkout_shared_reader_transaction(|| false)
+            .unwrap()
+            .unwrap();
+        reader.conn().execute_batch("BEGIN DEFERRED").unwrap();
+        assert!(
+            pool.oldest_checkout_age_at(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                > Duration::from_secs(1)
+        );
+        if poison {
+            reader.poison();
+        }
+        drop(reader);
+        assert_eq!(pool.oldest_checkout_age(), None);
+        if poison {
+            assert!(pool.reader().is_err());
+        } else {
+            let next = pool.reader().unwrap();
+            assert!(next.conn().is_autocommit());
+            assert!(pool.oldest_checkout_age().is_some());
+            drop(next);
+            assert_eq!(pool.oldest_checkout_age(), None);
+        }
+    }
+}
+
+fn file_pool_page_settings(name: &str) -> [(i64, i64); 2] {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join(name)),
+        max_readers: 1,
+        write_queue_enabled: Some(false),
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let read = |conn: &Connection| -> (i64, i64) {
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        let mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .unwrap();
+        (cache, mmap)
+    };
+    let writer = read(pool.writer().unwrap().conn());
+    let reader = read(pool.reader().unwrap().conn());
+    [writer, reader]
+}
+
+/// Every pooled connection holds its own page cache on the heap, so the
+/// default is what a daemon with dozens of connections pays per connection.
+#[test]
+fn pooled_connections_default_to_an_8_mib_page_cache_and_a_1_gib_map() {
+    if crate::test_process::run_in_child(|command| {
+        command.env_remove("KHIVE_SQLITE_CACHE_KIB");
+        command.env_remove("KHIVE_SQLITE_MMAP_BYTES");
+    }) {
+        return;
+    }
+    for (cache, mmap) in file_pool_page_settings("defaults.db") {
+        assert_eq!(cache, -8192, "8 MiB, expressed in KiB as SQLite reads it");
+        assert_eq!(mmap, 1_073_741_824);
+    }
+}
+
+#[test]
+fn page_cache_and_map_settings_come_from_the_environment() {
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_SQLITE_CACHE_KIB", "2048");
+        command.env("KHIVE_SQLITE_MMAP_BYTES", "0");
+    }) {
+        return;
+    }
+    for (cache, mmap) in file_pool_page_settings("overridden.db") {
+        assert_eq!(cache, -2048);
+        assert_eq!(mmap, 0, "0 turns memory-mapped reads off");
+    }
+    crate::test_process::set_var("KHIVE_SQLITE_CACHE_KIB", "4096");
+    crate::test_process::set_var("KHIVE_SQLITE_MMAP_BYTES", "4096");
+    assert_eq!(
+        (sqlite_cache_size_pragma(), sqlite_mmap_size_pragma()),
+        (-2048, 0),
+        "both settings are read once per process"
+    );
+}
+
+/// What the fmt subscriber writes while `body` runs on this thread, one line per event.
+fn logged_lines(body: impl FnOnce()) -> Vec<String> {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(Arc::new(log.reopen().unwrap()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    tracing::subscriber::with_default(subscriber, body);
+    fs::read_to_string(log.path())
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn a_size_setting_outside_its_range_or_not_an_integer_takes_the_default_and_says_so() {
+    let cache = |raw| {
+        sqlite_size_setting(
+            "KHIVE_SQLITE_CACHE_KIB",
+            raw,
+            DEFAULT_SQLITE_CACHE_KIB,
+            &SQLITE_CACHE_KIB_RANGE,
+        )
+    };
+    let mmap = |raw| {
+        sqlite_size_setting(
+            "KHIVE_SQLITE_MMAP_BYTES",
+            raw,
+            DEFAULT_SQLITE_MMAP_BYTES,
+            &SQLITE_MMAP_BYTES_RANGE,
+        )
+    };
+    let accepted = logged_lines(|| {
+        assert_eq!(cache(None), 8192);
+        assert_eq!(cache(Some("2048")), 2048);
+        assert_eq!(cache(Some("512")), 512);
+        assert_eq!(cache(Some("1048576")), 1_048_576);
+        assert_eq!(mmap(None), 1 << 30);
+        assert_eq!(mmap(Some("0")), 0);
+        assert_eq!(mmap(Some("268435456")), 268_435_456);
+        assert_eq!(mmap(Some("1099511627776")), 1 << 40);
+    });
+    assert!(
+        accepted.is_empty(),
+        "an accepted value logs nothing: {accepted:#?}"
+    );
+
+    let rejected_cache = ["511", "1048577", "-2048", "0", "", " 2048", "2k", "2048.0"];
+    let rejected_mmap = ["-1", "1099511627777", "1g"];
+    let lines = logged_lines(|| {
+        for raw in rejected_cache {
+            assert_eq!(cache(Some(raw)), 8192, "{raw:?}");
+        }
+        for raw in rejected_mmap {
+            assert_eq!(mmap(Some(raw)), 1 << 30, "{raw:?}");
+        }
+    });
+    let expected: Vec<String> = rejected_cache
+        .iter()
+        .map(|raw| {
+            format!(
+                "setting=\"KHIVE_SQLITE_CACHE_KIB\" value={raw:?} {}",
+                "default=8192 min=512 max=1048576"
+            )
+        })
+        .chain(rejected_mmap.iter().map(|raw| {
+            format!(
+                "setting=\"KHIVE_SQLITE_MMAP_BYTES\" value={raw:?} {}",
+                "default=1073741824 min=0 max=1099511627776"
+            )
+        }))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "one warning per rejected value: {lines:#?}"
+    );
+    for (line, fields) in lines.iter().zip(&expected) {
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains(fields.as_str()), "{line}\nexpected {fields}");
+    }
+}
+
+/// A set value that is not valid Unicode is still a set value: it is logged and
+/// ignored like any other invalid value, never treated as unset.
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_size_setting_is_logged_and_takes_the_default() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_SQLITE_CACHE_KIB", OsStr::from_bytes(b"20\xff48"));
+        command.env("KHIVE_SQLITE_MMAP_BYTES", OsStr::from_bytes(b"\xff"));
+    }) {
+        return;
+    }
+    let lines = logged_lines(|| {
+        assert_eq!(sqlite_cache_size_pragma(), -8192);
+        assert_eq!(sqlite_mmap_size_pragma(), 1 << 30);
+    });
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    for line in &lines {
+        assert!(line.contains("WARN"), "{line}");
+    }
+    let cache = format!(
+        "setting=\"KHIVE_SQLITE_CACHE_KIB\" value={:?}",
+        "20\u{fffd}48"
+    );
+    let mmap = format!("setting=\"KHIVE_SQLITE_MMAP_BYTES\" value={:?}", "\u{fffd}");
+    assert!(lines[0].contains(&cache), "{}\nexpected {cache}", lines[0]);
+    assert!(lines[1].contains(&mmap), "{}\nexpected {mmap}", lines[1]);
 }

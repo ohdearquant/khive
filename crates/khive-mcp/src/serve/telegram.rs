@@ -17,7 +17,7 @@ use super::{
 pub(super) fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     let admission = channel_loop_plan(server, args);
     if !args.daemon {
-        tracing::info!(target: "khive_mcp::serve", "telegram channel loops: skipped (client role; daemon owns channel loops)");
+        tracing::info!(target: "khive_mcp::serve","telegram channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
     log_inbound_refused_for_read_only_blob("telegram", admission);
@@ -96,7 +96,7 @@ fn spawn_telegram_channel_loops(
                             .await;
                         },
                     );
-                    tracing::info!(target: "khive_mcp::serve", "telegram channel polling loop started");
+                    tracing::info!(target: "khive_mcp::serve","telegram channel polling loop started");
                 }
                 if admission.outbound_delivery {
                     match outbox_runtime {
@@ -113,7 +113,7 @@ fn spawn_telegram_channel_loops(
                                     ))
                                 },
                             );
-                            tracing::info!(target: "khive_mcp::serve", "telegram channel outbox loop started");
+                            tracing::info!(target: "khive_mcp::serve","telegram channel outbox loop started");
                         }
                         None => {
                             tracing::error!(target: "khive_mcp::serve",
@@ -193,13 +193,13 @@ pub(super) async fn telegram_poll_loop(
     use serde_json::json;
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
+    let mut failed_polls = std::collections::HashMap::<String, u8>::new();
 
     loop {
         // This loop polls before it waits, so shutdown is read at the top as
         // well as inside the error backoff below.
         if shutdown.is_cancelled() {
-            tracing::info!(target: "khive_mcp::serve", "telegram channel polling loop: daemon shutdown observed, stopping");
+            tracing::info!(target: "khive_mcp::serve","telegram channel polling loop: daemon shutdown observed, stopping");
             return;
         }
         let kind = telegram_channel.kind();
@@ -207,7 +207,7 @@ pub(super) async fn telegram_poll_loop(
         if let Err(error) =
             cleanup_expired_channel_quarantine(&registry, &ingest_namespace, kind, &slug).await
         {
-            tracing::warn!(target: "khive_mcp::serve", channel = kind, slug, error = %error,
+            tracing::warn!(target: "khive_mcp::serve",channel = kind, slug, error = %error,
                 "quarantine retention cleanup failed; holding telegram poll");
             if !channel_cycle_wait(ERROR_BACKOFF, &shutdown).await {
                 return;
@@ -221,7 +221,7 @@ pub(super) async fn telegram_poll_loop(
         let polled = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                tracing::info!(target: "khive_mcp::serve", "telegram channel polling loop: cancelled in-flight poll");
+                tracing::info!(target: "khive_mcp::serve","telegram channel polling loop: cancelled in-flight poll");
                 return;
             }
             result = telegram_channel.poll(Utc::now()) => result,
@@ -246,19 +246,19 @@ pub(super) async fn telegram_poll_loop(
                         "default_inbound_actor": default_inbound_actor,
                     });
                     if let Err(error) = registry.dispatch("comm.ingest", params).await {
-                        let handled = handle_channel_ingest_failure(
+                        let outcome = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
                             (kind, &slug),
                             Some(&default_inbound_actor),
                             &env,
                             &error,
-                            &mut unknown_ingest_attempts,
+                            &mut failed_polls,
                             // The Telegram adapter declares no retention bound.
                             None,
                         )
                         .await;
-                        if !handled {
+                        if !outcome.released() {
                             all_ingested = false;
                         }
                     }
@@ -269,7 +269,7 @@ pub(super) async fn telegram_poll_loop(
                     poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforeCommit).await;
                     telegram_channel.commit_offset();
                     for key in batch_attempt_keys {
-                        unknown_ingest_attempts.remove(&key);
+                        failed_polls.remove(&key);
                     }
                 } else {
                     tracing::warn!(target: "khive_mcp::serve",

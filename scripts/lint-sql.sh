@@ -429,6 +429,10 @@ for directory in sorted(fragment_groups):
 if query_files:
     con = lint_connection()
     try:
+        # EXPLAIN resolves runtime function names and arity without evaluating
+        # their bodies. Keep this stub out of the DDL validation connections.
+        con.create_function("khive_tag_contains", 2, lambda tags, marker: None,
+                            deterministic=True)
         for path in chain:
             with open(path) as fh:
                 try:

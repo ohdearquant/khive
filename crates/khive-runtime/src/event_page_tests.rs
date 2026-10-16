@@ -763,6 +763,8 @@ mod socket {
                         .into(),
                 retryable: false,
                 writer_task_failure: None,
+                sqlite_write_failure: None,
+                read_failure: None,
             };
             write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
                 .await

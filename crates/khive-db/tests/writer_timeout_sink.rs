@@ -341,10 +341,10 @@ fn writer_admission_timeout_emits_ndjson_row() {
 /// takes before the pool mutex, so it never reaches `checkout_timeout`. The
 /// refused writer must still be counted and sunk: `lease_timeouts` rises,
 /// `timeouts` (the mutex stage) does not, and a `"kind":"timeout"` row with
-/// `"site":"volume_lease"` and `"phase":"lock"` names this pool's database.
+/// `"site":"volume_lease"` and `"phase":"lock_contended"` names this pool's database.
 #[test]
 #[serial_test::serial(writer_timeout_sink_volume)]
-fn writer_lease_timeout_counts_and_emits_lock_phase_row() {
+fn writer_lease_timeout_counts_and_emits_lock_contended_phase_row() {
     ensure_sink_dir();
 
     let dir = tempfile::tempdir().unwrap();
@@ -376,7 +376,7 @@ fn writer_lease_timeout_counts_and_emits_lock_phase_row() {
             matches!(
                 result,
                 Err(khive_db::SqliteError::CapacityUnavailable {
-                    phase: khive_storage::CapacityUnavailablePhase::Lock,
+                    phase: khive_storage::CapacityUnavailablePhase::LockContended,
                     ..
                 })
             ),
@@ -407,14 +407,14 @@ fn writer_lease_timeout_counts_and_emits_lock_phase_row() {
     let is_lease_row = |line: &str| {
         line.contains("\"kind\":\"timeout\"")
             && line.contains("\"site\":\"volume_lease\"")
-            && line.contains("\"phase\":\"lock\"")
+            && line.contains("\"phase\":\"lock_contended\"")
             && line.contains("\"timeout_ms\":100")
             && line.contains(&db_marker)
     };
     let contents = wait_for_ndjson_line(is_lease_row, Duration::from_secs(5));
     assert!(
         contents.lines().any(is_lease_row),
-        "expected a volume_lease timeout row with phase lock naming {db_marker}, got: {contents}"
+        "expected a volume_lease timeout row with phase lock_contended naming {db_marker}, got: {contents}"
     );
 }
 

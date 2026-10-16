@@ -763,7 +763,12 @@ async fn rerank_executed_prefers_final_scores_order_over_reranked_when_both_pres
 
     let payload = khive_types::RerankExecutedPayload {
         served_by_profile_id: Some("profile-a".to_string()),
-        model_id: khive_types::Id128::from_u128(1),
+        reranker: khive_types::RerankerKind::Native,
+        model_id: Some(khive_types::Id128::from_u128(1)),
+        query_id: None,
+        tiers: Vec::new(),
+        ignored_weights: Vec::new(),
+        unidentified_candidates: 0,
         candidates: vec![
             khive_types::Id128::from_bytes(*a.as_bytes()),
             khive_types::Id128::from_bytes(*b.as_bytes()),
@@ -820,7 +825,12 @@ async fn rerank_executed_ignores_stray_selected_field_and_uses_final_scores() {
 
     let payload = khive_types::RerankExecutedPayload {
         served_by_profile_id: Some("profile-a".to_string()),
-        model_id: khive_types::Id128::from_u128(1),
+        reranker: khive_types::RerankerKind::Native,
+        model_id: Some(khive_types::Id128::from_u128(1)),
+        query_id: None,
+        tiers: Vec::new(),
+        ignored_weights: Vec::new(),
+        unidentified_candidates: 0,
         candidates: vec![
             khive_types::Id128::from_bytes(*a.as_bytes()),
             khive_types::Id128::from_bytes(*b.as_bytes()),
@@ -870,7 +880,12 @@ async fn rerank_executed_uses_final_scores_when_reranked_is_empty() {
 
     let payload = khive_types::RerankExecutedPayload {
         served_by_profile_id: None,
-        model_id: khive_types::Id128::from_u128(1),
+        reranker: khive_types::RerankerKind::Native,
+        model_id: Some(khive_types::Id128::from_u128(1)),
+        query_id: None,
+        tiers: Vec::new(),
+        ignored_weights: Vec::new(),
+        unidentified_candidates: 0,
         candidates: vec![khive_types::Id128::from_bytes(*winner.as_bytes())],
         reranked: vec![],
         final_scores: vec![(khive_types::Id128::from_bytes(*winner.as_bytes()), 0.75)],
@@ -2063,5 +2078,60 @@ async fn refusal_target_filter_keeps_query_count_namespace_and_observations_sepa
             .items
             .is_empty(),
         "knowledge subjects must not become graph observations"
+    );
+}
+
+#[tokio::test]
+async fn weighted_rerank_without_model_projects_candidates_and_selected() {
+    let store = setup_memory_store();
+    let a = khive_types::Id128::from_u128(71);
+    let b = khive_types::Id128::from_u128(72);
+    let payload = khive_types::RerankExecutedPayload {
+        reranker: khive_types::RerankerKind::Weighted,
+        served_by_profile_id: None,
+        model_id: None,
+        query_id: Some("query/session-73".into()),
+        tiers: vec!["relevance".into()],
+        ignored_weights: vec!["unknown".into()],
+        unidentified_candidates: 1,
+        candidates: vec![a, b],
+        // A candidate whose scores do not fit f32 still has a candidate row.
+        reranked: vec![(b, vec![("relevance".into(), 0.75)])],
+        final_scores: vec![(b, 0.75)],
+        latency_us: 20,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert!(value.get("model_id").is_none());
+    let event = Event::new(
+        "default",
+        "memory.recall_rerank",
+        EventKind::RerankExecuted,
+        SubstrateKind::Note,
+        "tester",
+    )
+    .with_payload(value);
+    let id = event.id;
+    let observations = decode_event_observations(&event).unwrap();
+    let expected = [
+        (a, ObservationRole::Candidate, 0),
+        (b, ObservationRole::Candidate, 1),
+        (b, ObservationRole::Selected, 0),
+    ];
+    assert_eq!(observations.len(), expected.len());
+    for (observation, (entity, role, position)) in observations.iter().zip(expected) {
+        assert_eq!(observation.event_id, id);
+        assert_eq!(observation.entity_id, Uuid::from_bytes(*entity.as_bytes()));
+        assert_eq!(observation.referent_kind, ReferentKind::Note);
+        assert_eq!(observation.role, role);
+        assert_eq!(observation.position, position);
+    }
+    store.append_event(event).await.unwrap();
+    assert_eq!(selected_uuids_for(&store, id).await, vec![b.to_string()]);
+    let stored = store.get_event(id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_value::<khive_types::RerankExecutedPayload>(stored.payload).unwrap(),
+        payload
     );
 }

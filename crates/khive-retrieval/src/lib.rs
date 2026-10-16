@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod persist;
 pub mod policy;
 pub mod query_ir;
+pub mod query_variants;
 #[cfg(feature = "persist")]
 pub mod replay;
 pub mod search_config;
@@ -58,9 +59,9 @@ pub use khive_hnsw::{
 };
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
-    fuse_search_results, fuse_search_results_checked, DualIndexConfig, DualIndexRouter,
-    DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker, KeywordSearch, Query,
-    Reranker, VectorSearch,
+    fuse_search_results, fuse_search_results_checked, fuse_two_stage, DualIndexConfig,
+    DualIndexRouter, DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker,
+    KeywordSearch, Query, Reranker, VectorSearch,
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
@@ -84,6 +85,11 @@ pub use persist::{
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
 pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_variants::{
+    merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
+    QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,
+    VariantAttribution, VariantRankedList, VariantSource,
+};
 pub use search_config::SearchConfig;
 pub use timeout::{
     search_with_cancellation, search_with_deadline, search_with_optional_timeout,

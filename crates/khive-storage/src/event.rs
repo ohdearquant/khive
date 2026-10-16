@@ -1,5 +1,7 @@
 //! Event storage capability — append-only operation log.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -183,6 +185,29 @@ pub struct EventView {
     pub observations: Vec<EventObservation>,
 }
 
+/// Closed grouping keys for storage-level event counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGroupBy {
+    /// Exact stored verb name.
+    Verb,
+    /// Canonical stored event kind.
+    Kind,
+    /// Exact stored actor attribution.
+    Actor,
+}
+
+impl EventGroupBy {
+    /// Return the fixed stored column name; never caller-supplied SQL.
+    pub const fn column(self) -> &'static str {
+        match self {
+            Self::Verb => "verb",
+            Self::Kind => "kind",
+            Self::Actor => "actor",
+        }
+    }
+}
+
 /// Filter for querying events. Namespace is implicit in the scoped EventStore.
 ///
 /// New fields deserialize to defaults for older serialized filters. Complete
@@ -323,6 +348,22 @@ pub trait EventStore: Send + Sync + 'static {
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
 
+    /// Count matching rows per stored verb, kind, or actor in this store's namespace.
+    /// Empty groups are omitted. Backends must aggregate in storage rather than
+    /// substitute a bounded row query that could silently undercount.
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        let _ = (filter, group_by);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "count_events_grouped".into(),
+            message: "this EventStore backend does not implement grouped counts".into(),
+        })
+    }
+
     /// Validate `event` against the exact insert/observation shape the
     /// backend would build at append time, performing no I/O. Rejects a
     /// malformed row before it is ever enqueued for a write, so one bad
@@ -378,40 +419,5 @@ pub trait EventStore: Send + Sync + 'static {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn event_filter_target_id_roundtrips_and_defaults_for_legacy_frames() {
-        let target = Uuid::new_v4();
-        let filter = EventFilter {
-            target_id: Some(target),
-            ..EventFilter::default()
-        };
-        let mut wire = serde_json::to_value(&filter).unwrap();
-        assert_eq!(wire["target_id"], target.to_string());
-        let decoded: EventFilter = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(decoded.target_id, Some(target));
-        wire.as_object_mut().unwrap().remove("target_id");
-        let legacy: EventFilter = serde_json::from_value(wire).unwrap();
-        assert_eq!(legacy.target_id, None);
-    }
-
-    #[test]
-    fn event_page_window_budget_stop_roundtrips_and_defaults_when_absent() {
-        let stop = EventOrderKey {
-            created_at_us: 7,
-            physical_id: Uuid::from_u128(9).to_string(),
-        };
-        let window = EventPageWindow {
-            rows: Vec::new(),
-            budget_stop: Some(stop.clone()),
-        };
-        let mut wire = serde_json::to_value(&window).unwrap();
-        let decoded: EventPageWindow = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(decoded.budget_stop, Some(stop));
-        wire.as_object_mut().unwrap().remove("budget_stop");
-        let legacy: EventPageWindow = serde_json::from_value(wire).unwrap();
-        assert_eq!(legacy.budget_stop, None);
-    }
-}
+#[path = "event/tests.rs"]
+mod tests;

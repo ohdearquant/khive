@@ -517,8 +517,7 @@ are deferred with native rerank.
 
 ## Amendment 1 (2026-10-08): provenance event for the weighted-feature rerank path
 
-**Status**: proposed. It is the explicit instrumentation change that §Implementation "Events"
-reserves; nothing emits from the weighted path until it is accepted.
+**Status**: accepted (2026-10-08); implemented by this change
 
 ### Context
 

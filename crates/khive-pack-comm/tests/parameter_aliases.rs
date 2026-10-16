@@ -244,3 +244,79 @@ async fn mark_read_alias_retains_canonical_bounds_deduplication_and_prevalidatio
         assert_eq!(stored(&runtime, id).await.properties.unwrap()["read"], true);
     }
 }
+
+#[tokio::test]
+async fn send_forwarded_refusal_names_key_and_preserves_delivery_control() {
+    for forwarded in [json!({"from_actor": "forged:sender"}), Value::Null] {
+        let (registry, runtime) = fixture();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.notes(&token).unwrap();
+        let mut args = json!({
+            "to": "local",
+            "content": "ordinary send control",
+            "forwarded": forwarded
+        });
+        let error = registry
+            .dispatch("comm.send", args.clone())
+            .await
+            .unwrap_err();
+        let RuntimeError::InvalidInput(message) = error else {
+            panic!("forwarded must retain InvalidInput: {error}");
+        };
+        assert!(message.contains("unknown field `forwarded`"), "{message}");
+        assert_eq!(
+            store.count_notes("local", Some("message")).await.unwrap(),
+            0
+        );
+
+        args.as_object_mut().unwrap().remove("forwarded");
+        let sent = registry.dispatch("comm.send", args).await.unwrap();
+        let id = sent["full_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(stored(&runtime, id).await.content, "ordinary send control");
+        assert!(store.count_notes("local", Some("message")).await.unwrap() > 0);
+    }
+}
+
+#[tokio::test]
+async fn reply_forwarded_refusal_names_key_before_mutation() {
+    for forwarded in [json!({"from_actor": "forged:sender"}), Value::Null] {
+        let (registry, runtime) = fixture();
+        let (id, _) = seed(&registry, "ordinary reply parent").await;
+        let before = stored(&runtime, id).await;
+        assert_eq!(before.properties.as_ref().unwrap()["read"], false);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.notes(&token).unwrap();
+        let before_count = store.count_notes("local", Some("message")).await.unwrap();
+        let mut args = json!({
+            "id": id,
+            "content": "ordinary reply control",
+            "forwarded": forwarded
+        });
+        let error = registry
+            .dispatch("comm.reply", args.clone())
+            .await
+            .unwrap_err();
+        let RuntimeError::InvalidInput(message) = error else {
+            panic!("forwarded must retain InvalidInput: {error}");
+        };
+        assert!(message.contains("unknown field `forwarded`"), "{message}");
+        assert_eq!(stored(&runtime, id).await, before);
+        assert_eq!(
+            store.count_notes("local", Some("message")).await.unwrap(),
+            before_count
+        );
+
+        args.as_object_mut().unwrap().remove("forwarded");
+        let reply = registry.dispatch("comm.reply", args).await.unwrap();
+        let reply_id = reply["full_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            stored(&runtime, reply_id).await.content,
+            "ordinary reply control"
+        );
+        assert_eq!(
+            reply["thread_id"],
+            before.properties.as_ref().unwrap()["thread_id"]
+        );
+        assert!(store.count_notes("local", Some("message")).await.unwrap() > before_count);
+    }
+}

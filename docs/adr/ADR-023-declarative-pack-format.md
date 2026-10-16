@@ -128,6 +128,16 @@ The same handler is reachable as `memory.recall` from MCP and as
 `kkernel exec 'memory.recall(...)'` from the CLI. The CLI is the operator's window into the
 full surface; MCP is the agent's filtered view.
 
+**Accepted operator subhandler:** ADR-046's
+[resolved-proposal cleanup amendment](ADR-046-event-sourced-proposals.md#amendment-resolved-proposal-cleanup-2026-10-09)
+specifies the exact name `kg.proposal_cleanup` with `Visibility::Subhandler`
+and `VerbCategory::Declaration`. Once implemented, it is
+callable through `kkernel exec`, while MCP execution is refused in every form
+and named help retains the internal/non-callable description above. The
+explicit `kg.` spelling applies to this operator subhandler; it does not
+rename the bare public KG verbs or add a public verb. This note records an
+accepted contract, not an available handler or an authorization exemption.
+
 This replaces the previous `VerbDef` type. Migration is mechanical: rename
 `VerbDef` → `HandlerDef`, add `visibility: Visibility::Verb` to every existing
 verb entry in pack-kg / pack-gtd / pack-memory / pack-brain crates, and mark
@@ -135,23 +145,29 @@ internal pipeline handlers with `Visibility::Subhandler`.
 
 ### 3. Operator visibility override status
 
-Per-pack `verbs_disabled` configuration is **not supported in the shipped v1
-operator surface**. The active surface has two controls:
+Operators can disable selected public handlers from loaded packs:
 
-1. Pack authors set each handler's static `Visibility::{Verb, Subhandler}` in
-   `Pack::HANDLERS`.
-2. Operators select which packs load via ADR-027 pack selection (`--pack`,
-   `KHIVE_PACKS`, or the built-in production default pack set).
+```toml
+[packs.memory]
+verbs_disabled = ["memory.remember", "memory.prune"]
+```
 
-The runtime's MCP capability list is built from loaded handlers whose static
-visibility is `Visibility::Verb`. There is no deployment-time downgrade path from
-`Verb` to `Subhandler`, and operators cannot promote `Subhandler` handlers onto the
-MCP wire.
+A policy-only entry defaults to the `main` backend. Boot rejects names that
+are unknown, belong to another pack, name an unloaded pack, or identify an
+internal `Subhandler`. This policy applies to registered native public handlers;
+mounted tools retain their mount-owned policy.
 
-`verbs_disabled` remains a deferred policy hook. Implementing it requires a config
-parser field, boot-time validation against loaded pack handlers, and tests proving
-that disabled verbs disappear from MCP capability discovery while remaining
-available to operator-only introspection.
+Disabled verbs disappear from MCP capability discovery, the `verbs` catalog,
+and public help. Ordinary dispatch and intercepted requests return the same
+unknown-verb refusal used for unavailable verbs; CLI atomic preflight rejects
+the whole unit before opening its target database. Operator-only handler and
+pack introspection retains the full registered surface. Disabling a verb does
+not unload its pack or change its vocabulary, hooks, or stored data, and cannot
+promote a subhandler onto the MCP wire.
+
+The effective sorted, deduplicated policy participates in daemon `config_id`
+for both implicit-main and multi-backend deployments. Changing the policy
+therefore requires a matching daemon configuration.
 
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
@@ -563,9 +579,9 @@ pub trait Pack {
 
 ### Operator config status
 
-`verbs_disabled` is deferred and is not part of the shipped `khive.toml` schema.
-Current operator control is pack selection per ADR-027 plus pack-authored static
-handler visibility.
+`[packs.<name>].verbs_disabled` disables named public handlers after loaded-pack
+validation. Pack selection per ADR-027 and pack-authored static visibility still
+apply; operator-only introspection retains disabled handlers (see section 3).
 
 ### KindHook extension
 
@@ -597,7 +613,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 | Non-help subhandler via MCP request (single/batch/chain)   | Permission denied; internal subhandler; `not_committed`      |
 | Named MCP subhandler `help=true` request                   | Returns metadata with `callable_via_mcp: false`; no dispatch |
 | Subhandler visible through operator introspection          | Listed as `Visibility::Subhandler`, not MCP-callable         |
-| Future `verbs_disabled` config policy                      | Deferred; requires parser, validation, and capability tests  |
+| `verbs_disabled` config policy                             | Parsed and boot-validated; catalog and dispatch enforced     |
 | Pack template-generated crate compiles + passes smoke test | Yes                                                          |
 
 ## Amendment: dispatch-by-kind + KindHook as the mandatory pattern for future packs (2026-07-05)

@@ -1,0 +1,176 @@
+use super::*;
+
+#[test]
+fn camel_case_is_identifier() {
+    assert!(is_identifier("camelCase"));
+    assert!(is_identifier("myVariableName"));
+}
+
+#[test]
+fn snake_case_is_identifier() {
+    assert!(is_identifier("snake_case"));
+    assert!(is_identifier("MY_CONST"));
+}
+
+#[test]
+fn hyphenated_is_identifier() {
+    assert!(is_identifier("kebab-case"));
+    assert!(is_identifier("GPT-4"));
+}
+
+#[test]
+fn path_separators_are_identifier() {
+    assert!(is_identifier("a/b"));
+    assert!(is_identifier("pkg::Type"));
+}
+
+#[test]
+fn plain_word_is_not_identifier() {
+    // "plain" has no boundary — single run of lowercase, no separator
+    assert!(!is_identifier("plain"));
+}
+
+#[test]
+fn has_whitespace_is_not_identifier() {
+    assert!(!is_identifier("hello world"));
+    assert!(!is_identifier("foo bar"));
+}
+
+#[test]
+fn no_ascii_letter_not_identifier() {
+    assert!(!is_identifier("123"));
+    assert!(!is_identifier("_"));
+}
+
+#[test]
+fn camel_case_split() {
+    assert_eq!(split_identifier("camelCase", 1), vec!["camel", "case"]);
+}
+
+#[test]
+fn snake_case_split() {
+    assert_eq!(split_identifier("snake_case", 1), vec!["snake", "case"]);
+}
+
+#[test]
+fn gpt4_split() {
+    assert_eq!(split_identifier("GPT-4", 1), vec!["gpt", "4"]);
+}
+
+#[test]
+fn lora_split() {
+    assert_eq!(split_identifier("LoRA", 1), vec!["lo", "ra"]);
+}
+
+#[test]
+fn plain_single_part() {
+    assert_eq!(split_identifier("plain", 1), vec!["plain"]);
+}
+
+#[test]
+fn bm25f_split() {
+    // "BM25F": B+M (uppercase run), 2+5 (digits), F (letter)
+    let parts = split_identifier("BM25F", 1);
+    assert_eq!(parts, vec!["bm", "25", "f"]);
+}
+
+#[test]
+fn double_colon_separator() {
+    assert_eq!(split_identifier("pkg::Type", 1), vec!["pkg", "type"]);
+}
+
+#[test]
+fn dot_separator() {
+    assert_eq!(
+        split_identifier("com.example.Foo", 1),
+        vec!["com", "example", "foo"]
+    );
+}
+
+#[test]
+fn slash_separator() {
+    assert_eq!(split_identifier("a/b/c", 1), vec!["a", "b", "c"]);
+}
+
+#[test]
+fn min_part_len_filters_short() {
+    // "GPT-4": parts ["gpt", "4"] — "4" has len 1, filtered when min=2
+    let parts = split_identifier("GPT-4", 2);
+    assert_eq!(parts, vec!["gpt"]);
+}
+
+#[test]
+fn split_identifier_filters_unicode_min_part_len_by_chars() {
+    // "\u{4F60}" (你) is 1 char but 3 UTF-8 bytes; must be filtered by
+    // char count, not byte length, when min_part_len == 2.
+    let parts = split_identifier("foo_\u{4F60}", 2);
+    assert_eq!(parts, vec!["foo"]);
+
+    // A two-character non-ASCII part is kept at min_part_len == 2.
+    let parts = split_identifier("foo_\u{4F60}\u{597D}", 2);
+    assert_eq!(parts, vec!["foo", "\u{4F60}\u{597D}"]);
+}
+
+#[test]
+fn mixed_case_and_digits() {
+    // "v2Api" -> ["v", "2", "api"] with min=1; min=2 drops "v" and "2"
+    let parts = split_identifier("v2Api", 2);
+    assert_eq!(parts, vec!["api"]);
+}
+
+#[test]
+fn all_uppercase_run_then_lower() {
+    // "XMLParser" -> "XML" split before "P" (uppercase before lowercase)
+    // => ["xml", "parser"]
+    let parts = split_identifier("XMLParser", 1);
+    assert_eq!(parts, vec!["xml", "parser"]);
+}
+
+#[test]
+fn s_initial_words_split_at_the_acronym_boundary() {
+    for (input, expected) in [
+        ("DBUsers", vec!["db", "users"]),
+        ("APIUsage", vec!["api", "usage"]),
+        ("URLsafe", vec!["ur", "lsafe"]),
+        ("DBOwner", vec!["db", "owner"]),
+        ("HTTPServer", vec!["http", "server"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), expected, "{input}");
+    }
+}
+
+#[test]
+fn terminal_s_retains_acronym_without_hiding_later_boundaries() {
+    for input in ["APIs", "IDs", "URLs"] {
+        assert!(!is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+    }
+    for (input, expected) in [
+        ("APIsFoo", vec!["apis", "foo"]),
+        ("XMLIsEmpty", vec!["xmlis", "empty"]),
+        ("APIs2", vec!["apis", "2"]),
+        ("IDs_URLs", vec!["ids", "urls"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), expected, "{input}");
+    }
+}
+
+#[test]
+fn plural_exemption_ends_only_at_an_ascii_lowercase_continuation() {
+    for continuation in 'a'..='z' {
+        let input = format!("DBUs{continuation}");
+        assert!(is_identifier(&input), "{input}");
+        assert_eq!(
+            split_identifier(&input, 1),
+            vec!["db".to_owned(), format!("us{continuation}")],
+            "{input}"
+        );
+    }
+    // The rule is ASCII character-based, not a dictionary or Unicode word recognizer.
+    for input in ["DBUs", "DBUsé", "DBUs你"] {
+        assert!(!is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+    }
+}

@@ -4,10 +4,10 @@
 
 ## Scope
 
-The KG pack provides 26 verb handlers for the knowledge graph substrate: entity
+The KG pack provides 27 verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
 entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046),
-caller identity introspection (`whoami`), the secret gate's write-free verdict on a
+grouped event counts (`count`, ADR-022), caller identity introspection (`whoami`), the secret gate's write-free verdict on a
 note body (`scan`), and writer-contention, graph-edge
 integrity, plus WAL/checkpoint operator diagnostics (`db_diagnostics`,
 ADR-091/ADR-135 — its PASSIVE probe may backfill WAL frames but never changes
@@ -37,8 +37,8 @@ It is the first-party pack shipped with the khive binary.
 | [`src/lib.rs`](../src/lib.rs)                                     | Pack re-exports and crate documentation                  |
 | [`src/pack.rs`](../src/pack.rs)                                   | KgPack struct, Pack trait impl, edge endpoint rules      |
 | [`src/dispatch.rs`](../src/dispatch.rs)                           | PackRuntime impl, inventory self-registration            |
-| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (24 HandlerDef entries)         |
-| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 26 verb handler implementations                          |
+| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (27 HandlerDef entries)         |
+| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 27 verb handler implementations                          |
 | [`src/vocab.rs`](../src/vocab.rs)                                 | EntityKind (9) and NoteKind (5) enums with alias parsing |
 | [`src/entity_type_registry.rs`](../src/entity_type_registry.rs)   | Validates entity_type against per-kind subtypes          |
 | [`src/apply_worker/mod.rs`](../src/apply_worker/mod.rs)           | Applies approved proposal changesets to KG               |

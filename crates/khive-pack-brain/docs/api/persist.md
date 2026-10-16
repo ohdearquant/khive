@@ -41,6 +41,23 @@ and replacement snapshot commit in that same atomic unit. An absent or archived 
 rejected before any of those writes, so a peer lifecycle transition cannot leave a partial
 feedback trace after the warm process-local preflight has passed.
 
+Caller-judged `brain.auto_feedback` with a scorer/serve-ledger pair uses the
+`Graded` arm in `persist/feedback.rs`: the existing dedup claim and grade backfill
+join the public event, private event, and snapshot in that same atomic unit.
+It does not enter the implicit-mass gate. A conflicting claim publishes no state;
+any append, grade, or snapshot failure rolls back the claim along with the other
+writes, leaving an identical retry possible. Manual feedback admission is unchanged.
+
+`brain.auto_feedback(signal="unjudged")` instead uses the existing attributed
+`Runtime::events(token).append_event` operation. Its single `feedback_unjudged`
+event carries available serve provenance and commits through the event store's
+existing queue/direct transaction path. It does not call a profile mutation
+helper, append to the private brain log, update a snapshot, claim a scorer pair,
+backfill a grade, or create an implicit-mass row. Ledger resolution validates
+provenance without writing; even an already-graded pair can carry telemetry.
+The kind is excluded before evidence parsing by the existing interpreter/replay
+boundary. No default profile is fabricated for profileless telemetry.
+
 The monotonically-raised snapshot `updated_at` is the namespace's durable generation.
 `ensure_loaded` checks that primary-key row even for an already-active namespace and reloads
 when another process has advanced it. This keeps profile and binding reads coherent across

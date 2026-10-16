@@ -18,6 +18,33 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
     hash
 }
 
+/// SHA-256 of optional parsed text and an exact raw record.
+///
+/// The frame is a one-byte presence marker, followed, when text is present,
+/// by its big-endian `u64` UTF-8 byte length and bytes. The raw record always
+/// follows as its big-endian `u64` byte length and bytes. No normalization is
+/// performed. This is the persisted session-mirror content-hash format; absent
+/// text, empty text, and delimiter-containing values remain distinct.
+///
+/// Requires the `sha2` feature and does not allocate.
+#[cfg(feature = "sha2")]
+pub fn framed_text_sha256(text: Option<&str>, raw: &str) -> Hash32 {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    match text {
+        Some(value) => {
+            hash.update([1]);
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.update((raw.len() as u64).to_be_bytes());
+    hash.update(raw.as_bytes());
+    Hash32::from_bytes(hash.finalize().into())
+}
+
 /// 256-bit (32-byte) content hash.
 ///
 /// Used as a content-addressed identifier for HNSW checkpoints and other
@@ -99,20 +126,5 @@ impl fmt::Display for Hash32 {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn fnv1a_64_matches_published_vectors() {
-        // draft-eastlake-fnv-19, Appendix C: strings with and without NUL.
-        let cases: &[(&[u8], u64)] = &[
-            (b"", 0xcbf2_9ce4_8422_2325),
-            (b"a", 0xaf63_dc4c_8601_ec8c),
-            (b"foobar", 0x8594_4171_f739_67e8),
-            (b"\0", 0xaf63_bd4c_8601_b7df),
-            (b"a\0", 0x089b_e207_b544_f1e4),
-            (b"foobar\0", 0x3453_1ca7_168b_8f38),
-        ];
-        for &(bytes, expected) in cases {
-            assert_eq!(crate::fnv1a_64(bytes), expected);
-        }
-    }
-}
+#[path = "hash_tests.rs"]
+mod tests;

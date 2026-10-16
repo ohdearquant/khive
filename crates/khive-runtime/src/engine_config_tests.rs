@@ -3,6 +3,7 @@ use super::*;
 include!("engine_config_timeout_tests.rs");
 include!("engine_config_deadline_tests.rs");
 include!("engine_config_disk_guard_tests.rs");
+include!("engine_config_peer_tests.rs");
 
 fn write_toml(dir: &tempfile::TempDir, content: &str) -> PathBuf {
     let path = dir.path().join("config.toml");
@@ -87,9 +88,8 @@ default = true
         .expect("load should succeed")
         .expect("file should be found");
     assert_eq!(cfg.engines.len(), 1);
-    assert_eq!(cfg.engines[0].name, "x");
-    assert_eq!(cfg.engines[0].model, "all-minilm-l6-v2");
-    assert!(cfg.engines[0].default);
+    assert_eq!(cfg.engines[0].name, "all-minilm-l6-v2");
+    assert_eq!(cfg.engines[0].weight, 1.0);
 }
 
 #[test]
@@ -109,13 +109,13 @@ fn test_unknown_engine_model_rejected_before_conversion() {
         "expected UnknownModel for the primary engine, got {err:?}"
     );
 
-    let config: KhiveConfig = toml::from_str(
+    let path = write_toml(&dir,
             "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n\n[[engines]]\nname = \"secondary\"\nmodel = \"not-a-model\"\n",
-        )
-        .unwrap();
+        );
+    let error = KhiveConfig::load(Some(&path)).unwrap_err();
     assert!(matches!(
-        config.validate(),
-        Err(ConfigError::UnknownModel { name, model })
+        config_error_root(&error),
+        ConfigError::UnknownModel { name, model }
             if name == "secondary" && model == "not-a-model"
     ));
 }
@@ -201,9 +201,9 @@ fusion_weight = -0.5
     assert!(
         matches!(
             config_error_root(&err),
-            ConfigError::InvalidFusionWeight { .. }
+            ConfigError::InvalidEngineWeight { .. }
         ),
-        "expected InvalidFusionWeight, got {err:?}"
+        "expected InvalidEngineWeight, got {err:?}"
     );
 
     let path2 = write_toml(
@@ -220,9 +220,9 @@ fusion_weight = 0.0
     assert!(
         matches!(
             config_error_root(&err2),
-            ConfigError::InvalidFusionWeight { .. }
+            ConfigError::InvalidEngineWeight { .. }
         ),
-        "expected InvalidFusionWeight, got {err2:?}"
+        "expected InvalidEngineWeight, got {err2:?}"
     );
 }
 
@@ -240,18 +240,14 @@ fn test_env_var_fallback() {
     let additional = vec!["paraphrase-multilingual-minilm-l12-v2".to_string()];
 
     let mut engines = vec![EngineConfig {
-        name: "default".to_string(),
-        model: primary,
-        default: true,
-        fusion_weight: None,
+        name: primary,
+        weight: 1.0,
         dims: None,
     }];
-    for (i, model) in additional.into_iter().enumerate() {
+    for model in additional {
         engines.push(EngineConfig {
-            name: format!("engine-{}", i + 1),
-            model,
-            default: false,
-            fusion_weight: None,
+            name: model,
+            weight: 1.0,
             dims: None,
         });
     }
@@ -262,7 +258,7 @@ fn test_env_var_fallback() {
     cfg.validate().expect("env-derived config should be valid");
     assert_eq!(cfg.engines.len(), 2);
     assert!(cfg.default_engine().is_some());
-    assert_eq!(cfg.default_engine().unwrap().name, "default");
+    assert_eq!(cfg.default_engine().unwrap().name, "all-minilm-l6-v2");
 }
 
 #[test]
@@ -283,7 +279,7 @@ default = true
     let cfg = KhiveConfig::load(Some(&path))
         .expect("load should succeed")
         .expect("file should be present");
-    assert_eq!(cfg.engines[0].name, "file-engine");
+    assert_eq!(cfg.engines[0].name, "all-minilm-l6-v2");
 }
 
 #[test]
@@ -429,9 +425,9 @@ fusion_weight = 0.3
     assert!(
         matches!(
             config_error_root(&err),
-            ConfigError::UnsupportedFusionWeight { name } if name == "primary"
+            ConfigError::UnsupportedEngineWeight { name } if name == "all-minilm-l6-v2"
         ),
-        "expected UnsupportedFusionWeight for primary, got {err:?}"
+        "expected UnsupportedEngineWeight for primary, got {err:?}"
     );
 
     let unweighted_path = write_toml(
@@ -451,10 +447,7 @@ model = "paraphrase-multilingual-minilm-l12-v2"
         .expect("unweighted multi-engine config remains valid")
         .expect("file should be found");
     assert_eq!(cfg.engines.len(), 2);
-    assert!(cfg
-        .engines
-        .iter()
-        .all(|engine| engine.fusion_weight.is_none()));
+    assert!(cfg.engines.iter().all(|engine| engine.weight == 1.0));
 }
 
 #[test]

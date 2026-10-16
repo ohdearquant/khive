@@ -6,6 +6,7 @@ pub mod agent;
 pub mod attachment;
 pub mod blob;
 pub mod capability;
+pub mod embedding_space;
 pub mod entity;
 mod env;
 pub mod error;
@@ -34,6 +35,7 @@ pub use blob::{
     MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
+pub use embedding_space::{EmbeddingSpaceIdentity, EmbeddingSpaceIdentityError, EmbeddingSpaceKey};
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use env::read_env_number;
 pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
@@ -54,7 +56,7 @@ pub use request_context::{
     wait_for_request_read_cancellation, RequestReadContext, RequestReadDeadline,
     RequestReadStopReason, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
-pub use sparse::SparseStore;
+pub use sparse::{SparseStore, SparseStoreFactory};
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter, TopLevelMaintenance};
 pub use telemetry::{
     ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
@@ -62,9 +64,9 @@ pub use telemetry::{
     CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent, PhaseCancelledPayload,
     PhaseCompletedPayload, PhaseStartedPayload,
 };
-pub use text::TextSearch;
+pub use text::{TextSearch, TextSearchFactory};
 pub use types::StorageResult;
-pub use vectors::VectorStore;
+pub use vectors::{VectorStore, VectorStoreFactory};
 
 pub use types::{
     BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,
@@ -79,11 +81,11 @@ pub use types::{
     TextDocument, TextFilter, TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit,
     TextSearchOptions, TextSearchRequest, TextTermStats, TextTermStatsRequest, TimeRange,
     TraversalExecutionBudget, TraversalOptions, TraversalRequest, VectorIndexKind,
-    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
-    MAX_TRAVERSAL_WORK,
+    VectorMetadataFilter, VectorRecord, VectorScanEntry, VectorScanPage, VectorScanRequest,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS,
+    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

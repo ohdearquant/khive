@@ -2565,13 +2565,25 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
             Ok(())
         })
         .await;
+    assert_eq!(
+        result
+            .as_ref()
+            .err()
+            .and_then(StorageError::sqlite_write_failure),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_AUTH,
+            extended_code: rusqlite::ffi::SQLITE_AUTH,
+            settlement_unknown: false,
+        })
+    );
     assert!(
         matches!(
             &result,
             Err(StorageError::WriterTaskRequestFailed {
                 request_state: WriterTaskRequestState::TransactionRolledBack,
                 source,
-            }) if matches!(source.as_ref(), StorageError::Pool { operation, .. }
+            }) if matches!(source.without_sqlite_write_stage(), StorageError::Pool { operation, .. }
                 if operation == "test_pooled_commit")
         ),
         "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"

@@ -16,6 +16,10 @@
 #                          results (bench/, benchmark/, criterion/, *bench*result*)
 #   .json                — blocked if larger than MAX_JSON_KB (default 256 KB),
 #                          unless a known lockfile or benchmark-results path
+#   Extensions match case-insensitively (DATA.JSONL is JSONL), and file lists are
+#   read NUL-delimited so a non-ASCII name reaches the rules as named instead of
+#   in git's C-quoted form, which ends in a quote and matched no extension. A name
+#   starting with '-' is passed after '--', so basename cannot read it as an option.
 #
 # Bypass (deliberate, auditable): KHIVE_ALLOW_DATA=1 git commit ...
 # Tune:    KHIVE_MAX_JSON_KB=512 git commit ...
@@ -152,10 +156,12 @@ check_file() {
   local f="$1"
   [ "$MODE" = staged ] || [ -f "$f" ] || return 0
   local base lower bytes size_kb ceiling_kb
-  base="$(basename "$f")"
+  base="$(basename -- "$f")"
   lower="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
 
-  case "$base" in
+  # The extension decides the rule, so it is matched case-folded; the lockfile
+  # names and exemption regexes below still match the path as tracked.
+  case "$(basename -- "$lower")" in
     *.jsonl|*.ndjson)
       printf '%s' "$lower" | grep -qE "$BENCH_RE" && return 0
       # A consumer-declared exemption admits this one file up to its ceiling,
@@ -218,15 +224,15 @@ load_exemptions
 
 if [ "${1:-}" = "--all" ]; then
   # CI mode: scan every tracked + untracked (non-ignored) file in the tree
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     check_file "$f"
-  done < <(git ls-files && git ls-files --others --exclude-standard)
+  done < <(git ls-files -z && git ls-files -z --others --exclude-standard)
 else
   # Pre-commit mode: staged files only, judged from the index
   MODE=staged
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     check_file "$f"
-  done < <(git diff --cached --name-only --diff-filter=ACMR)
+  done < <(git diff --cached --name-only -z --diff-filter=ACMR)
 fi
 
 if [ "$fail" -ne 0 ]; then

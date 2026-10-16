@@ -275,9 +275,23 @@ async fn pool_backed_failed_call_whose_rollback_fails_reports_side_effects_unkno
     let script = writer
         .execute_script("BEGIN; INSERT INTO no_such_table VALUES (1);".to_string())
         .await;
+    assert_eq!(
+        script
+            .as_ref()
+            .err()
+            .and_then(khive_storage::StorageError::sqlite_write_failure),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_ERROR,
+            extended_code: rusqlite::ffi::SQLITE_ERROR,
+            settlement_unknown: true,
+        })
+    );
     assert!(
         matches!(
-            &script,
+            script
+                .as_ref()
+                .map_err(khive_storage::StorageError::without_sqlite_write_stage),
             Err(khive_storage::StorageError::WriterTaskTerminated {
                 request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                 ..

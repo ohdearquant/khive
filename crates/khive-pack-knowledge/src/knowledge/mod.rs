@@ -11,6 +11,7 @@ mod atom_validation;
 mod compose;
 mod crud;
 mod eval;
+mod export;
 mod fold_handler;
 pub(crate) mod index_handler;
 mod lexical_timeout;

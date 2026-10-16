@@ -5,6 +5,19 @@
 The search path uses a multi-signal TF-IDF variant with optional embedding rerank and optional
 query decomposition.
 
+### Atom and domain classification
+
+Across import, delete, listing, totals, cursor pagination, embedding coverage, and
+search kind filters, a domain mirror is a row whose decoded JSON string-array
+`tags` contains the exact, case-sensitive element `type:domain`. Escaped spellings
+such as `type\u003adomain` count; `type:domain-extra`, `prefix:type:domain`, and
+`TYPE:DOMAIN` remain ordinary atom tags. Legacy tags that are not a complete JSON
+string array retain the conservative, case-sensitive raw substring check.
+
+SQLite read predicates and Rust checks use the same classifier. Cursor indexes
+cover all live rows; classification is applied before the page limit. Upgrading
+rebuilds the atom cursor index without rewriting stored tags or atom content.
+
 ### Scoring
 
 For each candidate atom/domain, the score is a weighted sum of per-field TF scores multiplied

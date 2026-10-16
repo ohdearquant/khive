@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::{StorageCapability, StorageError};
 
 use super::schema::{
     AdjudicateParams, ChallengeParams, EditParams, ImportParams, Section, SectionType,
@@ -15,8 +16,8 @@ use super::schema::{
 use super::sections_index::embed_sections;
 use super::util::resolve_atom_id;
 use super::util::{
-    content_hash, deser, new_id, now_us, row_str, sql_err, validate_atom_content,
-    validate_section_content,
+    content_hash, deser, has_domain_mirror_tag, new_id, now_us, row_str, sql_err,
+    validate_atom_content, validate_section_content,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -694,7 +695,7 @@ fn prepare_import_file(
                 unknown_type = unknown_type.saturating_add(1);
                 continue;
             };
-            if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
+            if content.chars().count() < super::util::MIN_SECTION_CONTENT_LEN {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
@@ -842,10 +843,7 @@ async fn validate_existing_import_identities(
             .map_err(|error| sql_err("knowledge.import target preflight", error))?;
         if let Some(row) = existing {
             let slug = &prepared.slug;
-            if row_str(&row, "tags")
-                .unwrap_or_default()
-                .contains("type:domain")
-            {
+            if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
                 )));
@@ -1396,46 +1394,65 @@ impl KnowledgeHandlers {
         )
         .await?;
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("challenge writer", e))?;
+        let atom_id_for_update = atom_id.clone();
+        let target_hash_for_update = target_hash.clone();
+        let affected = sql
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    let affected = writer
+                        .execute(SqlStatement {
+                            sql: khive_runtime::sql!("knowledge_section_dispute").into(),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update.clone()),
+                                SqlValue::Text(stype.as_str().to_string()),
+                                SqlValue::Text(target_hash_for_update),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "challenge section status", e))?;
 
-        let affected = writer
-            .execute(SqlStatement {
-                sql: khive_runtime::sql!("knowledge_section_dispute").into(),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(stype.as_str().to_string()),
-                    SqlValue::Text(target_hash.clone()),
-                ],
-                label: None,
-            })
+                    if affected == 0 {
+                        return Ok(Box::new(0_u64) as Box<dyn std::any::Any + Send>);
+                    }
+                    // json_set targets the fixed nested path `$.dispute_count` only; no caller
+                    // input reaches this statement, so it cannot create or replace the
+                    // top-level reserved property key.
+                    let updated_atoms = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update),
+                                SqlValue::Text(ns.clone()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "challenge dispute_count increment", e))?;
+                    if updated_atoms != 1 {
+                        return Err(StorageError::Conflict {
+                            capability: StorageCapability::Sql,
+                            operation: "challenge dispute_count".into(),
+                            message: format!("expected one parent atom, updated {updated_atoms}"),
+                        });
+                    }
+
+                    Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+                })
+            }))
             .await
-            .map_err(|e| sql_err("challenge section status", e))?;
+            .map_err(|e| sql_err("challenge transaction", e))?
+            .downcast::<u64>()
+            .map_err(|_| RuntimeError::Internal("invalid challenge transaction outcome".into()))?;
+        let affected = *affected;
 
         if affected == 0 {
             return Err(RuntimeError::InvalidInput(
                 "section not found, already disputed, or deprecated".into(),
             ));
         }
-
-        // json_set targets the fixed nested path `$.dispute_count` only; no caller
-        // input reaches this statement, so it cannot create or replace the
-        // top-level reserved property key.
-        writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(ns.clone()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("challenge dispute_count increment", e))?;
 
         Ok(json!({
             "atom_id": atom_id,
@@ -1543,49 +1560,68 @@ impl KnowledgeHandlers {
         )
         .await?;
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("adjudicate writer", e))?;
+        let atom_id_for_update = atom_id.clone();
+        let target_hash_for_update = target_hash.clone();
+        let affected = sql
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    let affected = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_sections SET status='{new_status}' \
+                                 WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update.clone()),
+                                SqlValue::Text(stype.as_str().to_string()),
+                                SqlValue::Text(target_hash_for_update),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "adjudicate section status", e))?;
 
-        let affected = writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_sections SET status='{new_status}' \
-                     WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(stype.as_str().to_string()),
-                    SqlValue::Text(target_hash.clone()),
-                ],
-                label: None,
-            })
+                    if affected == 0 {
+                        return Ok(Box::new(0_u64) as Box<dyn std::any::Any + Send>);
+                    }
+                    // json_set targets the fixed nested path `$.dispute_count` only; no caller
+                    // input reaches this statement, so it cannot create or replace the
+                    // top-level reserved property key.
+                    let updated_atoms = writer
+                        .execute(SqlStatement {
+                            sql: format!(
+                                "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2"
+                            ),
+                            params: vec![
+                                SqlValue::Text(atom_id_for_update),
+                                SqlValue::Text(ns.clone()),
+                            ],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| StorageError::driver(StorageCapability::Sql, "adjudicate dispute_count decrement", e))?;
+                    if updated_atoms != 1 {
+                        return Err(StorageError::Conflict {
+                            capability: StorageCapability::Sql,
+                            operation: "adjudicate dispute_count".into(),
+                            message: format!("expected one parent atom, updated {updated_atoms}"),
+                        });
+                    }
+
+                    Ok(Box::new(affected) as Box<dyn std::any::Any + Send>)
+                })
+            }))
             .await
-            .map_err(|e| sql_err("adjudicate section status", e))?;
+            .map_err(|e| sql_err("adjudicate transaction", e))?
+            .downcast::<u64>()
+            .map_err(|_| RuntimeError::Internal("invalid adjudicate transaction outcome".into()))?;
+        let affected = *affected;
 
         if affected == 0 {
             return Err(RuntimeError::InvalidInput(
                 "section not found or not in disputed state".into(),
             ));
         }
-
-        // json_set targets the fixed nested path `$.dispute_count` only; no caller
-        // input reaches this statement, so it cannot create or replace the
-        // top-level reserved property key.
-        writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2"
-                ),
-                params: vec![
-                    SqlValue::Text(atom_id.clone()),
-                    SqlValue::Text(ns.clone()),
-                ],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("adjudicate dispute_count decrement", e))?;
 
         Ok(json!({
             "atom_id": atom_id,
@@ -1603,223 +1639,9 @@ impl KnowledgeHandlers {
 mod marker_tests;
 
 #[cfg(test)]
-mod import_traversal_tests {
-    use super::{collect_md_files_with_limits, ImportTraversalLimits};
-    use tempfile::TempDir;
-
-    #[test]
-    fn traversal_surfaces_root_read_errors() {
-        let root = TempDir::new().expect("temp root");
-        let missing = root.path().join("missing");
-        let error = collect_md_files_with_limits(
-            &missing,
-            ImportTraversalLimits {
-                max_depth: 8,
-                max_entries: 100,
-                max_files: 100,
-            },
-        )
-        .expect_err("missing traversal root must be surfaced");
-        assert!(error.to_string().contains("traversal failed"));
-    }
-
-    #[test]
-    fn traversal_enforces_depth_limit() {
-        let root = TempDir::new().expect("temp root");
-        let nested = root.path().join("nested");
-        std::fs::create_dir_all(&nested).expect("nested directory fixture");
-        let error = collect_md_files_with_limits(
-            root.path(),
-            ImportTraversalLimits {
-                max_depth: 0,
-                max_entries: 100,
-                max_files: 100,
-            },
-        )
-        .expect_err("depth over limit must fail closed");
-        let message = error.to_string();
-        assert!(message.contains("depth limit"), "{message}");
-        assert!(
-            message.contains(nested.to_string_lossy().as_ref()),
-            "{message}"
-        );
-        assert!(message.contains("depth=1"), "{message}");
-        assert!(message.contains("max_depth=0"), "{message}");
-        assert!(message.contains("entries_visited=1"), "{message}");
-        assert!(message.contains("max_entries=100"), "{message}");
-        assert!(message.contains("files_discovered=0"), "{message}");
-        assert!(message.contains("max_files=100"), "{message}");
-    }
-
-    #[test]
-    fn traversal_enforces_entry_limit() {
-        let root = TempDir::new().expect("temp root");
-        let first = root.path().join("a.md");
-        std::fs::write(&first, "a").expect("fixture");
-        let error = collect_md_files_with_limits(
-            root.path(),
-            ImportTraversalLimits {
-                max_depth: 8,
-                max_entries: 0,
-                max_files: 100,
-            },
-        )
-        .expect_err("entry over limit must fail closed");
-        let message = error.to_string();
-        assert!(message.contains("entry limit"), "{message}");
-        assert!(
-            message.contains(first.to_string_lossy().as_ref()),
-            "{message}"
-        );
-        assert!(message.contains("entries_visited=1"), "{message}");
-        assert!(message.contains("max_entries=0"), "{message}");
-        assert!(message.contains("files_discovered=0"), "{message}");
-        assert!(message.contains("max_files=100"), "{message}");
-        assert!(message.contains("depth=0"), "{message}");
-        assert!(message.contains("max_depth=8"), "{message}");
-    }
-
-    #[test]
-    fn traversal_enforces_markdown_file_limit() {
-        let root = TempDir::new().expect("temp root");
-        std::fs::write(root.path().join("a.md"), "a").expect("first fixture");
-        let second = root.path().join("b.md");
-        std::fs::write(&second, "b").expect("second fixture");
-        let error = collect_md_files_with_limits(
-            root.path(),
-            ImportTraversalLimits {
-                max_depth: 8,
-                max_entries: 100,
-                max_files: 1,
-            },
-        )
-        .expect_err("file over limit must fail closed");
-        let message = error.to_string();
-        assert!(message.contains("markdown file limit"), "{message}");
-        assert!(
-            message.contains(second.to_string_lossy().as_ref()),
-            "{message}"
-        );
-        assert!(message.contains("files_discovered=2"), "{message}");
-        assert!(message.contains("max_files=1"), "{message}");
-        assert!(message.contains("entries_visited=2"), "{message}");
-        assert!(message.contains("max_entries=100"), "{message}");
-        assert!(message.contains("depth=0"), "{message}");
-        assert!(message.contains("max_depth=8"), "{message}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn traversal_does_not_follow_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let root = TempDir::new().expect("temp root");
-        let markdown = root.path().join("source.md");
-        std::fs::write(&markdown, "source").expect("source fixture");
-        symlink(&markdown, root.path().join("alias.md")).expect("symlink fixture");
-        let discovery = collect_md_files_with_limits(
-            root.path(),
-            ImportTraversalLimits {
-                max_depth: 8,
-                max_entries: 100,
-                max_files: 100,
-            },
-        )
-        .expect("traversal");
-
-        assert_eq!(discovery.files, vec![markdown]);
-        assert_eq!(discovery.files_skipped, 1);
-    }
-}
+#[path = "sections_import_traversal_tests.rs"]
+mod import_traversal_tests;
 
 #[cfg(test)]
-mod import_read_tests {
-    use super::{read_import_file, MAX_IMPORT_FILE_BYTES, MAX_IMPORT_TOTAL_BYTES};
-    use tempfile::TempDir;
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_swap_at_read_time_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let root = TempDir::new().expect("temp root");
-        let outside = TempDir::new().expect("outside root");
-        let secret = outside.path().join("secret.md");
-        std::fs::write(&secret, "outside content").expect("secret fixture");
-
-        // Simulates the post-validation swap: the path traversal accepted
-        // as a regular file is, by read time, a symlink pointing outside
-        // the import root.
-        let swapped = root.path().join("swapped.md");
-        symlink(&secret, &swapped).expect("swap symlink fixture");
-
-        let mut total_bytes = 0u64;
-        let error = read_import_file(&swapped, "swapped.md", &mut total_bytes)
-            .expect_err("a symlink swapped in after validation must be refused at read time");
-        assert!(
-            error.to_string().contains("failed to open import source"),
-            "{error}"
-        );
-        assert_eq!(
-            total_bytes, 0,
-            "a rejected read must not count toward the aggregate cap"
-        );
-    }
-
-    #[test]
-    fn oversize_single_file_is_refused() {
-        let root = TempDir::new().expect("temp root");
-        let big = root.path().join("big.md");
-        let file = std::fs::File::create(&big).expect("create big fixture");
-        file.set_len(MAX_IMPORT_FILE_BYTES + 1)
-            .expect("grow big fixture past the per-file cap");
-        drop(file);
-
-        let mut total_bytes = 0u64;
-        let error = read_import_file(&big, "big.md", &mut total_bytes)
-            .expect_err("a file over the per-file cap must be refused");
-        assert!(
-            error.to_string().contains("exceeding the per-file cap"),
-            "{error}"
-        );
-        assert_eq!(
-            total_bytes, 0,
-            "a rejected read must not count toward the aggregate cap"
-        );
-    }
-
-    #[test]
-    fn aggregate_cap_is_refused_once_tripped() {
-        let root = TempDir::new().expect("temp root");
-        let small = root.path().join("small.md");
-        std::fs::write(
-            &small,
-            "a small file that pushes the running total over the cap",
-        )
-        .expect("small fixture");
-
-        // Seed the running total just under the aggregate cap so this one
-        // small read is what tips it over, without needing to write a
-        // 256 MiB fixture to disk.
-        let mut total_bytes = MAX_IMPORT_TOTAL_BYTES - 5;
-        let error = read_import_file(&small, "small.md", &mut total_bytes)
-            .expect_err("a read that crosses the aggregate cap must be refused");
-        assert!(
-            error.to_string().contains("exceeds the total-import cap"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn clean_read_under_both_caps_succeeds() {
-        let root = TempDir::new().expect("temp root");
-        let clean = root.path().join("clean.md");
-        std::fs::write(&clean, "# Clean\n\nWell under every cap.").expect("clean fixture");
-
-        let mut total_bytes = 0u64;
-        let content = read_import_file(&clean, "clean.md", &mut total_bytes)
-            .expect("a file under both caps must read successfully");
-        assert_eq!(content, "# Clean\n\nWell under every cap.");
-        assert_eq!(total_bytes, content.len() as u64);
-    }
-}
+#[path = "sections_import_read_tests.rs"]
+mod import_read_tests;

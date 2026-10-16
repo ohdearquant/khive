@@ -1,8 +1,11 @@
 //! Search result types returned by hybrid retrieval pipelines.
 //!
-//! These types depend only on `uuid` and `khive-score`, so any pipeline that produces
-//! ranked hits can return them without depending on a higher layer.
+//! Search evidence and built-in strategy labels are shared here so pipelines can retain
+//! their own ranking and duplicate-signal policies without depending on a higher layer.
 
+use std::collections::{hash_map::Entry, HashMap};
+
+use khive_fusion::FusionStrategy;
 use khive_score::DeterministicScore;
 use uuid::Uuid;
 
@@ -22,6 +25,22 @@ pub enum RankScoreKind {
 }
 
 impl RankScoreKind {
+    /// Rank kind for a built-in strategy, or the borrowed custom executor arguments.
+    ///
+    /// Custom executors declare their own kind. Returning their name and parameters
+    /// leaves resolution and fallback policy with the caller; `Err` is not a refusal.
+    /// Callers that intentionally fall back to RRF can use `unwrap_or(Self::Rrf)`.
+    pub fn of(strategy: &FusionStrategy) -> Result<Self, (&str, &serde_json::Value)> {
+        match strategy {
+            FusionStrategy::Rrf { .. } | FusionStrategy::WeightedRrf { .. } => Ok(Self::Rrf),
+            FusionStrategy::VectorOnly => Ok(Self::Vector),
+            FusionStrategy::KeywordOnly => Ok(Self::Keyword),
+            FusionStrategy::Weighted { .. } => Ok(Self::Weighted),
+            FusionStrategy::Union => Ok(Self::Union),
+            FusionStrategy::Custom { name, params } => Err((name, params)),
+        }
+    }
+
     /// Lowercase wire representation used by search serializers.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -64,6 +83,62 @@ pub struct SearchHit {
     pub title: Option<String>,
     /// Excerpt of the matched text, when the text leg carried one.
     pub snippet: Option<String>,
+}
+
+/// How repeated appearances contribute their per-leg signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalMerge {
+    /// Keep each first present signal, including a measured zero.
+    FirstPresent,
+    /// Keep the maximum present signal from each retrieval leg.
+    Maximum,
+}
+
+/// Accumulate evidence by ID without changing the first hit's score or rank kind.
+///
+/// Every appearance widens the source and fills missing title/snippet fields, even
+/// on a repeated visit from the same leg. Present empty strings are retained.
+/// This differs from `combine_leg_first_appearance`, which ignores a repeated leg
+/// entirely. Ranking and the final result limit remain the caller's responsibility.
+pub fn merge_hit_metadata(
+    metadata: &mut HashMap<Uuid, SearchHit>,
+    hit: SearchHit,
+    signals: SignalMerge,
+) {
+    match metadata.entry(hit.entity_id) {
+        Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            existing.source = existing.source.union(hit.source);
+            existing.signals.vector_similarity = match signals {
+                SignalMerge::FirstPresent => existing
+                    .signals
+                    .vector_similarity
+                    .or(hit.signals.vector_similarity),
+                SignalMerge::Maximum => existing
+                    .signals
+                    .vector_similarity
+                    .max(hit.signals.vector_similarity),
+            };
+            existing.signals.keyword_score = match signals {
+                SignalMerge::FirstPresent => {
+                    existing.signals.keyword_score.or(hit.signals.keyword_score)
+                }
+                SignalMerge::Maximum => existing
+                    .signals
+                    .keyword_score
+                    .max(hit.signals.keyword_score),
+            };
+            if existing.title.is_none() {
+                existing.title = hit.title;
+            }
+            if existing.snippet.is_none() {
+                existing.snippet = hit.snippet;
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(hit);
+        }
+    }
 }
 
 /// Result of a hybrid search: the fused hits — text hits alone when the vector

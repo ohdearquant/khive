@@ -10,6 +10,19 @@
 
 use std::sync::Arc;
 
+mod locks;
+#[cfg(all(test, unix))]
+use locks::open_lock_file;
+#[cfg(unix)]
+pub use locks::{
+    acquire_daemon_boot_guard, acquire_recovery_lock, try_acquire_daemon_boot_guard_until,
+    try_acquire_recoverer_lock_until, DaemonBootGuard,
+};
+#[cfg(unix)]
+pub(crate) use locks::{peer_uid, uid_is_permitted};
+#[cfg(unix)]
+use locks::{socket_identity, SocketIdentity};
+
 mod store_guard;
 mod store_identity;
 #[cfg(unix)]
@@ -29,15 +42,19 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
 
 #[cfg(unix)]
 use async_trait::async_trait;
 #[cfg(unix)]
 use libc;
-use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::Deserialize;
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+#[cfg(all(test, unix))]
+use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
@@ -45,6 +62,29 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::pack::RequestIdentity;
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
+
+// Unix-only: gated inside the file, because the error-constructor census
+// admits only attribute-free submodule declarations.
+mod exit_record;
+mod lifecycle;
+#[cfg(unix)]
+use lifecycle::khive_dir;
+#[cfg(test)]
+use lifecycle::khive_root_from;
+#[cfg(unix)]
+use lifecycle::{
+    current_supervisor_claim, default_socket_path, ensure_rendezvous_overrides_paired,
+    read_supervisor_marker_claim, DaemonLifecycle, PID_PATH_ENV, SOCKET_PATH_ENV,
+};
+pub use lifecycle::{
+    lock_path, volume_lock_dir, DaemonLifecyclePhase, DaemonLifecycleSnapshot, DaemonLifetime,
+    DaemonOptions, DaemonShutdownReason, DaemonStartupReport, DEFAULT_DEMAND_IDLE_SECS,
+};
+#[cfg(unix)]
+pub use lifecycle::{
+    pid_path, recoverer_lock_path, rendezvous_split, socket_path, RendezvousSplit,
+    SUPERVISOR_CLAIM_ENV,
+};
 
 mod load_limits;
 #[cfg(unix)]
@@ -65,201 +105,6 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 8;
-
-/// ADR-049 Amendment 11's disclosed initial demand idle interval.
-pub const DEFAULT_DEMAND_IDLE_SECS: u64 = 1_800;
-
-/// A launch-time choice, never inferred from process ancestry or environment.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonLifetime {
-    Demand,
-    #[default]
-    Persistent,
-}
-
-/// Immutable daemon options. Existing entry points use persistent mode.
-#[derive(Debug, Clone, Copy)]
-pub struct DaemonOptions {
-    pub lifetime: DaemonLifetime,
-    pub idle_interval: std::time::Duration,
-}
-
-impl Default for DaemonOptions {
-    fn default() -> Self {
-        Self {
-            lifetime: DaemonLifetime::Persistent,
-            idle_interval: std::time::Duration::from_secs(DEFAULT_DEMAND_IDLE_SECS),
-        }
-    }
-}
-
-/// Host-owned startup decisions disclosed by lifecycle diagnostics.
-#[derive(Debug, Clone, Default)]
-pub struct DaemonStartupReport {
-    pub skipped_components: Vec<String>,
-    /// A named unknown inventory or service obligation prevents retirement.
-    pub idle_ineligible_reasons: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonLifecyclePhase {
-    Serving,
-    Draining,
-    Stopped,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonShutdownReason {
-    Idle,
-    Signal,
-}
-
-/// Additive diagnostics for one daemon incarnation.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct DaemonLifecycleSnapshot {
-    pub lifetime: DaemonLifetime,
-    pub instance_generation: String,
-    pub effective_idle_interval_ms: u64,
-    pub phase: DaemonLifecyclePhase,
-    pub shutdown_reason: Option<DaemonShutdownReason>,
-    pub skipped_components: Vec<String>,
-    pub idle_ineligible_reasons: Vec<String>,
-    pub ordinary_requests: usize,
-    pub idle_blockers: Vec<String>,
-}
-
-#[cfg(unix)]
-struct DaemonLifecycle {
-    options: DaemonOptions,
-    state: std::sync::Mutex<DaemonLifecycleState>,
-    /// Admission for new connections on the daemon socket.
-    connections: ConnectionAdmission,
-}
-
-#[cfg(unix)]
-struct DaemonLifecycleState {
-    snapshot: DaemonLifecycleSnapshot,
-    last_request_completion: Option<tokio::time::Instant>,
-}
-
-#[cfg(unix)]
-impl DaemonLifecycle {
-    fn new(options: DaemonOptions, report: DaemonStartupReport) -> Self {
-        Self {
-            options,
-            state: std::sync::Mutex::new(DaemonLifecycleState {
-                snapshot: DaemonLifecycleSnapshot {
-                    lifetime: options.lifetime,
-                    instance_generation: uuid::Uuid::new_v4().to_string(),
-                    effective_idle_interval_ms: options
-                        .idle_interval
-                        .as_millis()
-                        .min(u128::from(u64::MAX))
-                        as u64,
-                    phase: DaemonLifecyclePhase::Serving,
-                    shutdown_reason: None,
-                    skipped_components: report.skipped_components,
-                    idle_ineligible_reasons: report.idle_ineligible_reasons,
-                    ordinary_requests: 0,
-                    idle_blockers: Vec::new(),
-                },
-                last_request_completion: None,
-            }),
-            connections: ConnectionAdmission::from_env(),
-        }
-    }
-
-    fn snapshot(&self) -> DaemonLifecycleSnapshot {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot
-            .clone()
-    }
-
-    fn ready(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_request_completion = Some(tokio::time::Instant::now());
-    }
-
-    fn admit(self: &Arc<Self>) -> Option<OrdinaryRequestGuard> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.snapshot.phase != DaemonLifecyclePhase::Serving {
-            return None;
-        }
-        state.snapshot.ordinary_requests += 1;
-        Some(OrdinaryRequestGuard(Arc::clone(self)))
-    }
-
-    /// The same mutex orders ordinary admission and the irreversible idle decision.
-    fn try_idle(&self, blockers: impl FnOnce() -> Vec<String>) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.options.lifetime != DaemonLifetime::Demand
-            || state.snapshot.phase != DaemonLifecyclePhase::Serving
-            || state.snapshot.ordinary_requests != 0
-            || !state.snapshot.idle_ineligible_reasons.is_empty()
-            || state
-                .last_request_completion
-                .is_none_or(|last| last.elapsed() < self.options.idle_interval)
-        {
-            return false;
-        }
-        state.snapshot.idle_blockers = blockers();
-        if !state.snapshot.idle_blockers.is_empty() {
-            return false;
-        }
-        state.snapshot.phase = DaemonLifecyclePhase::Draining;
-        state.snapshot.shutdown_reason = Some(DaemonShutdownReason::Idle);
-        true
-    }
-
-    fn draining(&self, reason: DaemonShutdownReason) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.snapshot.phase != DaemonLifecyclePhase::Stopped {
-            state.snapshot.phase = DaemonLifecyclePhase::Draining;
-            state.snapshot.shutdown_reason = Some(reason);
-        }
-    }
-
-    fn stopped(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot
-            .phase = DaemonLifecyclePhase::Stopped;
-    }
-}
-
-#[cfg(unix)]
-struct OrdinaryRequestGuard(Arc<DaemonLifecycle>);
-
-#[cfg(unix)]
-impl Drop for OrdinaryRequestGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.snapshot.ordinary_requests -= 1;
-        // The guard covers response transport and cleanup, not just dispatch.
-        state.last_request_completion = Some(tokio::time::Instant::now());
-    }
-}
 
 /// Internal signal carried in a dispatch result until the daemon moves it to
 /// response-frame metadata. It must never be sent in `result`: older v8
@@ -282,488 +127,6 @@ fn next_accept_error_backoff(previous: Option<std::time::Duration>) -> std::time
         .min(std::time::Duration::from_secs(1))
 }
 
-// ── paths ─────────────────────────────────────────────────────────────────────
-
-/// Base `.khive` directory used to anchor every advisory lock/socket/pid
-/// path below. Pure path computation — portable on every target, even
-/// though most of its callers (socket/pid paths) are unix-only.
-///
-/// Resolution order: `HOME`, then `USERPROFILE` (the conventional Windows
-/// home variable), then a platform-specific last resort. On non-unix targets
-/// the last resort is the OS temp directory (per-user on Windows), so the
-/// lock path can never be working-directory-relative there: two processes
-/// opening the same database from different working directories must resolve
-/// the same lock file. On unix the last resort stays the historical `"."` —
-/// a shared world-writable anchor such as `/tmp` would be worse, since a
-/// local attacker could pre-claim the directory and the socket/lock files
-/// under it before the daemon's first run.
-fn khive_dir() -> PathBuf {
-    khive_root_from(
-        std::env::var("HOME").ok(),
-        std::env::var("USERPROFILE").ok(),
-    )
-}
-
-/// Env-free core of [`khive_dir`], split out so the fallback chain is
-/// testable without mutating process-global environment variables.
-fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf {
-    home.filter(|v| !v.trim().is_empty())
-        .or_else(|| userprofile.filter(|v| !v.trim().is_empty()))
-        .map(PathBuf::from)
-        .unwrap_or_else(last_resort_root)
-        .join(".khive")
-}
-
-/// The directory for the SQLite volume lock files, from the single rule in
-/// [`khive_db::default_volume_lock_dir`]: `KHIVE_VOLUME_LOCK_DIR` when set,
-/// else `<home>/.khive/sqlite-volume-locks`. Unlike `khive_dir` it has no
-/// last-resort root: without a home directory the result is a configuration
-/// error, because a working-directory-relative lock directory would give two
-/// processes two different lock files.
-pub fn volume_lock_dir() -> Result<PathBuf, khive_db::SqliteError> {
-    khive_db::default_volume_lock_dir()
-}
-
-/// See [`khive_dir`] for why the two arms differ.
-#[cfg(unix)]
-fn last_resort_root() -> PathBuf {
-    PathBuf::from(".")
-}
-
-#[cfg(not(unix))]
-fn last_resort_root() -> PathBuf {
-    std::env::temp_dir()
-}
-
-/// Env var overriding the socket half of the daemon rendezvous.
-#[cfg(unix)]
-const SOCKET_PATH_ENV: &str = "KHIVE_SOCKET";
-
-/// Env var overriding the PID-file half of the daemon rendezvous.
-#[cfg(unix)]
-const PID_PATH_ENV: &str = "KHIVE_PID";
-
-/// Read a path override, treating an empty value as unset.
-///
-/// One predicate for "the operator set this variable", shared by the path
-/// resolvers and [`ensure_rendezvous_overrides_paired`]. A pairing check that
-/// disagreed with the resolvers about what counts as set would either refuse
-/// boots that resolve consistently, or admit the split rendezvous it exists
-/// to stop.
-#[cfg(unix)]
-fn path_override(key: &str) -> Option<PathBuf> {
-    match std::env::var(key) {
-        Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
-        _ => None,
-    }
-}
-
-#[cfg(unix)]
-fn default_socket_path() -> PathBuf {
-    khive_dir().join("khived.sock")
-}
-
-#[cfg(unix)]
-fn default_pid_path() -> PathBuf {
-    khive_dir().join("khived.pid")
-}
-
-/// Unix socket path the daemon binds and clients connect to.
-///
-/// Overridable via the `KHIVE_SOCKET` env var (for tests and ops), which must
-/// be set together with `KHIVE_PID`: the daemon refuses to boot when exactly
-/// one of the two is set.
-#[cfg(unix)]
-pub fn socket_path() -> PathBuf {
-    path_override(SOCKET_PATH_ENV).unwrap_or_else(default_socket_path)
-}
-
-/// PID file path written by the daemon.
-///
-/// Overridable via the `KHIVE_PID` env var, which must be set together with
-/// `KHIVE_SOCKET`: the daemon refuses to boot when exactly one of the two is
-/// set.
-#[cfg(unix)]
-pub fn pid_path() -> PathBuf {
-    path_override(PID_PATH_ENV).unwrap_or_else(default_pid_path)
-}
-
-/// Refuse to boot when exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set
-/// (#2656).
-///
-/// The socket and the PID file are the two halves of one rendezvous, but they
-/// resolve independently: with only `KHIVE_SOCKET` set a daemon binds a
-/// private socket while still claiming the shared PID file, and with only
-/// `KHIVE_PID` set it writes a private PID file while binding the shared
-/// socket. Either way [`cleanup_stale_daemon`] reads an incumbent's pid out of
-/// one instance's file and judges it by probing the other instance's socket,
-/// so both of its branches are wrong: a live incumbent produces a refusal
-/// naming a pid that has nothing to do with the socket being started, and a
-/// pid that is no longer running makes this process delete a rendezvous file
-/// another daemon's `shutdown_cleanup_if_owned` still expects to own.
-///
-/// Setting both variables (a fully private rendezvous) and setting neither
-/// (the default rendezvous) are both unchanged.
-#[cfg(unix)]
-fn ensure_rendezvous_overrides_paired() -> anyhow::Result<()> {
-    match (path_override(SOCKET_PATH_ENV), path_override(PID_PATH_ENV)) {
-        (Some(socket), None) => anyhow::bail!(
-            "refusing to start: {SOCKET_PATH_ENV} is set to {} but {PID_PATH_ENV} is not set. \
-             The socket and the PID file are two halves of one daemon rendezvous and must move \
-             together: with only {SOCKET_PATH_ENV} set, this daemon would bind a private socket \
-             while claiming the shared PID file at {}, which belongs to the default rendezvous \
-             served on {}. Set {PID_PATH_ENV} to a private path beside the socket, or unset \
-             {SOCKET_PATH_ENV} to share the default rendezvous.",
-            socket.display(),
-            default_pid_path().display(),
-            default_socket_path().display(),
-        ),
-        (None, Some(pid)) => anyhow::bail!(
-            "refusing to start: {PID_PATH_ENV} is set to {} but {SOCKET_PATH_ENV} is not set. \
-             The socket and the PID file are two halves of one daemon rendezvous and must move \
-             together: with only {PID_PATH_ENV} set, this daemon would write a private PID file \
-             while binding the shared socket at {}, the default rendezvous whose owner is \
-             recorded in {}. Set {SOCKET_PATH_ENV} to a private path beside the PID file, or \
-             unset {PID_PATH_ENV} to share the default rendezvous.",
-            pid.display(),
-            default_socket_path().display(),
-            default_pid_path().display(),
-        ),
-        _ => Ok(()),
-    }
-}
-
-/// Advisory lock file used to serialize stale-daemon recovery across concurrent
-/// clients (flock/`File::lock` on the file; released when the lock file
-/// handle is dropped). Path computation is portable; `kkernel exec`'s
-/// non-unix local-construction guard (`kkernel::exec::acquire_local_construction_guard`)
-/// shares this exact path with the unix daemon-boot guard so the two stay
-/// mutually exclusive.
-///
-/// Overridable via the `KHIVE_LOCK` env var (for tests).
-pub fn lock_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KHIVE_LOCK") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    khive_dir().join("khived.recovery.lock")
-}
-
-/// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
-/// across concurrent clients only — the daemon's own boot sequence never
-/// acquires this file ([`lock_path`] / [`acquire_daemon_boot_guard`] is the
-/// boot-side lock). A recoverer holding this lock across dead-confirmation
-/// → kill → spawn (khive-mcp's `kill_and_respawn`) therefore can never
-/// deadlock against a peer daemon's boot, unlike holding the shared boot
-/// lock for that whole span would.
-///
-/// Overridable via the `KHIVE_RECOVERER_LOCK` env var (for tests).
-#[cfg(unix)]
-pub fn recoverer_lock_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KHIVE_RECOVERER_LOCK") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    khive_dir().join("khived.recoverer.lock")
-}
-
-#[cfg(unix)]
-pub const SUPERVISOR_CLAIM_ENV: &str = "KHIVE_SUPERVISOR_CLAIM";
-
-#[cfg(unix)]
-fn read_supervisor_marker_claim() -> Option<(u32, String)> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(supervisor_marker_path())
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut marker = String::new();
-    file.take(4097).read_to_string(&mut marker).ok()?;
-    if marker.len() > 4096 {
-        return None;
-    }
-    let mut lines = marker.lines();
-    if lines.next()?.is_empty() {
-        return None;
-    }
-    let pid = lines.next()?.parse::<u32>().ok().filter(|pid| *pid > 0)?;
-    lines
-        .next()?
-        .parse::<u64>()
-        .ok()
-        .filter(|seconds| *seconds > 0)?;
-    let claim = lines.next()?.to_string();
-    if lines.next().is_some() {
-        return None;
-    }
-    let parsed = uuid::Uuid::parse_str(&claim).ok()?;
-    if parsed.get_version() != Some(uuid::Version::Random) || parsed.to_string() != claim {
-        return None;
-    }
-    Some((pid, claim))
-}
-
-#[cfg(unix)]
-fn current_supervisor_claim() -> Option<String> {
-    let claim = std::env::var(SUPERVISOR_CLAIM_ENV).ok()?;
-    let (pid, published_claim) = read_supervisor_marker_claim()?;
-    (pid == std::process::id() && claim == published_claim).then_some(claim)
-}
-
-#[cfg(unix)]
-fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn acquire_flock_blocking(path: &std::path::Path, label: &str) -> Option<std::fs::File> {
-    let file = match open_lock_file(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, path = ?path, "cannot open {label} lock file");
-            return None;
-        }
-    };
-    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        tracing::warn!("flock LOCK_EX failed on {label} lock");
-        return None;
-    }
-    Some(file)
-}
-
-/// Acquire an exclusive advisory flock on the recovery/startup lock file.
-///
-/// The returned `File` holds the lock for its lifetime; dropping it releases
-/// it.  Used by both the client (serializing kill+spawn) and the daemon server
-/// (serializing cleanup+bind+pid-write) so the two critical sections are
-/// mutually exclusive across processes.
-#[cfg(unix)]
-pub fn acquire_recovery_lock() -> Option<std::fs::File> {
-    acquire_flock_blocking(&lock_path(), "recovery")
-}
-
-/// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
-/// non-blocking `flock(LOCK_NB)` until `deadline` elapses. Bounded alternative
-/// to `acquire_recovery_lock`/`acquire_daemon_boot_guard`'s unbounded blocking
-/// flock — see `docs/api/daemon.md#try_acquire_flock_until` for why a caller
-/// merely detecting lock freedom needs a deadline instead.
-///
-/// - `Ok(Some(file))` — the lock was free within the deadline.
-/// - `Ok(None)` — `deadline` elapsed while the lock stayed held; an explicit
-///   "could not confirm" outcome, distinct from a hard I/O error.
-/// - `Err(_)` — the lock file could not be opened, or `flock` failed for a
-///   reason other than contention.
-///
-/// Blocking (paces retries with `std::thread::sleep`) — async callers must
-/// run this via `spawn_blocking`.
-#[cfg(unix)]
-fn try_acquire_flock_until(
-    path: &std::path::Path,
-    deadline: std::time::Instant,
-) -> std::io::Result<Option<std::fs::File>> {
-    let file = open_lock_file(path)?;
-    let poll_interval = std::time::Duration::from_millis(10);
-    loop {
-        // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(Some(file));
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(err);
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(poll_interval.min(deadline - now));
-    }
-}
-
-/// Bounded, deadline-aware variant of [`acquire_daemon_boot_guard`]: attempts
-/// the SAME boot/recovery lock ([`lock_path`]) but gives up at `deadline`
-/// instead of blocking forever. For callers that need to detect "is a boot in
-/// progress right now" without risking an unbounded wait behind a wedged
-/// holder: e.g. khive-mcp's `confirm_genuinely_dead` re-probing rounds,
-/// where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not just probe count.
-#[cfg(unix)]
-pub fn try_acquire_daemon_boot_guard_until(
-    deadline: std::time::Instant,
-) -> std::io::Result<Option<DaemonBootGuard>> {
-    try_acquire_flock_until(&lock_path(), deadline)
-}
-
-/// Bounded, deadline-aware acquisition of the recoverer-only lock
-/// ([`recoverer_lock_path`]). See [`try_acquire_daemon_boot_guard_until`] for
-/// the shared rationale — a second recoverer waiting for a peer's dead
-/// confirmation/kill/spawn critical section must give up and report
-/// "uncertain" rather than block forever if that peer is itself wedged.
-#[cfg(unix)]
-pub fn try_acquire_recoverer_lock_until(
-    deadline: std::time::Instant,
-) -> std::io::Result<Option<std::fs::File>> {
-    try_acquire_flock_until(&recoverer_lock_path(), deadline)
-}
-
-/// Guard returned by [`acquire_daemon_boot_guard`], held across cold-boot
-/// schema initialization (migrations + pack schema plans / FTS DDL) through
-/// daemon bind + pid-write.
-#[cfg(unix)]
-pub type DaemonBootGuard = std::fs::File;
-
-/// Acquire the recovery/boot lock, treating failure as fatal.
-///
-/// Unlike [`acquire_recovery_lock`] (best-effort, `None` on failure: used by
-/// shutdown cleanup, where skipping unlink is safer than blocking forever),
-/// daemon-mode boot must hold this lock across migrations/FTS DDL through
-/// bind+pid-write. Silently continuing with no lock reopens the cold-boot FTS
-/// race this guard exists to close, so callers that are about to run
-/// daemon-mode boot (or wait for one to quiesce) must fail loudly instead of
-/// proceeding unguarded.
-#[cfg(unix)]
-pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
-    acquire_recovery_lock()
-        .ok_or_else(|| anyhow::anyhow!("failed to acquire daemon boot/recovery lock"))
-}
-
-/// Identity of a bound Unix socket path, used to tell "the socket I bound" apart
-/// from "a same-path socket some other daemon bound after mine was removed".
-///
-/// A socket path can be recreated by a different process between the time
-/// this daemon captures its identity and the time it later checks it, so `dev`
-/// and `ino` (not the path) are what must match for cleanup to be safe.
-#[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SocketIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-#[cfg(unix)]
-fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    Some(SocketIdentity {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
-}
-
-// ── connection principal ──────────────────────────────────────────────────────
-
-/// The uid on the other end of an accepted connection, read from the kernel.
-///
-/// This is the only identity on this socket the caller cannot choose. Every
-/// identity field on the request frame — `namespace`, `actor_id`,
-/// `visible_namespaces`, `config_id` — is supplied by the connecting process,
-/// so none of them can answer "who is this". A check reading self-asserted
-/// fields is not a weak gate, it is not a gate: anyone who wants to pass it
-/// asserts the passing values.
-///
-/// `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux. Both report the peer's
-/// credentials as recorded by the kernel at connect time.
-#[cfg(unix)]
-pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple"))]
-    {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        // SAFETY: `fd` is a live connected socket owned by `stream` for the
-        // duration of this call; both out-params are valid initialized locals.
-        let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(uid as u32)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: `fd` is a live connected socket owned by `stream`; `cred` is
-        // an initialized local of exactly `len` bytes, which is what
-        // SO_PEERCRED writes.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
-                &mut len,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(cred.uid)
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_vendor = "apple"
-    )))]
-    {
-        let _ = fd;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "peer-credential capture is not implemented for this platform",
-        ))
-    }
-}
-
-/// Whether a connection from `uid` may be served by this daemon.
-///
-/// ADR-096 accepted per-request identity threading **for the single-principal
-/// owner-only socket only**, and rested that on three things: the `0600`
-/// socket, all connections being the same uid, and the database being already
-/// same-uid-accessible. The socket mode is asserted at bind. This asserts the
-/// second, which previously had no representation in the code at all — nothing
-/// read peer identity, so nothing could notice when it stopped being true.
-///
-/// **Principal is not attribution.** Many `actor_id`s over one socket is
-/// exactly what ADR-096 shipped and what every seat on a normal host does;
-/// refusing a second distinct actor would break the accepted design. The
-/// principal is the uid, and this refuses only a genuinely foreign one.
-///
-/// **There is deliberately no configuration escape hatch.** A flag permitting
-/// other uids would not weaken this assertion, it would delete it, in the way
-/// hardest to notice later: the check still exists, its tests still pass, and
-/// the deployment that matters has it off. A deployment that genuinely needs
-/// multiple uids needs a code change and a gated ADR — which is precisely the
-/// decision that should be impossible to make by accident.
-#[cfg(unix)]
-pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
-    peer == daemon_euid
-}
-
 // ── wire types ────────────────────────────────────────────────────────────────
 
 mod config_id;
@@ -773,490 +136,15 @@ pub use config_id::{
     config_id_extra_embedder_exclusions, config_ids_compatible, first_config_mismatch_field,
 };
 
-/// Request frame sent from a client to the daemon.
-#[derive(Serialize, Deserialize, Default)]
-pub struct DaemonRequestFrame {
-    pub ops: String,
-    /// Parse and inspect the catalog without dispatch, identity, or storage access.
-    #[serde(default)]
-    pub plan: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presentation_per_op: Option<Vec<Option<String>>>,
-    /// The client's resolved storage/gate default namespace for this request.
-    ///
-    /// As of protocol version 3 (ADR-096) the daemon serves the request under
-    /// this namespace instead of rejecting on mismatch: a per-request
-    /// identity input, not a same-process-identity assertion.
-    pub namespace: String,
-    /// The client's resolved write-stamp / gate actor identity (ADR-057),
-    /// carried on the frame so the warm daemon stamps writes with the
-    /// *caller's* actor instead of its own baked `actor_id` (ADR-096). `None`
-    /// mints `ActorRef::anonymous()`, matching an unconfigured actor.
-    #[serde(default)]
-    pub actor_id: Option<String>,
-    /// Opaque process provenance resolved in the originating client process.
-    /// It is carried per request because a shared warm daemon's environment
-    /// does not identify the worker that submitted the operation. Protocol v4
-    /// makes this field part of dispatch semantics: a v3 daemon must reject the
-    /// request rather than execute it while silently discarding provenance.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_ref: Option<String>,
-    /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
-    /// 3b), carried on the frame so the warm daemon widens read scope to
-    /// match the caller's own configuration rather than its own baked
-    /// `visible_namespaces` (ADR-096). A non-`local` `actor_id` joins default
-    /// reads where the registry mints the token (ADR-007 Rev 4 Rule 3b), so
-    /// an empty list still includes that actor in default reads. Explicit
-    /// `namespace=` operations remain scoped to exactly that namespace.
-    #[serde(default)]
-    pub visible_namespaces: Vec<String>,
-    /// Fingerprint of the client's engine-coherence config: packs, db target,
-    /// embedders, backend routing, and construction-baked outbound policy.
-    /// Identity fields are carried separately in this frame. The daemon rejects
-    /// requests whose configuration differs, except when its extra-embedder set
-    /// is a superset of the client's and every other field matches. See
-    /// ADR-027 / ADR-049 / ADR-096.
-    #[serde(default)]
-    pub config_id: String,
-    /// IPC protocol version sent by the client. Pre-versioning clients omit
-    /// this field (deserializes to 0). The daemon compares against
-    /// [`PROTOCOL_VERSION`] and rejects mismatches with an explicit error.
-    #[serde(default)]
-    pub protocol_version: u32,
-    /// When `true`, the daemon returns an identity frame (ok=true, result=None)
-    /// immediately after identity validation — without calling the dispatcher.
-    /// Used by the client's under-lock recovery probe to confirm a daemon is
-    /// alive and identity-matching without dispatching any mutating verb.
-    /// Pre-probe clients omit this field (deserializes to false → normal dispatch).
-    #[serde(default)]
-    pub probe_only: bool,
-    /// When `true`, the daemon returns a point-in-time [`MetricsSnapshot`] of
-    /// its server-side gauges (a read-only measurement surface for the
-    /// load/perf harness) instead of dispatching any op. Handled before the
-    /// `config_id` equality reject: a gauge read is process-global and
-    /// namespace/config-agnostic, not a namespaced record operation.
-    /// READ-ONLY — this field is the only input the frame accepts for a
-    /// metrics request; there is no reset or mutation reachable over the
-    /// wire. Pre-metrics clients omit this field (deserializes to `false` →
-    /// normal dispatch, unaffected).
-    #[serde(default)]
-    pub metrics_only: bool,
-    /// Output format for this request (ADR-078). Forwarded to the daemon's
-    /// serialization seam. `None` means use the daemon's resolved default.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
-    /// Per-operation output format overrides (ADR-078).
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format_per_op: Option<Vec<Option<String>>>,
-    /// Whether this request originated from the agent-facing MCP `request`
-    /// tool (the wire surface). When `true`, the daemon rejects
-    /// `Visibility::Subhandler` verbs: agents must not invoke internal
-    /// subhandlers. When `false` (the default, and the only value any
-    /// operator path sends), subhandlers are allowed: `kkernel exec` and
-    /// other in-process callers are trusted operator surfaces.
-    ///
-    /// This is the origin discriminator, not a daemon-vs-local one: operator
-    /// requests flow through the daemon by default too, so the gate cannot
-    /// key on transport.
-    #[serde(default)]
-    pub from_wire: bool,
-    /// Request-group correlation id (khive#948), echoed back unchanged on
-    /// [`DaemonResponseFrame::request_id`] and stamped into the dispatch's
-    /// audit event (`resource.request_id`) so a benchmark harness can join
-    /// its own pre-send sample to the server-side audit row for the same
-    /// request. Agent-facing MCP requests always carry one: the bridge keeps a
-    /// caller-supplied value or mints an opaque nonzero value when absent.
-    /// Operator-built/probe frames may still use `None`. Purely additive —
-    /// `#[serde(default)]` matches `metrics_only`/`format`/`format_per_op`
-    /// precedent, with no `PROTOCOL_VERSION` bump.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<u64>,
-}
-
-/// A dispatch failure whose domain outcome remains available to the transport.
-#[derive(Debug, Clone)]
-pub struct DaemonDispatchError {
-    pub message: String,
-    pub error_detail: serde_json::Value,
-}
-
-/// Per-field container limit, asserted equal to the request parser's bound by MCP.
-pub const ERROR_DETAIL_NESTING_DEPTH_LIMIT: usize = 64;
-
-fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
-    let mut pending = vec![(value, 0_usize)];
-    while let Some((value, depth)) = pending.pop() {
-        match value {
-            serde_json::Value::Array(items) if depth < ERROR_DETAIL_NESTING_DEPTH_LIMIT => {
-                pending.extend(items.iter().map(|child| (child, depth + 1)));
-            }
-            serde_json::Value::Object(fields) if depth < ERROR_DETAIL_NESTING_DEPTH_LIMIT => {
-                pending.extend(fields.values().map(|child| (child, depth + 1)));
-            }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => return false,
-            _ => {}
-        }
-    }
-    true
-}
-
-fn drop_error_detail_iteratively(value: serde_json::Value) {
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            serde_json::Value::Array(items) => pending.extend(items),
-            serde_json::Value::Object(fields) => pending.extend(fields.into_values()),
-            _ => {}
-        }
-    }
-}
-
-impl DaemonDispatchError {
-    /// Missing or unrecognized disposition from a legacy implementation is unknown.
-    pub fn new(message: impl Into<String>, error_detail: Option<serde_json::Value>) -> Self {
-        let message = message.into();
-        let mut fields = match error_detail {
-            Some(serde_json::Value::Object(fields)) => fields,
-            Some(data) => serde_json::Map::from_iter([("data".to_string(), data)]),
-            None => serde_json::Map::new(),
-        };
-        let disposition = match fields
-            .get("domain_disposition")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("committed") => crate::DomainDisposition::Committed,
-            Some("not_committed") => crate::DomainDisposition::NotCommitted,
-            _ => crate::DomainDisposition::Unknown,
-        };
-        if disposition != crate::DomainDisposition::Committed {
-            if let Some(result) = fields.remove("domain_result") {
-                drop_error_detail_iteratively(result);
-            }
-        }
-        let rejected: Vec<String> = fields
-            .iter()
-            .filter(|(_, value)| !error_detail_value_within_limit(value))
-            .map(|(name, _)| name.clone())
-            .collect();
-        let omitted_result = rejected.iter().any(|name| name == "domain_result");
-        let omitted_detail = !rejected.is_empty();
-        for name in rejected {
-            if let Some(value) = fields.remove(&name) {
-                drop_error_detail_iteratively(value);
-            }
-        }
-        let mut error_detail = serde_json::Value::Object(fields);
-        if error_detail["kind"].as_str().is_none() {
-            error_detail["kind"] = serde_json::json!("internal");
-        }
-        if error_detail["message"].as_str().is_none() {
-            error_detail["message"] = serde_json::json!(message);
-        }
-        error_detail["domain_disposition"] = serde_json::json!(disposition.as_str());
-        if omitted_detail {
-            error_detail["code"] = serde_json::json!(if omitted_result {
-                "result_too_deep"
-            } else {
-                "error_detail_too_deep"
-            });
-        }
-        Self {
-            message,
-            error_detail,
-        }
-    }
-}
-
-/// Response frame sent from the daemon back to a client.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DaemonResponseFrame {
-    pub ok: bool,
-    pub result: Option<String>,
-    pub error: Option<String>,
-    /// Additive failure metadata; legacy protocol-v4 peers still read `error` as text.
-    /// On a successful response, `{"lexical_timeout":true}` is a daemon-only
-    /// diagnostic that old clients ignore and new clients log locally.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_detail: Option<serde_json::Value>,
-    pub namespace_mismatch: bool,
-    /// Set when the request's `config_id` does not match the daemon's. Like
-    /// `namespace_mismatch`, this signals the client to fall back to local
-    /// dispatch rather than execute under a different runtime/config.
-    #[serde(default)]
-    pub config_mismatch: bool,
-    /// The `config_id` the daemon dispatched under, echoed back so the client
-    /// can positively confirm the result came from a matching runtime. A
-    /// pre-`config_id` daemon omits this field (deserializes to `None`), which
-    /// the client treats as a mismatch and falls back to local dispatch — this
-    /// closes the upgrade window where a new restricted client could otherwise
-    /// trust a still-warm legacy daemon's broader registry.
-    #[serde(default)]
-    pub served_config_id: Option<String>,
-    /// Set when the client's `protocol_version` does not match the daemon's
-    /// [`PROTOCOL_VERSION`]. The client must treat this as a hard error and
-    /// surface the human-readable `error` field rather than falling back to
-    /// local dispatch (which would hide the version skew).
-    #[serde(default)]
-    pub version_mismatch: bool,
-    /// The daemon's [`PROTOCOL_VERSION`], echoed in error responses so the
-    /// client can include both sides in the diagnostic message. Pre-versioning
-    /// daemons omit this field (deserializes to 0).
-    #[serde(default)]
-    pub daemon_protocol_version: u32,
-    /// Populated when the request set `metrics_only: true`: a point-in-time
-    /// snapshot of the daemon's server-side gauges. `None` on every other
-    /// response, and on any response from a daemon that predates this field
-    /// (client-side back-compat via `#[serde(default)]`, matching
-    /// `served_config_id`'s upgrade-window handling above).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<MetricsSnapshot>,
-    /// Echo of the request's `request_id` (khive#948), present whenever the
-    /// frame that produced this response carried one — including on every
-    /// error/denied arm, not only success, so a client can join a failure
-    /// the same way it joins a success. `#[serde(default)]` so an older
-    /// daemon's response (predating this field) deserializes to `None`
-    /// rather than a parse error.
-    #[serde(default)]
-    pub request_id: Option<u64>,
-}
-
-/// Move the private dispatch signal out of the result before any client can
-/// observe it. Unmarked results retain their exact bytes. The marked result
-/// was serialized from a JSON Value by the MCP server, so reserializing after
-/// removal reproduces its public envelope. The marker's escaped frame cost
-/// equals `error_detail:{"lexical_timeout":true}`, keeping the server's exact
-/// frame-fit calculation valid after this move.
+mod wire_frames;
 #[cfg(unix)]
-fn take_daemon_lexical_timeout_marker(raw: String) -> (String, Option<serde_json::Value>) {
-    if !raw.contains(DAEMON_LEXICAL_TIMEOUT_MARKER) {
-        return (raw, None);
-    }
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return (raw, None);
-    };
-    let Some(fields) = value.as_object_mut() else {
-        return (raw, None);
-    };
-    if !fields
-        .get("results")
-        .is_some_and(serde_json::Value::is_array)
-    {
-        return (raw, None);
-    }
-    let Some(marker) = fields.remove(DAEMON_LEXICAL_TIMEOUT_MARKER) else {
-        return (raw, None);
-    };
-    let detail =
-        (marker.as_bool() == Some(true)).then(|| serde_json::json!({"lexical_timeout": true}));
-    (
-        serde_json::to_string(&value).expect("serde_json::Value is serializable"),
-        detail,
-    )
-}
-
-/// One checkpoint store in this daemon's fixed topology. IDs are process-local:
-/// `main` or `secondary:<index>` in dispatcher order. The basename is display-only,
-/// not an identity; no directory path is exposed. Restart/topology changes reset
-/// the interpretation of interval deltas.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-#[serde(default)]
-pub struct CheckpointStoreMetrics {
-    pub store_id: String,
-    pub role: String,
-    pub database: Option<String>,
-    #[serde(flatten)]
-    pub timing: khive_db::checkpoint::CheckpointTiming,
-}
-
-/// Point-in-time snapshot of the daemon's server-side gauges — the
-/// load/perf harness read-surface (measurement substrate, not a product feature).
-///
-/// Every field here is a **server-side** gauge reachable from `handle_conn`
-/// without any mutation: [`khive_storage::tx_registry`] (ADR-091 Plank 0,
-/// process-global singleton), the main pool's backend-keyed routine WAL
-/// sample and process TRUNCATE counters (`khive_db::checkpoint`), and the
-/// ADR-067 Component A write queue depth/latest writer-stage sample. There is
-/// no reset reachable through this type or through [`DaemonRequestFrame`] —
-/// gauges out, nothing in.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-pub struct MetricsSnapshot {
-    /// Launch mode and the current lifecycle of this daemon incarnation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<DaemonLifecycleSnapshot>,
-    /// Last-observed WAL page count from the periodic checkpoint tick.
-    /// `None` when the checkpoint task has never ticked in this process
-    /// (for example, an in-memory dispatcher with no pool, or a daemon that
-    /// just started and hasn't hit its first tick yet).
-    pub wal_pages: Option<u64>,
-    /// Logical frames present in the WAL at the main backend's most recent
-    /// periodic PASSIVE checkpoint. Kept separate from physical allocation.
-    #[serde(default)]
-    pub wal_log_frames: Option<u64>,
-    /// Frames backfilled by that same periodic PASSIVE pass.
-    #[serde(default)]
-    pub wal_checkpointed_frames: Option<u64>,
-    /// Logical frames still pending after that pass (`log - checkpointed`).
-    #[serde(default)]
-    pub wal_pending_frames: Option<u64>,
-    /// Physical `-wal` sidecar bytes captured at the same routine tick.
-    #[serde(default)]
-    pub wal_physical_bytes: Option<u64>,
-    /// Wall-clock timestamp of the routine WAL sample, for staleness checks.
-    #[serde(default)]
-    pub wal_observed_at_unix_ms: Option<u64>,
-    /// Cumulative actual routine PASSIVE calls for each store this daemon
-    /// checkpoints. Microseconds preserve sub-millisecond costs; max is since
-    /// process start, not an interval maximum. Counters saturate rather than wrap.
-    #[serde(default)]
-    pub wal_checkpoint_stores: Vec<CheckpointStoreMetrics>,
-    /// Total WAL TRUNCATE escalation attempts (ADR-091 Plank 2) made in this
-    /// process's lifetime, regardless of whether they succeeded in reclaiming
-    /// pages.
-    pub wal_truncate_attempts: u64,
-    /// Current consecutive-failure count for TRUNCATE attempts that failed to
-    /// bring the WAL back below `warn_pages`; resets to 0 the next time an
-    /// attempt clears it.
-    pub wal_truncate_consecutive_failures: u64,
-    /// Total checkpoint ticks skipped because the dedicated checkpoint
-    /// connection was unavailable (ADR-091 checkpoint-pressure telemetry),
-    /// across this process's lifetime. `#[serde(default)]` so an older client
-    /// decoding a newer daemon's snapshot (or vice versa) does not fail.
-    #[serde(default)]
-    pub wal_checkpoint_skipped_ticks: u64,
-    /// Current consecutive-skip run length; 0 once the next tick is observed.
-    #[serde(default)]
-    pub wal_checkpoint_consecutive_skips: u64,
-    /// WAL page count last known at the time of the most recent skip, if any
-    /// skip has occurred yet in this process.
-    #[serde(default)]
-    pub wal_checkpoint_last_skip_wal_pages: Option<u64>,
-    /// Age, in microseconds, of the oldest currently-open transaction
-    /// registry entry (ADR-091 Plank 0). `None` when no transaction is
-    /// currently open.
-    pub oldest_pinned_tx_micros: Option<u64>,
-    /// Diagnostic label of the oldest currently-open transaction registry
-    /// entry, if any and if it was registered with one.
-    pub oldest_pinned_tx_label: Option<String>,
-    /// Number of currently open transaction registry entries.
-    pub open_tx_count: usize,
-    /// Current write-queue backlog depth (ADR-067 Component A): requests
-    /// enqueued but not yet accepted by the `WriterTask` drain loop. `None`
-    /// unless the write queue is enabled (`KHIVE_WRITE_QUEUE=1`) and a
-    /// file-backed pool is available.
-    pub write_queue_depth: Option<usize>,
-    /// The write queue's configured bounded capacity
-    /// (`PoolConfig::write_queue_capacity`), gated the same as
-    /// `write_queue_depth`.
-    pub write_queue_capacity: Option<usize>,
-    /// Latest completed writer-task span: bounded-channel admission/backlog.
-    #[serde(default)]
-    pub write_last_queue_wait_micros: Option<u64>,
-    /// Latest completed writer-task span: `BEGIN IMMEDIATE` acquisition.
-    #[serde(default)]
-    pub write_last_transaction_acquire_micros: Option<u64>,
-    /// Latest completed writer-task span: application transaction body.
-    #[serde(default)]
-    pub write_last_body_micros: Option<u64>,
-    /// Latest completed writer-task span: SQLite COMMIT/fsync phase.
-    #[serde(default)]
-    pub write_last_commit_micros: Option<u64>,
-    /// Whole latest writer-task request span, retained for compatibility and
-    /// comparison with the decomposed stages.
-    #[serde(default)]
-    pub write_last_total_micros: Option<u64>,
-    /// Wall-clock timestamp of the writer-stage sample.
-    #[serde(default)]
-    pub write_last_observed_at_unix_ms: Option<u64>,
-    /// Connection cap of the daemon socket this snapshot was served from.
-    /// `None` from a daemon that predates the cap and when no listener owns
-    /// the connection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connections: Option<ConnectionCapSnapshot>,
-    /// Bounds and counts of the best-effort recall serve-ledger tasks.
-    /// `None` from a daemon that predates the bound.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recall_ledger: Option<RecallLedgerSnapshot>,
-}
-
-// ── framing ───────────────────────────────────────────────────────────────────
-
-/// Read one length-prefixed frame (4-byte BE u32 length + JSON bytes).
+pub use wire_frames::{read_frame, write_frame};
 #[cfg(unix)]
-pub async fn read_frame<R>(stream: &mut R) -> std::io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("daemon frame of {len} bytes exceeds {MAX_FRAME_BYTES} cap"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-#[cfg(unix)]
-fn initial_frame_timeout_error() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "daemon initial request frame read timed out",
-    )
-}
-
-#[cfg(unix)]
-async fn read_initial_frame<R>(
-    stream: &mut R,
-    deadline: tokio::time::Instant,
-) -> std::io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    // Tokio polls the inner future before checking its timer. A frame already
-    // buffered when a delayed connection task first runs would otherwise pass
-    // even though its acceptance-time deadline has expired.
-    if tokio::time::Instant::now() >= deadline {
-        return Err(initial_frame_timeout_error());
-    }
-    let raw = tokio::time::timeout_at(deadline, read_frame(stream))
-        .await
-        .map_err(|_| initial_frame_timeout_error())??;
-    if tokio::time::Instant::now() >= deadline {
-        return Err(initial_frame_timeout_error());
-    }
-    Ok(raw)
-}
-
-/// Write one length-prefixed frame.
-#[cfg(unix)]
-pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "daemon frame of {} bytes exceeds {MAX_FRAME_BYTES} cap",
-                payload.len()
-            ),
-        ));
-    }
-    let len = (payload.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(payload).await?;
-    stream.flush().await?;
-    Ok(())
-}
+use wire_frames::{read_initial_frame, take_daemon_lexical_timeout_marker};
+pub use wire_frames::{
+    CheckpointStoreMetrics, DaemonDispatchError, DaemonRequestFrame, DaemonResponseFrame,
+    MetricsSnapshot, ERROR_DETAIL_NESTING_DEPTH_LIMIT,
+};
 
 // ── dispatch trait ────────────────────────────────────────────────────────────
 
@@ -1334,6 +222,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         )
         .await
         .map_err(|message| DaemonDispatchError::new(message, None))
+    }
+
+    /// The startup gate for the events daemon this daemon supervises, if any
+    /// ([`crate::events_split::EventsReadiness`]). A request that dispatches
+    /// verbs waits at it before dispatch and is refused, with nothing
+    /// committed, when it does not open; probe, plan, metrics and handover
+    /// frames never wait. `None`, the default, dispatches without waiting.
+    fn events_readiness(&self) -> Option<crate::events_split::EventsReadiness> {
+        None
     }
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
@@ -2118,7 +1015,7 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
     // than rejecting a differently-attributed same-uid connection to a cold
     // local-dispatch fallback. `config_id`: which governs packs/db/embed
     // coherence for the shared warm engine: remains a hard reject for every
-    // field other than a daemon-side superset of the client's extra embedders.
+    // field; only legacy IDs allow a superset of the client's extra embedders.
     } else if !config_ids_compatible(&frame.config_id, dispatcher.config_id()) {
         DaemonResponseFrame {
             ok: false,
@@ -2179,6 +1076,49 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                     error: Some("daemon is draining; request was not admitted".to_owned()),
                     error_detail: Some(serde_json::json!({
                         "kind": "runtime", "code": "daemon_draining",
+                        "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                    })),
+                    request_id: frame.request_id,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(dispatcher.config_id().to_owned()),
+                    version_mismatch: false,
+                    metrics: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&refusal) {
+                    let _ = write_response_frame(&mut peer_write, &payload).await;
+                }
+                return;
+            }
+        }
+        // A supervised events daemon that has not answered yet would fail
+        // this request's audit commit after its domain write committed, so
+        // the request waits for it here, before anything runs, and is
+        // refused with nothing committed when it does not answer in time.
+        if let Some(readiness) = dispatcher.events_readiness() {
+            let not_ready = tokio::select! {
+                outcome = readiness.wait() => outcome.err(),
+                _ = wait_for_peer_disconnect(&mut peer_read) => return,
+            };
+            if let Some(not_ready) = not_ready {
+                let message = not_ready.to_string();
+                tracing::warn!(
+                    socket = %not_ready.socket.display(),
+                    reason = ?not_ready.reason,
+                    request_id = frame.request_id,
+                    "request refused: the supervised events daemon is not answering"
+                );
+                let refusal = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(message.clone()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "runtime",
+                        "code": "events_daemon_unavailable",
+                        "message": message,
+                        "retryable": true,
+                        "socket": not_ready.socket.display().to_string(),
                         "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
                     })),
                     request_id: frame.request_id,
@@ -2458,17 +1398,36 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RendezvousPathRole {
+enum RendezvousPathRole<'a> {
     Socket,
     PidFile,
+    Store(&'a std::path::Path),
 }
 
 #[cfg(unix)]
-impl RendezvousPathRole {
+impl RendezvousPathRole<'_> {
+    fn refusal(
+        self,
+        rendezvous: std::fmt::Arguments<'_>,
+        store: std::fmt::Arguments<'_>,
+    ) -> anyhow::Error {
+        match self {
+            Self::Store(db_path) => anyhow::anyhow!(
+                "refusing to open events database {}: {store}. Check the offending directory's \
+                 ownership and permissions (remove group/other write access), or move the store \
+                 to a location trusted end to end. Only the first offending component is \
+                 reported; further untrusted ancestors or components may remain.",
+                db_path.display()
+            ),
+            Self::Socket | Self::PidFile => anyhow::anyhow!("{rendezvous}"),
+        }
+    }
+
     fn env_name(self) -> &'static str {
         match self {
             Self::Socket => SOCKET_PATH_ENV,
             Self::PidFile => PID_PATH_ENV,
+            Self::Store(_) => "events database",
         }
     }
 
@@ -2476,6 +1435,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket directory",
             Self::PidFile => "PID-file directory",
+            Self::Store(_) => "store directory",
         }
     }
 
@@ -2483,6 +1443,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket path",
             Self::PidFile => "PID-file path",
+            Self::Store(_) => "store path",
         }
     }
 
@@ -2490,6 +1451,7 @@ impl RendezvousPathRole {
         match self {
             Self::Socket => "socket-path",
             Self::PidFile => "PID-file-path",
+            Self::Store(_) => "store-path",
         }
     }
 }
@@ -2523,6 +1485,22 @@ pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::
     ensure_rendezvous_dir_is_trusted(parent, RendezvousPathRole::Socket, daemon_euid, true)
 }
 
+/// Apply the existing directory trust and default-root repair rules to an events store.
+#[cfg(unix)]
+pub(crate) fn ensure_store_dir_is_trusted(
+    parent: &std::path::Path,
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let daemon_euid = unsafe { libc::geteuid() } as u32;
+    ensure_rendezvous_dir_is_trusted(
+        parent,
+        RendezvousPathRole::Store(db_path),
+        daemon_euid,
+        true,
+    )
+}
+
 /// Vet the parent directory of a PID file before reading, locking, or writing
 /// it. The file's lock only protects the inode currently named by its path;
 /// every directory component must therefore be as swap-resistant as the
@@ -2541,7 +1519,7 @@ pub fn ensure_pid_file_dir_is_trusted(pid_file: &std::path::Path) -> anyhow::Res
 #[cfg(unix)]
 fn ensure_rendezvous_dir_is_trusted(
     parent: &std::path::Path,
-    role: RendezvousPathRole,
+    role: RendezvousPathRole<'_>,
     daemon_euid: u32,
     repair_owned_default: bool,
 ) -> anyhow::Result<()> {
@@ -2550,11 +1528,17 @@ fn ensure_rendezvous_dir_is_trusted(
 
     if repair_owned_default && parent == khive_dir() {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
+            role.refusal(
+                format_args!(
+                    "refusing to start: cannot chmod 0700 {}: {e}. The khive directory must be \
                  owner-only as the {directory_name} for {env_name}; it is part of the \
                  same-uid guarantee this daemon enforces.",
-                parent.display()
+                    parent.display()
+                ),
+                format_args!(
+                    "cannot chmod 0700 store directory {}: {e}",
+                    parent.display()
+                ),
             )
         })?;
         return ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role);
@@ -2563,35 +1547,56 @@ fn ensure_rendezvous_dir_is_trusted(
     // Fail closed on the stat itself: not being able to read the metadata is
     // not the same as the directory passing.
     let meta = std::fs::metadata(parent).map_err(|e| {
-        anyhow::anyhow!(
-            "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
+        role.refusal(
+            format_args!(
+                "refusing to start: cannot stat {directory_name} {} for {env_name}: {e}. \
              It gates rendezvous-path safety, and unreadable metadata is not a passing state.",
-            parent.display()
+                parent.display()
+            ),
+            format_args!(
+                "cannot stat store directory {}: {e}; unreadable metadata is not a passing state",
+                parent.display()
+            ),
         )
     })?;
 
     use std::os::unix::fs::MetadataExt;
     let owner = meta.uid();
     if owner != daemon_euid && owner != 0 {
-        anyhow::bail!(
-            "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {directory_name} {} for {env_name} is owned by uid {owner}, \
              not this daemon's uid ({daemon_euid}) or root. A directory owner can replace \
              the rendezvous path regardless of mode bits. Point {env_name} at a directory \
              you own, or unset it for the default.",
-            parent.display()
-        );
+                parent.display()
+            ),
+            format_args!(
+                "store directory {} is owned by uid {owner}, not this process's uid \
+                 ({daemon_euid}) or root; its owner can replace the database path",
+                parent.display()
+            ),
+        ));
     }
 
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 {
-        anyhow::bail!(
-            "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {directory_name} {} for {env_name} is mode {:04o} — writable \
              by group or other, so another local user could replace the rendezvous path. \
              Use a directory only you can write, or unset {env_name} for the default. \
              This daemon is not changing the permissions of a directory it does not own.",
-            parent.display(),
-            mode & 0o7777
-        );
+                parent.display(),
+                mode & 0o7777
+            ),
+            format_args!(
+                "store directory {} is mode {:04o}, writable by group or other, so another local \
+                 user could replace the database path",
+                parent.display(),
+                mode & 0o7777
+            ),
+        ));
     }
 
     ensure_rendezvous_path_is_swap_resistant(parent, daemon_euid, role)
@@ -2635,7 +1640,7 @@ fn ensure_socket_path_is_swap_resistant(
 fn ensure_rendezvous_path_is_swap_resistant(
     parent: &std::path::Path,
     daemon_euid: u32,
-    role: RendezvousPathRole,
+    role: RendezvousPathRole<'_>,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -2649,10 +1654,16 @@ fn ensure_rendezvous_path_is_swap_resistant(
     } else {
         std::env::current_dir()
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "refusing to start: cannot resolve the working directory to absolutize \
+                role.refusal(
+                    format_args!(
+                        "refusing to start: cannot resolve the working directory to absolutize \
                      {directory_name} {} for {env_name}: {e}.",
-                    parent.display()
+                        parent.display()
+                    ),
+                    format_args!(
+                        "cannot resolve the working directory for store directory {}: {e}",
+                        parent.display()
+                    ),
                 )
             })?
             .join(parent)
@@ -2685,10 +1696,17 @@ fn ensure_rendezvous_path_is_swap_resistant(
         }
         let candidate = resolved.join(&component);
         let meta = std::fs::symlink_metadata(&candidate).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to start: cannot stat {component_name} component {} for {env_name}: \
+            role.refusal(
+                format_args!(
+                    "refusing to start: cannot stat {component_name} component {} for {env_name}: \
                  {e}. An unreadable component is not a passing one.",
-                candidate.display()
+                    candidate.display()
+                ),
+                format_args!(
+                    "cannot stat store-path component {}: {e}; unreadable metadata is not a \
+                     passing state",
+                    candidate.display()
+                ),
             )
         })?;
         let owner = meta.uid();
@@ -2696,26 +1714,47 @@ fn ensure_rendezvous_path_is_swap_resistant(
         if meta.file_type().is_symlink() {
             symlinks_followed += 1;
             if symlinks_followed > 40 {
-                anyhow::bail!(
-                    "refusing to start: {path_name} for {env_name} resolves through more than \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {path_name} for {env_name} resolves through more than \
                      40 symlinks at {} — treating this as a loop.",
-                    candidate.display()
-                );
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "store path resolves through more than 40 symlinks at {}; treating this as \
+                         a loop",
+                        candidate.display()
+                    ),
+                ));
             }
             if owner != daemon_euid && owner != 0 {
-                anyhow::bail!(
-                    "refusing to start: {component_name} symlink component {} for {env_name} \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {component_name} symlink component {} for {env_name} \
                      is owned by uid {owner}, not this daemon's uid ({daemon_euid}) or root — \
                      its owner could retarget it after this check and re-root the {path_name}. \
                      Point {env_name} somewhere trusted end to end, or unset it for the default.",
-                    candidate.display()
-                );
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "store-path symlink component {} is owned by uid {owner}, not this \
+                         process's uid ({daemon_euid}) or root; its owner could retarget the \
+                         database path",
+                        candidate.display()
+                    ),
+                ));
             }
             let target = std::fs::read_link(&candidate).map_err(|e| {
-                anyhow::anyhow!(
-                    "refusing to start: cannot read {component_name} symlink component {} \
+                role.refusal(
+                    format_args!(
+                        "refusing to start: cannot read {component_name} symlink component {} \
                      for {env_name}: {e}.",
-                    candidate.display()
+                        candidate.display()
+                    ),
+                    format_args!(
+                        "cannot read store-path symlink component {}: {e}",
+                        candidate.display()
+                    ),
                 )
             })?;
             push_components(&mut stack, &target);
@@ -2726,33 +1765,55 @@ fn ensure_rendezvous_path_is_swap_resistant(
             let mode = meta.permissions().mode();
             let sticky = mode & 0o1000 != 0;
             if owner != daemon_euid && owner != 0 {
-                anyhow::bail!(
+                return Err(role.refusal(
+                    format_args!(
                     "refusing to start: {component_name} ancestor {} for {env_name} is owned by \
                      uid {owner}, not this daemon's uid ({daemon_euid}) or root — its owner \
                      could rename the next path component and re-root the {path_name}. Point \
                      {env_name} somewhere trusted end to end, or unset it for the default.",
                     candidate.display()
-                );
+                    ),
+                    format_args!(
+                        "store-path ancestor {} is owned by uid {owner}, not this process's uid \
+                         ({daemon_euid}) or root; its owner could rename the next path component",
+                        candidate.display()
+                    ),
+                ));
             }
             if mode & 0o022 != 0 && !sticky {
-                anyhow::bail!(
-                    "refusing to start: {component_name} ancestor {} for {env_name} is mode \
+                return Err(role.refusal(
+                    format_args!(
+                        "refusing to start: {component_name} ancestor {} for {env_name} is mode \
                      {:04o} — writable by group or other without the sticky bit, so another \
                      local user could rename the next path component and re-root the {path_name}. \
                      Point {env_name} somewhere trusted end to end, or unset it for the default.",
-                    candidate.display(),
-                    mode & 0o7777
-                );
+                        candidate.display(),
+                        mode & 0o7777
+                    ),
+                    format_args!(
+                        "store-path ancestor {} is mode {:04o}, writable by group or other without \
+                         the sticky bit, so another local user could rename the next path \
+                         component",
+                        candidate.display(), mode & 0o7777
+                    ),
+                ));
             }
             resolved = candidate;
             continue;
         }
 
-        anyhow::bail!(
-            "refusing to start: {component_name} component {} for {env_name} is neither a \
+        return Err(role.refusal(
+            format_args!(
+                "refusing to start: {component_name} component {} for {env_name} is neither a \
              directory nor a symlink — the {path_name} cannot traverse it.",
-            candidate.display()
-        );
+                candidate.display()
+            ),
+            format_args!(
+                "store-path component {} is neither a directory nor a symlink; the database path \
+                 cannot traverse it",
+                candidate.display()
+            ),
+        ));
     }
 
     Ok(())
@@ -2929,6 +1990,13 @@ where
         Incumbent::Stale => {}
     }
 
+    // Register the sender recorder before the shutdown streams below. The
+    // signal registry runs a signal's actions in registration order, so the
+    // recorder stores the sender before tokio's action wakes the shutdown
+    // path; registered after it, the exit record can say sender_pid=unknown.
+    if let Err(error) = exit_record::capture_signal_senders() {
+        tracing::warn!(target: "khive.boot", error = %error, "signal sender capture unavailable; the exit record will say sender_pid=unknown");
+    }
     // Install signal streams before publishing either rendezvous file. A
     // supervisor may stop us as soon as connect/pid checks succeed, before
     // the accept loop or shutdown future has been polled. Keep these streams
@@ -2961,10 +2029,13 @@ where
         }
         Err(e) => return Err(e.into()),
     };
+    // After the claim, never before: only the PID file's owner writes the record.
+    let exit_record = exit_record::ExitRecord::claim(&pid_file);
 
     let listener = match UnixListener::bind(&sock) {
         Ok(listener) => listener,
         Err(e) => {
+            exit_record.exiting(exit_record::ExitReason::Error);
             remove_pid_file_if_owned(&pid_file, &pid_file_guard);
             return Err(e.into());
         }
@@ -2975,6 +2046,7 @@ where
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         drop(listener);
         let _ = std::fs::remove_file(&sock);
+        exit_record.exiting(exit_record::ExitReason::Error);
         remove_pid_file_if_owned(&pid_file, &pid_file_guard);
         return Err(anyhow::anyhow!(
             "refusing to start: cannot chmod 0600 {}: {e}. The daemon socket must be owner-only \
@@ -3051,10 +2123,11 @@ where
     let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
-            _ = sigint.recv() => tracing::info!("received SIGINT"),
-        }
+        let signal = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        tracing::info!("received {signal}");
         // Tokio retains its process-wide handlers after the streams are dropped.
         // This daemon cannot restart without exec; a repeat signal must terminate
         // even if shutdown is blocked in synchronous recovery-lock acquisition.
@@ -3065,7 +2138,7 @@ where
                 return Err(std::io::Error::last_os_error());
             }
         }
-        Ok::<(), std::io::Error>(())
+        Ok::<&'static str, std::io::Error>(signal)
     };
     tokio::pin!(shutdown);
     lifecycle.ready();
@@ -3179,8 +2252,14 @@ where
                 }
             }
         } => DaemonShutdownReason::Signal,
-        result = &mut shutdown => { result?; DaemonShutdownReason::Signal },
-        _ = wait_for_idle(&dispatcher, &lifecycle) => DaemonShutdownReason::Idle,
+        result = &mut shutdown => {
+            exit_record.exiting(exit_record::ExitReason::Signal(result?));
+            DaemonShutdownReason::Signal
+        },
+        _ = wait_for_idle(&dispatcher, &lifecycle) => {
+            exit_record.exiting(exit_record::ExitReason::Idle);
+            DaemonShutdownReason::Idle
+        },
     };
 
     lifecycle.draining(reason);
@@ -3209,7 +2288,7 @@ where
         tokio::select! {
             _ = drain_for_idle(&active, drain_timeout()) => true,
             result = &mut shutdown => {
-                result?;
+                exit_record.exiting(exit_record::ExitReason::Signal(result?));
                 lifecycle.draining(DaemonShutdownReason::Signal);
                 let _ = request_shutdown_tx.send(true);
                 drain(&active).await
