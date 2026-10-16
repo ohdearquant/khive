@@ -44,7 +44,7 @@ pub(super) fn prepare_email_channel_loops(
     use std::sync::Arc;
 
     // External inbound without external senders: mail from outside is received and routed
-    // as untrusted, while outbound external sending stays off (ADR-200 Amendment 2).
+    // as untrusted, while outbound external sending stays off (ADR-200 Amendment 3).
     let inbound_only = ExternalInboundConfig::inbound_only_from_env()?;
     let runtime = server.channel_outbox_runtime_clone();
     if !prepare_polling
