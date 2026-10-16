@@ -655,7 +655,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
 
 class CiConcurrencyWorkflowTests(unittest.TestCase):
-    def test_main_pushes_run_newest_commit_without_cancelling_running_run(self):
+    def test_main_pushes_run_newest_commit_and_cancel_superseded_runs(self):
         concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
         self.assertEqual(
             mapping_entries(concurrency),
@@ -664,11 +664,12 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
                 "github.event_name == 'pull_request' && github.ref || "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main' "
                 "&& github.ref || github.run_id }}",
-                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                "(github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
             },
-            "Main pushes must share one group whose running run is never "
-            "cancelled and whose waiting run is replaced by the newest push "
-            "(the default single-slot queue); PRs retain ref-scoped "
+            "Main pushes must share one group in which the newest push cancels "
+            "the running run and replaces the waiting one, so a burst of merges "
+            "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
 
