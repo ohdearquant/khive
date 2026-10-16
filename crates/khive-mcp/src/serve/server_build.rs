@@ -121,11 +121,47 @@ pub fn mcp_max_readers(
             .iter()
             .any(|backend| backend.name == BackendId::MAIN && backend.kind == BackendKind::Sqlite)
     };
+    explicit.or((forwarding_mcp_client(args) && file_backed).then_some(1))
+}
+
+/// Whether an MCP host started with `args` forwards its requests to a daemon
+/// instead of serving its stores itself: not the daemon, and not opted out
+/// with `KHIVE_NO_DAEMON`. Always false off Unix, which has no daemon.
+fn forwarding_mcp_client(args: &Args) -> bool {
     #[cfg(unix)]
-    let forwarding = !args.daemon && !khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON");
+    {
+        !args.daemon && !khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON")
+    }
     #[cfg(not(unix))]
-    let forwarding = false;
-    explicit.or((forwarding && file_backed).then_some(1))
+    {
+        let _ = args;
+        false
+    }
+}
+
+/// Whether the last MCP boot in this process was a forwarding client. Unset,
+/// every boot runs the work a store-owning process runs.
+static FORWARDING_CLIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the MCP host role of the boot about to run from `args`: the daemon
+/// as the warm index host, and whether this boot is a forwarding client. Every
+/// MCP boot path calls this before it builds the server, because boot work
+/// that only a store-owning process runs reads these marks. Each call sets the
+/// forwarding mark for its own boot, so a daemon or daemonless boot after a
+/// forwarding one in the same process runs that work again.
+pub fn mark_mcp_host_role(args: &Args) {
+    if args.daemon {
+        khive_runtime::daemon::mark_warm_index_host();
+    }
+    FORWARDING_CLIENT.store(
+        forwarding_mcp_client(args),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Whether [`mark_mcp_host_role`] marked this process a forwarding client.
+pub fn is_forwarding_client() -> bool {
+    FORWARDING_CLIENT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Build a fully-configured server from parsed args (without serving).

@@ -10,6 +10,8 @@ use super::{
 mod admission;
 #[path = "migrations_tests/atom_weights.rs"]
 mod atom_weights;
+#[path = "migrations_tests/page_accounting.rs"]
+mod page_accounting;
 
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")

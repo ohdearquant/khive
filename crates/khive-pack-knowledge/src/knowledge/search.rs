@@ -11,8 +11,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 #[cfg(test)]
+use khive_runtime::hex_prefix_to_uuid_pattern;
+#[cfg(test)]
 use khive_runtime::Namespace;
-use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
@@ -125,6 +127,10 @@ struct ScoredHit {
     status: Option<String>,
     score: f32,
     provenance: ScoreProvenance,
+}
+
+fn compare_scored_hits(a: &ScoredHit, b: &ScoredHit) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f32(a.score, &a.slug, b.score, &b.slug)
 }
 
 // ─── embedding rerank ────────────────────────────────────────────────────────
@@ -278,12 +284,7 @@ async fn rerank_with_embeddings(
             hit.score = alpha * norm_tfidf + (1.0 - alpha) * cos.max(0.0);
             hit.provenance.embedding_rerank = true;
         }
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.slug.cmp(&b.slug))
-        });
+        hits.sort_by(compare_scored_hits);
         return Ok(true);
     }
     Ok(false)
@@ -431,12 +432,7 @@ async fn rerank_search_from_store(
         hit.score = alpha * (hit.score / max_score) + (1.0 - alpha) * cosine.max(0.0);
         hit.provenance.embedding_rerank = true;
     }
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
+    hits.sort_by(compare_scored_hits);
     Ok(Some(json!({
         "stored_vector_lookup": stored_vector_lookup,
         "candidates": hits.len(),
@@ -535,3 +531,7 @@ mod namespace_trigram_proto_tests;
 #[cfg(test)]
 #[path = "search_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "search/ordering_tests.rs"]
+mod ordering_tests;

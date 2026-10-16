@@ -62,6 +62,24 @@ Individual targets: `make check`, `make clippy`, `make test`, `make fmt`.
 3. Ensure `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` pass.
 4. Open a pull request against `main`. Describe what changed and why.
 
+### Verb Contract Changes
+
+A pull request that adds, removes, or changes a verb's request or response field must
+name its governing ADR change in the PR body. The same rule applies to documented
+response behavior, including budgets and ordering. Link the ADR amendment in the
+same diff or the separate amendment PR, and identify the clauses it changes. Use the
+verb's API documentation and architecture records to identify the governing ADRs.
+
+Do not merge a contract change without that reference. The governing amendment must
+be accepted before its dependent implementation merges; preparing an implementation
+does not accept a Proposed amendment. For a refactor or fix that preserves the
+contract, explicitly state that the contract is unchanged and give the relevant
+evidence in the PR body.
+
+If this rule catches a second contract drift incident, file a separate issue for a
+lint that maps verbs to their governing ADRs and checks the PR's changes and stated
+contract preservation.
+
 ## Architecture
 
 Design decisions are recorded as Architecture Decision Records (ADRs) in

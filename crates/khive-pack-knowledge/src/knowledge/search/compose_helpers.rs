@@ -1,7 +1,7 @@
 //! Domain loading, compose sizing, and knowledge-graph candidate blending.
 
 #[cfg(test)]
-use super::{atom_from_row, Atom};
+use super::{atom_from_row, hex_prefix_to_uuid_pattern, Atom};
 use super::{
     domain_from_row, embed_cosine_scores, estimate_compose_item_tokens, is_timeout, row_i64,
     row_str, sql_err, Domain, EntityFilter, HashMap, HashSet, KhiveRuntime, NamespaceToken,
@@ -16,6 +16,10 @@ pub(super) struct ScoredTextItem {
     pub(super) name: String,
     pub(super) text: String,
     pub(super) score: f32,
+}
+
+fn compare_scored_text_items(a: &ScoredTextItem, b: &ScoredTextItem) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f32(a.score, &a.slug, b.score, &b.slug)
 }
 
 pub(super) async fn load_domain_by_id_or_slug(
@@ -140,46 +144,21 @@ pub(super) async fn load_atom_by_id_or_slug(
                 && id.len() <= 36
                 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             if is_hex {
-                drop(reader);
-                let resolved = match runtime
-                    .resolve_prefix_in(
-                        "knowledge_atoms",
-                        "id",
-                        khive_runtime::PrefixScope {
-                            namespace: Some(ns),
-                            live_only: true,
-                        },
-                        &id,
-                    )
+                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
+                let rows = reader
+                    .query_all(SqlStatement {
+                        sql: khive_runtime::sql!("knowledge_compose_atom_prefix").into(),
+                        params: vec![SqlValue::Text(pattern), SqlValue::Text(ns.to_owned())],
+                        label: None,
+                    })
                     .await
-                {
-                    Ok(id) => id,
-                    Err(RuntimeError::AmbiguousPrefix { .. }) => {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "ambiguous atom prefix {id:?} matches multiple atoms"
-                        )));
-                    }
-                    Err(error) => return Err(error),
-                };
-                if let Some(resolved) = resolved {
-                    let mut reader = sql
-                        .reader()
-                        .await
-                        .map_err(|e| sql_err("compose atom reader", e))?;
-                    reader
-                        .query_row(SqlStatement {
-                            sql: khive_runtime::sql!("knowledge_compose_atom_id").into(),
-                            params: vec![
-                                SqlValue::Text(resolved.to_string()),
-                                SqlValue::Text(ns.to_owned()),
-                            ],
-                            label: None,
-                        })
-                        .await
-                        .map_err(|e| sql_err("compose atom by prefix", e))?
-                } else {
-                    None
+                    .map_err(|e| sql_err("compose atom by prefix", e))?;
+                if rows.len() > 1 {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "ambiguous atom prefix {id:?} matches multiple atoms"
+                    )));
                 }
+                rows.into_iter().next()
             } else {
                 None
             }
@@ -367,12 +346,7 @@ pub(super) async fn rerank_text_items(
         for (item, cos) in items.iter_mut().zip(cosines.iter()) {
             item.score = cos.max(0.0);
         }
-        items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.slug.cmp(&b.slug))
-        });
+        items.sort_by(compare_scored_text_items);
     }
     Ok(())
 }
@@ -396,6 +370,10 @@ pub(super) struct KgEntityHit {
     pub(super) name: String,
     pub(super) description: String,
     pub(super) score: f32,
+}
+
+fn compare_kg_entity_hits(a: &KgEntityHit, b: &KgEntityHit) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f32(a.score, &a.id, b.score, &b.id)
 }
 
 /// Finds `concept`/`document` KG entities relevant to `query`, reranked with
@@ -513,12 +491,7 @@ pub(super) async fn search_kg_entities(
         })
         .collect();
 
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    hits.sort_by(compare_kg_entity_hits);
     // Self-calibrating inclusion floor (ADR-051 Amendment 1): an entity only
     // blends in if it outranks the weakest atom that made the final body —
     // no fixed score constant. Applied after rerank, before the cap, so a
@@ -528,3 +501,7 @@ pub(super) async fn search_kg_entities(
     hits.truncate(cap);
     Ok(hits)
 }
+
+#[cfg(test)]
+#[path = "compose_ordering_tests.rs"]
+mod ordering_tests;

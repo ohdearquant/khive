@@ -65,8 +65,12 @@ pub(super) async fn build_single_backend_runtime_with_max_readers(
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
     }
-    crate::legacy_quarantine::repair_legacy_quarantine(&runtime, &[("main", runtime.backend())])
-        .await?;
+    crate::legacy_quarantine::repair_legacy_quarantine_at_boot(
+        &runtime,
+        &[("main", runtime.backend())],
+        super::is_forwarding_client(),
+    )
+    .await?;
     Ok(runtime)
 }
 

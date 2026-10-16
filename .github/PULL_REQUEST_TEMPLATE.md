@@ -13,8 +13,13 @@
 
 ## ADR
 
-<!-- If this PR introduces a significant design change, link to the ADR
-     (docs/adr/ADR-NNN-*.md). For small fixes, write "n/a". -->
+<!-- Every change to a verb's request/response fields or documented behavior
+     (including budgets and ordering) must name the governing ADR change:
+     link its hunk in this diff or the separate amendment PR and affected clauses.
+     Do not merge without that reference and acceptance of the amendment.
+     If the contract is unchanged, state that explicitly with evidence.
+     For changes unrelated to verb contracts or architecture, write "n/a".
+     See CONTRIBUTING.md, "Verb Contract Changes". -->
 
 ## AI-assisted contribution checklist
 

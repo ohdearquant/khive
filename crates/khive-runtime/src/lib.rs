@@ -51,6 +51,7 @@ pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
 pub use index_repair::IndexRepairReport;
+pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
 #[cfg(test)]
@@ -64,6 +65,7 @@ mod note_index;
 mod note_read;
 pub mod note_search_ann;
 mod note_store_guard;
+mod note_validation;
 pub mod note_write;
 #[cfg(test)]
 mod note_write_tests;
@@ -72,7 +74,8 @@ pub mod operations;
 mod outbound_email_policy;
 pub use outbound_email_policy::OutboundEmailPolicy;
 pub use outbound_email_policy::{
-    outbound_email_is_suppressed, EmailSuppression, EmailSuppressionKind, EmailSuppressionScope,
+    inbound_email_is_suppressed, outbound_email_is_suppressed, EmailSuppression,
+    EmailSuppressionKind, EmailSuppressionScope,
 };
 pub mod pack;
 pub mod pack_metadata;

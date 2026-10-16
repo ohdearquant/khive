@@ -379,7 +379,10 @@ async fn waiting_on_a_future_fence_polls_proof_without_repeating_knn() {
 #[serial_test::serial(config_ledger)]
 async fn missing_original_log_proof_refuses_even_when_text_recall_finds_memory() {
     let rt = vector_runtime().with_ann_fresh_tail_enabled(false);
-    let registry = registry(&rt);
+    let (registry, shared_ann) = registry_with_ann(&rt);
+    let ann_key = AnnKey::from_token(MODEL);
+    // The missing-log fixture also needs publication to remain below its fence.
+    let publication_guard = ann::hold_model_warm_lock_for_test(&shared_ann, &ann_key).await;
     let remembered = remember(&registry, CONTENT).await;
     let visibility_token = remembered["visibility_token"].clone();
     let seq = receipt_sequence(&rt, &visibility_token, "local", MODEL);
@@ -397,21 +400,40 @@ async fn missing_original_log_proof_refuses_even_when_text_recall_finds_memory()
         })
         .await
         .expect("remove original log proof");
-    let remaining = rt
-        .sql()
-        .reader()
-        .await
-        .expect("sql reader")
-        .query_scalar(SqlStatement {
-            sql: "SELECT COUNT(*) FROM ann_write_log WHERE seq = ?1".into(),
-            params: vec![SqlValue::Integer(
-                i64::try_from(seq).expect("SQLite sequence"),
-            )],
-            label: Some("session-visibility-check-original-log-proof".into()),
-        })
-        .await
-        .expect("check original log proof");
-    assert!(matches!(remaining, Some(SqlValue::Integer(0))));
+    {
+        let mut reader = rt.sql().reader().await.expect("sql reader");
+        let remaining = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log WHERE seq = ?1".into(),
+                params: vec![SqlValue::Integer(
+                    i64::try_from(seq).expect("SQLite sequence"),
+                )],
+                label: Some("session-visibility-check-original-log-proof".into()),
+            })
+            .await
+            .expect("check original log proof");
+        assert!(matches!(remaining, Some(SqlValue::Integer(0))));
+
+        let covered = reader
+            .query_scalar(SqlStatement {
+                // Match the publication arm of ann::session_fence_predicate.
+                sql: "SELECT COUNT(*) FROM ann_consumer_watermark \
+                      WHERE consumer = 'memory-notes:note.content' AND namespace = '*' \
+                        AND embedding_model = ?1 AND watermark >= ?2 AND watermark >= 0"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(MODEL.into()),
+                    SqlValue::Integer(i64::try_from(seq).expect("SQLite sequence")),
+                ],
+                label: Some("session-visibility-check-unpublished-watermark".into()),
+            })
+            .await
+            .expect("check unpublished watermark");
+        assert!(
+            matches!(covered, Some(SqlValue::Integer(0))),
+            "fixture must not have a published watermark covering sequence {seq}: {covered:?}"
+        );
+    }
 
     let eventual = registry
         .dispatch(
@@ -427,6 +449,7 @@ async fn missing_original_log_proof_refuses_even_when_text_recall_finds_memory()
         .await
         .expect_err("text or stale ANN hits cannot replace missing session proof");
     assert_freshness_unmet(error, MODEL);
+    drop(publication_guard);
 }
 
 #[tokio::test]

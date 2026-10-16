@@ -1,5 +1,6 @@
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+use khive_storage::types::SqlValue;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -63,23 +64,38 @@ pub(crate) async fn handle_delivered(
         )
     })?;
 
-    let sql = runtime.sql();
-    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
-    let row = reader
-        .query_row(SqlStatement {
-            sql: khive_runtime::sql!("delivered_count_select").into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
-                SqlValue::Text(token.actor().id.clone()),
-                SqlValue::Text(outbound_id.to_string()),
-            ],
-            label: Some("comm_delivered".into()),
-        })
+    let filter = NoteFilter {
+        kind: Some("message".into()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".into()),
+            },
+            PropertyFilter {
+                json_path: "$.from_actor".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(token.actor().id.clone()),
+            },
+            PropertyFilter {
+                json_path: "$.outbound_ref".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(outbound_id.to_string()),
+            },
+        ],
+        ..Default::default()
+    };
+    let counts = runtime
+        .notes(token)?
+        .count_notes_filtered_in_snapshot(token.namespace().as_str(), &[filter])
         .await
         .map_err(RuntimeError::Storage)?;
-
-    let inbound_count = match row.and_then(|row| row.get("inbound_count").cloned()) {
-        Some(SqlValue::Integer(count)) if count >= 0 => count,
+    let inbound_count = match counts.as_slice() {
+        [count] => i64::try_from(*count).map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "delivered: storage returned an invalid inbound count: {count} exceeds i64::MAX"
+            ))
+        })?,
         other => {
             return Err(RuntimeError::InvalidInput(format!(
                 "delivered: storage returned an invalid inbound count: {other:?}"

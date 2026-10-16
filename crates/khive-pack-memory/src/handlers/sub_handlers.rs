@@ -11,9 +11,9 @@ use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
-    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+    compute_score, deser, fuse_for_query, make_pipeline, note_has_any_tag, note_matches_tags,
+    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallLegs,
+    RecallParams, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, RECALL_DIAGNOSTIC_SNIPPET_CHARS,
 };
 
 impl MemoryPack {
@@ -117,6 +117,7 @@ impl MemoryPack {
                 token,
                 RecallCandidateParams {
                     candidate_limit,
+                    legs: RecallLegs::BOTH,
                     embedding_model: p.embedding_model.as_deref(),
                     session_fence: None,
                     cjk_fts_bypass: false,
@@ -234,6 +235,7 @@ impl MemoryPack {
                 token,
                 RecallCandidateParams {
                     candidate_limit,
+                    legs: RecallLegs::BOTH,
                     embedding_model: p.embedding_model.as_deref(),
                     session_fence: None,
                     cjk_fts_bypass: false,
@@ -249,7 +251,14 @@ impl MemoryPack {
         let (memory_ids, notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
 
-        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize)?;
+        let fused = fuse_for_query(
+            &candidates,
+            &memory_ids,
+            &cfg,
+            candidate_limit as usize,
+            &p.query,
+            p.embedding_model.as_deref(),
+        )?;
 
         let fused_candidates: Vec<Value> = fused
             .into_iter()
