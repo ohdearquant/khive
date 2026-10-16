@@ -7,7 +7,7 @@
     "action_request": "Requests to run, install or execute something, pipe a download into a shell, connect to a server or tool endpoint, or supply a credential, token or password.",
     "executable_attachment": "An attachment whose declared or sniffed type is executable or a script.",
     "html_only": "No text/plain part; the message is delivered with text extracted from the HTML.",
-    "opt_out": "Explicit opt-out phrasing in the subject or the first non-quoted line. Drives the unsubscribe entry point and never changes the delivery outcome."
+    "opt_out": "Explicit opt-out phrasing in the subject or the first non-quoted paragraph. Drives the unsubscribe entry point and never changes the delivery outcome."
   },
   "rules": [
     {
@@ -162,7 +162,7 @@
     {
       "id": "opt_out.unsubscribe",
       "family": "opt_out",
-      "description": "An explicit opt-out phrase in the subject or the first non-quoted line.",
+      "description": "An explicit opt-out phrase in the subject or the first non-quoted paragraph.",
       "match": [
         "unsubscribe",
         "remove me",
@@ -170,7 +170,16 @@
         "opt-out",
         "take me off",
         "stop emailing",
-        "stop sending"
+        "stop sending",
+        "stop contacting",
+        "don't email me",
+        "don\u2019t email me",
+        "dont email me",
+        "do not email me",
+        "don't contact me",
+        "don\u2019t contact me",
+        "do not contact me",
+        "no more emails"
       ]
     }
   ]
