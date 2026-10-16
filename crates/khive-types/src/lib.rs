@@ -13,6 +13,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod agent;
+pub mod app;
 #[cfg(feature = "serde")]
 pub mod canonical_json;
 pub mod edge;
@@ -43,6 +44,10 @@ pub mod timestamp;
 pub mod vector;
 
 pub use agent::{AgentRecord, AgentState, TerminalReason};
+pub use app::{
+    AppManifest, AppVerb, InstallRefusal, LifecycleClass, OwnedNames, Residency, RightsClass,
+    RowSubstrate, RowTypeDecl,
+};
 #[cfg(feature = "serde")]
 pub use canonical_json::canonical_json_bytes;
 pub use edge::{EdgeCategory, EdgeRelation};
