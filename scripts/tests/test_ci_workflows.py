@@ -714,19 +714,27 @@ class CiMatrixWorkflowTests(unittest.TestCase):
         }
         return json.loads(eval(expression, {"__builtins__": {}}, scope))
 
-    def test_own_codex_branch_pull_requests_run_the_linux_shards_only(self):
-        self.assertEqual(
-            self.matrix_for("pull_request", "codex/some-change", "ohdearquant/khive"),
-            self.UBUNTU,
-        )
+    def test_own_codex_split_and_docs_branch_pull_requests_run_the_linux_shards_only(self):
+        for head_ref in ["codex/some-change", "split/khive-runtime-daemon-3943", "docs/retrieval-crate-doc"]:
+            with self.subTest(head_ref=head_ref):
+                self.assertEqual(
+                    self.matrix_for("pull_request", head_ref, "ohdearquant/khive"),
+                    self.UBUNTU,
+                )
 
     def test_other_pull_requests_keep_the_macos_lane(self):
         expected = self.UBUNTU + [{"os": "macos-latest", "shard": 1}]
         for head_ref, head_repo in [
             ("batch/125", "ohdearquant/khive"),
             ("feature/codex/x", "ohdearquant/khive"),
+            ("feature/split/x", "ohdearquant/khive"),
+            ("splitter/x", "ohdearquant/khive"),
+            ("documents/x", "ohdearquant/khive"),
             ("codex/some-change", "contributor/khive"),
             ("codex/some-change", None),
+            ("split/some-change", "contributor/khive"),
+            ("docs/some-change", "contributor/khive"),
+            ("docs/some-change", None),
         ]:
             with self.subTest(head_ref=head_ref, head_repo=head_repo):
                 self.assertEqual(self.matrix_for("pull_request", head_ref, head_repo), expected)

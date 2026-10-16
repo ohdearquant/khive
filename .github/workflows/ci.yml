@@ -300,6 +300,10 @@ jobs:
       # pull request that runs the three-job matrix above, so the macOS lane
       # runs there, and the many draft pull requests on that prefix no longer
       # hold macOS slots that integration runs wait for.
+      # Pull requests from this repository's `split/` and `docs/` branches run
+      # the two Linux shards only as well. They carry verbatim moves of code
+      # between files and documentation changes; the Linux shards test them,
+      # and the push to main that lands them runs both macOS shards.
       # The head-repository check keeps the rule to branches of this
       # repository: a pull request from a fork runs the three-job matrix
       # whatever its branch is called.
@@ -308,7 +312,9 @@ jobs:
       # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
-          && startsWith(github.head_ref, 'codex/')
+          && (startsWith(github.head_ref, 'codex/')
+            || startsWith(github.head_ref, 'split/')
+            || startsWith(github.head_ref, 'docs/'))
           && github.event.pull_request.head.repo.full_name == github.repository
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
           || github.event_name == 'pull_request'
