@@ -206,6 +206,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
+  entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
+  remains pending acceptance and conformance validation.
+
 - Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
   `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
   constructors must supply it. Recall handlers supply zero pending graph gathering,

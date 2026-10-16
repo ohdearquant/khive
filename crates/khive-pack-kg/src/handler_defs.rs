@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (27 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (28 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,18 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 27] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
+    HandlerDef {
+        name: "schema",
+        description: "Report the full unfiltered loaded vocabulary and declared endpoint matrix. \
+                      Base * means any entity kind, not any substrate. Rows retain base or pack \
+                      origin, source/target substrate and optional entity-type columns. Returns \
+                      counts and a content hash; accepts no filters. Declarations do not replace \
+                      link validation or authorization.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
     HandlerDef {
         name: "count",
         description: "Count matching events in storage, grouped by verb, kind or actor. Only caller-visible namespaces contribute; an empty result is an empty object.",
