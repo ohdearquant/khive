@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn fold_gate_sql_err_message_is_prefixed_context_and_error() {
-    match sql_err("insert", "boom") {
+    match sql_err("fold gate insert", "boom") {
         RuntimeError::Internal(message) => {
             assert_eq!(message, "fold gate insert: boom");
         }
@@ -31,6 +31,25 @@ fn decayed_mass_one_half_life_halves() {
 fn decayed_mass_two_half_lives_quarters() {
     let m = decayed_mass(1.0, 2 * IMPLICIT_MASS_HALF_LIFE_US as i64);
     assert!((m - 0.25).abs() < 1e-9, "expected ~0.25, got {m}");
+}
+
+#[test]
+fn decayed_mass_preserves_scalar_boundaries() {
+    for mass in [0.0, -0.0, 1.5, -1.5, f64::MAX, f64::INFINITY, f64::NAN] {
+        for delta in [i64::MIN, 0, 1, IMPLICIT_MASS_HALF_LIFE_US as i64, i64::MAX] {
+            let expected = if delta <= 0 || mass == 0.0 {
+                mass
+            } else {
+                mass * 2f64.powf(-(delta as f64) / IMPLICIT_MASS_HALF_LIFE_US)
+            };
+            let actual = decayed_mass(mass, delta);
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
 }
 
 #[test]

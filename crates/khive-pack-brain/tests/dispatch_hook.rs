@@ -199,9 +199,8 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
 ///
 /// Sequence:
 ///   1. Create a real entity for brain.feedback target validation.
-///   2. Using brain_a, dispatch 5 brain.feedback calls — enough to cross
-///      DEFAULT_SNAPSHOT_BATCH_SIZE (5) and force upsert_snapshot into the
-///      shared DB.  Record persisted_total == 5.
+///   2. Using brain_a, dispatch 5 brain.feedback calls, each persisting its
+///      snapshot into the shared DB. Record persisted_total == 5.
 ///   3. Construct brain_b = BrainPack::new(rt.clone()), a fresh instance over
 ///      the same runtime/DB with empty in-memory state.  brain_a is no longer
 ///      used; its in-memory state is not accessible to brain_b.
@@ -253,8 +252,7 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
         .to_string();
 
     // --- Step 2: dispatch 5 brain.feedback calls via brain_a ---
-    // DEFAULT_SNAPSHOT_BATCH_SIZE = 5; the 5th call triggers upsert_snapshot,
-    // writing the "local" namespace snapshot into the shared DB.
+    // Every call writes the "local" namespace snapshot into the shared DB.
     let brain_a = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new()
         .build()
