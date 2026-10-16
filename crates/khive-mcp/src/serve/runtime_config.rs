@@ -193,12 +193,16 @@ pub(super) fn opened_diagnostic_backends(
 pub(super) fn build_pack_runtime(
     backend: Arc<StorageBackend>,
     backend_name: &str,
-    rt_config: RuntimeConfig,
+    mut rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
     declared_backend_db_paths: Arc<[PathBuf]>,
     diagnostic_backends: Arc<[OpenedDiagnosticBackend]>,
 ) -> KhiveRuntime {
+    // Map declarations are loaded once by the main runtime. Avoid repeating
+    // their filesystem checks and rejection logs for each pack runtime.
+    rt_config.code_map_root = None;
+    rt_config.code_maps.clear();
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
@@ -207,11 +211,62 @@ pub(super) fn build_pack_runtime(
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
         .with_diagnostic_observer_from(main_runtime)
-        .with_core_embedders_from(main_runtime);
+        .with_core_embedders_from(main_runtime)
+        .with_code_map_registry_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
         rt
+    }
+}
+
+#[cfg(test)]
+mod code_map_registry_tests {
+    use super::*;
+
+    #[test]
+    fn pack_runtime_shares_the_main_code_map_registration() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let map_root = fixture.path().join("maps");
+        std::fs::create_dir(&map_root).expect("map root");
+        let map_path = map_root.join("workspace.db");
+        std::fs::write(&map_path, b"map data").expect("map file");
+        let db_path = fixture.path().join("main.db");
+        let main_backend =
+            Arc::new(StorageBackend::sqlite_for_test(&db_path).expect("main backend"));
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            code_map_root: Some(map_root.display().to_string()),
+            code_maps: vec![khive_runtime::engine_config::CodeMapConfig {
+                name: Some("workspace".to_string()),
+                path: Some(map_path.display().to_string()),
+                source_root: Some(fixture.path().display().to_string()),
+                ..khive_runtime::engine_config::CodeMapConfig::default()
+            }],
+            ..RuntimeConfig::default()
+        };
+        let main_runtime = KhiveRuntime::from_backend(Arc::clone(&main_backend), config.clone());
+        let pack_runtime = build_pack_runtime(
+            Arc::clone(&main_backend),
+            BackendId::MAIN,
+            config,
+            &main_backend,
+            &main_runtime,
+            Vec::new().into(),
+            Vec::new().into(),
+        );
+
+        let main_generation = main_runtime
+            .code_map_registry()
+            .resolve("workspace")
+            .expect("main registration")
+            .generation();
+        let pack_generation = pack_runtime
+            .code_map_registry()
+            .resolve("workspace")
+            .expect("pack registration")
+            .generation();
+        assert_eq!(pack_generation, main_generation);
     }
 }
 
