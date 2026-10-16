@@ -310,7 +310,7 @@ impl AppManifest {
                 RowSubstrate::Entity => &self.entity_kinds,
                 RowSubstrate::Note => &self.note_kinds,
             };
-            if !slice.iter().any(|kind| *kind == row.kind) {
+            if !slice.contains(&row.kind) {
                 return Err(InstallRefusal::RowTypeOutsideSlice {
                     substrate: row.substrate,
                     kind: row.kind.clone(),
@@ -362,10 +362,7 @@ impl AppManifest {
                 ),
                 (RowSubstrate::Note, &self.note_kinds, &owner.note_kinds),
             ] {
-                if let Some(kind) = kinds
-                    .iter()
-                    .find(|kind| held.iter().any(|taken| *taken == kind.as_str()))
-                {
+                if let Some(kind) = kinds.iter().find(|kind| held.contains(&kind.as_str())) {
                     return Err(InstallRefusal::KindOwned {
                         substrate,
                         kind: kind.clone(),
