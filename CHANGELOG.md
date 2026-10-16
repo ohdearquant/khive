@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Edge-weight validators use the shared `khive-types` predicate,
+  preserving numeric boundaries and validation diagnostics.
 - With a configured runtime actor, a message the email channel quarantines, whatever its
   reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
   the mailbox recipient check keeps the quarantine record and its content reference out of
@@ -302,8 +304,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Edge-weight validators use the shared `khive-types` predicate,
-  preserving numeric boundaries and validation diagnostics.
 - `memory.recall` with `fusion_strategy="keyword_only"` no longer embeds the query or searches
   the vector index, and `fusion_strategy="vector_only"` no longer runs the full-text search.
   The saved work was most of the cost of a `keyword_only` recall that finds no text match.
