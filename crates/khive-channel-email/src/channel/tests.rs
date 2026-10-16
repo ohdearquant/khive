@@ -2749,4 +2749,4 @@ async fn malformed_message_is_quarantined_first() {
         Some("missing-body")
     );
 }
-include!("channel/external_inbound_tests.rs");
+include!("external_inbound_tests.rs");
