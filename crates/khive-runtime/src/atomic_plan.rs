@@ -395,6 +395,8 @@ pub struct LinkPlan {
     pub(crate) statements: Vec<PlanStatement>,
     /// Prepare-time disposition, protected by the first statement's guard.
     pub(crate) disposition: khive_storage::EdgeUpsertDisposition,
+    /// Response-only inference provenance captured before the write.
+    pub(crate) dependency_kind_inference_hint: Option<String>,
 }
 
 impl LinkPlan {
@@ -412,6 +414,11 @@ impl LinkPlan {
     /// its natural-key row.
     pub fn disposition(&self) -> khive_storage::EdgeUpsertDisposition {
         self.disposition
+    }
+
+    /// Explain an inferred qualifier without re-deriving it from a later read.
+    pub fn dependency_kind_inference_hint(&self) -> Option<&str> {
+        self.dependency_kind_inference_hint.as_deref()
     }
 }
 

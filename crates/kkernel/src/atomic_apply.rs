@@ -1173,6 +1173,9 @@ async fn build_op_result(
             }
             if let Some(obj) = raw.as_object_mut() {
                 obj.insert("mutation".to_string(), json!(p.disposition().name()));
+                if let Some(hint) = p.dependency_kind_inference_hint() {
+                    obj.insert("hint".to_string(), json!(hint));
+                }
             }
             Ok(raw)
         }

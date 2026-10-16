@@ -152,3 +152,74 @@ async fn atomic_success_results_carry_canonical_shaped_result_per_op() {
         "gtd.complete result must carry the terminal status: {envelope}"
     );
 }
+
+#[tokio::test]
+async fn atomic_link_hint_matches_canonical_and_respects_explicit_qualifiers() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let db_file = NamedTempFile::new().expect("temp db");
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let (canonical_hint, source, target) = {
+        let server = isolated_server(&db_path);
+        let created = dispatch_json(
+            &server,
+            concat!(
+                r#"[create(kind="document", name="HintCanonicalSource"), "#,
+                r#"create(kind="document", name="HintCanonicalTarget"), "#,
+                r#"create(kind="document", name="HintAtomicSource"), "#,
+                r#"create(kind="document", name="HintAtomicTarget")]"#,
+            ),
+        )
+        .await;
+        let id = |index: usize| {
+            created["results"][index]["result"]["id"]
+                .as_str()
+                .expect("document id")
+                .to_string()
+        };
+        let response = dispatch_json(
+            &server,
+            &format!(
+                "link(source_id={:?}, target_id={:?}, relation=\"depends_on\")",
+                id(0),
+                id(1)
+            ),
+        )
+        .await;
+        let hint = response["results"][0]["result"]["hint"]
+            .as_str()
+            .expect("canonical inference hint")
+            .to_string();
+        (hint, id(2), id(3))
+    };
+    let envelope = crate::atomic_apply::execute_atomic_ops_file(
+        vec![
+            atomic_op(
+                "link",
+                serde_json::json!({"source_id": source, "target_id": target, "relation": "depends_on"}),
+            ),
+            atomic_op(
+                "link",
+                serde_json::json!({"source_id": target, "target_id": source, "relation": "depends_on", "dependency_kind": "normative"}),
+            ),
+        ],
+        atomic_cfg(&db_path),
+        &KhiveConfig::default(),
+        khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+    )
+    .await
+    .expect("both links commit");
+    assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+    let inferred = &envelope["results"][0]["result"];
+    let explicit = &envelope["results"][1]["result"];
+    assert_eq!(inferred["hint"], canonical_hint, "{envelope}");
+    assert!(canonical_hint.contains("normative"));
+    assert!(canonical_hint.contains("links_to"));
+    assert!(explicit.get("hint").is_none(), "{envelope}");
+    for result in [inferred, explicit] {
+        assert_eq!(result["metadata"]["dependency_kind"], "normative");
+        assert!(result["metadata"].get("hint").is_none());
+        assert_eq!(result["mutation"], "created");
+    }
+}
