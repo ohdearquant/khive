@@ -152,11 +152,16 @@ jobs:
             # The checkout is one commit deep. The ancestry test below needs main's history, and the
             # comparison reads paths only, so fetch main's commits and trees without file contents.
             # A full-depth checkout fetches every branch and tag, and its time grows with their count.
-            if git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+            # A repository that already holds its history is used as it is.
+            history=true
+            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+              history=false
+              echo "fetching main's history failed"
+            fi
+            if [[ "$history" == "true" ]]; then
               runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
                 --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
-            else
-              echo "fetching main's history failed"
             fi
             while read -r run_id run_sha; do
               [[ -n "$run_id" ]] || continue

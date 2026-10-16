@@ -2750,6 +2750,25 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "docs_only=true", log)
         self.assertIn(f"Compared with {untested}", log)
 
+    def test_job_main_push_fetches_main_history_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that replaced a waiting run")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        # The runner checks out the pushed commit alone from a remote that holds main's history.
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", remote.as_uri(), str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertIn(f"Compared with {untested}", log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
     def test_job_main_push_without_a_full_run_or_with_a_failing_api_runs_the_full_suite(self):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
         head = self.commit("documentation")
