@@ -60,6 +60,8 @@ use direct_entity::{
 
 mod file_pending;
 use file_pending::{stamp_l2_declarations, FileReference};
+mod source_reads;
+pub use source_reads::CodeSourceReadReport;
 #[path = "source_ingest/l2_edge_refresh.rs"]
 mod l2_edge_refresh;
 use l2_edge_refresh::refresh_unchanged_l2_edges;
@@ -173,6 +175,10 @@ pub struct CodeSourceIngestReport {
     pub projects_updated: u64,
     pub modules_created: u64,
     pub modules_updated: u64,
+    /// Literal source-input observations from L1.5. These are lexical
+    /// evidence, not a complete read graph or Cargo target classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_reads: Option<CodeSourceReadReport>,
     /// `None` unless L2 was requested (`enable_l2`); present with all-zero
     /// counters for a valid L2 pass over zero Rust files or zero
     /// declarations, so "L2 requested but nothing found" stays
@@ -330,6 +336,7 @@ struct SourceSnapshot {
 struct ModuleScan {
     source_project: String,
     imports: Vec<UnresolvedSpec>,
+    source_reads: Vec<source_reads::SourceReadInput>,
 }
 
 type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
@@ -567,7 +574,7 @@ fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
 fn dependency_scope_for_kind(kind: &str) -> &'static str {
     match kind {
         "dev-dependencies" | "devDependencies" => "dev",
-        "build-dependencies" | "import" => "build",
+        "build-dependencies" | "import" | "source_read" => "build",
         _ => "normal",
     }
 }
@@ -1338,12 +1345,8 @@ fn target_ids_for(source_project: &str, spec: &UnresolvedSpec) -> Vec<Uuid> {
 /// so re-ingest can repair an older import-default scope without retaining a
 /// false production scope.
 ///
-/// The three rebuilt fields — `dependency_kinds`, `dependency_scopes`, and
-/// `language` — are the COMPLETE metadata set these edges carry: this
-/// function (and its Amendment-2 predecessor `merge_dependency_kinds`,
-/// which wrote the subset `{dependency_kinds, language}`) is the only
-/// writer of `depends_on` edge metadata in this pipeline, and B7 dedicates
-/// the map database to it, so no unknown fields exist to preserve.
+/// Source-reader observations share the natural edge with imports. Retain
+/// their revision-qualified evidence when another producer refreshes it.
 fn merge_dependency_metadata(
     existing_metadata: Option<&Value>,
     new_kind: &str,
@@ -1361,11 +1364,15 @@ fn merge_dependency_metadata(
         .unwrap_or_default();
     kinds.insert(new_kind.to_string());
     let scopes = scopes_for_dependency_kinds(&kinds, new_scope);
-    json!({
+    let mut metadata = json!({
         "dependency_kinds": kinds.into_iter().collect::<Vec<_>>(),
         "dependency_scopes": scopes.into_iter().collect::<Vec<_>>(),
         "language": language,
-    })
+    });
+    if let Some(observations) = existing_metadata.and_then(|m| m.get("source_read_observations")) {
+        metadata["source_read_observations"] = observations.clone();
+    }
+    metadata
 }
 
 /// Upserts a `depends_on` edge, merging its evidence kind and normalized
@@ -1611,8 +1618,10 @@ async fn stamp_import_scan_coverage(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     module_scans: HashMap<Uuid, ModuleScan>,
+    source_read_plans: &BTreeMap<Uuid, source_reads::SourceReadPlan>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<BTreeSet<Uuid>, CodeSourceIngestError> {
+    let mut source_reads_stamped = BTreeSet::new();
     for (module_id, scan) in module_scans {
         let mut unresolved_count = 0_u64;
         for spec in &scan.imports {
@@ -1638,13 +1647,22 @@ async fn stamp_import_scan_coverage(
             .unwrap_or_else(|| module_id.to_string());
         let mut row_missing = false;
         let mut invalid_properties = false;
+        let mut source_read_mismatch = false;
         let outcome = mutate_entity(rt, token, module_id, &source_label, report, |current| {
             row_missing = current.is_none();
+            source_read_mismatch = false;
             let mut module = current?.clone();
             let Some(Value::Object(mut props)) = module.properties.clone() else {
                 invalid_properties = true;
                 return None;
             };
+            if let Some(plan) = source_read_plans.get(&module_id) {
+                if !plan.matches(&props) {
+                    source_read_mismatch = true;
+                    return None;
+                }
+                props.insert("source_read_scan".into(), plan.observation.clone());
+            }
             props.insert(
                 "import_scan_status".into(),
                 json!(if unresolved_count == 0 {
@@ -1659,6 +1677,9 @@ async fn stamp_import_scan_coverage(
             Some(module)
         })
         .await?;
+        if outcome.wrote() && source_read_plans.contains_key(&module_id) {
+            source_reads_stamped.insert(module_id);
+        }
         if row_missing {
             report.warnings.push(format!(
                 "module {module_id} from this sweep's scan map was missing at stamp time; \
@@ -1671,11 +1692,16 @@ async fn stamp_import_scan_coverage(
                  coverage stamp skipped (F2 contract violation)"
             ));
             report.coverage_stamps_missed += 1;
+        } else if source_read_mismatch {
+            report.warnings.push(format!(
+                "module {module_id} changed since this invocation's source scan; coverage stamps skipped"
+            ));
+            report.coverage_stamps_missed += 1;
         } else if outcome == RowMutationOutcome::Blocked {
             report.coverage_stamps_missed += 1;
         }
     }
-    Ok(())
+    Ok(source_reads_stamped)
 }
 
 const SOURCE_SKIP_DIRS: &[&str] = &[
@@ -1852,11 +1878,12 @@ fn scan_import_source(
     canonical_root: &Path,
     path: &Path,
     language: &str,
-) -> Result<(String, Vec<String>), SourceReadError> {
+) -> Result<(String, Vec<String>, crate::source_reads::SourceReadScan), SourceReadError> {
     let content = safe_source::read_contained_to_string(canonical_root, path)?;
     Ok((
         content_hash(&content),
         imports::extract_raw_imports(language, &content),
+        source_reads::extract_on_worker(language, content),
     ))
 }
 
@@ -2360,7 +2387,11 @@ pub async fn run_code_ingest(
         .await?;
     }
     if opts.enable_l1_5 {
-        stamp_import_scan_coverage(rt, token, module_scans, &mut report).await?;
+        let plans = source_reads::prepare(&module_scans);
+        let stamped =
+            stamp_import_scan_coverage(rt, token, module_scans, &plans, &mut report).await?;
+        source_reads::persist_edges(rt, token, &plans, &stamped, opts.sweep_time, &mut report)
+            .await?;
     }
 
     // L2: symbol/call-edge persistence (Rust-only; see the module doc
@@ -2529,7 +2560,7 @@ async fn run_import_scan(
 
         let file_for_read = file.clone();
         let root_for_read = canonical_ingest_root.clone();
-        let (hash, raw_imports) =
+        let (hash, raw_imports, source_read_scan) =
             match blocking_io(move || scan_import_source(&root_for_read, &file_for_read, language))
                 .await?
             {
@@ -2636,8 +2667,17 @@ async fn run_import_scan(
         let scan = module_scans.entry(module_id).or_insert_with(|| ModuleScan {
             source_project: proj_name.clone(),
             imports: Vec::new(),
+            source_reads: Vec::new(),
         });
         scan.imports.extend(scan_imports);
+        scan.source_reads.push(source_reads::SourceReadInput {
+            source_path,
+            source_revision: snapshot.revision.clone(),
+            content_hash: hash,
+            language: language.to_string(),
+            sweep_time: sweep_time.to_rfc3339(),
+            scan: source_read_scan,
+        });
     }
     Ok(())
 }
@@ -4626,10 +4666,11 @@ mod tests {
             ModuleScan {
                 source_project: "fixture".to_string(),
                 imports: Vec::new(),
+                source_reads: Vec::new(),
             },
         );
         let mut report = CodeSourceIngestReport::default();
-        stamp_import_scan_coverage(&rt, &token, module_scans, &mut report)
+        stamp_import_scan_coverage(&rt, &token, module_scans, &BTreeMap::new(), &mut report)
             .await
             .expect("stamp path completes");
 

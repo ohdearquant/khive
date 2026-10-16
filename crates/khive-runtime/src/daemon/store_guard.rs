@@ -5,11 +5,11 @@ use std::ffi::{CString, OsStr};
 #[cfg(unix)]
 use std::io::{Read as _, Write as _};
 #[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt as _, MetadataExt};
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::path::PathBuf;
 
@@ -68,36 +68,42 @@ pub(super) fn regular_store_identity(
     Ok(Some((metadata.dev(), metadata.ino())))
 }
 
-/// Open a single directory entry without re-resolving any parent pathname.
+/// Preserve the store claim's existing diagnostic before shared component validation.
 #[cfg(unix)]
-fn open_claimed_entry(
-    parent: &std::fs::File,
-    name: &OsStr,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> std::io::Result<std::fs::File> {
-    let name = CString::new(name.as_bytes()).map_err(|_| {
+fn check_store_entry_name(name: &OsStr) -> std::io::Result<()> {
+    CString::new(name.as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "store entry contains U+0000",
         )
     })?;
-    // SAFETY: the directory fd and NUL-terminated entry name stay live through
-    // openat. FromRawFd takes ownership of the returned fd exactly once.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            // Variadic arguments require C default promotion; mode_t is u16 on macOS.
-            mode as libc::c_uint,
+    Ok(())
+}
+
+/// Open a database or sidecar relative to the held claim directory.
+#[cfg(unix)]
+fn open_claimed_store_file(
+    parent: &std::fs::File,
+    name: &OsStr,
+    read_only: bool,
+) -> std::io::Result<std::fs::File> {
+    check_store_entry_name(name)?;
+    if read_only {
+        // The shared read-only open is non-blocking; the caller still checks
+        // the opened file's regular type and descriptor identity before use.
+        khive_fs::fd_relative::open_at(parent, name, false)
+    } else {
+        khive_fs::fd_relative::open_file_at(
+            parent.as_fd(),
+            name,
+            khive_fs::fd_relative::OpenFileOptions {
+                read_write: true,
+                create: khive_fs::fd_relative::Create::IfMissing,
+                nonblock: false,
+                mode: 0o600,
+            },
         )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: openat returned a new, valid fd owned by this process.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Walk an already-canonical absolute parent path one component at a time.
@@ -118,8 +124,8 @@ fn open_claimed_directory(path: &std::path::Path) -> std::io::Result<std::fs::Fi
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
-                directory =
-                    open_claimed_entry(&directory, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                check_store_entry_name(name)?;
+                directory = khive_fs::fd_relative::open_dir_at(&directory, name)?;
             }
             _ => {
                 return Err(std::io::Error::new(
@@ -141,10 +147,10 @@ pub(super) fn ensure_claimed_parent_identity(
     database: &std::path::Path,
 ) -> anyhow::Result<()> {
     let parent = database.parent().expect("claimed path has a parent");
-    let held = directory.metadata()?;
+    let held = khive_fs::fd_relative::FileIdentity::of(directory)?;
     let observed = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
-        observed.is_dir() && (held.dev(), held.ino()) == (observed.dev(), observed.ino()),
+        observed.is_dir() && (held.dev, held.ino) == (observed.dev(), observed.ino()),
         "claimed database {} parent directory changed since claim",
         database.display()
     );
@@ -159,30 +165,16 @@ fn regular_store_identity_at(
     name: &OsStr,
     database: &std::path::Path,
 ) -> anyhow::Result<Option<(u64, u64)>> {
-    let name = CString::new(name.as_bytes())
+    CString::new(name.as_bytes())
         .map_err(|_| anyhow::anyhow!("database name {} contains U+0000", database.display()))?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: stat points to writable storage and name is NUL-terminated.
-    let rc = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        anyhow::bail!(
+    let stat = match khive_fs::fd_relative::stat_at(parent, name) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => anyhow::bail!(
             "cannot inspect claimed database {}: {error}",
             database.display()
-        );
-    }
-    // SAFETY: fstatat succeeded and initialized the complete stat structure.
-    let stat = unsafe { stat.assume_init() };
+        ),
+    };
     anyhow::ensure!(
         stat.st_mode & libc::S_IFMT == libc::S_IFREG,
         "claimed database {} is not a regular file",
@@ -256,13 +248,8 @@ pub fn bind_daemon_store_files(
         if let Some(hook) = take_store_bind_race_hook() {
             hook();
         }
-        let flags = if read_only {
-            libc::O_RDONLY
-        } else {
-            libc::O_RDWR | libc::O_CREAT
-        };
         // The creation mode keeps new stores private without changing existing permissions.
-        let file = open_claimed_entry(&guard.parent_dir, filename, flags, 0o600)
+        let file = open_claimed_store_file(&guard.parent_dir, filename, read_only)
             .map_err(|error| bind_open_error(&error, &guard.database, read_only))?;
         let metadata = file.metadata()?;
         anyhow::ensure!(
@@ -303,8 +290,8 @@ pub fn assert_daemon_store_identities(guards: &[DaemonStoreGuard]) -> anyhow::Re
                 guard.database.display()
             )
         })?;
-        let metadata = bound.metadata()?;
-        let bound_identity = (metadata.dev(), metadata.ino());
+        let identity = khive_fs::fd_relative::FileIdentity::of(bound)?;
+        let bound_identity = (identity.dev, identity.ino);
         let observed = regular_store_identity(&guard.database)?;
         anyhow::ensure!(
             observed == Some(bound_identity) && observed == guard.claimed_identity,
@@ -495,11 +482,10 @@ pub fn claim_stores(
             )
         })?;
         ensure_claimed_parent_identity(&parent_dir, &database)?;
-        let mut file = open_claimed_entry(
+        let mut file = open_claimed_store_file(
             &parent_dir,
             lock_path.file_name().expect("sidecar path has a file name"),
-            libc::O_RDWR | libc::O_CREAT,
-            0o600,
+            false,
         )
         .map_err(|error| {
             anyhow::anyhow!(

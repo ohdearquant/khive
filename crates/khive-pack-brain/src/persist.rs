@@ -3,7 +3,7 @@
 mod feedback;
 pub(crate) use feedback::persist_feedback_state_mutation;
 
-use crate::sql::sql;
+use crate::sql::{sql, sql_err};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -61,7 +61,6 @@ pub(crate) const MAX_PENDING_HOOK_SIGNALS_PER_NAMESPACE: usize = 256;
 use crate::event::interpret;
 
 const SNAPSHOT_PROFILE_ID: &str = "__brain__";
-const DEFAULT_SNAPSHOT_BATCH_SIZE: u64 = 5;
 
 fn version_covers(current: Option<i64>, observed: Option<i64>) -> bool {
     match (current, observed) {
@@ -71,7 +70,7 @@ fn version_covers(current: Option<i64>, observed: Option<i64>) -> bool {
     }
 }
 
-/// Tracks loaded namespaces and dirty event counts; owns the per-namespace state map.
+/// Tracks loaded namespaces and owns the per-namespace state map.
 pub struct PersistenceTracker {
     /// Namespace currently reflected in the shared `BrainState` slot, if any.
     pub(crate) active_namespace: Option<String>,
@@ -86,8 +85,6 @@ pub struct PersistenceTracker {
     /// mutation transaction. A warm process compares this version before
     /// reusing its in-memory registry.
     snapshot_versions: HashMap<String, i64>,
-    dirty_counts: HashMap<String, u64>,
-    snapshot_batch_size: u64,
     /// Pre-load accumulator for hook signals that arrive before `ensure_loaded` runs.
     ///
     /// When `on_dispatch` fires for a namespace that has never been loaded from the
@@ -119,8 +116,6 @@ impl PersistenceTracker {
             saved_states: HashMap::new(),
             loaded_namespaces: HashMap::new(),
             snapshot_versions: HashMap::new(),
-            dirty_counts: HashMap::new(),
-            snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
             pending_hook_signals: HashMap::new(),
             pending_hook_signals_dropped: 0,
         }
@@ -170,17 +165,6 @@ impl PersistenceTracker {
         let saved = self.saved_states.remove(&to_namespace);
         self.active_namespace = Some(to_namespace);
         saved
-    }
-
-    /// Increment the dirty event count for `namespace`; return `true` when a snapshot is due.
-    pub fn increment_dirty(&mut self, namespace: &str) -> bool {
-        let count = self.dirty_counts.entry(namespace.to_string()).or_insert(0);
-        *count += 1;
-        *count >= self.snapshot_batch_size
-    }
-
-    pub fn reset_dirty(&mut self, namespace: &str) {
-        self.dirty_counts.insert(namespace.to_string(), 0);
     }
 
     /// Return the total_events counter for any namespace stored in `saved_states`
@@ -280,10 +264,6 @@ pub(crate) enum ApplyTarget {
 #[path = "persist/pending_hook_signal_tests.rs"]
 mod pending_hook_signal_tests;
 
-fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::internal_with_context(format!("brain persistence {context}"), e)
-}
-
 #[cfg(test)]
 #[path = "persist/sql_err_tests.rs"]
 mod sql_err_tests;
@@ -298,7 +278,8 @@ async fn append_brain_event_on_writer(
     payload: &Value,
     created_at_us: i64,
 ) -> Result<(), RuntimeError> {
-    let payload_str = serde_json::to_string(payload).map_err(|e| sql_err("serialize event", e))?;
+    let payload_str = serde_json::to_string(payload)
+        .map_err(|e| sql_err("brain persistence serialize event", e))?;
 
     writer
         .execute(SqlStatement {
@@ -325,8 +306,8 @@ async fn upsert_snapshot_on_writer(
     snapshot: &BrainStateSnapshot,
     updated_at_us: i64,
 ) -> Result<(), RuntimeError> {
-    let snapshot_json =
-        serde_json::to_string(snapshot).map_err(|e| sql_err("serialize snapshot", e))?;
+    let snapshot_json = serde_json::to_string(snapshot)
+        .map_err(|e| sql_err("brain persistence serialize snapshot", e))?;
 
     upsert_snapshot_json_on_writer(writer, namespace, snapshot_json, updated_at_us).await
 }
@@ -429,6 +410,55 @@ enum FeedbackMutationOutcome {
     Rejected(RuntimeError),
 }
 
+/// Select the transaction's authoritative snapshot without losing version-matched hook state.
+async fn rebase_snapshot_on_writer<R: SqlReader + ?Sized>(
+    writer: &mut R,
+    namespace: &str,
+    local_version: Option<i64>,
+    local_snapshot: BrainStateSnapshot,
+    entity_capacity: usize,
+    context: (&'static str, &'static str),
+    map_error: fn(&'static str, RuntimeError) -> khive_storage::StorageError,
+) -> khive_storage::StorageResult<(BrainState, Option<i64>)> {
+    let previous_updated_at = load_snapshot_version_on_reader(writer, namespace)
+        .await
+        .map_err(|e| map_error(context.0, e))?;
+    let base_snapshot = match previous_updated_at {
+        Some(updated_at) if local_version == Some(updated_at) => local_snapshot,
+        Some(updated_at) => {
+            let (durable_snapshot, reloaded_updated_at) =
+                load_latest_snapshot_on_reader(writer, namespace, entity_capacity)
+                    .await
+                    .map_err(|e| map_error(context.1, e))?
+                    .ok_or_else(|| {
+                        khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Sql,
+                            context.1,
+                            std::io::Error::other(
+                                "snapshot disappeared inside the write transaction",
+                            ),
+                        )
+                    })?;
+            if reloaded_updated_at != updated_at {
+                return Err(khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    context.1,
+                    std::io::Error::other(format!(
+                        "snapshot generation changed inside the write transaction: \
+                         expected {updated_at}, got {reloaded_updated_at}"
+                    )),
+                ));
+            }
+            durable_snapshot
+        }
+        None => local_snapshot,
+    };
+    Ok((
+        BrainState::from_snapshot(base_snapshot, entity_capacity),
+        previous_updated_at,
+    ))
+}
+
 /// Apply a `BrainState` mutation with durability as part of the success
 /// contract (issues #457/#458).
 ///
@@ -439,7 +469,7 @@ enum FeedbackMutationOutcome {
 /// snapshot are then persisted — brain event-log append AND
 /// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`. Only
 /// after that unit commits does the proposed state replace the live state
-/// and the tracker get marked clean. If `mutate` fails, or the atomic unit
+/// and the tracker record the committed version. If `mutate` fails, or the atomic unit
 /// fails to append, upsert, or commit, this returns `Err` and the live state
 /// is left completely untouched — there is no in-memory mutation to roll
 /// back because it was never applied to the shared state in the first
@@ -470,52 +500,25 @@ pub async fn persist_brain_state_mutation<R: Send + 'static>(
     let payload = event.payload;
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
-            let previous_updated_at = load_snapshot_version_on_reader(writer, &namespace_for_op)
-                .await
-                .map_err(|e| {
+            let (mut proposed, previous_updated_at) = rebase_snapshot_on_writer(
+                writer,
+                &namespace_for_op,
+                local_version,
+                local_snapshot,
+                entity_capacity,
+                (
+                    "brain_persist_load_snapshot_version",
+                    "brain_persist_load_snapshot",
+                ),
+                |step, error| {
                     khive_storage::StorageError::driver(
                         khive_storage::StorageCapability::Sql,
-                        "brain_persist_load_snapshot_version",
-                        e,
+                        step,
+                        error,
                     )
-                })?;
-            let base_snapshot = match previous_updated_at {
-                Some(updated_at) if local_version == Some(updated_at) => local_snapshot,
-                Some(updated_at) => {
-                    let (durable_snapshot, reloaded_updated_at) =
-                        load_latest_snapshot_on_reader(writer, &namespace_for_op, entity_capacity)
-                            .await
-                            .map_err(|e| {
-                                khive_storage::StorageError::driver(
-                                    khive_storage::StorageCapability::Sql,
-                                    "brain_persist_load_snapshot",
-                                    e,
-                                )
-                            })?
-                            .ok_or_else(|| {
-                                khive_storage::StorageError::driver(
-                                    khive_storage::StorageCapability::Sql,
-                                    "brain_persist_load_snapshot",
-                                    std::io::Error::other(
-                                        "snapshot disappeared inside the write transaction",
-                                    ),
-                                )
-                            })?;
-                    if reloaded_updated_at != updated_at {
-                        return Err(khive_storage::StorageError::driver(
-                            khive_storage::StorageCapability::Sql,
-                            "brain_persist_load_snapshot",
-                            std::io::Error::other(format!(
-                                "snapshot generation changed inside the write transaction: \
-                                 expected {updated_at}, got {reloaded_updated_at}"
-                            )),
-                        ));
-                    }
-                    durable_snapshot
-                }
-                None => local_snapshot,
-            };
-            let mut proposed = BrainState::from_snapshot(base_snapshot, entity_capacity);
+                },
+            )
+            .await?;
 
             let result = match mutate(&mut proposed) {
                 Ok(result) => result,
@@ -584,7 +587,6 @@ pub async fn persist_brain_state_mutation<R: Send + 'static>(
             if !matches!(t.snapshot_version(&namespace), Some(current) if current > snapshot_version)
             {
                 *state.lock().unwrap() = *proposed;
-                t.reset_dirty(&namespace);
                 t.mark_loaded_at(namespace, Some(snapshot_version));
             }
             Ok(result)
@@ -613,16 +615,26 @@ async fn load_latest_snapshot_on_reader<R: SqlReader + ?Sized>(
         Some(row) => {
             let json_str = match row.get("snapshot_json") {
                 Some(SqlValue::Text(s)) => s.clone(),
-                _ => return Err(sql_err("load snapshot", "missing snapshot_json column")),
+                _ => {
+                    return Err(sql_err(
+                        "brain persistence load snapshot",
+                        "missing snapshot_json column",
+                    ))
+                }
             };
             let updated_at = match row.get("updated_at") {
                 Some(SqlValue::Integer(n)) => *n,
-                _ => return Err(sql_err("load snapshot", "missing updated_at column")),
+                _ => {
+                    return Err(sql_err(
+                        "brain persistence load snapshot",
+                        "missing updated_at column",
+                    ))
+                }
             };
-            let snapshot: BrainStateSnapshot =
-                serde_json::from_str(&json_str).map_err(|e| sql_err("deserialize snapshot", e))?;
+            let snapshot: BrainStateSnapshot = serde_json::from_str(&json_str)
+                .map_err(|e| sql_err("brain persistence deserialize snapshot", e))?;
             validate_brain_state_snapshot_with_capacity(&snapshot, entity_capacity)
-                .map_err(|e| sql_err("snapshot invariant violation", e))?;
+                .map_err(|e| sql_err("brain persistence snapshot invariant violation", e))?;
             Ok(Some((snapshot, updated_at)))
         }
     }
@@ -656,7 +668,7 @@ async fn load_snapshot_version_on_reader<R: SqlReader + ?Sized>(
         None => Ok(None),
         Some(SqlValue::Integer(version)) => Ok(Some(version)),
         other => Err(sql_err(
-            "load snapshot version",
+            "brain persistence load snapshot version",
             format!("expected integer updated_at, got {other:?}"),
         )),
     }
@@ -902,11 +914,11 @@ async fn load_events_since_with_window(
             let log_row = category == ReplaySkipCategory::Quarantine
                 || policy_excluded_seen < POLICY_EXCLUDED_LOG_DETAIL_CAP;
             if log_row {
-                eprintln!(
+                tracing::warn!(
                     "[brain] event-log replay: {label} row id={row_id} profile={profile_id:?}: {reason}"
                 );
             } else if policy_excluded_seen == POLICY_EXCLUDED_LOG_DETAIL_CAP {
-                eprintln!(
+                tracing::warn!(
                     "[brain] event-log replay: further policy-excluded rows elided from per-row \
                      logging (cap {POLICY_EXCLUDED_LOG_DETAIL_CAP}); see the summary line for totals"
                 );
@@ -1001,7 +1013,7 @@ async fn load_events_since_with_window(
         .filter(|row| row.category == ReplaySkipCategory::PolicyExcluded)
         .count();
     if !quarantined.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[brain] event-log replay: {} row(s) quarantined, {} row(s) policy-excluded \
              out of {} total; replayed {} clean event(s)",
             quarantine_count,

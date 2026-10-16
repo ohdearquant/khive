@@ -23,6 +23,7 @@ khive-storage = { version = "0.13.0", path = "../khive-storage" }
 khive-score = { version = "0.13.0", path = "../khive-score" }
 khive-fusion = { version = "0.13.0", path = "../khive-fusion" }
 khive-fold = { version = "0.13.0", path = "../khive-fold" }
+khive-fs = { version = "0.13.0", path = "../khive-fs" }
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["vectors"] }
 khive-query = { version = "0.13.0", path = "../khive-query" }
 khive-gate = { version = "0.13.0", path = "../khive-gate" }
