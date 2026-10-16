@@ -63,11 +63,41 @@ impl fmt::Display for RightsClass {
 ///
 /// `Primary` rows live in the shared substrate and outlive stop, uninstall
 /// and purge. `Corpus` rows live in the store the manifest names and are
-/// dropped as a unit by purge.
+/// dropped as a unit by purge; a representation (an index, an embedding, a
+/// derived view) is a corpus row whose store is the index it lives in, so
+/// the `representation` token resolves to `Corpus`. `Blob` rows are content
+/// addressed and referenced from primary rows; they name no store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleClass {
     Primary,
     Corpus { store: String },
+    Blob,
+}
+
+impl LifecycleClass {
+    /// Resolve a wire token and the store it names, if any. `representation`
+    /// is an alias of `corpus`; a corpus token with no store resolves to an
+    /// empty store name, which [`AppManifest::validate`] refuses. Anything
+    /// else is `None`.
+    pub fn from_token(token: &str, store: Option<&str>) -> Option<Self> {
+        match token {
+            "primary" => Some(LifecycleClass::Primary),
+            "corpus" | "representation" => Some(LifecycleClass::Corpus {
+                store: store.unwrap_or_default().into(),
+            }),
+            "blob" => Some(LifecycleClass::Blob),
+            _ => None,
+        }
+    }
+
+    /// The canonical wire token for this class.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LifecycleClass::Primary => "primary",
+            LifecycleClass::Corpus { .. } => "corpus",
+            LifecycleClass::Blob => "blob",
+        }
+    }
 }
 
 /// The residency the app asks for; the host validates it against the

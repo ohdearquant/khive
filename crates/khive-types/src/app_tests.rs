@@ -250,3 +250,65 @@ fn residency_and_substrate_tokens_are_exact() {
     assert_eq!(RowSubstrate::Note.as_str(), "note");
     assert_eq!(RowSubstrate::Entity.as_str(), "entity");
 }
+
+#[test]
+fn lifecycle_tokens_resolve_with_representation_as_a_corpus_alias() {
+    assert_eq!(
+        LifecycleClass::from_token("primary", None),
+        Some(LifecycleClass::Primary)
+    );
+    assert_eq!(
+        LifecycleClass::from_token("corpus", Some("album-features")),
+        Some(LifecycleClass::Corpus {
+            store: "album-features".into(),
+        })
+    );
+    assert_eq!(
+        LifecycleClass::from_token("representation", Some("album-index")),
+        Some(LifecycleClass::Corpus {
+            store: "album-index".into(),
+        })
+    );
+    assert_eq!(
+        LifecycleClass::from_token("blob", None),
+        Some(LifecycleClass::Blob)
+    );
+    assert_eq!(LifecycleClass::from_token("derived", None), None);
+    assert_eq!(LifecycleClass::from_token("Primary", None), None);
+    for (token, store) in [("primary", None), ("corpus", Some("s")), ("blob", None)] {
+        let class = LifecycleClass::from_token(token, store).unwrap();
+        assert_eq!(class.as_str(), token);
+    }
+    assert_eq!(
+        LifecycleClass::from_token("representation", Some("s"))
+            .unwrap()
+            .as_str(),
+        "corpus"
+    );
+}
+
+#[test]
+fn a_representation_without_a_store_refuses_like_a_corpus() {
+    let mut manifest = album();
+    manifest.row_types[0].lifecycle = LifecycleClass::from_token("representation", None).unwrap();
+    assert_eq!(
+        manifest.validate(),
+        Err(InstallRefusal::CorpusWithoutStore {
+            substrate: RowSubstrate::Entity,
+            kind: "photo".into(),
+        })
+    );
+}
+
+#[test]
+fn a_blob_row_type_validates_without_a_store() {
+    let mut manifest = album();
+    manifest.entity_kinds.push("original".into());
+    manifest.row_types.push(RowTypeDecl {
+        substrate: RowSubstrate::Entity,
+        kind: "original".into(),
+        lifecycle: LifecycleClass::Blob,
+    });
+    assert_eq!(manifest.validate(), Ok(()));
+    assert_eq!(manifest.admit(&[gtd_names()]), Ok(()));
+}
