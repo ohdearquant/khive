@@ -20,7 +20,7 @@ in `khive-types`) — no full-parity prepare/apply seam exists for them yet. Emb
 read, or unlisted verbs are likewise rejected before any write.
 
 The CLI is not the runner's sole production consumer: runtime callers can also supply prepared
-plans directly — the hard-delete path (`atomic_hard_delete_with_edge_purge` in `operations.rs`)
+plans directly — the hard-delete path (`atomic_hard_delete_with_edge_purge` in `operations/delete_restore.rs`)
 constructs a `DeletePlan` and invokes `run_atomic_unit` for its row-delete + incident-edge purge.
 Entity admission also supplies opaque `FinalizeEntity` plans for singleton and bulk writes.
 Their constructors are runtime-private. Tests construct ordinary plans directly as well.

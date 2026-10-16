@@ -135,7 +135,7 @@ fn events(outcome: &GraphMutationEventOutcome) -> StorageResult<Vec<Event>> {
         "local",
         "link",
         EventKind::LinkCreated,
-        SubstrateKind::Edge,
+        SubstrateKind::Entity,
         "fixture",
     )
     .with_payload(

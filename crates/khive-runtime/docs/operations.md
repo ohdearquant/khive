@@ -7,10 +7,24 @@ The in-source comments carry only short pointers here.
 
 ## Module layout
 
-`operations.rs` retains the shared types and remaining production verb bodies. Entity create and
-claim live in `operations/entity_create.rs`; bulk preparation lives in `operations/entity_bulk.rs`.
-`operations/entity_indexes.rs` prepares required indexes and attachments before admitted candidates
-enter the writer. Public method paths are unchanged. Fault-injection state,
+`operations.rs` retains shared types, endpoint matching and base rules, note creation and search,
+and note restoration. Its other concerns live in private children:
+
+| Module under `operations/` | Responsibility |
+| --- | --- |
+| `read_helpers.rs` | Search result types, UUID prefix helpers, previews and embedding-task collection |
+| `record_ops.rs` | Record reads, counts, event listing and note-plan preparation |
+| `identity_reads.rs` | UUID prefix and substrate resolution |
+| `graph_rules.rs` | Endpoint validation, relation rules and edge metadata |
+| `link_ops.rs` | Single and batch links and edge construction |
+| `traversal.rs` | Neighbors, traversal and graph-result enrichment |
+| `delete_restore.rs` | Atomic hard deletion, entity/edge restoration and record deletion |
+| `edge_query.rs` | Graph queries and edge reads, updates and deletion |
+
+Entity create and claim live in `operations/entity_create.rs`; bulk entity preparation lives in
+`operations/entity_bulk.rs`. `operations/entity_indexes.rs` prepares required indexes and
+attachments before admitted candidates enter the writer. Public method and type paths remain
+unchanged through inherent implementations and parent reexports. Fault-injection state,
 scoped guards and arming helpers live in `src/operations/fault_injection.rs`; the parent re-exports
 the existing public and crate-visible APIs and imports only the private state its operations use.
 The child exposes those internal items to its parent with `pub(super)` access.

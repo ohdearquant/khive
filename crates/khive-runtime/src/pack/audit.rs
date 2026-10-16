@@ -170,6 +170,28 @@ pub fn audit_admission_refused_obligation_last_at_ms() -> Option<u64> {
     }
 }
 
+/// Cumulative count of successful admission-degrade-safe reads whose audit
+/// generation exhausted its bounded transient retries (ADR-154 Amendment 2).
+/// These rows received no commit acknowledgement. They are separate from
+/// refusals before enqueue and from callers whose row is still unresolved.
+static AUDIT_RETRY_EXHAUSTED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AUDIT_RETRY_EXHAUSTED_OBLIGATIONS_LAST_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Safe-read audit obligations whose generation exhausted its retry budget.
+pub fn audit_retry_exhausted_obligation_count() -> u64 {
+    AUDIT_RETRY_EXHAUSTED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Wall-clock milliseconds of the last increment, or `None` before the first.
+pub fn audit_retry_exhausted_obligation_last_at_ms() -> Option<u64> {
+    match AUDIT_RETRY_EXHAUSTED_OBLIGATIONS_LAST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        at => Some(at),
+    }
+}
+
 /// Process-wide count of `DispatchObligation` rows that were **already
 /// enqueued but had not resolved by the time the caller's admission wait
 /// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for a
@@ -441,6 +463,7 @@ pub(super) async fn persist_git_digest_receipt(
 /// process-wide diagnostics counters above; the one exception is the
 /// admission-degrade case below, which increments one of its own dedicated
 /// [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`] /
+/// [`AUDIT_RETRY_EXHAUSTED_OBLIGATIONS`] /
 /// [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`] counters instead — it is
 /// neither a swallowed observability failure nor a propagated obligation
 /// failure.
@@ -450,8 +473,9 @@ pub(super) async fn persist_git_digest_receipt(
 /// for a verb that [`VerbRegistry::admission_degrade_safe`] has explicitly
 /// opted in (Assertive alone is not a sufficient signal — see that method's
 /// doc) performs no domain write, so this row's own admission being
-/// transiently refused or timed out (`AuditTerminalReason::QueueAdmissionExhausted`
-/// / `AdmissionDeadlineExpired`) degrades to best-effort instead of failing
+/// transiently refused, timing out, or exhausting bounded transient retries
+/// (`AuditTerminalReason::QueueAdmissionExhausted` / `AdmissionDeadlineExpired`
+/// / `RetryExhausted`) degrades to best-effort instead of failing
 /// the dispatch — the caller-visible read result is preserved. This function
 /// derives eligibility from `producer` itself rather than trusting the
 /// caller's `degrade_allowlisted` answer in isolation, so a `DispatchFailed`
@@ -462,7 +486,7 @@ pub(super) async fn persist_git_digest_receipt(
 /// generation commits it independently of the caller's wait, so failing the
 /// dispatch would report a committed domain write as failed while changing
 /// nothing about the row. `QueueAdmissionExhausted` (refused before enqueue,
-/// a confirmed loss) still fails a write's dispatch.
+/// a confirmed loss) and `RetryExhausted` still fail a write's dispatch.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -517,8 +541,8 @@ pub(super) async fn append_audit_event_best_effort(
                 // wait deadline elapsed on a row that is still likely to commit),
                 // failing the read discards a valid result to protect an
                 // obligation the read never needed as strictly as a write does.
-                // Any other reason (a definite store/durability failure) still
-                // fails the dispatch for reads exactly as it does for writes.
+                // Exhausting bounded transient retries also degrades a safe
+                // read. Other store/durability failures remain strict.
                 //
                 // The two admission-pressure reasons are not the same fact and
                 // are counted on separate counters: `QueueAdmissionExhausted`
@@ -557,6 +581,18 @@ pub(super) async fn append_audit_event_best_effort(
                         "read verb's audit obligation row was refused before \
                          enqueue under audit-lane admission pressure; dispatch \
                          still reports its own result (non-fatal)"
+                    );
+                    return Ok(());
+                }
+                if admission_degrade_eligible && reason == AuditTerminalReason::RetryExhausted {
+                    AUDIT_RETRY_EXHAUSTED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mark_admission_obligation_counter(&AUDIT_RETRY_EXHAUSTED_OBLIGATIONS_LAST_MS);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        "read verb's audit generation exhausted bounded transient retries; \
+                         dispatch still reports its own result (non-fatal)"
                     );
                     return Ok(());
                 }

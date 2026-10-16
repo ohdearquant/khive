@@ -501,6 +501,7 @@ async fn queued_request_probes_after_begin_rolls_back_and_task_recovers() {
             false,
             false,
             false,
+            SubmitLabels::None,
         )
         .await
         .expect("second request must be queued while first holds the lease");

@@ -15,14 +15,14 @@ description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-e
 bench = false
 
 [dependencies]
-khive-hnsw    = { version = "0.12.0", path = "../khive-hnsw", optional = true }
-khive-bm25    = { version = "0.12.0", path = "../khive-bm25", optional = true }
-khive-fusion  = { version = "0.12.0", path = "../khive-fusion" }
-khive-score   = { version = "0.12.0", path = "../khive-score" }
-khive-types   = { version = "0.12.0", path = "../khive-types" }
-khive-fold    = { version = "0.12.0", path = "../khive-fold", optional = true }
-khive-storage = { version = "0.12.0", path = "../khive-storage", optional = true }
-khive-gate    = { version = "0.12.0", path = "../khive-gate", optional = true }
+khive-hnsw    = { version = "0.13.0", path = "../khive-hnsw", optional = true }
+khive-bm25    = { version = "0.13.0", path = "../khive-bm25", optional = true }
+khive-fusion  = { version = "0.13.0", path = "../khive-fusion" }
+khive-score   = { version = "0.13.0", path = "../khive-score" }
+khive-types   = { version = "0.13.0", path = "../khive-types" }
+khive-fold    = { version = "0.13.0", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.13.0", path = "../khive-storage", optional = true }
+khive-gate    = { version = "0.13.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
 
 serde = { workspace = true }
@@ -54,10 +54,12 @@ policy = ["khive-gate"]
 # Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
 checkpoint = ["hnsw", "khive-fold", "khive-hnsw/checkpoint"]
 # SQLite-based persistence for HNSW and BM25 indexes
-persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand"]
+persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand", "khive-storage"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
 # The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
 storage-adapters = ["khive-storage"]
+# Shared candidate execution with the existing request-scoped storage context.
+executor = ["khive-storage"]
 # Native cross-encoder reranking (deferred until khive-inference is ported)
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
@@ -69,10 +71,11 @@ ann = ["khive-storage", "tracing"]
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-score = { version = "0.12.0", path = "../khive-score" }
-khive-fusion = { version = "0.12.0", path = "../khive-fusion" }
-# Only the storage-adapters and ann registry tests use khive-db; `vectors` loads sqlite-vec.
-khive-db = { version = "0.12.0", path = "../khive-db", features = ["vectors"] }
+tokio = { workspace = true, features = ["test-util"] }
+khive-score = { version = "0.13.0", path = "../khive-score" }
+khive-fusion = { version = "0.13.0", path = "../khive-fusion" }
+# Storage adapter, ANN registry and persistent weight tests use khive-db; `vectors` loads sqlite-vec.
+khive-db = { version = "0.13.0", path = "../khive-db", features = ["vectors", "test-support"] }
 
 [[bench]]
 name = "fusion_bench"

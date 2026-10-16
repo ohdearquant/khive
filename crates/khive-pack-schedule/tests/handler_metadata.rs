@@ -143,3 +143,28 @@ fn all_schedule_handlers_have_non_empty_params() {
         );
     }
 }
+
+#[test]
+fn both_creation_verbs_describe_explicit_catch_up_bound_without_a_period_default() {
+    for verb in ["schedule.remind", "schedule.schedule"] {
+        let h = find_handler(verb);
+        let policy = h
+            .params
+            .iter()
+            .find(|p| p.name == "misfire_policy")
+            .expect("policy metadata");
+        assert_eq!(policy.param_type, "string");
+        assert!(!policy.required);
+        assert!(policy.description.contains("catch_up_once"));
+        assert!(policy.description.contains("one-shot"));
+        let bound = h
+            .params
+            .iter()
+            .find(|p| p.name == "max_lateness")
+            .expect("bound metadata");
+        assert_eq!(bound.param_type, "integer");
+        assert!(!bound.required);
+        assert!(bound.description.contains("positive"));
+        assert!(bound.description.contains("No period-derived default"));
+    }
+}

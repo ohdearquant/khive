@@ -44,6 +44,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: component-${{ inputs.component }}
 
       - name: Compile-check this component's bench targets

@@ -3,7 +3,10 @@
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 /// The cursor is pack-owned; indexes on notes belong to core migration V52.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 1] = [COMM_CHANNEL_CURSOR_SCHEMA_STMT];
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
+    COMM_CHANNEL_CURSOR_SCHEMA_STMT,
+    COMM_SUPPRESSION_SCHEMA_STMT,
+];
 
 /// Pack-owned auxiliary cursor table for durable channel poll progress (issue
 /// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See
@@ -11,7 +14,133 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 1] = [COMM_CHANNEL_CURSOR_SCHEM
 pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     khive_runtime::sql!("channel_cursor_create");
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
+pub(crate) const COMM_SUPPRESSION_SCHEMA_STMT: &str =
+    khive_runtime::sql!("comm_suppression_create");
+
+pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
+    HandlerDef {
+        name: "comm.suppression_add",
+        description: "Add a suppression entry for an email address, exact domain, or recipient key. Address values are normalized with the shared email recipient normalizer; domain values are ASCII-lowercased and match that domain only.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "scope",
+                param_type: "string",
+                required: true,
+                description: "Suppression direction: `outbound` or `inbound`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: true,
+                description: "Value type: `address`, `domain`, or `recipient_key`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "value",
+                param_type: "string",
+                required: true,
+                description: "Address, exact domain, or opaque recipient key to suppress.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: true,
+                description: "Entry source: `operator`, `mailto_token`, `one_click`, or `reply_stop`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: false,
+                description: "Optional free-text reason recorded with the entry.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.suppression_list",
+        description: "List live email suppression entries, optionally filtered by scope and kind.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "scope",
+                param_type: "string",
+                required: false,
+                description: "Optional scope filter: `outbound` or `inbound`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Optional kind filter: `address`, `domain`, or `recipient_key`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Page size, default 100, maximum 500.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "offset",
+                param_type: "integer",
+                required: false,
+                description: "Number of matching entries to skip, default 0.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.suppression_remove",
+        description: "Remove one suppression entry. A non-empty reason is required; opt-out entries also require a later authenticated inbound message from the same address as evidence.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "Full UUID of the suppression entry.",
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: true,
+                description: "Non-empty reason for removing this entry; included in the audit event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "evidence_inbound_message_id",
+                param_type: "uuid",
+                required: false,
+                description: "Full UUID of an authenticated later inbound email from the suppressed address; required for opt-out sources.",
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.withheld_body",
+        description: "Read the original RFC 5322 bytes of a delivered withheld message, base64-encoded with their size. Open to the message's recipient actor and to the configured maintainer; every other caller is refused before the original is read. Never returns a content reference, and every call is audited.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Short 8-char prefix or full UUID of the delivered withheld message.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
@@ -623,6 +752,55 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
                 description: "RFC 3339 timestamp of this poll attempt. Defaults to now.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "held_messages",
+                param_type: "integer",
+                required: false,
+                description: "Messages that held the page this poll. Success outcome only; accepted by a writer that bounds its holds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "quarantined_after_hold",
+                param_type: "integer",
+                required: false,
+                description: "Messages given a terminal disposition this poll because their failed polls reached the writer's bound. Success outcome only.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "originals_not_retained",
+                param_type: "integer",
+                required: false,
+                description: "Records written this poll without their original, across every reason including the retention limit. Success outcome only; added to the row's running total.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "original_not_retained_reason",
+                param_type: "string",
+                required: false,
+                description: "The last reason a record was written without its original this poll: retention-limit | original-unavailable | retention-count-unreadable | original-store-failed | quarantine-write-failed | secondary-backend. Required exactly when originals_not_retained is above zero, refused otherwise.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "original_retention_state",
+                param_type: "string",
+                required: false,
+                description: "Whether the writer kept its originals this poll: retained | failing. Replaced by each success that reports it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "notices_failed",
+                param_type: "integer",
+                required: false,
+                description: "Notice sends that failed this poll. Success outcome only; added to the row's running total.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "notice_config_error",
+                param_type: "string",
+                required: false,
+                description: "Short description of a notice configuration problem, at most 255 bytes with no control characters. Success outcome only; cleared by a later success that omits it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     HandlerDef {
@@ -642,7 +820,16 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
                        counts remain namespace-wide. Heartbeat entries include their \
                        nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
                        fact. `stalled` becomes true after three missed nominal intervals; it is \
-                       null for legacy/malformed rows and known failure/backoff state. This is \
+                       null for legacy/malformed rows and known failure/backoff state. \
+                       `consecutive_held_polls` counts successive polls on which at least one \
+                       message held the channel's page (0 after a poll with no hold), with \
+                       `held_messages` from the latest poll, `last_held_at` and \
+                       `last_quarantined_after_hold_at`; all four are null when the writer does \
+                       not report holds. `originals_not_retained` and `notices_failed` are \
+                       running totals with `last_original_not_retained_at`, \
+                       `last_original_not_retained_reason`, `original_retention_state`, \
+                       `last_notice_failed_at` and `notice_config_error`; all seven are null \
+                       when the writer does not report them. This is \
                        not a computed healthy bool; overall \
                        health judgment belongs to the caller. Reads from the caller's injected \
                        namespace — `token.namespace()`, the same explicit \
