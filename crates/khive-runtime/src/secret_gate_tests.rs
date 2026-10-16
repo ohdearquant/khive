@@ -4971,3 +4971,108 @@ fn block_message_shape_guidance_names_effective_boundary() {
         "shape-based detector guidance must name an effective context boundary: {rendered}"
     );
 }
+
+#[test]
+fn allows_head_and_equals_revision_markers_near_auth_prose() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    for reference in [
+        format!("head={revision}"),
+        format!("head {revision}"),
+        format!("head:{revision}"),
+        format!("sha={revision}"),
+        format!("commit={revision}"),
+        format!("revision={revision}"),
+        format!("rev={revision}"),
+        format!("HEAD={}", revision.to_ascii_uppercase()),
+        format!("[head={revision}]"),
+        format!("`sha={revision}`"),
+    ] {
+        let content = format!("auth review uses {reference}");
+        assert!(
+            check(&content).is_ok(),
+            "an explicit Git revision in ordinary auth prose must pass: {content:?}, got {:?}",
+            scan(&content)
+        );
+        assert_eq!(mask_secrets(&content), content);
+    }
+}
+
+#[test]
+fn head_and_equals_revision_markers_do_not_hide_credential_labels() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    for label in ["key", "auth", "token"] {
+        let content = format!("{label}={revision}");
+        assert_eq!(
+            scan(&content).map(|matched| matched.detector),
+            Some("hex-credential-token"),
+            "direct credential assignments must stay blocked: {content:?}"
+        );
+        assert!(!mask_secrets(&content).contains(revision));
+    }
+    for label in ["api key value is", "auth value is", "token value is"] {
+        for marker in ["head", "sha"] {
+            for separator in [" ", "=", ":"] {
+                let content = format!("{label} {marker}{separator}{revision}");
+                assert_eq!(
+                    scan(&content).map(|matched| matched.detector),
+                    Some("hex-credential-token"),
+                    "a VCS marker must not shield the same-clause credential label: {content:?}"
+                );
+                assert!(!mask_secrets(&content).contains(revision));
+            }
+        }
+    }
+}
+
+#[test]
+fn revision_marker_exemption_requires_exactly_forty_hex_digits() {
+    // These lengths retain the existing detector policy; neither receives
+    // the exact-40-hex VCS exemption, regardless of its marker syntax.
+    for length in [39, 41] {
+        let value = "a".repeat(length);
+        for marker in ["head", "sha"] {
+            for separator in ["=", ":"] {
+                let content = format!("{marker}{separator}{value}");
+                assert!(!is_git_revision_reference(&content, 0, &content));
+            }
+            let content = format!("{marker} {value}");
+            assert!(!is_vcs_marker_before_hex(
+                &content,
+                &content[..marker.len()]
+            ));
+            let offset = marker.len() + 1;
+            assert!(!is_git_revision_reference(
+                &content,
+                offset,
+                &content[offset..]
+            ));
+        }
+    }
+}
+
+#[test]
+fn head_revision_marker_preserves_sentence_and_known_prefix_rules() {
+    let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    let content = format!("rotate the api key. the fix is head={revision}");
+    assert!(check(&content).is_ok());
+    assert_eq!(mask_secrets(&content), content);
+
+    let provider = "AKIAFAKEKEY1234567890";
+    let content = format!("auth review uses head={revision} and {provider}");
+    assert_eq!(scan(&content).unwrap().detector, "aws-access-key-id");
+    assert!(!mask_secrets(&content).contains(provider));
+}
+
+#[test]
+fn head_marker_does_not_exempt_a_split_credential() {
+    let first = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+    let second = "0123456789abcdef01234567";
+    let content = format!("api token context: head {first}\u{200B}{second}");
+    assert_eq!(
+        scan(&content).map(|matched| matched.detector),
+        Some("hex-credential-token")
+    );
+    let masked = mask_secrets(&content);
+    assert!(!masked.contains(first));
+    assert!(!masked.contains(second));
+}
