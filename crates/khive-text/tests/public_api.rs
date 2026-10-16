@@ -102,6 +102,58 @@ fn acronym_parts_obey_the_configured_minimum_without_dropping_the_original() {
 }
 
 #[test]
+fn plural_acronyms_stay_whole_through_public_tokenizers() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    let tokenizer = IdentifierTokenizer::default();
+    for input in ["APIs", "IDs", "URLs"] {
+        assert!(!is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+        assert_eq!(tokenizer.tokenize(input), vec![input]);
+        assert_eq!(preset::kg_name().analyze(input), vec![input.to_lowercase()]);
+    }
+    assert_eq!(preset::kg_name().analyze("REST APIs"), vec!["rest", "apis"]);
+    assert_eq!(preset::kg_name().analyze("IDs URLs"), vec!["ids", "urls"]);
+    assert_eq!(tokenizer.tokenize("(APIs), URLs!"), vec!["APIs", "URLs"]);
+    // The `s` starts a longer lowercase run, so the acronym boundary is before `L`.
+    assert!(is_identifier("URLsafe"));
+    assert_eq!(split_identifier("URLsafe", 1), vec!["ur", "lsafe"]);
+    assert_eq!(
+        tokenizer.tokenize("URLsafe"),
+        vec!["urlsafe", "ur", "lsafe"]
+    );
+    assert_eq!(
+        preset::kg_name().analyze("URLsafe"),
+        vec!["urlsafe", "ur", "lsafe"]
+    );
+}
+
+#[test]
+fn plural_suffixes_do_not_hide_adjacent_identifier_boundaries() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    for (input, parts) in [
+        ("APIsClient", vec!["apis", "client"]),
+        ("IDs_URLs", vec!["ids", "urls"]),
+        ("APIs2", vec!["apis", "2"]),
+        ("XMLParser", vec!["xml", "parser"]),
+        ("HTTPServer", vec!["http", "server"]),
+        ("XMLToJSON", vec!["xml", "to", "json"]),
+        ("PDFToText", vec!["pdf", "to", "text"]),
+        ("XMLTo", vec!["xml", "to"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), parts, "{input}");
+    }
+    assert_eq!(
+        IdentifierTokenizer { min_part_len: 4 }.tokenize("IDs_URLs"),
+        vec!["ids_urls", "urls"]
+    );
+}
+
+#[test]
 fn acronym_detection_preserves_plain_word_and_whitespace_rules() {
     use khive_text::identifier::is_identifier;
     use khive_text::tokenizer::IdentifierTokenizer;
@@ -116,6 +168,106 @@ fn acronym_detection_preserves_plain_word_and_whitespace_rules() {
     assert!(!is_identifier("XMLParser HTTPServer"));
     assert!(!is_identifier("XMLParser\u{2003}HTTPServer"));
     assert_eq!(tokenizer.tokenize("XML Parser"), vec!["XML", "Parser"]);
+}
+
+#[test]
+fn s_initial_words_and_terminal_plurals_reach_all_public_entrypoints() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    let tokenizer = IdentifierTokenizer::default();
+    for (input, parts) in [
+        ("DBUsers", vec!["db", "users"]),
+        ("APIUsage", vec!["api", "usage"]),
+        ("DBUsersGuide", vec!["db", "users", "guide"]),
+        ("dbUsers", vec!["db", "users"]),
+        ("dBUsers", vec!["d", "b", "users"]),
+        ("APIsFoo", vec!["apis", "foo"]),
+        // This has the same character shape as APIsFoo: no dictionary distinguishes "Is".
+        ("XMLIsEmpty", vec!["xmlis", "empty"]),
+        ("APIs2Users", vec!["apis", "2", "users"]),
+        ("DBUsers2APIs", vec!["db", "users", "2", "apis"]),
+    ] {
+        assert!(is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), parts, "{input}");
+        let mut expected = vec![input.to_lowercase()];
+        expected.extend(parts.into_iter().map(str::to_owned));
+        assert_eq!(tokenizer.tokenize(input), expected, "{input}");
+        assert_eq!(preset::kg_name().analyze(input), expected, "{input}");
+    }
+    let punctuated = "(DBUsers),\u{2003}APIUsage! APIsFoo";
+    assert!(!is_identifier(punctuated));
+    let expected = vec![
+        "dbusers", "db", "users", "apiusage", "api", "usage", "apisfoo", "apis", "foo",
+    ];
+    assert_eq!(tokenizer.tokenize(punctuated), expected);
+    assert_eq!(preset::kg_name().analyze(punctuated), expected);
+}
+
+#[test]
+fn plural_and_s_initial_word_parts_survive_each_separator() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    for separator in ["_", "-", ".", "/", ":", "::"] {
+        let input = format!("APIs{separator}DBUsers");
+        assert!(is_identifier(&input), "{input}");
+        assert_eq!(split_identifier(&input, 1), vec!["apis", "db", "users"]);
+        let expected = vec![
+            input.to_lowercase(),
+            "apis".into(),
+            "db".into(),
+            "users".into(),
+        ];
+        assert_eq!(
+            IdentifierTokenizer::default().tokenize(&input),
+            expected,
+            "{input}"
+        );
+        assert_eq!(preset::kg_name().analyze(&input), expected, "{input}");
+    }
+}
+
+#[test]
+fn s_initial_word_parts_respect_minimum_but_keep_the_original_token() {
+    use khive_text::identifier::split_identifier;
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    for (input, minimum, parts) in [
+        ("DBUsers", 0, vec!["db", "users"]),
+        ("DBUsers", 3, vec!["users"]),
+        ("DBUsers", 6, vec![]),
+        ("APIUsage", 4, vec!["usage"]),
+        ("APIUsage", 20, vec![]),
+        ("APIsFoo", 4, vec!["apis"]),
+    ] {
+        assert_eq!(split_identifier(input, minimum), parts, "{input}/{minimum}");
+        let mut expected = vec![input.to_lowercase()];
+        expected.extend(parts.into_iter().map(str::to_owned));
+        assert_eq!(
+            IdentifierTokenizer {
+                min_part_len: minimum
+            }
+            .tokenize(input),
+            expected,
+            "{input}/{minimum}"
+        );
+    }
+}
+
+#[test]
+fn lowercase_titlecase_uppercase_and_non_ascii_words_keep_plain_token_behavior() {
+    use khive_text::identifier::{is_identifier, split_identifier};
+    use khive_text::tokenizer::IdentifierTokenizer;
+
+    for input in [
+        "dbusers", "Dbusers", "DBUSERS", "APIs", "APIsé", "ÉUsers", "Users",
+    ] {
+        assert!(!is_identifier(input), "{input}");
+        assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
+        assert_eq!(IdentifierTokenizer::default().tokenize(input), vec![input]);
+        assert_eq!(preset::kg_name().analyze(input), vec![input.to_lowercase()]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +287,7 @@ fn script_profile_reexport() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_reexport() {
     assert!(khive_text::is_meaningful_query("search term"));
     assert!(!khive_text::is_meaningful_query(""));

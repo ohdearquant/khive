@@ -315,7 +315,7 @@ async fn request(
     let text = result
         .content
         .first()
-        .and_then(|content| content.raw.as_text())
+        .and_then(|content| content.as_text())
         .expect("MCP request must return a JSON text envelope");
     let body: Value = serde_json::from_str(&text.text)?;
     let results = body["results"].as_array().expect("per-operation results");

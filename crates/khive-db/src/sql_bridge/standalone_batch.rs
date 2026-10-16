@@ -4,6 +4,7 @@ use super::*;
 /// was poisoned (dropped instead of restored), if it was.
 pub(super) struct BatchFailure {
     pub(super) error: rusqlite::Error,
+    pub(super) stage: khive_storage::error::SqliteWriteStage,
     pub(super) poison_reason: Option<BatchPoisonReason>,
 }
 
@@ -38,6 +39,7 @@ pub(super) fn execute_standalone_batch(
                 BatchHandleDisposition::Retain,
                 Err(StandaloneWriteError::Sql(BatchFailure {
                     error,
+                    stage: khive_storage::error::SqliteWriteStage::Statement,
                     poison_reason: None,
                 })),
             );
@@ -67,6 +69,7 @@ pub(super) fn execute_standalone_batch(
             disposition,
             Err(StandaloneWriteError::Sql(BatchFailure {
                 error: begin_error,
+                stage: khive_storage::error::SqliteWriteStage::Begin,
                 poison_reason,
             })),
         );
@@ -98,8 +101,10 @@ pub(super) fn execute_standalone_batch(
     // ROLLBACK so the registry never reports a transaction as finished early.
     let _tx_handle =
         khive_storage::tx_registry::register_scoped(Some("execute_batch".to_string()), origin);
+    let mut stage = khive_storage::error::SqliteWriteStage::Statement;
     let result = (|| -> Result<u64, rusqlite::Error> {
         let total = execute_prepared_batch(conn, prepared, statements, event_rows)?;
+        stage = khive_storage::error::SqliteWriteStage::Commit;
         conn.execute_batch("COMMIT")?;
         Ok(total)
     })();
@@ -128,6 +133,7 @@ pub(super) fn execute_standalone_batch(
         result.map_err(|error| {
             StandaloneWriteError::Sql(BatchFailure {
                 error,
+                stage,
                 poison_reason,
             })
         }),

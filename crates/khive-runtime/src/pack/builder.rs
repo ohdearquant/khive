@@ -7,7 +7,7 @@ use khive_gate::{AllowAllGate, GateRef};
 use khive_storage::EventStore;
 #[cfg(doc)]
 use khive_storage::EventView;
-use khive_types::Namespace;
+use khive_types::{Namespace, NotePropertyPolicySpec};
 use serde_json::Value;
 
 use crate::error::{
@@ -28,6 +28,7 @@ use super::{PackFactory, PackRegistry};
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    pub(super) pack_versions: HashMap<String, &'static str>,
     /// Parallel to `packs`: whether the composition root vouches for the
     /// pack at the same index, recorded by the registration method the
     /// *caller* chose rather than anything the pack reports about itself.
@@ -84,6 +85,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            pack_versions: HashMap::new(),
             pack_trusted: Vec::new(),
             disabled_verbs: HashMap::new(),
             resolvers: Vec::new(),
@@ -487,6 +489,7 @@ impl VerbRegistryBuilder {
                 disabled_verbs.insert(handler.name);
             }
         }
+        let note_property_policies = collect_note_property_policies(&ordered_packs)?;
         if activate {
             for pack in &ordered_packs {
                 pack.validate_config()?;
@@ -607,6 +610,8 @@ impl VerbRegistryBuilder {
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             attributed_edge_rules: Arc::new(attributed_edge_rules),
+            pack_versions: Arc::new(self.pack_versions),
+            note_property_policies: Arc::new(note_property_policies),
             resolvers: Arc::new(self.resolvers),
             kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
@@ -625,6 +630,37 @@ impl VerbRegistryBuilder {
             audit_batch,
         })
     }
+}
+
+/// Validate and capture property metadata in topological pack/declaration order.
+fn collect_note_property_policies(
+    packs: &[Box<dyn PackRuntime>],
+) -> Result<Vec<NotePropertyPolicySpec>, RuntimeError> {
+    let mut policies = Vec::new();
+    let mut seen = HashSet::new();
+    for pack in packs {
+        let owned_kinds = pack.note_kinds();
+        for spec in pack.note_property_policies() {
+            if !owned_kinds.contains(&spec.kind) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares property policy for unowned note kind {:?}, key {:?}",
+                    pack.name(),
+                    spec.kind,
+                    spec.key
+                )));
+            }
+            if !seen.insert((spec.kind, spec.key)) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares duplicate property policy for note kind {:?}, key {:?}",
+                    pack.name(),
+                    spec.kind,
+                    spec.key
+                )));
+            }
+            policies.push(*spec);
+        }
+    }
+    Ok(policies)
 }
 
 /// Validate that no two packs declare the same note kind.
@@ -846,6 +882,11 @@ impl PackMetadataRegistry {
 
     pub fn pack_names(&self) -> Vec<&str> {
         self.registry.pack_names()
+    }
+
+    /// Factory-reported version, if this pack was registered through a factory.
+    pub fn pack_version(&self, name: &str) -> Option<&'static str> {
+        self.registry.pack_version(name)
     }
 
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {

@@ -3,6 +3,7 @@
 mod feedback;
 pub(crate) mod handlers;
 pub(crate) mod knowledge;
+mod lint;
 mod pack;
 mod vocab;
 

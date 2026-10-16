@@ -42,6 +42,11 @@ cd crates && cargo bench -p khive-pack-memory --bench memory_bench -- --test
 
 - Benchmarks require a release build (`--release`) for representative latency numbers.
 - Set `KHIVE_RECALL_PROFILE=1` to emit per-stage JSON timing to stderr during recall.
+  The `c` field identifies the recall across async worker changes and concurrent calls.
+  Each profiled handler emits one `total` record on completion, including empty or
+  verbose responses, errors and cancellation. Its duration covers the handler;
+  stages that were never reached are omitted. A `total` record alone does not imply
+  success. The environment setting is cached for the lifetime of the process.
 - FTS-gather strategies are controlled via env vars: `KHIVE_RECALL_FTS_GATHER`,
   `KHIVE_RECALL_FTS_TERM_K`, `KHIVE_RECALL_FTS_SELECTION`, `KHIVE_RECALL_FTS_GATHER_LIMIT`,
   `KHIVE_RECALL_FTS_GATHER_MULTIPLIER`, `KHIVE_RECALL_FTS_CJK_BYPASS`.
@@ -70,7 +75,6 @@ selection (lowest_df / highest_idf) drops meaningful terms and loses recall, and
 - vs prior: first formal release ledger entry — no prior comparable baseline
 
 #### `memory_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
-
 
 | Scenario                             | Low      | Median   | High     | Outliers   |
 | ------------------------------------ | -------- | -------- | -------- | ---------- |

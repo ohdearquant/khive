@@ -872,13 +872,25 @@ async fn unknown_link_usage() {
     )
     .await
     .expect_err("actual COMMIT and ROLLBACK refusal");
+    let RuntimeError::Storage(storage_error) = &error else {
+        panic!("expected a storage error from the real COMMIT refusal: {error:?}");
+    };
+    assert_eq!(
+        storage_error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_AUTH,
+            extended_code: rusqlite::ffi::SQLITE_AUTH,
+            settlement_unknown: true,
+        })
+    );
     assert!(
         matches!(
-            error,
-            RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            storage_error.without_sqlite_write_stage(),
+            StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
-                ..
-            })
+                sqlite_full_codes: None,
+            }
         ),
         "real transaction finality must be unknown: {error:?}"
     );

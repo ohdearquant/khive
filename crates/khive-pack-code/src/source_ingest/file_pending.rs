@@ -60,6 +60,7 @@ pub(super) async fn stamp_l2_declarations(
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
+    let context = candidate_context(token.namespace().as_str());
     let mut seen = HashSet::new();
     let mut kept = Vec::new();
     for reference in references {
@@ -69,11 +70,9 @@ pub(super) async fn stamp_l2_declarations(
         // The per-item screen record_l2_pending_batch applies. A refused
         // reference was already reported there; it is only left out here, so
         // one refused reference cannot make the module row refuse the stamp.
-        match secret_gate::check_json_at(
+        match context.check_properties(Some(
             &serde_json::to_value(&reference.reference).expect("serializes"),
-            "entity",
-            "properties",
-        ) {
+        )) {
             Ok(()) => kept.push(reference.clone()),
             Err(RuntimeError::SecretDetected(_)) => {}
             Err(other) => return Err(other.into()),
@@ -84,11 +83,9 @@ pub(super) async fn stamp_l2_declarations(
     for implementation in implementations {
         // The existing pending-impl writer already reports refused items.
         // Keep their producer inventory out of the same stamped row as well.
-        match secret_gate::check_json_at(
+        match context.check_properties(Some(
             &serde_json::to_value(&implementation.implementation).expect("serializes"),
-            "entity",
-            "properties",
-        ) {
+        )) {
             Ok(()) => kept.push(implementation.clone()),
             Err(RuntimeError::SecretDetected(_)) => {}
             Err(other) => return Err(other.into()),
@@ -97,50 +94,58 @@ pub(super) async fn stamp_l2_declarations(
     let implementations = kept;
     let mut row_missing = false;
     let mut invalid_properties = false;
-    let outcome = mutate_entity(rt, token, module_id, file_label, report, |current| {
-        row_missing = current.is_none();
-        let mut module = current?.clone();
-        let Some(Value::Object(mut props)) = module.properties.clone() else {
-            invalid_properties = true;
-            return None;
-        };
-        props.insert(
-            "declaration_ids".into(),
-            json!(declaration_ids
-                .iter()
-                .map(Uuid::to_string)
-                .collect::<Vec<_>>()),
-        );
-        let entries = props.entry("l2_file_pending").or_insert_with(|| json!({}));
-        if !entries.is_object() {
-            *entries = json!({});
-        }
-        entries.as_object_mut().expect("object").insert(
-            file_key(file_label),
-            json!(FilePending {
-                content_hash: content_hash.to_owned(),
-                declaration_ids: declaration_ids.to_vec(),
-                references: references.to_vec(),
-                scanner_version: RUST_L2_SCANNER_IDENTITY_VERSION,
-                natural_edge_ids: Some(
-                    natural_edge_ids
-                        .iter()
-                        .copied()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect()
-                ),
-                implementations: implementations.to_vec(),
-            }),
-        );
-        props.insert("l2_content_hash".into(), json!(content_hash));
-        props.insert(
-            "l2_scanner_identity_version".into(),
-            json!(RUST_L2_SCANNER_IDENTITY_VERSION),
-        );
-        module.properties = Some(Value::Object(props));
-        Some(module)
-    })
+    let outcome = mutate_entity_with_context(
+        rt,
+        token,
+        &context,
+        module_id,
+        file_label,
+        report,
+        |current| {
+            row_missing = current.is_none();
+            let mut module = current?.clone();
+            let Some(Value::Object(mut props)) = module.properties.clone() else {
+                invalid_properties = true;
+                return None;
+            };
+            props.insert(
+                "declaration_ids".into(),
+                json!(declaration_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()),
+            );
+            let entries = props.entry("l2_file_pending").or_insert_with(|| json!({}));
+            if !entries.is_object() {
+                *entries = json!({});
+            }
+            entries.as_object_mut().expect("object").insert(
+                file_key(file_label),
+                json!(FilePending {
+                    content_hash: content_hash.to_owned(),
+                    declaration_ids: declaration_ids.to_vec(),
+                    references: references.to_vec(),
+                    scanner_version: RUST_L2_SCANNER_IDENTITY_VERSION,
+                    natural_edge_ids: Some(
+                        natural_edge_ids
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    ),
+                    implementations: implementations.to_vec(),
+                }),
+            );
+            props.insert("l2_content_hash".into(), json!(content_hash));
+            props.insert(
+                "l2_scanner_identity_version".into(),
+                json!(RUST_L2_SCANNER_IDENTITY_VERSION),
+            );
+            module.properties = Some(Value::Object(props));
+            Some(module)
+        },
+    )
     .await?;
     if row_missing {
         report.warnings.push(format!(

@@ -49,6 +49,7 @@ pub struct VerbInfo {
 #[derive(Debug, Serialize)]
 pub struct PackInfo {
     pub name: String,
+    pub version: String,
     pub note_kinds: Vec<String>,
     pub entity_kinds: Vec<String>,
     pub requires: Vec<String>,
@@ -95,10 +96,12 @@ fn build_registry() -> Result<(PackMetadataRegistry, KhiveRuntime)> {
 }
 
 fn pack_info_from_registry(registry: &PackMetadataRegistry, name: &str) -> Option<PackInfo> {
-    // pack_verbs returns None if name isn't registered — gate everything off it.
+    // Introspection installs every pack through its factory.
     let verbs = registry.pack_verbs(name)?;
+    let version = registry.pack_version(name)?;
     Some(PackInfo {
         name: name.to_string(),
+        version: version.to_string(),
         note_kinds: registry
             .pack_note_kinds(name)
             .unwrap_or(&[])
@@ -141,6 +144,43 @@ pub fn list_packs() -> Result<Vec<PackInfo>> {
         .iter()
         .filter_map(|n| pack_info_from_registry(&registry, n))
         .collect())
+}
+
+/// Emit the list command's output one line at a time, without trailing newlines.
+pub(crate) fn render_pack_list(
+    packs: &[PackInfo],
+    human: bool,
+    mut emit: impl FnMut(std::fmt::Arguments<'_>),
+) {
+    if human {
+        for p in packs {
+            emit(format_args!(
+                "# {} {} ({} verbs)",
+                p.name,
+                p.version,
+                p.verbs.len()
+            ));
+            if !p.requires.is_empty() {
+                emit(format_args!("  requires: {}", p.requires.join(", ")));
+            }
+            if !p.note_kinds.is_empty() {
+                emit(format_args!("  note_kinds:   {}", p.note_kinds.join(", ")));
+            }
+            if !p.entity_kinds.is_empty() {
+                emit(format_args!(
+                    "  entity_kinds: {}",
+                    p.entity_kinds.join(", ")
+                ));
+            }
+            for v in &p.verbs {
+                emit(format_args!("    {:<20} {}", v.name, v.description));
+            }
+            emit(format_args!(""));
+        }
+    } else {
+        let json = serde_json::to_string(&packs).expect("serialize PackInfo[]");
+        emit(format_args!("{json}"));
+    }
 }
 
 /// Return the full handler surface for one pack — its verbs with descriptions,
@@ -395,10 +435,193 @@ mod tests {
     fn list_packs_returns_at_least_kg() {
         let packs = list_packs().expect("list_packs succeeds");
         assert!(!packs.is_empty(), "at least one pack must register");
+        for pack in &packs {
+            assert!(!pack.version.is_empty(), "{} has no version", pack.name);
+            let registration = inventory::iter::<khive_runtime::PackRegistration>
+                .into_iter()
+                .find(|registration| registration.0.name() == pack.name)
+                .expect("listed pack must have a named factory");
+            assert_eq!(pack.version, registration.0.version(), "{}", pack.name);
+        }
         let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
         assert!(
             names.contains(&"kg"),
             "kg pack must be registered; got {names:?}"
+        );
+    }
+
+    fn pack_list_output(packs: &[super::PackInfo], human: bool) -> String {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        super::render_pack_list(packs, human, |line| {
+            writeln!(&mut output, "{line}").expect("capture pack list line");
+        });
+        output
+    }
+
+    #[test]
+    fn pack_list_formatter_preserves_output_bytes_and_empty_lists() {
+        let packs = [
+            super::PackInfo {
+                name: "sparse".into(),
+                version: "1.0".into(),
+                note_kinds: vec![],
+                entity_kinds: vec![],
+                requires: vec![],
+                verbs: vec![],
+            },
+            super::PackInfo {
+                name: "rich".into(),
+                version: "2.0-β".into(),
+                note_kinds: vec!["observation".into(), "reference".into()],
+                entity_kinds: vec!["concept".into(), "document".into()],
+                requires: vec!["kg".into(), "memory".into()],
+                verbs: vec![
+                    VerbInfo {
+                        name: "rich.first".into(),
+                        description: "say \"hi\"\nnext".into(),
+                        visibility: VerbVisibility::Verb,
+                        category: "Query".into(),
+                    },
+                    VerbInfo {
+                        name: "rich.second".into(),
+                        description: "second".into(),
+                        visibility: VerbVisibility::Subhandler,
+                        category: "Action".into(),
+                    },
+                ],
+            },
+        ];
+        assert_eq!(
+            pack_list_output(&packs, true),
+            concat!(
+                "# sparse 1.0 (0 verbs)\n\n",
+                "# rich 2.0-β (2 verbs)\n",
+                "  requires: kg, memory\n",
+                "  note_kinds:   observation, reference\n",
+                "  entity_kinds: concept, document\n",
+                "    rich.first           say \"hi\"\nnext\n",
+                "    rich.second          second\n\n",
+            )
+        );
+        assert_eq!(
+            pack_list_output(&packs, false),
+            concat!(
+                r#"[{"name":"sparse","version":"1.0","note_kinds":[],"entity_kinds":[],"requires":[],"verbs":[]},"#,
+                r#"{"name":"rich","version":"2.0-β","note_kinds":["observation","reference"],"entity_kinds":["concept","document"],"requires":["kg","memory"],"verbs":["#,
+                r#"{"name":"rich.first","description":"say \"hi\"\nnext","visibility":"verb","category":"Query"},"#,
+                r#"{"name":"rich.second","description":"second","visibility":"subhandler","category":"Action"}]}]"#,
+                "\n",
+            )
+        );
+        assert_eq!(pack_list_output(&[], false), "[]\n");
+        assert_eq!(pack_list_output(&[], true), "");
+    }
+
+    #[test]
+    fn factory_version_override_reaches_pack_info() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        struct VersionedPack;
+        impl khive_types::Pack for VersionedPack {
+            const NAME: &'static str = "version_probe";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [khive_types::HandlerDef] = &[];
+        }
+        #[async_trait::async_trait]
+        impl khive_runtime::PackRuntime for VersionedPack {
+            khive_runtime::pack_runtime_metadata!();
+
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: serde_json::Value,
+                _registry: &khive_runtime::VerbRegistry,
+                _token: &khive_runtime::NamespaceToken,
+            ) -> Result<serde_json::Value, khive_runtime::RuntimeError> {
+                panic!("metadata inspection must not dispatch")
+            }
+        }
+        struct VersionedFactory;
+        impl khive_runtime::PackFactory for VersionedFactory {
+            khive_runtime::pack_factory_metadata!(VersionedPack);
+
+            fn version(&self) -> &'static str {
+                "93.7.1-external"
+            }
+
+            fn intentionally_verbless(&self) -> bool {
+                true
+            }
+
+            fn create(
+                &self,
+                _runtime: khive_runtime::KhiveRuntime,
+            ) -> Box<dyn khive_runtime::PackRuntime> {
+                Box::new(VersionedPack)
+            }
+        }
+        static FACTORY: VersionedFactory = VersionedFactory;
+        let runtime = khive_runtime::KhiveRuntime::new(
+            khive_runtime::RuntimeConfig::no_embeddings().for_metadata_registry(),
+        )
+        .expect("metadata runtime");
+        let registered = || {
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            khive_runtime::PackRegistry::register_packs_with_runtimes_with_extra_factories(
+                &[&FACTORY],
+                &["version_probe".to_owned()],
+                &std::collections::HashMap::new(),
+                &runtime,
+                &mut builder,
+            )
+            .expect("custom factory registration");
+            builder
+        };
+        let metadata = registered().build_metadata().expect("custom pack metadata");
+        assert_eq!(
+            metadata.pack_version("version_probe"),
+            Some("93.7.1-external")
+        );
+        assert_eq!(metadata.pack_version("missing"), None);
+        let info = super::pack_info_from_registry(&metadata, "version_probe")
+            .expect("factory metadata produces a descriptor");
+        assert_ne!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.version, "93.7.1-external");
+        assert_eq!(
+            serde_json::to_value(&info).unwrap()["version"],
+            "93.7.1-external"
+        );
+        let packs = [info];
+        let json: serde_json::Value =
+            serde_json::from_str(&pack_list_output(&packs, false)).expect("JSON pack list");
+        let listed = json.as_array().expect("pack list array");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "version_probe");
+        assert_eq!(listed[0]["version"], "93.7.1-external");
+        assert_eq!(
+            pack_list_output(&packs, true),
+            "# version_probe 93.7.1-external (0 verbs)\n\n"
+        );
+        let registry = registered().build().expect("custom serving registry");
+        assert_eq!(
+            registry.clone().pack_version("version_probe"),
+            Some("93.7.1-external")
+        );
+
+        let mut direct = khive_runtime::VerbRegistryBuilder::new();
+        direct.register(VersionedPack);
+        assert_eq!(
+            direct
+                .build_metadata()
+                .unwrap()
+                .pack_version("version_probe"),
+            None,
+            "direct registration must not invent a factory version",
         );
     }
 

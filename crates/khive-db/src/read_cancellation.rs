@@ -25,12 +25,15 @@ pub const DEFAULT_SQLITE_INTERRUPT_GRACE_MS: u64 = 500;
 
 /// Resolve the validated SQLite interrupt-settlement grace.
 pub fn sqlite_interrupt_grace_from_env() -> Duration {
-    let millis = std::env::var("KHIVE_SQLITE_INTERRUPT_GRACE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| (10..=5_000).contains(millis))
-        .unwrap_or(DEFAULT_SQLITE_INTERRUPT_GRACE_MS);
-    Duration::from_millis(millis)
+    let millis = crate::env::env_parse_or(
+        "KHIVE_SQLITE_INTERRUPT_GRACE_MS",
+        DEFAULT_SQLITE_INTERRUPT_GRACE_MS,
+    );
+    Duration::from_millis(if (10..=5_000).contains(&millis) {
+        millis
+    } else {
+        DEFAULT_SQLITE_INTERRUPT_GRACE_MS
+    })
 }
 
 /// Second-stage bound applied once the grace window in
@@ -45,12 +48,15 @@ pub const DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS: u64 = 5_000;
 
 /// Resolve the validated hard cap on post-grace join waiting.
 pub fn sqlite_interrupt_hard_cap_from_env() -> Duration {
-    let millis = std::env::var("KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| (100..=60_000).contains(millis))
-        .unwrap_or(DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS);
-    Duration::from_millis(millis)
+    let millis = crate::env::env_parse_or(
+        "KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS",
+        DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS,
+    );
+    Duration::from_millis(if (100..=60_000).contains(&millis) {
+        millis
+    } else {
+        DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -706,7 +712,7 @@ where
 /// `None` for every other storage error and for driver errors that are not
 /// SQLite failures.
 pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite::ErrorCode> {
-    let StorageError::Driver { source, .. } = error else {
+    let StorageError::Driver { source, .. } = error.without_sqlite_write_stage() else {
         return None;
     };
     if let Some(error) = source.downcast_ref::<rusqlite::Error>() {
@@ -715,7 +721,8 @@ pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite
     source
         .downcast_ref::<crate::error::SqliteError>()
         .and_then(|error| match error {
-            crate::error::SqliteError::Rusqlite(error) => error.sqlite_error_code(),
+            crate::error::SqliteError::Rusqlite(error)
+            | crate::error::SqliteError::Write { source: error, .. } => error.sqlite_error_code(),
             _ => None,
         })
 }
@@ -912,6 +919,61 @@ where
 mod tests {
     use super::*;
     use khive_storage::scope_request_read_cancellation;
+
+    #[test]
+    fn sqlite_interrupt_environment_bounds_remain_fresh() {
+        const GRACE: &str = "KHIVE_SQLITE_INTERRUPT_GRACE_MS";
+        const HARD_CAP: &str = "KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS";
+        if crate::test_process::run_in_child(|command| {
+            command.env_remove(GRACE).env_remove(HARD_CAP);
+        }) {
+            return;
+        }
+        for (key, read, fallback, cases) in [
+            (
+                GRACE,
+                sqlite_interrupt_grace_from_env as fn() -> Duration,
+                500,
+                [
+                    ("10", 10),
+                    ("5000", 5000),
+                    ("9", 500),
+                    ("5001", 500),
+                    ("invalid", 500),
+                    (" 10 ", 500),
+                    ("18446744073709551616", 500),
+                ],
+            ),
+            (
+                HARD_CAP,
+                sqlite_interrupt_hard_cap_from_env as fn() -> Duration,
+                5000,
+                [
+                    ("100", 100),
+                    ("60000", 60000),
+                    ("99", 5000),
+                    ("60001", 5000),
+                    ("invalid", 5000),
+                    (" 100 ", 5000),
+                    ("18446744073709551616", 5000),
+                ],
+            ),
+        ] {
+            assert_eq!(read(), Duration::from_millis(fallback));
+            for (value, expected) in cases {
+                crate::test_process::set_var(key, value);
+                assert_eq!(read(), Duration::from_millis(expected), "{key}={value:?}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                crate::test_process::set_var(key, std::ffi::OsStr::from_bytes(b"\xff"));
+                assert_eq!(read(), Duration::from_millis(fallback));
+            }
+            crate::test_process::remove_var(key);
+            assert_eq!(read(), Duration::from_millis(fallback));
+        }
+    }
 
     #[test]
     fn sqlite_progress_fast_path_never_locks_registration_state() {

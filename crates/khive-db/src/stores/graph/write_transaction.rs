@@ -22,17 +22,22 @@ where
             if pooled {
                 pool.retire_pooled_writer(conn);
             }
-            return Err(StorageError::writer_task_terminated(
-                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            ));
+            return Err(crate::error::SqliteError::settlement_with_cause(
+                &error,
+                khive_storage::error::SqliteWriteStage::Begin,
+            )
+            .into_storage_error(StorageCapability::Graph, GRAPH_MUTATION_EVENTS_OP));
         }
         crate::timeout_sink::maybe_emit_busy(
             &crate::timeout_sink::db_label(pool),
             crate::timeout_sink::Site::StandaloneGraph,
             &error,
         );
-        return Err(map_err(error, GRAPH_MUTATION_EVENTS_OP))
-            .inspect_err(|error| pool.record_direct_writer_error(error));
+        return Err(crate::error::with_write_stage(
+            map_err(error, GRAPH_MUTATION_EVENTS_OP),
+            khive_storage::error::SqliteWriteStage::Begin,
+        ))
+        .inspect_err(|error| pool.record_direct_writer_error(error));
     }
     if let Err(error) = pool.write_admission().check() {
         if conn.execute_batch("ROLLBACK").is_err() || !conn.is_autocommit() {

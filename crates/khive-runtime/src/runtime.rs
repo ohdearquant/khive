@@ -262,6 +262,7 @@ pub use crate::config::{
 struct CoreEmbedderState {
     registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
+    engines: Option<Vec<crate::engine_config::EngineConfig>>,
     embedding_model: Option<EmbeddingModel>,
     additional_embedding_models: Vec<EmbeddingModel>,
 }
@@ -475,10 +476,11 @@ impl KhiveRuntime {
     }
 
     pub(crate) fn new_with_file_backend(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
         #[cfg(all(test, target_os = "macos"))]
@@ -554,9 +556,10 @@ impl KhiveRuntime {
     }
 
     fn new_readonly_with_file_backend(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         #[cfg(unix)]
         crate::events_split::socket_path::validate_configured_events_socket(&config)?;
         #[cfg(all(test, target_os = "macos"))]
@@ -592,16 +595,34 @@ impl KhiveRuntime {
     /// backend. Prefer [`Self::from_prepared_backend`] when constructing one
     /// fallible host runtime.
     ///
-    /// The returned runtime has `db_path = None` and `embedding_model = None`; all
-    /// storage access is through the provided `backend`. Set `backend_id` and
-    /// `default_namespace` via the config builder pattern if non-defaults are needed.
+    /// All storage access is through the provided `backend`; the config's
+    /// ordered embedding peers are prepared before assembly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine configuration is invalid. Use
+    /// [`Self::try_from_backend`] to handle configuration errors at startup.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        Self::try_from_backend(backend, config)
+            .expect("from_backend requires a valid embedding engine configuration")
+    }
+
+    /// Assemble an already-opened backend after validating its engine config.
+    ///
+    /// This retains [`Self::from_backend`]'s warning-only storage-model
+    /// registration policy; use [`Self::from_prepared_backend`] when those
+    /// registration failures must also abort startup.
+    pub fn try_from_backend(
+        backend: Arc<StorageBackend>,
+        mut config: RuntimeConfig,
+    ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         if !backend.is_read_only() {
             if let Err(err) = register_configured_embedding_models(&backend, &config) {
                 tracing::warn!(error = %err, "failed to register configured embedding models");
             }
         }
-        Self::assemble_from_backend(backend, config, false)
+        Ok(Self::assemble_from_backend(backend, config, false))
     }
 
     /// Construct a single-backend runtime after a host boot coordinator has
@@ -612,8 +633,9 @@ impl KhiveRuntime {
     /// semantics. This method never runs migrations itself.
     pub fn from_prepared_backend(
         backend: Arc<StorageBackend>,
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
+        config.prepare_engines()?;
         if backend.attachment_cutover_status()?
             != khive_db::migrations::AttachmentCutoverStatus::Complete
         {
@@ -731,6 +753,7 @@ impl KhiveRuntime {
         self.core_embedders = Some(CoreEmbedderState {
             registry: main.embedder_registry.clone(),
             default_embedder_name: main.default_embedder_name.clone(),
+            engines: main.config.engines.clone(),
             embedding_model: main.config.embedding_model,
             additional_embedding_models: main.config.additional_embedding_models.clone(),
         });
@@ -770,6 +793,7 @@ impl KhiveRuntime {
                 None => self.clone(),
                 Some(core_embedders) => {
                     let mut core = self.clone();
+                    core.config.engines = core_embedders.engines.clone();
                     core.config.embedding_model = core_embedders.embedding_model;
                     core.config.additional_embedding_models =
                         core_embedders.additional_embedding_models.clone();
@@ -789,6 +813,7 @@ impl KhiveRuntime {
                 // `config.embedding_model` (`resolve_embedding_model`).
                 let (embedder_registry, default_embedder_name) = match &self.core_embedders {
                     Some(core_embedders) => {
+                        core_config.engines = core_embedders.engines.clone();
                         core_config.embedding_model = core_embedders.embedding_model;
                         core_config.additional_embedding_models =
                             core_embedders.additional_embedding_models.clone();
@@ -1082,10 +1107,13 @@ impl KhiveRuntime {
     /// Collect the same per-file report as the primary diagnostic surface for
     /// one opened backend. The process identity comes from main; invoking
     /// `ProcessIdentity::current` on a secondary would miscount main generations.
+    /// `collect_size_composition = false` skips the `dbstat` walk (see
+    /// `khive_db::diagnostics::collect_with_runtime_audit_metrics_for_process_interruptibly`).
     pub async fn db_diagnostics_for_opened_backend_with_audit_metrics(
         &self,
         backend: &OpenedDiagnosticBackend,
         runtime_audit_batch_metrics: Option<khive_db::diagnostics::RuntimeAuditBatchMetrics>,
+        collect_size_composition: bool,
     ) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
         let main_pool = self.core().backend.pool_arc();
         let process = khive_db::diagnostics::ProcessIdentity::current(&main_pool);
@@ -1104,6 +1132,7 @@ impl KhiveRuntime {
                 khive_db::SessionSweepConfig::default().interval,
                 crate::pack::audit_append_failure_count(),
                 runtime_audit_batch_metrics,
+                collect_size_composition,
             )
             .await
             .map_err(RuntimeError::from)?;
@@ -1505,6 +1534,7 @@ impl KhiveRuntime {
                 if matches!(
                     &error,
                     khive_db::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    | khive_db::SqliteError::Write { source: rusqlite::Error::SqliteFailure(code, _), .. }
                         if code.code == rusqlite::ErrorCode::ConstraintViolation
                 ) {
                     RuntimeError::InvalidInput(format!(
@@ -1512,7 +1542,7 @@ impl KhiveRuntime {
                         identity.model_key()
                     ))
                 } else {
-                    RuntimeError::Sqlite(error)
+                    RuntimeError::from(error)
                 }
             })?;
 
@@ -2522,6 +2552,16 @@ impl KhiveRuntime {
         &self,
         provider: impl crate::embedder_registry::EmbedderProvider + 'static,
     ) -> RuntimeResult<()> {
+        if let Some(engine) = self
+            .config
+            .engines
+            .as_ref()
+            .and_then(|engines| engines.iter().find(|engine| engine.name == provider.name()))
+        {
+            engine
+                .check_dimensions(provider.dimensions())
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        }
         let mut registry = self
             .embedder_registry
             .write()
@@ -2550,16 +2590,19 @@ impl KhiveRuntime {
     /// Optionally filter by `engine_name`. Returns an empty vec when the
     /// `_embedding_models` table does not yet exist (e.g. no migrations have run
     /// or no models have been registered). All other SQL errors are propagated.
+    /// Malformed required fields, unknown statuses and invalid non-NULL optional
+    /// dimensions/UUIDs are warned and skipped. The legacy optional timestamps
+    /// retain their non-integer-to-None compatibility behavior.
     pub async fn list_embedding_models(
         &self,
         engine_filter: Option<&str>,
-    ) -> RuntimeResult<Vec<khive_db::EmbeddingModelRegistryRecord>> {
+    ) -> RuntimeResult<Vec<crate::EmbeddingModelRecord>> {
         use khive_storage::{SqlStatement, SqlValue};
 
         let (sql_text, params) = if let Some(engine) = engine_filter {
             (
-                "SELECT engine_name, model_id, key_version, dim, status, \
-                 activated_at, superseded_at \
+                "SELECT id, engine_name, model_id, key_version, dim, output_dim, status, \
+                 activated_at, superseded_at, superseded_by, canonical_key, created_at \
                  FROM _embedding_models WHERE engine_name = ?1 \
                  ORDER BY engine_name, activated_at IS NULL, activated_at"
                     .to_string(),
@@ -2567,8 +2610,8 @@ impl KhiveRuntime {
             )
         } else {
             (
-                "SELECT engine_name, model_id, key_version, dim, status, \
-                 activated_at, superseded_at \
+                "SELECT id, engine_name, model_id, key_version, dim, output_dim, status, \
+                 activated_at, superseded_at, superseded_by, canonical_key, created_at \
                  FROM _embedding_models \
                  ORDER BY engine_name, activated_at IS NULL, activated_at"
                     .to_string(),
@@ -2596,56 +2639,10 @@ impl KhiveRuntime {
             Err(e) => return Err(crate::RuntimeError::Storage(e)),
         };
 
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            macro_rules! required_text {
-                ($col:expr) => {
-                    match row.get($col) {
-                        Some(SqlValue::Text(s)) => s.clone(),
-                        other => {
-                            tracing::warn!(column = $col, value = ?other, "skipping registry row: unexpected type");
-                            continue;
-                        }
-                    }
-                };
-            }
-            let engine_name = required_text!("engine_name");
-            let model_id = required_text!("model_id");
-            let key_version = required_text!("key_version");
-            let dimensions = match row.get("dim") {
-                Some(SqlValue::Integer(n)) => match u32::try_from(*n) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        tracing::warn!(dim = n, "skipping registry row: dim out of u32 range");
-                        continue;
-                    }
-                },
-                other => {
-                    tracing::warn!(column = "dim", value = ?other, "skipping registry row: unexpected type");
-                    continue;
-                }
-            };
-            let status = required_text!("status");
-            let activated_at = match row.get("activated_at") {
-                Some(SqlValue::Integer(n)) => Some(*n),
-                _ => None,
-            };
-            let superseded_at = match row.get("superseded_at") {
-                Some(SqlValue::Integer(n)) => Some(*n),
-                _ => None,
-            };
-            records.push(khive_db::EmbeddingModelRegistryRecord {
-                engine_name,
-                model_id,
-                key_version,
-                dimensions,
-                status,
-                activated_at,
-                superseded_at,
-            });
-        }
-
-        Ok(records)
+        Ok(rows
+            .iter()
+            .filter_map(crate::EmbeddingModelRecord::from_sql_row)
+            .collect())
     }
 }
 

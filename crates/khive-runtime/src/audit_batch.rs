@@ -65,16 +65,7 @@ pub enum AuditProducer {
     /// A drained process-lifetime `OnceLock` config-lock row.
     ConfigLocked,
     /// A `memory.recall` execution's pure-observability audit row.
-    ///
-    /// Classified and ready for routing, but not yet wired to a live call
-    /// site in this slice: `khive-pack-memory`'s recall handler reaches only
-    /// `KhiveRuntime` (`crates/khive-runtime/src/runtime.rs`), which does not
-    /// hold this batch seam and is outside this change's file ownership
-    /// (`final_file_ownership_r2.md` assigns `runtime.rs` to the D8 author).
-    /// Wiring this variant to `emit_recall_executed_event` needs either an
-    /// ownership-map amendment granting `runtime.rs` a narrow accessor, or
-    /// threading a second seam onto `KhiveRuntime` — both out of scope here.
-    #[allow(dead_code)]
+    /// Submitted by the recall handler through its owning registry's batch.
     RecallExecuted,
 }
 
@@ -247,8 +238,9 @@ pub enum AuditCommitOutcome {
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
 /// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
-/// these three fields plus `admission_refused_obligations` and
-/// `admission_unresolved_obligations`, which are sourced from process-wide
+/// these three fields plus `admission_refused_obligations`,
+/// `retry_exhausted_obligations`, and `admission_unresolved_obligations`,
+/// which are sourced from process-wide
 /// counters outside `AuditBatch` rather than from this struct — see
 /// `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,10 +509,14 @@ enum RetryDecision {
 }
 
 fn classify_store_error(err: &StorageError) -> RetryDecision {
-    match err {
+    match err.without_sqlite_write_stage() {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        StorageError::CapacityUnavailable {
+            phase: khive_storage::CapacityUnavailablePhase::LockContended,
+            ..
+        } => RetryDecision::Retry,
         // Transient availability conditions, not judgments on the batch. The
         // events-daemon forwarding lane (ADR-170) reports an unreachable or
         // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports
@@ -566,7 +562,7 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
 /// error is not one of the typed transient variants `classify_store_error`
 /// retries on its own.
 fn is_sqlite_busy_or_locked(err: &StorageError) -> bool {
-    let StorageError::Driver { source, .. } = err else {
+    let StorageError::Driver { source, .. } = err.without_sqlite_write_stage() else {
         return false;
     };
     matches!(

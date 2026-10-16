@@ -2,6 +2,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use khive_fs::opened_file::opened_file_path;
 use khive_storage::blob::ContentRef;
 #[cfg(unix)]
 use khive_storage::types::StorageResult;
@@ -68,7 +70,7 @@ pub(super) fn verify_blob_root_identity(
     root: &Path,
     root_handle: &std::fs::File,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    use khive_fs::fd_relative::FileIdentity;
 
     let current = open_dir_no_follow(root).map_err(|error| {
         std::io::Error::new(
@@ -79,9 +81,9 @@ pub(super) fn verify_blob_root_identity(
             ),
         )
     })?;
-    let expected = root_handle.metadata()?;
-    let current = current.metadata()?;
-    if expected.dev() != current.dev() || expected.ino() != current.ino() {
+    let expected = FileIdentity::of(root_handle)?;
+    let current = FileIdentity::of(&current)?;
+    if expected != current {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -207,12 +209,10 @@ pub(super) fn unlink_blob_shard_file_no_follow(
     // `open(root)` time; that is the operator's configured deployment, not
     // a check-to-use window.
     use std::fs::OpenOptions;
-    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
-        FILE_DISPOSITION_INFO,
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
     };
 
     const FILE_SHARE_READ: u32 = 0x1;
@@ -221,10 +221,6 @@ pub(super) fn unlink_blob_shard_file_no_follow(
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    /// `FILE_NAME_NORMALIZED | VOLUME_NAME_DOS` — both zero; named for the
-    /// contract (normalized on-disk case, drive-letter form) rather than
-    /// passing a bare 0.
-    const FINAL_PATH_FLAGS: u32 = 0x0;
 
     fn open_dir_pinned_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         let dir = OpenOptions::new()
@@ -246,37 +242,6 @@ pub(super) fn unlink_blob_shard_file_no_follow(
         Ok(dir)
     }
 
-    /// The handle's true, fully resolved path (`GetFinalPathNameByHandleW`,
-    /// normalized `\\?\`-prefixed DOS form). A handle property: later
-    /// changes to any directory the original path traversed cannot alter it.
-    fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
-        let handle = file.as_raw_handle();
-        let mut buf: Vec<u16> = vec![0; 512];
-        loop {
-            let len = unsafe {
-                GetFinalPathNameByHandleW(
-                    handle as _,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    FINAL_PATH_FLAGS,
-                )
-            };
-            if len == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let len = len as usize;
-            if len <= buf.len() {
-                buf.truncate(len);
-                return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
-                    &buf,
-                )));
-            }
-            // Returned length is the required buffer size (in wide chars,
-            // including the terminator) when the buffer was too small.
-            buf.resize(len, 0);
-        }
-    }
-
     verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
@@ -284,7 +249,7 @@ pub(super) fn unlink_blob_shard_file_no_follow(
     let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
     let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
 
-    let expected = final_path_by_handle(root_handle)?
+    let expected = opened_file_path(root_handle)?
         .join(&hex[0..2])
         .join(&hex[2..4])
         .join(hex);
@@ -300,7 +265,7 @@ pub(super) fn unlink_blob_shard_file_no_follow(
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(shard2.join(hex))?;
 
-    let resolved = final_path_by_handle(&target)?;
+    let resolved = opened_file_path(&target)?;
     if resolved != expected {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -396,16 +361,12 @@ pub(super) fn open_blob_shard_file_no_follow_windows(
     for_mtime_update: bool,
 ) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
-    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FINAL_PATH_FLAGS: u32 = 0x0;
 
     fn open_dir_pinned_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         let dir = OpenOptions::new()
@@ -428,36 +389,13 @@ pub(super) fn open_blob_shard_file_no_follow_windows(
         Ok(dir)
     }
 
-    fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<PathBuf> {
-        let mut buf: Vec<u16> = vec![0; 512];
-        loop {
-            let len = unsafe {
-                GetFinalPathNameByHandleW(
-                    file.as_raw_handle() as _,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    FINAL_PATH_FLAGS,
-                )
-            };
-            if len == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let len = len as usize;
-            if len <= buf.len() {
-                buf.truncate(len);
-                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
-            }
-            buf.resize(len, 0);
-        }
-    }
-
     verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
     let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
     let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
-    let expected = final_path_by_handle(root_handle)?
+    let expected = opened_file_path(root_handle)?
         .join(&hex[0..2])
         .join(&hex[2..4])
         .join(hex);
@@ -475,7 +413,7 @@ pub(super) fn open_blob_shard_file_no_follow_windows(
             "refusing to read a blob leaf that is not a regular file",
         ));
     }
-    let resolved = final_path_by_handle(&target)?;
+    let resolved = opened_file_path(&target)?;
     if resolved != expected {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -671,22 +609,22 @@ pub(super) fn unlink_entry_at(
 
 #[cfg(unix)]
 pub(super) fn rename_entry_at(
-    source_fd: std::os::unix::io::RawFd,
+    source: &std::fs::File,
     from: &str,
-    destination_fd: std::os::unix::io::RawFd,
+    destination: &std::fs::File,
     to: &str,
 ) -> std::io::Result<()> {
-    let c_from = std::ffi::CString::new(from)
+    // Preserve the existing NUL diagnostics before shared component validation.
+    let _ = std::ffi::CString::new(from)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_to = std::ffi::CString::new(to)
+    let _ = std::ffi::CString::new(to)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: both names are NUL-terminated and relative to live directory
-    // handles retained from the same blob root.
-    let rc = unsafe { libc::renameat(source_fd, c_from.as_ptr(), destination_fd, c_to.as_ptr()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    khive_fs::fd_relative::rename_at(
+        source,
+        std::ffi::OsStr::new(from),
+        destination,
+        std::ffi::OsStr::new(to),
+    )
 }
 
 #[cfg(unix)]

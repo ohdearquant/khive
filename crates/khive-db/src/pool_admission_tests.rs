@@ -377,13 +377,22 @@ fn native_sqlite_full_survives_guarded_transaction_classification() {
     // terminal unknown that tests/pr3423_sqlite_full.rs pins; it is never
     // rewritten as a guard refusal.
     let error = result.expect_err("SQLite page limit must produce a native FULL");
+    assert_eq!(
+        error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_FULL,
+            extended_code: rusqlite::ffi::SQLITE_FULL,
+            settlement_unknown: true,
+        })
+    );
     assert!(
         matches!(
-            error,
+            error.without_sqlite_write_stage(),
             StorageError::WriterTaskTerminated {
                 request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                 sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, extended)),
-            } if extended & 0xff == rusqlite::ffi::SQLITE_FULL
+            } if *extended & 0xff == rusqlite::ffi::SQLITE_FULL
         ),
         "native FULL classification: {error:?}"
     );

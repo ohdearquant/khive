@@ -8,7 +8,10 @@ use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use crate::handlers::{handle_reply, handle_send};
+use crate::handlers::{
+    handle_reply, handle_send, handle_suppression_add, handle_suppression_list,
+    record_mailto_unsubscribe_suppression,
+};
 use crate::inbox_signal::InboxSignal;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,36 @@ async fn send(
     args: Value,
 ) -> Result<Value, RuntimeError> {
     handle_send(runtime, signal, token, args).await
+}
+
+fn external_policy(external_senders: &[&str], cap: u64) -> OutboundEmailPolicy {
+    OutboundEmailPolicy::configured_for_tests(
+        vec!["allowed@example.com".into()],
+        external_senders
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        cap,
+    )
+    .unwrap()
+}
+
+fn external_request(recipient: &str, key: &str) -> Value {
+    json!({
+        "to": format!("email:{recipient}"),
+        "content": "external body",
+        "subject": "external subject",
+        "idempotency_key": key
+    })
+}
+
+fn external_denied(error: RuntimeError, expected_verb: &str, condition: &str) {
+    let RuntimeError::PermissionDenied { verb, reason, .. } = error else {
+        panic!("expected typed permission denial, got {error:?}");
+    };
+    assert_eq!(verb, expected_verb);
+    assert!(reason.contains(condition), "{reason}");
+    assert!(reason.contains("no message was committed by this request"));
 }
 
 #[tokio::test]
@@ -679,4 +712,232 @@ async fn email_exact_replay_does_not_bypass_dispatch_authorization() {
     assert_eq!(reason, "fixture-caller-denied");
     assert_eq!(snapshot(&runtime).await, before);
     assert_eq!(signal.snapshot(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn external_sender_scope_keeps_policy_recipients_available_to_other_actors() {
+    let outside_runtime =
+        runtime().with_outbound_email_policy(external_policy(&["actor:other"], 5));
+    let token = outside_runtime.authorize(Namespace::local()).unwrap();
+    let signal = InboxSignal::new();
+    let before = snapshot(&outside_runtime).await;
+    external_denied(
+        send(
+            &outside_runtime,
+            &signal,
+            &token,
+            external_request("external@example.net", "outside-set"),
+        )
+        .await
+        .unwrap_err(),
+        "comm.send",
+        "caller is not an external sender",
+    );
+    assert_eq!(snapshot(&outside_runtime).await, before);
+    assert_eq!(signal.snapshot(), 0);
+    send(
+        &outside_runtime,
+        &signal,
+        &token,
+        json!({"to":"email:allowed@example.com","content":"policy recipient"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(signal.snapshot(), 1);
+
+    let inside = runtime().with_outbound_email_policy(external_policy(&["actor:sender"], 5));
+    let inside_token = inside.authorize(Namespace::local()).unwrap();
+    let inside_signal = InboxSignal::new();
+    let admitted = send(
+        &inside,
+        &inside_signal,
+        &inside_token,
+        external_request("external@example.net", "inside-set"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(admitted["replayed"], false);
+    assert_eq!(inside_signal.snapshot(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn external_admission_honors_address_domain_and_recipient_key_suppressions() {
+    let policy = external_policy(&["actor:sender"], 5);
+    let derived_key = policy.recipient_key("external@example.net").unwrap();
+    for (kind, value) in [
+        ("address", "external@example.net".to_string()),
+        ("domain", "example.net".to_string()),
+        ("recipient_key", derived_key.clone()),
+    ] {
+        let runtime = runtime().with_outbound_email_policy(policy.clone());
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let signal = InboxSignal::new();
+        handle_suppression_add(
+            &runtime,
+            &token,
+            json!({
+                "scope":"outbound",
+                "kind":kind,
+                "value":value,
+                "source":"operator"
+            }),
+        )
+        .await
+        .unwrap();
+        let listed = handle_suppression_list(&runtime, &token, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+        let before = snapshot(&runtime).await;
+        external_denied(
+            send(
+                &runtime,
+                &signal,
+                &token,
+                external_request("external@example.net", "suppression-match"),
+            )
+            .await
+            .unwrap_err(),
+            "comm.send",
+            "recipient is suppressed",
+        );
+        assert_eq!(snapshot(&runtime).await, before);
+        assert_eq!(signal.snapshot(), 0);
+
+        let control = external_request("other@example.net", "suppression-control");
+        let control_result = send(&runtime, &signal, &token, control).await;
+        if kind == "domain" {
+            external_denied(
+                control_result.unwrap_err(),
+                "comm.send",
+                "recipient is suppressed",
+            );
+            assert_eq!(signal.snapshot(), 0);
+        } else {
+            assert!(control_result.is_ok(), "{kind} suppression must be exact");
+            assert_eq!(signal.snapshot(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn external_admission_refuses_while_the_footer_is_unavailable() {
+    for reason in [
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set",
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read",
+        "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE does not contain {unsubscribe}",
+    ] {
+        let policy =
+            external_policy(&["actor:sender"], 5).with_external_footer_for_tests(Err(reason));
+        let runtime = runtime().with_outbound_email_policy(policy);
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let signal = InboxSignal::new();
+        let before = snapshot(&runtime).await;
+        external_denied(
+            send(
+                &runtime,
+                &signal,
+                &token,
+                external_request("external@example.net", "footer-unavailable"),
+            )
+            .await
+            .unwrap_err(),
+            "comm.send",
+            "external email footer is unavailable",
+        );
+        assert_eq!(snapshot(&runtime).await, before);
+        assert_eq!(signal.snapshot(), 0);
+
+        // A policy-recipient send with the same bad footer is still admitted.
+        send(
+            &runtime,
+            &signal,
+            &token,
+            json!({"to":"email:allowed@example.com","content":"policy recipient"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(signal.snapshot(), 1);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn external_daily_cap_counts_fresh_messages_but_not_exact_replays() {
+    let runtime = runtime().with_outbound_email_policy(external_policy(&["actor:sender"], 1));
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let signal = InboxSignal::new();
+    let first_request = external_request("first@example.net", "cap-first");
+    let first = send(&runtime, &signal, &token, first_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["replayed"], false);
+
+    let before_refusal = snapshot(&runtime).await;
+    external_denied(
+        send(
+            &runtime,
+            &signal,
+            &token,
+            external_request("second@example.net", "cap-second"),
+        )
+        .await
+        .unwrap_err(),
+        "comm.send",
+        "daily external cap reached",
+    );
+    assert_eq!(snapshot(&runtime).await, before_refusal);
+    assert_eq!(signal.snapshot(), 1);
+
+    let replay = send(&runtime, &signal, &token, first_request)
+        .await
+        .unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["full_id"], first["full_id"]);
+    assert_eq!(snapshot(&runtime).await, before_refusal);
+    assert_eq!(signal.snapshot(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn mailto_unsubscribe_entry_refuses_the_next_send_to_that_recipient() {
+    let policy = external_policy(&["actor:sender"], 5);
+    let recipient_key = policy.recipient_key("external@example.net").unwrap();
+    let runtime = runtime().with_outbound_email_policy(policy);
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let signal = InboxSignal::new();
+
+    // The channel records the verified token's key; admission must then refuse a fresh send.
+    let recorded = record_mailto_unsubscribe_suppression(&runtime, &recipient_key, "channel:email")
+        .await
+        .unwrap();
+    assert!(recorded, "the first opt-out inserts an entry");
+    // A second copy of the same unsubscribe must not fail and must not duplicate.
+    let replay = record_mailto_unsubscribe_suppression(&runtime, &recipient_key, "channel:email")
+        .await
+        .unwrap();
+    assert!(!replay, "a repeated opt-out is a no-op, not a failure");
+    let listed = handle_suppression_list(&runtime, &token, json!({"scope":"outbound"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+
+    let before = snapshot(&runtime).await;
+    external_denied(
+        send(
+            &runtime,
+            &signal,
+            &token,
+            external_request("external@example.net", "post-opt-out"),
+        )
+        .await
+        .unwrap_err(),
+        "comm.send",
+        "recipient is suppressed",
+    );
+    assert_eq!(snapshot(&runtime).await, before);
+    assert_eq!(signal.snapshot(), 0);
 }

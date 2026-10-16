@@ -4145,7 +4145,16 @@ async fn failed_rollback_poisons_handle_reuse_fails_loud() {
     )
     .await;
     let batch_error = batch.expect_err("invalid second statement must fail the batch");
-    let poison = match &batch_error {
+    assert_eq!(
+        batch_error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Statement,
+            primary_code: rusqlite::ffi::SQLITE_ERROR,
+            extended_code: rusqlite::ffi::SQLITE_ERROR,
+            settlement_unknown: true,
+        })
+    );
+    let poison = match batch_error.without_sqlite_write_stage() {
         StorageError::Driver { source, .. } => source
             .downcast_ref::<PoisonedBatchError>()
             .expect("failed rollback must retain its typed poison wrapper"),
@@ -4242,7 +4251,16 @@ async fn non_transient_begin_failure_poisons_handle() {
     )
     .await;
     let batch_error = batch.expect_err("BEGIN inside an open transaction must fail");
-    let poison = match &batch_error {
+    assert_eq!(
+        batch_error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Begin,
+            primary_code: rusqlite::ffi::SQLITE_ERROR,
+            extended_code: rusqlite::ffi::SQLITE_ERROR,
+            settlement_unknown: false,
+        })
+    );
+    let poison = match batch_error.without_sqlite_write_stage() {
         StorageError::Driver { source, .. } => source
             .downcast_ref::<PoisonedBatchError>()
             .expect("failed BEGIN must retain its typed poison wrapper"),
@@ -4649,9 +4667,24 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
                 })
             }))
             .await;
+        if mode == "commit" {
+            assert_eq!(
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(StorageError::sqlite_write_failure),
+                Some(khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: rusqlite::ffi::SQLITE_AUTH,
+                    extended_code: rusqlite::ffi::SQLITE_AUTH,
+                    settlement_unknown: true,
+                })
+            );
+        }
         assert!(
-            matches!(result, Err(StorageError::WriterTaskTerminated { request_state, .. })
-                if request_state == expected),
+            matches!(result.as_ref().map_err(StorageError::without_sqlite_write_stage),
+                Err(StorageError::WriterTaskTerminated { request_state, .. })
+                if *request_state == expected),
             "{mode}: {result:?}"
         );
         assert!(
@@ -5665,4 +5698,33 @@ async fn max_completed_hold_operation_names_the_caller_read_not_a_bridge_constan
         Some("writer.query_row"),
         "a pooled read drawn through the writer must record its own operation"
     );
+}
+
+/// The standalone writer takes the same page-cache and map settings as the
+/// pooled connections rather than a copy of its own.
+#[test]
+fn standalone_writer_takes_the_configured_page_cache_and_map() {
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_SQLITE_CACHE_KIB", "1024");
+        command.env("KHIVE_SQLITE_MMAP_BYTES", "4096");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("standalone_writer_page_settings.db")),
+        write_queue_enabled: Some(false),
+        max_readers: 1,
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let conn = open_standalone_writer(&pool).unwrap();
+    let cache: i64 = conn
+        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+        .unwrap();
+    let mmap: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((cache, mmap), (-1024, 4096));
 }

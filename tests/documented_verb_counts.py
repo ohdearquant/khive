@@ -584,26 +584,58 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
     return deduped
 
 
+PUBLISHED_NAMES = (
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "npm/README.md",
+    "cli/main.ts",
+    "cli/tests/golden/help_toplevel.txt",
+)
+PUBLISHED_GLOBS = (
+    "docs/**/*.md",
+    "marketplace/**/*.md",
+    "scripts/**/*.md",
+    "crates/**/README.md",
+    "crates/**/docs/**/*.md",
+)
+UNSCANNED_PREFIX = "docs/adr/"
+
+
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    parts = []
+    for piece in re.split(r"(\*\*/|\*)", pattern):
+        if piece == "**/":
+            parts.append("(?:[^/]+/)*")
+        elif piece == "*":
+            parts.append("[^/]*")
+        else:
+            parts.append(re.escape(piece))
+    return re.compile("".join(parts) + r"\Z")
+
+
+PUBLISHED_GLOB_RES = tuple(_glob_regex(pattern) for pattern in PUBLISHED_GLOBS)
+
+
+def is_published_markdown(relative: str) -> bool:
+    """Whether the repository-relative POSIX path names a Markdown file the scanner reads.
+
+    The same names, globs and exclusion as ``_published_files``; a test holds the two equal
+    on the repository tree."""
+    if not relative.endswith(".md") or relative.startswith(UNSCANNED_PREFIX):
+        return False
+    return relative in PUBLISHED_NAMES or any(
+        pattern.match(relative) for pattern in PUBLISHED_GLOB_RES
+    )
+
+
 def _published_files(repo_root: Path, pack_names: Iterable[str]) -> list[Path]:
     paths: set[Path] = set()
-    for name in (
-        "README.md",
-        "AGENTS.md",
-        "CLAUDE.md",
-        "npm/README.md",
-        "cli/main.ts",
-        "cli/tests/golden/help_toplevel.txt",
-    ):
+    for name in PUBLISHED_NAMES:
         candidate = repo_root / name
         if candidate.is_file():
             paths.add(candidate)
-    for pattern in (
-        "docs/**/*.md",
-        "marketplace/**/*.md",
-        "scripts/**/*.md",
-        "crates/**/README.md",
-        "crates/**/docs/**/*.md",
-    ):
+    for pattern in PUBLISHED_GLOBS:
         paths.update(path for path in repo_root.glob(pattern) if path.is_file())
     pages_workflow = repo_root / ".github/workflows/pages.yml"
     if pages_workflow.is_file():
@@ -615,7 +647,7 @@ def _published_files(repo_root: Path, pack_names: Iterable[str]) -> list[Path]:
     return sorted(
         path
         for path in paths
-        if not path.relative_to(repo_root).as_posix().startswith("docs/adr/")
+        if not path.relative_to(repo_root).as_posix().startswith(UNSCANNED_PREFIX)
     )
 
 
@@ -664,3 +696,14 @@ def validate_documented_counts(repo_root: Path, verbs_result: object) -> list[st
     if missing_packs:
         errors.append(f"published docs contain no per-pack verb claim for: {missing_packs}")
     return errors
+
+
+if __name__ == "__main__":
+    import sys
+
+    # ci-docs-only.sh asks whether a changed Markdown path carries claims this scanner checks:
+    # exit 0 when it does, 1 when it does not, 2 on a usage error.
+    if len(sys.argv) != 3 or sys.argv[1] != "--published-markdown":
+        print("usage: documented_verb_counts.py --published-markdown <path>", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(0 if is_published_markdown(sys.argv[2]) else 1)

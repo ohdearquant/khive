@@ -31,9 +31,10 @@ fn parse_max_line_bytes(raw: &str) -> anyhow::Result<usize> {
     }
 }
 
-/// An overlong line is replaced with a short, invalid JSON line. rmcp emits
-/// its ordinary JSON-RPC parse error (without an id) for that sentinel. The reader
-/// then drains the rest of the offending line before forwarding the next one.
+/// An overlong line is replaced with valid JSON that is not a JSON-RPC message.
+/// rmcp emits its ordinary Invalid Request error (-32600, without an id) for
+/// that sentinel; rmcp 2.2 silently ignores syntactically invalid JSON instead.
+/// The reader then drains the rest of the offending line before forwarding the next one.
 /// This keeps both our staging buffer and rmcp's line buffer bounded, even if
 /// the peer sends no newline after crossing the limit.
 pub(crate) struct BoundedLineReader<R> {
@@ -112,7 +113,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
                 this.line.clear();
                 this.discarding = newline.is_none();
                 Pin::new(&mut this.inner).consume(consumed);
-                this.ready.extend_from_slice(b"!\n");
+                this.ready.extend_from_slice(b"{}\n");
                 continue;
             }
             this.line.extend_from_slice(&input[..consumed]);
@@ -147,7 +148,7 @@ mod tests {
             AsyncRwTransport::new_server(BoundedLineReader::new(server_read, 96), server_write);
         let receive = tokio::spawn(async move { transport.receive().await });
 
-        // No newline: the cap itself must trigger rmcp's parse error instead
+        // No newline: the cap itself must trigger rmcp's invalid-request error instead
         // of waiting for an unbounded `read_until` to finish the line.
         client_write.write_all(&[b'x'; 97]).await.unwrap();
         let mut client_read = BufReader::new(client_read);
@@ -160,7 +161,7 @@ mod tests {
         .expect("oversized unterminated line must get a prompt error")
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(response["error"]["code"].as_i64(), Some(-32700));
+        assert_eq!(response["error"]["code"].as_i64(), Some(-32600));
         assert!(response.get("id").is_none());
 
         client_write
