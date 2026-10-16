@@ -26,8 +26,6 @@ use router::*;
 
 pub(crate) use event_counts::*;
 
-use brain_handlers::*;
-
 #[cfg(test)]
 #[path = "handlers/event_counts_read_budget_tests.rs"]
 mod event_counts_read_budget_tests;
