@@ -779,6 +779,14 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_trend_points_are_nightly_and_per_release_not_per_merge(self):
+        on = indented_block(workflow_text("bench-track.yml"), "on", 0)
+        self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
+        self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
+        push = indented_block(on, "push", 2)
+        self.assertNotIn("branches", push, "a push to a branch must not record a trend point")
+        self.assertIn('tags: ["v*"]', push)
+
     def test_publish_failure_is_advisory_and_records_incident(self):
         for workflow_name, publish_name in (
             ("bench-component.yml", "Publish ledger to perf-data branch"),
@@ -940,7 +948,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
             "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
         ):
             self.assertIn(evidence_path, step(artifact_name))
-        self.assertIn("github.event_name == 'push'", step(publish_name))
+        publish_if = step(publish_name)
+        self.assertIn("github.event_name != 'pull_request'", publish_if)
+        self.assertIn("github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')", publish_if)
 
         # Execute the workflow's real shell and real recorder. Only the native
         # benchmark, remote publisher and upload service are fixture boundaries.
