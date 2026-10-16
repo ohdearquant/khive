@@ -661,7 +661,7 @@ An id cursor resolves to the full `(created_at, full_id)` tuple of the
 referenced note so ties on equal microsecond timestamps are broken
 deterministically instead of being skipped or duplicated. A timestamp cursor
 is parsed to microseconds via chrono (matching the pattern in
-`khive-pack-brain/src/handlers.rs` and `khive-vcs/src/sync.rs`) rather than
+`khive-pack-brain/src/handlers/event_counts.rs` and `khive-vcs/src/sync.rs`) rather than
 compared as a raw string, so non-canonical but valid RFC 3339 forms
 (whole-second `Z`, `+00:00` offsets, ...) compare correctly against khive's
 canonical microsecond timestamps. An `after` value that is neither a
