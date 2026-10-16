@@ -5,7 +5,8 @@
 **Amended**: 2026-08-07 (missed-event grace policy, Amendment A; implementation note,
 Amendment B; reminder delivery and failure observability, Amendment C; process-local
 ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E;
-durable dispatch receipts and renewable leases, Amendment F)
+durable dispatch receipts and renewable leases, Amendment F); 2026-09-21 (interval and
+cron recurrence, Amendment G); 2026-10-14 (per-event missed-schedule policy, Amendment H)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time),
@@ -1092,15 +1093,14 @@ In every case the missed occurrence itself is recorded as missed and never dispa
 exactly one future occurrence is armed. Legacy rows carrying an expression the parser
 rejects fail closed before invocation, as before.
 
-## Proposed Amendment H (2026-09-29): per-event missed-schedule policy (#1508)
+## Amendment H: Per-event missed-schedule policy (2026-09-29)
 
-**Status**: proposed; acceptance and a signed document hash are required before
-dependent source merges. This amendment would refine Amendment A's global
+**Status**: Accepted (2026-10-14). This amendment refines Amendment A's global
 skip-and-mark rule for events whose creator explicitly opts in. Amendment F's
 claim, receipt, lease, identity, and indeterminate-outcome guarantees remain in
-force. It also proposes additive arguments to the two creation verbs governed
-by ADR-040; the accepted ADR-040 verb table remains unchanged until this
-amendment is signed and its corresponding contract update lands.
+force. It also adds optional arguments to the two creation verbs governed by
+ADR-040; the ADR-040 verb table remains unchanged until the corresponding
+contract update lands with the first implementation.
 
 ### Intent and write contract
 
@@ -1117,20 +1117,13 @@ rather than silently ignoring a safety bound. Malformed or unknown stored
 policy values fail closed before action invocation and retain a
 `not_invoked` failure receipt.
 
-For `catch_up_once`, a caller may supply `max_lateness` for any recurrence. If
-it is omitted on a repeating event, the effective bound is **that due
-occurrence's own period**: the duration from the selected latest due
-occurrence to its next scheduled occurrence. This is 24 hours for `daily`,
-seven days for `weekly`, the fixed interval for `every:<N><unit>`, and the
-actual adjacent-occurrence gap for `monthly` and five-field UTC cron. The
-period is computed at drain time, since calendar and cron gaps vary; an
-omitted bound is not frozen into a numeric value at creation. A non-repeating
-event has no period, so `catch_up_once` on a one-shot requires an explicit
-positive `max_lateness`. The pack rejects an omitted bound in that case; it
-must never acquire an unbounded catch-up window by default. Existing rows
-require no migration and continue to use `skip`. Sparse cron patterns can
-have a long default period; callers that need a shorter safety window supply
-an explicit bound.
+For `catch_up_once`, an explicit positive `max_lateness` is required on every
+event, repeating or one-shot; the pack rejects an omitted bound at creation,
+before any note is written. Issue #1508 proposed defaulting the bound to the
+schedule's own period. That default is not adopted: the drain dispatches only
+the latest occurrence at or before its evaluation time (`L` below), whose age
+is always less than the period, so a period default would never prevent a
+dispatch. Existing rows require no migration and continue to use `skip`.
 
 ### Selection and disposition
 
@@ -1157,12 +1150,11 @@ uses the pre-invocation `missed` receipt. A successful late dispatch records
 its actual completion in `fired_at`; if older occurrences were collapsed,
 `missed_at` also records that skip without claiming they fired.
 
-For example, if a daily reminder first due Monday at 09:00 is drained
-Thursday at 09:10, `L` is Thursday 09:00, `F` is Friday 09:00, and the
-omitted bound is one day: one Thursday delivery is eligible and the row next
-arms for Friday. With an explicit one-hour bound and a Thursday 12:00 drain,
-Thursday's occurrence is too old; nothing is delivered and the row next arms
-for Friday. Restoring a much older backup does not replay Monday, Tuesday,
+For example, if a daily reminder with a one-hour bound, first due Monday at
+09:00, is drained Thursday at 09:10, `L` is Thursday 09:00 and `F` is Friday
+09:00: one Thursday delivery is eligible and the row next arms for Friday. If
+the same row is drained Thursday at 12:00, Thursday's occurrence is too old;
+nothing is delivered and the row next arms for Friday. Restoring a much older backup does not replay Monday, Tuesday,
 and Wednesday; each opted-in repeating row can yield at most one current
 catch-up invocation per drain, while default `skip` rows retain their prior
 safe behavior. Opt-in permits one side effect per eligible row, so the
@@ -1198,9 +1190,9 @@ The existing version-1 receipt remains valid for pre-amendment claims and
 default `skip` rows; the new version must not reinterpret a version-1
 `occurrence_id` as a catch-up occurrence.
 
-The claim records `effective_max_lateness` (positive integer seconds) used
-for its decision so recovery can audit the choice without consulting a later
-daemon environment. If a
+The claim records `effective_max_lateness`, the row's stored `max_lateness` in
+positive integer seconds, used for its decision so recovery can audit the
+choice without consulting a later daemon environment. If a
 durable success or known failure survives a crash, recovery finalizes that
 same `L` without invoking it again and computes the next future trigger from
 the recovery finalization time. The receipt's `scheduled_for` stays `L` after

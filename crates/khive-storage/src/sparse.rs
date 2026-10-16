@@ -1,5 +1,7 @@
 //! Sparse vector storage and lexical-semantic search capability.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -9,6 +11,11 @@ use crate::types::{
     BatchWriteSummary, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector,
     StorageResult,
 };
+
+/// Opens a sparse vector store for one model and namespace binding.
+pub trait SparseStoreFactory: Send + Sync + 'static {
+    fn open(&self, model_key: &str, namespace: &str) -> StorageResult<Arc<dyn SparseStore>>;
+}
 
 /// Sparse vector storage and lexical-semantic search capability.
 #[async_trait]

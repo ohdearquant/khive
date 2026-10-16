@@ -100,6 +100,7 @@ fn reference_fuse_candidates(
 
     let retrieval_cfg = retrieval_hybrid_config(&cfg.fuse_strategy, limit);
     fuse_search_results(sources, &retrieval_cfg)
+        .unwrap()
         .into_iter()
         .map(|(id, score)| {
             let m = meta.remove(&id).unwrap_or_default();
@@ -205,7 +206,7 @@ fn memory_ids() -> HashSet<Uuid> {
     (1..=5).map(uid).collect()
 }
 
-fn strategies() -> Vec<FusionStrategy> {
+fn strategies(source_count: usize) -> Vec<FusionStrategy> {
     let custom = FusionStrategy::try_custom("custom".to_owned(), serde_json::json!({}))
         .expect("a non-empty name is a valid custom strategy");
     vec![
@@ -220,8 +221,13 @@ fn strategies() -> Vec<FusionStrategy> {
             weights: vec![0.5, 0.5],
         },
         FusionStrategy::Union,
-        FusionStrategy::weighted_rrf(60, vec![1.0, 1.0]),
-        FusionStrategy::weighted_rrf(1, vec![2.0, 0.5]),
+        FusionStrategy::weighted_rrf(60, vec![1.0; source_count]),
+        FusionStrategy::weighted_rrf(
+            1,
+            (0..source_count)
+                .map(|i| if i == 0 { 2.0 } else { 0.5 })
+                .collect(),
+        ),
         custom,
     ]
 }
@@ -335,13 +341,13 @@ fn fuse_candidates_matches_the_previous_body_for_every_strategy() {
     let mut saw_empty = false;
 
     for (name, candidates) in scenarios() {
-        for strategy in strategies() {
+        for strategy in strategies(candidates.vector_hits_per_model.len().max(1) + 1) {
             for limit in [10, 3, 1] {
                 let cfg = RecallConfig {
                     fuse_strategy: strategy.clone(),
                     ..RecallConfig::default()
                 };
-                let got = fuse_candidates(&candidates, &memory_ids, &cfg, limit);
+                let got = fuse_candidates(&candidates, &memory_ids, &cfg, limit).unwrap();
                 let want = reference_fuse_candidates(&candidates, &memory_ids, &cfg, limit);
                 let got_rows = rows(&got);
                 assert_eq!(
@@ -383,7 +389,7 @@ fn keyword_only_repeated_id_keeps_its_labels_on_the_first_copy_only() {
         ..RecallConfig::default()
     };
 
-    let hits = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let hits = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
 
     assert_eq!(
         hits.len(),
@@ -403,4 +409,64 @@ fn keyword_only_repeated_id_keeps_its_labels_on_the_first_copy_only() {
     assert_eq!(hits[2].entity_id, second);
     assert_eq!(hits[2].title.as_deref(), Some("second"));
     assert_eq!(hits[2].snippet.as_deref(), Some("second snippet"));
+}
+
+#[test]
+fn weighted_rrf_invalid_engine_slots_do_not_report_a_recall_miss() {
+    use khive_fusion::{FuseError, FusionStrategyError};
+    use khive_runtime::RuntimeError;
+
+    let candidates = candidate_set(vec![], vec![vec![], vec![]]);
+    let memory_ids = HashSet::new();
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(10, vec![1.0, 1.0]),
+        ..RecallConfig::default()
+    };
+    assert!(matches!(
+        fuse_candidates(&candidates, &memory_ids, &cfg, 10),
+        Err(RuntimeError::Fusion(
+            FuseError::WeightedRrfWeightCountMismatch {
+                source_count: 3,
+                weight_count: 2,
+            }
+        ))
+    ));
+
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::WeightedRrf {
+            k: 10,
+            weights: vec![1.0, f64::INFINITY, 1.0],
+        },
+        ..RecallConfig::default()
+    };
+    assert!(matches!(
+        fuse_candidates(&candidates, &memory_ids, &cfg, 10),
+        Err(RuntimeError::Fusion(FuseError::InvalidWeightedRrfStrategy(
+            FusionStrategyError::WeightInfinite,
+        )))
+    ));
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(10, vec![1.0; 3]),
+        ..RecallConfig::default()
+    };
+    assert!(fuse_candidates(&candidates, &memory_ids, &cfg, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn weighted_rrf_recall_preserves_score_overflow() {
+    use khive_fusion::FuseError;
+    use khive_runtime::RuntimeError;
+
+    let id = uid(1);
+    let candidates = candidate_set(vec![text_hit(id, 100, None, None)], vec![]);
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(1, vec![1.0, f64::MAX]),
+        ..RecallConfig::default()
+    };
+    assert!(matches!(
+        fuse_candidates(&candidates, &[id].into_iter().collect(), &cfg, 10),
+        Err(RuntimeError::Fusion(FuseError::WeightedRrfScoreOverflow))
+    ));
 }

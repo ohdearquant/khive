@@ -101,8 +101,8 @@ fn assert_matches_scoring(name: &str, arms: &[Vec<Row>], config: &HybridConfig) 
         }
         plain.push(rows);
     }
-    let scored = fuse_search_results(plain, config);
-    let fused = fuse_labelled_scored(arms.to_vec(), config, join_labels);
+    let scored = fuse_search_results(plain, config).unwrap();
+    let fused = fuse_labelled_scored(arms.to_vec(), config, join_labels).unwrap();
 
     let mut want = Vec::new();
     for (id, score) in &scored {
@@ -180,7 +180,7 @@ fn fuse_labelled_scored_combines_every_appearance_in_arm_then_position_order() {
     let arms = labelled("1:0.9 2:0.8 1:0.7 | 3:0.9 1:0.8");
     let config = HybridConfig::new(10);
 
-    let fused = fuse_labelled_scored(arms, &config, join_labels);
+    let fused = fuse_labelled_scored(arms, &config, join_labels).unwrap();
 
     assert_eq!(fused.len(), 3);
     assert_eq!(label_of(&fused, 1), "0.0+0.2+1.1");
@@ -194,7 +194,7 @@ fn fuse_labelled_scored_keeps_the_labels_of_arms_the_strategy_ignores() {
     let arms = labelled("1:0.9 2:0.8 | 1:0.7 3:0.6");
     let config = HybridConfig::new(10).with_fusion_strategy(FusionStrategy::VectorOnly);
 
-    let fused = fuse_labelled_scored(arms, &config, join_labels);
+    let fused = fuse_labelled_scored(arms, &config, join_labels).unwrap();
 
     assert_eq!(fused.len(), 2);
     assert_eq!(label_of(&fused, 1), "0.0+1.0");
@@ -208,11 +208,30 @@ fn fuse_labelled_scored_returns_only_the_ids_scoring_keeps() {
     let arms = labelled("1:0.9 2:0.8 3:0.7 4:0.6 | 5:0.9");
 
     let top_two = HybridConfig::new(2);
-    let fused = fuse_labelled_scored(arms.clone(), &top_two, join_labels);
+    let fused = fuse_labelled_scored(arms.clone(), &top_two, join_labels).unwrap();
     assert_eq!(sorted_ids(&fused), vec![1, 5]);
 
     let floor = DeterministicScore::from_f64(0.016);
     let floored = HybridConfig::new(10).with_min_score(floor);
-    let fused = fuse_labelled_scored(arms, &floored, join_labels);
+    let fused = fuse_labelled_scored(arms, &floored, join_labels).unwrap();
     assert_eq!(sorted_ids(&fused), vec![1, 2, 5]);
+}
+
+#[test]
+fn fuse_labelled_scored_preserves_errors_before_combining_labels() {
+    use khive_fusion::FuseError;
+
+    let config =
+        HybridConfig::new(10).with_fusion_strategy(FusionStrategy::weighted_rrf(10, vec![1.0]));
+    let arms = labelled("1:0.9 | 1:0.8");
+    let result = fuse_labelled_scored(arms, &config, |_, _| {
+        panic!("invalid fusion must return before combining labels")
+    });
+    assert_eq!(
+        result,
+        Err(FuseError::WeightedRrfWeightCountMismatch {
+            source_count: 2,
+            weight_count: 1,
+        })
+    );
 }

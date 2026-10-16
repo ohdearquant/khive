@@ -194,7 +194,10 @@ async fn reader_busy_and_queued_write_refusals_do_not_count_as_direct() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, StorageError::WriterTaskBusy { .. }),
+        matches!(
+            error.without_sqlite_write_stage(),
+            StorageError::WriterTaskBusy { .. }
+        ),
         "{error:?}"
     );
     let snapshot = queued.pool.writer_acquisition_snapshot();
@@ -278,7 +281,8 @@ where
     holder.execute_batch("ROLLBACK").unwrap();
 
     // A rollback-journal reader permits the body write but blocks COMMIT.
-    // The same actual route returns the existing text-only Pool representation.
+    // Native COMMIT evidence wraps the existing Pool representation without
+    // changing the source-chain-based direct BUSY counter.
     let commit_primary = Fixture::new(true, false);
     let commit_blocked = Fixture::new(false, false);
     let reader = rusqlite::Connection::open(&commit_blocked.path).unwrap();
@@ -307,8 +311,20 @@ where
         khive_storage::WriterTaskRequestState::TransactionRolledBack
     );
     assert!(
-        matches!(source.as_ref(), StorageError::Pool { .. }),
-        "COMMIT's discarded typed SQLite cause must remain text-only"
+        matches!(
+            source.without_sqlite_write_stage(),
+            StorageError::Pool { .. }
+        ),
+        "COMMIT evidence must preserve the existing pool error"
+    );
+    assert_eq!(
+        error.sqlite_write_failure(),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_BUSY,
+            extended_code: rusqlite::ffi::SQLITE_BUSY,
+            settlement_unknown: false,
+        })
     );
     assert_eq!(
         commit_primary
@@ -316,7 +332,7 @@ where
             .writer_acquisition_snapshot()
             .direct_busy_refusals,
         0,
-        "text-only COMMIT failure contributes zero"
+        "COMMIT metadata does not add a native SQLite cause to the source chain"
     );
     assert!(commit_primary.pool.try_writer().unwrap().is_autocommit());
     assert!(

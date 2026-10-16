@@ -301,8 +301,7 @@ async fn reindex_child() {
     run_reindex_with_setup(
         args,
         |mut config| {
-            config.embedding_model = None;
-            config.additional_embedding_models.clear();
+            config.disable_embedding_models();
             config
         },
         |rt| {

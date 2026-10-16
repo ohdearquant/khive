@@ -8,7 +8,7 @@ use uuid::Uuid;
 use khive_types::SubstrateKind;
 
 /// Controls how BM25 candidate rows are gathered before final ranking.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TextGatherMode {
     /// Current behavior: ORDER BY rank LIMIT top_k.

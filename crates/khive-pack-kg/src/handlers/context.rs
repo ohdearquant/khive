@@ -36,7 +36,7 @@ use khive_runtime::{
 use khive_storage::types::{Direction, NeighborHit, NeighborQuery, PageRequest};
 use khive_storage::{EdgeRelation, Entity, EntityFilter};
 
-use super::common::{deser, parse_direction, parse_relation, ContextParams};
+use super::common::{deser, parse_direction, parse_relation, ContextParams, DoublingWindowIter};
 use super::message_scope::{message_neighbor_permitted, resolve_mailbox_graph_id};
 use crate::KgPack;
 
@@ -111,6 +111,31 @@ struct NeighborRecord {
     via: Option<Uuid>,
 }
 
+struct NeighborCandidate {
+    id: Uuid,
+    edge_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    direction: &'static str,
+}
+
+struct AnchorEdgeRecord {
+    edge_id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+}
+
+fn context_edge_endpoints(parent_id: Uuid, neighbor_id: Uuid, direction: &str) -> (Uuid, Uuid) {
+    // Incoming preserves neighbor -> parent; outgoing and symmetric both use parent -> neighbor.
+    if direction == "incoming" {
+        (neighbor_id, parent_id)
+    } else {
+        (parent_id, neighbor_id)
+    }
+}
+
 /// True iff every relation in the filter is symmetric. See `docs/api/context-verb.md`.
 fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     match relations {
@@ -155,7 +180,9 @@ async fn fetch_directed_neighbors(
         return Ok(hits
             .into_iter()
             .map(|(h, dir)| {
-                let tag = if dir == Direction::Out {
+                let tag = if h.relation.is_symmetric() {
+                    "both"
+                } else if dir == Direction::Out {
                     "outgoing"
                 } else {
                     "incoming"
@@ -185,7 +212,17 @@ async fn fetch_directed_neighbors(
     } else {
         "incoming"
     };
-    Ok(hits.into_iter().map(|h| (h, tag)).collect())
+    Ok(hits
+        .into_iter()
+        .map(|h| {
+            let tag = if h.relation.is_symmetric() {
+                "both"
+            } else {
+                tag
+            };
+            (h, tag)
+        })
+        .collect())
 }
 
 async fn fetch_mailbox_neighbors(
@@ -196,13 +233,13 @@ async fn fetch_mailbox_neighbors(
     node_id: Uuid,
     options: &ContextNeighborRead<'_>,
     permitted: &mut HashMap<Uuid, bool>,
-) -> Result<(Vec<(Uuid, EdgeRelation, f64, &'static str)>, bool), RuntimeError> {
+) -> Result<(Vec<NeighborCandidate>, bool), RuntimeError> {
     const SCAN_CAP: u32 = 10_000;
     let mut merged: Vec<(NeighborHit, &'static str)> = Vec::new();
     let mut scan_incomplete = false;
     for namespace in token.visible_namespaces() {
-        let mut window = options.fanout;
-        loop {
+        let mut windows = DoublingWindowIter::new(options.fanout, SCAN_CAP);
+        while let Some(window) = windows.next() {
             let raw = missing_neighbor_anchor_as_empty(
                 fetch_directed_neighbors(
                     runtime,
@@ -245,7 +282,7 @@ async fn fetch_mailbox_neighbors(
                 scan_incomplete = true;
                 break;
             }
-            window = window.saturating_mul(2).min(SCAN_CAP);
+            windows.advance(window, 0, true);
         }
     }
     let direction_rank = |tag: &str| match tag {
@@ -255,17 +292,17 @@ async fn fetch_mailbox_neighbors(
     };
     merged.sort_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
     merged.dedup_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
-    merged.sort_by(|a, b| {
-        b.0.weight
-            .partial_cmp(&a.0.weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.node_id.cmp(&b.0.node_id))
-            .then(a.0.edge_id.cmp(&b.0.edge_id))
-    });
+    merged.sort_by(compare_context_neighbors);
     Ok((
         merged
             .into_iter()
-            .map(|(hit, tag)| (hit.node_id, hit.relation, hit.weight, tag))
+            .map(|(hit, direction)| NeighborCandidate {
+                id: hit.node_id,
+                edge_id: hit.edge_id,
+                relation: hit.relation,
+                weight: hit.weight,
+                direction,
+            })
             .collect(),
         scan_incomplete,
     ))
@@ -286,10 +323,122 @@ fn compact_len(v: &Value) -> Result<usize, RuntimeError> {
     Ok(s.chars().count())
 }
 
+/// The two projections of one discovery step share a single admission cost.
+struct ContextPair {
+    neighbor: Value,
+    edge: Value,
+    size: usize,
+}
+
+impl ContextPair {
+    fn new(neighbor: Value, edge: Value) -> Result<Self, RuntimeError> {
+        let size = compact_len(&neighbor)? + compact_len(&edge)?;
+        Ok(Self {
+            neighbor,
+            edge,
+            size,
+        })
+    }
+}
+
 struct AnchorBlock {
     entity_json: Value,
     entity_size: usize,
-    neighbor_jsons: Vec<(Value, usize)>,
+    pairs: Vec<ContextPair>,
+}
+
+// Only the library unit-test target has this private, namespace-scoped barrier.
+// No state or public test API is compiled into production or integration targets.
+#[cfg(test)]
+mod hydration_pause {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct Pause {
+        id: Uuid,
+        entered: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    fn pauses() -> &'static Mutex<HashMap<String, Pause>> {
+        static PAUSES: OnceLock<Mutex<HashMap<String, Pause>>> = OnceLock::new();
+        PAUSES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) struct Arm {
+        namespace: String,
+        id: Uuid,
+        entered: Option<oneshot::Receiver<()>>,
+        resume: Option<oneshot::Sender<()>>,
+    }
+
+    impl Arm {
+        pub(super) async fn reached(&mut self) {
+            tokio::time::timeout(Duration::from_secs(10), self.entered.take().unwrap())
+                .await
+                .expect("context expansion watchdog")
+                .expect("context must reach the hydration barrier");
+        }
+
+        pub(super) fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
+    impl Drop for Arm {
+        fn drop(&mut self) {
+            self.release();
+            let mut entries = pauses().lock().expect("hydration pause lock");
+            if entries
+                .get(&self.namespace)
+                .is_some_and(|pause| pause.id == self.id)
+            {
+                entries.remove(&self.namespace);
+            }
+        }
+    }
+
+    pub(super) fn arm(namespace: &str) -> Arm {
+        let id = Uuid::new_v4();
+        let (entered, reached) = oneshot::channel();
+        let (resume, released) = oneshot::channel();
+        let mut entries = pauses().lock().expect("hydration pause lock");
+        assert!(!entries.contains_key(namespace), "one pause per namespace");
+        entries.insert(
+            namespace.to_owned(),
+            Pause {
+                id,
+                entered,
+                resume: released,
+            },
+        );
+        Arm {
+            namespace: namespace.to_owned(),
+            id,
+            entered: Some(reached),
+            resume: Some(resume),
+        }
+    }
+
+    pub(super) async fn wait(namespace: &str) {
+        let pause = {
+            pauses()
+                .lock()
+                .expect("hydration pause lock")
+                .remove(namespace)
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            // Arm drop releases the read even if the mutation/assertion panics.
+            let _ = tokio::time::timeout(Duration::from_secs(10), pause.resume)
+                .await
+                .expect("context hydration release watchdog");
+        }
+    }
 }
 
 impl KgPack {
@@ -442,6 +591,9 @@ impl KgPack {
         // Anchors seed the visited set so an anchor already shown at the top
         // level never also appears inside another anchor's neighbor list.
         let mut visited: HashSet<Uuid> = anchor_ids.iter().copied().collect();
+        let anchor_id_set: HashSet<Uuid> = anchor_ids.iter().copied().collect();
+        let mut seen_anchor_edge_ids = HashSet::new();
+        let mut anchor_edge_records = Vec::new();
         let mut per_anchor_neighbors: Vec<Vec<NeighborRecord>> =
             Vec::with_capacity(anchor_ids.len());
         let mut permitted = HashMap::new();
@@ -470,15 +622,30 @@ impl KgPack {
                 .await?;
                 scan_incomplete |= incomplete;
 
-                for (id, relation, weight, dir) in hop1_raw {
+                for hit in hop1_raw {
+                    let id = hit.id;
+                    if anchor_id_set.contains(&id) {
+                        if seen_anchor_edge_ids.insert(hit.edge_id) {
+                            let (source_id, target_id) =
+                                context_edge_endpoints(anchor, id, hit.direction);
+                            anchor_edge_records.push(AnchorEdgeRecord {
+                                edge_id: hit.edge_id,
+                                source_id,
+                                target_id,
+                                relation: hit.relation,
+                                weight: hit.weight,
+                            });
+                        }
+                        continue;
+                    }
                     if !visited.insert(id) {
                         continue;
                     }
                     recs.push(NeighborRecord {
                         id,
-                        relation,
-                        direction: dir,
-                        weight,
+                        relation: hit.relation,
+                        direction: hit.direction,
+                        weight: hit.weight,
                         hop: 1,
                         via: None,
                     });
@@ -500,17 +667,12 @@ impl KgPack {
                     )
                     .await?;
                     scan_incomplete |= incomplete;
-                    for (id, relation, weight, dir) in hop2_raw {
-                        hop2_pool.push((*parent, id, relation, weight, dir));
+                    for hit in hop2_raw {
+                        hop2_pool.push((*parent, hit.id, hit.relation, hit.weight, hit.direction));
                     }
                 }
                 // Deterministic hop-1 stratum ordering; see docs/api/context-verb.md.
-                hop2_pool.sort_by(|a, b| {
-                    b.3.partial_cmp(&a.3)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.0.cmp(&b.0))
-                });
+                hop2_pool.sort_by(compare_hop2_neighbors);
                 for (parent, id, relation, weight, dir) in hop2_pool {
                     if !visited.insert(id) {
                         continue;
@@ -531,6 +693,9 @@ impl KgPack {
         if let Some(t) = t2 {
             plog(call_id, "expand", t.elapsed().as_micros());
         }
+
+        #[cfg(test)]
+        hydration_pause::wait(token.namespace().as_str()).await;
 
         // ---- Stage 3: batch entity metadata fetch (anchors + all neighbors) ----
         let t3 = if prof { Some(Instant::now()) } else { None };
@@ -654,9 +819,15 @@ impl KgPack {
             });
             let entity_size = compact_len(&entity_json)?;
 
-            let mut neighbor_jsons = Vec::with_capacity(per_anchor_neighbors[i].len());
+            let mut pairs = Vec::with_capacity(per_anchor_neighbors[i].len());
             for rec in &per_anchor_neighbors[i] {
                 let Some(ne) = meta_for(&rec.id) else {
+                    continue;
+                };
+                let parent_id = rec.via.unwrap_or(*anchor);
+                let Some(parent) = meta_for(&parent_id) else {
+                    // Separate scoped reads can lose a parent after discovery.
+                    // Skip both projections before budgeting; retain visited ownership.
                     continue;
                 };
                 let nj = json!({
@@ -671,18 +842,57 @@ impl KgPack {
                     "via": rec.via.map(|v| v.to_string()),
                     "description": ne.description,
                 });
-                let size = compact_len(&nj)?;
-                neighbor_jsons.push((nj, size));
+                let (source_id, target_id) =
+                    context_edge_endpoints(parent_id, rec.id, rec.direction);
+                let source_name = if source_id == parent_id {
+                    parent.name.as_deref()
+                } else {
+                    ne.name.as_deref()
+                };
+                let target_name = if target_id == parent_id {
+                    parent.name.as_deref()
+                } else {
+                    ne.name.as_deref()
+                };
+                let edge = json!({
+                    "source_id": source_id.to_string(),
+                    "source_name": source_name,
+                    "target_id": target_id.to_string(),
+                    "target_name": target_name,
+                    "relation": rec.relation.as_str(),
+                    "weight": rec.weight,
+                    "direction": rec.direction,
+                    "hop": rec.hop,
+                    "via": rec.via.map(|v| v.to_string()),
+                });
+                pairs.push(ContextPair::new(nj, edge)?);
             }
             blocks.push(AnchorBlock {
                 entity_json,
                 entity_size,
-                neighbor_jsons,
+                pairs,
             });
         }
 
-        let (out_anchors, truncated, dropped_anchors, dropped_neighbors) =
+        let (out_anchors, out_edges, truncated, dropped_anchors, dropped_neighbors) =
             assemble_within_budget(&blocks, budget);
+
+        anchor_edge_records.sort_by_key(|edge| edge.edge_id);
+        let anchor_edges: Vec<Value> = anchor_edge_records
+            .into_iter()
+            .filter_map(|edge| {
+                let source = entity_meta.get(&edge.source_id)?;
+                let target = entity_meta.get(&edge.target_id)?;
+                Some(json!({
+                    "source_id": edge.source_id.to_string(),
+                    "source_name": source.name,
+                    "target_id": edge.target_id.to_string(),
+                    "target_name": target.name,
+                    "relation": edge.relation.as_str(),
+                    "weight": edge.weight,
+                }))
+            })
+            .collect();
 
         if let Some(t) = t4 {
             plog(call_id, "assembly", t.elapsed().as_micros());
@@ -690,6 +900,8 @@ impl KgPack {
 
         let mut response = json!({
             "anchors": out_anchors,
+            "edges": out_edges,
+            "anchor_edges": anchor_edges,
             "truncated": truncated,
             // `stage` is additive: every drop this handler produces originates in the
             // Stage-4 budget walk — `fanout`/`hops` bound the neighbor candidate pool
@@ -697,6 +909,7 @@ impl KgPack {
             "dropped": {
                 "anchors": dropped_anchors,
                 "neighbors": dropped_neighbors,
+                "edges": dropped_neighbors,
                 "stage": "budget",
             },
         });
@@ -737,7 +950,7 @@ impl KgPack {
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
-) -> (Vec<Value>, bool, usize, usize) {
+) -> (Vec<Value>, Vec<Value>, bool, usize, usize) {
     let mut running = 0usize;
     let mut truncated = false;
     let mut included: Vec<bool> = vec![false; blocks.len()];
@@ -752,19 +965,21 @@ fn assemble_within_budget(
     }
 
     let mut out_anchors: Vec<Value> = Vec::with_capacity(blocks.len());
+    let mut out_edges: Vec<Value> = Vec::new();
     let mut committed_neighbors: Vec<usize> = vec![0; blocks.len()];
     for (i, block) in blocks.iter().enumerate() {
         if !included[i] {
             continue;
         }
         let mut neighbor_out: Vec<Value> = Vec::new();
-        for (nj, size) in &block.neighbor_jsons {
-            if running + size > budget {
+        for pair in &block.pairs {
+            if running + pair.size > budget {
                 truncated = true;
                 break;
             }
-            running += size;
-            neighbor_out.push(nj.clone());
+            running += pair.size;
+            neighbor_out.push(pair.neighbor.clone());
+            out_edges.push(pair.edge.clone());
             committed_neighbors[i] += 1;
         }
         out_anchors.push(json!({
@@ -778,176 +993,41 @@ fn assemble_within_budget(
     let dropped_neighbors: usize = blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| b.neighbor_jsons.len() - committed_neighbors[i])
+        .map(|(i, b)| b.pairs.len() - committed_neighbors[i])
         .sum();
 
-    (out_anchors, truncated, dropped_anchors, dropped_neighbors)
+    (
+        out_anchors,
+        out_edges,
+        truncated,
+        dropped_anchors,
+        dropped_neighbors,
+    )
+}
+
+fn compare_context_neighbors(
+    a: &(NeighborHit, &str),
+    b: &(NeighborHit, &str),
+) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f64(
+        a.0.weight,
+        &(a.0.node_id, a.0.edge_id),
+        b.0.weight,
+        &(b.0.node_id, b.0.edge_id),
+    )
+}
+
+fn compare_hop2_neighbors(
+    a: &(Uuid, Uuid, EdgeRelation, f64, &str),
+    b: &(Uuid, Uuid, EdgeRelation, f64, &str),
+) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f64(a.3, &(a.1, a.0), b.3, &(b.1, b.0))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "context_tests.rs"]
+mod tests;
 
-    fn anchor_block(
-        name: &str,
-        entity_size_filler: usize,
-        neighbor_sizes: &[usize],
-    ) -> AnchorBlock {
-        let entity_json = json!({ "id": name, "filler": "x".repeat(entity_size_filler) });
-        let entity_size = compact_len(&entity_json).unwrap();
-        let neighbor_jsons = neighbor_sizes
-            .iter()
-            .enumerate()
-            .map(|(idx, &sz)| {
-                let nj = json!({ "id": format!("{name}-n{idx}"), "filler": "x".repeat(sz) });
-                let size = compact_len(&nj).unwrap();
-                (nj, size)
-            })
-            .collect();
-        AnchorBlock {
-            entity_json,
-            entity_size,
-            neighbor_jsons,
-        }
-    }
-
-    #[test]
-    fn relations_all_symmetric_true_for_only_symmetric_relations() {
-        assert!(relations_all_symmetric(Some(&[EdgeRelation::CompetesWith])));
-        assert!(relations_all_symmetric(Some(&[
-            EdgeRelation::CompetesWith,
-            EdgeRelation::ComposedWith
-        ])));
-    }
-
-    #[test]
-    fn relations_all_symmetric_false_for_mixed_or_absent() {
-        assert!(!relations_all_symmetric(None));
-        assert!(!relations_all_symmetric(Some(&[])));
-        assert!(!relations_all_symmetric(Some(&[EdgeRelation::Extends])));
-        assert!(!relations_all_symmetric(Some(&[
-            EdgeRelation::CompetesWith,
-            EdgeRelation::Extends
-        ])));
-    }
-
-    #[test]
-    fn assemble_within_budget_no_truncation_when_everything_fits() {
-        let blocks = vec![anchor_block("a1", 4, &[4, 4]), anchor_block("a2", 4, &[4])];
-        let total: usize = blocks
-            .iter()
-            .map(|b| b.entity_size + b.neighbor_jsons.iter().map(|(_, s)| s).sum::<usize>())
-            .sum();
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, total);
-        assert!(!truncated);
-        assert_eq!(d_anchors, 0);
-        assert_eq!(d_neighbors, 0);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 2);
-        assert_eq!(out[1]["neighbors"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn assemble_within_budget_exact_boundary_is_not_truncated() {
-        // A budget exactly equal to the cumulative size must NOT truncate —
-        // the spec's stop condition is "would push the running total PAST
-        // budget", i.e. a record landing exactly on the boundary still fits.
-        let blocks = vec![anchor_block("a1", 4, &[4])];
-        let exact_total = blocks[0].entity_size + blocks[0].neighbor_jsons[0].1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, exact_total);
-        assert!(
-            !truncated,
-            "exact-fit budget must not be reported as truncated"
-        );
-        assert_eq!(d_anchors, 0);
-        assert_eq!(d_neighbors, 0);
-        assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn assemble_within_budget_one_char_over_boundary_truncates_the_overflowing_record() {
-        let blocks = vec![anchor_block("a1", 4, &[4, 4])];
-        let entity_size = blocks[0].entity_size;
-        let first_neighbor_size = blocks[0].neighbor_jsons[0].1;
-        // Budget fits the anchor entity plus the first neighbor exactly, but not
-        // a single Unicode scalar more — the second neighbor must be dropped.
-        let budget = entity_size + first_neighbor_size;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
-        assert!(truncated);
-        assert_eq!(d_anchors, 0, "the anchor's entity record itself fit");
-        assert_eq!(
-            d_neighbors, 1,
-            "exactly the overflowing neighbor is dropped"
-        );
-        assert_eq!(out[0]["neighbors"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn assemble_within_budget_anchor_entity_overflow_drops_whole_anchor_and_all_after_it() {
-        let blocks = vec![anchor_block("a1", 4, &[4]), anchor_block("a2", 4, &[4])];
-        // Budget too small even for the first anchor's entity record.
-        let budget = blocks[0].entity_size - 1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
-        assert!(truncated);
-        assert!(out.is_empty(), "no anchor entity fit at all");
-        assert_eq!(d_anchors, 2, "both anchors dropped");
-        assert_eq!(d_neighbors, 2, "both anchors' single neighbor each dropped");
-    }
-
-    #[test]
-    fn assemble_within_budget_first_anchor_bloated_neighbor_no_longer_starves_second_anchor() {
-        // Regression test for the context-verb anchor-starvation defect: a bloated
-        // neighbor list on a higher-ranked anchor must never push a lower-ranked
-        // (but still selected) anchor's own entity record out of the result. Only
-        // that first anchor's oversized neighbor should be dropped.
-        let blocks = vec![anchor_block("a1", 4, &[2000]), anchor_block("a2", 4, &[4])];
-        let budget = blocks[0].entity_size + blocks[1].entity_size + blocks[1].neighbor_jsons[0].1;
-        let (out, truncated, d_anchors, d_neighbors) = assemble_within_budget(&blocks, budget);
-        assert!(truncated);
-        assert_eq!(
-            out.len(),
-            2,
-            "both anchors' entity records must survive a bloated sibling neighbor list"
-        );
-        assert_eq!(
-            out[1]["entity"]["id"], "a2",
-            "second anchor's entity must be present"
-        );
-        assert_eq!(d_anchors, 0, "no anchor entity is dropped");
-        assert_eq!(
-            d_neighbors, 1,
-            "only the oversized first-anchor neighbor is dropped"
-        );
-        assert_eq!(
-            out[0]["neighbors"].as_array().unwrap().len(),
-            0,
-            "first anchor's oversized neighbor did not fit"
-        );
-        assert_eq!(
-            out[1]["neighbors"].as_array().unwrap().len(),
-            1,
-            "second anchor's small neighbor still fits"
-        );
-    }
-
-    #[test]
-    fn assemble_within_budget_hop_and_via_pass_through_untouched() {
-        let hop1 = json!({ "id": "n1", "hop": 1, "via": Value::Null });
-        let hop2 = json!({ "id": "n2", "hop": 2, "via": "n1" });
-        let sz1 = compact_len(&hop1).unwrap();
-        let sz2 = compact_len(&hop2).unwrap();
-        let block = AnchorBlock {
-            entity_json: json!({ "id": "a1" }),
-            entity_size: compact_len(&json!({ "id": "a1" })).unwrap(),
-            neighbor_jsons: vec![(hop1, sz1), (hop2, sz2)],
-        };
-        let budget = block.entity_size + sz1 + sz2;
-        let (out, truncated, ..) = assemble_within_budget(&[block], budget);
-        assert!(!truncated);
-        let neighbors = out[0]["neighbors"].as_array().unwrap();
-        assert_eq!(neighbors[0]["hop"], 1);
-        assert_eq!(neighbors[0]["via"], Value::Null);
-        assert_eq!(neighbors[1]["hop"], 2);
-        assert_eq!(neighbors[1]["via"], "n1");
-    }
-}
+#[cfg(test)]
+#[path = "context_ordering_tests.rs"]
+mod ordering_tests;

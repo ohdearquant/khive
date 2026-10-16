@@ -55,19 +55,12 @@ pub(crate) struct AnnBridge {
     search_pause: Option<Arc<TestSearchPause>>,
 }
 
-impl std::ops::Deref for AnnBridge {
-    type Target = AnnBridgeCore;
-
-    fn deref(&self) -> &AnnBridgeCore {
-        &self.core
-    }
-}
-
-impl std::ops::DerefMut for AnnBridge {
-    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
-        &mut self.core
-    }
-}
+khive_vamana::impl_ann_bridge_helpers!(
+    AnnBridge,
+    /// Stamp this bridge with the namespace write-generation its corpus scan
+    /// started at or after (issue #770). Called just before install; see
+    /// `install_if_fresher`.
+);
 
 #[cfg(test)]
 #[derive(Default)]
@@ -836,14 +829,6 @@ impl AnnBridge {
     pub fn build(vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
         let core = AnnBridgeCore::build(vectors, dim, id_map)?;
         Ok(Self::from_core(core))
-    }
-
-    /// Stamp this bridge with the namespace write-generation its corpus scan
-    /// started at or after (issue #770). Called just before install; see
-    /// `install_if_fresher`.
-    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
-        self.generation = generation;
-        self
     }
 
     /// Stamp the ann_write_log watermark this bridge's corpus state reflects

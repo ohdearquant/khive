@@ -248,14 +248,10 @@ mod backend_batch_witnesses {
         let embedded = &multi.per_pack_runtimes["kg"];
         let text_only = &multi.per_pack_runtimes["comm"];
         embedded.register_embedder(BatchEmbedder);
-        assert_eq!(
-            embedded.config().embedding_model,
-            (!extra_only).then_some(model)
-        );
-        assert_eq!(
-            embedded.config().additional_embedding_models,
-            if extra_only { vec![model] } else { vec![] }
-        );
+        // Both legacy spellings become one ordered peer, and the first peer is the
+        // compatibility default model, so an extra-only configuration projects to it.
+        assert_eq!(embedded.config().embedding_model, Some(model));
+        assert!(embedded.config().additional_embedding_models.is_empty());
         assert!(text_only.config().embedding_model.is_none());
         assert!(text_only.config().additional_embedding_models.is_empty());
         let namespace = khive_runtime::Namespace::local();
@@ -307,20 +303,9 @@ mod backend_batch_witnesses {
         assert!(direct_outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));
-        if extra_only {
-            assert!(
-                !embedded.vector_arm_selected(),
-                "default-model search policy is unchanged"
-            );
-            assert!(
-                direct_hits.is_empty(),
-                "extra-only does not activate the default vector arm"
-            );
-        } else {
-            assert_eq!(direct_hits.len(), 1, "direct vector positive control");
-            assert_eq!(direct_hits[0].note_id, note.id);
-            assert_eq!(direct_hits[0].source, khive_runtime::SearchSource::Vector);
-        }
+        assert_eq!(direct_hits.len(), 1, "direct vector positive control");
+        assert_eq!(direct_hits[0].note_id, note.id);
+        assert_eq!(direct_hits[0].source, khive_runtime::SearchSource::Vector);
         let map = map_with_first(
             &[
                 ("comm".into(), Arc::clone(text_only)),
@@ -341,17 +326,13 @@ mod backend_batch_witnesses {
         assert!(outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));
-        if extra_only {
-            assert!(hits.is_empty());
-        } else {
-            assert_eq!(
-                hits.len(),
-                1,
-                "opt-out write must not contribute a vector row"
-            );
-            assert_eq!(hits[0].note_id, note.id);
-            assert_eq!(hits[0].source, khive_runtime::SearchSource::Vector);
-        }
+        assert_eq!(
+            hits.len(),
+            1,
+            "opt-out write must not contribute a vector row"
+        );
+        assert_eq!(hits[0].note_id, note.id);
+        assert_eq!(hits[0].source, khive_runtime::SearchSource::Vector);
         assert!(
             !text_only.vector_arm_selected(),
             "pack write settings remain unchanged"

@@ -187,7 +187,10 @@ pub use builder::{PackMetadataRegistry, VerbRegistryBuilder};
 
 mod catalog;
 mod dispatch;
+mod graph_lint;
 mod registry_access;
+#[cfg(test)]
+pub(crate) use graph_lint::registry_with_lint_owners;
 mod request_identity;
 pub(crate) use request_identity::is_special_relation;
 pub use request_identity::{
@@ -226,6 +229,7 @@ use audit::{
 pub use audit::{
     audit_admission_refused_obligation_count, audit_admission_refused_obligation_last_at_ms,
     audit_admission_unresolved_obligation_count, audit_admission_unresolved_obligation_last_at_ms,
+    audit_retry_exhausted_obligation_count, audit_retry_exhausted_obligation_last_at_ms,
     resolve_explicit_namespace,
 };
 pub(crate) use audit::{audit_append_failure_count, audit_obligation_append_failure_count};

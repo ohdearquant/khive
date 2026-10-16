@@ -409,6 +409,9 @@ const V52_UP: &str = include_str!("../sql/052-comm-core-indexes.sql");
 const V53_UP: &str = include_str!("../sql/053-entity-kind-list-order.sql");
 const MEMORY_VISIBILITY_CUTOVER_VERSION: u32 = 54;
 const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
+
+const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
+const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -759,6 +762,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: MEMORY_VISIBILITY_CUTOVER_VERSION,
         name: "memory_visibility_epochs",
         up: V54_UP,
+    },
+    VersionedMigration {
+        version: 55,
+        name: "knowledge_atom_cursor_all_live_tags",
+        up: V55_UP,
+    },
+    VersionedMigration {
+        version: 56,
+        name: "atom_weight_tables",
+        up: V56_UP,
     },
 ];
 
@@ -1515,6 +1528,49 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
 pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteError> {
     let conn = crate::pool::open_read_only_snapshot_connection(path)?;
     validate_schema_is_current(&conn)
+}
+
+/// Page accounting for one database file. Each value is a single pragma read,
+/// so the cost does not grow with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageAccounting {
+    /// `PRAGMA page_size`, in bytes.
+    pub page_size: u64,
+    /// `PRAGMA page_count`: every page in the database, free pages included.
+    pub page_count: u64,
+    /// `PRAGMA freelist_count`: pages that later writes can reuse but that stay
+    /// in the file until a `VACUUM`.
+    pub freelist_count: u64,
+}
+
+/// Open `path` read-only and report its page accounting without creating,
+/// migrating or walking the file. The caller must ensure `path` exists.
+pub fn inspect_page_accounting(path: &std::path::Path) -> Result<PageAccounting, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let read = |pragma: &str| -> Result<u64, SqliteError> {
+        let value: i64 = conn.query_row(pragma, [], |row| row.get(0))?;
+        u64::try_from(value)
+            .map_err(|_| SqliteError::InvalidData(format!("{pragma} returned {value}")))
+    };
+    Ok(PageAccounting {
+        page_size: read("PRAGMA page_size")?,
+        page_count: read("PRAGMA page_count")?,
+        freelist_count: read("PRAGMA freelist_count")?,
+    })
+}
+
+/// Open `path` read-only and run `PRAGMA integrity_check` over the whole file,
+/// returning every row SQLite reports: exactly `["ok"]` for a sound file. The
+/// check reads every page, so its cost grows with the file. No error limit is
+/// applied: the pragma's default stops at 100 rows, so the largest limit it
+/// accepts is passed instead.
+pub fn inspect_integrity(path: &std::path::Path) -> Result<Vec<String>, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let mut statement = conn.prepare(&format!("PRAGMA integrity_check({})", i32::MAX))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Require an already-open database to match this build's latest core schema
@@ -2274,3 +2330,7 @@ mod schedule_core_index_migration_tests;
 #[cfg(test)]
 #[path = "comm_core_index_migration_tests.rs"]
 mod comm_core_index_migration_tests;
+
+#[cfg(test)]
+#[path = "knowledge_cursor_tag_migration_tests.rs"]
+mod knowledge_cursor_tag_migration_tests;

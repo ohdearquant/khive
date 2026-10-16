@@ -193,4 +193,21 @@ pub trait AttachmentStore: Send + Sync + 'static {
     }
     /// Remove one attachment role without touching the referenced blob.
     async fn delete_attachment(&self, record_uuid: Uuid, role: &str) -> StorageResult<bool>;
+    /// Atomically remove a role only while its substrate and content reference still match.
+    /// Returns `true` only when removed; `false` means absent or changed and writes nothing.
+    /// The referenced blob is untouched. Backends must not implement this as a read followed
+    /// by an unguarded delete, since a replacement between those operations must survive.
+    async fn delete_attachment_if(
+        &self,
+        _record_uuid: Uuid,
+        _role: &str,
+        _expected_substrate: AttachmentSubstrate,
+        _expected_ref: &ContentRef,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Attachments,
+            operation: "delete_attachment_if".into(),
+            message: "the attachment backend does not support conditional delete".to_string(),
+        })
+    }
 }

@@ -157,8 +157,7 @@ impl EmbedderProvider for InterleavingProvider {
 }
 
 fn no_models(mut cfg: RuntimeConfig) -> RuntimeConfig {
-    cfg.embedding_model = None;
-    cfg.additional_embedding_models.clear();
+    cfg.disable_embedding_models();
     cfg.brain_profile = None;
     cfg.packs.clear();
     cfg

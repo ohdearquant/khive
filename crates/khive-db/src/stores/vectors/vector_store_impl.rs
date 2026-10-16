@@ -11,7 +11,12 @@ use super::{
     VectorProvenance, VectorRecord, VectorRowRef, VectorSearchHit, VectorSearchRequest,
     VectorStore, VectorStoreCapabilities, VectorStoreInfo,
 };
-use khive_storage::{decode_f32_native, encode_f32_native};
+use khive_storage::{
+    decode_f32_native, encode_f32_native, VectorScanEntry, VectorScanPage, VectorScanRequest,
+};
+
+/// sqlite-vec's ceiling on `k` in a vec0 KNN query (`SQLITE_VEC_VEC0_K_MAX`).
+const VEC0_K_MAX: usize = 4096;
 
 #[async_trait]
 impl VectorStore for SqliteVecStore {
@@ -94,18 +99,21 @@ impl VectorStore for SqliteVecStore {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_insert_vectors_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        &store_embedding_model2,
-                        &records,
-                        attempted,
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_insert_batch"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_insert_vectors_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            &store_embedding_model2,
+                            &records,
+                            attempted,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_insert_batch"))
+                    },
+                    "vec_insert_batch",
+                )
                 .await;
         }
 
@@ -243,23 +251,26 @@ impl VectorStore for SqliteVecStore {
             let embedding_model2 = embedding_model.clone();
             let embedding2 = embedding.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    vec_upsert_atomic_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        subject_id,
-                        &kind_str2,
-                        &namespace2,
-                        &field2,
-                        &embedding_model2,
-                        &embedding2,
-                        "vec_update_atomic",
-                        true,
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_update"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        vec_upsert_atomic_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            subject_id,
+                            &kind_str2,
+                            &namespace2,
+                            &field2,
+                            &embedding_model2,
+                            &embedding2,
+                            "vec_update_atomic",
+                            true,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_update"))
+                    },
+                    "vec_update",
+                )
                 .await;
         }
 
@@ -389,15 +400,19 @@ impl VectorStore for SqliteVecStore {
                 ));
             }
 
-            // Push namespace+embedding_model (and optionally kind) directly into
-            // the MATCH predicate so sqlite-vec evaluates them before computing
-            // global top-k, preventing cross-namespace recall starvation.
+            // MATCH applies namespace, model and kind inside sqlite-vec before its
+            // top-k, but orders by distance alone, so rows tied at the top_k
+            // boundary would be cut in table order. The query widens k until the
+            // last row returned is strictly farther than the boundary row, or the
+            // eligible rows run out, and the cut below orders ties by subject ID.
+            // A k past sqlite-vec's limit uses the scalar distance over every
+            // eligible row instead.
             let kind_clause = if kind_filter.is_some() {
                 "AND kind = ?5"
             } else {
                 ""
             };
-            let sql = format!(
+            let match_sql = format!(
                 "SELECT subject_id, distance \
                  FROM {t} \
                  WHERE embedding MATCH ?1 \
@@ -409,44 +424,67 @@ impl VectorStore for SqliteVecStore {
                 t = table,
                 kind_clause = kind_clause
             );
+            let exact_sql = format!(
+                "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
+                 FROM {t} \
+                 WHERE namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
+                 ORDER BY exact_distance, subject_id \
+                 LIMIT ?2",
+                t = table,
+                kind_clause = kind_clause
+            );
 
             let query_blob = encode_f32_native(&query_embedding);
-            let mut stmt = conn.prepare(&sql)?;
-
-            // Collect rows into a Vec to avoid holding MappedRows (which is
-            // parameterised on its closure type) across both branches.
-            let raw_rows: Vec<rusqlite::Result<(String, f64)>> =
+            let query_rows = |sql: &str, limit: usize| -> rusqlite::Result<Vec<(String, f64)>> {
+                let mut stmt = conn.prepare(sql)?;
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, f64)> {
+                    Ok((row.get(0)?, row.get(1)?))
+                };
                 if let Some(ref kind_str) = kind_filter {
                     stmt.query_map(
                         rusqlite::params![
                             query_blob,
-                            request.top_k,
+                            limit,
                             &namespace,
                             &effective_model,
                             kind_str
                         ],
-                        |row| {
-                            let id_str: String = row.get(0)?;
-                            let distance: f64 = row.get(1)?;
-                            Ok((id_str, distance))
-                        },
+                        read_row,
                     )?
                     .collect()
                 } else {
                     stmt.query_map(
-                        rusqlite::params![query_blob, request.top_k, &namespace, &effective_model],
-                        |row| {
-                            let id_str: String = row.get(0)?;
-                            let distance: f64 = row.get(1)?;
-                            Ok((id_str, distance))
-                        },
+                        rusqlite::params![query_blob, limit, &namespace, &effective_model],
+                        read_row,
                     )?
                     .collect()
+                }
+            };
+
+            let top_k = request.top_k as usize;
+            let mut k = top_k.saturating_add(1);
+            let mut rows = loop {
+                if k > VEC0_K_MAX {
+                    break query_rows(&exact_sql, top_k)?;
+                }
+                let rows = query_rows(&match_sql, k)?;
+                if top_k == 0 || rows.len() < k || rows[k - 1].1 > rows[top_k - 1].1 {
+                    break rows;
+                }
+                k = if k == VEC0_K_MAX {
+                    VEC0_K_MAX + 1
+                } else {
+                    k.saturating_mul(2).min(VEC0_K_MAX)
                 };
+            };
+            rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            rows.truncate(top_k);
 
             let mut hits = Vec::new();
-            for (rank_idx, row) in raw_rows.into_iter().enumerate() {
-                let (id_str, distance) = row?;
+            for (rank_idx, (id_str, distance)) in rows.into_iter().enumerate() {
                 let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -498,10 +536,13 @@ impl VectorStore for SqliteVecStore {
         if let Some(writer_task) = self.current_writer_task("vec_delete_subjects")? {
             let table_for_error = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    delete_vector_subjects_dml(conn, &table, &id_strings)
-                        .map_err(|e| map_err(e, "vec_delete_subjects"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        delete_vector_subjects_dml(conn, &table, &id_strings)
+                            .map_err(|e| map_err(e, "vec_delete_subjects"))
+                    },
+                    "vec_delete_subjects",
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!(target: "khive_db::stores::vectors", error = %e, table = %table_for_error, "delete_subjects failed");
@@ -627,6 +668,99 @@ impl VectorStore for SqliteVecStore {
         .await
     }
 
+    async fn scan_vectors(&self, request: VectorScanRequest) -> StorageResult<VectorScanPage> {
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let kind = request.kind.map(|kind| kind.to_string());
+        let after = request.after.map(|id| id.to_string());
+        let probe_limit = i64::from(request.limit.get()) + 1;
+
+        self.with_reader("vec_scan_vectors", move |conn| {
+            let invalid_blob = |message: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    )),
+                )
+            };
+            let expected_bytes = dims
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    invalid_blob("stored vector dimensions overflow the byte length".into())
+                })?;
+            // Only the constructor-validated model table is interpolated. No
+            // MATCH: SQLite filters and orders the raw scan before its limit.
+            let sql = format!(
+                "SELECT subject_id, embedding FROM {table} \
+                 WHERE namespace = ?1 AND embedding_model = ?2 AND field = ?3 \
+                   AND (?4 IS NULL OR kind = ?4) \
+                   AND (?5 IS NULL OR subject_id COLLATE BINARY > ?5) \
+                 ORDER BY subject_id COLLATE BINARY ASC LIMIT ?6"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![
+                &request.namespace,
+                &request.embedding_model,
+                &request.field,
+                &kind,
+                &after,
+                probe_limit,
+            ])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                let spelling: String = row.get(0)?;
+                let subject_id = Uuid::parse_str(&spelling).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                // A normalized cursor must have the same ordering as stored
+                // text, so refuse noncanonical persisted spellings.
+                if subject_id.to_string() != spelling {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stored vector subject_id is not canonical",
+                        )),
+                    ));
+                }
+                let blob: Vec<u8> = row.get(1)?;
+                if blob.len() != expected_bytes {
+                    return Err(invalid_blob(format!(
+                        "stored vector has {} bytes, expected {expected_bytes}",
+                        blob.len(),
+                    )));
+                }
+                let vector = decode_f32_native(&blob).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                items.push(VectorScanEntry {
+                    subject_id,
+                    vectors: vec![vector],
+                });
+            }
+            let next_after = if items.len() as u64 > u64::from(request.limit.get()) {
+                items.pop();
+                items.last().map(|item| item.subject_id)
+            } else {
+                None
+            };
+            Ok(VectorScanPage { items, next_after })
+        })
+        .await
+    }
+
     async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
         let table = self.table_name.clone();
 
@@ -673,18 +807,21 @@ impl VectorStore for SqliteVecStore {
             let kind_json2 = kind_json.clone();
             let allow_json2 = allow_json.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    orphan_sweep_dml(
-                        conn,
-                        &table2,
-                        ns_json2.as_deref(),
-                        kind_json2.as_deref(),
-                        allow_json2.as_deref(),
-                        max_delete,
-                        dry_run,
-                    )
-                    .map_err(|e| map_err(e, "orphan_sweep"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        orphan_sweep_dml(
+                            conn,
+                            &table2,
+                            ns_json2.as_deref(),
+                            kind_json2.as_deref(),
+                            allow_json2.as_deref(),
+                            max_delete,
+                            dry_run,
+                        )
+                        .map_err(|e| map_err(e, "orphan_sweep"))
+                    },
+                    "orphan_sweep",
+                )
                 .await;
         }
 

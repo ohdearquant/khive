@@ -1,5 +1,7 @@
 //! Full-text search capability.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -9,6 +11,11 @@ use crate::types::{
     BatchWriteSummary, IndexRebuildScope, StorageResult, TextDocument, TextFilter, TextIndexStats,
     TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats, TextTermStatsRequest,
 };
+
+/// Opens a full-text store for one table and tokenizer binding.
+pub trait TextSearchFactory: Send + Sync + 'static {
+    fn open(&self, table_key: &str, tokenizer: &str) -> StorageResult<Arc<dyn TextSearch>>;
+}
 
 /// Full-text search capability over indexed documents.
 #[async_trait]

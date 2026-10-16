@@ -14,6 +14,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
+pub mod backend_handle;
 pub mod blob;
 pub mod bounded_read;
 pub mod build_info;
@@ -22,6 +23,7 @@ pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
+pub mod context;
 pub mod cost_unit;
 pub mod credentials;
 mod visibility_receipts;
@@ -30,6 +32,8 @@ pub mod curation;
 pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
+pub mod embedding;
+pub mod embedding_reranker;
 pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
@@ -44,8 +48,10 @@ mod fence_identity;
 pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod hooks;
 mod index_repair;
 pub use index_repair::IndexRepairReport;
+pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
 #[cfg(test)]
@@ -59,6 +65,7 @@ mod note_index;
 mod note_read;
 pub mod note_search_ann;
 mod note_store_guard;
+mod note_validation;
 pub mod note_write;
 #[cfg(test)]
 mod note_write_tests;
@@ -66,6 +73,10 @@ pub mod objectives;
 pub mod operations;
 mod outbound_email_policy;
 pub use outbound_email_policy::OutboundEmailPolicy;
+pub use outbound_email_policy::{
+    inbound_email_is_suppressed, outbound_email_is_suppressed, EmailSuppression,
+    EmailSuppressionKind, EmailSuppressionScope,
+};
 pub mod pack;
 pub mod pack_metadata;
 mod params;
@@ -97,6 +108,8 @@ pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
 
+pub use context::{ContextContributor, ContextRequest, ContextSlice, ScoreSemantics};
+
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use agent_lifecycle::{
     apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
@@ -112,6 +125,7 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
+pub use backend_handle::{BackendHandle, BackendHandleError, RetrievalTier};
 pub use blob::{
     resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
@@ -137,6 +151,8 @@ pub use daemon::{
 };
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
+pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
+pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
     BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
@@ -162,7 +178,7 @@ pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use kg_read::KgNeighborRead;
-pub use khive_db::env::env_parse_or;
+pub use khive_db::env::{env_flag, env_parse_or};
 pub use khive_db::{
     checkpoint_once, run_checkpoint_task, run_migrations, stores::event::event_insert_statements,
     CheckpointConfig, CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
@@ -193,7 +209,7 @@ pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, ConditionalInsertStage,
     EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
-    PostCommitDegradation, QueryResult, Resolved,
+    PostCommitDegradation, PrefixScope, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -226,6 +242,10 @@ pub use runtime::{
     NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+pub use secret_gate_finalizer::{
+    EntityCandidateAdmission, EntityCandidateContext, EntityCandidateMutation,
+    EntityCandidateOrigin, EntityCandidatePrepared, EntityFinalizationPlan,
+};
 pub use telemetry_config::{
     TelemetryCarrier, TelemetryChannelConfig, TelemetryConfig, TelemetryFailurePosture,
     TelemetryPolicy,

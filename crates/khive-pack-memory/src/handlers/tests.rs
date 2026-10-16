@@ -69,6 +69,7 @@ fn effective_config_uses_defaults() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -103,6 +104,7 @@ fn effective_config_legacy_overrides() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -139,6 +141,7 @@ fn effective_config_explicit_config_wins() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -179,6 +182,7 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -242,6 +246,7 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -334,7 +339,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },
         ..RecallConfig::default()
     };
-    let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10);
+    let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10).unwrap();
     let rrf_order: Vec<Uuid> = rrf_results.iter().map(|h| h.entity_id).collect();
 
     let candidates_weighted = RecallCandidateSet {
@@ -353,7 +358,8 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         },
         ..RecallConfig::default()
     };
-    let weighted_results = fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
+    let weighted_results =
+        fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10).unwrap();
     let weighted_order: Vec<Uuid> = weighted_results.iter().map(|h| h.entity_id).collect();
 
     assert_ne!(
@@ -413,7 +419,7 @@ fn vector_only_fusion_unions_hits_across_every_engine() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert!(
@@ -461,7 +467,7 @@ fn vector_only_with_zero_vector_models_never_leaks_text_hits() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
 
     assert!(
         results.is_empty(),
@@ -514,7 +520,7 @@ fn keyword_only_with_zero_vector_models_still_returns_text_hits() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert_eq!(
@@ -577,7 +583,7 @@ fn multi_engine_rrf_gives_each_engine_a_separate_rank_contribution() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert_eq!(
@@ -1273,6 +1279,7 @@ fn fused_probe_scores(cfg: &RecallConfig) -> Vec<f64> {
     };
 
     fuse_candidates(&candidates, &memory_ids, cfg, 10)
+        .unwrap()
         .iter()
         .map(|h| h.score.to_f64())
         .collect()

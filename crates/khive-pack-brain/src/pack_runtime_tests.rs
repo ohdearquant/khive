@@ -124,6 +124,7 @@ fn forwarder_surface_tracks_the_actual_trait() {
 struct Probe<'a> {
     calls: Mutex<Vec<&'static str>>,
     state: Arc<u32>,
+    context: Option<Arc<dyn khive_runtime::ContextContributor>>,
     runtime: &'a KhiveRuntime,
     registry: &'a VerbRegistry,
     token: &'a NamespaceToken,
@@ -143,6 +144,55 @@ impl Probe<'_> {
         assert!(std::ptr::eq(token, self.token));
     }
 }
+
+struct ContextProbe {
+    seen: Mutex<Vec<(khive_runtime::ContextRequest, String)>>,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::ContextContributor for ContextProbe {
+    fn source_pack(&self) -> &'static str {
+        "probe"
+    }
+
+    async fn contribute(
+        &self,
+        req: &khive_runtime::ContextRequest,
+        token: &NamespaceToken,
+    ) -> Result<Vec<khive_runtime::ContextSlice>, RuntimeError> {
+        let namespace = token.namespace().as_str().to_owned();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((req.clone(), namespace.clone()));
+        tokio::task::yield_now().await;
+        Ok(vec![khive_runtime::ContextSlice {
+            source_pack: self.source_pack(),
+            kind: "probe-note".into(),
+            id: req.entity_ids[0].clone(),
+            content: json!({
+                "namespace": namespace,
+                "query": req.query,
+                "nested": [null, {"owned": true}]
+            }),
+            score: Some(1.75),
+            score_semantics: khive_runtime::ScoreSemantics::Rerank,
+        }])
+    }
+}
+
+static PROBE_PROPERTY_POLICIES: [khive_types::NotePropertyPolicySpec; 2] = [
+    khive_types::NotePropertyPolicySpec {
+        kind: "probe-note",
+        key: "derived",
+        policy: khive_types::PropertyPolicy::Derived,
+    },
+    khive_types::NotePropertyPolicySpec {
+        kind: "probe-note",
+        key: "owner",
+        policy: khive_types::PropertyPolicy::OwnerOnly,
+    },
+];
 macro_rules! metadata_probes {
     ($($name:ident -> $ty:ty = $value:expr;)*) => {
         $(fn $name(&self) -> $ty { self.hit(stringify!($name)); $value })*
@@ -165,6 +215,7 @@ impl PackRuntime for Probe<'_> {
         entity_types -> &'static [khive_types::EntityTypeDef] = &[];
         requires -> &'static [&'static str] = &["probe-required"];
         note_kind_specs -> &'static [khive_runtime::NoteKindSpec] = &[];
+        note_property_policies -> &'static [khive_types::NotePropertyPolicySpec] = &PROBE_PROPERTY_POLICIES;
         note_embedding_policies -> &'static [khive_types::NoteEmbeddingPolicySpec] = &[];
         schema_column_additions -> &'static [khive_types::PackColumnAddition] = &[];
         validation_rules -> &'static [khive_runtime::ValidationRule] = &[];
@@ -189,6 +240,10 @@ impl PackRuntime for Probe<'_> {
         self.hit("kind_hook");
         assert_eq!(kind, "probe-kind");
         None
+    }
+    fn context_contributor(&self) -> Option<Arc<dyn khive_runtime::ContextContributor>> {
+        self.hit("context_contributor");
+        self.context.clone()
     }
     fn accept_channel_ingest_capability(&self, _capability: ChannelIngestCapability) {
         self.hit("accept_channel_ingest_capability");
@@ -288,6 +343,7 @@ fn runtime() -> KhiveRuntime {
         disk_guard_config: None,
         volume_lock_dir: None,
         default_namespace: Namespace::local(),
+        engines: None,
         embedding_model: None,
         additional_embedding_models: vec![],
         gate: Arc::new(khive_runtime::AllowAllGate),
@@ -315,9 +371,14 @@ async fn forwards_every_runtime_method_to_the_same_inner_instance() {
     let runtime = runtime();
     let registry = VerbRegistryBuilder::new().build().unwrap();
     let token = runtime.authorize(Namespace::local()).unwrap();
+    let context_source = Arc::new(ContextProbe {
+        seen: Mutex::new(vec![]),
+    });
+    let stored_capability: Arc<dyn khive_runtime::ContextContributor> = context_source.clone();
     let inner = Arc::new(Probe {
         calls: Mutex::new(vec![]),
         state: Arc::new(71),
+        context: Some(stored_capability.clone()),
         runtime: &runtime,
         registry: &registry,
         token: &token,
@@ -375,8 +436,67 @@ async fn forwards_every_runtime_method_to_the_same_inner_instance() {
     assert!(called!(entity_types, wrapper.entity_types()).is_empty());
     assert_eq!(called!(requires, wrapper.requires()), &["probe-required"]);
     assert!(called!(note_kind_specs, wrapper.note_kind_specs()).is_empty());
+    let policies = called!(note_property_policies, wrapper.note_property_policies());
+    assert_eq!(policies, &PROBE_PROPERTY_POLICIES);
+    assert!(std::ptr::eq(policies, &PROBE_PROPERTY_POLICIES[..]));
     assert!(called!(note_embedding_policies, wrapper.note_embedding_policies()).is_empty());
     assert!(called!(kind_hook, wrapper.kind_hook("probe-kind")).is_none());
+    let capability = called!(context_contributor, wrapper.context_contributor())
+        .expect("the wrapper preserves the inner Some capability");
+    assert!(Arc::ptr_eq(&capability, &stored_capability));
+    assert_eq!(capability.source_pack(), "probe");
+    assert!(context_source.seen.lock().unwrap().is_empty());
+    let absent_inner = Arc::new(Probe {
+        calls: Mutex::new(vec![]),
+        state: inner.state.clone(),
+        context: None,
+        runtime: &runtime,
+        registry: &registry,
+        token: &token,
+    });
+    assert!(BrainPackRuntime(absent_inner.clone())
+        .context_contributor()
+        .is_none());
+    assert_eq!(*absent_inner.calls.lock().unwrap(), ["context_contributor"]);
+    assert!(context_source.seen.lock().unwrap().is_empty());
+    let context_request = khive_runtime::ContextRequest {
+        query: Some("owned context query".into()),
+        entity_ids: vec!["opaque-first-id".into(), "second-id".into()],
+        consumer_kind: "probe-consumer".into(),
+        budget_hint: 1234,
+        hops: 4,
+        fanout: 7,
+        direction: khive_storage::Direction::Both,
+        relations: vec!["depends_on".into(), "relates_to".into()],
+    };
+    let slices = capability
+        .contribute(&context_request, &token)
+        .await
+        .expect("the returned dynamic capability executes real contribution");
+    {
+        let seen = context_source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (request, namespace) = &seen[0];
+        assert_eq!(namespace, token.namespace().as_str());
+        assert_eq!(namespace, "local");
+        assert_eq!(request.query, context_request.query);
+        assert_eq!(request.entity_ids, context_request.entity_ids);
+        assert_eq!(request.consumer_kind, context_request.consumer_kind);
+        assert_eq!(request.budget_hint, context_request.budget_hint);
+        assert_eq!((request.hops, request.fanout), (4, 7));
+        assert_eq!(request.direction, khive_storage::Direction::Both);
+        assert_eq!(request.relations, context_request.relations);
+    }
+    drop(context_request);
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].source_pack, "probe");
+    assert_eq!(slices[0].kind, "probe-note");
+    assert_eq!(slices[0].id, "opaque-first-id");
+    assert_eq!(slices[0].score, Some(1.75));
+    assert_eq!(
+        slices[0].score_semantics,
+        khive_runtime::ScoreSemantics::Rerank
+    );
     called!(
         accept_channel_ingest_capability,
         wrapper.accept_channel_ingest_capability(
@@ -445,5 +565,22 @@ async fn forwards_every_runtime_method_to_the_same_inner_instance() {
         )
         .unwrap(),
         json!({"dispatch": "probe"})
+    );
+    drop(wrapper);
+    drop(inner);
+    drop(absent_inner);
+    drop(capability);
+    drop(stored_capability);
+    drop(context_source);
+    drop(token);
+    drop(registry);
+    drop(runtime);
+    assert_eq!(
+        serde_json::to_value(slices).unwrap(),
+        json!([{
+            "source_pack": "probe", "kind": "probe-note", "id": "opaque-first-id",
+            "content": {"namespace": "local", "query": "owned context query", "nested": [null, {"owned": true}]},
+            "score": 1.75, "score_semantics": "rerank"
+        }])
     );
 }

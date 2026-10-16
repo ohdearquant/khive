@@ -9,6 +9,11 @@ sub-procedure with a mandatory split for records naming both a technique and a d
 of it, and step 9 gains a question-note requirement for records carrying deployment
 vocabulary without an instance identifier. See "Service/concept tie-break" below.
 
+**Amended 2026-10-10 (#4786)**: the
+[explicit-import/VCS policy boundary](#amendment-2026-10-10-explicit-import-and-vcs-snapshot-policy-boundary-4786)
+below scopes the forward-compatibility clause to VCS snapshot synchronization;
+explicit operator and library imports follow ADR-035's import policy.
+
 ## Context
 
 khive is a research knowledge graph runtime. Entities are the nodes — papers, algorithms,
@@ -586,3 +591,49 @@ registry is the builtin table composed with every loaded pack's `ENTITY_TYPES`.
 This amendment exists so the legacy backfill has one pass rather than two. It
 converts the largest remaining unregistered group on a real store from residue
 into rows a backfill can promote through the normal write path, with validation.
+
+---
+
+## Amendment 2026-10-10: explicit import and VCS snapshot policy boundary (#4786)
+
+**Status: Accepted (2026-10-10), together with the ADR-035 import
+amendment.** Acceptance of the text is not implementation acceptance. This
+companion scopes the accepted
+[forward-compatibility clause](#forward-compatibility-vcs-import); it does not
+mark the record superseded or claim new implementation.
+
+The
+[ADR-035 amendment](ADR-035-cli-config-and-auto-embed.md#amendment-2026-10-10-embedding-pipeline-and-import-strictness-4785-4786)
+specifies strict-by-default explicit operator import through `kkernel kg import`,
+including archive JSON and adapter/NDJSON inputs, and through
+`KhiveRuntime::import_kg` library calls. For those entry points alone, their
+selected import policy supersedes this record's
+snapshot degradation rule: strict import refuses unknown entity kinds before
+writes; an explicitly relaxed import retains their original spelling and warns
+once per distinct unknown kind. This applies even when the document's bytes have
+snapshot shape. Existing known-kind normalization, ordinary create validation
+and the closed edge-relation vocabulary are unchanged.
+
+VCS snapshot synchronization through `khive_vcs::run_sync` remains governed by
+this record's accepted forward-compatibility clause. When an older version
+encounters an unknown kind through that route, it must downgrade to `Concept`,
+clear `entity_type`, preserve `khive:original_kind` and any original subtype in
+the existing metadata keys, add `khive:degraded_kind` and warn. The new
+`[schema].strict` import setting does not select the synchronization policy.
+Entry point, rather than guessed provenance or JSON shape, selects the policy.
+
+The current synchronization validator rejects unknown kinds rather than
+implementing that accepted degradation rule. This is an existing implementation
+gap. Neither the separate control path nor this amendment establishes that
+degradation already ships. The companion makes no broader synchronization
+redesign or new kind registration.
+
+Acceptance evidence must use the same otherwise-valid unknown-kind snapshot
+through explicit strict import, explicit relaxed import and older-version VCS
+synchronization. Observe pre-write refusal in the strict case, retained raw
+spelling with the warning in the relaxed case, and every field, metadata key,
+tag and warning of the degradation contract in the VCS case. These are required
+future observations, not executed results. The paired relaxed-import allow and
+refusal controls required by ADR-035 also remain pending. Implementation
+acceptance waits on that evidence, executed and reported in the implementation
+pull request.

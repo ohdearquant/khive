@@ -32,7 +32,7 @@ let config = HybridConfig::new(10);
 
 // vector_hits / keyword_hits come from your VectorSearch / KeywordSearch impls
 // (or khive-hnsw::HnswIndex::search / khive-bm25::Bm25Index::search directly).
-let fused = fuse_search_results(vec![vector_hits, keyword_hits], &config);
+let fused = fuse_search_results(vec![vector_hits, keyword_hits], &config)?;
 for (id, score) in &fused {
     println!("{id}: {}", score.to_f64());
 }
@@ -46,9 +46,19 @@ retain an empty arm as an empty vector instead of removing it, so the remaining
 source keeps its assigned position. Generic RRF and Union callers may supply N
 sources in their own documented order. Even a single supplied source is
 transformed by the configured strategy before `min_score` is applied.
-`fuse_search_results` falls back to RRF if a `Weighted` hybrid strategy is not
-given exactly the two vector/text source slots;
-`fuse_search_results_checked` returns `Err` in that case instead.
+`fuse_search_results`, `hybrid::fuse_labelled_scored`, and
+`DualIndexRouter::merge_results` return `Result<Vec<_>, khive_fusion::FuseError>`.
+Callers must propagate or handle the error before consuming results. Invalid
+`WeightedRrf` parameters, source-count mismatches, and score overflow return
+errors; empty source slots still participate in validation. Valid inputs with
+no hits return `Ok(Vec::new())`.
+
+The unchecked helper still falls back to RRF if a `Weighted` hybrid strategy is
+not given exactly the two vector/text source slots, or if the strategy is
+`Custom`. `fuse_search_results_checked` retains its `RetrievalError` result type
+and returns `Err` for those cases as well as weighted-RRF errors. Labelled fusion
+propagates errors before combining labels. Dual-index merging preserves its
+`Custom` fallback and primary/legacy weight handling.
 
 ## Configuration (Cargo features)
 

@@ -218,7 +218,10 @@ async fn test_insert_rejects_duplicate_actor_key_pair() {
     record_conflict.idempotency_key = Some("dup-key".to_string());
 
     let err = store.insert(&record_conflict).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 }
 
 /// The other property this store exists to hold: at most one non-terminal
@@ -236,7 +239,10 @@ async fn test_rejects_second_non_terminal_for_same_provider_session() {
     conflicting.provider_session_id = Some("session-1".to_string());
 
     let err = store.insert(&conflicting).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 
     let holder = store
         .find_non_terminal_by_provider_session("test-provider", "session-1")
@@ -264,7 +270,10 @@ async fn test_suspended_record_still_holds_provider_session_pair() {
     let mut conflicting = make_record("agent-susp-2", "actor-b");
     conflicting.provider_session_id = Some("session-2".to_string());
     let err = store.insert(&conflicting).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 }
 
 /// Once the holder reaches terminal, the pair frees up: a new spawn against

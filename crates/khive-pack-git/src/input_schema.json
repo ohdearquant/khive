@@ -186,6 +186,10 @@
         ],
         "pattern": "^[a-fA-F0-9]{40}$"
       },
+      "force": {
+        "type": "boolean",
+        "description": "Validation only: true always refuses force_denied before transport; false or omission requests an ordinary push."
+      },
       "session_id": {
         "type": "string",
         "minLength": 1

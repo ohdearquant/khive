@@ -139,15 +139,9 @@ impl KindHook for MemoryHook {
         // Falsifier: if shared `create` ever grows the full specialized contract — stored type,
         // salience, decay and authenticated actor routing — this refusal is what should be
         // removed, not worked around.
-        Err(RuntimeError::InvalidInput(
-            "kind=memory is not creatable through shared `create`, `stream.batch`, or standalone \
-             `stream.append` — \
-             `memory.remember` derives `memory_type`, `salience` and `decay_factor` together and \
-             owns episodic actor routing, so a row written here is stored without the fields \
-             `memory.recall` supplies at read time and the same record reads differently \
-             depending on which path reads it; use `memory.remember` instead"
-                .into(),
-        ))
+        khive_runtime::hooks::refuse_shared_create("memory", "memory.remember")
+            .prepare_create(_runtime, _args)
+            .await
     }
 
     async fn normalize_note_update(

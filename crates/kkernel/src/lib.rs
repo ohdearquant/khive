@@ -53,6 +53,7 @@ mod _pack_links {
     use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
+    use khive_pack_charter::CharterPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
     use khive_pack_exec::ExecPack as _;

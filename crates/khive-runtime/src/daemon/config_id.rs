@@ -3,6 +3,7 @@ pub(super) struct ConfigIdFields<'a> {
     db: &'a str,
     embed: &'a str,
     extra: &'a str,
+    pub(super) engine_peers: Option<&'a str>,
     fresh_tail: &'a str,
     blob_hydration_bytes: &'a str,
     backend: &'a str,
@@ -58,6 +59,15 @@ pub(super) fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         .rsplit_once(";blob_hydration_bytes=")
         .unwrap_or((rest, "<legacy-absent>"));
     let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
+    let (rest, engine_peers) = match rest.rsplit_once(";engine_peers=") {
+        Some((rest, peers)) => {
+            if peers.len() != 64 || !peers.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            (rest, Some(peers))
+        }
+        None => (rest, None),
+    };
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
     let (db, embed) = rest.rsplit_once(";embed=")?;
@@ -67,6 +77,7 @@ pub(super) fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         db,
         embed,
         extra,
+        engine_peers,
         fresh_tail,
         blob_hydration_bytes,
         backend,
@@ -97,6 +108,9 @@ pub fn config_id_extra_embedder_exclusions(
     }
     let client = parse_config_id(client_id)?;
     let daemon = parse_config_id(daemon_id)?;
+    if client.engine_peers.is_some() || daemon.engine_peers.is_some() {
+        return config_ids_compatible(client_id, daemon_id).then(Vec::new);
+    }
     let mut client_available = extra_embedder_set(client.extra);
     client_available.insert(client.embed);
     let daemon_extras = extra_embedder_set(daemon.extra);
@@ -115,8 +129,8 @@ pub fn config_id_extra_embedder_exclusions(
 }
 
 /// Whether a daemon configuration can serve a client's requested runtime.
-/// Every fingerprint field must match except that the daemon may have more
-/// configured extra embedding models than the client requested.
+/// Every peer fingerprint must match exactly. Only legacy ids without peer
+/// fingerprints allow a daemon to hold more extra models than the client.
 pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
     if client_id == daemon_id {
         return true;
@@ -129,10 +143,16 @@ pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
     let client_extras = extra_embedder_set(client.extra);
     let mut daemon_available = extra_embedder_set(daemon.extra);
     daemon_available.insert(daemon.embed);
-    let daemon_has_requested_extras = client_extras.is_subset(&daemon_available);
+    let daemon_has_requested_extras =
+        if client.engine_peers.is_some() || daemon.engine_peers.is_some() {
+            client.extra == daemon.extra
+        } else {
+            client_extras.is_subset(&daemon_available)
+        };
 
     client.packs == daemon.packs
         && client.db == daemon.db
+        && client.engine_peers == daemon.engine_peers
         && client.embed == daemon.embed
         && daemon_has_requested_extras
         && client.fresh_tail == daemon.fresh_tail
@@ -167,6 +187,8 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "packs"
     } else if client.db != daemon.db {
         "db"
+    } else if client.engine_peers != daemon.engine_peers {
+        "engine_peers"
     } else if client.embed != daemon.embed {
         "embed"
     } else if !client_extras.is_subset(&daemon_available) {

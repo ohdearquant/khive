@@ -4,6 +4,15 @@
 mod write_transaction;
 use write_transaction::run_graph_mutation_transaction;
 
+#[path = "graph/symmetric_update.rs"]
+mod symmetric_update;
+pub use symmetric_update::{
+    edge_symmetric_conflict_probe_statement, edge_symmetric_delete_noncanonical_statement,
+    edge_symmetric_update_inplace_statement, EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
+    EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL, EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+    EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -13,7 +22,10 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
-use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
+use khive_storage::graph::{
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    SymmetricEdgeUpdateRequest,
+};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
@@ -537,6 +549,30 @@ pub fn edge_soft_delete_statement(id: Uuid, now: i64) -> SqlStatement {
     }
 }
 
+/// Rewire a merge edge without changing its other fields or adding revision guards.
+/// The caller owns conflict checks and the transaction; `namespace` is the edge's
+/// stored attribution, which may differ from either merge participant's namespace.
+pub fn edge_merge_rewire_statement(
+    namespace: &str,
+    id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    updated_at: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+        vec![
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+        ],
+    )
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_edge(Hard)` issues.
 pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     SqlStatement {
@@ -546,143 +582,39 @@ pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
     }
 }
 
+/// A common table expression `edge_ns(namespace)` holding every namespace
+/// present in `graph_edges`, read with one index seek per namespace
+/// (`min(namespace)` above the previous one), followed by a final NULL row.
+///
+/// Every `graph_edges` index leads with `namespace`, so a lookup by endpoint
+/// alone (`source_id = ? OR target_id = ?`) cannot seek and reads every edge.
+/// Joined to this walk (`edge_ns CROSS JOIN graph_edges`, which keeps the walk
+/// as the outer loop) the same lookup seeks `(namespace, source_id, ...)` and
+/// `(namespace, target_id, ...)` once per namespace, so its cost follows the
+/// number of namespaces and incident edges instead of the size of the table.
+pub(crate) const EDGE_NAMESPACES_CTE: &str = "WITH RECURSIVE edge_ns(namespace) AS ( \
+     SELECT (SELECT min(namespace) FROM graph_edges) \
+     UNION ALL \
+     SELECT (SELECT min(namespace) FROM graph_edges WHERE namespace > edge_ns.namespace) \
+     FROM edge_ns WHERE edge_ns.namespace IS NOT NULL)";
+
 /// The exact cascade `DELETE` this store's `purge_incident_edges` issues.
+///
+/// Removes every edge whose source or target is `node_id`, in any namespace,
+/// found by walking the namespaces present in `graph_edges` and seeking each
+/// one. A self-loop matches both arms and is deleted once.
 pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
     SqlStatement {
-        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1".to_string(),
+        sql: format!(
+            "DELETE FROM graph_edges WHERE id IN ({EDGE_NAMESPACES_CTE} \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.source_id = ?1 \
+             UNION ALL \
+             SELECT e.id FROM edge_ns CROSS JOIN graph_edges AS e \
+               ON e.namespace = edge_ns.namespace AND e.target_id = ?1)"
+        ),
         params: vec![SqlValue::Text(node_id.to_string())],
         label: Some("edge-purge-incident".to_string()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Symmetric-relation update DML (ADR-099 B3 r6 second pass) — the SQL text
-// `khive-runtime::operations::KhiveRuntime::update_edge_symmetric_dml` (the
-// synchronous raw-connection commit-time path, run inside the writer-task/
-// pool-mutex transaction) and ADR-099's atomic `prepare_update_edge` symmetric
-// branch (the async plan-time path) both bind. `upsert_edge` cannot be used
-// here: it resolves `ON CONFLICT(namespace, id)` first and cannot detect a
-// natural-key collision at (namespace, source_id, target_id, relation) with a
-// *different* id, which is exactly the case a symmetric-relation endpoint
-// canonicalization can produce.
-//
-// The two call sites bind these against different parameter-passing
-// mechanisms — `conn.execute`/`conn.query_row` with `rusqlite::params!` in the
-// synchronous path (it must run inside an existing transaction on a borrowed
-// `&rusqlite::Connection`, so it cannot go through the `SqlStatement`/
-// `SqlValue` plan-shape khive-storage abstracts elsewhere) vs. `SqlValue`
-// plan params for the async `PlanStatement` path — but the SQL TEXT itself
-// (the `EDGE_SYMMETRIC_*_SQL` constants below) is the single source of truth
-// for both, closing the class of drift that produced a hand-copied SQL
-// literal silently diverging from canonical (ADR-099 §B3).
-pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges \
-     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-     AND relation = ?4 AND id != ?5";
-
-pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
-    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
-
-/// Canonical `update_edge`'s guarded variant of
-/// [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`]: `?3`/`?4` pin the fetched
-/// snapshot's `updated_at`/`deleted_at` so a writer whose edge changed
-/// concurrently after it read that snapshot cannot delete the row out from
-/// under the concurrent write, even though a canonical survivor genuinely
-/// exists at the natural key. Zero affected rows means stale, not
-/// "no conflict" — the caller has already confirmed a conflicting canonical
-/// row exists before running this statement. Deliberately a DIFFERENT
-/// constant from the unguarded one above: merge's predicate-based rewrites
-/// (`khive-runtime::curation`) intentionally keep running the unguarded form
-/// inside their own single writer transaction and must not be changed to
-/// bind this one.
-pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL: &str =
-    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2 \
-     AND updated_at = ?3 AND deleted_at IS ?4";
-
-/// Case (a) update, guarded on the fetched snapshot's revision and deletion
-/// marker: `?9`/`?10` pin `updated_at`/`deleted_at` as read, and `?5 >
-/// updated_at` requires the replacement revision to strictly advance —
-/// mirroring `edge_replace_if_unchanged_statement`'s guard so the symmetric
-/// path cannot silently overwrite a concurrent writer's change between the
-/// snapshot read and this write.
-pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
-     source_id = ?1, target_id = ?2, relation = ?3, \
-     weight = ?4, updated_at = ?5, metadata = ?6 \
-     WHERE namespace = ?7 AND id = ?8 \
-       AND updated_at = ?9 AND deleted_at IS ?10 \
-       AND ?5 > updated_at";
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] — the
-/// async prepare-time conflict probe.
-pub fn edge_symmetric_conflict_probe_statement(
-    namespace: &str,
-    canon_src: Uuid,
-    canon_tgt: Uuid,
-    relation: EdgeRelation,
-    exclude_id: Uuid,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_CONFLICT_PROBE_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(canon_src.to_string()),
-            SqlValue::Text(canon_tgt.to_string()),
-            SqlValue::Text(relation.to_string()),
-            SqlValue::Text(exclude_id.to_string()),
-        ],
-        label: Some("edge-symmetric-conflict-probe".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`] —
-/// case (b): a canonical row already exists, delete the requested row.
-pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(id.to_string()),
-        ],
-        label: Some("edge-symmetric-delete-noncanonical".to_string()),
-    }
-}
-
-/// Plan-shape builder for [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`] —
-/// case (a): no conflict, update the requested row in place, guarded on the
-/// fetched snapshot's revision and deletion marker.
-#[allow(clippy::too_many_arguments)]
-pub fn edge_symmetric_update_inplace_statement(
-    namespace: &str,
-    id: Uuid,
-    canon_src: Uuid,
-    canon_tgt: Uuid,
-    relation: EdgeRelation,
-    weight: f64,
-    updated_at_micros: i64,
-    metadata: Option<&str>,
-    expected_updated_at_micros: i64,
-    expected_deleted_at_micros: Option<i64>,
-) -> SqlStatement {
-    SqlStatement {
-        sql: EDGE_SYMMETRIC_UPDATE_INPLACE_SQL.to_string(),
-        params: vec![
-            SqlValue::Text(canon_src.to_string()),
-            SqlValue::Text(canon_tgt.to_string()),
-            SqlValue::Text(relation.to_string()),
-            SqlValue::Float(weight),
-            SqlValue::Integer(updated_at_micros),
-            match metadata {
-                Some(m) => SqlValue::Text(m.to_string()),
-                None => SqlValue::Null,
-            },
-            SqlValue::Text(namespace.to_string()),
-            SqlValue::Text(id.to_string()),
-            SqlValue::Integer(expected_updated_at_micros),
-            match expected_deleted_at_micros {
-                Some(value) => SqlValue::Integer(value),
-                None => SqlValue::Null,
-            },
-        ],
-        label: Some("edge-symmetric-update-inplace".to_string()),
     }
 }
 
@@ -690,14 +622,14 @@ pub fn edge_symmetric_update_inplace_statement(
 // Symmetric-relation update DML — atomic-only, commit-time self-guarding
 // variant (ADR-099 §B3).
 //
-// Canonical `update_edge_symmetric_dml` binds the shared SQL constants above
-// directly, not the plan-shape builders — the builders are used by the atomic
-// prepare path. Canonical probes and branches synchronously INSIDE its own
-// writer-task transaction, with no other op interleaved between its probe and
-// its write, so the interleaving exposure the atomic path has does not arise
-// there. Canonical's absorption delete is nonetheless bound to the GUARDED
-// constant, because its snapshot is read before the transaction and can be
-// stale by the time the delete runs.
+// Canonical `update_edge_symmetric_dml` binds the shared SQL constants in
+// `graph/symmetric_update.rs` directly, not the plan-shape builders — the
+// builders are used by the atomic prepare path. Canonical probes and branches
+// synchronously INSIDE its own writer-task transaction, with no other op
+// interleaved between its probe and its write, so the interleaving exposure the
+// atomic path has does not arise there. Canonical's absorption delete is
+// nonetheless bound to the GUARDED constant, because its snapshot is read
+// before the transaction and can be stale by the time the delete runs.
 //
 // The atomic path is structurally different: its conflict probe runs in the
 // async PREPARE phase, which for a multi-op `--atomic` unit completes for
@@ -997,15 +929,18 @@ where
     let pool = backend.pool_arc();
     if let Some(writer_task) = pool.writer_task_for_write(None, GRAPH_MUTATION_EVENTS_OP)? {
         return writer_task
-            .send_bounded(move |conn| {
-                graph_mutation_events_enlisted(
-                    conn,
-                    mutation,
-                    preconditions,
-                    retirements,
-                    make_events,
-                )
-            })
+            .send_bounded_at(
+                move |conn| {
+                    graph_mutation_events_enlisted(
+                        conn,
+                        mutation,
+                        preconditions,
+                        retirements,
+                        make_events,
+                    )
+                },
+                GRAPH_MUTATION_EVENTS_OP,
+            )
             .await
             .inspect(count_graph_mutation_events)
             .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)));
@@ -1321,7 +1256,7 @@ impl SqlGraphStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -1358,10 +1293,13 @@ impl SqlGraphStore {
     ) -> Result<GuardedEdgeUpsertOutcome, StorageError> {
         if let Some(writer_task) = self.current_writer_task(operation)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    observed_edge_upsert(conn, &request, guard_endpoints)
-                        .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        observed_edge_upsert(conn, &request, guard_endpoints)
+                            .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
@@ -1379,10 +1317,13 @@ impl SqlGraphStore {
     ) -> Result<GuardedEdgeBatchUpsertOutcome, StorageError> {
         if let Some(writer_task) = self.current_writer_task(operation)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    observed_edge_batch_upsert(conn, &requests, guard_endpoints)
-                        .map_err(|error| map_err(error, operation))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        observed_edge_batch_upsert(conn, &requests, guard_endpoints)
+                            .map_err(|error| map_err(error, operation))
+                    },
+                    operation,
+                )
                 .await;
         }
 
@@ -2471,6 +2412,13 @@ impl SqlGraphStore {
 
 #[async_trait]
 impl GraphStore for SqlGraphStore {
+    async fn update_symmetric_edge_if_unchanged(
+        &self,
+        request: SymmetricEdgeUpdateRequest,
+    ) -> StorageResult<SymmetricEdgeUpdateOutcome> {
+        self.update_symmetric_edge(request).await
+    }
+
     async fn latest_annotating_note(
         &self,
         node_id: Uuid,
@@ -2579,10 +2527,13 @@ impl GraphStore for SqlGraphStore {
         }
         if let Some(writer_task) = self.current_writer_task(OP)? {
             return writer_task
-                .send_bounded(move |conn| {
-                    conditional_commit_annotation_insert(conn, edge, &guard)
-                        .map_err(|error| map_err(error, OP))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        conditional_commit_annotation_insert(conn, edge, &guard)
+                            .map_err(|error| map_err(error, OP))
+                    },
+                    OP,
+                )
                 .await;
         }
         let origin = self.pool.origin();
@@ -3511,6 +3462,82 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader(
+            "count_edges_by_relation_and_endpoint_base_in_namespaces",
+            move |conn| {
+                let mut totals: HashMap<EdgeRelation, EdgeEndpointBaseCounts> = HashMap::new();
+                for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                    let (where_clause, params) =
+                        build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                    // One lookup per endpoint per table answers both questions the
+                    // single-purpose counts ask with separate correlated subqueries:
+                    // liveness as in [`LIVE_ENDPOINTS_CONDITION`] (an endpoint is
+                    // excluded only when present and tombstoned) and the base as in
+                    // [`endpoint_base_case`] (entity first, then note, else none). `id`
+                    // is the primary key of both tables, so each LEFT JOIN matches at
+                    // most one row and never multiplies an edge. The edge filter runs
+                    // in the inner select, where its unqualified columns resolve
+                    // against graph_edges alone.
+                    let sql = format!(
+                        "SELECT e.relation, \
+                         CASE WHEN se.id IS NOT NULL THEN 'entity' \
+                         WHEN sn.id IS NOT NULL THEN 'note' ELSE 'none' END AS source_base, \
+                         CASE WHEN te.id IS NOT NULL THEN 'entity' \
+                         WHEN tn.id IS NOT NULL THEN 'note' ELSE 'none' END AS target_base, \
+                         COUNT(*) \
+                         FROM (SELECT relation, source_id, target_id \
+                         FROM graph_edges{where_clause}) e \
+                         LEFT JOIN entities se ON se.id = e.source_id \
+                         LEFT JOIN notes sn ON sn.id = e.source_id \
+                         LEFT JOIN entities te ON te.id = e.target_id \
+                         LEFT JOIN notes tn ON tn.id = e.target_id \
+                         WHERE se.deleted_at IS NULL AND sn.deleted_at IS NULL \
+                         AND te.deleted_at IS NULL AND tn.deleted_at IS NULL \
+                         GROUP BY e.relation, source_base, target_base"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                        let relation: String = row.get(0)?;
+                        let source: String = row.get(1)?;
+                        let target: String = row.get(2)?;
+                        let count: i64 = row.get(3)?;
+                        Ok((relation, source, target, count))
+                    })?;
+                    for row in rows {
+                        let (relation_str, source, target, count) = row?;
+                        let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        fold_endpoint_base_row(
+                            totals.entry(relation).or_default(),
+                            &source,
+                            &target,
+                            count as u64,
+                        );
+                    }
+                }
+                Ok(totals.into_iter().collect())
+            },
+        )
+        .await
+    }
+
     async fn query_edges_after(
         &self,
         filter: EdgeFilter,
@@ -3926,6 +3953,10 @@ mod annotation_tests;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "incident_edge_plan_tests.rs"]
+mod incident_edge_plan_tests;
 
 #[cfg(test)]
 #[path = "graph_index_repair_tests.rs"]
