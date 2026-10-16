@@ -188,13 +188,14 @@ pub(super) fn prepare(scans: &HashMap<Uuid, ModuleScan>) -> BTreeMap<Uuid, Sourc
             observations.push(observation);
         }
         unresolved += residuals.len() as u64;
+        // Persist source-derived scan facts. The invocation clock remains in
+        // row matching and edge fingerprints, not in the module observation.
         let observation = json!({
             "scanner_version": 1,
             "status": "lexical",
             "source_path": input.source_path,
             "source_revision": input.source_revision,
             "content_hash": input.content_hash,
-            "sweep_time": input.sweep_time,
             "observations": observations,
             "unresolved": residuals,
         });

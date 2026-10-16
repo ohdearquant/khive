@@ -118,6 +118,45 @@ fn module_fingerprint_requires_path_revision_hash_language_and_sweep() {
 }
 
 #[test]
+fn module_observations_are_stable_across_sweep_times() {
+    let reader = Uuid::from_u128(1);
+    let target = Uuid::from_u128(2);
+    let mut scans = HashMap::from([
+        (
+            reader,
+            module(input(
+                "src/lib.rs",
+                "const S: &str = include_str!(\"input.rs\");",
+            )),
+        ),
+        (
+            target,
+            module(input("src/input.rs", "pub const VALUE: u8 = 1;")),
+        ),
+    ]);
+    let earlier = prepare(&scans);
+    let later_time = "2026-10-16T00:01:00+00:00";
+    for scan in scans.values_mut() {
+        scan.source_reads[0].sweep_time = later_time.into();
+    }
+    let later = prepare(&scans);
+    for id in [reader, target] {
+        assert_eq!(earlier[&id].observation, later[&id].observation);
+        assert!(later[&id].observation.get("sweep_time").is_none());
+    }
+    for endpoint in ["reader", "input"] {
+        assert_eq!(
+            earlier[&reader].edges[&target][0][endpoint]["sweep_time"],
+            "2026-10-16T00:00:00+00:00"
+        );
+        assert_eq!(
+            later[&reader].edges[&target][0][endpoint]["sweep_time"],
+            later_time
+        );
+    }
+}
+
+#[test]
 fn import_refresh_preserves_revision_qualified_reader_evidence() {
     let existing = json!({"dependency_kinds":["source_read"],
         "source_read_observations":[{"reader":{"content_hash":"old"}}]});

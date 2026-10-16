@@ -11,8 +11,9 @@ string literals with a comment/string-aware lexical scan. A literal is an
 observation, not proof that a runtime call reads it.
 
 Each scanned module carries `source_read_scan`, with `scanner_version: 1`,
-`status: "lexical"`, source path, revision, content hash, sweep time,
-`observations` and `unresolved` reasons. Observations preserve their kind,
+`status: "lexical"`, source path, revision, content hash, `observations` and
+`unresolved` reasons. The persisted scan is independent of the invocation clock;
+sweep time remains in current-row matching and edge fingerprints. Observations preserve their kind,
 literal path and base (`file` or `repository`), plus resolution status and the
 normalized target path when available. Dynamic includes, opaque macros and
 attributes, known filesystem calls, parse failures, unsupported languages,
