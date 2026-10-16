@@ -421,6 +421,10 @@ impl VerbRegistry {
         ("kg", "query"),
         ("kg", "resolve"),
         ("kg", "whoami"),
+        // schema reports the loaded vocabulary and the declared endpoint
+        // matrix from the registry's in-memory declarations: no store read,
+        // no store write, no event.
+        ("kg", "schema"),
         // scan runs the secret gate over caller-supplied text in process: no
         // store read, no store write, no event.
         ("kg", "scan"),
