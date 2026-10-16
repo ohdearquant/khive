@@ -514,6 +514,25 @@ been best-effort since its introduction. Four outcomes:
 `id`/`full_id` are returned in all four arms. There is no retry loop; a caller polling unread counts simply
 sees the message still unread (or in an indeterminate state) and can
 re-issue `comm.read` (self-healing).
+
+Storage failures also carry `mark_error_details`, projected by the shared runtime
+error serializer. The legacy `mark_error` string and `status`/`read` values remain
+unchanged. The details retain the typed `code` and `stage` when available, plus
+`sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` for native
+SQLite failures. A direct mark blocked by a SQLite writer lock reports
+`code=stage=sqlite_statement_failure`; it is distinct from a pooled-writer checkout
+timeout or queued writer admission failure. Errors without native SQLite evidence
+do not invent native codes.
+
+`mark_error_details.domain_disposition` reflects the mark failure's known outcome.
+Failed marks use `not_committed`; an unknown request or native settlement retains
+`unknown`, even if the compatibility `status` field cannot express that additional
+uncertainty. Terminal writer evidence keeps its code precedence over an attached
+native stage. Successful marks and the `Ok(false)` no-row result have no
+`mark_error_details`. The same per-message shape applies to bulk `comm.read` and
+best-effort `comm.mark_read`; their aggregate statuses and body-exposure rules are
+unchanged.
+
 Every validation error that runs before the patch (not found, wrong kind,
 outbound, wrong addressee) is unaffected and stays a hard error.
 
@@ -813,6 +832,16 @@ generic `create(kind="message", properties=...)` and `update` mutations refuse
 caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
 `comm.ingest` subhandler remains their only supported writer; ordinary custom
 message metadata is unaffected.
+
+A quarantined message, whatever its `quarantine_reason`, is addressed to the
+maintainer (the runtime's configured actor) in place of the landing actor that
+ingest routing would choose (ADR-200 Amendment 1, Decision 6). The mailbox
+recipient check then keeps the record and its `quarantine_content_ref` out of
+every other actor's inbox, thread, read, get and search results. The rule is
+applied at ingest, so it covers records ingested once it is deployed: a
+quarantine record already stored keeps the `to_actor` it was written with, and a
+replay of the same message does not re-address it. A runtime with no configured
+actor keeps the routed landing actor.
 
 Delivered external email carries `origin: "external"`, `trust: "untrusted"`, and
 a JSON array of screening rule IDs. Inbox and thread reads retain these in

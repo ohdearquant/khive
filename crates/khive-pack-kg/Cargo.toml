@@ -16,7 +16,7 @@ bench = false
 
 [dependencies]
 khive-changeset = { version = "0.13.0", path = "../khive-changeset" }
-khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde", "blake3"] }
 khive-runtime = { version = "0.13.0", path = "../khive-runtime" }
 khive-score = { version = "0.13.0", path = "../khive-score" }
 khive-query = { version = "0.13.0", path = "../khive-query" }

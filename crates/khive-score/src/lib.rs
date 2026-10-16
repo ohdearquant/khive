@@ -12,6 +12,7 @@ pub mod distance;
 mod ops;
 mod score;
 mod unit_score;
+pub mod vector;
 mod weights;
 
 pub use arithmetic_error::ArithmeticError;

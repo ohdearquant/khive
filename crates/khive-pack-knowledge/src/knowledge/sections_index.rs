@@ -2,22 +2,15 @@
 //!
 //! Embeds `knowledge_sections` into the inline `embedding` column with the
 //! default embedder. Vectors are unit-normalised little-endian `f32` so a stored
-//! dot product equals cosine similarity. Embed text is breadcrumb-enriched:
+//! dot product equals cosine similarity, except vectors at or below the shared
+//! `1e-8` norm cutoff remain unchanged. Embed text is breadcrumb-enriched:
 //! `atom_name \n heading \n\n content`.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_score::vector::l2_normalize;
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::util::{now_us, row_str, sql_err};
-
-fn unit_normalize(v: &mut [f32]) {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-12 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
-}
 
 struct SectionEmbeddingInput {
     id: String,
@@ -218,7 +211,7 @@ pub(crate) async fn embed_sections(
                     let now = now_us();
                     for (input, outcome) in staged.iter().zip(outcomes) {
                         let mut emb = outcome.vector;
-                        unit_normalize(&mut emb);
+                        l2_normalize(&mut emb);
                         match writer
                             .execute(SqlStatement {
                                 sql: khive_runtime::sql!("knowledge_section_embedding_update")

@@ -104,8 +104,8 @@ through to explicit detection instead of being silently allowed.
   able to skip a chain that reconstructs a blocked credential — AND only when the token is not in
   credential-value syntax (see the clause-label guard below).
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
-  marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
-  one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
+  marker (`commit`, `revision`, `rev`, `sha`, `head` — immediately preceding word, or
+  `marker:value` / `marker=value` in one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
   `/commit/`, or `/commits/`), or used as the exact value of an HTML `href` is treated as a public
   VCS coordinate near a trigger word. URL and `href` forms are still refused when their immediate
   field label is credential-shaped; ordinary marker forms retain the broader clause-label guard.
@@ -114,8 +114,8 @@ through to explicit detection instead of being silently allowed.
   exempt hex value is a plain alphanumeric token, so it still participates in fragment
   reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
   the marker is accumulated and blocked from the other fragments' anchors. That symmetric-anchor
-  compensation is **guaranteed only for that topology**: the inline `marker:value` form is a
-  colon-bearing token that neighboring bridge anchors reject (fragments must be
+  compensation is **guaranteed only for that topology**: the inline `marker:value` / `marker=value` form is a
+  separator-bearing token that neighboring bridge anchors reject (fragments must be
   alphanumeric-only), and a chain probing across a bare marker word terminates at the marker. A
   split credential whose fragments are reachable only through an inline-marker token or across a
   marker word is therefore a bounded-fragment residual (see the reconstruction bounds above), not
@@ -549,7 +549,7 @@ For each token, in order:
    outright.
 2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests), using the line-local rule
    above for bare 40-hex values. Trigger-adjacent hex
-   requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`) to earn the
+   requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`, `head`) to earn the
    same exemption, and only when the surrounding clause carries no credential label (`api key
    value is commit <hex>` is a labeled credential wearing a marker, not a VCS citation). The
    exemption is a flag over the hex-credential-shape checks only, never an early skip of fragment

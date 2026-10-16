@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 28    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 29    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -238,11 +238,26 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 28 verbs
+## `kg` pack — 29 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
 Declaration = changes institutional status by fiat.
+
+### `schema` — Assertive
+
+Report the full, unfiltered vocabulary and declared endpoint matrix for the loaded
+registry. Accepts no parameters or filters.
+
+```text
+schema()
+```
+
+Returns `entity_kinds`, `note_kinds`, `edge_relations`, `endpoint_rules`,
+`packs_loaded`, their `counts`, and a content hash in `contract_version`. Endpoint
+rows retain their base or pack origin, source and target substrates, and optional
+entity types. A base `*` means any entity kind, not any substrate. These declarations
+do not replace link validation or authorization.
 
 ### `create` — Commissive
 

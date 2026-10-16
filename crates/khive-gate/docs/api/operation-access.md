@@ -55,7 +55,11 @@ Revision `domain-effects-v16` classifies `comm.withheld_body` as `Write`, like `
 every call, allowed or refused, appends an audit event, and an allowed call returns the
 original bytes of a withheld external message.
 
-Revision `domain-effects-v17` classifies `apply_changeset` as `Write`: it applies an ordered
+Revision `domain-effects-v17` classifies `schema` as `Read`: it projects loaded
+registry declarations without reading or mutating graph records. Ordinary Gate
+admission and configured dispatch audit behavior still apply.
+
+Revision `domain-effects-v18` classifies `apply_changeset` as `Write`: it applies an ordered
 canonical change-set as one writer transaction. The wrapper also checks each constituent
 operation under its own verb and the applying caller.
 
@@ -211,6 +215,7 @@ operation under its own verb and the applying caller.
 | `schedule.cancel`                 | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L135)                      |
 | `schedule.remind`                 | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L25)                       |
 | `schedule.schedule`               | Write  | Verb       | [khive-pack-schedule/src/vocab.rs](../../../khive-pack-schedule/src/vocab.rs#L54)                       |
+| `schema`                          | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
 | `search`                          | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L716)                    |
 | `session.export`                  | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L171)                        |
 | `session.list`                    | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L115)                        |

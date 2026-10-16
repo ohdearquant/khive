@@ -156,6 +156,36 @@ for "undo just this one edge without touching anything else that has changed sin
 inversion is the surgical tool; git revert is the blunt one, kept available deliberately for the
 cases the surgical tool cannot reach.
 
+### Proposed amendment (2026-10-13): limits of surgical inversion
+
+**Status: Proposed; requires approval before adoption.** This amendment narrows
+D4's claim that every delete or merge has a representable inverse. A soft delete
+of an entity, an active note or an edge inverts to ADR-101's proposed `restore`;
+restore inverts to a soft delete of the same record. Both are independently
+reviewed change-sets. Restore requires Tier 2; incomplete rule coverage is a
+blocking finding, not approval to land.
+
+A hard delete has no surgical inverse because the live surface has no full-record
+insert. A merge has no surgical inverse because live restore refuses merge
+tombstones and no operation moves rewired edges back. An archived-note soft
+delete also cannot recover its original status: live restore always makes notes
+active. These cases refuse with their operation index and use a reviewed
+compensating change-set against current state or D4's existing git backstop.
+
+Inversion compares all captured content while accounting only for the lifecycle
+fields the live operations actually change: deletion sets `deleted_at`, note
+deletion sets status `deleted`, edge deletion advances `updated_at`, and every
+restore clears `deleted_at` and advances `updated_at` (note restore sets status
+`active`). Entity/note delete checks their unchanged `updated_at`; restore checks
+live content independently of its new update timestamp. Creation timestamps and
+all other captured fields remain comparison evidence. Intervening content changes
+refuse; this is a stage-time check, not the atomic landing check.
+
+Rewinding a mixed delete/restore list tracks a known tombstoned state separately
+from its unknown timestamp. It never fabricates a deletion time. Full-record
+content survives inversion twice; exact historical lifecycle timestamps are not
+promised after real live mutations.
+
 ### D5 — Topology: MCP-client-only access to the live graph
 
 Tooling built for this ADR (the headless CLI and any future reviewer surface) accesses the

@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (28 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (29 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 29] = [
     HandlerDef {
         name: "apply_changeset",
         description: "Apply one bounded canonical NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
@@ -23,6 +23,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
         params: &[
             ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text including its supported schema envelope, at most 2000 operations in source order.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
+    },
+    HandlerDef {
+        name: "schema",
+        description: "Report the full unfiltered loaded vocabulary and declared endpoint matrix. \
+                      Base * means any entity kind, not any substrate. Rows retain base or pack \
+                      origin, source/target substrate and optional entity-type columns. Returns \
+                      counts and a content hash; accepts no filters. Declarations do not replace \
+                      link validation or authorization.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "count",

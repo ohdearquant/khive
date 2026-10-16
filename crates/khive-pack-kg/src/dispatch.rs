@@ -147,6 +147,10 @@ impl PackRuntime for KgPack {
             return handle_verbs(params, registry).await;
         }
 
+        if verb == "schema" {
+            return crate::schema::handle_schema(params, registry);
+        }
+
         // KG graph operations honor the NamespaceToken minted by VerbRegistry::dispatch.
         let graph_token = token;
 

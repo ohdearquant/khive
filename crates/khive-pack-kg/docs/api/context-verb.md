@@ -12,7 +12,8 @@ Every successful response includes `anchors`, `edges`, `anchor_edges`, `truncate
 `dropped`. `anchor_edges` is always an array, including when no edges connect selected anchors.
 `edges` is an array, including for zero-hop, isolated-anchor, empty-search, and wholly
 budget-cut results. `dropped.edges` is always present and equals `dropped.neighbors`;
-`dropped.stage` remains `"budget"`.
+`dropped.anchor_edges` counts excluded anchor-edge records, and `dropped.stage` remains
+`"budget"`.
 
 Each edge has exactly `source_id`, `source_name`, `target_id`, `target_name`, `relation`,
 `weight`, `direction`, `hop`, and `via`. Its relation, weight, direction, hop, and via match
@@ -37,11 +38,14 @@ relation, direction, namespace, and mailbox permission filters are unchanged. An
 hits remain excluded from neighbor lists and hop-2 parents, and their edges appear only here.
 Edges from a hop-1 neighbor to an anchor are not included.
 
-`anchor_edges` does not count against the response `budget`; it is bounded by the hop-1 fan-out
-of selected anchors: at most `selected_anchor_count × fanout × visible_namespace_count` hits.
-It does not change the nested `neighbors` arrays, the top-level `edges` array, or the budget-cut
-`dropped.edges` count. Because it sits outside the budget, an entry can name an anchor that the
-budget walk dropped from `anchors`.
+Under ADR-140 Amendment 1, `anchor_edges` spends the budget remaining after anchors and
+neighbor/edge pairs. Entries retain their stored-edge-ID order. Each entry costs the
+Unicode-scalar length of its compact JSON serialization and is admitted only when both
+endpoint anchors were admitted and its cost fits. Excluded entries increase
+`dropped.anchor_edges` and set `truncated`; a later fitting entry may still be admitted.
+This final pass preserves the nested `neighbors`, top-level `edges`, and their drop counts
+for every budget. Candidate discovery remains bounded by the hop-1 fan-out of selected
+anchors: at most `selected_anchor_count × fanout × visible_namespace_count` hits.
 
 If either endpoint lacks scoped metadata at assembly time, omit the whole pair before
 budget accounting. Preserve the visited decision: no rediscovery, metadata refetch, extra
@@ -75,7 +79,8 @@ not a UTF-8 byte count. Exact fits are admitted. The effective-budget bounds and
 
 A budget-cut pair is emitted in neither location. Drops for budget-cut anchors include
 those anchors' pairs. The assembler returns anchors, edges, truncation, dropped anchors,
-and dropped pairs; the same pair count supplies both dropped neighbor and edge counts.
+and dropped pairs, plus the consumed record budget for the final anchor-edge pass; the same
+pair count supplies both dropped neighbor and edge counts.
 ADR-140 explicitly proposes this two-pass/per-anchor rule as a replacement for ADR-089
 §Semantics item 5's generic global-stop prose upon acceptance.
 

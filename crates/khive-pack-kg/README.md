@@ -9,9 +9,10 @@ See [event subject history](docs/api/event-target-filter.md) for exact event `ta
 
 ## Verbs
 
-28 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md).
 The [canonical change-set apply](docs/api/apply-changeset.md) verb lands staged identifiers and
 captured preimages in one writer transaction.
+
+29 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb              | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

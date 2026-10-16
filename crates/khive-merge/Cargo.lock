@@ -1410,6 +1410,7 @@ dependencies = [
  "khive-channel",
  "khive-db",
  "khive-fold",
+ "khive-fs",
  "khive-fusion",
  "khive-gate",
  "khive-query",
