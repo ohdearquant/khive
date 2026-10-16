@@ -100,6 +100,8 @@ Rules:
 
 This departs from the earlier reading of "each have their own storage" (line 1) as "all of an app's rows in its own store": the app's own store is its corpus store, and the owner's authored rows are the owner's regardless of which app wrote them. The founder's line names ownership of storage; it does not name ownership of the person's data by the app, and the second reading would make purge a data-destruction event.
 
+Lifecycle classes per the 2026-08-21 ruling are four: primary, corpus, representation, blob. This record declares the first two in the manifest; representations (indexes, embeddings, derived views) are corpus-class rows whose store is the index they live in, and blobs are class D by content address (ADR-111/155) referenced from primary rows. A manifest may name representation and blob explicitly; the install check treats them as the corpus and blob classes.
+
 ### D7: Grants bind to an installation
 
 An installation is the signer plus the manifest digest plus an install sequence number. Install records the grant against the installation; uninstall revokes that installation's grants and no other grant of the same signer; a reinstall is a new installation with new grants and revives nothing. A run carrying the app's skills records the installation among its sources. Stopping one installation fences new work for that installation only; a run using several installations keeps the others.
