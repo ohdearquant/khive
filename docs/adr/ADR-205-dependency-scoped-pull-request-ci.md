@@ -7,7 +7,7 @@
 
 A pull-request run of `ci.yml` costs about 148 runner-minutes (20 completed runs sampled on 2026-10-15: coverage measurement 43, the two nextest shards 64 together, the Windows compile check 12, the core-only build 11, the rest under 20 combined). The hosted runner pool is shared, so the queue, not the suite, sets merge latency: at 17:35Z on 2026-10-16, 26 jobs were running in this repository's runs while 57 runs waited, 30 of them pull-request CI runs whose gates waited on jobs that test crates the pull request cannot have changed.
 
-The workflow already classifies a change before building. `scripts/ci-docs-only.sh` admits a Markdown-only change to the documentation lane, and `scripts/ci-integration-only.sh` lets a pull request from this repository's own `codex/` branches skip the build and test jobs when it touches crate source and Markdown only, on the premise that an integration branch tests it later. Both scripts judge paths; neither knows which crates depend on which.
+The workflow already classifies a change before building. `scripts/ci-docs-only.sh` admits a Markdown-only change to the documentation lane, and `scripts/ci-integration-only.sh` lets a pull request from this repository's automation branches (the head-ref prefix that `ci.yml` checks before calling it) skip the build and test jobs when it touches crate source and Markdown only, on the premise that an integration branch tests it later. Both scripts judge paths; neither knows which crates depend on which.
 
 The code pack does. `code.ingest` reads every `Cargo.toml` under a folder and writes `project` entities with `depends_on` edges, each edge carrying its dependency kind (normal, dev or build) and scope, into a dedicated map database and never into the production graph (ADR-085). On this workspace it ingests 53 crates and their dependency edges in about 15 seconds. ADR-139 defines the read side, `code.list`, `code.search` and `code.deps` over a registry of named maps; it is Accepted and not yet implemented (#5581).
 
@@ -65,7 +65,7 @@ The Windows compile check, the MSRV check, the core-only build, `wasm-parity`, `
 
 ### D7. The integration-only lane is retired
 
-A pull request from a `codex/` branch no longer skips its build and test jobs. Its own run tests the dependents closure like any other pull request. `scripts/ci-integration-only.sh` is deleted with the lane; its path allow-list moves into the new classifier script as the D3 list.
+A pull request from an automation branch no longer skips its build and test jobs. Its own run tests the dependents closure like any other pull request. `scripts/ci-integration-only.sh` is deleted with the lane; its path allow-list moves into the new classifier script as the D3 list.
 
 ### D8. Parity control and escape audit
 
