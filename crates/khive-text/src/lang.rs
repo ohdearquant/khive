@@ -59,8 +59,7 @@ pub struct ScriptProfile {
 impl ScriptProfile {
     /// Analyze `text` and return a ScriptProfile.
     pub fn analyze(text: &str) -> Self {
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
+        let (cjk, n) = cjk_counts(text);
         if n == 0 {
             return Self {
                 cjk_fraction: 0.0,
@@ -68,8 +67,7 @@ impl ScriptProfile {
                 char_count: 0,
             };
         }
-        let cjk = chars.iter().filter(|&&c| is_cjk_char(c)).count();
-        let latin = chars.iter().filter(|&&c| c.is_ascii_alphabetic()).count();
+        let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
         Self {
             cjk_fraction: cjk as f64 / n as f64,
             latin_fraction: latin as f64 / n as f64,
