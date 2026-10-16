@@ -136,7 +136,7 @@ async fn schema(runtime: &KhiveRuntime) -> Value {
         .reader()
         .await
         .unwrap()
-        .query(SqlStatement {
+        .query_all(SqlStatement {
             sql: "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name".into(),
             params: vec![],
             label: Some("test_binding_schema_snapshot".into()),
@@ -538,11 +538,11 @@ async fn finalization_preserves_existing_vector_spaces_and_metadata() {
         .unwrap();
     let before_schema = schema(&runtime).await;
     let before_models =
-        serde_json::to_value(runtime.list_embedding_models().await.unwrap()).unwrap();
+        serde_json::to_value(runtime.list_embedding_models(None).await.unwrap()).unwrap();
     runtime.finalize_embedding_engines().unwrap();
     assert_eq!(schema(&runtime).await, before_schema);
     assert_eq!(
-        serde_json::to_value(runtime.list_embedding_models().await.unwrap()).unwrap(),
+        serde_json::to_value(runtime.list_embedding_models(None).await.unwrap()).unwrap(),
         before_models
     );
     assert_eq!(historical.count().await.unwrap(), 1);

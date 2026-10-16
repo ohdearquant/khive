@@ -22,7 +22,7 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 | `src/persist/`           | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
 | `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
 | `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
-| `src/replay/`            | Temporal replay and drift metrics (feature `persist`)                         |
+| `src/replay/`            | Historical weights, rank history, and drift metrics (feature `persist`)      |
 | `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |
 | `src/timeout.rs`         | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
 | `src/weights/`           | Per-atom weight loading for replay (feature `persist`)                        |
@@ -75,9 +75,10 @@ known gap pending an ADR-030 amendment.
 ### Namespace isolation
 
 Namespace enforcement is the responsibility of the runtime layer (ADR-012). Storage stores
-are ID-only. The retrieval crate provides per-namespace filtering helpers
-(`filter_atoms_by_namespace` in `replay/engine_replay.rs`) for use by callers that operate
-below the runtime trust boundary.
+are ID-only. The historical weight and event readers in `replay/engine_replay.rs` take an
+explicit namespace. The crate has no engine-backed replay or public namespace-filtering
+helper. Its unreachable undeclared-feature integration was removed; supported readers,
+drift metrics and report types remain behind `persist`.
 
 ## Invariants
 

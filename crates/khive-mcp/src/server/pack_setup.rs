@@ -129,6 +129,8 @@ impl KhiveMcpServer {
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
+            events_readiness: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(unix)]
             bridge_executable: None,
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]

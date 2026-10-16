@@ -1,50 +1,23 @@
 //! `kkernel kg init` and `kkernel kg hook` — initialization and hook management.
 
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use super::types::{HookCommand, HookStatus, InitArgs};
 use anyhow::{bail, Context, Result};
 
-const DEFAULT_KHIVE_TOML: &str = r#"# .khive/khive.toml — project KG configuration
+const DEFAULT_KHIVE_TOML: &str = r#"# .khive/config.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
 
-[[backends]]
-name = "main"
-path = "~/.khive/khive.db"
-cache_mb = 256
-journal_mode = "wal"
-
 [[engines]]
-name = "mE5-small"
-dim = 384
-weight = 1.0
-
-[packs.kg]
-backend = "main"
-engines = ["mE5-small"]
-
-[packs.memory]
-backend = "main"
-engines = ["mE5-small"]
-
-[packs.gtd]
-backend = "main"
-engines = []
-
-[embed]
-model = "mE5-small"
-dimensions = 384
-auto_embed = true
-batch_size = 64
-
-[embed.fields]
-include = ["name", "description"]
-
-[schema]
-strict = true
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+dims = 384
 "#;
 
-const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!khive.toml\n";
+const OLD_GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!khive.toml\n";
+const GITIGNORE_CONTENT: &str = "*\n!.gitignore\n!kg/\n!kg/**\nkg/.remote-cache/\nkg/.remote-cache/**\nkg/remotes/\n!config.toml\n";
 
 const PRE_COMMIT_HOOK: &str = r#"#!/usr/bin/env bash
 # .khive/kg/hooks/pre-commit
@@ -87,6 +60,41 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     let khive_dir = args.repo.join(".khive");
     let kg_dir = khive_dir.join("kg");
     let hooks_dir = kg_dir.join("hooks");
+    let toml_path = khive_dir.join("config.toml");
+    let legacy_path = khive_dir.join("khive.toml");
+    let root_path = args.repo.join("khive.toml");
+
+    // Refuse legacy files, directories and dangling symlinks before any
+    // scaffolding is written. Reconciliation is an explicit operator choice.
+    match std::fs::symlink_metadata(&legacy_path) {
+        Ok(_) => bail!(
+            "Legacy configuration {} is not a loader path; reconcile it with {} before running kg init",
+            legacy_path.display(),
+            toml_path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", legacy_path.display()))
+        }
+    }
+
+    if existing_config_file(&root_path)? {
+        println!(
+            "  Skipped {} (root config takes precedence)",
+            toml_path.display()
+        );
+        println!("  Preserved {}", root_path.display());
+    } else if existing_config_file(&toml_path)? {
+        println!("  Skipped {} (already exists)", toml_path.display());
+    } else {
+        std::fs::create_dir_all(&khive_dir)
+            .with_context(|| format!("create {}", khive_dir.display()))?;
+        if create_default_config(&toml_path)? {
+            println!("  Initialized {}", toml_path.display());
+        } else {
+            println!("  Skipped {} (already exists)", toml_path.display());
+        }
+    }
 
     std::fs::create_dir_all(&kg_dir).with_context(|| format!("create {}", kg_dir.display()))?;
     std::fs::create_dir_all(&hooks_dir)
@@ -100,19 +108,7 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     }
 
     let gitignore = khive_dir.join(".gitignore");
-    if !gitignore.exists() {
-        std::fs::write(&gitignore, GITIGNORE_CONTENT)
-            .with_context(|| format!("write {}", gitignore.display()))?;
-    }
-
-    let toml_path = khive_dir.join("khive.toml");
-    if !toml_path.exists() {
-        std::fs::write(&toml_path, DEFAULT_KHIVE_TOML)
-            .with_context(|| format!("write {}", toml_path.display()))?;
-        println!("  Initialized {}", toml_path.display());
-    } else {
-        println!("  Skipped {} (already exists)", toml_path.display());
-    }
+    update_gitignore(&gitignore)?;
 
     let hook_script = hooks_dir.join("pre-commit");
     if !hook_script.exists() {
@@ -142,6 +138,78 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn existing_config_file(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    let is_file = if metadata.file_type().is_symlink() {
+        std::fs::metadata(path)
+            .with_context(|| format!("resolve existing configuration {}", path.display()))?
+            .is_file()
+    } else {
+        metadata.is_file()
+    };
+    if !is_file {
+        bail!(
+            "Configuration path {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+fn create_default_config(path: &Path) -> Result<bool> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(DEFAULT_KHIVE_TOML.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if !existing_config_file(path)? {
+                bail!(
+                    "Configuration path {} changed during initialization; rerun kg init",
+                    path.display()
+                );
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn update_gitignore(path: &Path) -> Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file
+            .write_all(GITIGNORE_CONTENT.as_bytes())
+            .with_context(|| format!("write {}", path.display())),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // A link belongs to the operator. Do not follow it for migration.
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            if metadata.is_file()
+                && std::fs::read(path).with_context(|| format!("read {}", path.display()))?
+                    == OLD_GITIGNORE_CONTENT.as_bytes()
+            {
+                std::fs::write(path, GITIGNORE_CONTENT)
+                    .with_context(|| format!("write {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
 }
 
 pub(super) fn cmd_hook(cmd: HookCommand) -> Result<()> {
@@ -253,7 +321,7 @@ mod tests {
 
         assert!(tmp.path().join(".khive/kg/entities.ndjson").exists());
         assert!(tmp.path().join(".khive/kg/edges.ndjson").exists());
-        assert!(tmp.path().join(".khive/khive.toml").exists());
+        assert!(tmp.path().join(".khive/config.toml").exists());
         assert!(tmp.path().join(".khive/kg/hooks/pre-commit").exists());
     }
 
@@ -261,7 +329,7 @@ mod tests {
     fn init_does_not_overwrite_existing_toml() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".khive")).unwrap();
-        let toml_path = tmp.path().join(".khive/khive.toml");
+        let toml_path = tmp.path().join(".khive/config.toml");
         std::fs::write(&toml_path, "# custom\n").unwrap();
 
         let args = InitArgs {
@@ -273,6 +341,15 @@ mod tests {
 
         let content = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(content, "# custom\n", "should not overwrite existing toml");
+    }
+
+    #[test]
+    fn atomic_config_create_preserves_an_existing_competing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "# competing config\n").unwrap();
+        assert!(!create_default_config(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"# competing config\n");
     }
 
     #[test]
@@ -330,5 +407,22 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "KG exports stay trackable");
+
+        for (path, expected) in [(".khive/config.toml", 1), (".khive/khive.toml", 0)] {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "check-ignore",
+                    "--no-index",
+                    "-q",
+                    "--",
+                    path,
+                ])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{path}");
+        }
     }
 }

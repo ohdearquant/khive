@@ -18,36 +18,39 @@ impl KhiveRuntime {
         vector_similarity_floor: Option<f64>,
         tolerate_vector_error: bool,
     ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
-        let mut vector_error: Option<String> = None;
-        let mut vector_hits = if query_vector.is_some() || !self.default_embedder_name().is_empty()
-        {
-            match self
-                .vector_search(
-                    token,
-                    query_vector,
-                    Some(query_text),
-                    candidates,
-                    Some(SubstrateKind::Entity),
-                )
-                .await
-            {
-                Ok(hits) => hits,
-                Err(e) if tolerate_vector_error => {
-                    vector_error = Some(e.to_string());
+        khive_storage::await_request_read_phase("hybrid_search.vector", async {
+            let mut vector_error: Option<String> = None;
+            let mut vector_hits =
+                if query_vector.is_some() || !self.default_embedder_name().is_empty() {
+                    match self
+                        .vector_search(
+                            token,
+                            query_vector,
+                            Some(query_text),
+                            candidates,
+                            Some(SubstrateKind::Entity),
+                        )
+                        .await
+                    {
+                        Ok(hits) => hits,
+                        Err(e) if tolerate_vector_error => {
+                            vector_error = Some(e.to_string());
+                            Vec::new()
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
                     Vec::new()
-                }
-                Err(e) => return Err(e),
+                };
+            if let Some(cosine_floor) = vector_similarity_floor {
+                // Vector store scores use canonical cosine similarity (`1 - distance`),
+                // so the caller's raw-cosine floor is already on the comparison scale.
+                let score_floor = DeterministicScore::from_f64(cosine_floor);
+                vector_hits.retain(|hit| hit.score >= score_floor);
             }
-        } else {
-            Vec::new()
-        };
-        if let Some(cosine_floor) = vector_similarity_floor {
-            // Vector store scores use canonical cosine similarity (`1 - distance`),
-            // so the caller's raw-cosine floor is already on the comparison scale.
-            let score_floor = DeterministicScore::from_f64(cosine_floor);
-            vector_hits.retain(|hit| hit.score >= score_floor);
-        }
-        Ok((vector_hits, vector_error))
+            Ok((vector_hits, vector_error))
+        })
+        .await?
     }
 
     /// Search one configured embedding space using a raw vector or query text.

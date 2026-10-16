@@ -21,8 +21,8 @@ use khive_runtime::audit_batch::{
 use khive_storage::event::{EventAppendDisposition, IdempotentEventBatchResult};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
 use khive_storage::{
-    Event, EventFilter, EventStore, StorageCapability, StorageError, StorageResult,
-    WriterTaskRequestState,
+    CapacityUnavailablePhase, Event, EventFilter, EventStore, StorageCapability, StorageError,
+    StorageResult, WriterTaskRequestState,
 };
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use serial_test::serial;
@@ -45,6 +45,7 @@ struct FakeStore {
     /// arm — unlike `fail_next`/`fail_pool_next`, which both fail with
     /// classifier-retryable shapes.
     fail_terminal_next: AtomicUsize,
+    fail_capacity: Mutex<Option<CapacityUnavailablePhase>>,
     calls: AtomicU64,
     rows: Mutex<Vec<Event>>,
     /// Armed once: the next `append_events_idempotent` call commits its rows
@@ -61,6 +62,7 @@ impl FakeStore {
             fail_next_source: Mutex::new(commit_failure_source),
             fail_pool_next: AtomicUsize::new(0),
             fail_terminal_next: AtomicUsize::new(0),
+            fail_capacity: Mutex::new(None),
             calls: AtomicU64::new(0),
             rows: Mutex::new(Vec::new()),
             ambiguous_ack_once: std::sync::atomic::AtomicBool::new(false),
@@ -113,6 +115,13 @@ impl EventStore for FakeStore {
         events: Vec<Event>,
     ) -> StorageResult<IdempotentEventBatchResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(phase) = *self.fail_capacity.lock() {
+            return Err(StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase,
+                message: "capacity admission unavailable".into(),
+            });
+        }
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
             return Err(StorageError::WriterTaskRequestFailed {
@@ -620,6 +629,52 @@ async fn d8_non_retryable_store_error_still_reports_store_failure() {
         metrics.degraded,
         "a generation that failed to flush leaves its rows out of the audit trail"
     );
+}
+
+#[serial]
+#[tokio::test]
+async fn lease_contention_uses_exact_commit_attempt_budget() {
+    for (phase, reason, attempts) in [
+        (
+            CapacityUnavailablePhase::LockContended,
+            AuditTerminalReason::RetryExhausted,
+            3_u64,
+        ),
+        (
+            CapacityUnavailablePhase::Identity,
+            AuditTerminalReason::StoreFailure,
+            1,
+        ),
+        (
+            CapacityUnavailablePhase::Lock,
+            AuditTerminalReason::StoreFailure,
+            1,
+        ),
+        (
+            CapacityUnavailablePhase::Probe,
+            AuditTerminalReason::StoreFailure,
+            1,
+        ),
+    ] {
+        let store = FakeStore::new();
+        *store.fail_capacity.lock() = Some(phase);
+        let batch = AuditBatch::new(
+            store.clone(),
+            AuditBatchConfig {
+                max_commit_attempts: std::num::NonZeroU8::new(3).unwrap(),
+                ..AuditBatchConfig::default()
+            },
+        );
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await;
+        assert_eq!(result, Err(reason), "{phase}");
+        assert_eq!(store.calls.load(Ordering::SeqCst), attempts, "{phase}");
+        assert!(store.rows.lock().is_empty(), "{phase}");
+    }
 }
 
 /// The writer task wraps any request operation it rolled back in
