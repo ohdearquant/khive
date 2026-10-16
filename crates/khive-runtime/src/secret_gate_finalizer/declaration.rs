@@ -798,7 +798,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
-        reservation: Reservation::NamedCheck { function: "reject_reserved_secret_gate_property", file: "khive-runtime/src/secret_gate.rs" },
+        reservation: Reservation::NamedCheck { function: "validate_kg_import", file: "khive-runtime/src/portability.rs" },
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: None,

@@ -497,27 +497,6 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
     Ok(())
 }
 
-/// Pre-import validation that does not require entity-kind knowledge.
-/// Entity-kind validation happens inside `runtime.import_kg` against the
-/// merged pack/runtime kind registry installed by `install_import_kind_registry`.
-pub(super) fn validate_archive_edge_weights(archive: &KgArchive) -> Result<()> {
-    for edge in &archive.edges {
-        validate_edge_weight(edge.weight, edge.edge_id)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn validate_archive_deterministic(
-    archive: &KgArchive,
-    valid_entity_kinds: &[String],
-) -> Result<()> {
-    let runtime = KhiveRuntime::memory()?;
-    runtime.install_kind_registry(valid_entity_kinds.to_vec(), Vec::new());
-    runtime.validate_kg_import(archive, ImportKindPolicy::Strict)?;
-    Ok(())
-}
-
 /// Install the merged pack/runtime entity- and note-kind registry on `runtime`
 /// so that `runtime.import_kg` (and any other runtime-layer kind validation)
 /// accepts pack-registered kinds such as `resource`, not just the eight base
