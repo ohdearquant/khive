@@ -33,19 +33,19 @@ fn fixture_registry_cleanup_preserves_other_roots() {
 
 #[cfg(unix)]
 mod target_filter_tests {
-    include!("events_split_target_tests.rs");
+    include!("../events_split_target_tests.rs");
 }
 
 // The full daemon/forwarding test suite for this module lands with the
 // final slice of this series; these tests cover the naming and
 // classification contracts the module itself defines.
 
-include!("events_sidecar_path_tests.rs");
+include!("../events_sidecar_path_tests.rs");
 
 #[cfg(unix)]
 mod store_trust_tests {
     use super::*;
-    include!("events_store_trust_tests.rs");
+    include!("../events_store_trust_tests.rs");
 }
 
 #[cfg(unix)]
@@ -75,8 +75,8 @@ fn deep_symlink_chains_within_the_kernel_bound_derive_the_target_sidecar() {
     );
 }
 
-include!("events_sidecar_hardening_tests.rs");
-include!("events_lock_search_parent_tests.rs");
+include!("../events_sidecar_hardening_tests.rs");
+include!("../events_lock_search_parent_tests.rs");
 
 #[cfg(unix)]
 fn write_owner_only_test_file(path: &Path) {
@@ -876,8 +876,8 @@ async fn dispatch_rejects_invalid_wire_namespace() {
     );
 }
 
-include!("events_split_shutdown_tests.rs");
-include!("events_split_readiness_tests.rs");
+include!("../events_split_shutdown_tests.rs");
+include!("../events_split_readiness_tests.rs");
 
 #[cfg(unix)]
 #[tokio::test]
