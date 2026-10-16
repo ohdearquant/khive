@@ -105,11 +105,11 @@ impl WriteAdmission {
         let current = self.current_volume_override.lock().clone();
         #[cfg(not(test))]
         let current: Option<VolumeIdentity> = None;
-        let current = match current {
-            Some(identity) => identity,
-            None => VolumeIdentity::resolve(path)?,
+        let unchanged = match current {
+            Some(identity) => &identity == expected,
+            None => expected.still_identifies(path)?,
         };
-        if &current != expected {
+        if !unchanged {
             return Err(SqliteError::CapacityUnavailable {
                 phase: CapacityUnavailablePhase::Identity,
                 message: "database volume changed after admission identity was captured"
@@ -244,7 +244,7 @@ impl WriteAdmission {
 
     /// The lease is taken before the pool mutex, so ordinary same-volume
     /// writer contention ends here rather than at `checkout_timeout`. Count it
-    /// and write a `timeout` row with `phase=lock`, as the pool mutex stage
+    /// and write a `timeout` row with `phase=lock_contended`, as the pool mutex stage
     /// does for its own timeouts, so the contention stays visible.
     fn record_lease_timeout(&self, error: &SqliteError) {
         self.lease_timeouts.fetch_add(1, Ordering::Relaxed);

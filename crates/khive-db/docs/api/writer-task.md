@@ -69,8 +69,10 @@ checkpoint/VACUUM distinction.
 Volume-lease acquisition uses `disk_guard_deadline_ms` (backend override, then
 `KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms; valid range 100–10,000 ms).
 It does not reuse the queue-only `write_admission_deadline_ms` governed by
-ADR-131. `CapacityUnavailable` identifies `identity`, `lock` and `probe` failures;
-like `CapacityFloor`, it is not automatically retryable. Same-thread nesting
+ADR-131. `CapacityUnavailable` identifies `identity`, `lock`, `lock_contended` and
+`probe` phases. Only `lock_contended`, a lease wait that reached its deadline,
+is retryable within the caller's bounded retry budget. `CapacityFloor` and the
+other unavailable phases remain non-retryable. Same-thread nesting
 returns `VolumeLeaseReentry` immediately with both call sites instead of waiting
 as ordinary contention. A manual atomic unit's lease is detached from the thread
 that took it, so a later request from that thread waits as ordinary contention.

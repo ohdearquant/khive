@@ -838,12 +838,10 @@ async fn notification_write_that_fails_fast_also_closes_the_session() {
     let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
         jsonrpc: rmcp::model::JsonRpcVersion2_0,
         notification: rmcp::model::ServerNotification::ProgressNotification(
-            rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
-                progress: 1.0,
-                total: None,
-                message: None,
-            }),
+            rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam::new(
+                rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
+                1.0,
+            )),
         ),
     });
 
@@ -895,12 +893,10 @@ async fn notification_write_to_a_reading_peer_leaves_the_session_open() {
     let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
         jsonrpc: rmcp::model::JsonRpcVersion2_0,
         notification: rmcp::model::ServerNotification::ProgressNotification(
-            rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
-                progress: 1.0,
-                total: None,
-                message: None,
-            }),
+            rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam::new(
+                rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
+                1.0,
+            )),
         ),
     });
 
@@ -996,14 +992,10 @@ async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
         rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
             jsonrpc: rmcp::model::JsonRpcVersion2_0,
             notification: rmcp::model::ServerNotification::ProgressNotification(
-                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                    progress_token: rmcp::model::ProgressToken(
-                        rmcp::model::NumberOrString::Number(1),
-                    ),
-                    progress: 1.0,
-                    total: None,
-                    message: None,
-                }),
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam::new(
+                    rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
+                    1.0,
+                )),
             ),
         })
     };

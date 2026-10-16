@@ -1,10 +1,10 @@
 use super::{mark_all_failed_request_result, KhiveMcpServer};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use std::time::Duration;
 
 fn result_with_summary(succeeded: u64, failed: u64, aborted: u64) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(format!(
+    CallToolResult::success(vec![ContentBlock::text(format!(
             "{{\"results\":[],\"summary\":{{\"succeeded\":{succeeded},\"failed\":{failed},\"aborted\":{aborted}}},\"status\":\"partial\"}}"
         ))])
 }
@@ -27,7 +27,7 @@ fn mixed_request_does_not_set_mcp_is_error() {
 
 #[test]
 fn plan_response_without_summary_keeps_its_original_mcp_status() {
-    let mut result = CallToolResult::success(vec![Content::text("{\"parsed\":false}")]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text("{\"parsed\":false}")]);
     mark_all_failed_request_result(&mut result);
     assert_eq!(result.is_error, Some(false));
 }

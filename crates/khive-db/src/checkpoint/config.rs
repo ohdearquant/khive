@@ -131,60 +131,39 @@ impl CheckpointConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(ms) = std::env::var("KHIVE_CHECKPOINT_INTERVAL_MS") {
-            if let Ok(v) = ms.parse::<u64>() {
-                if v > 0 {
-                    cfg.interval = Duration::from_millis(v);
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_CHECKPOINT_INTERVAL_MS", 0_u64);
+        if n > 0 {
+            cfg.interval = Duration::from_millis(n);
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_WARN_PAGES") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.warn_pages = n;
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_WARN_PAGES", 0_u64);
+        if n > 0 {
+            cfg.warn_pages = n;
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_WARN_SUSTAINED_CYCLES") {
-            if let Ok(n) = v.parse::<u8>() {
-                if n > 0 {
-                    cfg.warn_sustained_cycles = n;
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_WARN_SUSTAINED_CYCLES", 0_u8);
+        if n > 0 {
+            cfg.warn_sustained_cycles = n;
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_HIGH_WATER_PAGES") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.high_water_pages = n;
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_HIGH_WATER_PAGES", 0_u64);
+        if n > 0 {
+            cfg.high_water_pages = n;
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.truncate_high_water_pages = n;
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", 0_u64);
+        if n > 0 {
+            cfg.truncate_high_water_pages = n;
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.truncate_min_interval = Duration::from_secs(n);
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", 0_u64);
+        if n > 0 {
+            cfg.truncate_min_interval = Duration::from_secs(n);
         }
 
-        if let Ok(v) = std::env::var("KHIVE_WAL_TRUNCATE_BUSY_MS") {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    cfg.truncate_busy_timeout = Duration::from_millis(n);
-                }
-            }
+        let n = crate::env::env_parse_or("KHIVE_WAL_TRUNCATE_BUSY_MS", 0_u64);
+        if n > 0 {
+            cfg.truncate_busy_timeout = Duration::from_millis(n);
         }
 
         (cfg.tx_warn_secs, cfg.tx_max_age_secs) =
@@ -214,20 +193,14 @@ pub(crate) fn tx_age_thresholds_from_env(
     let mut warn_secs = default_warn;
     let mut max_age_secs = default_max;
 
-    if let Ok(v) = std::env::var("KHIVE_TX_WARN_SECS") {
-        if let Ok(n) = v.parse::<u64>() {
-            if n > 0 {
-                warn_secs = Duration::from_secs(n);
-            }
-        }
+    let n = crate::env::env_parse_or("KHIVE_TX_WARN_SECS", 0_u64);
+    if n > 0 {
+        warn_secs = Duration::from_secs(n);
     }
 
-    if let Ok(v) = std::env::var("KHIVE_TX_MAX_AGE_SECS") {
-        if let Ok(n) = v.parse::<u64>() {
-            if n > 0 {
-                max_age_secs = Duration::from_secs(n);
-            }
-        }
+    let n = crate::env::env_parse_or("KHIVE_TX_MAX_AGE_SECS", 0_u64);
+    if n > 0 {
+        max_age_secs = Duration::from_secs(n);
     }
 
     if warn_secs >= max_age_secs {

@@ -8,7 +8,7 @@ use khive_runtime::{
     PresentationMode, RuntimeConfig, RuntimeError, StorageBackend, VerbRegistry,
     VerbRegistryBuilder, OPERATION_CLASSIFIER_VERSION,
 };
-use khive_storage::{EntityFilter, EntityStore, GraphStore, NoteStore};
+use khive_storage::EntityFilter;
 use khive_types::{
     canonical_json_bytes, EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Hash32, Pack,
     VerbCategory, VerbPresentationPolicy, Visibility,
@@ -73,11 +73,20 @@ fn default_registry() -> (Arc<StorageBackend>, VerbRegistry) {
 async fn domain_counts(backend: &StorageBackend) -> (u64, u64, u64) {
     (
         backend
+            .entities()
+            .unwrap()
             .count_entities("local", EntityFilter::default())
             .await
             .unwrap(),
-        backend.count_notes("local", None).await.unwrap(),
         backend
+            .notes()
+            .unwrap()
+            .count_notes("local", None)
+            .await
+            .unwrap(),
+        backend
+            .graph()
+            .unwrap()
             .count_edges(khive_storage::types::EdgeFilter::default())
             .await
             .unwrap(),
@@ -620,7 +629,7 @@ async fn schema_is_an_explicit_read_without_weakening_enrollment_or_unknown_deni
     }
     assert_eq!(classify_operation("schema"), Some(OperationAccess::Read));
     assert_eq!(classify_operation("schema.lookalike"), None);
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v13");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v17");
     let gate = Arc::new(CallerEnrollmentGate::with_write_denials(
         vec!["schema-test".into()],
         false,

@@ -90,7 +90,7 @@ async fn direct_locked_constraint_and_checkout_refusals_add_zero() {
         matches!(
             refused,
             StorageError::CapacityUnavailable {
-                phase: khive_storage::CapacityUnavailablePhase::Lock,
+                phase: khive_storage::CapacityUnavailablePhase::LockContended,
                 ..
             }
         ),

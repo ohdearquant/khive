@@ -64,14 +64,14 @@ use bridge_fragments::{
     bridge_fragment_chain, contains_bounded_word, contains_word, is_bridge_fragment_shape,
     trailing_bridge_fragment_cut,
 };
-#[cfg(test)]
-use credential_triggers::LOOKUP_KEY_LABELS;
 use credential_triggers::{
     assignment_credential_trigger, build_match, extract_token, find_trigger,
     inline_credential_trigger, is_assignment_label_gap, is_base64_content_hash,
-    is_lookup_key_label, is_pure_hex, is_structured_identifier, is_uuid_canonical, shannon_entropy,
-    strip_delimiters, value_candidates, wrapper_strip_repeated,
+    is_credential_token_label, is_lookup_key_label, is_pure_hex, is_structured_identifier,
+    is_uuid_canonical, shannon_entropy, strip_delimiters, value_candidates, wrapper_strip_repeated,
 };
+#[cfg(test)]
+use credential_triggers::{LOOKUP_KEY_LABELS, POSITION_TOKEN_LABELS, RECEIPT_TOKEN_LABELS};
 #[cfg(test)]
 use entropy::TRIGGER_WINDOW;
 use entropy::{
@@ -234,6 +234,31 @@ pub fn check_at(content: &str, record: &str, field: &str) -> RuntimeResult<()> {
 /// the JSON, not the path of the string leaf that matched inside it.
 pub fn check_json_at(value: &serde_json::Value, record: &str, field: &str) -> RuntimeResult<()> {
     locate(check_json(value), record, field)
+}
+
+/// Scan the supplied note fields in content, name, then properties order.
+///
+/// Returns the first refusal unchanged, located under `record` (for example,
+/// `note[2].properties`). Optional fields are scanned only when present; JSON
+/// scanning uses the same structured-value rules as [`check_json_at`].
+///
+/// This is field scanning only. Callers retain responsibility for property
+/// derivation, reserved-key checks, embedding inputs, and write admission, in
+/// their existing order.
+pub fn check_note_fields_at(
+    content: &str,
+    name: Option<&str>,
+    properties: Option<&serde_json::Value>,
+    record: &str,
+) -> RuntimeResult<()> {
+    check_at(content, record, "content")?;
+    if let Some(name) = name {
+        check_at(name, record, "name")?;
+    }
+    if let Some(properties) = properties {
+        check_json_at(properties, record, "properties")?;
+    }
+    Ok(())
 }
 
 /// `check_tags` that names where it looked.
@@ -491,6 +516,10 @@ pub fn mask_for_redaction_surface(
 #[cfg(test)]
 #[path = "secret_gate/issue_2655_tests.rs"]
 mod issue_2655_tests;
+
+#[cfg(test)]
+#[path = "secret_gate/note_fields_tests.rs"]
+mod note_fields_tests;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

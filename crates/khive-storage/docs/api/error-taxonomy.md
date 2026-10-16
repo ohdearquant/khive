@@ -4,6 +4,29 @@
 storage capability trait. This document covers the classifier predicates whose
 full rationale does not fit inline in the rustdoc contract.
 
+## Capacity admission
+
+`CapacityFloor` refuses a write that would violate the sampled free-space floor.
+It is not automatically retryable. `CapacityUnavailable` identifies the step
+that could not establish admission safety:
+
+| Phase            | Meaning                                                        | `is_retryable()` |
+| ---------------- | -------------------------------------------------------------- | ---------------- |
+| `identity`       | The physical volume could not be resolved or verified           | `false`          |
+| `lock`           | The cooperative lease could not be attempted or was refused     | `false`          |
+| `lock_contended` | The guard deadline elapsed while waiting for the volume lease   | `true`           |
+| `probe`          | Available capacity could not be established                     | `false`          |
+
+Only lease contention is transient: a retry can acquire the released lease and
+then sample capacity again. Each attempt remains bounded by
+`disk_guard_deadline_ms`, and a caller must bound its retry count or total budget.
+Neither error retries an operation itself. SQLite reports both unavailable lock
+phases as `sqlite_capacity_unavailable`; native `SQLITE_FULL` remains separate.
+
+`CapacityUnavailablePhase` is a public closed enum. Downstream exhaustive matches
+must add the `LockContended` variant; its stable display value is
+`lock_contended`.
+
 ## `WriterTaskNoRuntime`
 
 Returned instead of panicking: a caller that constructs a store from a plain,
