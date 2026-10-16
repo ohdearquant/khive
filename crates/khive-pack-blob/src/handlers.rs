@@ -78,15 +78,19 @@ struct RangeParams {
     length: Option<u64>,
 }
 
+fn range_integer<E: serde::de::Error>(value: Value, field: &str) -> Result<u64, E> {
+    value.as_u64().ok_or_else(|| {
+        E::custom(format!(
+            "range.{field} must be a non-negative integer, got {value}"
+        ))
+    })
+}
+
 fn deserialize_range_offset<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u64, D::Error> {
     let value = Value::deserialize(deserializer)?;
-    value.as_u64().ok_or_else(|| {
-        serde::de::Error::custom(format!(
-            "range.offset must be a non-negative integer, got {value}"
-        ))
-    })
+    range_integer::<D::Error>(value, "offset")
 }
 
 fn deserialize_range_length<'de, D: serde::Deserializer<'de>>(
@@ -94,13 +98,7 @@ fn deserialize_range_length<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<u64>, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     value
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "range.length must be a non-negative integer, got {value}"
-                ))
-            })
-        })
+        .map(|value| range_integer::<D::Error>(value, "length"))
         .transpose()
 }
 
@@ -169,6 +167,10 @@ fn parse_upload_id(raw: &str, verb: &str) -> Result<UploadId, RuntimeError> {
     UploadId::from_hex(raw).map_err(|error| RuntimeError::InvalidInput(format!("{verb}: {error}")))
 }
 
+fn invalid_part_base64(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
+}
+
 pub(crate) async fn handle_begin(
     uploads: &UploadManager,
     token: &NamespaceToken,
@@ -221,15 +223,13 @@ pub(crate) async fn handle_put_part(
             ));
         }
         let mut tail = [0; 3];
-        let tail_len = BASE64.decode_slice(suffix, &mut tail).map_err(|error| {
-            RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
-        })?;
+        let tail_len = BASE64
+            .decode_slice(suffix, &mut tail)
+            .map_err(invalid_part_base64)?;
         let decoded_len = (prefix.len() / 4 * 3 + tail_len) as u64;
         return uploads.reject_oversized_part(&id, index, decoded_len).await;
     }
-    let bytes = BASE64.decode(b64).map_err(|error| {
-        RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
-    })?;
+    let bytes = BASE64.decode(b64).map_err(invalid_part_base64)?;
     uploads.put_part(&id, index, bytes).await
 }
 
