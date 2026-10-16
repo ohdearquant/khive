@@ -152,7 +152,7 @@ stays below the floor.
    when it drops the original's reference on a secondary backend (#5405). The poller does not learn about that last
    one today: `comm.ingest` returns an ordinary receipt.
 
-Authentication and malformed quarantines (`auth-absent`, `dmarc-fail`, `unaligned`, `off-allowlist`,
+Authentication and malformed quarantines (`auth-absent`, `auth-untrusted`, `dmarc-fail`, `unaligned`, `off-allowlist`,
 `missing-body`, `parse-failure`, `too-large`) are rejections of mail the channel did not accept. A rejection never
 notifies: a notice per rejected message would let any sender flood the operator's inbox. A rejected message whose
 original is lost does take part in the lost-original run of decision 5, whose notices are bounded per credential and
@@ -705,6 +705,9 @@ reintroduce the injection it prevents:
 - A quarantined message is written with no `from_actor` (or an explicit anonymous/quarantine
   actor). It carries a property marking it quarantined and the reason (auth-absent,
   dmarc-fail, unaligned, or off-allowlist). It is never stamped with the maintainer actor.
+  ADR-200 Amendment 1 Decision 6 amends the addressing half of this clause: a record the channel
+  quarantines, whatever its reason, is addressed to the maintainer, so that no other actor's mailbox
+  read finds it, while `from_actor` stays the quarantine actor and the two rules below are unchanged.
 - Quarantined notes MUST NOT trigger the inbox wake-up monitor's trusted-sender path and MUST be
   distinguishable by agents so their content is never treated as principal instructions. Content
   of a quarantined message is data to be shown, never a command to be followed -- the same

@@ -203,6 +203,7 @@ fn guards(target: Uuid, expected: Option<Edge>) -> GraphMutationPreconditions {
             relation: EdgeRelation::LinksTo,
             expected,
         }],
+        statement_guards: Vec::new(),
     }
 }
 fn assert_conflict(error: RuntimeError, message: &str) {

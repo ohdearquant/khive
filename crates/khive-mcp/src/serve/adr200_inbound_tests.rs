@@ -729,7 +729,8 @@ async fn a16_other_callers_are_refused_before_the_original_is_read() {
 }
 
 /// A quarantine record keeps its own operator recovery path: `comm.withheld_body`
-/// refuses it for its recipient and for the maintainer.
+/// refuses it for the maintainer it is addressed to, and refuses the landing actor
+/// as a caller that is neither its recipient nor the maintainer.
 #[tokio::test]
 async fn withheld_body_refuses_a_quarantine_record() {
     let (_blobs, _runtime, registry) = fixture_with_maintainer(Some(MAINTAINER));
@@ -750,17 +751,141 @@ async fn withheld_body_refuses_a_quarantine_record() {
         )
         .await;
     }
-    let inbox = as_actor(&registry, "comm.inbox", json!({"status":"all"})).await;
+    let inbox = as_named(&registry, MAINTAINER, "comm.inbox", json!({"status":"all"}))
+        .await
+        .unwrap();
     let record = &inbox["messages"][0];
     assert_eq!(record["properties"]["quarantined"], "true", "{inbox}");
     let id = record["id"].as_str().unwrap();
-    for caller in [ACTOR, MAINTAINER] {
-        let refused = withheld_body_as(&registry, caller, id).await.unwrap_err();
+    let refused = withheld_body_as(&registry, MAINTAINER, id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{refused:?}"
+    );
+    let refused = withheld_body_as(&registry, ACTOR, id).await.unwrap_err();
+    assert!(
+        !matches!(refused, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{refused:?}"
+    );
+}
+
+/// `verb` dispatched as `actor`, the result or the error kept.
+async fn as_named(
+    registry: &VerbRegistry,
+    actor: &str,
+    verb: &str,
+    params: Value,
+) -> Result<Value, khive_runtime::RuntimeError> {
+    registry
+        .dispatch_with_identity(
+            verb,
+            params,
+            Some(RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some(actor.into()),
+                ..Default::default()
+            }),
+        )
+        .await
+}
+
+/// A quarantine record as the email channel builds it, with `reason`, landing on
+/// `actor:fallback` by ingest routing.
+fn quarantine_envelope(reason: &str) -> ChannelEnvelope {
+    let mut env = ChannelEnvelope::new(
+        "email:quarantine",
+        "email:maintainer@example.com",
+        "quarantinedmarkerdsix body",
+    )
+    .with_subject("review")
+    .with_external_id("imap:fixture:account:11:9")
+    .with_quarantine_replay(ORIGINAL.to_vec(), "email:maintainer@example.com");
+    for (key, value) in [
+        ("quarantined", "true"),
+        ("quarantine_reason", reason),
+        ("quarantine_claimed_from", "Stranger@Example.COM"),
+    ] {
+        env.metadata.insert(key.into(), value.into());
+    }
+    env
+}
+
+/// The surfaces A17 names, read as `actor`; true where the result names `id`.
+async fn surfaces_naming(
+    registry: &VerbRegistry,
+    actor: &str,
+    id: &str,
+) -> Vec<(&'static str, bool)> {
+    let mut seen = Vec::new();
+    for (surface, verb, params) in [
+        ("inbox", "comm.inbox", json!({"status": "all"})),
+        ("thread", "comm.thread", json!({"id": id})),
+        ("read", "comm.read", json!({"id": id})),
+        ("get", "get", json!({"id": id})),
+        (
+            "search",
+            "search",
+            json!({"kind": "note", "query": "quarantinedmarkerdsix"}),
+        ),
+    ] {
+        let text = as_named(registry, actor, verb, params)
+            .await
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        seen.push((surface, text.contains(id)));
+    }
+    seen
+}
+
+/// A17 (ADR-200 Amendment 1 Decision 6): with a configured maintainer, a quarantine
+/// record of any reason is addressed to the maintainer. The landing actor finds it
+/// through no inbox, thread, read, get or search result, and the maintainer finds it
+/// through each.
+#[tokio::test]
+async fn a17_quarantine_record_is_addressed_to_the_maintainer() {
+    for reason in ["dmarc-fail", "screened", "too-large"] {
+        let (_blobs, _runtime, registry) = fixture_with_maintainer(Some(MAINTAINER));
+        let first = ingest(&registry, &quarantine_envelope(reason)).await;
+        let id = first["full_id"].as_str().unwrap().to_string();
+        let read = as_named(&registry, MAINTAINER, "comm.read", json!({"id": id}))
+            .await
+            .unwrap();
         assert!(
-            matches!(refused, khive_runtime::RuntimeError::InvalidInput(_)),
-            "{caller}: {refused:?}"
+            read.to_string()
+                .contains(&format!("\"to_actor\":\"{MAINTAINER}\"")),
+            "{reason}: {read}"
+        );
+        let landing = surfaces_naming(&registry, "actor:fallback", &id).await;
+        assert!(
+            landing.iter().all(|(_, seen)| !seen),
+            "{reason}: {landing:?}"
+        );
+        let maintainer = surfaces_naming(&registry, MAINTAINER, &id).await;
+        assert!(
+            maintainer.iter().all(|(_, seen)| *seen),
+            "{reason}: {maintainer:?}"
         );
     }
+}
+
+/// With no configured actor there is no maintainer, so a quarantine record keeps
+/// the landing actor that ingest routing chose, and that actor finds it.
+#[tokio::test]
+async fn quarantine_record_keeps_its_landing_actor_without_a_maintainer() {
+    let (_blobs, _runtime, registry) = fixture();
+    let first = ingest(&registry, &quarantine_envelope("dmarc-fail")).await;
+    let id = first["full_id"].as_str().unwrap().to_string();
+    let read = as_named(&registry, "actor:fallback", "comm.read", json!({"id": id}))
+        .await
+        .unwrap();
+    assert!(
+        read.to_string().contains("\"to_actor\":\"actor:fallback\""),
+        "{read}"
+    );
+    let landing = surfaces_naming(&registry, "actor:fallback", &id).await;
+    assert!(landing.iter().all(|(_, seen)| *seen), "{landing:?}");
 }
 
 /// A17: a delivered withheld message stores no blob reference and no read

@@ -11,9 +11,10 @@
 //! See `crates/khive-pack-brain/docs/api/fold-gate.md` for the full mass
 //! invariant, concurrency proof, why the decay math runs in Rust not SQL, and
 //! the scorer-dedup atomicity argument.
-use crate::sql::sql;
+use crate::sql::{sql, sql_err};
 
 use khive_runtime::{EventAttribution, RuntimeError};
+use khive_score::{Decay, HalfLife};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
@@ -25,10 +26,6 @@ pub const IMPLICIT_MASS_CAP: f64 = 1.5;
 /// window (ADR-081 §2, §4): 7 days, expressed in microseconds.
 pub const IMPLICIT_MASS_HALF_LIFE_US: f64 = 7.0 * 24.0 * 3600.0 * 1_000_000.0;
 
-fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::internal_with_context(format!("fold gate {context}"), e)
-}
-
 /// Decay `old_mass` forward by `delta_us` microseconds under the shared half-life.
 ///
 /// `delta_us <= 0` (clock skew, or the very first event) is treated as zero
@@ -37,7 +34,12 @@ pub fn decayed_mass(old_mass: f64, delta_us: i64) -> f64 {
     if delta_us <= 0 || old_mass == 0.0 {
         return old_mass;
     }
-    old_mass * 2f64.powf(-(delta_us as f64) / IMPLICIT_MASS_HALF_LIFE_US)
+    let half_life = HalfLife::try_new(IMPLICIT_MASS_HALF_LIFE_US)
+        .expect("implicit mass half-life is finite and positive");
+    let factor = Decay::exponential_with_half_life(half_life)
+        .factor(delta_us as f64)
+        .expect("positive i64 microseconds are finite");
+    old_mass * factor
 }
 
 /// Decide whether an incoming implicit event of weight `w` folds at full weight.
@@ -388,10 +390,10 @@ async fn fold_within_tx(
         Some(r) => {
             let mass = r
                 .f64("mass")
-                .map_err(|_| sql_err("read mass", "missing mass column"))?;
+                .map_err(|_| sql_err("fold gate read mass", "missing mass column"))?;
             let last = r
                 .i64("last_event_at")
-                .map_err(|_| sql_err("read mass", "missing last_event_at column"))?;
+                .map_err(|_| sql_err("fold gate read mass", "missing last_event_at column"))?;
             (mass, last)
         }
     };

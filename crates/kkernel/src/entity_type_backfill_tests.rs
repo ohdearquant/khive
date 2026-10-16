@@ -329,3 +329,91 @@ async fn compose_registry_installs_entity_kind_hooks_for_backfill_writes() {
         .expect("a workspace entity carrying a valid schema_version must update freely");
     assert_eq!(updated.name, "Renamed Valid Workspace");
 }
+
+#[tokio::test]
+async fn nullable_census_counts_only_live_null_types_in_the_exact_namespace() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    runtime.backend().entities().unwrap();
+    {
+        let writer = runtime.backend().pool().writer().unwrap();
+        for (index, namespace, entity_type, deleted_at) in [
+            (1, "census", None, None),
+            (2, "census", None, None),
+            (3, "census", Some("paper"), None),
+            (4, "census", Some("NULL"), None),
+            (5, "other", None, None),
+            (6, "census", None, Some(2_i64)),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, entity_type, name, created_at, updated_at, deleted_at) \
+                     VALUES (?1, ?2, 'document', ?3, 'census fixture', 1, 1, ?4)",
+                    (
+                        Uuid::from_u128(index).to_string(),
+                        namespace,
+                        entity_type,
+                        deleted_at,
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    assert_eq!(nullable_count(&runtime, "census").await.unwrap(), 2);
+    assert_eq!(nullable_count(&runtime, "other").await.unwrap(), 1);
+    assert_eq!(nullable_count(&runtime, "missing").await.unwrap(), 0);
+
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .execute(
+            "UPDATE entities SET entity_type = 'paper', version = version + 1 \
+             WHERE namespace = 'census' AND entity_type IS NULL AND deleted_at IS NULL",
+            [],
+        )
+        .unwrap();
+    assert_eq!(nullable_count(&runtime, "census").await.unwrap(), 0);
+}
+
+#[test]
+fn nullable_census_distinguishes_unavailable_reporting_from_an_absent_null_group() {
+    let error = nullable_count_from_groups(None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "entity-type-backfill entity type census is unavailable"
+    );
+    assert_eq!(nullable_count_from_groups(Some(Vec::new())).unwrap(), 0);
+    assert_eq!(
+        nullable_count_from_groups(Some(vec![(Some("NULL".into()), 7)])).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn nullable_census_propagates_storage_failure_instead_of_reporting_zero() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    assert_eq!(nullable_count(&runtime, "local").await.unwrap(), 0);
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .execute("DROP TABLE entities", [])
+        .unwrap();
+
+    let error = nullable_count(&runtime, "local").await.unwrap_err();
+    assert!(error
+        .downcast_ref::<khive_storage::StorageError>()
+        .is_some());
+}

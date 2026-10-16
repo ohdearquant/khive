@@ -4,6 +4,10 @@
 mod write_transaction;
 use write_transaction::run_graph_mutation_transaction;
 
+#[path = "graph/guarded_insert.rs"]
+mod guarded_insert;
+use guarded_insert::{check_statement_guards, insert_edge_if_absent};
+
 #[path = "graph/symmetric_update.rs"]
 mod symmetric_update;
 pub use symmetric_update::{
@@ -23,7 +27,8 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, EdgeInsertIfAbsentOutcome,
+    GraphStatementGuard, GraphStatementGuardFailure, SymmetricEdgeUpdateOutcome,
     SymmetricEdgeUpdateRequest,
 };
 use khive_storage::types::{
@@ -843,6 +848,7 @@ pub struct GraphEdgeSnapshotGuard {
 pub struct GraphMutationPreconditions {
     pub document: Option<GraphDocumentGuard>,
     pub edges: Vec<GraphEdgeSnapshotGuard>,
+    pub statement_guards: Vec<GraphStatementGuard>,
 }
 
 /// Internal seam for khive-runtime; no compatibility promise.
@@ -858,6 +864,9 @@ pub enum GraphMutationRequest {
         requests: Vec<EdgeUpsertRequest>,
         guard_endpoints: bool,
     },
+    InsertIfAbsent {
+        edge: Edge,
+    },
     CommitAnnotation {
         edge: Edge,
         guard: CommitAnnotationGuard,
@@ -871,6 +880,10 @@ pub enum GraphMutationRequest {
 pub enum GraphMutationOutcome {
     Single(GuardedEdgeUpsertOutcome),
     Batch(GuardedEdgeBatchUpsertOutcome),
+    /// This arm carries only Created, ExistingLive or Tombstoned. Statement
+    /// guard refusals use the top-level arm for every mutation request kind.
+    InsertIfAbsent(EdgeInsertIfAbsentOutcome),
+    GuardFailed(GraphStatementGuardFailure),
     CommitAnnotation(CommitAnnotationInsertOutcome),
 }
 
@@ -889,6 +902,7 @@ fn count_graph_mutation_events(outcome: &GraphMutationEventOutcome) {
     let written = match &outcome.mutation {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
         GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => 0,
     };
@@ -1086,6 +1100,12 @@ where
         });
     }
     check_graph_mutation_preconditions(conn, &preconditions, &retirements)?;
+    if let Some(failure) = check_statement_guards(conn, &preconditions.statement_guards)? {
+        return Ok(GraphMutationEventOutcome {
+            mutation: GraphMutationOutcome::GuardFailed(failure),
+            retired: Vec::new(),
+        });
+    }
     let mutation = match mutation {
         GraphMutationRequest::Single {
             request,
@@ -1107,6 +1127,21 @@ where
             }
             GraphMutationOutcome::Batch(outcome)
         }
+        GraphMutationRequest::InsertIfAbsent { edge } => {
+            if edge.deleted_at.is_some() {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Graph,
+                    operation: GRAPH_MUTATION_EVENTS_OP.into(),
+                    message: "expected a live edge for create-only insertion".into(),
+                });
+            }
+            #[cfg(test)]
+            statement_guard_tests::after_guards(&edge);
+            GraphMutationOutcome::InsertIfAbsent(
+                insert_edge_if_absent(conn, edge)
+                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+            )
+        }
         GraphMutationRequest::CommitAnnotation { edge, guard } => {
             if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
                 return Err(StorageError::InvalidInput {
@@ -1124,6 +1159,7 @@ where
     let written = match &mutation {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
         GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => {
             return Ok(GraphMutationEventOutcome {
@@ -3965,3 +4001,7 @@ mod index_repair_tests;
 #[cfg(test)]
 #[path = "graph_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "graph/statement_guard_tests.rs"]
+mod statement_guard_tests;

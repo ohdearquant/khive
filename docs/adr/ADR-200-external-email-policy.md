@@ -5,7 +5,7 @@
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
-- **Amendments**: Amendment 1 (proposed 2026-10-14), at the end of this record
+- **Amendments**: Amendment 1 (proposed 2026-10-14) and Amendment 2 (proposed 2026-10-16), at the end of this record
 
 ## Context
 
@@ -379,24 +379,56 @@ conversation, and an opt-out inside a message that screening quarantines is not 
    `screened` and that carries the `opt_out` label still adds the §5.4 entry point 3 suppression for its `From:`
    address before the quarantine is acknowledged. §8.4 already says the label does not change the delivery outcome;
    this makes the suppression not depend on it either, in the direction §8.4 names as safe.
-6. **Quarantine records are addressed to the maintainer.** At ingest, a message that screening quarantines is
-   addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the ingest
-   handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
+6. **Quarantine records are addressed to the maintainer.** At ingest, a message the channel quarantines, whatever
+   its reason, is addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the
+   ingest handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
    governs every mailbox read (`permits_message_note`, `khive-runtime/src/mailbox_view.rs`) then keeps the record and
-   its `quarantine_content_ref` from every other actor. A runtime with no configured actor has no maintainer, so its
-   quarantine records keep today's landing actor and are visible to that actor.
+   its `quarantine_content_ref` out of every other actor's mailbox reads. The rule applies at ingest, so it covers
+   records ingested once it is deployed: a quarantine record already stored keeps the `to_actor` it was written with,
+   and a replay of the same message does not re-address it. A runtime with no configured actor has no maintainer, so
+   its quarantine records keep today's landing actor and are visible to that actor.
 
 **Unchanged.** Quarantine records keep `quarantine_content_ref` and their existing operator recovery path. The
 screening rules, outcomes and labels of §8.3 and §8.4 are unchanged.
 
 **Acceptance (added to the ADR's table).**
 
-| Case                    | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A16 withheld read       | The recipient actor and the maintainer each read a withheld original byte for byte; a third actor is refused before any read; each call is audited; an ordinary or quarantined message is refused.                                                                                                                                                                                                                                                                                                                      |
-| A17 no reference        | A delivered withheld message's properties, and every inbox, thread, read and notice result for it, contain no blob reference and no original bytes; a retried delivery of the same transport message is acknowledged through its attachment. A quarantine record is addressed to the maintainer: a non-maintainer landing actor finds it through no inbox, thread, read, get or search result, and the maintainer finds it through each; on a runtime with no configured actor it keeps its landing actor (Decision 6). |
-| A18 thread routing      | An external message whose thread UUID names a thread with a verified outbound email routes to that thread's actor; one naming a thread with no such email routes by recipient alias or to the external inbound actor.                                                                                                                                                                                                                                                                                                   |
-| A19 quarantined opt-out | An authenticated opt-out in a message quarantined as `screened` suppresses its `From:` address, and the next send to that address is refused.                                                                                                                                                                                                                                                                                                                                                                           |
+| Case                    | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A16 withheld read       | The recipient actor and the maintainer each read a withheld original byte for byte; a third actor is refused before any read; each call is audited; an ordinary or quarantined message is refused.                                                                                                                                                                                                                                                                                                                                   |
+| A17 no reference        | A delivered withheld message's properties, and every inbox, thread, read and notice result for it, contain no blob reference and no original bytes; a retried delivery of the same transport message is acknowledged through its attachment. A quarantine record ingested under Decision 6 is addressed to the maintainer: a non-maintainer landing actor finds it through no inbox, thread, read, get or search result, and the maintainer finds it through each; on a runtime with no configured actor it keeps its landing actor. |
+| A18 thread routing      | An external message whose thread UUID names a thread with a verified outbound email routes to that thread's actor; one naming a thread with no such email routes by recipient alias or to the external inbound actor.                                                                                                                                                                                                                                                                                                                |
+| A19 quarantined opt-out | An authenticated opt-out in a message quarantined as `screened` suppresses its `From:` address, and the next send to that address is refused.                                                                                                                                                                                                                                                                                                                                                                                        |
 
 Realistic replies from developers that ask the reader to install, run or connect something are A15 fixtures, and the
 change that adds them reports how many each screening family catches.
+
+## Amendment 2 (2026-10-16) -- The opt-out window is the first non-quoted paragraph, and the phrase list names asks for no more email
+
+**Trigger.** A recorded decline ends its first paragraph with "Please don't email me about this again", and the
+sending client wraps that sentence onto a second line. §8.4 reads the subject and the first non-quoted line, so the
+phrase is never seen, and the phrase list does not contain it. Under 15 U.S.C. 7704(a)(3) and (a)(4) a reply to the
+sender's return address asking for no more mail is an opt-out request the sender has ten business days to honour,
+whatever its wording, and a missed one is a second send to a person who asked us to stop. The two errors are not
+symmetric: a false label suppresses a person who wrote "don't email me", which is never wrong.
+
+**Decisions (amending §8.4).**
+
+1. The opt-out window is the subject or the **first non-quoted paragraph** of the plain text: the lines from the
+   first non-empty line that does not start with `>` up to the next empty or quoted line, joined with one space
+   before matching. Quoted text and everything after the first blank line stay outside the window, so a top-posted
+   reply above our own message, and a reply that quotes it, match only on what the person wrote. The HTML-only
+   path reads the same paragraph of the extracted text.
+2. The phrase list gains the plain asks for no more email: "stop contacting", "don't email me" (straight and curly
+   apostrophe), "dont email me", "do not email me", "don't contact me" (both apostrophes), "do not contact me",
+   "no more emails". The bare words "email me" are not a phrase.
+3. Outcome and entry point are unchanged: the label still never changes the delivery outcome, and §5.4 entry
+   point 3 still writes the suppression.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                | Required behaviour                                                                                                                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A20 wrapped opt-out | A recorded decline whose "don't email me" sentence is wrapped onto the second line of its first paragraph is delivered marked with the opt-out label and no other family.                                         |
+| A21 email-me decoy  | A recorded engaged reply containing "email me" twice ("can you email me the setup docs", "you can email me at") is delivered without the opt-out label; a widening to the bare words would turn this fixture red. |
+| A22 quoted opt-out  | A reply whose only opt-out phrase is on a quoted line, followed by an unquoted line, is delivered without the label (existing fixture, unchanged).                                                                |

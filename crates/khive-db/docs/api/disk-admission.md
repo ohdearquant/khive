@@ -48,6 +48,27 @@ Callers can supply an explicit directory through `PoolConfig.volume_lock_dir`,
 `StorageBackend::sqlite_with_volume_lock_dir`, or the constructor accepting both
 captured policies. Test callers use private fixture directories.
 
+Headless and containerized deployments must provide a writable home directory
+for the service user, or set `KHIVE_VOLUME_LOCK_DIR` to an absolute directory
+that every cooperating khive process of the deployment can write. For example:
+
+```sh
+export KHIVE_VOLUME_LOCK_DIR=/var/lib/khive/volume-locks
+```
+
+Provision that directory so the service processes can create and open its lock
+files. Processes admitting writes on the same physical volume must share the
+same underlying lock directory, including when their database files have
+different parent directories. Containers must share the backing directory,
+rather than each using a private directory at the same path.
+
+If the resolved directory cannot be created, database opening fails closed with
+a `lock`-phase refusal naming the attempted path and `KHIVE_VOLUME_LOCK_DIR`.
+There is no automatic fallback to the database's parent: separate database
+parents on one volume would select different lock directories and stop sharing
+the cooperative admission lease required by ADR-154. Correct the directory's
+access or configure the shared absolute override before trying again.
+
 Within one process, requests for a volume slot are queued in the order they
 enter its registry mutex. Only the front waiter can acquire a free slot; a new
 arrival cannot overtake queued requests. An expired waiter removes itself and
