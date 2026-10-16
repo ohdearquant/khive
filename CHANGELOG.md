@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- With a configured runtime actor, a message the email channel quarantines, whatever its
+  reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
+  the mailbox recipient check keeps the quarantine record and its content reference out of
+  every other actor's inbox, thread, read, get and search results. This applies to records
+  ingested after the upgrade: a quarantine record already stored keeps the landing actor it
+  was written with, and nothing re-addresses it. A runtime with no configured actor keeps the
+  landing actor.
 ### Fixed
 
 - An authenticated opt-out in a message that screening quarantines as `screened` now records

@@ -223,18 +223,24 @@ pub fn validate_import(root: &Path, requested: &Path) -> anyhow::Result<PathBuf>
 /// Open the validated source and recheck the opened object's type.
 pub fn open_import(root: &Path, requested: &Path) -> anyhow::Result<std::fs::File> {
     let path = validate_import(root, requested)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        use khive_fs::opened_file::ContainedOpenError;
+        khive_fs::opened_file::open_regular_file_nofollow(&path).map_err(|error| match error {
+            ContainedOpenError::Open(error) => {
+                anyhow::anyhow!("open import source {}: {error}", path.display())
+            }
+            ContainedOpenError::Metadata(error) => error.into(),
+            _ => anyhow::anyhow!("import source must be a regular file: {}", path.display()),
+        })
     }
-    let file = options
-        .open(&path)
-        .map_err(|error| anyhow::anyhow!("open import source {}: {error}", path.display()))?;
-    if !file.metadata()?.is_file() {
-        anyhow::bail!("import source must be a regular file: {}", path.display());
+    #[cfg(not(unix))]
+    {
+        let file = std::fs::File::open(&path)
+            .map_err(|error| anyhow::anyhow!("open import source {}: {error}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("import source must be a regular file: {}", path.display());
+        }
+        Ok(file)
     }
-    Ok(file)
 }

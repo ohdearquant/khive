@@ -814,6 +814,16 @@ caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
 `comm.ingest` subhandler remains their only supported writer; ordinary custom
 message metadata is unaffected.
 
+A quarantined message, whatever its `quarantine_reason`, is addressed to the
+maintainer (the runtime's configured actor) in place of the landing actor that
+ingest routing would choose (ADR-200 Amendment 1, Decision 6). The mailbox
+recipient check then keeps the record and its `quarantine_content_ref` out of
+every other actor's inbox, thread, read, get and search results. The rule is
+applied at ingest, so it covers records ingested once it is deployed: a
+quarantine record already stored keeps the `to_actor` it was written with, and a
+replay of the same message does not re-address it. A runtime with no configured
+actor keeps the routed landing actor.
+
 Delivered external email carries `origin: "external"`, `trust: "untrusted"`, and
 a JSON array of screening rule IDs. Inbox and thread reads retain these in
 properties; their projections and successful `comm.read` body results also
