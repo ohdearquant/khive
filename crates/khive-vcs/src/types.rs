@@ -61,7 +61,9 @@ impl SnapshotId {
                 hex
             )));
         }
-        Ok(Self(format!("sha256:{}", hex.to_ascii_lowercase())))
+        let mut id = format!("sha256:{}", hex);
+        id.make_ascii_lowercase();
+        Ok(Self(id))
     }
 
     /// Construct from a full prefixed string (`"sha256:<hex64>"`).

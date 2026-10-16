@@ -878,22 +878,17 @@ fn extract_chatgpt_text(
     let content = content?;
 
     if content_type == "text" {
-        let parts = content.get("parts")?.as_array()?;
-        let joined: Vec<String> = parts
-            .iter()
-            .filter_map(|p| p.as_str().map(str::to_string))
-            .collect();
-        return if joined.is_empty() {
-            None
-        } else {
-            Some(joined.join("\n"))
-        };
+        return extract_chatgpt_parts(content);
     }
 
     if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
         return Some(text.to_string());
     }
 
+    extract_chatgpt_parts(content)
+}
+
+fn extract_chatgpt_parts(content: &Map<String, Value>) -> Option<String> {
     let parts = content.get("parts")?.as_array()?;
     let joined: Vec<String> = parts
         .iter()

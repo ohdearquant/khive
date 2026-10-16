@@ -17,6 +17,44 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
 pub(crate) const COMM_SUPPRESSION_SCHEMA_STMT: &str =
     khive_runtime::sql!("comm_suppression_create");
 
+const ATTACHMENTS_PARAM: ParamDef = ParamDef {
+    name: "attachments", param_type: "array", required: false,
+    description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const IDEMPOTENCY_KEY_PARAM: ParamDef = ParamDef {
+    name: "idempotency_key",
+    param_type: "string",
+    required: false,
+    description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const SUBJECT_PARAM: ParamDef = ParamDef {
+    name: "subject",
+    param_type: "string",
+    required: false,
+    description: "Optional subject line.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const CHANNEL_KIND_PARAM: ParamDef = ParamDef {
+    name: "channel_kind",
+    param_type: "string",
+    required: true,
+    description: "Channel kind identifier (e.g. `email`).",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const CHANNEL_SLUG_PARAM: ParamDef = ParamDef {
+    name: "channel_slug",
+    param_type: "string",
+    required: true,
+    description: "Stable per-credential identifier distinguishing accounts of the same kind.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "comm.suppression_add",
@@ -147,18 +185,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "attachments", param_type: "array", required: false,
-                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "idempotency_key",
-                param_type: "string",
-                required: false,
-                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATTACHMENTS_PARAM,
+            IDEMPOTENCY_KEY_PARAM,
             ParamDef {
                 name: "to",
                 param_type: "string",
@@ -173,13 +201,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                 description: "Message body. Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "subject",
-                param_type: "string",
-                required: false,
-                description: "Optional subject line.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            SUBJECT_PARAM,
             ParamDef {
                 name: "thread_id",
                 param_type: "uuid",
@@ -436,18 +458,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "attachments", param_type: "array", required: false,
-                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "idempotency_key",
-                param_type: "string",
-                required: false,
-                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATTACHMENTS_PARAM,
+            IDEMPOTENCY_KEY_PARAM,
             ParamDef {
                 name: "id",
                 param_type: "string",
@@ -555,13 +567,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                 description: "Message body text.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "subject",
-                param_type: "string",
-                required: false,
-                description: "Optional subject line.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            SUBJECT_PARAM,
             ParamDef {
                 name: "thread_id",
                 param_type: "uuid",
@@ -703,13 +709,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                               verb has no wire path for an untrusted caller to reach.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
             ParamDef {
                 name: "channel_slug",
                 param_type: "string",
@@ -904,20 +904,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Assertive,
         params: &[
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "channel_slug",
-                param_type: "string",
-                required: true,
-                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
+            CHANNEL_SLUG_PARAM,
         ],
     },
     HandlerDef {
@@ -929,20 +917,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Declaration,
         params: &[
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "channel_slug",
-                param_type: "string",
-                required: true,
-                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
+            CHANNEL_SLUG_PARAM,
             ParamDef {
                 name: "source",
                 param_type: "string",

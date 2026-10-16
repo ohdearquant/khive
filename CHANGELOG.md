@@ -218,6 +218,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
+  for caller-supplied seal keys. All-zero keys are refused; initialization starts
+  at epoch zero with no previous key and the same empty, deny-all state.
 - Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
   entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
   remains pending acceptance and conformance validation.
