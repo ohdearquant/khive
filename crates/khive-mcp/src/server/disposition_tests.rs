@@ -1368,6 +1368,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "process_files",
         "khive-runtime/src/daemon/process_files.rs",
     ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "boot_guard",
+        "khive-runtime/src/daemon/boot_guard.rs",
+    ),
 ];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {

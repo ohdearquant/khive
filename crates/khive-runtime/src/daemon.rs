@@ -10,7 +10,21 @@
 
 use std::sync::Arc;
 
+mod boot_guard;
+mod connection;
+mod dispatch_trait;
 mod locks;
+mod process_files;
+mod run_daemon;
+
+pub use dispatch_trait::*;
+
+pub use connection::*;
+
+pub use run_daemon::*;
+
+pub use boot_guard::*;
+
 #[cfg(all(test, unix))]
 use locks::open_lock_file;
 #[cfg(unix)]
@@ -22,6 +36,7 @@ pub use locks::{
 pub(crate) use locks::{peer_uid, uid_is_permitted};
 #[cfg(unix)]
 use locks::{socket_identity, SocketIdentity};
+pub use process_files::*;
 
 mod store_guard;
 mod store_identity;
@@ -65,19 +80,8 @@ use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, 
 
 // Unix-only: gated inside the file, because the error-constructor census
 // admits only attribute-free submodule declarations.
-mod connection;
-mod dispatch_trait;
 mod exit_record;
 mod lifecycle;
-mod process_files;
-mod run_daemon;
-
-pub use dispatch_trait::*;
-
-pub use connection::*;
-
-pub use run_daemon::*;
-
 #[cfg(unix)]
 use lifecycle::khive_dir;
 #[cfg(test)]
@@ -96,7 +100,6 @@ pub use lifecycle::{
     pid_path, recoverer_lock_path, rendezvous_split, socket_path, RendezvousSplit,
     SUPERVISOR_CLAIM_ENV,
 };
-pub use process_files::*;
 
 mod load_limits;
 #[cfg(unix)]
