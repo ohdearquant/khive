@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SQLite volume-lock directory creation refusals name the attempted path and the
+  `KHIVE_VOLUME_LOCK_DIR` override. Headless and containerized deployments require
+  a writable home directory or an absolute, writable lock directory shared by all
+  cooperating khive processes of the deployment; an unusable directory still
+  refuses the open rather than falling back to a database-specific directory.
+
 - An authenticated opt-out in a message that screening quarantines as `screened` now records
   the reply-stop suppression for its sender before the quarantine is acknowledged, as a
   delivered opt-out already did. No other quarantine reason records an opt-out, and ingest
