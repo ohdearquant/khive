@@ -115,7 +115,7 @@ pub(super) fn conditional_commit_annotation_insert(
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let affected = conn.execute(
-        include_str!("../../sql/commit-annotation-insert.sql"),
+        include_str!("../../../sql/commit-annotation-insert.sql"),
         rusqlite::params![
             edge.namespace,
             Uuid::from(edge.id).to_string(),
@@ -134,7 +134,7 @@ pub(super) fn conditional_commit_annotation_insert(
         return Ok(CommitAnnotationInsertOutcome::Created(edge));
     }
     let source_live: bool = conn.query_row(
-        include_str!("../../sql/commit-annotation-source-live-select.sql"),
+        include_str!("../../../sql/commit-annotation-source-live-select.sql"),
         rusqlite::params![
             edge.source_id.to_string(),
             edge.namespace,

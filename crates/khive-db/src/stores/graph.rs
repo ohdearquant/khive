@@ -69,6 +69,10 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
+// The child modules name sibling store modules as `super::event` and
+// `super::index_repair`; this import keeps those paths resolving one level down.
+use super::{event, index_repair};
+
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Graph, op, e)
