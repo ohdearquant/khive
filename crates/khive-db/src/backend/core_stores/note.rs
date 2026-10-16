@@ -1,7 +1,9 @@
 use super::super::StorageBackend;
 use super::map_open_error;
 use async_trait::async_trait;
-use khive_storage::note::{Note, NoteFilter, NoteKeyCursor, NoteStore, NoteVisibility};
+use khive_storage::note::{
+    Note, NoteFilter, NoteKeyCursor, NotePropertyPatch, NoteStore, NoteVisibility,
+};
 use khive_storage::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
     StorageCapability, StorageResult,
@@ -128,6 +130,19 @@ impl NoteStore for StorageBackend {
         self.notes()
             .map_err(|error| map_open_error(error, StorageCapability::Notes, "notes"))?
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
+            .await
+    }
+
+    async fn try_patch_note_properties(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        kind: &str,
+        patch: &NotePropertyPatch,
+    ) -> StorageResult<bool> {
+        self.notes()
+            .map_err(|error| map_open_error(error, StorageCapability::Notes, "notes"))?
+            .try_patch_note_properties(id, namespace, kind, patch)
             .await
     }
 

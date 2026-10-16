@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use khive_db::stores::note::{note_due_key_values, SqlNoteStore};
 use khive_db::{ConnectionPool, PoolConfig, SqlBridge};
+use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
 use khive_storage::note::{Note, NotePropertyPatch, NotePropertyPrecondition};
 use khive_storage::WriterTaskRequestState;
 use khive_storage::{NoteStore, SqlAccess, SqlValue, StorageCapability, StorageError};
@@ -622,7 +623,18 @@ async fn each_writer_route_preserves_statement_error_context_and_recovers() {
             .unwrap();
         let before = fixture.snapshot(note.id);
         let error = fixture.patch(note.id, &patch()).await.unwrap_err();
-        let source = match &error {
+        assert_eq!(
+            error.sqlite_write_failure(),
+            Some(SqliteWriteFailure {
+                stage: SqliteWriteStage::Statement,
+                primary_code: rusqlite::ffi::SQLITE_CONSTRAINT,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+                settlement_unknown: false,
+            }),
+            "route {route:?}: {error:?}"
+        );
+        assert!(!error.is_retryable(), "route {route:?}: {error:?}");
+        let source = match error.without_sqlite_write_stage() {
             StorageError::WriterTaskRequestFailed {
                 request_state,
                 source,
@@ -632,7 +644,7 @@ async fn each_writer_route_preserves_statement_error_context_and_recovers() {
                     *request_state,
                     WriterTaskRequestState::TransactionRolledBack
                 );
-                source.as_ref()
+                source.without_sqlite_write_stage()
             }
             error => {
                 assert!(!matches!(route, Route::Queued));
@@ -720,9 +732,19 @@ async fn queued_terminal_unknown_outcome_is_not_wrapped_or_retried() {
         .await
         .unwrap();
     let error = fixture.patch(note.id, &patch()).await.unwrap_err();
+    assert_eq!(
+        error.sqlite_write_failure(),
+        Some(SqliteWriteFailure {
+            stage: SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_AUTH,
+            extended_code: rusqlite::ffi::SQLITE_AUTH,
+            settlement_unknown: true,
+        })
+    );
+    assert!(!error.is_retryable(), "{error:?}");
     assert!(
         matches!(
-            error,
+            error.without_sqlite_write_stage(),
             StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
                 ..
@@ -731,6 +753,8 @@ async fn queued_terminal_unknown_outcome_is_not_wrapped_or_retried() {
         "{error:?}"
     );
     let error = fixture.patch(note.id, &patch()).await.unwrap_err();
+    assert_eq!(error.sqlite_write_failure(), None);
+    assert!(!error.is_retryable(), "{error:?}");
     assert!(
         matches!(
             error,
