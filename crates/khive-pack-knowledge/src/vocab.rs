@@ -2,6 +2,22 @@
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
+const ROLE_PARAM: ParamDef = ParamDef {
+    name: "role",
+    param_type: "string",
+    required: false,
+    description: "Agent role hint prepended to query for scoring",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const ATOM_ID_PARAM: ParamDef = ParamDef {
+    name: "atom_id",
+    param_type: "string",
+    required: true,
+    description: "Atom UUID or slug",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 /// Pack-owned schema for persisted retrieval-evaluation summaries.
 ///
 /// These statements stay in the Knowledge pack's schema plan rather than the
@@ -333,13 +349,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
                 description: "Exclude atoms with this exact status. Only used when status= is not set. Valid values: draft | reviewed | deprecated.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "role",
-                param_type: "string",
-                required: false,
-                description: "Agent role hint prepended to query for scoring",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ROLE_PARAM,
             ParamDef {
                 name: "limit",
                 param_type: "integer",
@@ -411,13 +421,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
                 description: "Orientation query text",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "role",
-                param_type: "string",
-                required: false,
-                description: "Agent role hint prepended to query for scoring",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ROLE_PARAM,
             ParamDef {
                 name: "limit",
                 param_type: "integer",
@@ -554,13 +558,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "atom_id",
-                param_type: "string",
-                required: true,
-                description: "Atom UUID or slug",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATOM_ID_PARAM,
             ParamDef {
                 name: "section_type",
                 param_type: "string",
@@ -590,13 +588,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "atom_id",
-                param_type: "string",
-                required: true,
-                description: "Atom UUID or slug",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATOM_ID_PARAM,
             ParamDef {
                 name: "section_type",
                 param_type: "string",
