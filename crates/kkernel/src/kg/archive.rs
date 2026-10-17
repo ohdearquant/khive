@@ -7,8 +7,11 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_runtime::{
+    runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig,
+};
 use khive_storage::EdgeRelation;
+use khive_types::ImportKindPolicy;
 use khive_vcs_adapters::{
     BibtexFormatAdapter, CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord,
     FormatAdapter, JsonFormatAdapter,
@@ -206,6 +209,8 @@ fn publish_export_portable(
 
 pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let ns = Namespace::parse(&args.namespace)?;
+    let (khive_cfg, mut destination_config, policy, validated) =
+        resolve_import_destination(&args, &ns)?;
     let format = args.format.unwrap_or_else(|| {
         match args
             .source
@@ -225,8 +230,14 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             .with_context(|| format!("read {}", args.source.display()))?
     };
 
-    // Discover the merged pack vocabulary before the target runtime exists.
-    let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
+    // Discover the merged pack vocabulary against an in-memory runtime. This
+    // deliberately happens before the target runtime exists: deterministic
+    // source failures must not create or migrate `--db` as a side effect.
+    let validation_runtime = KhiveRuntime::new(destination_config.clone().for_metadata_registry())
+        .context("create import validation runtime")?;
+    validation_runtime
+        .authorize(ns.clone())
+        .context("authorize kg import before destination setup")?;
     let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
     if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
         bail!("--default-kind is only supported for CSV/TSV input");
@@ -249,8 +260,9 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             } else {
                 source
             };
-            let adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
-                .with_context(|| format!("parse adapter input {}", args.source.display()))?;
+            let adapter =
+                JsonFormatAdapter::new_with_kind_policy(&input, &valid_entity_kinds, policy)
+                    .with_context(|| format!("parse adapter input {}", args.source.display()))?;
             archive_from_adapter(&args.namespace, adapter, args.verbose)?
         }
         ImportFormat::Csv | ImportFormat::Tsv => {
@@ -259,31 +271,33 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             } else {
                 DelimitedFormat::Tsv
             };
-            let adapter = CsvFormatAdapter::new(
+            let adapter = CsvFormatAdapter::new_with_kind_policy(
                 &source,
                 delimiter,
                 args.default_kind.as_deref(),
                 &valid_entity_kinds,
+                policy,
             )
             .with_context(|| format!("parse adapter input {}", args.source.display()))?;
             archive_from_adapter(&args.namespace, adapter, args.verbose)?
         }
     };
-    validate_archive_deterministic(&archive, &valid_entity_kinds)?;
+    validation_runtime.validate_kg_import(&archive, policy)?;
     drop(validation_runtime);
 
-    let config = RuntimeConfig {
-        db_path: Some(args.db.clone()),
-        default_namespace: ns.clone(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        ..Default::default()
-    };
-    let runtime = KhiveRuntime::new(config)?;
+    if let Some(target) = &validated {
+        destination_config.db_path = Some(target.path.clone());
+        khive_mcp::serve::reverify_reindex_target_identity(target)
+            .context("kg import destination changed before open")?;
+    }
+    let boot_guard = crate::exec::acquire_local_construction_guard(&destination_config)?;
+    let runtime =
+        khive_mcp::serve::build_single_backend_runtime(destination_config, &khive_cfg).await?;
+    drop(boot_guard);
     install_import_kind_registry(&runtime)?;
     let token = runtime.authorize(ns)?;
     let summary = runtime
-        .import_kg(&archive, &token)
+        .import_kg_with_policy(&archive, &token, policy)
         .await
         .with_context(|| format!("import {}", args.source.display()))?;
 
@@ -301,6 +315,85 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     };
     println!("{json}");
     Ok(())
+}
+
+/// Resolve the actual selected import policy and guarded one-database target
+/// without opening the destination. The CLI and policy-retention test use this
+/// same path; there is no alternate default-runtime construction.
+fn resolve_import_destination(
+    args: &ImportArgs,
+    ns: &Namespace,
+) -> Result<(
+    KhiveConfig,
+    RuntimeConfig,
+    ImportKindPolicy,
+    Option<khive_mcp::serve::ValidatedReindexTarget>,
+)> {
+    let loaded =
+        KhiveConfig::load_with_home_fallback_and_source(args.config.as_deref(), Some(&args.db))
+            .context("load kg import config")?;
+    let config_source = loaded.as_ref().map(|(_, path)| path.as_path());
+    let khive_cfg = loaded
+        .as_ref()
+        .map(|(config, _)| config.clone())
+        .unwrap_or_default();
+    let policy = if khive_cfg.schema.strict {
+        ImportKindPolicy::Strict
+    } else {
+        ImportKindPolicy::PreserveUnknown
+    };
+    let db_text = args.db.to_str().context("kg import --db must be UTF-8")?;
+    let mut destination_config = runtime_config_from_khive_config(
+        &khive_cfg,
+        RuntimeConfig {
+            db_path: Some(args.db.clone()),
+            default_namespace: ns.clone(),
+            ..Default::default()
+        },
+    );
+    destination_config.disable_embedding_models();
+    khive_mcp::serve::reject_conflicting_db_override_with_source(
+        Some(db_text),
+        &khive_cfg.backends,
+        config_source,
+    )
+    .context("kg import destination configuration")?;
+    khive_mcp::serve::validate_effective_backend_alias_modes(&khive_cfg.backends)?;
+    khive_mcp::serve::validate_declared_backend_access_modes(&khive_cfg.backends)?;
+    khive_mcp::serve::validate_wal_ceiling_topology(
+        &destination_config,
+        &khive_cfg.backends,
+        false,
+    )?;
+    let validated = khive_mcp::serve::validate_reindex_db_target_with_source(
+        Some(db_text),
+        &khive_cfg.backends,
+        config_source,
+    )
+    .context("kg import destination target")?;
+    if let Some(main) = khive_cfg
+        .backends
+        .iter()
+        .find(|backend| backend.name == "main")
+    {
+        let resolved = khive_runtime::resolve_wal_ceiling(
+            main.wal_ceiling_bytes,
+            destination_config.wal_ceiling_env_raw.as_deref(),
+            &main.name,
+            main.kind.clone(),
+            true,
+            main.read_only,
+        )?;
+        destination_config.wal_ceiling_bytes = resolved.effective_bytes;
+        destination_config.wal_ceiling_configured_bytes = resolved.configured_bytes;
+        destination_config.wal_ceiling_source = resolved.source;
+        destination_config.disk_guard_config =
+            main.resolve_disk_guard(&destination_config.disk_guard_environment)?;
+    } else {
+        destination_config.resolve_wal_ceiling_policy(false)?;
+        destination_config.resolve_disk_guard_policy(false)?;
+    }
+    Ok((khive_cfg, destination_config, policy, validated))
 }
 
 fn archive_from_adapter(
@@ -402,50 +495,6 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
         );
     }
     Ok(())
-}
-
-/// Pre-import validation that does not require entity-kind knowledge.
-/// Entity-kind validation happens inside `runtime.import_kg` against the
-/// merged pack/runtime kind registry installed by `install_import_kind_registry`.
-pub(super) fn validate_archive_edge_weights(archive: &KgArchive) -> Result<()> {
-    for edge in &archive.edges {
-        validate_edge_weight(edge.weight, edge.edge_id)?;
-    }
-    Ok(())
-}
-
-fn validate_archive_deterministic(
-    archive: &KgArchive,
-    valid_entity_kinds: &[String],
-) -> Result<()> {
-    if archive.format != "khive-kg" {
-        bail!(
-            "unsupported archive format {:?}; expected \"khive-kg\"",
-            archive.format
-        );
-    }
-    if archive.version != "0.1" {
-        bail!(
-            "unsupported archive version {:?}; supported: \"0.1\"",
-            archive.version
-        );
-    }
-    for (index, entity) in archive.entities.iter().enumerate() {
-        if !valid_entity_kinds.iter().any(|kind| kind == &entity.kind) {
-            bail!(
-                "archive entity {index} ({}) has unknown entity kind {:?}",
-                entity.id,
-                entity.kind
-            );
-        }
-        if entity.name.trim().is_empty() {
-            bail!(
-                "archive entity {index} ({}) name must be non-blank",
-                entity.id
-            );
-        }
-    }
-    validate_archive_edge_weights(archive)
 }
 
 /// Install the merged pack/runtime entity- and note-kind registry on `runtime`
@@ -844,6 +893,7 @@ mod tests {
         std::fs::write(&source_path, &archive_json).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -884,6 +934,7 @@ mod tests {
         std::fs::write(&source_path, &archive_json).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -936,6 +987,7 @@ mod tests {
         std::fs::write(&source_path, &json_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -978,6 +1030,7 @@ mod tests {
         std::fs::write(&source_path, &ndjson_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1020,6 +1073,7 @@ mod tests {
         std::fs::write(&source_path, &json_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path,
             namespace: "test-ns".to_string(),
@@ -1051,6 +1105,7 @@ mod tests {
         std::fs::write(&source_path, &json_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1090,6 +1145,7 @@ mod tests {
         std::fs::write(&source_path, &ndjson_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1244,6 +1300,7 @@ mod tests {
         std::fs::write(&source_path, &json_input).unwrap();
 
         let args = ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1296,6 +1353,7 @@ mod tests {
         let baseline_source = tmp.path().join("baseline.json");
         std::fs::write(&baseline_source, &baseline_json).unwrap();
         cmd_import(ImportArgs {
+            config: None,
             source: baseline_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1318,6 +1376,7 @@ mod tests {
         std::fs::write(&bad_source, &bad_json).unwrap();
 
         let err = cmd_import(ImportArgs {
+            config: None,
             source: bad_source,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1376,6 +1435,7 @@ mod tests {
         .unwrap();
 
         let err = cmd_import(ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1435,6 +1495,7 @@ mod tests {
         .unwrap();
 
         let err = cmd_import(ImportArgs {
+            config: None,
             source: source_path,
             db: db_path.clone(),
             namespace: "test-ns".to_string(),
@@ -1468,6 +1529,51 @@ mod tests {
             err.to_string().contains("outside the valid range"),
             "expected range error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod import_destination_tests {
+    use super::*;
+    #[test]
+    fn selected_declared_main_retains_wal_disk_actor_and_import_policy_without_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The resolved target is canonical, and a temp dir can sit under a symlink
+        // (macOS /var -> /private/var), so build the expected paths from the canonical root.
+        let root = tmp.path().canonicalize().unwrap();
+        let db = root.join("fresh/nested/target.db");
+        let config = root.join("selected.toml");
+        std::fs::write(&config, format!("[schema]\nstrict=false\n[actor]\nid=\"lambda:import-test\"\n[[backends]]\nname=\"main\"\npath={:?}\nwal_ceiling_bytes=104857600\ndisk_reserve_bytes=123456\ndisk_guard_deadline_ms=777\n", db.to_str().unwrap())).unwrap();
+        let args = ImportArgs {
+            config: Some(config),
+            source: root.join("unused"),
+            db: db.clone(),
+            namespace: "local".into(),
+            format: None,
+            default_kind: None,
+            verbose: false,
+        };
+        let (selected, runtime, policy, target) =
+            resolve_import_destination(&args, &Namespace::local()).unwrap();
+        assert!(!selected.schema.strict);
+        assert_eq!(policy, ImportKindPolicy::PreserveUnknown);
+        assert_eq!(runtime.actor_id.as_deref(), Some("lambda:import-test"));
+        assert_eq!(runtime.wal_ceiling_bytes, 104857600);
+        assert_eq!(runtime.wal_ceiling_configured_bytes, 104857600);
+        assert_eq!(
+            runtime.wal_ceiling_source,
+            khive_runtime::WalCeilingSource::BackendField
+        );
+        assert_eq!(
+            runtime.disk_guard_config,
+            selected.backends[0]
+                .resolve_disk_guard(&runtime.disk_guard_environment)
+                .unwrap()
+        );
+        assert!(runtime.engines.as_ref().unwrap().is_empty());
+        assert!(runtime.embedding_model.is_none());
+        assert_eq!(target.unwrap().path, db);
+        assert!(!db.parent().unwrap().exists());
     }
 }
 

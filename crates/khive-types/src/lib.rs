@@ -55,7 +55,7 @@ pub use edge_rules::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     BASE_ENTITY_ENDPOINT_RULES,
 };
-pub use entity::{validate_edge_weight, Entity, EntityKind, Link, PropertyValue};
+pub use entity::{validate_edge_weight, Entity, EntityKind, ImportKindPolicy, Link, PropertyValue};
 pub use entity_type::{
     to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
 };

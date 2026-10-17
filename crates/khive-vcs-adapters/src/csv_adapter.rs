@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use khive_types::ImportKindPolicy;
 use serde_json::{Map, Value};
 
 use crate::json_adapter::{parse_edge, parse_entity};
@@ -36,6 +37,24 @@ impl CsvFormatAdapter {
         format: DelimitedFormat,
         default_kind: Option<&str>,
         extra_valid_kinds: &[String],
+    ) -> Result<Self, AdapterError> {
+        Self::new_with_kind_policy(
+            source,
+            format,
+            default_kind,
+            extra_valid_kinds,
+            ImportKindPolicy::Strict,
+        )
+    }
+
+    /// Parse tabular records with explicit unknown-entity-kind admission.
+    /// Relations and every other record check are unchanged.
+    pub fn new_with_kind_policy(
+        source: &str,
+        format: DelimitedFormat,
+        default_kind: Option<&str>,
+        extra_valid_kinds: &[String],
+        policy: ImportKindPolicy,
     ) -> Result<Self, AdapterError> {
         let delimiter = match format {
             DelimitedFormat::Csv => b',',
@@ -90,7 +109,13 @@ impl CsvFormatAdapter {
                 );
             } else {
                 adapter.entities.push(object.and_then(|object| {
-                    parse_entity(index, object, &mut adapter.warnings, extra_valid_kinds)
+                    parse_entity(
+                        index,
+                        object,
+                        &mut adapter.warnings,
+                        extra_valid_kinds,
+                        policy,
+                    )
                 }));
             }
         }
