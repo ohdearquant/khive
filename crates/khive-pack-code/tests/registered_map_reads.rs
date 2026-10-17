@@ -102,7 +102,16 @@ async fn l1_ingested_projects_support_registered_dependency_reads() {
         .await
         .unwrap();
         assert_eq!(report.projects_created, 5);
-        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // The fixture is not a git checkout, so ingest records its source as unversioned; any other
+        // warning fails.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("git metadata unavailable")),
+            "{:?}",
+            report.warnings
+        );
     }
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
