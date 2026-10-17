@@ -5,7 +5,8 @@
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
-- **Amendments**: Amendment 1 (proposed 2026-10-14) and Amendment 2 (proposed 2026-10-16), at the end of this record
+- **Amendments**: Amendment 1 (proposed 2026-10-14), Amendment 2 (proposed 2026-10-16), Amendment 3 (proposed
+  2026-10-16) and Amendment 4 (proposed 2026-10-17), at the end of this record
 
 ## Context
 
@@ -462,3 +463,40 @@ external sending.
 | Case             | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | A23 inbound only | With external senders unset and the setting enabled, an authenticated message from a sender other than the maintainer is delivered to its routed actor marked external and untrusted, an inbound suppression entry still blocks it, a send to an address outside the outbound allowlist is refused, and start-up fails while the inbound actor is unset or empty or the setting holds an unrecognised value. |
+
+## Amendment 4 (2026-10-17) -- The remote mirror's credential, its answer, and an idle refresh
+
+**Status**: Proposed 2026-10-17.
+
+**Trigger.** §6 names `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` and `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` but leaves
+"its credential" unnamed, and it says nothing about an answer that is only partly well formed. Its refresh is also tied
+to delivery: the mirror is read before an external message is handed to SMTP, and admission refuses once the last
+successful refresh is older than the maximum age. A deployment with no external message pending therefore never
+refreshes, passes the maximum age, and from then on refuses every new external message, so no external message is ever
+pending to trigger the refresh that would reopen admission. [Source: §6, the "At delivery" and "At admission" bullets.]
+
+**Decision.**
+
+1. **Configuration.** The credential is `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN`, sent as a bearer token. The URL, the
+   token and the maximum age are read only while external senders are configured, like the §5 variables. The URL must
+   be `https://`. Setting some of the three but not all, or a maximum age that is not a positive integer, is a
+   configuration error at start-up. No error repeats the credential.
+2. **The read.** One `GET` under one deadline that covers connection, headers and body. Redirects are not followed, so
+   the credential reaches only the configured URL. The answer is `{"as_of": "<RFC 3339>", "recipient_keys": [...]}`
+   with an optional `count`; unknown fields are ignored, so the incremental form §6 allows can be added later. A status
+   other than 200, a body over the size limit the implementation states, an `as_of` that does not parse, a `count` that
+   differs from the number of keys, or any key that is not 64 lowercase hex characters fails the whole refresh. A partly
+   valid set is never applied.
+3. **Recording.** The missing keys are added before the refresh time is recorded, so a failure part way leaves the
+   previous time, which can only make admission refuse sooner. The time is kept in the local store beside the list, so
+   every process that admits external mail reads the same value.
+4. **Idle refresh.** Besides the refresh before an external send, a delivery cycle refreshes when no successful refresh
+   is recorded or the last one is at least half the maximum age old. It is the same refresh, still at most one per
+   cycle, and it changes no other rule: a failed idle refresh records nothing, so admission keeps refusing until one
+   succeeds.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                | Required behaviour                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A24 mirror contract | A partial or non-`https` mirror configuration refuses start-up without repeating the credential. A redirect, a non-200 answer, a count mismatch or one malformed key fails the refresh and adds no key. With nothing pending, a cycle with no recorded refresh reads the mirror and, once that read succeeds, external admission is open; a cycle under half the maximum age reads nothing. |
