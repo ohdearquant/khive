@@ -100,3 +100,138 @@ cd crates && cargo bench -p khive-vamana --bench vamana_bench -- search
 - Single-query search latency target: < 3 ms at N=10k (from perf/recall-fts SLO)
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Lifecycle and persistence suite — baseline pending
+
+The additional targets are `vamana_lifecycle` and `vamana_persistence`.
+The latter requires `mmap`, which is enabled by default. The original
+`vamana_bench` workloads and historical ledger above are unchanged. No new
+measurement is claimed: baseline commit, machine, toolchain and values are
+**pending** until the suite is measured. Source provenance is
+`d3619dec9e32045f273c61b5a7b2eb70fe6463a3`, not a measured baseline.
+
+A scenario's full name joins its group and suffix with `/`.
+
+| Group                   | Scenario suffixes                         | Measurement and fixture                                                     | Baseline |
+| ----------------------- | ----------------------------------------- | --------------------------------------------------------------------------- | -------- |
+| `lifecycle_insert`      | `100_into_5000`                           | 100 sequential inserts into a clean 5K index; whole-batch latency           | pending  |
+| `lifecycle_tombstone`   | `single_100_of_5000`, `batch_100_of_5000` | 100 single calls versus one 100-ID batch on a fresh 5K index                | pending  |
+| `lifecycle_consolidate` | `500_tombstones_of_5000`                  | Consolidate a prepared 5K index with 500 tombstones; 4500-entry remap       | pending  |
+| `portable_round_trip`   | `5000`                                    | `to_bytes` plus `from_bytes`, including the full external-ID map            | pending  |
+| `recall_at_k`           | `per_query_k10/{1000,5000}`               | Criterion rotating-query evaluation; fixed all-query report described below | pending  |
+| `filesystem_round_trip` | `save_load_5000`, `save_atomic_load_5000` | v1 or v2 directory save plus load of a clean 5K index                       | pending  |
+
+### Generated fixtures and resets
+
+All new data is generated; no model, ignored corpus or live index is read.
+Vectors have 384 dimensions, are normalized, and use `StdRng` with explicit
+seeds. Lifecycle and persistence use corpus seed 42, insert seed 43 and verification
+query seed 44. New scenarios use default R=64, L=128, alpha=1.2, including at 1K
+for consistency with the existing ordinary quality test. The original 1K
+performance bench still uses R=32/L=64 and is a different workload.
+
+Mutation scenarios build their baseline once. Every measured iteration creates
+one owned `fork_for_maintenance` outside the timer; it copies full lifecycle
+state and starts with fresh search scratch. This prevents repeated inserts from
+growing the fixture, repeated deletes from failing, or consolidation from
+becoming a no-op. At most the baseline and one working index are live. Sequential
+custom loops avoid Criterion batching many multi-megabyte indexes. Each 5K×384
+raw vector slab alone is 7.68 MB, before graph/reverse adjacency and SQ8 codes.
+
+The insert batch must return ordinals 5000..5099 and leave 5100 live vectors.
+Single and batch tombstones use the same 100 unique ordinals, explicitly excluding
+the medoid; these rows measure graph repair without medoid re-election.
+Consolidation starts after 500 repaired tombstones and verifies the complete
+new-to-old survivor mapping, 4500 live vectors and cleared tombstone/churn state.
+A v1 snapshot is not used to reset mutations: it cannot represent tombstones.
+Input construction, fork, assertions and output destruction are outside timers;
+all 100 requested insert/delete calls, including their graph maintenance, are
+inside their respective batch timers. Inserts include any scratch initialization
+needed by the fresh working index.
+
+### Recall value and actual median/p99
+
+The 1K fixture uses corpus/query seeds 0xDEAD_BEEF/0xCAFE_BABE, and the 5K fixture
+uses 0xFEED_FACE/0xABCD_1234. Corpus and query sets are independent. The selected
+scenario warms one query, then evaluates **all 1000 or 5000 queries exactly once**
+in a fixed measured pass using `recall_at_k(one_query_slice,10)`. Its arithmetic
+mean is the same mean-recall definition as the multi-query API. Every returned
+value must be finite and within [0,1]. It prints alongside its Criterion group:
+
+```text
+recall_at_k/per_query_k10/N/distribution queries=N recall_at_10=... eval_median_ns=... eval_p99_ns=...
+```
+
+The median is the midpoint of the two central duration samples; p99 uses
+nearest rank `ceil(0.99*N)` (rank 990 or 4950). These are measured **per-query
+evaluation** latencies, including exact brute-force reference search, ANN search
+and recall overlap computation. They are not ANN-only search times, full-batch
+latencies, or percentiles inferred from Criterion averages. Sample insertion,
+validation, averaging and sorting follow the per-query timers. The Criterion
+companion repeatedly evaluates one rotating query, including input selection,
+using the same fixed fixture; its iteration calibration never reduces the
+fixed report's query count, including with `--quick`.
+
+`tests/benchmark.rs` retains the ordinary >=0.80 recall gate on 1000×384 vectors
+and **50 queries**, and the ignored >=0.85 gate on 5000 vectors and 100 queries.
+The new 1000-query benchmark also asserts >=0.80. No costly ordinary 1000-query
+test replaces or duplicates that existing gate. The 5K benchmark reports quality;
+it does not invent a stronger threshold than the existing policy.
+
+The evaluator scans the corpus for each exact reference query. At 5K/5K this is
+25 million vector-distance pairs, so its one fixed pass can dominate smoke-run
+wall time. The suite does not repeat 100 full passes to manufacture a p99. With
+`parallel`, reference evaluation uses the Rayon global pool; the separate
+`KHIVE_ANN_BUILD_THREADS` cap only controls graph builds. Record both that setting
+and `RAYON_NUM_THREADS` on the measurement machine.
+
+### Persistence boundaries
+
+`save`, `save_atomic` and `load` operate on a **directory of segments**, not one
+temp file. Each iteration creates a fresh private TempDir before timing, saves
+the unchanged clean 5K baseline and loads it before stopping the timer. This
+includes serialization, publication and load validation; v2 additionally has
+its documented crash-safe staging/fsync protocol. It measures a new directory,
+not overwrite throughput. v1 save cannot persist tombstones.
+
+After timing, both persistence and portable-codec scenarios verify vector count,
+dimensions, configuration, complete vector contents and fixed-query search
+results. Portable decoding also verifies all 5000 external IDs. Loaded mmap
+indexes are dropped before explicit directory cleanup; cleanup failures fail
+the benchmark. No missing fixture, partial workload or operation error is silently
+skipped. No cold-cache claim is made: the just-saved files are in the OS cache.
+The original in-memory snapshot group remains distinct from filesystem I/O.
+
+### Execution and baseline recording
+
+From `crates/`:
+
+```sh
+cargo bench -p khive-vamana --benches -- --quick --noplot
+cargo bench -p khive-vamana --bench vamana_lifecycle -- recall_at_k
+cargo bench -p khive-vamana --bench vamana_persistence -- filesystem_round_trip
+```
+
+The new targets use 10 Criterion samples, 100 ms warmup and a 1 s measurement target;
+setup and fixed recall reporting add wall time outside measured intervals.
+Record a full run for baselines, naming commit, Rust toolchain, CPU/RAM/OS,
+features, commands, thread settings and fixture seeds. For advisory median
+latency rows, use Criterion's `new/estimates.json` median estimate rather than
+renaming its headline mean. Use the explicit distribution line for recall's
+actual per-query median/p99. New values remain pending.
+
+## Performance guarantees
+
+| Operation       | Input                         | Metric         | Bound                                                                                                                                 |
+| --------------- | ----------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `search`        | 10K vectors, 384d, k=10       | median latency | < 3 ms (ADR-048 SLO, `crates/khive-vamana/docs/benchmarks.md:100`) — repository-stated timing target, advisory until promoted (#5642) |
+| `insert`        | 100 vectors into 5K index     | median latency | Advisory trend against the recorded baseline                                                                                          |
+| `consolidate`   | 5K index after 500 tombstones | median latency | Advisory trend against the recorded baseline                                                                                          |
+| `recall_at_k`   | 1K vectors, 1K queries, k=10  | recall@10      | >= 0.80 (ADR-048, `crates/khive-vamana/docs/benchmarks.md:98`) — repository-stated quality bar                                        |
+| `save` + `load` | 5K index to temp file         | median latency | Advisory trend against the recorded baseline                                                                                          |
+
+The table is the issue #5645 contract. Timing targets are advisory, including
+the repository-stated 3 ms search target; no fixed-percentage regression gate is
+added. Recall >=0.80 remains a quality gate. The existing ordinary 50-query
+fixture and new 1000-query benchmark are distinguished above. No new performance
+count/allocation guarantee, workflow change or guarantee-schema file is added.

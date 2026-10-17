@@ -58,6 +58,15 @@ toml = { workspace = true }
 name = "vamana_bench"
 harness = false
 
+[[bench]]
+name = "vamana_lifecycle"
+harness = false
+
+[[bench]]
+name = "vamana_persistence"
+harness = false
+required-features = ["mmap"]
+
 [[example]]
 name = "vec_bench"
 required-features = ["mmap"]
