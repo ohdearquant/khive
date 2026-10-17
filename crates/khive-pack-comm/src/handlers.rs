@@ -18,7 +18,7 @@ use khive_runtime::{
     RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 use crate::idempotency::MessageIdentity;

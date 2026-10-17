@@ -687,6 +687,43 @@ fn acquisition_mapping_preserves_capacity_settlement_and_original_stop_error() {
     }
 }
 
+#[tokio::test]
+async fn backend_note_handle_forwards_guarded_property_patch() {
+    use khive_storage::note::{NotePropertyPatch, NotePropertyPrecondition};
+    use serde_json::json;
+
+    let backend = StorageBackend::memory().unwrap();
+    let notes: &dyn NoteStore = &backend;
+    let mut note = Note::new("local", "observation", "kept");
+    note.properties = Some(json!({"state": "pending", "unrelated": 7}));
+    notes.upsert_note(note.clone()).await.unwrap();
+    let patch = NotePropertyPatch {
+        preconditions: vec![NotePropertyPrecondition::ExtractEquals {
+            key: "state".into(),
+            value: SqlValue::Text("pending".into()),
+        }],
+        set: [("state".into(), json!("done"))].into(),
+        extend_expires_at: None,
+        updated_at: note.updated_at + 1,
+    };
+    assert!(notes
+        .try_patch_note_properties(note.id, "local", "observation", &patch)
+        .await
+        .unwrap());
+    let updated = notes.get_note(note.id).await.unwrap().unwrap();
+    assert_eq!(updated.content, note.content);
+    assert_eq!(
+        updated.properties,
+        Some(json!({"state": "done", "unrelated": 7}))
+    );
+    assert_eq!(updated.updated_at, patch.updated_at);
+    assert!(!notes
+        .try_patch_note_properties(note.id, "local", "observation", &patch)
+        .await
+        .unwrap());
+    assert_eq!(notes.get_note(note.id).await.unwrap().unwrap(), updated);
+}
+
 #[test]
 fn every_live_core_trait_method_has_an_explicit_matching_backend_override() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -765,7 +802,7 @@ fn every_live_core_trait_method_has_an_explicit_matching_backend_override() {
         total += expected.len();
     }
     assert_eq!(
-        total, 95,
+        total, 96,
         "review every new core method and update the bound inventory"
     );
 }

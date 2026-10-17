@@ -16,6 +16,7 @@ pub(super) const STORE_WRITES: &[&str] = &[
     "set_note_property",
     "try_patch_note_property",
     "patch_note_property_atomic",
+    "try_patch_note_properties",
 ];
 
 // The complement is explicit, including readers: a new trait method of any
