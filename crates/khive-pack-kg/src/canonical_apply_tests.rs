@@ -331,8 +331,13 @@ async fn canonical_proposal_scans_values_under_reserved_property_keys() {
         "patch":{"target":"entity","properties":{"khive:secret_gate":rejected}},
         "preimage":{"target":"entity","properties":{"khive:secret_gate":rejected}}});
     let plain = delta(&[update]);
-    let escaped = plain.replace("@fixture.example", "\\u0040fixture.example");
+    // JSON escapes keep the credential's shape and the key's trigger word out of the NDJSON
+    // text, so only a scan of the decoded values can refuse it.
+    let escaped = plain
+        .replace("@fixture.example", "\\u0040fixture.example")
+        .replace("khive:secret_gate", "khive:\\u0073ecret_gate");
     assert_ne!(escaped, plain);
+    assert!(!escaped.contains("secret"));
     khive_runtime::secret_gate::check_at(&escaped, "proposal", "changeset")
         .expect("the undecoded text passes a scan of the text alone");
     let error = registry
