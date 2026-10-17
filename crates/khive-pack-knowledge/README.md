@@ -32,7 +32,7 @@ rerank, and composed into markdown briefings under a token budget.
 ## Usage
 
 This crate is not called directly as a Rust library — it registers `KnowledgePack`
-with the runtime's `inventory`-based pack registry and dispatches its 20 verbs
+with the runtime's `inventory`-based pack registry and dispatches its 21 verbs
 through the MCP `request` DSL (or `kkernel exec`). A caller issues:
 
 ```text
@@ -129,12 +129,13 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 | `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget                                           |
 | `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest                                                 |
 | `knowledge.export`                                                                | [Deterministic namespace corpus JSONL](docs/api/export.md), returned as data plus table-row counts |
+| `knowledge.lint`                                                                  | [Caller-visible graph rules, statistics and guarded repairs](docs/api/lint.md)                     |
 | `knowledge.import`                                                                | Validate/import atlas markdown with frontmatter or path identity                                   |
 | `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                                                            |
 | `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                                                            |
 | `knowledge.feedback`                                                              | Apply per-section signals to posterior weights                                                     |
 
-All 20 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
+All 21 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
 
 For a cheap, stable inventory walk, call
 `knowledge.list(fields=["id","slug"], after="", limit=500)` and round-trip each

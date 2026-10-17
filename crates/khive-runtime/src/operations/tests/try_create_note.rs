@@ -483,7 +483,9 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
 
     let runtime = rt();
     let token = NamespaceToken::local();
-    runtime.text_for_notes(&token).unwrap();
+    // The note text store stays unopened until the ingest: once this backend
+    // has proven `fts_notes`, opening it runs no DDL, so the denied CREATE
+    // below would never be reached.
     runtime
         .backend()
         .pool()

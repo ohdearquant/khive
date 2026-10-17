@@ -88,7 +88,7 @@ async fn mounted_catalog_and_calls_are_available_on_the_mcp_wire() {
             )
             .await
             .unwrap();
-        serde_json::from_str(&result.content[0].raw.as_text().unwrap().text).unwrap()
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
     }
     assert_eq!(plan(&client, "demo.echo").await["stages"][0]["known"], true);
     assert_eq!(
@@ -160,7 +160,7 @@ async fn mounted_catalog_and_calls_are_available_on_the_mcp_wire() {
             )
             .await
             .unwrap();
-        let wire = &result.content[0].raw.as_text().unwrap().text;
+        let wire = &result.content[0].as_text().unwrap().text;
         let body: Value = serde_json::from_str(wire).unwrap();
         assert_eq!(body["results"][0]["ok"], success, "{body}");
         if success {

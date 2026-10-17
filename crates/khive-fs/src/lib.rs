@@ -9,6 +9,8 @@
 //! The Unix `atomic_publish` module stages and publishes files within a held directory.
 //! The `opened_file` module reports the path behind an open file and provides a contained open
 //! on every platform; its separate final-component no-follow regular-file open is Unix only.
+//! `tree_discovery` adds breadth-first discovery with progress and failure reports on every
+//! platform, retaining parent-directory capabilities for selected files on Unix.
 
 #[cfg(unix)]
 pub mod atomic_publish;
@@ -17,5 +19,6 @@ pub mod directory_walk;
 #[cfg(unix)]
 pub mod fd_relative;
 pub mod opened_file;
+pub mod tree_discovery;
 #[cfg(unix)]
 pub mod tree_walk;

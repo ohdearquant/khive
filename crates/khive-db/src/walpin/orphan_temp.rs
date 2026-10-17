@@ -167,13 +167,24 @@ pub(super) fn enumerate_live_bounded(
     max_entries: usize,
     purpose: EnumerationPurpose,
 ) -> io::Result<WalpinReport> {
+    enumerate_live_bounded_with_clock(dir, sweep_interval, max_entries, purpose, now_epoch_secs)
+}
+
+#[cfg(unix)]
+pub(super) fn enumerate_live_bounded_with_clock(
+    dir: &Path,
+    sweep_interval: Duration,
+    max_entries: usize,
+    purpose: EnumerationPurpose,
+    clock: impl FnOnce() -> i64,
+) -> io::Result<WalpinReport> {
     let handle = match unix_impl::SidecarDirHandle::open_if_exists(dir) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(WalpinReport::default()),
         Err(e) => return Err(e),
     };
 
-    let now = now_epoch_secs();
+    let now = clock();
     // Fallback window for records that predate the `sweep_interval_ms`
     // field — records carrying their producer's own cadence are judged
     // against it instead (see `stale_window_secs`), so a session sweeping

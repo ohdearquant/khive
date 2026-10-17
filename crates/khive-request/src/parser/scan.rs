@@ -62,6 +62,12 @@ pub(crate) struct NormalizedQuotedString<'a> {
     pub(crate) first_control_byte: Option<ControlByteHit>,
 }
 
+fn owned_quoted_prefix(raw: &str, pos: usize) -> String {
+    let mut owned = String::with_capacity(raw.len() + 8);
+    owned.push_str(&raw[..pos]);
+    owned
+}
+
 /// Rewrites raw literal newline, carriage return, and tab bytes inside a
 /// double-quoted string literal into their JSON escape form, so a value
 /// containing one of those three bytes verbatim (as opposed to a
@@ -125,9 +131,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                 None => hex_valid = false,
             }
             if (c as u32) < 0x20 && out.is_none() {
-                let mut owned = String::with_capacity(raw.len() + 8);
-                owned.push_str(&raw[..pos]);
-                out = Some(owned);
+                out = Some(owned_quoted_prefix(raw, pos));
             }
             if let Some(out) = out.as_mut() {
                 out.push(c);
@@ -161,11 +165,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                     && !prev_was_high_surrogate
                     && first_control_byte.is_none()
                 {
-                    let out = out.get_or_insert_with(|| {
-                        let mut owned = String::with_capacity(raw.len() + 8);
-                        owned.push_str(&raw[..next_pos]);
-                        owned
-                    });
+                    let out = out.get_or_insert_with(|| owned_quoted_prefix(raw, next_pos));
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
                         raw_pos: next_pos,
@@ -174,9 +174,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                     });
                 }
                 if (next_c as u32) < 0x20 && out.is_none() {
-                    let mut owned = String::with_capacity(raw.len() + 8);
-                    owned.push_str(&raw[..next_pos]);
-                    out = Some(owned);
+                    out = Some(owned_quoted_prefix(raw, next_pos));
                 }
                 if let Some(out) = out.as_mut() {
                     out.push(next_c);
@@ -186,11 +184,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
         }
         match c {
             '\n' | '\r' | '\t' => {
-                let out = out.get_or_insert_with(|| {
-                    let mut owned = String::with_capacity(raw.len() + 8);
-                    owned.push_str(&raw[..pos]);
-                    owned
-                });
+                let out = out.get_or_insert_with(|| owned_quoted_prefix(raw, pos));
                 match c {
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
@@ -199,11 +193,7 @@ pub(crate) fn normalize_quoted_string(raw: &str) -> NormalizedQuotedString<'_> {
                 }
             }
             c if (c as u32) < 0x20 => {
-                let out = out.get_or_insert_with(|| {
-                    let mut owned = String::with_capacity(raw.len() + 8);
-                    owned.push_str(&raw[..pos]);
-                    owned
-                });
+                let out = out.get_or_insert_with(|| owned_quoted_prefix(raw, pos));
                 if first_control_byte.is_none() {
                     first_control_byte = Some(ControlByteHit {
                         normalized_pos: out.len(),
@@ -318,28 +308,5 @@ fn arg_value_has_prev_ref(av: &ArgValue) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn many_control_bytes_retain_only_the_first_hit() {
-        let raw = "\u{0}".repeat(4096);
-        let normalized = normalize_quoted_string(&raw);
-        let hit = normalized
-            .first_control_byte
-            .expect("first control byte must be recorded");
-        assert_eq!(
-            hit.raw_pos, 0,
-            "must record the earliest hit, not a later one"
-        );
-        assert_eq!(hit.byte, 0);
-    }
-
-    #[test]
-    fn control_free_string_stays_borrowed_after_single_scan() {
-        let raw = r#""quoted key""#;
-        let normalized = normalize_quoted_string(raw);
-        assert!(matches!(normalized.text, Cow::Borrowed(_)));
-        assert!(normalized.first_control_byte.is_none());
-    }
-}
+#[path = "scan_tests.rs"]
+mod tests;

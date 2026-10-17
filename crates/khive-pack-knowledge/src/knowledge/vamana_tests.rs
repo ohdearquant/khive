@@ -1,5 +1,9 @@
 use super::*;
 
+mod runtime_measurement {
+    include!("vamana/runtime_measurement_tests.rs");
+}
+
 mod helper_reuse {
     include!("vamana/helper_reuse_tests.rs");
 }

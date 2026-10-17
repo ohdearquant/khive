@@ -12,8 +12,87 @@ use crate::types::{
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRequest, EdgeUpsertResult, GraphPath,
     GuardedBatchOutcome, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
     GuardedWriteOutcome, LinkId, NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest,
-    SeekCursor, SeekPage, SortOrder, StorageResult, TraversalRequest,
+    SeekCursor, SeekPage, SortOrder, SqlStatement, StorageResult, TraversalRequest,
 };
+
+/// One caller-labelled predicate evaluated inside a graph writer transaction.
+///
+/// The statement must be one SELECT (including WITH followed by SELECT) returning
+/// exactly one row and one column. SQLite INTEGER 1 passes and INTEGER 0 refuses;
+/// other values and result shapes refuse with a typed reason. The caller owns
+/// the predicate and its tables. This is trusted in-process SQL, not a sandbox.
+#[derive(Clone, Debug)]
+pub struct GraphStatementGuard {
+    pub label: String,
+    pub statement: SqlStatement,
+}
+
+/// SQLite value class observed in a guard's non-boolean result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphGuardValueKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+/// Predicate or result-shape refusal from one graph statement guard.
+///
+/// SQL preparation, binding and execution failures remain storage errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphStatementGuardFailureReason {
+    PredicateFalse,
+    NoRows,
+    MultipleRows,
+    ColumnCount { actual: usize },
+    NonBoolean { kind: GraphGuardValueKind },
+}
+
+impl std::fmt::Display for GraphStatementGuardFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredicateFalse => f.write_str("predicate_false"),
+            Self::NoRows => f.write_str("zero_rows"),
+            Self::MultipleRows => f.write_str("multiple_rows"),
+            Self::ColumnCount { actual } => write!(f, "column_count({actual})"),
+            Self::NonBoolean { kind } => write!(f, "non_boolean({kind:?})"),
+        }
+    }
+}
+
+/// The first refused guard, identified by its required caller label.
+///
+/// Display includes the label and reason, never the SQL text or bound values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphStatementGuardFailure {
+    pub label: String,
+    pub reason: GraphStatementGuardFailureReason,
+}
+
+impl std::fmt::Display for GraphStatementGuardFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "graph statement guard {:?} failed: {}",
+            self.label, self.reason
+        )
+    }
+}
+
+/// Transaction-observed result of a guarded, create-only graph insertion.
+///
+/// Existing rows are never replaced or resurrected. A natural-key winner takes
+/// precedence when the requested ID also collides; an unrelated ID collision
+/// without a natural-key winner remains a storage error. Only Created carries
+/// a new edge and permits its corresponding lifecycle event.
+#[derive(Clone, Debug)]
+pub enum EdgeInsertIfAbsentOutcome {
+    Created(Edge),
+    ExistingLive,
+    Tombstoned,
+    GuardFailed(GraphStatementGuardFailure),
+}
 
 /// The exact persisted cursor row observed by the reconciliation preview.
 #[derive(Clone, Debug)]
@@ -421,6 +500,29 @@ pub trait GraphStore: Send + Sync + 'static {
                     .into(),
             }),
         }
+    }
+    /// Count live edges across the given namespaces grouped by relation and,
+    /// within each relation, by the base each endpoint resolves against.
+    ///
+    /// The live edge total, the relation counts and the endpoint-base counts
+    /// describe one population, so one grouped scan answers all three:
+    /// summing each relation's buckets gives its relation count, and summing
+    /// the buckets across relations gives the endpoint-base counts. Asking for
+    /// them as three aggregates walks the edge table and its endpoint probes
+    /// three times. Backends without this aggregate report `Unsupported`, and
+    /// callers fall back to the three single-purpose counts.
+    async fn count_edges_by_relation_and_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<Vec<(EdgeRelation, EdgeEndpointBaseCounts)>> {
+        let _ = namespaces;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "count_edges_by_relation_and_endpoint_base_in_namespaces".into(),
+            message: "this backend does not implement the combined relation and endpoint-base \
+                      edge count"
+                .into(),
+        })
     }
     /// Seek-pagination page of edges ordered by `id` ascending, using an
     /// indexed range scan (`id > after`) against the `(namespace, id)`

@@ -774,7 +774,7 @@ fn fsync_dir_best_effort(dir: &Path) {
 /// scp-style `user@host:path` remotes) from git stderr before it reaches a
 /// caller-visible error — ADR-037 §157 prohibits leaking remote URLs. See
 /// `docs/api/sync.md` for the exact matched forms.
-fn redact_git_stderr(raw: &str) -> String {
+pub(crate) fn redact_git_stderr(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0;
@@ -1059,7 +1059,7 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
             )
         })?;
 
-        if !r.weight.is_finite() || !(0.0..=1.0).contains(&r.weight) {
+        if !khive_types::validate_edge_weight(r.weight) {
             bail!(
                 "edge {i} ({}): weight {} out of range; must be finite and in [0.0, 1.0]",
                 r.edge_id,

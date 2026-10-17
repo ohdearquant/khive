@@ -6,6 +6,21 @@ full algorithm spec: the allowlist layers that suppress false positives, the tri
 matching rules, and the per-function shape criteria used by the detection helpers. The in-source
 module doc-comment carries only a concise summary and points here.
 
+## Note-field scan composition
+
+`secret_gate::check_note_fields_at(content, name, properties, record)` shares the
+note-field scan used by ordinary and conditional note creation, atomic note
+batches, proposal note preparation, and code-ingest preflight. It scans content,
+then a present name, then present JSON properties through `check_at` and
+`check_json_at`, returning the first refusal with the caller's record label and
+field location. Absent optional fields are skipped; JSON null and non-string
+leaves retain the existing structured scanner's behavior.
+
+The helper implements the existing ADR-115 field checks without changing the
+credential detector or admission contract. Each caller still owns its property
+derivation, reserved-key checks, embedding-input checks, and storage operations;
+those steps keep their existing positions relative to the field scan.
+
 ## Module-level detection algorithm
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
@@ -89,8 +104,8 @@ through to explicit detection instead of being silently allowed.
   able to skip a chain that reconstructs a blocked credential — AND only when the token is not in
   credential-value syntax (see the clause-label guard below).
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
-  marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
-  one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
+  marker (`commit`, `revision`, `rev`, `sha`, `head` — immediately preceding word, or
+  `marker:value` / `marker=value` in one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
   `/commit/`, or `/commits/`), or used as the exact value of an HTML `href` is treated as a public
   VCS coordinate near a trigger word. URL and `href` forms are still refused when their immediate
   field label is credential-shaped; ordinary marker forms retain the broader clause-label guard.
@@ -99,8 +114,8 @@ through to explicit detection instead of being silently allowed.
   exempt hex value is a plain alphanumeric token, so it still participates in fragment
   reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
   the marker is accumulated and blocked from the other fragments' anchors. That symmetric-anchor
-  compensation is **guaranteed only for that topology**: the inline `marker:value` form is a
-  colon-bearing token that neighboring bridge anchors reject (fragments must be
+  compensation is **guaranteed only for that topology**: the inline `marker:value` / `marker=value` form is a
+  separator-bearing token that neighboring bridge anchors reject (fragments must be
   alphanumeric-only), and a chain probing across a bare marker word terminates at the marker. A
   split credential whose fragments are reachable only through an inline-marker token or across a
   marker word is therefore a bounded-fragment residual (see the reconstruction bounds above), not
@@ -501,7 +516,8 @@ own word (`auth header`, `auth:`) still triggers exactly as before.
 The bare substring `token` is NOT in this list because it fires on benign terms like `tokenizer`,
 `token_count`, and `next_token`. Instead the dedicated boundary-aware helpers `has_standalone_token`
 (standalone word) and `has_token_assignment` (`token=` / `token:` with word boundary before) are
-used.
+used. Assignment labels are read whole instead: a label ending in `_token` before its `:`/`=` is a
+credential label unless it names a position (see the credential token label rule below).
 
 ## is_base64_content_hash
 
@@ -533,7 +549,7 @@ For each token, in order:
    outright.
 2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests), using the line-local rule
    above for bare 40-hex values. Trigger-adjacent hex
-   requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`) to earn the
+   requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`, `head`) to earn the
    same exemption, and only when the surrounding clause carries no credential label (`api key
    value is commit <hex>` is a labeled credential wearing a marker, not a VCS citation). The
    exemption is a flag over the hex-credential-shape checks only, never an early skip of fragment
@@ -615,6 +631,23 @@ For each token, in order:
    stems such as `hmac` are not trigger words. A corpus replay that is identical across such a change
    certifies preservation on the corpus population only; the opened shape class carries its own
    before/after arms.
+   **Credential token labels** (`is_credential_token_label`): the assignment-label path treats a
+   label as a credential label when it is `token` or ends in `_token`, so `access_token: <uuid>`,
+   `{"refresh_token": "<value>"}` and `github_token=<value>` get the checks `token: <value>` gets.
+   The exception is the closed vocabulary `POSITION_TOKEN_LABELS` (`next_token`, `next_page_token`,
+   `page_token`, `pagination_token`, `continuation_token`, `resume_token`, `sync_token`, ...), whose
+   values are cursors into a paged, resumable or synced listing, and `RECEIPT_TOKEN_LABELS`
+   (`visibility_token`), whose value is a sealed receipt the server returns to its own caller: opening
+   it only narrows a scope the caller is already authorized for, so a quoted `memory.remember`
+   response passes. As with lookup keys the match is the whole label, so a qualified spelling such as
+   `stale_next_token` stays a credential label. The same predicate decides whether the label directly
+   before a value is a credential label (`has_immediate_credential_label`), so `access_token:` and
+   `github_token:` also withhold the repository-revision and LaTeX exemptions that `token:` withholds.
+   The rule fails closed: any unlisted `*_token` label is a credential label, including
+   non-secret names such as `skip_token`, `delta_token`, `idempotency_token`, `lease_token` and
+   `cancel_token`, and a `*_token` label that sits within the trigger window but labels a different
+   value still counts (`chars_per_token: 4 for profile <uuid>` is refused). A new non-credential
+   `*_token` name is added to one of the two lists, with a test.
 
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a

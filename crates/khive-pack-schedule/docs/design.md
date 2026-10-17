@@ -172,9 +172,35 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
 - `cancel` enforces a namespace check (`note.namespace != token.namespace()`)
   before modifying the event. This is the standard namespace isolation gate and
   is consistent with the pattern in other packs.
+- Cancellation uses `NoteStore::replace_note_if_unchanged` with the revision and
+  deletion marker from the validated pending note. A concurrent edit, fire,
+  cancellation or deletion refuses the write with a typed conflict; the caller
+  must read fresh state before retrying. Already non-pending notes retain their
+  existing invalid-input refusal. Cancellation advances `updated_at` strictly,
+  including when the stored timestamp is ahead of the clock; an exhausted
+  `i64::MAX` timestamp fails before any write. Other note fields and properties
+  are retained. See the proposed cancellation amendment in ADR-040.
 - Pagination in `agenda` uses `u64` offsets (not `u32`) to prevent overflow on
   very large stores. This is a defensive coding choice beyond ADR-040's spec.
 - The direct pack handler returns schedule intent only (`events` and `count`).
   `khive-mcp`, which owns the daemon tick loop, decorates successful
   `schedule.agenda` results with process-local `ticker.last_tick_at` per ADR-106
   Amendment D. The heartbeat is not pack data and is never persisted.
+
+## Per-event missed occurrences
+
+Both creation verbs accept optional `misfire_policy` and `max_lateness` under
+ADR-106 Amendment H. Omission preserves the existing `skip` behavior and stores
+no new policy fields. Explicit `skip` may be stored but cannot carry a bound.
+`catch_up_once` always requires a positive integer bound in seconds, including
+one-shots; no recurrence period supplies a default. Creation and the executor
+share `misfire::parse_misfire_policy`, including strict stored-value validation.
+
+The executor considers only the latest due occurrence within the explicit bound,
+including equality. Repeating rows retain the armed trigger as an occurrence and
+use the shared recurrence parser and original monthly anchor. Older due
+occurrences collapse into `missed_at`; they are never dispatched individually.
+An opted-in repeating row restored from an old backup can still invoke once when
+its latest occurrence is recent, so this is not a restore-wide zero-firing rule.
+The executor persists a v2 receipt distinguishing the exact source trigger from
+the selected occurrence. Legacy skip rows keep their v1 receipt behavior.

@@ -919,7 +919,7 @@ the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_V
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
 successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
 (`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
-owning pack. Its count is taken from the code: at this revision the constant holds 61 entries. A
+owning pack. Its count is taken from the code: at this revision the constant holds 62 entries. A
 test fails when this list or this count differs from the constant, so an entry added on one side
 only cannot pass unnoticed.
 
@@ -934,7 +934,7 @@ only cannot pass unnoticed.
 - git: `git.ingest_cursor`;
 - gtd: `gtd.census`, `gtd.next`, `gtd.tasks`;
 - kg: `get`, `list`, `stats`, `count`, `search`, `neighbors`, `traverse`, `context`, `query`,
-  `resolve`, `whoami`, `scan`, `verbs`, `stream.read`, `stream.stat`;
+  `resolve`, `whoami`, `schema`, `scan`, `verbs`, `stream.read`, `stream.stat`;
 - knowledge: `knowledge.get`, `knowledge.list`, `knowledge.export`, `knowledge.stats`, `knowledge.fold`,
   `knowledge.topic`;
 - moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
@@ -1183,6 +1183,7 @@ pack, a successful dispatch and the existing transient admission conditions.
 | `git.receipts`               | G`local_vocab.rs:69`  | G`local_handlers.rs:936–988`; `checked_policy:272–307`, `optional:83–89`, `validate_keys:91–99`; G`params.rs::parse:170–198`, `receipts.rs::list_owned:340–388`, `ReceiptPage::to_value:150–155`; T`policy.rs::actor_label:35–37`                                        | The existing-receipt SELECT is read-only, but the preceding `tool.check` dispatch writes a new decision receipt. **Exclude**.                                                                                      |
 | `stream.read`                | K`handler_defs.rs:39` | K`handlers/stream.rs:261–275`; `deser` alias K`handlers/common.rs:1094` to R`params.rs::deser_params:16–19`; R`streams.rs::stream_read:1436–1485`, `validate_stream:48–55`, `statement:40–46`; R`presentation.rs::micros_to_iso:595–599`                                 | Reader `query_all` WITH/SELECT snapshot; local validation, JSON parsing and rendering. No stream append or schema ensure. **Retain**.                                                                              |
 | `stream.stat`                | K`handler_defs.rs:51` | K`handlers/stream.rs:277–284`; same `deser` helper; R`streams.rs::stream_stat:1488–1497`, `validate_stream:48–55`, `statement:40–46`                                                                                                                                     | Reader `query_row` COUNT/MAX SELECT and local rendering. **Retain**.                                                                                                                                               |
+| `schema`                     | K`handler_defs.rs:19` | K`schema.rs::handle_schema:52–122`; R`pack/builder.rs::pack_names:883`, `all_entity_kinds:908`, `all_note_kinds:912`, `all_edge_rules_with_packs:921`                                                                                                                    | In-memory registry declarations sorted and rendered to JSON with a content hash; no store read, no store write, no event. **Retain**.                                                                              |
 | `tool.check`                 | T`vocab.rs:219`       | T`handlers.rs:894–909`; `req_str:55–57`, `opt_str:42–53`, `decision_for:831–892`; T`policy.rs::actor_label:35–37`, `decide_with_receipt:798–841`, `Decision::to_json:760–769`; policy chain below                                                                        | Both registered and missing-tool decision branches select `Receipt::Record`; `append_event(ToolCheckDecided).await?` at T`policy.rs:839` is required. **Exclude**.                                                 |
 | `tool.describe`              | T`vocab.rs:200`       | T`handlers.rs:765–790`; `resolve_tool:225–245`, `capabilities_of:378–396`, `full:132–140`, shared tool helpers below; T`pin.rs::RegistryPin::from_entity`; T`policy.rs::decide:846–889`                                                                                  | Registry/entity/graph reads and SELECT-based policy/grant evaluation. Calls receipt-free `decide`, not `decide_with_receipt`. **Retain**.                                                                          |
 | `tool.list`                  | T`vocab.rs:207`       | T`handlers.rs:792–820`; `registry_entities:146–163`, `summary:116–130`, shared tool helpers below; R`operations.rs::list_entities_filtered:2599–2623`                                                                                                                    | `query_entities_count_free`, validation and local summary rendering. **Retain**.                                                                                                                                   |
