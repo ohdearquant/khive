@@ -362,7 +362,11 @@ fn repeated_loads_receive_distinct_registration_generations() {
     create_file(&map);
     let entry = entry("map", &map, fixture.path());
 
-    let first = CodeMapRegistry::load(Some(maps.to_str().unwrap()), &[entry.clone()], &[]);
+    let first = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        std::slice::from_ref(&entry),
+        &[],
+    );
     let second = CodeMapRegistry::load(Some(maps.to_str().unwrap()), &[entry], &[]);
 
     assert_ne!(
