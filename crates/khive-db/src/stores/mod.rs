@@ -130,13 +130,26 @@ where
     F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
+    let trace = khive_storage::request_context::capture_search_phase_trace();
+    let _admission_phase = trace.as_ref().and_then(|trace| {
+        reader_phase(capability, ReaderPhaseKind::Admission).map(|phase| trace.enter(phase))
+    });
     let admission = pool.acquire_reader_admission(capability, operation).await?;
+    drop(_admission_phase);
+    let _blocking_phase = trace.as_ref().and_then(|trace| {
+        reader_phase(capability, ReaderPhaseKind::BlockingRead).map(|phase| trace.enter(phase))
+    });
+    let worker_trace = trace.clone();
     crate::read_cancellation::run_declared_interruptible_read(capability, operation, move |scope| {
+        let _checkout_phase = worker_trace.as_ref().and_then(|trace| {
+            reader_phase(capability, ReaderPhaseKind::Checkout).map(|phase| trace.enter(phase))
+        });
         let mut guard = pool.resolve_reader_checkout(
             capability,
             operation,
             pool.reader_with_admission(admission, || scope.should_stop()),
         )?;
+        drop(_checkout_phase);
         let result = scope.run_pooled_reader(&mut guard, read);
         if let Err(error) = &result {
             pool.record_reader_query_error(error);
@@ -144,6 +157,51 @@ where
         result
     })
     .await
+}
+
+#[derive(Clone, Copy)]
+enum ReaderPhaseKind {
+    Admission,
+    Checkout,
+    BlockingRead,
+}
+
+fn reader_phase(
+    capability: StorageCapability,
+    kind: ReaderPhaseKind,
+) -> Option<khive_storage::request_context::SearchPhase> {
+    use khive_storage::request_context::SearchPhase;
+
+    Some(match (capability, kind) {
+        (StorageCapability::Text, ReaderPhaseKind::Admission) => SearchPhase::TextReaderAdmission,
+        (StorageCapability::Text, ReaderPhaseKind::Checkout) => SearchPhase::TextReaderCheckout,
+        (StorageCapability::Text, ReaderPhaseKind::BlockingRead) => SearchPhase::TextBlockingRead,
+        (StorageCapability::Vectors, ReaderPhaseKind::Admission) => {
+            SearchPhase::VectorReaderAdmission
+        }
+        (StorageCapability::Vectors, ReaderPhaseKind::Checkout) => {
+            SearchPhase::VectorReaderCheckout
+        }
+        (StorageCapability::Vectors, ReaderPhaseKind::BlockingRead) => {
+            SearchPhase::VectorBlockingRead
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::Admission) => {
+            SearchPhase::EntityReaderAdmission
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::Checkout) => {
+            SearchPhase::EntityReaderCheckout
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::BlockingRead) => {
+            SearchPhase::EntityBlockingRead
+        }
+        (StorageCapability::Notes, ReaderPhaseKind::Admission) => SearchPhase::NoteReaderAdmission,
+        (StorageCapability::Notes, ReaderPhaseKind::Checkout) => SearchPhase::NoteReaderCheckout,
+        (StorageCapability::Notes, ReaderPhaseKind::BlockingRead) => SearchPhase::NoteBlockingRead,
+        (StorageCapability::Graph, ReaderPhaseKind::Admission) => SearchPhase::GraphReaderAdmission,
+        (StorageCapability::Graph, ReaderPhaseKind::Checkout) => SearchPhase::GraphReaderCheckout,
+        (StorageCapability::Graph, ReaderPhaseKind::BlockingRead) => SearchPhase::GraphBlockingRead,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
