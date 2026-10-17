@@ -6,6 +6,16 @@
 [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)\
 **Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`
 
+The maintainers' request of 2026-10-17, translated: "For every performance-critical
+crate I want crate-by-crate benches. Most crates had a bench setup at some point, but it
+was never kept in order: new features shipped without updating those benches, and no new
+ones were written. Benches should also use the code dependency map; recompiling the whole
+thing for every batch is too much. At our size we should have each crate's performance
+guarantees worked out, otherwise how do we track down regressions later? If we are going
+to commercialize, these matter even more." What this ADR guarantees on a pull request is
+the deterministic work and quality bound; what it guarantees before a release is the
+qualified timing promise; hosted timing on a pull request is advisory by design.
+
 ## Decision summary
 
 Each performance-critical crate owns an executable performance contract in
