@@ -131,15 +131,15 @@ impl AcceptanceTests<'_> {
     ) -> Result<(), String> {
         for item in items {
             match item {
-                Item::Fn(function) if possible_in_test(&function.attrs) => {
-                    if test_attributes(&function.attrs)
-                        .iter()
-                        .any(|attr| matches!(attribute_name(attr).as_str(), "test" | "tokio::test"))
-                    {
-                        let mut name = local_modules.clone();
-                        name.push(function.sig.ident.to_string());
-                        self.tests.insert(format!("{origin}::{}", name.join("::")));
-                    }
+                Item::Fn(function)
+                    if possible_in_test(&function.attrs)
+                        && test_attributes(&function.attrs).iter().any(|attr| {
+                            matches!(attribute_name(attr).as_str(), "test" | "tokio::test")
+                        }) =>
+                {
+                    let mut name = local_modules.clone();
+                    name.push(function.sig.ident.to_string());
+                    self.tests.insert(format!("{origin}::{}", name.join("::")));
                 }
                 Item::Mod(module) if possible_in_test(&module.attrs) => {
                     if let Some((_, items)) = &module.content {
