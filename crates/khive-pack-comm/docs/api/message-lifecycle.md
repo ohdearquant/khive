@@ -1002,7 +1002,9 @@ the reason is never invented.
 
 ## `vocab.rs::COMM_SCHEMA_PLAN_STMTS`
 
-The pack plan contains only the auxiliary `comm_channel_cursor` table. Numbered core migration
+The pack plan contains the auxiliary `comm_channel_cursor`, `comm_suppression` and
+`comm_suppression_mirror` tables; the last holds one row, the time of the last successful remote
+suppression mirror refresh that external admission reads (ADR-200 §6). Numbered core migration
 V52 installs the six comm indexes on `notes`: `idx_comm_message_direction`,
 `idx_comm_message_thread`, `idx_comm_message_to_actor`, `idx_comm_message_outbound_ref`,
 `idx_comm_message_outbound_recipient`, and `idx_comm_quarantine_expiry`. They are available

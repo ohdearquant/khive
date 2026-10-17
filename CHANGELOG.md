@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
   Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
   empty, and on any other non-empty value.
+- With `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL`, `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN` and
+  `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` set, the email outbox reads the complete set of
+  remote one-click suppressions and records every missing key in the local suppression list
+  before an external message is sent (ADR-200 section 6, Amendment 4). A failed read keeps
+  external messages pending, and external admission refuses with `suppression mirror stale`
+  once the last successful read is older than the maximum age. Each outbox cycle also reads
+  the mirror when its stamp is half the maximum age old, so an idle deployment stays fresh.
 ### Changed
 
 - Edge-weight validators use the shared `khive-types` predicate,

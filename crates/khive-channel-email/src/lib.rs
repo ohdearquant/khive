@@ -45,6 +45,7 @@ pub mod external_host;
 pub mod external_inbound;
 pub(crate) mod oauth;
 pub mod screening;
+pub mod suppression_mirror;
 pub(crate) mod unsubscribe;
 
 pub use backoff::{is_backoff_eligible, BackoffTick, ImapBackoff, ImapSingleFlight};

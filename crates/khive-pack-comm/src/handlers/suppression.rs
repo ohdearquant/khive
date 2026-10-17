@@ -457,6 +457,124 @@ pub async fn record_reply_opt_out_suppression(
     .await
 }
 
+/// Apply one successful read of the remote suppression mirror (ADR-200 §6).
+///
+/// Every key of the complete remote set that the local list does not already hold as a
+/// `one_click` entry is added as one. Nothing is removed and nothing is written back: the local
+/// list stays the one source that admission and delivery read. The refresh time is stamped only
+/// after every key is in, so a failure part way keeps the previous stamp, which can only make
+/// admission refuse sooner. A key that is not 64 lowercase hex characters refuses the whole
+/// set before anything is written. Returns the number of keys added.
+pub async fn apply_suppression_mirror_refresh(
+    runtime: &KhiveRuntime,
+    remote_as_of: &str,
+    recipient_keys: &[String],
+    created_by: &str,
+) -> Result<usize, RuntimeError> {
+    if remote_as_of.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "suppression mirror read carries no as_of time".into(),
+        ));
+    }
+    if let Some(position) = recipient_keys
+        .iter()
+        .position(|key| key.len() != 64 || !khive_types::is_lowercase_hex(key))
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "suppression mirror key at position {position} is not 64 lowercase hex characters"
+        )));
+    }
+    let remote_count = i64::try_from(recipient_keys.len()).map_err(|_| {
+        RuntimeError::InvalidInput("suppression mirror set is larger than a count can hold".into())
+    })?;
+    let sql = runtime.sql();
+    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+    ensure_suppression_schema(&mut *writer).await?;
+    let rows = writer
+        .query_all(SqlStatement {
+            sql: khive_runtime::sql!("comm_suppression_outbound_list").into(),
+            params: vec![],
+            label: Some("comm_suppression_mirror_held".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let mut held = std::collections::HashSet::new();
+    for row in &rows {
+        let record = parse_record(row, "suppression_mirror_refresh")?;
+        if record.kind == "recipient_key" && record.source == "one_click" {
+            held.insert(record.value);
+        }
+    }
+    let reason = format!("one-click unsubscribe, remote mirror as of {remote_as_of}");
+    let mut added = 0;
+    for key in recipient_keys {
+        if held.contains(key) {
+            continue;
+        }
+        let inserted = writer
+            .execute(SqlStatement {
+                sql: khive_runtime::sql!("comm_suppression_insert").into(),
+                params: vec![
+                    SqlValue::Text(Uuid::new_v4().to_string()),
+                    SqlValue::Text("outbound".to_string()),
+                    SqlValue::Text("recipient_key".to_string()),
+                    SqlValue::Text(key.clone()),
+                    SqlValue::Text("one_click".to_string()),
+                    SqlValue::Text(created_by.to_string()),
+                    SqlValue::Integer(Utc::now().timestamp_micros()),
+                    SqlValue::Text(reason.clone()),
+                ],
+                label: Some("comm_suppression_mirror_add".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+        if inserted == 1 {
+            added += 1;
+        }
+    }
+    writer
+        .execute(SqlStatement {
+            sql: khive_runtime::sql!("comm_suppression_mirror_upsert").into(),
+            params: vec![
+                SqlValue::Integer(Utc::now().timestamp_micros()),
+                SqlValue::Text(remote_as_of.to_string()),
+                SqlValue::Integer(remote_count),
+            ],
+            label: Some("comm_suppression_mirror_stamp".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    Ok(added)
+}
+
+/// The time of the last successful remote suppression mirror refresh, or `None` when none is
+/// recorded (ADR-200 §6). External admission reads this from the local store, with no network
+/// I/O.
+pub async fn suppression_mirror_last_refresh(
+    runtime: &KhiveRuntime,
+) -> Result<Option<DateTime<Utc>>, RuntimeError> {
+    let sql = runtime.sql();
+    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+    ensure_suppression_schema(&mut *writer).await?;
+    let rows = writer
+        .query_all(SqlStatement {
+            sql: khive_runtime::sql!("comm_suppression_mirror_select").into(),
+            params: vec![],
+            label: Some("comm_suppression_mirror_select".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let micros = integer_column(row, "refreshed_at", "suppression_mirror_read")?;
+    DateTime::<Utc>::from_timestamp_micros(micros)
+        .map(Some)
+        .ok_or_else(|| {
+            RuntimeError::Internal("suppression mirror refresh time is out of range".into())
+        })
+}
+
 fn validate_closed_set<'a>(
     verb: &str,
     field: &str,
@@ -516,10 +634,16 @@ fn parse_uuid(verb: &str, field: &str, value: &str) -> Result<Uuid, RuntimeError
 async fn ensure_suppression_schema(
     writer: &mut dyn khive_storage::SqlWriter,
 ) -> Result<(), RuntimeError> {
-    writer
-        .execute_script(crate::vocab::COMM_SUPPRESSION_SCHEMA_STMT.to_string())
-        .await
-        .map_err(RuntimeError::Storage)
+    for statement in [
+        crate::vocab::COMM_SUPPRESSION_SCHEMA_STMT,
+        crate::vocab::COMM_SUPPRESSION_MIRROR_SCHEMA_STMT,
+    ] {
+        writer
+            .execute_script(statement.to_string())
+            .await
+            .map_err(RuntimeError::Storage)?;
+    }
+    Ok(())
 }
 
 fn parse_record(row: &SqlRow, verb: &str) -> Result<SuppressionRecord, RuntimeError> {
