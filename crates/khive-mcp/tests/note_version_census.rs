@@ -804,10 +804,19 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         "upsert_note",
         MarkerDisposition::FixedNonMemoryKind,
     ),
+    // The atomic note create and the canonical create share one builder: an
+    // ordinary create upserts, a canonical create inserts under its staged
+    // identifier. Neither carries a key.
     (
         "khive-runtime/src/atomic_prepare/add_update.rs",
-        "prepare_add_note",
+        "prepare_add_note_record",
         "note_upsert_statement",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        "khive-runtime/src/atomic_prepare/add_update.rs",
+        "prepare_add_note_record",
+        "note_insert_if_absent_statement",
         MarkerDisposition::UnkeyedNote,
     ),
     (

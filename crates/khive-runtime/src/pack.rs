@@ -186,6 +186,7 @@ mod builder;
 pub use builder::{PackMetadataRegistry, VerbRegistryBuilder};
 
 mod catalog;
+pub(crate) use catalog::CanonicalNoteHookLookup;
 mod dispatch;
 mod graph_lint;
 mod registry_access;

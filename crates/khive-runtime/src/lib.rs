@@ -2,6 +2,9 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+mod canonical_apply;
+pub use canonical_apply::prepare_canonical_changeset;
+
 #[cfg(test)]
 mod test_process;
 

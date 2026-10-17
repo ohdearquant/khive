@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 28    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 29    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -238,7 +238,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 28 verbs
+## `kg` pack — 29 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -1043,6 +1043,20 @@ Withdraw an open proposal (proposer-only).
 ```
 request(ops="withdraw(id=\"<proposal-id>\")")
 ```
+
+### `apply_changeset` — Commissive
+
+Apply one canonical change-set atomically. The complete NDJSON delta, its schema envelope plus at
+most 2000 operations in source order, lands through one writer transaction and keeps the
+identifiers its creates and links were staged with. Each operation's captured preimage is compared
+with the live record immediately before that operation writes; the first refusal rolls back the
+whole unit and names its operation index and field. Merge operations are refused before
+preparation. Canonical properties replace the whole map. See
+[the change-set apply reference](../../crates/khive-pack-kg/docs/api/apply-changeset.md).
+
+| Param   | Type   | Required | Notes                                                                              |
+| ------- | ------ | -------- | ---------------------------------------------------------------------------------- |
+| `delta` | string | yes      | Complete NDJSON delta text including its schema envelope, at most 2000 operations. |
 
 ### `resolve` — Assertive
 

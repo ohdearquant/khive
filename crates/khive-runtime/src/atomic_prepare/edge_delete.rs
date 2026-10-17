@@ -81,9 +81,32 @@ pub(super) async fn prepare_update_edge(
         changed_fields.push("properties");
     }
 
+    prepare_update_edge_plan(
+        token,
+        id,
+        edge,
+        expected_updated_at,
+        expected_deleted_at,
+        changed_fields,
+        chrono::Utc::now().timestamp_micros(),
+    )
+}
+
+pub(crate) fn prepare_update_edge_plan(
+    token: &NamespaceToken,
+    id: Uuid,
+    mut edge: khive_storage::Edge,
+    expected_updated_at: chrono::DateTime<chrono::Utc>,
+    expected_deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    changed_fields: Vec<&'static str>,
+    now_micros: i64,
+) -> RuntimeResult<AtomicOpPlan> {
+    let namespace = edge.namespace.clone();
     let (canon_src, canon_tgt) =
         canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
-    let now = chrono::Utc::now();
+    let now = chrono::DateTime::from_timestamp_micros(now_micros).ok_or_else(|| {
+        RuntimeError::InvalidInput("invalid canonical edge write timestamp".into())
+    })?;
 
     let mut statements: Vec<PlanStatement> = Vec::new();
     let mut edge_natural_key: Option<EdgeNaturalKey> = None;
@@ -262,7 +285,6 @@ pub async fn prepare_delete(
     expected_kind: Option<AtomicDeleteKind>,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
-    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
     let hard = obj(args)?
         .get("hard")
         .and_then(|v| v.as_bool())
@@ -278,6 +300,23 @@ pub async fn prepare_delete(
     } else {
         runtime.resolve_by_id(token, id).await?
     };
+
+    prepare_delete_from_snapshot(runtime, token, args, expected_kind, resolved).await
+}
+
+pub(crate) async fn prepare_delete_from_snapshot(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    expected_kind: Option<AtomicDeleteKind>,
+    resolved: Option<Resolved>,
+) -> RuntimeResult<AtomicOpPlan> {
+    let id = require_uuid(args, "id")?;
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+    let hard = obj(args)?
+        .get("hard")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     match resolved {
         Some(Resolved::Entity(entity)) => {
@@ -528,7 +567,7 @@ pub async fn prepare_delete(
 /// `EdgeDeleted` event (edges are never FTS/vector-indexed, so unlike the
 /// entity/note branches there is no index purge here — `delete_edge` has
 /// none either).
-pub(super) async fn prepare_delete_edge(
+pub(crate) async fn prepare_delete_edge(
     token: &NamespaceToken,
     id: Uuid,
     edge: khive_storage::types::Edge,

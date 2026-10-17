@@ -291,6 +291,14 @@ that only looks atomic.
 - **`properties`.** On this route a touched `properties` field is the whole map: the op replaces
   the map, and its preimage is the whole prior map, which is what the comparison reads. Live
   `update` keeps its merge semantics.
+- **Reserved properties** ([ADR-115](ADR-115-secret-gate-content-manifest-exemption.md) §4). A
+  whole `properties` map may repeat a runtime-reserved key byte for byte or leave it out. Leaving
+  it out carries the stored value forward only while every field it vouches for is unchanged
+  (entity: name, description, tags and the map outside the reserved keys; note: content, name and
+  the map outside the reserved keys). A differing value, or a value the stored row does not carry,
+  refuses the unit. Canonical ops take no manifest exemption, so a canonical write that changes
+  exempted bytes drops the stamp, and the row must then pass the ordinary secret scans as a whole.
+  The preimage comparison reads a reserved key the captured map leaves out as not captured.
 - **`merge`.** `merge` is on ADR-099 D3's admissible list but has no full-parity plan under the
   runner yet, and the runner's admissibility check refuses it as `KnownUnimplemented`. A
   change-set containing a `merge` op is refused before preparation with that reason until merge

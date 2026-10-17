@@ -177,6 +177,13 @@ impl PackRuntime for KgPack {
         );
 
         match verb {
+            // Built and boxed outside this async body: the canonical apply future is large, and
+            // constructed here it would grow the stack frame of every dispatch, whichever verb is
+            // called.
+            "apply_changeset" => {
+                self.handle_apply_changeset_boxed(graph_token, params, registry)
+                    .await
+            }
             // Kind-discriminated: override only for entity/edge kinds.
             "create" | "list" | "search" => {
                 let tok = if kind_is_entity_or_edge {

@@ -89,12 +89,12 @@ fn list_items(response: &Value) -> &[Value] {
 
 // KG includes the schema introspection verb and the four stream verbs.
 #[test]
-fn pack_verbs_returns_twenty_eight() {
+fn pack_verbs_returns_twenty_nine() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        28,
-        "KgPack must expose exactly 28 verbs including grouped event count"
+        29,
+        "KgPack must expose exactly 29 verbs including schema and canonical change-set apply"
     );
 }
 
@@ -103,6 +103,7 @@ fn pack_verbs_names_are_correct() {
     let pack = pack();
     let names: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
     for expected in &[
+        "apply_changeset",
         "create",
         "get",
         "list",
