@@ -31,6 +31,7 @@ syn = { workspace = true }
 quote = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-kg = { version = "0.13.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
@@ -41,3 +42,15 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 same-file = "1.0.6"
+
+[[bench]]
+name = "code_ingest"
+harness = false
+
+[[bench]]
+name = "code_findings"
+harness = false
+
+[[bench]]
+name = "code_allocations"
+harness = false
