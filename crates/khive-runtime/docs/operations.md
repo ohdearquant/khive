@@ -194,3 +194,25 @@ External integration test crates enable it via `khive-runtime = { ..., features 
   table scan, then disarms. Used to prove callers that resolve an id through a prefix (e.g. the
   `get` verb's fallback chain) distinguish a storage fault from a genuine no-match instead of
   reporting both as not-found.
+
+## Guarded create-only links
+
+`KhiveRuntime::link_if_absent_with_guards(token, spec, guards)` validates the
+link's namespace, endpoints, relation and fields through the normal edge builder,
+then evaluates caller-owned statement guards and inserts on one writer
+transaction. `resurrect=true` is rejected because this API never changes an
+existing edge. Registry hook dispatch remains the caller's responsibility, as
+with other direct runtime link helpers.
+
+The result is `EdgeInsertIfAbsentOutcome`: `Created(edge)`, `ExistingLive`,
+`Tombstoned`, or `GuardFailed(failure)`. Only `Created` emits `LinkCreated`, using
+the actual endpoint kinds and the token's event attribution. Other outcomes
+leave edge and event state unchanged. Guard failures carry a caller label and
+a typed predicate/result-shape reason; SQL driver failures remain errors.
+See the [graph composition contract](../../khive-db/docs/api/graph.md#caller-supplied-statement-guards-and-create-only-insertion)
+for ordered guard evaluation and exact boolean-result requirements.
+
+`link_many_guarded_observed` evaluates supplied guards even for an empty
+batch. Its existing tuple-returning API reports a guard refusal as a storage
+conflict containing the label and reason. Existing callers with no statement
+guards retain their prior behavior.

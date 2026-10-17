@@ -403,7 +403,7 @@ async fn record_serve_routes_through_writer_task_when_flag_enabled() {
 
 #[test]
 fn serve_ledger_sql_err_message_is_prefixed_context_and_error() {
-    match sql_err("insert", "boom") {
+    match sql_err("serve ledger insert", "boom") {
         RuntimeError::Internal(message) => {
             assert_eq!(message, "serve ledger insert: boom");
         }

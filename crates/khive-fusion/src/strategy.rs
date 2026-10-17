@@ -186,10 +186,19 @@ impl FusionStrategy {
     /// non-finite or not strictly positive. Source-count validation happens when the strategy is
     /// fused because a strategy does not carry its source lists.
     pub fn try_weighted_rrf(k: usize, weights: Vec<f64>) -> Result<Self, FusionStrategyError> {
+        Self::validate_weighted_rrf(k, &weights)?;
+        Ok(Self::WeightedRrf { k, weights })
+    }
+
+    /// Validates weighted RRF parameters without taking ownership of the weights.
+    pub(crate) fn validate_weighted_rrf(
+        k: usize,
+        weights: &[f64],
+    ) -> Result<(), FusionStrategyError> {
         if k == 0 {
             return Err(FusionStrategyError::RrfKZero);
         }
-        for weight in &weights {
+        for weight in weights {
             if weight.is_nan() {
                 return Err(FusionStrategyError::WeightNaN);
             }
@@ -200,7 +209,7 @@ impl FusionStrategy {
                 return Err(FusionStrategyError::WeightNotPositive);
             }
         }
-        Ok(Self::WeightedRrf { k, weights })
+        Ok(())
     }
 
     /// Create weighted reciprocal rank fusion. Panics on zero `k` or invalid weights.

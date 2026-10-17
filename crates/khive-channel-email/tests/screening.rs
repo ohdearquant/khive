@@ -101,13 +101,18 @@ fn f1_f2_f3_f5_deliver_without_withholding() {
     }
 }
 
-/// F4 delivers and does not set opt_out: its phrase is outside the list.
+/// F4 delivers with opt_out set: its ask for no more email sits on the second
+/// wrapped line of the first paragraph, inside the window of Amendment 2.
 #[test]
-fn f4_delivers_without_opt_out() {
+fn f4_delivers_with_opt_out() {
     let result = outcome(&input(F4_SUBJECT, F4));
     assert_eq!(result.disposition, Disposition::DeliverMarked);
-    assert!(!result.opt_out, "F4 must not set opt_out");
-    assert!(!result.families.contains(&Family::OptOut));
+    assert!(
+        result.opt_out,
+        "F4 must set opt_out; matched {:?}",
+        result.rule_ids
+    );
+    assert_eq!(result.families, vec![Family::OptOut]);
 }
 
 /// F6 quarantines with at least agent_addressed and action_request.
@@ -144,7 +149,7 @@ fn per_family_catch_counts_over_f1_f6() {
     assert_eq!(get("action_request"), 1);
     assert_eq!(get("executable_attachment"), 0);
     assert_eq!(get("html_only"), 0);
-    assert_eq!(get("opt_out"), 0);
+    assert_eq!(get("opt_out"), 1);
 }
 
 // ---------------------------------------------------------------------------

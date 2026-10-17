@@ -335,6 +335,11 @@ The `fix` callback receives the same `ValidationContext` and the violations emit
 
 ### 8. Rule evaluation order
 
+**Proposed follow-up**: [ADR-202](ADR-202-read-only-pack-validation.md) specifies a
+read-only compiled-pack runner and its captured corpus. It also proposes policy-selection
+amendments to §1/§4. Until that proposal is accepted, the order and deferred runner below
+remain the accepted contract.
+
 The validation pipeline runs in a defined sequence:
 
 1. **ADR-020 structural checks**: seven unconditional checks run first, with six at error severity
@@ -371,6 +376,9 @@ prefix) are reserved for the `khive-runtime` validation infrastructure.
 `entity_count` and `edge_count` in v1. A follow-up ADR must wire the runtime rule
 collection into the CLI validation pass and extend `GraphSnapshot` before pack-provided
 rules run during `kkernel kg validate` invocations.
+
+[ADR-202](ADR-202-read-only-pack-validation.md) is the Proposed follow-up for that
+read-only integration. It does not activate the runner or the auto-fix write path.
 
 ### 10. `rules.toml` loading and unsupported YAML
 

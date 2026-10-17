@@ -204,11 +204,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
         let objective = self.get(name)?;
-        objective
-            .select(candidates, context)
-            .into_iter()
-            .next()
-            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
+        objective.select(candidates, context)
     }
 
     /// Select the best candidate using the current default objective.
@@ -220,11 +216,7 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
         let objective = self.get_default()?;
-        objective
-            .select(candidates, context)
-            .into_iter()
-            .next()
-            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
+        objective.select(candidates, context)
     }
 }
 

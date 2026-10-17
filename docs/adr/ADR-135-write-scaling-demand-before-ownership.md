@@ -254,3 +254,11 @@ F7's current-versus-disabled comparison from the production topology matrix. An 
 may still issue a raw pragma to construct a historical control, but neither `PoolConfig` nor an
 environment variable selects the posture in a shipped connection constructor — only the ownership
 claim does.
+
+## Proposed clarification (2026-10-14): best-effort comm mark result details
+
+Status: **PROPOSED**. This clarification requires owner architecture acceptance before the dependent response-shape change merges. The existing Accepted F6 decision and the ADR's Accepted status are unchanged.
+
+For an error while marking a message read, the existing best-effort result gains an additive wire field, `mark_error_details`, produced by the shared runtime error serializer. This applies to single `comm.read`, each bulk `comm.read` result, and each best-effort `comm.mark_read` result. Its object preserves available typed `code`/`stage` and native `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` metadata. Those fields are optional by error; not every error has a stage or native codes. Stages without native evidence do not synthesize native result codes. The serializer retains terminal writer-outcome precedence over attached SQLite-stage evidence.
+
+The object's `domain_disposition` describes the mark operation. A failed mark is `not_committed` unless writer-request or native settlement evidence leaves its outcome unknown; unknown evidence remains `unknown`. The compatibility `mark_error` text and `status`, `read`, `properties` and body-exposure behavior do not change, including when the compatibility status is `failed` while the richer settlement evidence is unknown. Successful marks and the no-live-row `Ok(false)` outcome omit `mark_error_details`. Validation errors, atomic mark-read refusals, aggregate statuses, admission order and retry behavior are unchanged.

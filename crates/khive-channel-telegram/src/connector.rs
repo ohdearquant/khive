@@ -105,6 +105,28 @@ fn telegram_api_error<T>(
     }
 }
 
+/// Read a Bot API response and classify failed HTTP statuses before typed success parsing.
+async fn telegram_response_body(
+    method: &str,
+    resp: reqwest::Response,
+) -> Result<(reqwest::StatusCode, String), ChannelError> {
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        ChannelError::Transport(format!(
+            "{method}: failed to read response body: {}",
+            e.without_url()
+        ))
+    })?;
+
+    if !status.is_success() {
+        let parsed: Option<TelegramApiResponse<serde_json::Value>> =
+            serde_json::from_str(&body).ok();
+        return Err(telegram_api_error(method, status, parsed.as_ref()));
+    }
+
+    Ok((status, body))
+}
+
 /// Injectable seam for the two Bot API methods this adapter uses.
 #[async_trait]
 pub(crate) trait TelegramConnector: Send + Sync {
@@ -198,19 +220,7 @@ impl TelegramConnector for LiveTelegramConnector {
                 ChannelError::Transport(format!("sendMessage request failed: {}", e.without_url()))
             })?;
 
-        let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ChannelError::Transport(format!(
-                "sendMessage: failed to read response body: {}",
-                e.without_url()
-            ))
-        })?;
-
-        if !status.is_success() {
-            let parsed: Option<TelegramApiResponse<serde_json::Value>> =
-                serde_json::from_str(&body).ok();
-            return Err(telegram_api_error("sendMessage", status, parsed.as_ref()));
-        }
+        let (status, body) = telegram_response_body("sendMessage", resp).await?;
 
         let parsed: TelegramApiResponse<serde_json::Value> =
             serde_json::from_str(&body).map_err(|e| {
@@ -239,19 +249,7 @@ impl TelegramConnector for LiveTelegramConnector {
                 ChannelError::Transport(format!("getUpdates request failed: {}", e.without_url()))
             })?;
 
-        let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ChannelError::Transport(format!(
-                "getUpdates: failed to read response body: {}",
-                e.without_url()
-            ))
-        })?;
-
-        if !status.is_success() {
-            let parsed: Option<TelegramApiResponse<serde_json::Value>> =
-                serde_json::from_str(&body).ok();
-            return Err(telegram_api_error("getUpdates", status, parsed.as_ref()));
-        }
+        let (status, body) = telegram_response_body("getUpdates", resp).await?;
 
         let parsed: TelegramApiResponse<Vec<TelegramUpdate>> = serde_json::from_str(&body)
             .map_err(|e| ChannelError::Transport(format!("getUpdates: malformed response: {e}")))?;

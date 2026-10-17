@@ -13,9 +13,17 @@ use crate::external_inbound::ThreadOwner;
 /// store and the boot-resolved outbound policy.
 #[async_trait]
 pub trait ExternalEmailHost: Send + Sync {
-    /// Whether external senders are configured. With none, the channel reads no inbound
-    /// suppression list and every non-maintainer sender stays off the allowlist.
+    /// Whether external senders are configured.
     fn external_senders_configured(&self) -> bool;
+
+    /// Whether authenticated non-maintainer mail is admitted as external inbound (ADR-200 section
+    /// 7 step 5). While it is not, the channel reads no inbound suppression list and every
+    /// non-maintainer sender stays off the allowlist. Configured external senders always enable
+    /// it; a host can also enable it alone, so external mail is received while outbound external
+    /// sending stays disabled.
+    fn external_inbound_enabled(&self) -> bool {
+        self.external_senders_configured()
+    }
 
     /// The recipient key a mailto unsubscribe token verifies to, or `None` when it does not verify.
     fn verify_unsubscribe_token(&self, token: &str) -> Option<String>;

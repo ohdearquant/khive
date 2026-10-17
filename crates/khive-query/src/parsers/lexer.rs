@@ -99,16 +99,17 @@ impl Cursor {
         Ok(self.input[start..self.pos].iter().collect())
     }
 
+    /// Advance over ASCII digits without consuming whitespace or other characters.
+    pub(super) fn skip_ascii_digits(&mut self) {
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.advance();
+        }
+    }
+
     pub(super) fn parse_number(&mut self) -> Result<usize, QueryError> {
         self.skip_whitespace();
         let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
+        self.skip_ascii_digits();
         if self.pos == start {
             return Err(self.err("expected number"));
         }

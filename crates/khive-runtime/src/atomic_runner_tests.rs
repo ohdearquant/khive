@@ -214,6 +214,7 @@ fn link_plan(edge_id: Uuid, source: Uuid, target: Uuid) -> AtomicOpPlan {
                 guard: Some(AffectedRowGuard::exactly(1)),
             }],
             disposition: khive_storage::EdgeUpsertDisposition::Created,
+            dependency_kind_inference_hint: None,
         })
 }
 

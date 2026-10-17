@@ -40,7 +40,6 @@ const RECLAIM: &str = "khive-mcp/src/pending_events/reclaim.rs";
 const RECEIPTS: &str = "khive-mcp/src/pending_events/receipt.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
-const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
 const CURATION: &str = "khive-runtime/src/curation/merge_sql.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
 const OPERATIONS: &str = "khive-runtime/src/operations.rs";
@@ -1029,7 +1028,6 @@ fn census() -> BTreeMap<(String, String), String> {
         (RECLAIM, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
-        (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
         (OPERATIONS, "restore_note"),
@@ -1187,12 +1185,6 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"archived"}"#,
         ),
-        (
-            SCHEDULE,
-            "cancel_pending_event",
-            "scheduled_event",
-            r#"{"status":"pending"}"#,
-        ),
         (CURATION, "merge_note_sql", "memory", "{}"),
         (CREATE, "prepare_note_create", "memory", "{}"),
         (OPERATIONS, "restore_note", "memory", "{}"),
@@ -1288,10 +1280,6 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     "done",
                     r#"{"originals":{}}"#,
                 ],
-            ),
-            SCHEDULE => conn.execute(
-                sql,
-                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
             ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),

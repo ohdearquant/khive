@@ -7,8 +7,11 @@
 
 //! Hybrid search and ranking with deterministic scoring for khive.
 //!
-//! Combines HNSW vector search, BM25 keyword search, and RRF fusion into a unified
-//! retrieval layer. All scores use `DeterministicScore` for cross-platform consistency.
+//! Combines vector search and keyword search behind composable traits, with rank fusion
+//! (RRF by default), into a unified retrieval layer, and holds the checkpoint helpers that
+//! the memory and knowledge packs share for their khive-vamana ANN indexes. The optional
+//! `hnsw` and `bm25` features re-export those standalone index crates.
+//! All scores use `DeterministicScore` for cross-platform consistency.
 //! See `docs/architecture.md` for module layout, design principles, ID bridging
 //! strategies, and trait composition guide.
 

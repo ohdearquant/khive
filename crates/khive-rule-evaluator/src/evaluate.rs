@@ -39,18 +39,19 @@ pub fn record_prefix(entity_id: Option<&str>, entity_name: Option<&str>) -> Stri
     }
 }
 
+fn parsed_ndjson_values(content: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+}
+
 /// Collect all IDs from in-memory NDJSON into a set; malformed rows are skipped.
 ///
 /// Reads the `"id"` field — suitable for entities.ndjson and notes.ndjson.
 pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-        })
+    parsed_ndjson_values(content)
+        .filter_map(|v| v.get("id")?.as_str().map(str::to_string))
         .collect()
 }
 
@@ -61,11 +62,8 @@ pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
 /// referential-integrity check accepts `annotates` targets that point at edges
 /// in either serialization form.
 pub fn collect_edge_ids(content: &str) -> std::collections::HashSet<String> {
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+    parsed_ndjson_values(content)
+        .filter_map(|v| {
             // Prefer the canonical `edge_id` field; fall back to `id`.
             v.get("edge_id")
                 .or_else(|| v.get("id"))
