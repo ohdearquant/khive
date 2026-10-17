@@ -1,11 +1,16 @@
 # khive-db Benchmarks
 
 Performance benchmarks for the khive-db storage layer, covering FTS5 text
-search, sqlite-vec vector operations, and backend creation overhead.
+search, sqlite-vec vector operations, backend creation overhead, typed stores,
+and pooled reader acquisition. See the [scenario and measurement guide](../benchmarks.md)
+for the new workloads and their timing boundaries.
 
 ## Suite
 
-Defined in `benches/db_hot_path.rs`. Three benchmark groups:
+The historical groups below are defined in `benches/db_hot_path.rs`.
+`benches/db_concurrency.rs` adds `concurrent_fts_reads/{1,4,8}` and
+`write_under_read_load/{0,4}`. New targets `db_stores` and `db_pool` are listed
+in the [scenario guide](../benchmarks.md#scenarios). Existing workload code is unchanged.
 
 ### `fts_benches` — FTS5 text search
 
@@ -50,7 +55,26 @@ cargo bench -p khive-db --features vectors -- storage_backend
 
 ## Release Ledger
 
-### v0.2.8 - 2026-06-08
+### Current-main rebaseline — pending
+
+The source base for this benchmark addition is
+`d3619dec9e32045f273c61b5a7b2eb70fe6463a3`; this is provenance, not a measured
+baseline. Measurement commit, toolchain, machine/OS and results are **pending**.
+The owner records these after running on the measurement machine. No old
+number is relabeled as a result for the current main revision.
+
+| Target/group                                                                                                         | Coverage                                                            | Current baseline |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ---------------- |
+| `db_hot_path`: `fts5_search`, `fts5_search_unranked`, `fts5_rank_within_cap`, `fts5_term_stats`, `fts5_upsert_batch` | Existing FTS workloads, all sizes                                   | pending          |
+| `db_hot_path`: `sqlite_vec_search`, `sqlite_vec_insert_batch`                                                        | Existing 10K × 384-dim workloads, all sizes                         | pending          |
+| `db_hot_path`: `storage_backend_creation`                                                                            | Existing memory/file workloads                                      | pending          |
+| `db_concurrency`: `concurrent_fts_reads/{1,4,8}`                                                                     | 10K documents; 8 searches/task; wave wall-time                      | pending          |
+| `db_concurrency`: `write_under_read_load/{0,4}`                                                                      | One document upsert with 0/4 concurrent readers                     | pending          |
+| `db_stores`: `entity_upsert_batch`, `entity_page`, `edge_upsert_batch`, `edge_neighbors`, `edge_traverse`            | All generated sizes in the scenario guide                           | pending          |
+| `db_stores`: `note_upsert_batch`, `note_filtered_query`, `event_append_batch`, `event_page`                          | All generated sizes in the scenario guide                           | pending          |
+| `db_pool`: `pooled_reader_checkout_window`, `pooled_reader_checkout_p99`                                             | 1/4/8/16 threads; separate wave wall-time and empirical acquire p99 | pending          |
+
+### Historical: v0.2.8 - 2026-06-08
 
 - Commit: `d3629501c550fd2f3bb7ed350a2b60309d596465`
 - Crate version: `0.2.8`
@@ -114,9 +138,27 @@ cargo bench -p khive-db --features vectors -- storage_backend
 
 ## Regression policy
 
-- Any hot-path benchmark regressing >5% vs baseline requires investigation before merge.
-- Run `cargo bench -p khive-db --features vectors` in CI or locally before
-  performance-sensitive PRs.
-- Update the baseline table after hardware changes or significant optimizations.
+Timing results are advisory trends against rolling and fixed references, not a
+fixed-percentage merge gate. Compare matching toolchain, hardware, flags and
+fixture protocols; investigate changes with that context. Keep historical rows
+and add a named measurement entry after hardware or workload changes.
+Workflow wiring and proposed guarantee-schema changes are outside this addition.
 
-Last reviewed: v0.2.8 (2026-06-08)
+## Performance guarantees
+
+| Operation               | Input                       | Metric         | Bound                                                                     |
+| ----------------------- | --------------------------- | -------------- | ------------------------------------------------------------------------- |
+| FTS5 AnyTerm search     | 10K docs, 3 terms, top_k=20 | latency median | Advisory trend; last ledger value 14.87 ms (`docs/api/benchmarks.md:71`)  |
+| FTS5 batch upsert       | 100 docs                    | latency median | Advisory trend; last ledger value 7.19 ms (`docs/api/benchmarks.md:86`)   |
+| sqlite-vec KNN search   | 10K × 384-dim, top_k=100    | latency median | Advisory trend; last ledger value 10.60 ms (`docs/api/benchmarks.md:96`)  |
+| sqlite-vec batch insert | 1000 records × 384-dim      | latency median | Advisory trend; last ledger value 27.24 ms (`docs/api/benchmarks.md:104`) |
+| Entity batch upsert     | 1000 entities               | latency median | Advisory trend against the recorded baseline                              |
+| Edge neighbors          | 10K edges, depth=2          | latency median | Advisory trend against the recorded baseline                              |
+| Concurrent FTS reads    | 8 tasks × 8 searches        | wall-time      | Advisory trend against the recorded baseline                              |
+
+These rows copy issue #5644. The neighbor depth=2 premise belongs to
+`GraphStore::traverse`; the public neighbor call is one-hop. See the
+[measurement guide](../benchmarks.md) for that distinction and the empirical
+p99 definition. All baseline values added for current main remain pending.
+
+Historical ledger last measured: v0.2.8 (2026-06-08).
