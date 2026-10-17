@@ -11,6 +11,17 @@ use super::common::{
 };
 use crate::KgPack;
 
+// Keep the default bulk response bounded while verbose callers retain the
+// original caller-indexed explanations.
+fn add_bulk_inference_hints(response: &mut Value, hints: Vec<Value>, verbose: bool) {
+    if !hints.is_empty() {
+        response["inferred_count"] = json!(hints.len());
+        if verbose {
+            response["hints"] = Value::Array(hints);
+        }
+    }
+}
+
 impl KgPack {
     pub(crate) async fn handle_link(
         &self,
@@ -151,9 +162,7 @@ impl KgPack {
                     "skipped": skipped,
                     "failed": 0,
                 });
-                if !hints.is_empty() {
-                    resp["hints"] = Value::Array(hints);
-                }
+                add_bulk_inference_hints(&mut resp, hints, verbose);
                 if verbose {
                     resp["edges"] = Value::Array(
                         rows.iter()
@@ -334,9 +343,7 @@ impl KgPack {
                     "failed": error_list.len(),
                     "errors": error_list,
                 });
-                if !hints.is_empty() {
-                    resp["hints"] = Value::Array(hints);
-                }
+                add_bulk_inference_hints(&mut resp, hints, verbose);
                 if verbose {
                     resp["edges"] = serde_json::Value::Array(results);
                 }
