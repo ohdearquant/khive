@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   external messages pending, and external admission refuses with `suppression mirror stale`
   once the last successful read is older than the maximum age. Each outbox cycle also reads
   the mirror when its stamp is half the maximum age old, so an idle deployment stays fresh.
+- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
+  host composition register providers before binding ordered peers and their declared
+  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
+  runtimes keep no configured default while explicit manual named access remains available.
+
 ### Changed
 
 - Edge-weight validators use the shared `khive-types` predicate,
