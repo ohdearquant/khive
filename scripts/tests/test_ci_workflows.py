@@ -895,7 +895,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
         self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
         push = indented_block(on, "push", 2)
-        self.assertNotIn("branches", push, "a push to a branch must not record a trend point")
+        # The one branch push is a merge train's integration branch, which runs the train's dependents
+        # closure and records no trend point (ADR-206 Amendment 1); a push to main never runs it.
+        self.assertEqual(re.findall(r"(?m)^    branches: (.+)$", push), ['["integration/train-*"]'])
         self.assertIn('tags: ["v*"]', push)
 
     def test_publish_failure_is_advisory_and_records_incident(self):
@@ -1051,7 +1053,7 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions), "failure must follow both publication steps")
         self.assertIn("id: criterion", step(criterion_name))
         for name in (record_name, final_name):
-            self.assertIn("if: ${{ !cancelled() }}", step(name))
+            self.assertIn("if: ${{ !cancelled() && steps.select.outputs.empty != 'true' }}", step(name))
             self.assertIn("COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}", step(name))
             self.assertIn("CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}", step(name))
         self.assertIn("if: always()", step(artifact_name))
@@ -1177,6 +1179,146 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(len(quick_commands), 1)
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
+
+    SELECT_NAME = "Select the component's crates that have a bench target"
+
+    def component_step(self, name):
+        # Up to the next step of any shape: the select step is followed by a `uses:` step, not a named one.
+        return workflow_text("bench-component.yml").split(f"      - name: {name}\n", 1)[1].split("\n      - ", 1)[0] + "\n"
+
+    def test_component_runs_only_crates_that_have_a_bench_target(self):
+        # A component may name a crate before its first benchmark lands. The select step reads cargo metadata and
+        # passes compile and Criterion only the crates with a bench target; a name outside the workspace fails it.
+        workflow = workflow_text("bench-component.yml")
+        select = self.component_step(self.SELECT_NAME)
+        self.assertIn("id: select", select)
+        self.assertIn("COMPONENT_CRATES: ${{ inputs.crates }}", select)
+        self.assertEqual(workflow.count("inputs.crates"), 1, "only the select step reads the declared crate list")
+        for name in ("Compile-check this component's bench targets",
+                     "Run Criterion benches (quick profile, bounded to 10 minutes)"):
+            self.assertIn("COMPONENT_CRATES: ${{ steps.select.outputs.crates }}", self.component_step(name))
+        order = [workflow.index(marker) for marker in (
+            f"      - name: {self.SELECT_NAME}\n", "      - uses: Swatinem/rust-cache@v2\n",
+            "      - name: Compile-check this component's bench targets\n")]
+        self.assertEqual(order, sorted(order), "select runs before the cache restore and the compile")
+        script = textwrap.dedent(select.split("        run: |\n", 1)[1])
+        packages = {"khive-alpha": ["lib", "bench"], "khive-beta": ["lib", "test"], "khive-gamma": ["bench", "lib"],
+                    "khive-delta": ["lib"]}
+        metadata = {"packages": [{"name": name, "targets": [{"kind": [kind]} for kind in kinds]}
+                                 for name, kinds in packages.items()]}
+
+        def run(source, crates):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                (root / "crates").mkdir()
+                bins = root / "bin"
+                bins.mkdir()
+                (root / "metadata.json").write_text(json.dumps(metadata))
+                for tool, text in {"cargo": '#!/bin/sh\ncat "$FAKE_METADATA"\n',
+                                   "python3": f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'}.items():
+                    (bins / tool).write_text(text)
+                    (bins / tool).chmod(0o755)
+                output = root / "output"
+                output.write_text("")
+                result = subprocess.run(
+                    ["bash", "-c", source], cwd=root / "crates", capture_output=True, text=True, timeout=10, check=False,
+                    env={**os.environ, "PATH": f"{bins}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                         "FAKE_METADATA": str(root / "metadata.json"), "COMPONENT": "fixture-component",
+                         "COMPONENT_CRATES": crates})
+                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                log = root / "component-phases.log"
+                return result, values, log.read_text() if log.exists() else ""
+
+        result, values, log = run(script, "khive-alpha khive-beta khive-gamma")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values, {"crates": "khive-alpha khive-gamma", "empty": "false"})
+        self.assertIn("phase=select selected=khive-alpha,khive-gamma left_out=khive-beta", log)
+        self.assertNotIn("::notice::", result.stdout)
+
+        result, values, log = run(script, "khive-beta khive-delta")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values, {"crates": "", "empty": "true"})
+        self.assertIn("::notice::component fixture-component has no crate with a bench target", result.stdout)
+        self.assertIn("no ledger record", result.stdout)
+
+        # A name outside the workspace, or no name at all, fails the step and writes no `empty` output, so the
+        # record, report and page steps run as for a compile failure.
+        for crates in ("khive-alpha khive-omega", ""):
+            with self.subTest(crates=crates):
+                result, values, _ = run(script, crates)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("empty", values)
+                self.assertIn("::error::", result.stdout)
+        self.assertIn("khive-omega", run(script, "khive-alpha khive-omega")[0].stdout)
+
+        # Must-fail arm: a selector that keeps every named crate hands khive-beta, which has no bench target, to
+        # compile and Criterion, and this fixture tells the two apart.
+        keep_all = script.replace('if "bench" in kinds[c]', "if True")
+        self.assertNotEqual(keep_all, script)
+        self.assertNotEqual(run(keep_all, "khive-alpha khive-beta khive-gamma")[1]["crates"], "khive-alpha khive-gamma")
+
+    def test_an_empty_component_records_and_pages_nothing(self):
+        # Evaluates each step's `if:` as GitHub does: an expression with no status function is ANDed with success(),
+        # and an output of a skipped or failed step reads as the empty string.
+        workflow = workflow_text("bench-component.yml")
+
+        def condition(block):
+            found = re.findall(r"(?m)^        if: (.+)$", block)
+            self.assertEqual(len(found), 1, block)
+            return found[0]
+
+        cache = workflow.split("      - uses: Swatinem/rust-cache@v2\n", 1)[1].split("      - ", 1)[0]
+        conditions = {
+            "cache": condition(cache),
+            "compile": condition(self.component_step("Compile-check this component's bench targets")),
+            "record": condition(self.component_step("Record component trend ledger entry")),
+            "publish": condition(self.component_step("Publish ledger to perf-data branch")),
+            "page": condition(self.component_step("Warn if trend ledger record errored (advisory, never fails)")),
+            "report": condition(self.component_step("Report benchmark failures after publication")),
+        }
+
+        def evaluate(expression, select_ok, empty, record_exit):
+            expression = expression.strip()
+            if expression.startswith("${{"):
+                expression = expression.removeprefix("${{").removesuffix("}}").strip()
+            implicit = not re.search(r"\b(?:cancelled|always|success|failure)\(\)", expression)
+            for name, local in {
+                "!cancelled()": "True",
+                "steps.select.outputs.empty": "empty",
+                "steps.record.outputs.exit_code": "record_exit",
+                "github.event_name": "event_name",
+                "github.ref": "ref",
+                "startsWith(": "starts_with(",
+                "&&": " and ",
+                "||": " or ",
+            }.items():
+                expression = expression.replace(name, local)
+            self.assertNotRegex(expression, r"github\.|steps\.|!(?!=)", "an unmapped name or operator is left")
+            scope = {"empty": empty, "record_exit": record_exit, "event_name": "push", "ref": "refs/heads/main",
+                     "starts_with": lambda value, prefix: value.lower().startswith(prefix.lower())}
+            value = eval(expression, {"__builtins__": {}}, scope)
+            return bool(value) and (select_ok or not implicit)
+
+        # (select step succeeded, its `empty` output, the record step's exit code output) -> steps that run.
+        cases = {
+            (True, "true", ""): set(),
+            (True, "false", "0"): {"cache", "compile", "record", "publish", "report"},
+            (True, "false", "1"): {"cache", "compile", "record", "publish", "page", "report"},
+            (False, "", "1"): {"record", "publish", "page", "report"},
+        }
+        for (select_ok, empty, record_exit), expected in cases.items():
+            with self.subTest(select_ok=select_ok, empty=empty, record_exit=record_exit):
+                ran = {name for name, expression in conditions.items()
+                       if evaluate(expression, select_ok, empty, record_exit)}
+                self.assertEqual(ran, expected)
+
+        # Must-fail arm: without the select guard the record step runs for an empty component and its error record
+        # pages the tracking issue, which is what the guard exists to prevent.
+        unguarded = {name: expression.replace(" && steps.select.outputs.empty != 'true'", "")
+                     for name, expression in conditions.items() if name in ("record", "page")}
+        self.assertNotEqual(unguarded, {name: conditions[name] for name in unguarded})
+        self.assertTrue(evaluate(unguarded["record"], True, "true", ""))
+        self.assertTrue(evaluate(unguarded["page"], True, "true", ""))
 
 
 class FilteredCargoTestWorkflowTests(unittest.TestCase):
@@ -3254,6 +3396,133 @@ esac
         self.assertEqual(scope, "full", log)
 
 
+class BenchTrainScopeTests(ScopeFixture):
+    """bench-track.yml on a merge train's push: the train's closure, mapped to the components."""
+
+    COMPONENTS = ("scoring_retrieval", "ann_query", "storage_brain", "packs", "runtime_mcp", "gate_channel_code")
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {"gh": ScopeStepTests.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
+        if shutil.which("timeout") is None:
+            tools["timeout"] = '#!/bin/bash\nshift\nexec "$@"\n'
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.runner_temp = self.root / "runner-temp"
+        self.runner_temp.mkdir()
+        self.gh_log = self.root / "gh.log"
+
+    def step(self, name):
+        job = indented_block(indented_block(workflow_text("bench-track.yml"), "jobs", 0), "changes", 2)
+        step = job.split(f"- name: {name}\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        return textwrap.dedent(match.group(1))
+
+    def run_script(self, script, env, cwd):
+        output = self.root / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-c", script], cwd=cwd, text=True, capture_output=True, timeout=60, check=False,
+            env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output), **env},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        return values, completed.stdout + completed.stderr
+
+    def scope(self, head, main_ref="main", runs="201 202", artifact_runs="202"):
+        values, log = self.run_script(self.step("Scope the train"), {
+            "RUNNER_TEMP": str(self.runner_temp), "HEAD_SHA": head, "MAIN_REF": main_ref, "REPOSITORY": "o/r",
+            "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs, "GH_ARTIFACT_RUNS": artifact_runs,
+            "FAKE_DIR": str(self.fake)}, self.repo)
+        self.assertEqual(list(values), ["test_scope"], log)
+        return values["test_scope"], log
+
+    def components(self, train_scope):
+        values, log = self.run_script(self.step("Map changed paths to components"), {
+            "EVENT_NAME": "push", "BASE_SHA": "", "HEAD_SHA": "", "TRAIN_SCOPE": train_scope}, self.root)
+        self.assertEqual(values.pop("selective"), "true", log)
+        return {name for name in self.COMPONENTS if values[name] == "true"}
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def test_a_train_is_scoped_over_its_range_from_the_merge_base_with_main(self):
+        scope, log = self.scope(self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "j k", log)
+        self.assertIn(f"train range: {self.base}..", log)
+        self.assertIn("kkernel from main push run 202", log)
+
+    def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
+        scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+        self.assertEqual(self.components(scope), set(self.COMPONENTS))
+
+    def test_every_failure_selects_every_component(self):
+        head = self.change("crates/k/src/lib.rs")
+        for main_ref, runs, artifact_runs in (("no-such-ref", "201 202", "202"), ("main", "", "202"),
+                                              ("main", "201", "202")):
+            with self.subTest(main_ref=main_ref, runs=runs):
+                scope, log = self.scope(head, main_ref=main_ref, runs=runs, artifact_runs=artifact_runs)
+                self.assertEqual(scope, "full", log)
+        self.assertEqual(self.components(""), set(self.COMPONENTS))
+
+    def test_the_closure_maps_to_the_components_that_hold_its_crates(self):
+        self.assertEqual(self.components("khive-score khive-db khive-runtime"),
+                         {"scoring_retrieval", "storage_brain", "runtime_mcp"})
+        self.assertEqual(self.components("khive-pack-kg"), {"packs"})
+        self.assertEqual(self.components("khive-runtime kkernel"), {"runtime_mcp"})
+        self.assertEqual(self.components("khive-channel khive-pack-code"), {"gate_channel_code"})
+        self.assertEqual(self.components("khive-changeset khive-wire-protocol"), {"gate_channel_code"})
+        self.assertEqual(self.components("khive-types khive-storage"), set())
+
+    def test_the_binary_lookup_is_the_ci_scope_steps_own(self):
+        def shared(script):
+            lines = script.splitlines()
+            start = next(i for i, line in enumerate(lines) if line.lstrip().startswith("mode=$("))
+            end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+            return "\n".join(lines[start:end])
+
+        ci = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
+        ci_run = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", ci + "\n").group(1))
+        self.assertEqual(shared(self.step("Scope the train")), shared(ci_run))
+
+    def test_every_benchmarked_crate_is_in_exactly_one_component(self):
+        # A component may name a crate whose first benchmark has not landed yet (the component job leaves it out),
+        # so the components cover the benchmarked crates rather than equal them. Every name is a workspace package.
+        import tomllib
+
+        text = workflow_text("bench-track.yml")
+        inputs = dict(re.findall(r"(?m)^      component: (\S+)\n      crates: (.+)$", text))
+        inputs = {name.replace("-", "_"): sorted(crates.split()) for name, crates in inputs.items()}
+        self.assertEqual(sorted(inputs), sorted(self.COMPONENTS))
+        table = re.findall(r"(?m)^                ((?:crates/[a-z0-9-]+/\*\|?)+)\)\n                  (\w+)=true$",
+                           text)
+        table = {flag: sorted(path.split("/")[1] for path in paths.split("|")) for paths, flag in table}
+        self.assertEqual(table, inputs, "the path table and the component jobs name different crates")
+        benchmarked, packages = set(), {}
+        for manifest in sorted((REPO_ROOT / "crates").glob("*/Cargo.toml")):
+            data = tomllib.loads(manifest.read_text())
+            if "package" not in data:
+                continue
+            packages[manifest.parent.name] = data["package"]["name"]
+            auto = data["package"].get("autobenches", True) and list((manifest.parent / "benches").glob("*.rs"))
+            if data.get("bench") or auto:
+                benchmarked.add(manifest.parent.name)
+                self.assertEqual(data["package"]["name"], manifest.parent.name, manifest)
+        members = [crate for crates in inputs.values() for crate in crates]
+        self.assertEqual(len(members), len(set(members)), "a crate is in two components")
+        self.assertTrue(benchmarked, "no benchmarked crate found: the manifest scan read nothing")
+        self.assertEqual(benchmarked - set(members), set(), "a benchmarked crate is in no component")
+        # The train maps a crate to crates/<name>/Cargo.toml, so every member's directory is its package name.
+        self.assertEqual({m for m in members if packages.get(m) != m}, set(),
+                         "a component names a crate that is not a package of that directory name")
+
+
 class OptionalWorkflowCodexSkipTests(unittest.TestCase):
     """Optional pull-request workflows skip own codex/ pull requests and still run on the merged tree."""
 
@@ -3327,9 +3596,23 @@ class OptionalWorkflowCodexSkipTests(unittest.TestCase):
                 self.assertEqual(self.paths(push), self.paths(self.trigger(text, "pull_request")))
 
     def test_bench_track_publishes_from_main_only(self):
-        # Its push jobs write the performance ledger, so an integration branch must never trigger it.
-        push = self.trigger(workflow_text("bench-track.yml"), "push")
-        self.assertNotIn("integration", push)
+        # A merge train's push runs the components of its dependents closure (ADR-206 Amendment 1). The
+        # performance ledger is written from main and release tags only, so every step that publishes
+        # carries that ref guard, and the e2e job, which the train does not run, excludes integration pushes.
+        text = workflow_text("bench-track.yml")
+        push = self.trigger(text, "push")
+        self.assertEqual(re.findall(r"(?m)^    branches: (.+)$", push), ['["integration/train-*"]'])
+        guard = "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))"
+        for workflow in ("bench-track.yml", "bench-component.yml"):
+            steps = re.split(r"(?m)^      - ", workflow_text(workflow))[1:]
+            publishing = [step for step in steps if "run: bash scripts/perf/publish_ledger.sh" in step]
+            with self.subTest(workflow=workflow):
+                self.assertEqual(len(publishing), 1)
+                condition = re.search(r"(?m)^        if: (.+)$", publishing[0])
+                self.assertIsNotNone(condition)
+                self.assertIn(guard, condition.group(1))
+        e2e = indented_block(indented_block(text, "jobs", 0), "e2e", 2)
+        self.assertIn("!(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/'))", e2e)
 
 
 if __name__ == "__main__":
