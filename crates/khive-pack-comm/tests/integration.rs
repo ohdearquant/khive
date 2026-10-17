@@ -3587,6 +3587,12 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
     created_at INTEGER NOT NULL,
     reason TEXT NOT NULL,
     UNIQUE (scope, kind, value, source)
+)",
+            "CREATE TABLE IF NOT EXISTS comm_suppression_mirror (
+    mirror TEXT PRIMARY KEY CHECK (mirror = 'one_click'),
+    refreshed_at INTEGER NOT NULL,
+    remote_as_of TEXT NOT NULL CHECK (length(remote_as_of) > 0),
+    remote_count INTEGER NOT NULL CHECK (remote_count >= 0)
 )"
         ]
     );
@@ -3606,7 +3612,7 @@ async fn verb_registry_aggregates_comm_schema_plan() {
         .find(|p| p.pack == "comm")
         .expect("comm plan present");
     assert!(!comm_plan.is_empty(), "auxiliary schema stays pack-owned");
-    assert_eq!(comm_plan.statements.len(), 2);
+    assert_eq!(comm_plan.statements.len(), 3);
     let pack = CommPack::new(_rt);
     assert_eq!(
         comm_plan.statements,
