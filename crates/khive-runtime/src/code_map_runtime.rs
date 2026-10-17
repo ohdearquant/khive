@@ -36,6 +36,19 @@ fn opened_file_identity(file: &File) -> Result<FileIdentity, String> {
     }
 }
 
+fn opened_file_link_count(file: &File) -> Result<u64, String> {
+    #[cfg(any(unix, windows))]
+    {
+        khive_db::file_identity::file_link_count(file)
+            .map_err(|_| "opened file link count could not be read".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err("link count is unsupported on this platform".to_string())
+    }
+}
+
 fn path_identity(path: &Path) -> std::io::Result<FileIdentity> {
     #[cfg(any(unix, windows))]
     {
@@ -240,7 +253,9 @@ impl CodeMapRegistry {
             map.identity,
             &self.protected_databases,
         )
-        .map_err(|_| RuntimeError::Internal("code map could not be opened safely".to_string()))?;
+        .map_err(|_| {
+            RuntimeError::Internal(format!("code map {name:?} could not be opened safely"))
+        })?;
         connection
             .execute_batch("BEGIN DEFERRED")
             .map_err(|_| RuntimeError::Internal("code map read could not begin".to_string()))?;
@@ -377,6 +392,11 @@ fn validate_code_map(
     if protected.contains(&identity) {
         return Err("file identity matches a production database or companion".to_string());
     }
+    // Canonicalization does not resolve hard links: a second link inside the root
+    // can name a file outside it (ADR-139 Amendment 2).
+    if opened_file_link_count(&file)? != 1 {
+        return Err("map file does not have exactly one link".to_string());
+    }
     drop(file);
 
     let generation = next_registration_generation()
@@ -422,6 +442,9 @@ impl RegisteredCodeMap {
             || opened_file_identity(&file)? != self.identity
         {
             return Err("registered map identity changed".to_string());
+        }
+        if opened_file_link_count(&file)? != 1 {
+            return Err("registered map file does not have exactly one link".to_string());
         }
         // Header bytes 18 and 19 are the write and read format versions; 2 is WAL.
         let mut header = [0u8; 20];
