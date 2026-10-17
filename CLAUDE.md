@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  154 public verbs (see the verb-catalog paragraph below       │
+│  157 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -206,7 +206,8 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 14 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, tool, exec, git,
-code, workspace, blob (the aggregate is registry-discovered with `verbs()`; the `code` pack contributes one verb, `code.ingest`
+code, workspace, blob (the aggregate is registry-discovered with `verbs()`; the `code` pack contributes `code.list`, `code.search`,
+and `code.deps` for registered-map reads (ADR-139), plus `code.ingest`
 (ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
 dedicated map database); its `finding` note kind and `findings.json` batch ingest are
 still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Amendment

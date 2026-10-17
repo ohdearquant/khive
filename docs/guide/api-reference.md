@@ -28,7 +28,7 @@ An always-machine-readable copy of this page is at
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
+| `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
@@ -60,8 +60,8 @@ one more snapshot attempt; a snapshot still failing after the bounded repairs re
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
+`code` registers the `finding` note kind and edge rules, `code.ingest` (source ingest,
+ADR-085), and `code.list`, `code.search`, `code.deps` (registered-map reads, ADR-139); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
 That admin path is history-preserving: a deterministic entity, finding-note,
@@ -3173,12 +3173,44 @@ observed `from`, requested `to`, whether the move was a fast-forward, and `recei
 | `reason`               | string  | no       | Operator note stored with the receipt.                |
 | `session_id`           | string  | no       | Session label copied to the receipt.                  |
 
-## `code` pack — 1 verb
+## `code` pack — 4 verbs
 
 Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
 set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
 `finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
 ingest (not reachable via this MCP verb surface).
+
+### `code.list`, `code.search`, `code.deps` — Assertive
+
+Read an operator-registered code map by name through the shared read-only registry.
+No verb accepts a database path. Register maps with `code_map_root` and `[[code_maps]]`
+configuration as described in [ADR-139](../adr/ADR-139-code-map-read-access.md).
+
+| Verb          | Required       | Optional                                                                                   | Result                                       |
+| ------------- | -------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `code.list`   | `map`          | `kind`, `project_id`, `cursor`, `limit` (1–500, default 100)                               | `map`, `items`, `next_cursor`                |
+| `code.search` | `map`, `query` | `kind`, `project_id`, `cursor`, `limit` (1–200, default 20)                                | `map`, `items` with `score`, `next_cursor`   |
+| `code.deps`   | `map`, `id`    | `direction` (default `both`), `max_depth` (1–10, default 2), `limit` (1–1000, default 200) | `map`, `root`, `nodes`, `edges`, `truncated` |
+
+All reads expose only live projects and module/function/datatype/interface concepts.
+List and search items contain `id`, `kind`, `name`, and nullable `project_id`; project
+rows return null, while code rows follow live containment edges to their project.
+List orders by name then id. Search uses a non-empty literal, case-insensitive name
+query: exact matches precede prefixes, then interior matches, with id breaking ties.
+Cursors bind the map registration and every filter; stale or malformed tokens fail.
+
+Dependencies follow every live local `depends_on` scope, including normal/dev/build.
+Direction accepts `incoming`, `outgoing`, or `both`. Nodes order by breadth-first
+depth then id, counting the root against the node limit. `truncated` identifies
+omitted reachable nodes within the requested depth; all dependency edges between
+returned nodes are retained. Unknown maps, missing roots and invalid bounds fail
+explicitly. Map paths never appear in responses.
+
+```text
+code.list(map="workspace", kind="project", limit=500)
+code.search(map="workspace", query="parser", limit=20)
+code.deps(map="workspace", id="<project-id>", direction="incoming", max_depth=1)
+```
 
 ### `code.ingest` — Commissive
 

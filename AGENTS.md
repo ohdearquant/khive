@@ -21,7 +21,8 @@ commit/issue/pull_request provenance note kinds
 and a batch ingester, and four write verbs, `git.commit` / `git.branch` / `git.update_ref` / `git.push`
 (ADR-108), that shell to system git with hardened, allowlisted argv construction — no
 tag/merge/checkout/pull/fetch, no force-push under any argument combination; the `code`
-pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
+pack contributes `code.list`, `code.search`, and `code.deps` for registered-map reads
+(ADR-139), plus `code.ingest` (L1 manifest + L1.5 import-scan source ingestion
 into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
 written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
 the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
