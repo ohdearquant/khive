@@ -65,3 +65,7 @@ path = "benches/kg_bench.rs"
 [[test]]
 name = "neighbors_batch_projection"
 path = "tests/neighbors_batch_projection.rs"
+
+[[bench]]
+name = "kg_lifecycle"
+harness = false
