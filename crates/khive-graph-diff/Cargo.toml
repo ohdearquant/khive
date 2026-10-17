@@ -16,3 +16,18 @@ khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "graph_parse"
+harness = false
+
+[[bench]]
+name = "graph_diff"
+harness = false
+
+[[bench]]
+name = "graph_allocations"
+harness = false
