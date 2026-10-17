@@ -27,7 +27,7 @@ use khive_types::EdgeRelation;
 use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
-use crate::sql::sql;
+use crate::sql::{sql, EntityRows};
 use khive_runtime::process_retry::{
     spawn_retrying_executable_busy, spawn_retrying_executable_busy_async,
     EXECUTABLE_BUSY_BACKOFF_MS,
@@ -913,13 +913,7 @@ async fn resolve_id(
     _token: &NamespaceToken,
     raw: &str,
 ) -> Result<Option<Uuid>> {
-    if let Ok(u) = Uuid::parse_str(raw) {
-        return Ok(Some(u));
-    }
-    runtime
-        .resolve_prefix_unfiltered(raw)
-        .await
-        .map_err(anyhow::Error::new)
+    resolve_project_id(runtime, raw).await
 }
 
 /// Resolve an explicit `git.digest(project)` UUID or 8+ hex prefix without a
