@@ -132,7 +132,7 @@ async fn paused_real_scan_keeps_aged_observation_and_health_reports_stalled() {
     assert_eq!(before.properties, after.properties);
     assert_eq!(before.updated_at, after.updated_at);
 
-    let server = KhiveMcpServer::new(runtime).unwrap();
+    let server = KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
     let health = server
         .verb_registry_clone()
         .dispatch("comm.health", json!({}))
@@ -205,7 +205,7 @@ async fn real_scan_records_the_selected_page_before_failed_delivery() {
         DateTime::parse_from_rfc3339(outbox["oldest_pending_created_at"].as_str().unwrap())
             .unwrap();
     assert_eq!(observed.timestamp_micros(), created);
-    let server = KhiveMcpServer::new(runtime).unwrap();
+    let server = KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
     let health: Value = server
         .verb_registry_clone()
         .dispatch("comm.health", json!({}))
