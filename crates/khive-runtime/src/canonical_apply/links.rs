@@ -163,5 +163,8 @@ pub(super) async fn materialize(
         target_id: edge.target_id,
         statements,
         disposition: EdgeUpsertDisposition::Created,
+        // Canonical apply writes the metadata drafted with the changeset and reports through its
+        // own outcome, so no per-link response reads this hint.
+        dependency_kind_inference_hint: None,
     }))
 }
