@@ -7,13 +7,11 @@ mod mutation_plans;
 mod store_impl;
 mod traversal;
 
-use store_impl::*;
-
 use traversal::*;
 
 use edge_upserts::*;
 
-pub(crate) use edge_reads::*;
+use edge_reads::*;
 
 pub use mutation_plans::*;
 
@@ -572,7 +570,10 @@ impl SqlGraphStore {
 // DDL
 // =============================================================================
 
-const GRAPH_DDL: &str = include_str!("../../sql/graph-ddl.sql");
+// The schema loader sits in a child module without glob imports, so its
+// `include_str!` binding stays unambiguous to the static SQL census.
+mod ddl;
+use ddl::GRAPH_DDL;
 
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(GRAPH_DDL)

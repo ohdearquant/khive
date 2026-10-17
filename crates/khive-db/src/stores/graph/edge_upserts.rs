@@ -1,4 +1,21 @@
-use super::*;
+// Named imports rather than `use super::*;`: the static SQL census refuses an
+// `include_str!` loader in a module that has a glob import in scope.
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
+use khive_storage::types::{
+    Edge, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    GuardedEdgeBatchRefusal, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
+    MissingEndpoints,
+};
+use khive_types::EdgeRelation;
+use rusqlite::OptionalExtension;
+use uuid::Uuid;
+
+use crate::sql_bridge::bind_params;
+
+use super::edge_reads::read_edge;
+use super::edge_statements::{edge_upsert_statement_with_resurrection, endpoint_exists_clause};
+#[cfg(test)]
+use super::tests;
 
 /// Canonical endpoint order for symmetric relations (F012).
 ///
