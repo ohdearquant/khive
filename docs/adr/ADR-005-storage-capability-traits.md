@@ -1199,8 +1199,7 @@ amendment; transport composition is specified in
 
 ## Amendment: guarded partial note property updates (2026-10-09, #5069)
 
-**Status: Proposed.** This amendment accompanies its implementation for review;
-it does not establish acceptance before that review.
+**Status: Accepted (2026-10-17).** This amendment was reviewed with its implementation.
 
 `NoteStore` adds the provided method
 `try_patch_note_properties(&self, id: Uuid, namespace: &str, kind: &str, patch: &NotePropertyPatch) -> StorageResult<bool>`.
