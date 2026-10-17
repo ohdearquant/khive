@@ -2039,12 +2039,12 @@ dependencies = [
 name = "khive-channel-email"
 version = "0.13.0"
 dependencies = [
- "criterion",
  "async-imap",
  "async-native-tls",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "criterion",
  "futures",
  "khive-channel",
  "khive-pack-blob",
