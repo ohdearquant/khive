@@ -61,3 +61,4 @@ harness = false
 [[example]]
 name = "vec_bench"
 required-features = ["mmap"]
+test = true
