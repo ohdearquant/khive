@@ -229,6 +229,11 @@ pub struct SubstrateCoordinator {
     pub(super) delay_backend: Option<(String, Duration)>,
     #[cfg(test)]
     pub(super) phase_hold_backend: Option<(String, khive_storage::request_context::SearchPhase)>,
+    /// Test-only: a named single backend enters this phase, waits for the request read
+    /// deadline the way a deadline-aware reader admission does, then fails with a timeout.
+    #[cfg(test)]
+    pub(super) phase_deadline_error_backend:
+        Option<(String, khive_storage::request_context::SearchPhase)>,
     /// Test-only: when set, a backend's entity fan-out task returns this
     /// list verbatim instead of calling `hybrid_search`, so RRF-merge
     /// regression tests can pin exact ranks/UUIDs (MAJ-4).
@@ -256,6 +261,8 @@ impl SubstrateCoordinator {
             #[cfg(test)]
             phase_hold_backend: None,
             #[cfg(test)]
+            phase_deadline_error_backend: None,
+            #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
             note_hits_override: None,
@@ -277,6 +284,8 @@ impl SubstrateCoordinator {
             delay_backend: None,
             #[cfg(test)]
             phase_hold_backend: None,
+            #[cfg(test)]
+            phase_deadline_error_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -301,6 +310,8 @@ impl SubstrateCoordinator {
             delay_backend: None,
             #[cfg(test)]
             phase_hold_backend: None,
+            #[cfg(test)]
+            phase_deadline_error_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -355,6 +366,16 @@ impl SubstrateCoordinator {
         phase: khive_storage::request_context::SearchPhase,
     ) -> Self {
         self.phase_hold_backend = Some((backend_id.to_string(), phase));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_phase_deadline_error_backend(
+        mut self,
+        backend_id: &str,
+        phase: khive_storage::request_context::SearchPhase,
+    ) -> Self {
+        self.phase_deadline_error_backend = Some((backend_id.to_string(), phase));
         self
     }
 
@@ -845,11 +866,29 @@ impl SubstrateCoordinator {
                 .any(|id| id == backend_id.as_str());
             #[cfg(not(test))]
             let should_hang = false;
+            #[cfg(test)]
+            let phase_deadline_error = self
+                .phase_deadline_error_backend
+                .as_ref()
+                .and_then(|(id, phase)| (id == backend_id.as_str()).then_some(*phase));
+            #[cfg(not(test))]
+            let phase_deadline_error: Option<
+                khive_storage::request_context::SearchPhase,
+            > = None;
             if search_notes {
                 let search_fut = async {
                     if should_hang {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
+                    }
+                    if let Some(phase) = phase_deadline_error {
+                        let _phase = khive_storage::request_context::enter_search_phase(phase);
+                        khive_storage::request_context::wait_for_request_read_cancellation().await;
+                        return Err(RuntimeError::Storage(
+                            khive_storage::StorageError::Timeout {
+                                operation: "held search phase".into(),
+                            },
+                        ));
                     }
                     runtime
                         .backend()
@@ -876,11 +915,18 @@ impl SubstrateCoordinator {
                     phase_trace.clone(),
                     search_fut,
                 );
+                let deadline_snapshot_store = std::sync::OnceLock::new();
+                let search_fut = search_with_deadline_snapshot(
+                    search_fut,
+                    phase_trace.clone(),
+                    request_deadline.async_at(),
+                    &deadline_snapshot_store,
+                );
                 let search_fut =
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(outcome)) => {
+                    Ok((Ok(outcome), None)) => {
                         let filtered_note_hits: Vec<NoteSearchHit> = outcome
                             .hits
                             .iter()
@@ -900,7 +946,7 @@ impl SubstrateCoordinator {
                         };
                         return (vec![], filtered_note_hits, vec![backend_result]);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -910,8 +956,30 @@ impl SubstrateCoordinator {
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
+                    Ok((_late, Some(phase_snapshot))) => {
+                        tracing::warn!(
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
+                            timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
+                            "backend search task completed after the shared request deadline"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
                     Err(_elapsed) => {
-                        let phase_snapshot = phase_trace.snapshot();
+                        let phase_snapshot = deadline_snapshot_store
+                            .get()
+                            .cloned()
+                            .unwrap_or_else(|| phase_trace.snapshot());
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
@@ -942,6 +1010,15 @@ impl SubstrateCoordinator {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
                     }
+                    if let Some(phase) = phase_deadline_error {
+                        let _phase = khive_storage::request_context::enter_search_phase(phase);
+                        khive_storage::request_context::wait_for_request_read_cancellation().await;
+                        return Err(RuntimeError::Storage(
+                            khive_storage::StorageError::Timeout {
+                                operation: "held search phase".into(),
+                            },
+                        ));
+                    }
                     runtime
                         .backend()
                         .pool_arc()
@@ -963,11 +1040,18 @@ impl SubstrateCoordinator {
                     phase_trace.clone(),
                     search_fut,
                 );
+                let deadline_snapshot_store = std::sync::OnceLock::new();
+                let search_fut = search_with_deadline_snapshot(
+                    search_fut,
+                    phase_trace.clone(),
+                    request_deadline.async_at(),
+                    &deadline_snapshot_store,
+                );
                 let search_fut =
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(outcome)) => {
+                    Ok((Ok(outcome), None)) => {
                         let filtered_hits: Vec<SearchHit> = outcome
                             .hits
                             .iter()
@@ -987,7 +1071,7 @@ impl SubstrateCoordinator {
                         };
                         return (filtered_hits, vec![], vec![backend_result]);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -997,8 +1081,30 @@ impl SubstrateCoordinator {
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
+                    Ok((_late, Some(phase_snapshot))) => {
+                        tracing::warn!(
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
+                            timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
+                            "backend search task completed after the shared request deadline"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
                     Err(_elapsed) => {
-                        let phase_snapshot = phase_trace.snapshot();
+                        let phase_snapshot = deadline_snapshot_store
+                            .get()
+                            .cloned()
+                            .unwrap_or_else(|| phase_trace.snapshot());
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
@@ -1414,6 +1520,30 @@ impl SubstrateCoordinator {
     }
 }
 
+/// Race one single-backend search against the request deadline instant, as the fan-out
+/// worker does, so a search still in flight at the deadline is reported with the phase it
+/// was in even when it then resolves: a deadline-aware wait (reader admission, checkout)
+/// returns an error at the deadline instead of outliving the outer timeout. The snapshot is
+/// also left in `store` for the arm that sees the outer timeout elapse first.
+async fn search_with_deadline_snapshot<F: std::future::Future>(
+    search: F,
+    trace: khive_storage::request_context::SearchPhaseTrace,
+    deadline: tokio::time::Instant,
+    store: &std::sync::OnceLock<khive_storage::request_context::SearchPhaseSnapshot>,
+) -> (
+    F::Output,
+    Option<khive_storage::request_context::SearchPhaseSnapshot>,
+) {
+    tokio::pin!(search);
+    let snapshot = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => trace.snapshot(),
+        result = &mut search => return (result, None),
+    };
+    let _ = store.set(snapshot.clone());
+    (search.await, Some(snapshot))
+}
+
 /// Per-backend fan-out search timeout (MAJ-2 fix): bounds how long a single
 /// backend's search task may run before the coordinator gives up on it and
 /// reports a timeout-specific error for that backend, so one hung backend
@@ -1485,6 +1615,10 @@ mod search_phase_trace_tests {
     }
 
     fn search_request(query: &str) -> ValidatedSearchRequest {
+        search_request_of_kind("entity", query)
+    }
+
+    fn search_request_of_kind(kind: &str, query: &str) -> ValidatedSearchRequest {
         let runtime = runtime();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(runtime.config().gate.clone());
@@ -1495,10 +1629,10 @@ mod search_phase_trace_tests {
         let registry = builder.build().expect("build KG registry");
         runtime.install_edge_rules(registry.all_edge_rules());
         ValidatedSearchRequest::from_value(
-            serde_json::json!({"kind": "entity", "query": query, "limit": 10}),
+            serde_json::json!({"kind": kind, "query": query, "limit": 10}),
             &registry,
         )
-        .expect("valid entity search")
+        .expect("valid search request")
     }
 
     fn subscriber(capture: LogCapture) -> impl tracing::Subscriber + Send + Sync + 'static {
@@ -1567,6 +1701,51 @@ mod search_phase_trace_tests {
         assert!(logs.contains("in_flight_phase=not_entered"), "{logs}");
         assert!(logs.contains("active_phases=none"), "{logs}");
         assert!(logs.contains("completed_phases=none"), "{logs}");
+    }
+
+    // The default deployment has one backend and no fan-out worker. A deadline-aware wait
+    // there (reader admission) fails at the deadline rather than hanging, so the search
+    // resolves with an error inside the outer timeout; the warning must still name the
+    // phase that was in flight at the deadline.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_deadline_error_names_the_held_search_phase() {
+        for (kind, phase, expected) in [
+            (
+                "entity",
+                SearchPhase::EntityReaderAdmission,
+                "entity_reader_admission",
+            ),
+            (
+                "note",
+                SearchPhase::NoteReaderAdmission,
+                "note_reader_admission",
+            ),
+        ] {
+            let capture = LogCapture::default();
+            let guard = tracing::subscriber::set_default(subscriber(capture.clone()));
+            let coordinator = SubstrateCoordinator::single(runtime())
+                .with_phase_deadline_error_backend("main", phase);
+            let request = search_request_of_kind(kind, "single backend deadline");
+            let _ = coordinator
+                .fan_out_search(&request, &Namespace::local())
+                .await;
+            drop(guard);
+            let logs = capture.contents();
+
+            assert!(
+                logs.contains(&format!("in_flight_phase={expected}")),
+                "{kind} search deadline did not name {expected}: {logs}"
+            );
+            assert!(
+                logs.contains("completed after the shared request deadline"),
+                "{kind}: {logs}"
+            );
+            assert!(
+                logs.contains("completed_phases=authorization="),
+                "{kind}: {logs}"
+            );
+        }
     }
 
     #[tokio::test]
