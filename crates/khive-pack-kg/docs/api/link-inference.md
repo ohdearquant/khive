@@ -1,6 +1,6 @@
 # Inferred dependency kinds in link responses
 
-For `depends_on`, khive infers a `metadata.dependency_kind` when the caller does
+On the local runtime path, for `depends_on`, khive infers a `metadata.dependency_kind` when the caller does
 not supply one. A successful link response adds a top-level `hint` naming that
 inferred value. The hint is response information; it is never stored in the edge
 or its event payload.
@@ -27,10 +27,24 @@ precedence over a competing top-level value. A null metadata argument is treated
 as omitted; `metadata.dependency_kind: null` remains invalid. Relations other than
 `depends_on` and endpoint pairs without a default receive no hint.
 
-Bulk link responses add `hints: [{"index": 0, "hint": "..."}]` when any successful
-entry inferred a value, including when `verbose` is false. Indices refer to the
-original input array. Skipped duplicates and failed entries receive no hint.
-Verbose edge objects carry the same hint. Empty hint fields are omitted.
+Bulk link responses add `inferred_count` when any successful entry inferred a
+value. The default response includes only that count, so explanations do not
+grow with the batch size. With `verbose=true`, the response also includes
+`hints: [{"index": 0, "hint": "..."}]` and the same hint on each affected edge.
+Indices refer to the original input array. Skipped duplicates, failed entries,
+and explicit qualifiers do not contribute to the count or hints. Re-linking a
+live edge without a qualifier discloses inference again. Empty hint and count
+fields are omitted.
+
+A singleton `create` with an `edges` list adds the same response-only `hint` to
+each returned edge whose dependency kind was inferred. Its stored edge metadata
+and events remain unchanged.
+
+On multi-backend servers, a single link by UUID can use the coordinator route.
+That route validates and stores caller-supplied metadata without inferring a
+dependency kind, even when both endpoints resolve to the same backend. It
+therefore returns no inference hint. Supply `dependency_kind` explicitly on
+that route when the qualifier is needed.
 
 CLI `--atomic` link results carry the same optional `hint`. Its provenance is
 captured during preparation; a later response read cannot change which value
