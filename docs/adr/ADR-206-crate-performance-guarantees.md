@@ -4,7 +4,9 @@
 **Date**: 2026-10-17\
 **Depends on**: [ADR-166](ADR-166-hot-path-latency-regression-guard.md),
 [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)\
-**Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`
+**Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`\
+**Amendments**: [Amendment 1](#amendment-1-2026-10-17-closure-selection-runs-once-per-merge-train)
+(2026-10-17, Proposed): D6 closure selection runs once per merge train
 
 The maintainers' request of 2026-10-17, translated: "For every performance-critical
 crate I want crate-by-crate benches. Most crates had a bench setup at some point, but it
@@ -23,7 +25,8 @@ Each performance-critical crate owns an executable performance contract in
 contract. Deterministic work bounds gate affected pull requests. Timings on hosted
 runners remain advisory. A published absolute performance promise requires qualified
 reference measurements and fresh evidence before release. Benchmark selection uses
-the code map's dependents closure; complete scheduled and release runs catch omissions.
+the code map's dependents closure, once per merge train (Amendment 1); complete
+scheduled and release runs catch omissions.
 
 This is a new contract built on ADR-166, not a claim that its proposed trend lane or
 ADR-205's selector already exists. Both records are marked Proposed at the grounding
@@ -289,13 +292,25 @@ the promise through that same review; an unrecorded release override is not an o
 
 ### D6. Select by dependents closure and account for the whole cost
 
-For PRs, reuse ADR-205's classifier result for the exact base/head pair and validated
-map. Select changed crates plus their transitive dependents across normal, development
-and build edges, then select their declared PR producers. Bench-only runtime relationships,
-shared fixtures and generator/script inputs that are absent from Cargo's graph are
-declared in manifests and add affected producers. A `covered-by` contract adds its
-producer even when that dependency is not a Cargo edge. The expanded set is the logged
-benchmark scope; execution is never limited to only the directly changed crates.
+_Changed by [Amendment 1](#amendment-1-2026-10-17-closure-selection-runs-once-per-merge-train):
+the closure is taken once per merge train, not per pull request._
+
+The closure runs on the push of a merge train's integration branch (`integration/train-*`),
+over the train's whole range from its merge base with main to its tip. It reuses ADR-205's
+classifier for that range and the validated map. Select changed crates plus their transitive
+dependents across normal, development and build edges, then select their declared
+producers. Bench-only runtime relationships, shared fixtures and generator/script inputs
+that are absent from Cargo's graph are declared in manifests and add affected producers. A
+`covered-by` contract adds its producer even when that dependency is not a Cargo edge. The
+expanded set is the logged benchmark scope; execution is never limited to only the
+directly changed crates. The train run records nothing in the performance ledger.
+
+A pull request run keeps the direct path mapping it had before this record: a component runs
+when the pull request changes a path its crates own, which gives a contributor a cheap
+benchmark before merge. Pull requests from the repository's own automation branches, which
+the workflow already exempts, keep that exemption on pull request runs; their changes are
+benchmarked by the train that carries them. A change merged outside a train is covered by
+its own pull request run (when not exempt) and by the next daily run of the complete set.
 
 Manifests, claims and referenced Markdown fixtures are classified before a docs-only
 exit. A pure prose edit can avoid compilation but must still pass the cheap claims and
@@ -305,11 +320,17 @@ selects the full applicable set. Map failure, warning, missing project or uncert
 input mapping also selects the full set with a reason. If that work cannot fit the
 approved capacity, required checks remain incomplete; safety is not traded for a skip.
 
-The selector is a proposed deliverable until ADR-205's implementation is available.
-Implement benchmark mode by extending `scripts/ci-test-scope.py` or its shared library,
+The train step calls `scripts/ci-test-scope.py` the way the CI workflow's scope step does,
 with the same main-built classifier, refusal-before-ingest ordering, map freshness and
-Cargo parity controls. Do not treat a stale map or the absent script as an empty scope.
-Do not use a branch-name exemption: all PRs follow the same scope rule at activation.
+Cargo parity controls; a workflow test holds the binary lookup lines of the two steps
+equal. Every failure (no merge base with main, no published binary, a classifier error or
+an empty result) selects the full set. Do not treat a stale map or the absent script as an
+empty scope. The closure maps to the benchmark components, each a fixed set of crates
+that shares one build cache with the daily run; a component runs when the closure holds
+one of its crates, and runs only those of its crates that have a bench target
+(Amendment 1, decision 5). A workflow test asserts that every crate with a benchmark
+target belongs to exactly one component and that the pull request path table and the
+component jobs name the same crates.
 
 Selection limits executed benchmark/test targets, not what Cargo must compile as their
 dependencies. Compile selected packages together where feature sets permit, in a reused
@@ -332,8 +353,10 @@ amortize qualification work over the stated window. Track both hosted runner-min
 and all compute-minutes including the build host. Shorter elapsed time from parallelism
 is not a cost reduction.
 
-Both totals must be no greater than their pre-change baselines for comparable volume,
-with no loss of required coverage. Savings come first from removing four overlapping
+Amendment 1 replaces the ceiling "no greater than the pre-change baseline" for the train
+run with its measured envelope; the other windows keep it. Both totals must otherwise be
+no greater than their pre-change baselines for comparable volume, with no loss of
+required coverage. Savings come first from removing four overlapping
 component builds, reusing selection, avoiding duplicate synthetic runs, and sharing
 scheduled/release evidence. New cases are admitted only within the measured envelope.
 There is no savings claim yet: the current workflow is already daily, closure selection
@@ -502,7 +525,8 @@ Acceptance requires recorded evidence for all of these controls:
 5. Map/Cargo closure parity holds for normal/dev/build edges. A shared-layer change
    selects downstream benches; a shared fixture selects every declared consumer; a
    missing map and an unknown executable path select the full set. Docs-only changes
-   still receive claim checking. No branch name exempts a PR.
+   still receive claim checking. A train push runs the closure of the whole train; the
+   automation-branch exemption applies to pull request runs only.
 6. PR timing breaches remain advisory, required deterministic failures block, and
    release evaluation refuses stale/wrong-SHA evidence, missing real data, unqualified
    reference results and expired gaps. Disabling the advisory workflow cannot satisfy
@@ -511,7 +535,8 @@ Acceptance requires recorded evidence for all of these controls:
    PR gate still detects quality/work regressions after its timed speedup is separated.
    Every public performance statement in the migration census is registered, corrected
    or removed; deliberately changing a registered number fails the documentation check.
-8. The measured rollout meets both D6 cost ceilings across the representative PR,
+8. The measured rollout meets the Amendment 1 envelope for train runs over the first
+   sixteen trains, and both D6 cost ceilings for the other windows across the representative PR,
    scheduled and release windows while the planned/observed census proves complete
    required coverage. No savings claim is accepted from fewer recorded scenarios.
 
@@ -523,3 +548,69 @@ against the current repository, approve the companion ADR-166 clarifications, me
 the cost ceilings, identify reservable reference capacity and complete the crate/claim
 registration census. Until qualification exists, numerical timing observations may be
 published with their evidence, but no new absolute timing guarantee is active.
+
+## Amendment 1 (2026-10-17): closure selection runs once per merge train
+
+**Status**: Proposed
+
+D6 as first written selected each pull request's dependents closure and removed the
+automation-branch exemption. Before activation, its own cost rule was applied to the job
+records of the existing benchmark workflow and to the last 80 merged pull requests (46 from
+the repository's own automation branches, 34 from others), with the closure computed from
+`cargo metadata` over normal, development and build edges and the path rules of
+`scripts/ci-test-scope.py`:
+
+| Selection                                                           | Component jobs | Runner-minutes   | Changes benchmarked before merge |
+| ------------------------------------------------------------------- | -------------- | ---------------- | -------------------------------- |
+| Before this record: direct path mapping, automation branches exempt | 18             | about 125 to 220 | 12 of 80                         |
+| Closure per pull request, no exemption (D6 as first written)        | 146            | about 1,000      | 55 of 80                         |
+| Closure once per train of five (union of the members' closures)     | 59             | about 410        | 55 of 80                         |
+| The same, six components (decision 5) once their benchmarks land    | 91             | at least 630     | 71 of 80                         |
+
+Runner-minutes multiply component jobs by the median component job on a pull request, 6.9
+runner-minutes (17 runs, range 3.6 to 8.7). The first row's upper figure instead takes the
+job records of the 46 pull request runs that ran at all (mean 6.4 runner-minutes, selection
+job included) for each of the 34 pull requests from other branches. Under the closure, 25 of
+the 80 pull requests select no benchmarked crate and 8 select the full set; 11 of 16 trains
+of five select all four components. Under both closure rows, every change whose closure
+holds a benchmarked crate is benchmarked before merge; the other 25 have nothing to
+benchmark. The last row applies the same rule to the six components of decision 5 as if
+every crate in them had its benchmark: 9 of the 80 pull requests then select nothing, both
+new components are selected by all 16 trains and 11 trains select all six. Its 6.9
+runner-minutes per job is a floor for the `runtime-mcp` component, whose release build of
+`khive-runtime`, `khive-mcp` and `kkernel` is heavier than any component measured here.
+
+Per-pull-request closure costs about five to eight times the existing spend and fails D6's
+ceiling. Per-train closure costs two to three times the existing spend and benchmarks every
+change that has a benchmark before it reaches main, against 12 of 80 before. The decision:
+
+1. The closure runs once on the push of a merge train's integration branch, over the train's
+   whole range, and never publishes to the performance ledger.
+2. Pull request runs keep the direct path mapping and the automation-branch exemption.
+3. The daily run of the complete set and the release run stay as the backstop.
+4. The train run is accepted at its measured envelope in place of D6's "no greater than
+   the pre-change baseline" for that window: about 410 runner-minutes per 80 merged pull
+   requests on top of the pull request spend for the 20 crates benchmarked at this record,
+   and at least 630 once the crates of decision 5 have their benchmarks. The rollout
+   re-measures the first sixteen trains from job records, re-measures the `runtime-mcp`
+   job cost after the first train that runs it, and reports an overrun as an operational
+   finding.
+5. Two components join the four: `runtime-mcp` (`khive-runtime`, `khive-mcp`, `kkernel`) and
+   `gate-channel-code` (`khive-gate`, `khive-channel`, `khive-pack-code`, `khive-changeset`,
+   `khive-channel-email`, `khive-graph-diff`, `khive-wire-protocol`), each with a 40-minute
+   job budget. A component job runs only the crates that have a bench target, read from
+   `cargo metadata`; a component with none runs nothing, writes no ledger record and opens
+   no tracking incident, so a crate can sit in its component before its first benchmark
+   lands. A name that is not a workspace package fails the job. Every crate with a bench
+   target is in exactly one component (a workflow test).
+6. Before the first train that carries a `runtime-mcp` benchmark lands, that component's
+   quick Criterion pass is timed on the CI build host against the 600-second bound of a
+   component job, and the number is recorded here beside the 6.9-minute floor. The first
+   train that runs `gate-channel-code` after its crates have benchmarks reports the job's
+   wall time; if it exceeds the 40-minute budget, the component is split then.
+
+The 20 crates with a benchmark target at this record are exactly the 20 crates of the four
+original components, which keep their names, cache keys and ledger names, so the train run
+reuses their build caches from the daily run. Chunking the benchmarked crates afresh would
+have changed the cache keys and the ledger's component names for no selection benefit, so it
+was not adopted.
