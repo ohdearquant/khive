@@ -1,7 +1,8 @@
 use super::*;
 use crate::pool::PoolConfig;
 use khive_storage::types::{
-    Direction, TraversalExecutionBudget, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
+    Direction, EdgeUpsertDisposition, TraversalExecutionBudget, TraversalOptions,
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
 };
 use khive_storage::{BatchWriteErrorClass, BatchWriteRetryability};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};

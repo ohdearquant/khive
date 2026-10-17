@@ -356,7 +356,7 @@ pub use edge_query::QueryResult;
 use graph_rules::{accepted_entity_relations_description, static_impossible_edge_pattern_warnings};
 pub use graph_rules::{
     accepted_entity_relations_for_entities, accepted_pack_relations_for_entities,
-    merge_entry_metadata,
+    dependency_kind_inference_hint, merge_entry_metadata,
 };
 pub(crate) use graph_rules::{
     canonical_edge_endpoint_kinds, canonical_edge_endpoints, merge_dependency_kind,

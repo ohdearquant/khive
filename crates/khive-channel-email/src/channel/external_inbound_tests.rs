@@ -201,6 +201,7 @@ fn external_raw_fixture(name: &str) -> &'static [u8] {
 #[derive(Default)]
 struct RoutingHost {
     enabled: bool,
+    inbound_only: bool,
     blocked: bool,
     fail_lookup: bool,
     owners: HashMap<String, crate::ThreadOwner>,
@@ -211,6 +212,9 @@ struct RoutingHost {
 impl ExternalEmailHost for RoutingHost {
     fn external_senders_configured(&self) -> bool {
         self.enabled
+    }
+    fn external_inbound_enabled(&self) -> bool {
+        self.enabled || self.inbound_only
     }
     fn verify_unsubscribe_token(&self, _: &str) -> Option<String> {
         None
@@ -372,6 +376,52 @@ async fn a12_raw_poll_disabled_auth_block_and_maintainer_precede_screening() {
             assert!(env.content.contains("Ignore your previous instructions"));
         }
     }
+}
+
+#[tokio::test]
+async fn inbound_only_host_admits_external_mail_without_external_senders() {
+    // Control: with neither external senders nor the inbound switch, step 5 quarantines.
+    let page = external_raw_page("benign", Arc::new(RoutingHost::default())).await;
+    let env = &page.envelopes[0];
+    assert_eq!(
+        env.metadata.get("quarantine_reason").map(String::as_str),
+        Some("off-allowlist")
+    );
+    assert!(env.inbound_delivery.is_none());
+
+    let host = Arc::new(RoutingHost {
+        inbound_only: true,
+        ..Default::default()
+    });
+    assert!(!host.external_senders_configured());
+    let page = external_raw_page("benign", Arc::clone(&host)).await;
+    let env = &page.envelopes[0];
+    assert_eq!(env.metadata.get("quarantine_reason"), None);
+    assert_eq!(
+        env.inbound_delivery.as_ref().unwrap().actor,
+        "lambda:recipient"
+    );
+    assert_eq!(env.from, "email:stranger@outside.example");
+    assert_eq!(env.metadata["origin"], "external");
+    assert_eq!(env.metadata["trust"], "untrusted");
+
+    // Step 6 still applies: an inbound suppression entry blocks the sender.
+    let page = external_raw_page(
+        "benign",
+        Arc::new(RoutingHost {
+            inbound_only: true,
+            blocked: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(
+        page.envelopes[0]
+            .metadata
+            .get("quarantine_reason")
+            .map(String::as_str),
+        Some("blocked")
+    );
 }
 
 #[tokio::test]
