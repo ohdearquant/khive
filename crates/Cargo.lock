@@ -3067,6 +3067,7 @@ dependencies = [
 name = "khive-wire-protocol"
 version = "0.13.0"
 dependencies = [
+ "criterion",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

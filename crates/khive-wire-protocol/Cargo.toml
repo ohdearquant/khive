@@ -14,3 +14,18 @@ categories.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "wire_codec"
+harness = false
+
+[[bench]]
+name = "wire_handshake"
+harness = false
+
+[[bench]]
+name = "wire_allocations"
+harness = false
