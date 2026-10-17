@@ -1,6 +1,6 @@
 # Graph Store (Edges)
 
-`SqlGraphStore` (`crates/khive-db/src/stores/graph.rs`) implements the
+`SqlGraphStore` (`crates/khive-db/src/stores/graph/store_impl.rs`) implements the
 `GraphStore` capability trait over the `graph_edges` table. This is the
 function-specific technical reference for its write-routing and the
 endpoint-existence guards that back `link`'s atomic-unit safety.
