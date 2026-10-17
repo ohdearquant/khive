@@ -2012,6 +2012,7 @@ dependencies = [
 name = "khive-changeset"
 version = "0.13.0"
 dependencies = [
+ "criterion",
  "khive-types",
  "proptest",
  "serde",
