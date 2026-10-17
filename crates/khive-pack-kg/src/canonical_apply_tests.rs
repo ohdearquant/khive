@@ -310,24 +310,67 @@ async fn canonical_proposal_scans_decoded_delta_values_for_secrets() {
 }
 
 #[tokio::test]
-async fn canonical_proposal_leaves_reserved_property_values_to_apply() {
-    let (_runtime, registry) = setup();
-    // Stamp-shaped: a value under the reserved key that a key-aware scan would read as a
-    // credential. Whether it may be written is decided at apply, against the stored row.
-    let stamp = "Zx8Qp3Lm9Rt2Vb7Nc4Kd1Wf6Hj0Gs5Ya";
+async fn canonical_proposal_scans_values_under_reserved_property_keys() {
+    let (runtime, registry) = setup();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let events = runtime.events(&token).unwrap();
+    let filter = khive_storage::EventFilter {
+        kinds: vec![khive_types::EventKind::ProposalCreated],
+        ..Default::default()
+    };
+    let before = events.count_events(filter.clone()).await.unwrap();
+    // A reserved key does not exempt its value: the proposal stores the delta before apply
+    // decides whether the key may be written.
+    let rejected = format!(
+        "postgresql://{}:{}@fixture.example/database",
+        "fixture-user", "<PASSWORD>"
+    );
     let update = json!({"op":"update","target_id":Uuid::from_u128(801),
+        "patch":{"target":"entity","properties":{"khive:secret_gate":rejected}},
+        "preimage":{"target":"entity","properties":{"khive:secret_gate":rejected}}});
+    let plain = delta(&[update]);
+    let escaped = plain.replace("@fixture.example", "\\u0040fixture.example");
+    assert_ne!(escaped, plain);
+    khive_runtime::secret_gate::check_at(&escaped, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let error = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title":"Reserved credential", "description":"Refuse on the decoded value",
+                "changeset":{"kind":"canonical","schema_version":1,"delta":escaped},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::SecretDetected(_)),
+        "{error:?}"
+    );
+    assert_eq!(events.count_events(filter).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn canonical_proposal_admits_the_runtime_secret_gate_stamp() {
+    let (_runtime, registry) = setup();
+    // The value the runtime itself writes under the reserved key; an operation that carries it
+    // back as a preimage echo passes the proposal scan, and apply decides the echo.
+    let stamp = "exempted:content-sha256-manifest-v1";
+    let update = json!({"op":"update","target_id":Uuid::from_u128(802),
         "patch":{"target":"entity","properties":{"khive:secret_gate":stamp}},
         "preimage":{"target":"entity","properties":{"khive:secret_gate":stamp}}});
     registry
         .dispatch(
             "propose",
             json!({
-                "title":"Reserved echo", "description":"Apply decides reserved values",
+                "title":"Stamp echo", "description":"Apply decides reserved values",
                 "changeset":{"kind":"canonical","schema_version":1,"delta":delta(&[update])},
             }),
         )
         .await
-        .expect("propose leaves a reserved value to apply");
+        .expect("the runtime's own stamp passes the proposal scan");
 }
 
 #[tokio::test]

@@ -167,44 +167,19 @@ pub(crate) fn validate_proposal(
 
 /// The proposal's own scan reads `delta` as one NDJSON string, where a JSON escape keeps a
 /// credential's shape hidden until the text is decoded, so the decoded envelope and every
-/// operation are scanned as well. Runtime-reserved property values are left out, as the
-/// apply-time scans leave them out: their admission is decided against the row each operation
-/// meets.
+/// operation are scanned as well. Values under runtime-reserved property keys are scanned too:
+/// the proposal stores the delta when it is created, before apply decides whether a reserved
+/// value may be written, and the runtime's own reserved values are fixed strings that pass.
 fn scan_decoded_delta(changeset: &ChangeSet) -> Result<(), RuntimeError> {
     let envelope = serde_json::to_value(&changeset.envelope)
         .map_err(|error| RuntimeError::Internal(error.to_string()))?;
     khive_runtime::secret_gate::check_json_at(&envelope, "proposal", "changeset")?;
     for op in &changeset.ops {
-        let mut value =
+        let value =
             serde_json::to_value(op).map_err(|error| RuntimeError::Internal(error.to_string()))?;
-        strip_reserved_properties(&mut value);
         khive_runtime::secret_gate::check_json_at(&value, "proposal", "changeset")?;
     }
     Ok(())
-}
-
-fn strip_reserved_properties(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::Object(properties)) = map.get_mut("properties") {
-                for key in [
-                    khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY,
-                    khive_runtime::secret_gate::RESERVED_WEB_RECEIPT_KEY,
-                ] {
-                    properties.remove(key);
-                }
-            }
-            for child in map.values_mut() {
-                strip_reserved_properties(child);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                strip_reserved_properties(item);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn reject_nested_canonical(changeset: &ProposalChangeset) -> Result<(), RuntimeError> {
