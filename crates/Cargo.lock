@@ -2907,6 +2907,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
+ "criterion",
  "iana-time-zone",
  "inventory",
  "khive-changeset",
