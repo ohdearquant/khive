@@ -37,3 +37,7 @@ lattice-embed = { workspace = true }
 [[bench]]
 name = "gtd_bench"
 harness = false
+
+[[bench]]
+name = "gtd_maintenance"
+harness = false
