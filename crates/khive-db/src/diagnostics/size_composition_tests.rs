@@ -263,6 +263,7 @@ fn size_composition_releases_snapshot_on_every_outcome() {
         if outcome == "dbstat" {
             assert!(report
                 .size_composition_error
+                .as_deref()
                 .expect("SQL failure")
                 .contains("query failed"));
             assert_eq!(test_support::entries(), 1);
