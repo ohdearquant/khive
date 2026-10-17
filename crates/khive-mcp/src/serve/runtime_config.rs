@@ -220,56 +220,6 @@ pub(super) fn build_pack_runtime(
     }
 }
 
-#[cfg(test)]
-mod code_map_registry_tests {
-    use super::*;
-
-    #[test]
-    fn pack_runtime_shares_the_main_code_map_registration() {
-        let fixture = tempfile::tempdir().expect("fixture");
-        let map_root = fixture.path().join("maps");
-        std::fs::create_dir(&map_root).expect("map root");
-        let map_path = map_root.join("workspace.db");
-        std::fs::write(&map_path, b"map data").expect("map file");
-        let db_path = fixture.path().join("main.db");
-        let main_backend =
-            Arc::new(StorageBackend::sqlite_for_test(&db_path).expect("main backend"));
-        let config = RuntimeConfig {
-            db_path: Some(db_path),
-            code_map_root: Some(map_root.display().to_string()),
-            code_maps: vec![khive_runtime::engine_config::CodeMapConfig {
-                name: Some("workspace".to_string()),
-                path: Some(map_path.display().to_string()),
-                source_root: Some(fixture.path().display().to_string()),
-                ..khive_runtime::engine_config::CodeMapConfig::default()
-            }],
-            ..RuntimeConfig::default()
-        };
-        let main_runtime = KhiveRuntime::from_backend(Arc::clone(&main_backend), config.clone());
-        let pack_runtime = build_pack_runtime(
-            Arc::clone(&main_backend),
-            BackendId::MAIN,
-            config,
-            &main_backend,
-            &main_runtime,
-            Vec::new().into(),
-            Vec::new().into(),
-        );
-
-        let main_generation = main_runtime
-            .code_map_registry()
-            .resolve("workspace")
-            .expect("main registration")
-            .generation();
-        let pack_generation = pack_runtime
-            .code_map_registry()
-            .resolve("workspace")
-            .expect("pack registration")
-            .generation();
-        assert_eq!(pack_generation, main_generation);
-    }
-}
-
 /// Resolve the `--db`/`KHIVE_DB` value into the anchor used for tier-3
 /// project-local `.khive/config.toml` DISCOVERY — as distinct from
 /// [`khive_runtime::resolve_db_anchor`], which always materializes a concrete
@@ -911,4 +861,54 @@ fn apply_config_pack_selection(
         }
     }
     base
+}
+
+#[cfg(test)]
+mod code_map_registry_tests {
+    use super::*;
+
+    #[test]
+    fn pack_runtime_shares_the_main_code_map_registration() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let map_root = fixture.path().join("maps");
+        std::fs::create_dir(&map_root).expect("map root");
+        let map_path = map_root.join("workspace.db");
+        std::fs::write(&map_path, b"map data").expect("map file");
+        let db_path = fixture.path().join("main.db");
+        let main_backend =
+            Arc::new(StorageBackend::sqlite_for_test(&db_path).expect("main backend"));
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            code_map_root: Some(map_root.display().to_string()),
+            code_maps: vec![khive_runtime::engine_config::CodeMapConfig {
+                name: Some("workspace".to_string()),
+                path: Some(map_path.display().to_string()),
+                source_root: Some(fixture.path().display().to_string()),
+                ..khive_runtime::engine_config::CodeMapConfig::default()
+            }],
+            ..RuntimeConfig::default()
+        };
+        let main_runtime = KhiveRuntime::from_backend(Arc::clone(&main_backend), config.clone());
+        let pack_runtime = build_pack_runtime(
+            Arc::clone(&main_backend),
+            BackendId::MAIN,
+            config,
+            &main_backend,
+            &main_runtime,
+            Vec::new().into(),
+            Vec::new().into(),
+        );
+
+        let main_generation = main_runtime
+            .code_map_registry()
+            .resolve("workspace")
+            .expect("main registration")
+            .generation();
+        let pack_generation = pack_runtime
+            .code_map_registry()
+            .resolve("workspace")
+            .expect("pack registration")
+            .generation();
+        assert_eq!(pack_generation, main_generation);
+    }
 }
