@@ -53,6 +53,134 @@ fn agent_preserves_unknown_channel_heartbeat_nulls() {
     }
 }
 
+// comm.health reports `outbox: null` for a channel with no recorded outbox scan
+// (a legacy row or a quarantine-only identity).
+#[test]
+fn agent_preserves_a_null_outbox() {
+    let v = json!({
+        "channels": [{
+            "channel_kind": "email",
+            "channel_slug": "ops",
+            "outbox": null,
+            "quarantined_count": 1,
+        }]
+    });
+    let out = present_with_policy(
+        v,
+        PresentationMode::Agent,
+        NOW,
+        VerbPresentationPolicy::Standard,
+    );
+    let channel = out["channels"][0].as_object().expect("channel object");
+    assert_eq!(
+        channel.get("outbox"),
+        Some(&Value::Null),
+        "Agent presentation must keep a null outbox: {out}"
+    );
+}
+
+// Before a scan first succeeds, and on an empty pending page, the outbox
+// object carries nulls that state what was not observed.
+#[test]
+fn agent_preserves_unknown_outbox_scan_facts() {
+    let v = json!({
+        "channels": [{
+            "outbox": {
+                "last_scan_completed_at": null,
+                "last_scan_succeeded": null,
+                "last_success_at": null,
+                "last_failure_at": null,
+                "consecutive_failures": null,
+                "last_error": null,
+                "pending_rows_seen": null,
+                "pending_rows_limit": null,
+                "oldest_pending_created_at": null,
+                "scan_interval_secs": null,
+                "stalled": null,
+                "oldest_pending_age_secs": null,
+            },
+        }]
+    });
+    let out = present_with_policy(
+        v,
+        PresentationMode::Agent,
+        NOW,
+        VerbPresentationPolicy::Standard,
+    );
+    let outbox = out["channels"][0]["outbox"]
+        .as_object()
+        .expect("outbox object");
+    for field in [
+        "last_scan_completed_at",
+        "last_scan_succeeded",
+        "last_success_at",
+        "last_failure_at",
+        "consecutive_failures",
+        "last_error",
+        "pending_rows_seen",
+        "pending_rows_limit",
+        "oldest_pending_created_at",
+        "scan_interval_secs",
+        "stalled",
+        "oldest_pending_age_secs",
+    ] {
+        assert_eq!(
+            outbox.get(field),
+            Some(&Value::Null),
+            "Agent presentation must preserve unknown outbox fact `{field}`"
+        );
+    }
+}
+
+#[test]
+fn agent_keeps_a_recorded_empty_outbox_scan() {
+    let v = json!({
+        "channels": [{
+            "outbox": {
+                "last_scan_completed_at": "2025-05-23T16:07:00Z",
+                "last_scan_succeeded": true,
+                "last_success_at": "2025-05-23T16:07:00Z",
+                "last_failure_at": null,
+                "consecutive_failures": 0,
+                "last_error": null,
+                "pending_rows_seen": 0,
+                "pending_rows_limit": 500,
+                "oldest_pending_created_at": null,
+                "scan_interval_secs": 60,
+                "stalled": false,
+                "oldest_pending_age_secs": null,
+            },
+        }]
+    });
+    let out = present_with_policy(
+        v,
+        PresentationMode::Agent,
+        NOW,
+        VerbPresentationPolicy::Standard,
+    );
+    let outbox = &out["channels"][0]["outbox"];
+    assert_eq!(outbox["last_scan_succeeded"], json!(true), "{out}");
+    assert_eq!(outbox["consecutive_failures"], json!(0), "{out}");
+    assert_eq!(outbox["pending_rows_seen"], json!(0), "{out}");
+    assert_eq!(outbox["pending_rows_limit"], json!(500), "{out}");
+    assert_eq!(outbox["scan_interval_secs"], json!(60), "{out}");
+    assert_eq!(outbox["stalled"], json!(false), "{out}");
+    assert!(outbox["last_scan_completed_at"].is_string(), "{out}");
+    assert!(outbox["last_success_at"].is_string(), "{out}");
+    for field in [
+        "last_failure_at",
+        "last_error",
+        "oldest_pending_created_at",
+        "oldest_pending_age_secs",
+    ] {
+        assert_eq!(
+            outbox.get(field),
+            Some(&Value::Null),
+            "an empty scan must keep `{field}` null: {out}"
+        );
+    }
+}
+
 #[test]
 fn agent_truncates_score_field() {
     let v = json!({"score": 0.12345678});
