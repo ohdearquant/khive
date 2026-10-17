@@ -7,8 +7,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use khive_db::stores::blob::FsBlobStore;
 use khive_runtime::atomic_prepare::prepare_add_entity;
 use khive_runtime::keyed_memory::{create_keyed_memory, KeyedMemorySpec};
-use khive_runtime::{run_atomic_unit, AtomicRunOutcome};
+use khive_runtime::{run_atomic_unit, AtomicRunOutcome, KgArchive};
 use khive_storage::{BlobStore, NewAttachment};
+use khive_types::EdgeRelation;
 use serde_json::json;
 use support::{executor, Fixture, CONTENT, DIMS, MODEL, ROWS};
 
@@ -209,12 +210,21 @@ fn keyed_memory(c: &mut Criterion) {
 fn import(c: &mut Criterion) {
     let rt = executor();
     let source = Fixture::new(false);
-    rt.block_on(source.seed_graph());
-    let archive = rt
+    // Storage seeding bypasses endpoint validation. Import must receive a
+    // concept -> concept relation admitted by the live runtime contract.
+    rt.block_on(source.seed_graph(EdgeRelation::Extends));
+    let mut archive = rt
         .block_on(source.runtime.export_kg(&source.token))
         .expect("generate archive");
+    drop(source);
     assert_eq!(archive.entities.len(), ROWS);
     assert_eq!(archive.edges.len(), ROWS);
+    archive.entities.sort_unstable_by_key(|entity| entity.id);
+    archive.edges.sort_unstable_by_key(|edge| edge.edge_id);
+    assert!(archive
+        .edges
+        .iter()
+        .all(|edge| edge.relation == EdgeRelation::Extends));
     let mut group = c.benchmark_group("runtime_import_kg");
     group.throughput(Throughput::Elements(ROWS as u64));
     group.bench_function("10k_entities_10k_edges", |b| {
@@ -222,20 +232,67 @@ fn import(c: &mut Criterion) {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
                 let fx = Fixture::new(false);
+                let empty = rt
+                    .block_on(fx.runtime.export_kg(&fx.token))
+                    .expect("inspect fresh import destination");
+                assert!(empty.entities.is_empty());
+                assert!(empty.edges.is_empty());
                 let start = Instant::now();
                 let result = rt
                     .block_on(fx.runtime.import_kg(&archive, &fx.token))
                     .expect("import");
                 elapsed += start.elapsed();
                 assert_eq!(result.entities_imported, ROWS);
-                assert_eq!(result.edges_imported, ROWS);
+                assert_eq!(
+                    result.edges_imported,
+                    ROWS,
+                    "first skipped edge: {:?}",
+                    result.skipped_edges.first()
+                );
                 assert_eq!(result.edges_skipped, 0);
+                assert!(result.skipped_edges.is_empty());
+                let mut persisted = rt
+                    .block_on(fx.runtime.export_kg(&fx.token))
+                    .expect("read back imported storage");
+                assert_imported_archive(&mut persisted, &archive);
                 black_box(result);
             }
             elapsed
         });
     });
     group.finish();
+}
+
+// Compare actual namespace rows, not only the import summary. Export time is
+// intentionally fresh; every entity/edge archive field is preserved by import
+// for this same-namespace, microsecond-timestamp fixture. Storage-only revision,
+// tombstone and content-ref fields are not part of the archive contract.
+fn assert_imported_archive(actual: &mut KgArchive, expected: &KgArchive) {
+    assert_eq!(actual.format, expected.format);
+    assert_eq!(actual.version, expected.version);
+    assert_eq!(actual.namespace, expected.namespace);
+    assert_eq!(actual.entities.len(), ROWS);
+    assert_eq!(actual.edges.len(), ROWS);
+    actual.entities.sort_unstable_by_key(|entity| entity.id);
+    actual.edges.sort_unstable_by_key(|edge| edge.edge_id);
+    for (got, want) in actual.entities.iter().zip(&expected.entities) {
+        assert_eq!(got.id, want.id);
+        assert_eq!(
+            serde_json::to_value(got).expect("serialize persisted entity"),
+            serde_json::to_value(want).expect("serialize archive entity"),
+            "imported entity {}",
+            want.id
+        );
+    }
+    for (got, want) in actual.edges.iter().zip(&expected.edges) {
+        assert_eq!(got.edge_id, want.edge_id);
+        assert_eq!(
+            serde_json::to_value(got).expect("serialize persisted edge"),
+            serde_json::to_value(want).expect("serialize archive edge"),
+            "imported edge {}",
+            want.edge_id
+        );
+    }
 }
 
 criterion_group! {

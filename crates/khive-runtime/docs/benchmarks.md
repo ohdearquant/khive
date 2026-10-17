@@ -48,6 +48,17 @@ timing loop. Those checks reject empty searches, wrong cardinalities and missing
 graph/archive content. The BFS sizes at depths 1–4 are 5, 21, 85 and 341 nodes,
 including the root; the full graph still contains 10K nodes and edges.
 
+The import archive uses `concept -[extends]-> concept`, which the runtime's
+endpoint contract accepts. The read/export fixture retains its original
+`depends_on` relation. Storage seeding alone does not validate endpoint kinds;
+`import_kg` does, so an invalid relation would measure skipped edges. Each import
+iteration verifies an empty destination before timing, retains the full 10K
+entity/10K edge summary assertions, rejects every skipped edge, and reads back
+all records afterward. The untimed readback compares every archived entity and
+edge field by stable ID, including edge endpoints, relation, weight, metadata
+and timestamps. Export timestamps are intentionally fresh; storage-only fields
+not represented by the archive are outside that comparison.
+
 Writes use sequential `iter_custom` loops: one fresh fixture per iteration, an
 `Instant` interval around the requested operation, and untimed teardown. Only one
 write fixture is live at once. This prevents later iterations from measuring

@@ -87,7 +87,7 @@ fn hybrid_search(c: &mut Criterion) {
 fn graph_and_stats(c: &mut Criterion) {
     let rt = executor();
     let fx = Fixture::new(false);
-    rt.block_on(fx.seed_graph());
+    rt.block_on(fx.seed_graph(khive_types::EdgeRelation::DependsOn));
     let neighbors = || {
         fx.runtime
             .neighbors(&fx.token, id(0), Direction::Out, None, None)

@@ -215,7 +215,7 @@ impl Fixture {
         }
     }
 
-    pub async fn seed_graph(&self) {
+    pub async fn seed_graph(&self, relation: EdgeRelation) {
         self.seed_entities(false).await;
         let edges = (0..ROWS)
             .map(|i| {
@@ -229,7 +229,7 @@ impl Fixture {
                     namespace: "local".into(),
                     source_id: id(source),
                     target_id: id(target),
-                    relation: EdgeRelation::DependsOn,
+                    relation,
                     weight: 1.0,
                     created_at: timestamp(),
                     updated_at: timestamp(),
