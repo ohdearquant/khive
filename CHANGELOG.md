@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Edge-weight validators use the shared `khive-types` predicate,
+  preserving numeric boundaries and validation diagnostics.
 - With a configured runtime actor, a message the email channel quarantines, whatever its
   reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
   the mailbox recipient check keeps the quarantine record and its content reference out of
