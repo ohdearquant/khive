@@ -1,7 +1,15 @@
 //! Migration SQL population for the route census: the files registered in
 //! `khive-db/src/migrations.rs`, not every file under `khive-db/sql`.
 
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use syn::visit::Visit;
+use syn::{Expr, Macro};
+
+use super::super::declaration::Substrate;
+use super::model::RouteClass;
+use super::source_inventory::scan_migration_sources;
 
 fn registered_migration_paths(source: &str) -> Result<BTreeSet<String>, String> {
     let file = syn::parse_file(source).map_err(|error| format!("migrations.rs: {error}"))?;

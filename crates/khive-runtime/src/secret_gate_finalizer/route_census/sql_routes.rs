@@ -1,96 +1,7 @@
-use super::*;
+use std::collections::BTreeSet;
 
-pub(super) const STORE_WRITES: &[&str] = &[
-    "upsert_entity",
-    "upsert_entities",
-    "upsert_entity_with_attachments",
-    "insert_entity_if_absent",
-    "replace_entity_if_unchanged",
-    "upsert_note",
-    "upsert_notes",
-    "insert_note_if_absent",
-    "try_insert_note",
-    "try_insert_note_with_attachments",
-    "replace_note_if_unchanged",
-    "update_note_properties",
-    "set_note_property",
-    "try_patch_note_property",
-    "patch_note_property_atomic",
-    "try_patch_note_properties",
-];
-
-// The complement is explicit, including readers: a new trait method of any
-// spelling makes the census red until its properties behavior is classified.
-pub(super) const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
-    "get_entity",
-    "delete_entity",
-    "query_entities",
-    "query_entities_count_free",
-    "entity_sequence",
-    "query_entities_after",
-    "count_entities",
-    "count_entities_by_type",
-    "get_entity_including_deleted",
-    "get_live_notes_by_key",
-    "query_keyed_notes",
-    "get_note",
-    "get_note_including_deleted",
-    "delete_note",
-    "query_notes",
-    "query_notes_count_free",
-    "query_notes_filtered",
-    "query_notes_filtered_count_free",
-    "count_notes_filtered_in_snapshot",
-    "count_notes_filtered_bounded_in_snapshot",
-    "note_sequence",
-    "query_notes_filtered_after",
-    "query_notes_filtered_bounded",
-    "count_notes",
-    "count_notes_in_namespaces",
-    "get_notes_batch",
-    "get_notes_batch_including_deleted",
-    "get_note_visibility_batch",
-];
-
-pub(super) const ENTITY_BUILDERS: &[&str] = &[
-    "entity_upsert_statement",
-    "entity_insert_if_absent_statement",
-    "entity_replace_if_unchanged_statement",
-];
-pub(super) const NOTE_BUILDERS: &[&str] = &[
-    "note_insert_if_absent_statement",
-    "note_insert_keyed_statement",
-    "note_upsert_statement",
-    "note_replace_if_unchanged_statement",
-    "note_update_properties_statement",
-    "note_set_property_statement",
-];
-
-// External references to these khive-db statements bypass the builder and
-// store-method detectors. Both statements insert a whole note properties
-// object, even when an ON CONFLICT clause does not replace an existing row.
-pub(super) const NOTE_PROPERTY_SQL_CONSTANTS: &[&str] =
-    &["NOTE_UPSERT_SQL", "NOTE_INSERT_IF_ABSENT_SQL"];
-
-// Evidence for a site that reaches a note SQL constant only if a name that the
-// census cannot classify is not a type. The census refuses it wherever it
-// occurs, instead of routing or dropping it.
-pub(super) const UNRESOLVED_CONSTANT: &str = "UNRESOLVED note SQL constant";
-
-// Evidence prefix for a path that resolves to a note SQL constant.
-pub(super) const SQL_CONSTANT_EVIDENCE: &str = "SQL constant ";
-
-// Evidence prefix for a statement that writes a guarded table in a spelling the
-// census cannot classify. The census refuses it wherever it occurs, because a
-// spelling it cannot read is a route it cannot inventory.
-pub(super) const UNCLASSIFIED_SQL: &str = "UNCLASSIFIED guarded-table SQL write";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum DetectedClass {
-    WholeObject,
-    SingleKey(String),
-    FixedKeySet(BTreeSet<String>),
-}
+use super::super::declaration::Substrate;
+use super::model::DetectedClass;
 
 pub(super) fn canonical_key_path(path: &str) -> Option<String> {
     // Canonicalization sorts and deduplicates the set; labels remain byte-exact.
@@ -113,93 +24,6 @@ pub(super) fn detected_key_class(paths: BTreeSet<String>) -> DetectedClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RouteClass {
-    Application,
-    Migration,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct Site {
-    pub(super) key: String,
-    pub(super) target: Substrate,
-    pub(super) route_class: RouteClass,
-    pub(super) class: DetectedClass,
-    pub(super) write_count: usize,
-    pub(super) calls: BTreeSet<String>,
-    pub(super) evidence: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct RuntimeTableSite {
-    pub(super) key: String,
-    pub(super) write_count: usize,
-    pub(super) calls: BTreeSet<String>,
-    pub(super) evidence: BTreeSet<String>,
-}
-
-#[derive(Debug)]
-pub(super) struct SourcePopulation {
-    pub(super) properties: Vec<Site>,
-    pub(super) runtime_tables: Vec<RuntimeTableSite>,
-    /// SQL assets that a followed loader resolved, for the asset-side reach check.
-    pub(super) resolved_sql: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SqlConstantReference {
-    pub(super) site: String,
-    pub(super) constant: String,
-}
-
-pub(super) struct ScannedSource {
-    pub(super) sql_errors: Vec<String>,
-    pub(super) resolved_sql: BTreeSet<String>,
-    pub(super) sites: Vec<Site>,
-    pub(super) runtime_tables: Vec<RuntimeTableSite>,
-    /// Every expression path has an ordinal, whether or not it resolves. Both
-    /// passes visit the same AST, so a sibling reference cannot stand in for it.
-    pub(super) constant_references: BTreeMap<usize, SqlConstantReference>,
-}
-
-pub(super) fn attribute_name(attr: &Attribute) -> String {
-    attr.path()
-        .segments
-        .iter()
-        .map(|part| part.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::")
-}
-
-pub(super) fn test_only(attrs: &[Attribute]) -> bool {
-    fn requires_test(meta: &syn::Meta) -> bool {
-        match meta {
-            syn::Meta::Path(path) => path.is_ident("test"),
-            syn::Meta::List(list) if list.path.is_ident("all") => list
-                .parse_args_with(
-                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-                )
-                .is_ok_and(|items| items.iter().any(requires_test)),
-            syn::Meta::List(list) if list.path.is_ident("any") => list
-                .parse_args_with(
-                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-                )
-                .is_ok_and(|items| !items.is_empty() && items.iter().all(requires_test)),
-            _ => false,
-        }
-    }
-
-    attrs.iter().any(|attr| {
-        let name = attribute_name(attr);
-        if name == "test" || name == "tokio::test" {
-            return true;
-        }
-        name == "cfg"
-            && matches!(&attr.meta, syn::Meta::List(list)
-                if list.parse_args::<syn::Meta>().is_ok_and(|meta| requires_test(&meta)))
-    })
-}
-
 /// One bare top-level identifier, optionally following `$` and `.`.
 pub(super) fn bare_top_level_path(path: &str) -> bool {
     let segment = path.strip_prefix("$.").unwrap_or(path);
@@ -209,18 +33,6 @@ pub(super) fn bare_top_level_path(path: &str) -> bool {
     let mut bytes = segment.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-pub(super) fn literal_string(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Lit(ExprLit {
-            lit: Lit::Str(value),
-            ..
-        }) => Some(value.value()),
-        Expr::Reference(reference) => literal_string(&reference.expr),
-        Expr::Paren(paren) => literal_string(&paren.expr),
-        _ => None,
-    }
 }
 
 /// The guarded table that one word names, if any.
@@ -629,16 +441,80 @@ pub(super) fn sql_single_key_path(literal: &str) -> Option<String> {
         .flatten()
 }
 
-pub(super) fn macro_strings(tokens: TokenStream, strings: &mut Vec<String>) {
-    for token in tokens {
-        match token {
-            TokenTree::Literal(literal) => {
-                if let Ok(value) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
-                    strings.push(value.value());
+pub(super) fn sql_statements(sql: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Sql,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut statements = Vec::new();
+    let mut statement = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut mode = Mode::Sql;
+    while let Some(character) = chars.next() {
+        match mode {
+            Mode::Sql => match character {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::BlockComment;
+                }
+                '\'' => {
+                    statement.push(character);
+                    mode = Mode::SingleQuote;
+                }
+                '"' => {
+                    statement.push(character);
+                    mode = Mode::DoubleQuote;
+                }
+                ';' => {
+                    if !statement.trim().is_empty() {
+                        statements.push(std::mem::take(&mut statement));
+                    }
+                }
+                _ => statement.push(character),
+            },
+            Mode::SingleQuote | Mode::DoubleQuote => {
+                statement.push(character);
+                let quote = if matches!(mode, Mode::SingleQuote) {
+                    '\''
+                } else {
+                    '"'
+                };
+                if character == quote {
+                    if chars.peek() == Some(&quote) {
+                        statement.push(chars.next().expect("peeked quote"));
+                    } else {
+                        mode = Mode::Sql;
+                    }
                 }
             }
-            TokenTree::Group(group) => macro_strings(group.stream(), strings),
-            _ => {}
+            Mode::LineComment => {
+                if character == '\n' {
+                    statement.push(' ');
+                    mode = Mode::Sql;
+                }
+            }
+            Mode::BlockComment => {
+                if character == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    statement.push(' ');
+                    mode = Mode::Sql;
+                }
+            }
         }
     }
+    if !statement.trim().is_empty() {
+        statements.push(statement);
+    }
+    statements
 }

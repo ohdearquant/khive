@@ -1,6 +1,16 @@
 //! Invocation-local source ASTs shared by both route resolution modes.
 
-use super::*;
+use super::ast_helpers::test_only;
+use super::model::{ScannedSource, NOTE_PROPERTY_SQL_CONSTANTS};
+use super::module_resolution::{
+    module_parents, resolve_imports, use_bindings, use_tree_imports, Binding, ModuleBindings,
+    ModuleId, SqlBindings,
+};
+use super::source_collector::{declared_binding, with_declared_types, SourceCollector};
+use super::source_inventory::{module_source_paths, source_path};
+use super::static_sql_source::{CanonicalBindings, StaticSqlSources};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 pub(super) fn parse_production_sources(
     sources: &[(String, String)],
