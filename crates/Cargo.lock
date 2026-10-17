@@ -2384,6 +2384,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "criterion",
  "inventory",
  "khive-db",
  "khive-fs",
