@@ -475,6 +475,10 @@ impl VerbRegistry {
         ("brain", "brain.profile"),
         ("brain", "brain.resolve"),
         ("brain", "brain.bindings"),
+        // Registered rollback-mode map reads: no domain or maintenance writes.
+        ("code", "code.deps"),
+        ("code", "code.list"),
+        ("code", "code.search"),
         // comm
         ("comm", "comm.delivered"),
         ("comm", "comm.transport_status"),
