@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
   Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
   empty, and on any other non-empty value.
+- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
+  host composition register providers before binding ordered peers and their declared
+  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
+  runtimes keep no configured default while explicit manual named access remains available.
+
 ### Changed
 
 - Edge-weight validators use the shared `khive-types` predicate,
@@ -227,10 +232,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
-  host composition register providers before binding ordered peers and their declared
-  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
-  runtimes keep no configured default while explicit manual named access remains available.
 - `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
   for caller-supplied seal keys. All-zero keys are refused; initialization starts
   at epoch zero with no previous key and the same empty, deny-all state.
