@@ -1513,14 +1513,21 @@ messages for which none of those roles is in play, and says so for each one it s
 #### 1. The verb and its scope
 
 `comm.archive(before, dry_run?)` runs on the backend that serves comm and acts on every namespace
-in that backend. `before` is a required timestamp, compared with `created_at`. There is no default
-horizon and no schedule.
+in that backend. `before` is a required RFC 3339 timestamp, compared with `created_at`. There is no
+default horizon and no schedule.
+
+`before` has an upper limit: the run reads its clock once, before selection, and refuses (invalid
+input, naming the latest value it would accept) any `before` later than that reading minus a
+minimum age of 24 hours. No message younger than the minimum age is archived, whatever the caller
+passes, and `dry_run` applies the same refusal. The journal records the clock reading beside
+`before`, and a resumed run (§5 step 3) keeps both from its own entry.
 
 The verb is registered `Commissive` with Gate classification `Write`, as `memory.vacuum` and
 `session.vacuum` are. Because it deletes messages of every actor in the backend, granting it is
 granting that deletion; a multi-tenant deployment does not grant it to tenants. It refuses on a
 backend with no database file path, because the archive file and the run lock are written beside
-the database.
+the database, and on a database not in write-ahead-log mode, because §5 step 6 relies on the log
+keeping commits in order.
 
 `dry_run=true` performs the selection of §2 and returns the counts a run would archive and skip,
 per reason. It writes nothing, takes no lock, and does not resume an earlier run.
@@ -1548,9 +1555,21 @@ whole backend.
 - Neither copy is an endpoint of any edge, live or soft-deleted.
 - Neither copy is an entry in a note stream.
 
+**Thread id spellings.** A stored `thread_id` names `R` when, with surrounding whitespace removed,
+it is one of the four UUID text forms of `R`: hyphenated (36 characters), simple (32 hex digits),
+braced (hyphenated inside `{}`) or URN (`urn:uuid:` followed by the hyphenated form), with the hex
+digits in any letter case. This is the set `uuid::Uuid::parse_str` accepts, and it is the only
+definition of membership this amendment uses. The canonical spelling is the lower-case hyphenated
+form. A `thread_id` that is in none of the four forms is not parseable (`malformed` below). The
+set is wider than the spellings the thread reader looks up by exact match
+(`thread_id_query_spellings` in the comm pack's handler validation): that lookup finds a
+mixed-case spelling only when the reading starts from the row that stores it, so it cannot serve
+as a membership test.
+
 **Thread.** A thread is named by a root UUID `R`. Its members are every live message note in the
-backend whose `thread_id`, in any spelling the thread reader accepts (canonical, compact, braced,
-URN, upper-case), names `R`, together with the note `R` itself. A thread is archivable only when:
+backend whose `thread_id` names `R` in one of those spellings, together with the note `R` itself.
+Selection (§5 step 4) parses every message note's `thread_id` during its census, so a member in
+any of those spellings is found there. A thread is archivable only when:
 
 - `R` is a live message note whose `thread_id` is `R` in canonical spelling;
 - every member stores its `thread_id` in canonical spelling. Version 1 does not rewrite or
@@ -1569,12 +1588,15 @@ checks run per note; the pair-level conditions (read, age, and the exclusions) a
 both copies of a pair; thread conditions come last. Every note a run examines and does not
 archive is counted under the first reason it meets, in this order:
 
-1. `malformed`: not a message with a valid direction, actor fields and parseable `thread_id`;
+1. `malformed`: not a message with a valid direction, actor fields and a `thread_id` in one of the
+   four forms above;
 2. `unpaired`: no structural pair, or more than one note naming the same outbound copy;
 3. `unread`, then `too_recent`;
 4. `channel`, `quarantine`, `attachments`, `referenced` (an edge endpoint), `stream`;
-5. `legacy_thread`: the thread has a member in an older spelling, or its root does not carry its
-   own canonical `thread_id`;
+5. `no_root`, then `legacy_thread`: `no_root` when no live message note has the id `R` (a thread
+   opened by a channel-ingested message whose id is not a note's, for example); `legacy_thread`
+   when the census found a member whose stored `thread_id` is not the canonical spelling, or the
+   root does not carry its own `thread_id` in the canonical spelling;
 6. `oversized`: the thread exceeds the bound;
 7. `thread_blocked`: the note qualifies but its thread does not.
 
@@ -1613,9 +1635,9 @@ A first-reason count is not a census of a class: an unread channel-addressed pai
   copy and the inbound copy are live. Archiving the pair releases the key and ends replay, as a
   hard delete of the outbound copy already does today, and a key is only affected once its pair is
   older than `before`. A later request with the same key creates a new pair only when it is
-  otherwise valid: a send that supplies the archived thread is refused by the existing missing-thread
-  check, a reply to an archived message is refused as not found, and a send that starts a new thread
-  succeeds.
+  otherwise valid: a send that supplies the archived thread is refused by the existing
+  missing-thread check, a reply to an archived message is refused as not found, and a send that
+  starts a new thread succeeds.
 
 #### 4. Continuations that race an archive
 
@@ -1658,6 +1680,7 @@ contracts and is outside this version.
    crash. When another holder has the lock, the run refuses and says another archive run is
    alive. When the lock cannot be taken for any other reason (permissions, an open failure, a file
    system without locks), the run refuses with that error and never reports it as another run.
+   The lock file is created owner-only (mode `0600`) and opened without following a symbolic link.
    This lock belongs to archival alone; it is not the blob collector's lock. It is taken before
    any source writer is admitted and never while one is held. Ownership is the lock and never the
    journal's state.
@@ -1680,18 +1703,35 @@ contracts and is outside this version.
    journal entry and no file. File writes never happen while the source writer is held.
 5. **Journal, then copy.** The run inserts its own journal entry in state `copying`, and only then
    creates the archive file, so no archive file exists without an entry that owns it. The
-   selected threads are written to that new SQLite file beside the comm database. For each thread
+   selected threads are written to that new SQLite file beside the comm database. The file is
+   created exclusively (the run refuses if a file already exists at the path), owner-only (mode
+   `0600`, since it holds message bodies) and without following a symbolic link, and it is written
+   in rollback-journal mode with `synchronous=FULL`. For each thread
    the file holds its message notes as stored rows, every column including `version`, and a
    digest per note over that row's canonical serialization. The live store's `notes_seq` identity
    rows are not copied and never deleted: the sequence row stays the note's durable identity. FTS
    and vector entries are not copied; they are rebuildable state.
-6. **Verify.** The run re-reads the file and compares each thread's notes and digests with the rows
-   it selected. Any difference ends the run with nothing deleted. On success the run records
-   `verified` in its journal, in a source transaction, before the first delete.
+6. **Make durable, then verify.** The run closes its connection to the archive file, then syncs the
+   file and the directory that holds it to stable storage (`fsync`, or `F_FULLFSYNC` on platforms
+   where `fsync` does not reach the device), as blob publication syncs a blob before it becomes
+   reachable ([ADR-111](ADR-111-blob-store.md) §4). It then opens the file read-only, re-reads it
+   and compares each thread's notes and digests with the rows it selected. A failed sync, a failed
+   read or any difference ends the run with nothing deleted and the entry still `copying`. Only
+   after both syncs and the comparison succeed does the run record `verified` in its journal, in a
+   source transaction, before the first delete. The source's `synchronous=NORMAL` is then
+   sufficient: a write-ahead-log commit lost to a power failure takes every later commit with it,
+   so no delete can persist without the `verified` record before it, and that record is written
+   only after the archive is on stable storage. This is also what makes step 3 safe: an entry found
+   short of `verified` has deleted nothing.
 7. **Delete, one thread per transaction.** For each thread in the file, one atomic unit on the
    source writer:
-   - re-checks every condition of §2 for every member, with the thread's membership resolved
-     again in every spelling, and compares each member's digest with the copy;
+   - re-checks every condition of §2 for every member and compares each member's digest with the
+     copy. Membership is resolved again by exact match on the eight formatter spellings of `R`
+     (lower- and upper-case hyphenated, simple, braced and URN), which the thread index can seek.
+     A member in any other accepted spelling that existed at the census already kept the thread
+     out of the run as `legacy_thread`. One written in such a spelling after the census, which
+     only a writer that stores a caller's spelling verbatim can do, is not found here and ends as
+     a write by an unfenced writer after the commit does (§4): it names a root that is gone;
    - applies the prepared deletion statements ordinary hard deletion uses for each member: the
      note row, its FTS document and rowid mapping, its vectors with their provenance and
      approximate-index delete log for each registered embedding model, and its `NoteDeleted`
@@ -1712,7 +1752,8 @@ contracts and is outside this version.
 
    A recorded outcome is never revised, including by a resume.
 8. **Complete.** When every thread has an outcome, the run writes the outcomes into the archive
-   file's manifest and marks its journal entry `complete`.
+   file's manifest, syncs the file again as in step 6, and only then marks its journal entry
+   `complete`.
 
 The result reports the archive file path, threads and notes archived, threads recorded
 `changed_since_copy` and `already_absent`, and the per-reason skip counts. Reclaiming the freed
@@ -1720,9 +1761,15 @@ pages stays with the backend's vacuum path.
 
 **Selection access.** Selection runs before the writer is taken, as a census over every namespace
 in the backend: message notes in pages, and the outbound-reference check over live and
-soft-deleted rows. The existing outbound-reference index excludes soft-deleted rows and is
-prefixed by direction and sender, so the implementation adds the index that check needs. The
-re-check inside step 7 is bounded by the thread bound and uses indexed lookups only.
+soft-deleted rows. The existing outbound-reference index excludes soft-deleted rows and leads with
+namespace, kind, direction and sender, so the implementation adds a non-partial index led by the
+outbound reference itself. The census parses every message note's `thread_id` once, so its cost
+follows the number of message notes. The re-check inside step 7 is bounded by the thread bound,
+except for its two backend-wide lookups: the membership lookup and the check that no other note
+names an outbound copy. The thread index leads with namespace, so the membership lookup walks the
+namespaces that hold notes and seeks each one, as the edge cascade walks the namespaces of
+`graph_edges`; its cost inside the writer follows the number of namespaces, not the size of the
+backend. The outbound-reference lookup seeks the index above directly.
 
 ### Consequences
 
