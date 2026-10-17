@@ -1538,12 +1538,15 @@ mod import_destination_tests {
     #[test]
     fn selected_declared_main_retains_wal_disk_actor_and_import_policy_without_open() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = tmp.path().join("fresh/nested/target.db");
-        let config = tmp.path().join("selected.toml");
+        // The resolved target is canonical, and a temp dir can sit under a symlink
+        // (macOS /var -> /private/var), so build the expected paths from the canonical root.
+        let root = tmp.path().canonicalize().unwrap();
+        let db = root.join("fresh/nested/target.db");
+        let config = root.join("selected.toml");
         std::fs::write(&config, format!("[schema]\nstrict=false\n[actor]\nid=\"lambda:import-test\"\n[[backends]]\nname=\"main\"\npath={:?}\nwal_ceiling_bytes=104857600\ndisk_reserve_bytes=123456\ndisk_guard_deadline_ms=777\n", db.to_str().unwrap())).unwrap();
         let args = ImportArgs {
             config: Some(config),
-            source: tmp.path().join("unused"),
+            source: root.join("unused"),
             db: db.clone(),
             namespace: "local".into(),
             format: None,
