@@ -97,3 +97,56 @@ A >10% wall-time regression in `rrf` or `weighted` at the 2×150-item scenario
 requires a comment in the PR explaining the cause before merge.
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Weighted RRF and fallible normalization coverage
+
+The existing `fusion_bench` target adds 18 scenarios. From `crates/`, run
+`cargo bench -p khive-fusion --benches -- --quick --noplot`.
+
+| Group                   | New scenarios                                                    | Measured input                                                                              | Baseline |
+| ----------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | -------- |
+| `fuse_dispatcher`       | `weighted_rrf/{2,3}src_500items_top{10,50,100}` (6 combinations) | 2 or 3 ordered sources, 500 items each, RRF smoothing k=60, source weights [1,2] or [1,2,3] | pending  |
+| `weight_utils_fallible` | `normalized/{2,3,20}`, `finite_unnormalized/{2,3,20}`            | Positive finite vectors with unit and non-unit sums                                         | pending  |
+| `weight_utils_fallible` | `nan_last/{2,3,20}`, `infinity_last/{2,3,20}`                    | Non-finite final entry, forcing validation of every preceding element                       | pending  |
+
+Fixtures reuse the existing seed-42 source generator. Its actual shared-ID count
+is `floor(per_source / 3)`, or 166 of 500 items; the older "30%" description is
+approximate. Private IDs are distinct across sources. Weighted RRF uses positions
+in each input list, not the generated score magnitudes. Unlike weighted linear
+fusion, its source weights are **not normalized**. The new setup checks exact
+output length, unique IDs and descending-score/ascending-ID ordering.
+
+`try_normalize_weights` rejects the first non-finite entry and returns its index.
+A finite sum different from one is valid and is normalized, so that requested
+case is named `finite_unnormalized`, not an error case. Setup checks both accepted
+outputs and the exact last-index refusals. This matrix uses positive finite input
+for success cases; it does not claim to cover every finite fallback policy.
+
+New dispatcher timings keep the existing boundary: source cloning, ownership
+transfer, validation, fusion and output destruction are included. The fallible
+normalization timing includes validation and any output allocation/destruction;
+fixture construction and assertions stay outside. Thus these are end-to-end
+public-function costs, not allocation-free kernel timings. Existing scenarios
+retain their original source and comparison series.
+
+The producer for pending baselines is the qualified-host `scoring-retrieval`
+component run. Record commit, toolchain, machine, command, scenario and result for
+each completed row. Original historical numbers above retain their provenance.
+The old >10% comment policy is a request for explanation, not an automatic timing
+failure threshold for these advisory measurements.
+
+## Performance guarantees
+
+| Operation                | Input                       | Metric               | Bound                                        |
+| ------------------------ | --------------------------- | -------------------- | -------------------------------------------- |
+| `reciprocal_rank_fusion` | 2 sources × 500 items, k=60 | throughput (items/s) | Advisory trend against the recorded baseline |
+| `fuse` (WeightedRrf)     | 2 sources × 500 items, k=60 | median latency       | Advisory trend against the recorded baseline |
+| `normalize_weights`      | 20-element vector           | median latency       | Advisory trend against the recorded baseline |
+| `try_normalize_weights`  | 20-element valid vector     | median latency       | Advisory trend against the recorded baseline |
+
+All rows are advisory comparisons against rolling and fixed references, never
+fixed percentage failures. The existing RRF target reports latency; its 2×500
+item throughput can be derived as 1,000 divided by the measured operation seconds,
+including the documented clone/destruction costs. No throughput observation is
+invented here. The WeightedRrf row has three explicit output limits above; compare
+like-for-like scenarios. No new deterministic count or allocation bound is added.
