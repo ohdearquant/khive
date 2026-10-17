@@ -19,8 +19,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles refuse updates. Storage failures use `PersistError::Storage`.
   Core migrations now install `atom_weights` and `weight_events`; the standalone
   `init_weight_schema` bootstrap remains available for compatibility.
+### Added
+
+- `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` receives authenticated mail from outside senders
+  (delivered as untrusted external messages and routed as with external senders configured)
+  without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
+  Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
+  empty, and on any other non-empty value.
+### Changed
+
+- Edge-weight validators use the shared `khive-types` predicate,
+  preserving numeric boundaries and validation diagnostics.
+- With a configured runtime actor, a message the email channel quarantines, whatever its
+  reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
+  the mailbox recipient check keeps the quarantine record and its content reference out of
+  every other actor's inbox, thread, read, get and search results. This applies to records
+  ingested after the upgrade: a quarantine record already stored keeps the landing actor it
+  was written with, and nothing re-addresses it. A runtime with no configured actor keeps the
+  landing actor.
+- The email opt-out label (ADR-200 Amendment 2) now reads the first non-quoted paragraph of a
+  reply rather than its first line, so a phrase a mail client wrapped onto the second line still
+  counts, and the phrase list gains the plain asks for no more email ("don't email me",
+  "do not contact me", "no more emails" and their spellings). The bare words "email me" are not a
+  phrase: a reply asking us to email the docs is delivered without the label.
 
 ### Fixed
+
+- SQLite volume-lock directory creation refusals name the attempted path and the
+  `KHIVE_VOLUME_LOCK_DIR` override. Headless and containerized deployments require
+  a writable home directory or an absolute, writable lock directory shared by all
+  cooperating khive processes of the deployment; an unusable directory still
+  refuses the open rather than falling back to a database-specific directory.
 
 - An authenticated opt-out in a message that screening quarantines as `screened` now records
   the reply-stop suppression for its sender before the quarantine is acknowledged, as a
@@ -209,6 +238,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains unimplemented.
 
 ### Added
+
+- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
+  for caller-supplied seal keys. All-zero keys are refused; initialization starts
+  at epoch zero with no previous key and the same empty, deny-all state.
+- Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
+  entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
+  remains pending acceptance and conformance validation.
 
 - Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
   `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct

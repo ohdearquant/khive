@@ -42,9 +42,7 @@ impl Parser {
                 }
                 // Enforce digits on both sides; `f64::parse` would accept `1.` and `-.5`.
                 let int_start = self.pos;
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.advance();
-                }
+                self.skip_ascii_digits();
                 if self.pos == int_start {
                     return Err(self.err("expected digit after '-'"));
                 }
@@ -53,9 +51,7 @@ impl Parser {
                     has_frac = true;
                     self.advance();
                     let frac_start = self.pos;
-                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                        self.advance();
-                    }
+                    self.skip_ascii_digits();
                     if self.pos == frac_start {
                         return Err(self.err(
                             "float literal must have digits after '.' (e.g. '1.0', not '1.')",

@@ -91,6 +91,19 @@ pub struct HandshakeSequenceError {
     pub error: Box<Frame>,
 }
 
+impl HandshakeSequenceError {
+    fn malformed(message: String) -> Self {
+        Self {
+            error: Box::new(Frame::Error {
+                id: None,
+                code: WireErrorCode::MalformedFrame,
+                message,
+                unrecognized_code: None,
+            }),
+        }
+    }
+}
+
 impl std::fmt::Display for HandshakeSequenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.error.as_ref() {
@@ -184,28 +197,16 @@ impl HandshakeGate {
             }
             (State::AwaitingHandshake, _) => {
                 self.state = State::Closed(CloseReason::NonHandshakeFirst);
-                Err(HandshakeSequenceError {
-                    error: Box::new(Frame::Error {
-                        id: None,
-                        code: WireErrorCode::MalformedFrame,
-                        message: format!(
-                            "expected \"handshake\" as the first frame, got {:?}",
-                            frame.kind()
-                        ),
-                        unrecognized_code: None,
-                    }),
-                })
+                Err(HandshakeSequenceError::malformed(format!(
+                    "expected \"handshake\" as the first frame, got {:?}",
+                    frame.kind()
+                )))
             }
             (State::Completed(_), Frame::Handshake { .. }) => {
                 self.state = State::Closed(CloseReason::DuplicateHandshake);
-                Err(HandshakeSequenceError {
-                    error: Box::new(Frame::Error {
-                        id: None,
-                        code: WireErrorCode::MalformedFrame,
-                        message: "handshake already completed on this connection".to_string(),
-                        unrecognized_code: None,
-                    }),
-                })
+                Err(HandshakeSequenceError::malformed(
+                    "handshake already completed on this connection".to_string(),
+                ))
             }
             (State::Completed(_), _) => {
                 // The gate is the server-side inbound admission point, so a
@@ -216,27 +217,16 @@ impl HandshakeGate {
                     Ok(HandshakeOutcome::Admitted)
                 } else {
                     self.state = State::Closed(CloseReason::ServerOnlyKind);
-                    Err(HandshakeSequenceError {
-                        error: Box::new(Frame::Error {
-                            id: None,
-                            code: WireErrorCode::MalformedFrame,
-                            message: format!(
+                    Err(HandshakeSequenceError::malformed(format!(
                                 "frame kind {:?} is server-to-client only; a server never accepts it as an inbound frame",
                                 frame.kind()
-                            ),
-                            unrecognized_code: None,
-                        }),
-                    })
+                            )))
                 }
             }
-            (State::Closed(reason), _) => Err(HandshakeSequenceError {
-                error: Box::new(Frame::Error {
-                    id: None,
-                    code: WireErrorCode::MalformedFrame,
-                    message: format!("connection already closed by {}", reason.phrase()),
-                    unrecognized_code: None,
-                }),
-            }),
+            (State::Closed(reason), _) => Err(HandshakeSequenceError::malformed(format!(
+                "connection already closed by {}",
+                reason.phrase()
+            ))),
         }
     }
 }

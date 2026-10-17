@@ -32,6 +32,20 @@ fn pattern_endpoint_matches(
     }
 }
 
+fn collect_pack_relations(
+    rules: &[EdgeEndpointRule],
+    accepts: impl Fn(&EdgeEndpointRule) -> bool,
+) -> Vec<EdgeRelation> {
+    let mut relations: Vec<EdgeRelation> = rules
+        .iter()
+        .filter(|rule| accepts(rule))
+        .map(|rule| rule.relation)
+        .collect();
+    relations.sort_by_key(|relation| relation.as_str());
+    relations.dedup();
+    relations
+}
+
 /// Relations that a composed pack `EDGE_RULES` set accepts for a given
 /// `(entity_kind, entity_type)` endpoint pair, using the EXACT SAME
 /// `endpoint_matches` semantics `pack_rule_allows` applies internally
@@ -52,17 +66,10 @@ pub fn accepted_pack_relations_for_entities(
     tgt_kind: &str,
     tgt_entity_type: Option<&str>,
 ) -> Vec<EdgeRelation> {
-    let mut relations: Vec<EdgeRelation> = rules
-        .iter()
-        .filter(|r| {
-            endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
-                && endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
-        })
-        .map(|r| r.relation)
-        .collect();
-    relations.sort_by_key(|r| r.as_str());
-    relations.dedup();
-    relations
+    collect_pack_relations(rules, |r| {
+        endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
+            && endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
+    })
 }
 
 /// Relations accepted for one resolved entity endpoint pair under the full
@@ -142,17 +149,10 @@ fn accepted_pack_relations_for_pattern_entities(
     tgt_kind: &str,
     tgt_entity_type: Option<&str>,
 ) -> Vec<EdgeRelation> {
-    let mut relations: Vec<EdgeRelation> = rules
-        .iter()
-        .filter(|r| {
-            pattern_endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
-                && pattern_endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
-        })
-        .map(|r| r.relation)
-        .collect();
-    relations.sort_by_key(|r| r.as_str());
-    relations.dedup();
-    relations
+    collect_pack_relations(rules, |r| {
+        pattern_endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
+            && pattern_endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
+    })
 }
 
 /// All `(source_kind, target_kind)` entity-kind pairs — restricted to the closed
@@ -378,6 +378,33 @@ pub(crate) fn merge_dependency_kind(
         o.insert("dependency_kind".to_string(), serde_json::json!(inferred));
     }
     Some(obj)
+}
+
+/// Explain a dependency qualifier added by inference without changing metadata.
+///
+/// Call after metadata validation, with the caller's metadata after merging an
+/// explicit top-level qualifier and the effective metadata after inference.
+/// A present caller key always suppresses the hint. The effective value comes
+/// from the existing inference path rather than a second endpoint-kind table.
+pub fn dependency_kind_inference_hint(
+    relation: EdgeRelation,
+    supplied_metadata: Option<&serde_json::Value>,
+    effective_metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    if relation != EdgeRelation::DependsOn
+        || supplied_metadata.is_some_and(|metadata| metadata.get("dependency_kind").is_some())
+    {
+        return None;
+    }
+    let kind = effective_metadata?
+        .get("dependency_kind")?
+        .as_str()
+        .filter(|kind| VALID_DEPENDENCY_KINDS.contains(kind))?;
+    let mut hint = format!("dependency_kind was inferred as {kind:?} from endpoint kinds.");
+    if kind == "normative" {
+        hint.push_str(" For references that are not normative, use links_to.");
+    }
+    Some(hint)
 }
 
 /// Merge a caller-supplied top-level `dependency_kind` param into an edge's

@@ -17,7 +17,33 @@ pub struct ExternalInboundConfig {
 }
 
 impl ExternalInboundConfig {
-    /// Load routing only when the host's frozen policy enables external senders.
+    /// Read `KHIVE_EMAIL_EXTERNAL_INBOUND`, which enables external inbound mail on its own,
+    /// with no external sender configured, so outbound external sending stays disabled.
+    ///
+    /// Unset or empty is `false` and `enabled` (any case) is `true`. Any other value is a
+    /// configuration error rather than a silent `false`.
+    pub fn inbound_only_from_env() -> Result<bool, ChannelError> {
+        let raw = match std::env::var("KHIVE_EMAIL_EXTERNAL_INBOUND") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(false),
+            Err(error) => {
+                return Err(ChannelError::Config(format!(
+                    "KHIVE_EMAIL_EXTERNAL_INBOUND is invalid: {error}"
+                )));
+            }
+        };
+        match raw.trim() {
+            "" => Ok(false),
+            value if value.eq_ignore_ascii_case("enabled") => Ok(true),
+            value => Err(ChannelError::Config(format!(
+                "KHIVE_EMAIL_EXTERNAL_INBOUND {value:?} is not recognised: set it to \"enabled\" \
+                 or leave it unset"
+            ))),
+        }
+    }
+
+    /// Load routing only when external inbound is enabled: by configured external senders in the
+    /// host's frozen policy, or by [`Self::inbound_only_from_env`].
     pub fn from_env(enabled: bool) -> Result<Option<Self>, ChannelError> {
         if !enabled {
             return Ok(None);
