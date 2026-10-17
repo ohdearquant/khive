@@ -111,17 +111,21 @@ jobs:
   # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
   # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
   # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  #
+  # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
+  # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
   changed-paths:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
     needs: resolve-revision
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The scope step fetches a binary and ingests the workspace map; its own steps are bounded below it.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
-      integration_only: ${{ steps.classify.outputs.integration_only }}
+      test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@v7
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -142,7 +146,6 @@ jobs:
         run: |
           set -euo pipefail
           docs_only=false
-          integration_only=false
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
@@ -184,20 +187,56 @@ jobs:
           if [[ "$docs_only" != "true" ]]; then
             docs_only=false
           fi
-          # A pull request from this repository's own codex/ branches is built and tested before review
-          # and reaches main only through an integration/** branch, whose push run executes every job on
-          # the merged tree. When it changes crate source and Markdown only, its own run keeps the checks
-          # below and skips the build and test jobs. A change to a workflow, a CI script, a manifest, a
-          # lockfile or toolchain configuration keeps the full suite here (scripts/ci-integration-only.sh).
-          if [[ "$EVENT_NAME" == "pull_request" && "$docs_only" != "true" \
-                && "${HEAD_REF:-}" == codex/* && "${HEAD_REPOSITORY:-}" == "$REPOSITORY" ]]; then
-            integration_only=$(bash scripts/ci-integration-only.sh "$base" "$HEAD_SHA")
-          fi
-          if [[ "$integration_only" != "true" ]]; then
-            integration_only=false
-          fi
           echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
-          echo "integration_only=$integration_only" | tee -a "$GITHUB_OUTPUT"
+      # The path rules run first, on the changed paths alone (--paths-only prints `full` or `map`). Only a
+      # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
+      # successful push run on main published, which ingests this checkout's map and resolves the changed
+      # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
+      # and every event other than a pull request writes `full`.
+      - name: Scope
+        id: scope
+        if: steps.classify.outputs.docs_only != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          test_scope=full
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "full suite: $EVENT_NAME runs are never scoped"
+          elif ! base=$(git rev-parse --verify "${HEAD_SHA}^1"); then
+            echo "full suite: the merge ref has no base parent"
+          else
+            mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            if [[ "$mode" == "map" ]]; then
+              binary=""
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
+                --jq '.workflow_runs[].id') || runs=""
+              for run_id in $runs; do
+                dir="$RUNNER_TEMP/kkernel-main-$run_id"
+                if timeout 120 gh run download "$run_id" -R "$REPOSITORY" -n kkernel-debug-linux -D "$dir" \
+                    && [[ -f "$dir/kkernel" ]]; then
+                  chmod +x "$dir/kkernel"
+                  binary="$dir/kkernel"
+                  echo "kkernel from main push run $run_id"
+                  break
+                fi
+              done
+              if [[ -z "$binary" ]]; then
+                echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
+              else
+                test_scope=$(timeout 300 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                  || test_scope=full
+              fi
+            fi
+          fi
+          if [[ -z "$test_scope" ]]; then
+            test_scope=full
+          fi
+          echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -281,7 +320,7 @@ jobs:
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -345,11 +384,16 @@ jobs:
       # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
       # `ld terminated with signal 7 [Bus error]`, e.g. run 28604091732).
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # `full`, or the crates this pull request changed plus their dependents (ADR-205); scripts/ci.sh
+      # passes them to the test and clippy phases as -p arguments. An unset scope runs the full suite.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
       # The model cache below is load-bearing, not an optimisation: with this
       # set, a phase whose model is missing fails naming the directory instead
       # of fetching from huggingface.co.
       LATTICE_OFFLINE: "1"
     steps:
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
@@ -539,11 +583,28 @@ jobs:
       - name: khive-contract suite
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
+      # The pull-request scope step runs this kkernel to ingest the workspace map (ADR-205 D4). It is the
+      # debug build the workspace tests just ran, published only by a main push run whose shard 1 passed
+      # every step above, with its debug sections stripped.
+      - name: Strip the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/kkernel-scope"
+          strip --strip-debug -o "$RUNNER_TEMP/kkernel-scope/kkernel" target/debug/kkernel
+          ls -l target/debug/kkernel "$RUNNER_TEMP/kkernel-scope/kkernel"
+      - name: Publish the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kkernel-debug-linux
+          path: ${{ runner.temp }}/kkernel-scope/kkernel
+          retention-days: 7
+          if-no-files-found: error
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -619,7 +680,7 @@ jobs:
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -705,7 +766,7 @@ jobs:
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -893,7 +954,7 @@ jobs:
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -916,7 +977,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
     needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -972,7 +1033,7 @@ jobs:
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -1184,7 +1245,7 @@ jobs:
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -1210,7 +1271,7 @@ jobs:
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1378,7 +1439,7 @@ jobs:
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1403,7 +1464,7 @@ jobs:
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -1483,7 +1544,7 @@ jobs:
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1558,7 +1619,9 @@ jobs:
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    # A scoped pull request skips coverage: a number over a subset is not comparable with the baseline
+    # (ADR-205 D5). Every run on main keeps it.
+    if: needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1745,7 +1808,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
     needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1823,26 +1886,29 @@ jobs:
           # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
           # inputs fail the ratchet. The lane jobs may skip only when the
-          # classifier succeeded and reported docs_only=true or
-          # integration_only=true. Any other skip fails the gate. On the
-          # integration lane this gate covers the jobs that ran here; the
-          # build and test jobs run in the integration branch's push run.
+          # classifier succeeded and reported docs_only=true. The coverage
+          # jobs may also skip when the classifier succeeded with a crate-list
+          # test scope (ADR-205 D6). Any other skip fails the gate.
           echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
-          echo "$NEEDS" | jq -r '"integration lane: \(.["changed-paths"].result) integration_only=\(.["changed-paths"].outputs.integration_only // "unset")"'
+          echo "$NEEDS" | jq -r '"test scope: \(.["changed-paths"].result) test_scope=\(.["changed-paths"].outputs.test_scope // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
             | (if .["changed-paths"].result == "success"
-                  and (.["changed-paths"].outputs.docs_only == "true"
-                       or .["changed-paths"].outputs.integration_only == "true")
+                  and .["changed-paths"].outputs.docs_only == "true"
                then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
                      "msrv-check", "core-only"]
                else [] end) as $docs_lane_skips
+            | (.["changed-paths"].outputs.test_scope // "") as $scope
+            | (if .["changed-paths"].result == "success"
+                  and $scope != "" and ($scope | ascii_downcase) != "full"
+               then ["coverage-measurement", "coverage-ratchet"]
+               else [] end) as $scoped_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped"
-                  or (($allowed_skips + $docs_lane_skips) | index($job) | not)))
+                  or (($allowed_skips + $docs_lane_skips + $scoped_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"
