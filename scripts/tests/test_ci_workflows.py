@@ -718,6 +718,65 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
         )
 
 
+def steps_before_checkout_in_missing_directory(text: str) -> list[str]:
+    """Name each `run` step that executes before `actions/checkout` in a job whose default
+    working directory is a relative path, without setting its own working directory.
+
+    Such a step runs in a directory the checkout has not created yet and fails with
+    "No such file or directory" before its command starts.
+    """
+    offenders = []
+    jobs = re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text.split("\njobs:\n", 1)[1])
+    for job in jobs:
+        name = job.split(":", 1)[0]
+        workdir = re.search(r"(?m)^    defaults:\n      run:\n(?:        .*\n)*?        working-directory: (\S+)", job)
+        if not workdir or workdir.group(1).startswith(("/", "${{")):
+            continue
+        steps = job.split("\n    steps:\n", 1)
+        if len(steps) < 2:
+            continue
+        for step in re.split(r"(?m)^      - ", steps[1])[1:]:
+            if re.search(r"uses: actions/checkout@", step):
+                break
+            if re.search(r"(?m)^(?:        )?run:", step) and "working-directory:" not in step:
+                offenders.append(f"{name}: {step.splitlines()[0].strip()}")
+    return offenders
+
+
+class StepOrderWorkflowTests(unittest.TestCase):
+    def test_no_run_step_precedes_checkout_in_a_missing_working_directory(self):
+        names = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
+        self.assertIn("ci.yml", names)
+        offenders = {name: steps_before_checkout_in_missing_directory(workflow_text(name)) for name in names}
+        self.assertEqual({name: found for name, found in offenders.items() if found}, {})
+
+    def test_the_check_finds_a_run_step_before_checkout(self):
+        text = textwrap.dedent(
+            """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                defaults:
+                  run:
+                    working-directory: crates
+                steps:
+                  - name: Too early
+                    run: echo early
+                  - uses: actions/checkout@v7
+                  - name: After
+                    run: echo late
+              other:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: No default directory
+                    run: echo fine
+                  - uses: actions/checkout@v7
+            """
+        )
+        self.assertEqual(steps_before_checkout_in_missing_directory(text), ["build: name: Too early"])
+
+
 class CiMatrixWorkflowTests(unittest.TestCase):
     """Evaluates the `ci` job's matrix expression for each event shape.
 

@@ -392,11 +392,13 @@ jobs:
       # of fetching from huggingface.co.
       LATTICE_OFFLINE: "1"
     steps:
-      - name: Test scope
-        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      # Steps before the checkout cannot use the job's default working directory: `crates` does
+      # not exist until the repository is checked out.
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
       # check + clippy + test + release passes exceed that, and ld's mmap'd
       # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
