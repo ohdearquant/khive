@@ -18,3 +18,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "gate_lifecycle"
+harness = false
+
+[[bench]]
+name = "gate_allocations"
+harness = false
