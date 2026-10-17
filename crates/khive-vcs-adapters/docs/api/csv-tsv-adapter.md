@@ -6,6 +6,12 @@ for quoted separators, escaped quotes, CRLF and multiline fields. Rows must have
 number of fields as the header. Empty input, empty headers and case-insensitive duplicate
 headers are refused. Header-only input is accepted when its columns satisfy the required shape.
 
+Existing `new` construction is strict. `new_with_kind_policy(source, format,
+default_kind, extra_valid_kinds, ImportKindPolicy::PreserveUnknown)` admits genuinely unknown
+entity kinds, including supplied defaults, retaining their exact textual spelling. Known kinds
+and aliases keep their normal normalization. Relations remain closed in both policies;
+mandatory distinct-kind warnings belong to the importer after complete preflight.
+
 Headers are trimmed. Nonblank textual cells retain their original bytes, including quoted
 surrounding whitespace and newlines. Whitespace-only cells are treated as absent; numeric
 weights accept surrounding whitespace. Field names are case-insensitive; property names
@@ -35,4 +41,4 @@ kkernel kg import records.data --format csv --db private.db --default-kind conce
 An existing Rust CLI limitation remains: adapter edge endpoints must refer to entities in the
 same import. Consequently, a standalone CSV/TSV edge list is parsed by the adapter but refused
 by the CLI, even if the target database already contains the endpoints. This is an existing gap
-against ADR-036 §6, not a new endpoint policy. Mapping files and schema modes remain separate work.
+against ADR-036 §6, not a new endpoint policy. Mapping files remain separate work.
