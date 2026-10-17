@@ -6,6 +6,11 @@ use rusqlite::{params, Connection};
 use syn::parse::Parser;
 use syn::visit::Visit;
 
+use khive_db::stores::note::note_due_key_values;
+
+#[path = "../../khive-db/src/stores/note/guarded_patch.rs"]
+mod guarded_note_patch;
+
 #[path = "../../khive-runtime/tests/support/static_sql_source.rs"]
 mod static_sql_source;
 use static_sql_source::{CanonicalBindings, StaticSqlSources};
@@ -16,11 +21,6 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
     "khive-db/sql/notes-ddl.sql",
 ];
 const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
-    (
-        "khive-pack-comm/sql/quarantine_duplicate_retention_repair.sql",
-        COMM_INGEST,
-        "repair_duplicate_quarantine",
-    ),
     (
         "khive-pack-gtd/sql/task-transition-update.sql",
         GTD,
@@ -46,7 +46,7 @@ const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
 const COMM_HEARTBEAT: &str = "khive-pack-comm/src/handlers/quarantine_heartbeat.rs";
-const COMM_INGEST: &str = "khive-pack-comm/src/handlers/ingest.rs";
+const GUARDED_PATCH: &str = "khive-db/src/stores/note/guarded_patch.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn words(sql: &str) -> Vec<String> {
@@ -1035,9 +1035,8 @@ fn census() -> BTreeMap<(String, String), String> {
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
         (MESSAGE, "create_keyed_message_pair_with_attachments"),
-        // A matching quarantine replay repairs legacy retention metadata in
-        // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM_INGEST, "repair_duplicate_quarantine"),
+        // Guarded partial properties advance through the note version trigger.
+        (GUARDED_PATCH, "note_patch_properties_statement"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -1056,6 +1055,14 @@ fn census() -> BTreeMap<(String, String), String> {
         "property_cas_statements".to_owned(),
     );
     let statement = property_cas_probe_statement();
+    assert!(statement.sql.starts_with(&found[&key]));
+    assert!(note_writer(&statement.sql));
+    found.insert(key, statement.sql);
+    let key = (
+        GUARDED_PATCH.to_owned(),
+        "note_patch_properties_statement".to_owned(),
+    );
+    let statement = guarded_patch_probe_statement();
     assert!(statement.sql.starts_with(&found[&key]));
     assert!(note_writer(&statement.sql));
     found.insert(key, statement.sql);
@@ -1190,10 +1197,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "{}",
         ),
         (
-            COMM_INGEST,
-            "repair_duplicate_quarantine",
+            GUARDED_PATCH,
+            "note_patch_properties_statement",
             "message",
-            r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
+            "{}",
         ),
         (FAULT, "injected_failure_statement", "memory", "{}"),
     ];
@@ -1281,18 +1288,14 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 params!["active", 200_i64, ID, "local", "memory"],
             ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
-            COMM_INGEST => conn.execute(
-                sql,
-                params![
-                    ID,
-                    "local",
-                    "census-ref",
-                    "email",
-                    "census@example.com",
-                    300_i64,
-                    200_i64
-                ],
-            ),
+            GUARDED_PATCH => {
+                let statement = guarded_patch_probe_statement();
+                assert_eq!(statement.sql, *sql);
+                conn.execute(
+                    sql,
+                    rusqlite::params_from_iter(guarded_patch_probe_params(&statement)),
+                )
+            }
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),
         }
@@ -2018,6 +2021,37 @@ fn markerless_route_census_rejects_empty_and_unlisted_production_callers() {
         std::panic::catch_unwind(|| assert_markerless_callers(&scan(transport), &inventory))
             .is_err()
     );
+}
+
+fn guarded_patch_probe_statement() -> khive_storage::SqlStatement {
+    let patch = khive_storage::note::NotePropertyPatch {
+        preconditions: Vec::new(),
+        set: [("checked".into(), serde_json::json!(true))].into(),
+        extend_expires_at: None,
+        updated_at: 200,
+    };
+    guarded_note_patch::note_patch_properties_statement(
+        uuid::Uuid::parse_str(ID).unwrap(),
+        "local",
+        "message",
+        &patch,
+    )
+    .unwrap()
+}
+
+fn guarded_patch_probe_params(
+    statement: &khive_storage::SqlStatement,
+) -> Vec<rusqlite::types::Value> {
+    statement
+        .params
+        .iter()
+        .map(|value| match value {
+            khive_storage::SqlValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+            khive_storage::SqlValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+            khive_storage::SqlValue::Null => rusqlite::types::Value::Null,
+            other => panic!("unexpected real guarded patch probe binding: {other:?}"),
+        })
+        .collect()
 }
 
 // These probes call the real public builder. Only its chosen Uuid/Text fixture

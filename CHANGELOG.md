@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `NoteStore::try_patch_note_properties` applies guarded partial property writes,
+  forward-only expiry and a monotonic update timestamp in one storage operation.
+  Its provided default returns `Unsupported`; existing implementations remain
+  source-compatible. Comm duplicate-quarantine repair now uses this typed operation
+  through a channel-ingest capability, preserving its property guards and writer
+  admission while removing the pack's repair SQL.
 - `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` receives authenticated mail from outside senders
   (delivered as untrusted external messages and routed as with external senders configured)
   without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
