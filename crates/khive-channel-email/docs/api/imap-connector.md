@@ -58,7 +58,7 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.
 
-See `crates/khive-channel-email/src/channel.rs`'s
+See `crates/khive-channel-email/src/channel/tests.rs`'s
 `poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata` test for the
 end-to-end proof that a `Malformed` disposition survives into the `ChannelEnvelope` handed
 to `comm.ingest`, not just this function's intermediate value.

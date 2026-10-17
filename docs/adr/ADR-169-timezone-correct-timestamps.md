@@ -276,11 +276,11 @@ conceptually belongs to, because the two do not always agree:
 | `sent_at`      | `crates/khive-pack-comm/src/handlers.rs::handle_send` / `crates/khive-pack-comm/src/handlers/reply.rs::handle_reply` and `crates/khive-pack-comm/src/handlers/ingest.rs::handle_ingest` |
 | `delivered_at` | `crates/khive-mcp/src/serve.rs:1562,1872`                                                                                                                                               |
 | `cancelled_at` | `crates/khive-pack-schedule/src/handlers.rs:1060`                                                                                                                                       |
-| `last_seen_at` | `crates/khive-pack-code/src/source_ingest.rs` (many sites; see the enumeration note)                                                                                                    |
+| `last_seen_at` | `crates/khive-pack-code/src/source_ingest.rs` and `crates/khive-pack-code/src/source_ingest/l2.rs` (many sites; see the enumeration note)                                               |
 
 **This table names fields and files, not a closed set of lines, and it is a starting point rather
 than the inventory itself.** An earlier draft cited `last_seen_at` as two specific lines in
-`source_ingest.rs`; that file in fact writes the field at nine, and a reader auditing the two
+`source_ingest.rs`; that file in fact wrote the field at nine sites, and a reader auditing the two
 cited ones would have finished believing the field was covered. Line lists in a document that
 outlives the code it cites decay silently and in the direction of looking complete, so the
 enumeration belongs in a command, not here. Enumerate before trusting any row:

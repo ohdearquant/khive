@@ -61,6 +61,14 @@ pub fn database_file_identity(path: &Path) -> io::Result<DatabaseFileIdentity> {
     identity_from_handle(file.as_raw_handle())
 }
 
+/// Identity of a file held open by an external owner, without resolving its path.
+#[cfg(windows)]
+pub fn database_file_identity_from_file(file: &std::fs::File) -> io::Result<DatabaseFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    identity_from_handle(file.as_raw_handle())
+}
+
 #[cfg(windows)]
 fn identity_from_handle(
     handle: std::os::windows::io::RawHandle,

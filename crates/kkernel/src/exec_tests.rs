@@ -2796,9 +2796,12 @@ async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
         return;
     }
 
+    // The dispatch and atomic pipelines are awaited from many points of this
+    // one test future. Boxing them keeps each behind a pointer, so the test
+    // future stays inside a default test-thread stack in debug builds.
     async fn call(db_path: &str, ops: &str) -> serde_json::Value {
         let server = isolated_server(db_path);
-        let envelope = dispatch_json(&server, ops).await;
+        let envelope = Box::pin(dispatch_json(&server, ops)).await;
         assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
         envelope["results"][0]["result"].clone()
     }
@@ -2809,12 +2812,12 @@ async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
 
     async fn update(db_path: &str, atomic: bool, args: serde_json::Value) -> Result<(), String> {
         let envelope = if atomic {
-            crate::atomic_apply::execute_atomic_ops_file(
+            Box::pin(crate::atomic_apply::execute_atomic_ops_file(
                 vec![atomic_op("update", args)],
                 atomic_cfg(db_path),
                 &KhiveConfig::default(),
                 khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
-            )
+            ))
             .await
             .map_err(|error| format!("{error:#}"))?
         } else {
@@ -2826,7 +2829,7 @@ async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
                 .collect::<Vec<_>>()
                 .join(", ");
             let server = isolated_server(db_path);
-            dispatch_json(&server, &format!("update({fields})")).await
+            Box::pin(dispatch_json(&server, &format!("update({fields})"))).await
         };
         let accepted = if atomic {
             envelope["atomic"]["committed"] == true
