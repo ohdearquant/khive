@@ -2541,3 +2541,45 @@ fn wal_ceiling_alias_conflict_escapes_control_characters_in_the_path() {
 }
 include!("engine_config_backend_batch_tests.rs");
 include!("engine_config_storage_tests.rs");
+
+#[test]
+fn code_map_configuration_parses_entries_and_retains_malformed_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+code_map_root = "/var/lib/khive/maps"
+
+[[code_maps]]
+name = "workspace"
+path = "/var/lib/khive/maps/workspace.db"
+source_root = "/work/project"
+"#,
+    );
+    let config = KhiveConfig::load(Some(&path))
+        .expect("config loads")
+        .expect("config exists");
+
+    assert_eq!(config.code_map_root.as_deref(), Some("/var/lib/khive/maps"));
+    assert_eq!(config.code_maps.len(), 1);
+    assert_eq!(config.code_maps[0].name.as_deref(), Some("workspace"));
+    assert_eq!(
+        config.code_maps[0].path.as_deref(),
+        Some("/var/lib/khive/maps/workspace.db")
+    );
+    assert_eq!(
+        config.code_maps[0].source_root.as_deref(),
+        Some("/work/project")
+    );
+
+    let path = write_toml(
+        &dir,
+        "[[code_maps]]\nname = \"workspace\"\nsource_root = \"/src\"\nunknown = true\n\n[[code_maps]]\nname = \"missing-path\"\nsource_root = \"/src\"\n",
+    );
+    let config = KhiveConfig::load(Some(&path))
+        .expect("malformed entries do not prevent configuration parsing")
+        .expect("config exists");
+    assert_eq!(config.code_maps.len(), 2);
+    assert!(config.code_maps[0].unknown_fields.contains_key("unknown"));
+    assert!(config.code_maps[1].path.is_none());
+}

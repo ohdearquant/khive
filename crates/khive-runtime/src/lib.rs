@@ -19,6 +19,9 @@ pub mod blob;
 pub mod bounded_read;
 pub mod build_info;
 mod code_map_runtime;
+pub use code_map_runtime::{
+    CodeMapRegistry, FileIdentity, RegisteredCodeMap, RegistrationGeneration,
+};
 pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
@@ -155,8 +158,9 @@ pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
-    GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
+    BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
+    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling,
+    StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
