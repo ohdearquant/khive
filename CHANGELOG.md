@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
   Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
   empty, and on any other non-empty value.
+- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
+  host composition register providers before binding ordered peers and their declared
+  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
+  runtimes keep no configured default while explicit manual named access remains available.
+
 ### Changed
 
 - Edge-weight validators use the shared `khive-types` predicate,

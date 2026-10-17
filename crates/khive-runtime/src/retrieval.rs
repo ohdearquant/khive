@@ -258,8 +258,9 @@ impl KhiveRuntime {
     /// Embed a query string for retrieval using the named model.
     ///
     /// Applies the pre-0.6 query-role behavior. E5 and Qwen models retain
-    /// their query instructions, while BGE and custom providers receive the
-    /// original unprefixed query text.
+    /// their query instructions and BGE receives the original unprefixed query
+    /// text. A custom provider receives the original text through its
+    /// query-role method and owns its own query preparation.
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
@@ -300,12 +301,12 @@ impl KhiveRuntime {
         let emb_model = model.unwrap_or_default();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let embeddings = match emb_model {
-            EmbeddingModel::BgeSmallEnV15
-            | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => {
-                with_embedding_admission(service.embed(&texts, emb_model)).await
-            }
+        let embeddings = match model {
+            Some(
+                EmbeddingModel::BgeSmallEnV15
+                | EmbeddingModel::BgeBaseEnV15
+                | EmbeddingModel::BgeLargeEnV15,
+            ) => with_embedding_admission(service.embed(&texts, emb_model)).await,
             _ => with_embedding_admission(service.embed_query(&texts, emb_model)).await,
         };
         let out = embeddings?
@@ -560,12 +561,12 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = match emb_model {
-            EmbeddingModel::BgeSmallEnV15
-            | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => {
-                with_embedding_admission(service.embed(texts, emb_model)).await
-            }
+        let out = match model {
+            Some(
+                EmbeddingModel::BgeSmallEnV15
+                | EmbeddingModel::BgeBaseEnV15
+                | EmbeddingModel::BgeLargeEnV15,
+            ) => with_embedding_admission(service.embed(texts, emb_model)).await,
             _ => with_embedding_admission(service.embed_query(texts, emb_model)).await,
         };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
@@ -1002,53 +1003,6 @@ impl KhiveRuntime {
 
             fused.truncate(limit as usize);
             Ok((fused, vector_error))
-        })
-        .await?
-    }
-
-    /// The vector stage of hybrid entity search: one KNN query over the entity vectors of
-    /// the primary namespace. It does not depend on an entity kind, which only the text
-    /// stage and the filter after fusion apply.
-    async fn hybrid_vector_stage(
-        &self,
-        token: &NamespaceToken,
-        query_text: &str,
-        query_vector: Option<Vec<f32>>,
-        candidates: u32,
-        vector_similarity_floor: Option<f64>,
-        tolerate_vector_error: bool,
-    ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
-        khive_storage::await_request_read_phase("hybrid_search.vector", async {
-            let mut vector_error: Option<String> = None;
-            let mut vector_hits =
-                if query_vector.is_some() || self.config().embedding_model.is_some() {
-                    match self
-                        .vector_search(
-                            token,
-                            query_vector,
-                            Some(query_text),
-                            candidates,
-                            Some(SubstrateKind::Entity),
-                        )
-                        .await
-                    {
-                        Ok(hits) => hits,
-                        Err(e) if tolerate_vector_error => {
-                            vector_error = Some(e.to_string());
-                            Vec::new()
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    Vec::new()
-                };
-            if let Some(cosine_floor) = vector_similarity_floor {
-                // Vector store scores use canonical cosine similarity (`1 - distance`),
-                // so the caller's raw-cosine floor is already on the comparison scale.
-                let score_floor = DeterministicScore::from_f64(cosine_floor);
-                vector_hits.retain(|hit| hit.score >= score_floor);
-            }
-            Ok((vector_hits, vector_error))
         })
         .await?
     }

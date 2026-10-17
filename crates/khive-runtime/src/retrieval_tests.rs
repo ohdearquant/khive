@@ -1073,6 +1073,7 @@ async fn hybrid_search_each_kind_matches_per_kind_search_when_one_kind_dominates
 // ---- embed intent tests ----
 
 struct CapturingEmbeddingService {
+    dimensions: usize,
     captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
@@ -1084,7 +1085,7 @@ impl EmbeddingService for CapturingEmbeddingService {
         _model: EmbeddingModel,
     ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
         self.captured.lock().unwrap().push(texts.to_vec());
-        Ok(texts.iter().map(|_| vec![1.0]).collect())
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
     }
 
     fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -1102,6 +1103,7 @@ struct CapturingEmbedderProvider {
 }
 
 struct RewritingPassageService {
+    dimensions: usize,
     captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
@@ -1113,7 +1115,7 @@ impl EmbeddingService for RewritingPassageService {
         _model: EmbeddingModel,
     ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
         self.captured.lock().unwrap().push(texts.to_vec());
-        Ok(texts.iter().map(|_| vec![1.0]).collect())
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
     }
 
     async fn embed_passage(
@@ -1146,11 +1148,14 @@ impl EmbedderProvider for RewritingPassageProvider {
     }
 
     fn dimensions(&self) -> usize {
-        1
+        crate::config::parse_embedding_model_alias(&self.name)
+            .map(|model| model.dimensions())
+            .unwrap_or(1)
     }
 
     async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
         Ok(std::sync::Arc::new(RewritingPassageService {
+            dimensions: self.dimensions(),
             captured: std::sync::Arc::clone(&self.captured),
         }))
     }
@@ -1245,11 +1250,14 @@ impl EmbedderProvider for CapturingEmbedderProvider {
     }
 
     fn dimensions(&self) -> usize {
-        1
+        crate::config::parse_embedding_model_alias(&self.name)
+            .map(|model| model.dimensions())
+            .unwrap_or(1)
     }
 
     async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
         Ok(std::sync::Arc::new(CapturingEmbeddingService {
+            dimensions: self.dimensions(),
             captured: std::sync::Arc::clone(&self.captured),
         }))
     }
