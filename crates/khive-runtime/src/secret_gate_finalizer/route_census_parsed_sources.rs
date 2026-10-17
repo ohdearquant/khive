@@ -11,6 +11,7 @@ use super::source_inventory::{module_source_paths, source_path};
 use super::static_sql_source::{CanonicalBindings, StaticSqlSources};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use syn::visit::Visit;
 
 pub(super) fn parse_production_sources(
     sources: &[(String, String)],
