@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RetrievalPersistence::new` now accepts `Arc<dyn SqlAccess>`. Snapshot writes and
+  namespace clears use the backend writer route; loads and statistics use its
+  reader. Core migrations install the snapshot table and namespace index. The
+  existing `init_schema` compatibility bootstrap now uses the admitted writer.
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
 ### Added
 
 - `NoteStore::try_patch_note_properties` applies guarded partial property writes,

@@ -76,6 +76,8 @@ khive-score = { version = "0.13.0", path = "../khive-score" }
 khive-fusion = { version = "0.13.0", path = "../khive-fusion" }
 # Storage adapter, ANN registry and persistent weight tests use khive-db; `vectors` loads sqlite-vec.
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["vectors", "test-support"] }
+# The read-only snapshot test freezes WAL sidecars with the shared fixture.
+khive-storage = { version = "0.13.0", path = "../khive-storage", features = ["test-support"] }
 
 [[bench]]
 name = "fusion_bench"
