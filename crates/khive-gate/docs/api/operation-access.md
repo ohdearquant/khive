@@ -59,6 +59,10 @@ Revision `domain-effects-v17` classifies `schema` as `Read`: it projects loaded
 registry declarations without reading or mutating graph records. Ordinary Gate
 admission and configured dispatch audit behavior still apply.
 
+Revision `domain-effects-v18` classifies `apply_changeset` as `Write`: it applies an ordered
+canonical change-set as one writer transaction. The wrapper also checks each constituent
+operation under its own verb and the applying caller.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -66,6 +70,7 @@ admission and configured dispatch audit behavior still apply.
 | `agent.resume`                    | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L88)                               |
 | `agent.spawn`                     | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L13)                               |
 | `agent.suspend`                   | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L74)                               |
+| `apply_changeset`                 | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
 | `blob.abort`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L133)                                |
 | `blob.begin`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L67)                                 |
 | `blob.commit`                     | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L118)                                |

@@ -300,6 +300,9 @@ impl KhiveRuntime {
         model_name: &str,
         text: &str,
     ) -> RuntimeResult<Vec<f32>> {
+        let _phase = khive_storage::request_context::enter_search_phase(
+            khive_storage::request_context::SearchPhase::VectorEmbedding,
+        );
         let model = parse_embedding_model_alias(model_name);
         let service = match token {
             Some(token) => self.embedder_with_token(token, model_name).await?,
@@ -900,28 +903,38 @@ impl KhiveRuntime {
             // the lexical leg still errors at runtime on residual punctuation the sanitizer
             // doesn't strip, this fails loud instead of degrading to vector-only fusion.
             let text_store = self.text(token)?;
-            let text_fut = text_store.search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: text_mode,
-                filter: Some(TextFilter {
-                    namespaces: visible_ns.clone(),
-                    // Push the entity-kind filter into the FTS query. Without it the
-                    // text arm returns the top `candidates` rows across EVERY entity
-                    // kind in the namespace and the kind is applied only afterwards,
-                    // so when one kind dominates the lexical ranking a search for a
-                    // rarer kind gets back fewer rows than exist, or none. The
-                    // `EntityFilter.kinds` check below stays as the backstop.
-                    record_kinds: entity_kind
-                        .map(|kind| vec![kind.to_string()])
-                        .unwrap_or_default(),
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            });
+            let text_fut = async {
+                let _phase = khive_storage::request_context::enter_search_phase(
+                    khive_storage::request_context::SearchPhase::TextSearch,
+                );
+                text_store
+                    .search(TextSearchRequest {
+                        query: query_text.to_string(),
+                        mode: text_mode,
+                        filter: Some(TextFilter {
+                            namespaces: visible_ns.clone(),
+                            // Push the entity-kind filter into the FTS query. Without it the
+                            // text arm returns the top `candidates` rows across EVERY entity
+                            // kind in the namespace and the kind is applied only afterwards,
+                            // so when one kind dominates the lexical ranking a search for a
+                            // rarer kind gets back fewer rows than exist, or none. The
+                            // `EntityFilter.kinds` check below stays as the backstop.
+                            record_kinds: entity_kind
+                                .map(|kind| vec![kind.to_string()])
+                                .unwrap_or_default(),
+                            ..TextFilter::default()
+                        }),
+                        top_k: candidates,
+                        snippet_chars: 200,
+                    })
+                    .await
+            };
             let text_fut = crate::stage_seam::text_stage(text_fut);
             // The stages read nothing from each other, so they run together; a text error wins.
             let vector_fut = async {
+                let _phase = khive_storage::request_context::enter_search_phase(
+                    khive_storage::request_context::SearchPhase::VectorSearch,
+                );
                 match vector_pool {
                     Some(pool) => Ok((pool, None)),
                     None => {
@@ -954,12 +967,20 @@ impl KhiveRuntime {
             // ranking and the alive/kind/tag/property filters below; reusing one arm's
             // cap here lets stale or filtered hits hide live candidates from the other.
             let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
-            let mut fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
+            let mut fused = {
+                let _phase = khive_storage::request_context::enter_search_phase(
+                    khive_storage::request_context::SearchPhase::Fusion,
+                );
+                rrf_fuse(text_hits, vector_hits, fusion_limit, query_text)
+            };
 
             // tags_any has a SQL column and is pushed into query_entities; properties
             // filtering has no SQL column and is applied in Rust below on the fetched records.
             if !fused.is_empty() {
                 let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
+                let _phase = khive_storage::request_context::enter_search_phase(
+                    khive_storage::request_context::SearchPhase::EntityHydration,
+                );
                 let alive_page = self
                     .entities(token)?
                     .query_entities(
@@ -980,6 +1001,7 @@ impl KhiveRuntime {
                         },
                     )
                     .await?;
+                drop(_phase);
                 let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
                 let mut alive: HashSet<Uuid> = HashSet::new();
                 for e in alive_page.items {

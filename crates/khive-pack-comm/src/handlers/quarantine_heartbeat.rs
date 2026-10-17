@@ -362,6 +362,15 @@ pub(crate) async fn handle_heartbeat(
     let p: HeartbeatParams = serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("heartbeat: bad params: {e}")))?;
 
+    persist_heartbeat(runtime, token, p, None).await
+}
+
+pub(super) async fn persist_heartbeat(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    p: HeartbeatParams,
+    outbox_scan: Option<super::outbox_scan::OutboxScan>,
+) -> Result<Value, RuntimeError> {
     if p.channel_kind.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "heartbeat: `channel_kind` must not be empty".into(),
@@ -475,6 +484,10 @@ pub(crate) async fn handle_heartbeat(
     // every dispatch (subhandlers included) is the sole authorization
     // boundary here (ADR-018) — this handler must not layer a second,
     // handler-local namespace check on top of it.
+    // The Rust-only outbox writer instead supplies the token its comm-backend
+    // runtime authorized for the scanned message namespace. It shares this
+    // guarded persistence helper, never dispatches a wire verb, and cannot
+    // redirect a write through a JSON namespace field.
     //
     // The local single-tenant poll loop (`khive-mcp`'s
     // `record_channel_heartbeat`) is unaffected: it always passes
@@ -522,93 +535,98 @@ pub(crate) async fn handle_heartbeat(
 
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
-    props["last_poll_attempt_at"] = json!(at);
-    if let Some(poll_interval_secs) = p.poll_interval_secs {
-        props["poll_interval_secs"] = json!(poll_interval_secs);
-    }
+    if let Some(scan) = outbox_scan {
+        super::outbox_scan::update_properties(&mut props, scan)?;
+    } else {
+        props["last_poll_attempt_at"] = json!(at);
+        if let Some(poll_interval_secs) = p.poll_interval_secs {
+            props["poll_interval_secs"] = json!(poll_interval_secs);
+        }
 
-    match outcome {
-        "success" => {
-            props["last_success_at"] = json!(at);
-            props["consecutive_failures"] = json!(0);
-            // last_error is intentionally left untouched — design review amendment 3.
-            if let Some(held) = p.held_messages {
-                props["held_messages"] = json!(held);
-                if held > 0 {
-                    let prev_held_polls = props
-                        .get("consecutive_held_polls")
+        match outcome {
+            "success" => {
+                props["last_success_at"] = json!(at);
+                props["consecutive_failures"] = json!(0);
+                // last_error is intentionally left untouched — design review amendment 3.
+                if let Some(held) = p.held_messages {
+                    props["held_messages"] = json!(held);
+                    if held > 0 {
+                        let prev_held_polls = props
+                            .get("consecutive_held_polls")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        props["consecutive_held_polls"] = json!(prev_held_polls.saturating_add(1));
+                        props["last_held_at"] = json!(at);
+                    } else {
+                        props["consecutive_held_polls"] = json!(0);
+                    }
+                }
+                if p.quarantined_after_hold
+                    .is_some_and(|released| released > 0)
+                {
+                    props["last_quarantined_after_hold_at"] = json!(at);
+                }
+                // `originals_not_retained` and `notices_failed` are running totals:
+                // added to, never replaced, so a consumer sees the channel's whole
+                // history rather than the latest poll's slice. The last-reason,
+                // last-timestamp and current-state facts are replaced (or, for
+                // `notice_config_error`, cleared) by each success that reports them.
+                if let Some(not_retained) = p.originals_not_retained {
+                    let prev_total = props
+                        .get("originals_not_retained")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    props["consecutive_held_polls"] = json!(prev_held_polls.saturating_add(1));
-                    props["last_held_at"] = json!(at);
-                } else {
-                    props["consecutive_held_polls"] = json!(0);
+                    props["originals_not_retained"] =
+                        json!(prev_total.saturating_add(not_retained));
+                    if not_retained > 0 {
+                        props["last_original_not_retained_at"] = json!(at);
+                        if let Some(reason) = p.original_not_retained_reason.as_deref() {
+                            props["last_original_not_retained_reason"] = json!(reason);
+                        }
+                    }
                 }
-            }
-            if p.quarantined_after_hold
-                .is_some_and(|released| released > 0)
-            {
-                props["last_quarantined_after_hold_at"] = json!(at);
-            }
-            // `originals_not_retained` and `notices_failed` are running totals:
-            // added to, never replaced, so a consumer sees the channel's whole
-            // history rather than the latest poll's slice. The last-reason,
-            // last-timestamp and current-state facts are replaced (or, for
-            // `notice_config_error`, cleared) by each success that reports them.
-            if let Some(not_retained) = p.originals_not_retained {
-                let prev_total = props
-                    .get("originals_not_retained")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                props["originals_not_retained"] = json!(prev_total.saturating_add(not_retained));
-                if not_retained > 0 {
-                    props["last_original_not_retained_at"] = json!(at);
-                    if let Some(reason) = p.original_not_retained_reason.as_deref() {
-                        props["last_original_not_retained_reason"] = json!(reason);
+                if let Some(state) = p.original_retention_state.as_deref() {
+                    props["original_retention_state"] = json!(state);
+                }
+                if let Some(failed) = p.notices_failed {
+                    let prev_total = props
+                        .get("notices_failed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    props["notices_failed"] = json!(prev_total.saturating_add(failed));
+                    if failed > 0 {
+                        props["last_notice_failed_at"] = json!(at);
+                    }
+                }
+                // `notice_config_error` is a CURRENT-problem fact, not a historical
+                // one: a success that does not carry it CLEARS the row's value, so a
+                // resolved configuration problem stops being reported. That is
+                // deliberately unlike `last_error`, which a success RETAINS so a
+                // caller can compare it against `last_success_at`.
+                match p.notice_config_error.as_deref() {
+                    Some(problem) => props["notice_config_error"] = json!(problem),
+                    None => {
+                        if let Some(map) = props.as_object_mut() {
+                            map.remove("notice_config_error");
+                        }
                     }
                 }
             }
-            if let Some(state) = p.original_retention_state.as_deref() {
-                props["original_retention_state"] = json!(state);
-            }
-            if let Some(failed) = p.notices_failed {
-                let prev_total = props
-                    .get("notices_failed")
+            "failure" => {
+                props["last_failure_at"] = json!(at);
+                let prev_failures = props
+                    .get("consecutive_failures")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                props["notices_failed"] = json!(prev_total.saturating_add(failed));
-                if failed > 0 {
-                    props["last_notice_failed_at"] = json!(at);
-                }
+                props["consecutive_failures"] = json!(prev_failures + 1);
+                props["last_error"] = json!({
+                    "class": p.error_class.clone().unwrap_or_default(),
+                    "message": p.error_message.clone().unwrap_or_default(),
+                    "at": at,
+                });
             }
-            // `notice_config_error` is a CURRENT-problem fact, not a historical
-            // one: a success that does not carry it CLEARS the row's value, so a
-            // resolved configuration problem stops being reported. That is
-            // deliberately unlike `last_error`, which a success RETAINS so a
-            // caller can compare it against `last_success_at`.
-            match p.notice_config_error.as_deref() {
-                Some(problem) => props["notice_config_error"] = json!(problem),
-                None => {
-                    if let Some(map) = props.as_object_mut() {
-                        map.remove("notice_config_error");
-                    }
-                }
-            }
+            _ => unreachable!("outcome already validated above"),
         }
-        "failure" => {
-            props["last_failure_at"] = json!(at);
-            let prev_failures = props
-                .get("consecutive_failures")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            props["consecutive_failures"] = json!(prev_failures + 1);
-            props["last_error"] = json!({
-                "class": p.error_class.clone().unwrap_or_default(),
-                "message": p.error_message.clone().unwrap_or_default(),
-                "at": at,
-            });
-        }
-        _ => unreachable!("outcome already validated above"),
     }
 
     khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;

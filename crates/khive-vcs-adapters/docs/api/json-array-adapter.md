@@ -15,6 +15,12 @@ the base `EntityKind` taxonomy and aliases. Extra kinds compare case-insensitive
 merged pack kind registry should pass it here so kinds such as `resource` are not rejected before
 runtime validation.
 
+`new` and `new_with_valid_kinds` remain strict. `new_with_kind_policy(input, kinds,
+ImportKindPolicy::PreserveUnknown)` preserves the exact spelling of genuinely unknown,
+nonblank entity kinds. Known base aliases and pack kinds retain their existing normalization.
+This pure adapter does not emit mandatory kind warnings: the importer warns once per distinct
+raw unknown kind after complete preflight. Relation validation is independent of this policy.
+
 ## Entity/edge dispatch
 
 Key matching is ASCII case-insensitive. An object with canonical `source` and `target` is an edge;
@@ -27,8 +33,9 @@ stored results, so a second call produces no records.
 
 Required non-blank fields are `kind` and `name`; an absent ID receives a new UUID. Reserved fields
 include `entity_type`, description, tags, timestamps, and properties. Remaining unknown keys fold
-into the properties object rather than being discarded. Unknown kinds fail unless accepted by the
-base taxonomy, an alias, or the supplied extra-kind set.
+into the properties object rather than being discarded. Unknown kinds fail under strict construction unless accepted by the
+base taxonomy, an alias, or the supplied extra-kind set. Explicit relaxed construction
+preserves only otherwise unknown nonblank kind strings.
 
 ## Edge parsing
 

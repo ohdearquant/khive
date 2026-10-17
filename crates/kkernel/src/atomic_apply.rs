@@ -690,6 +690,12 @@ fn describe_failure(failure: &AtomicOpFailure) -> String {
     match failure {
         AtomicOpFailure::NoteConflict(conflict) => conflict.clone().into_error().to_string(),
         AtomicOpFailure::EntityConflict(conflict) => conflict.clone().into_error().to_string(),
+        AtomicOpFailure::PreimageMismatch { target_id, field_path } => {
+            format!("captured preimage mismatch for {target_id} at {field_path}")
+        }
+        AtomicOpFailure::OwnerSnapshotConflict { target_id, kind } => {
+            format!("owner_snapshot_conflict for {target_id} ({kind})")
+        }
         AtomicOpFailure::GuardFailed {
             statement_label,
             expected,

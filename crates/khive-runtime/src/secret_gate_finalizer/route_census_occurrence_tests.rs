@@ -4,6 +4,7 @@ fn one_write_route() -> RouteInventoryEntry {
     RouteInventoryEntry {
         id: "fixture.checked-write",
         site: "sample/src/lib.rs::write",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         reservation: Reservation::NamedCheck {

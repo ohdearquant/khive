@@ -483,6 +483,10 @@ include!("serve_outbox_parity_tests.rs");
 #[path = "serve_outbox_slug_tests.rs"]
 mod outbox_slug_tests;
 
+#[cfg(all(test, feature = "channel-email", feature = "channel-telegram"))]
+#[path = "serve_outbox_health_tests.rs"]
+mod outbox_health_tests;
+
 #[cfg(all(test, unix))]
 #[path = "serve_reader_pool_tests.rs"]
 mod reader_pool_tests;

@@ -258,6 +258,59 @@ delayed sweep. ADR-119's component supervisor remains authoritative for hung
 task detection and restart. All channel projections use the same captured
 `as_of`, so a multi-channel response has one consistent comparison instant.
 
+### Outbox scan observations
+
+Issue #5213 adds `outbox` beside the inbound poll fields. It is `null` when
+no outbox scan has been recorded, including legacy and quarantine-only rows.
+An outbox-only channel has null inbound poll facts; an outbox report never
+establishes an inbound poll or resets its failures.
+
+The email and Telegram delivery paths record the result immediately after the
+pending-row query completes, before attempting any delivery. Empty successful
+scans still update `last_scan_completed_at` and `last_success_at`. The nested
+object contains:
+
+- `last_scan_completed_at` and `last_scan_succeeded`: time and result of the
+  latest completed query attempt, including failed queries.
+- `last_success_at`, `last_failure_at`, `consecutive_failures` and `last_error`:
+  independent outbox scan evidence. Failure preserves the success timestamp
+  and last successful page observations; success resets the failure count and
+  retains the prior error with its timestamp.
+- `scan_interval_secs`: the positive nominal scan cadence, currently five
+  seconds. `stalled` is true when `as_of` is strictly more than three nominal
+  intervals after `last_scan_completed_at`. Invalid, missing, overflowing or
+  future clock facts produce null. Scan failure remains visible independently
+  of this schedule fact.
+- `pending_rows_seen` and `pending_rows_limit`: the row count in the last
+  successful channel-scoped page and its bound, currently 200. Only due,
+  undelivered, non-held rows eligible for this channel enter the page. These are
+  page observations, not a total queue count.
+- `oldest_pending_created_at` and `oldest_pending_age_secs`: the earliest
+  creation time among those observed rows, and its whole-second age at the
+  response `as_of`. Both are null for an empty page; invalid/future timestamps
+  have unknown age. The queue may change after the scan, and an older row may
+  lie beyond the newest-first page, so this is not the oldest row of the whole
+  queue. `last_success_at` dates the observation, including after a scan error.
+
+Agent presentation, the MCP default, keeps a null `outbox` and every null field
+inside it, so a channel with no recorded scan, a scan that has not yet
+succeeded and an empty page stay distinct from observed values.
+
+A skipped rate-limit pause does not advance scan evidence. A long deliberate
+pause, slow query or slow delivery can therefore produce `stalled: true`;
+this remains an advisory cadence fact, not a supervisor or overall health verdict.
+Send outcomes do not change scan success. Health writes are best-effort: a
+failure is logged without changing delivery or retry behavior.
+
+The Rust-only `record_outbox_scan` helper shares the heartbeat row's guarded
+insert/replace and preserves inbound properties. Its `NamespaceToken` is
+authorized by the same comm-backend runtime that scanned the message rows;
+there is no new wire verb or caller-controlled JSON namespace. Outbox evidence
+is stored and read in that scanned message namespace. Inbound polls retain
+their existing namespace convention, so deployments with separate operational
+and message namespaces must read each scope explicitly. No fallback to `local`
+is performed.
+
 `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report of
 this process's own cumulative CPU time and RSS (via `getrusage`,
 `khive_runtime::process_resource_usage`) plus the names of any background

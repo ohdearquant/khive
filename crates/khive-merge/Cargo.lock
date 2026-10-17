@@ -1252,6 +1252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-changeset"
+version = "0.13.0"
+dependencies = [
+ "khive-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "khive-channel"
 version = "0.13.0"
 dependencies = [
@@ -1396,6 +1406,7 @@ dependencies = [
  "chrono-tz",
  "iana-time-zone",
  "inventory",
+ "khive-changeset",
  "khive-channel",
  "khive-db",
  "khive-fold",

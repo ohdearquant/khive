@@ -11,6 +11,8 @@ use serde::Serialize;
 /// Subcommands for `kkernel kg` — KG validation/review, sync, import/export, and hooks.
 #[derive(Subcommand, Debug)]
 pub enum KgCommand {
+    /// Apply a Tier-1 canonical change-set through the daemon as one atomic unit.
+    Apply(ApplyArgs),
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
     Validate(ValidateArgs),
 
@@ -48,6 +50,23 @@ pub enum KgCommand {
 
     /// Review a staged change-set without applying or committing it (ADR-145).
     Review(ReviewArgs),
+}
+
+#[derive(clap::Parser, Debug)]
+pub struct ApplyArgs {
+    pub changeset: PathBuf,
+    #[arg(long)]
+    pub rules: PathBuf,
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
+    #[arg(long, env = "KHIVE_DB")]
+    pub db: Option<String>,
+    #[arg(long, default_value = "local")]
+    pub namespace: String,
+    #[arg(long = "pack")]
+    pub packs: Vec<String>,
+    #[arg(long, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 /// CLI arguments for `kkernel kg update`.
@@ -196,6 +215,10 @@ pub struct ExportArgs {
 /// CLI arguments for `kkernel kg import`.
 #[derive(clap::Parser, Debug)]
 pub struct ImportArgs {
+    /// Explicit config selection; otherwise use the normal config discovery order.
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
+
     /// Source archive or adapter input file.
     pub source: PathBuf,
 

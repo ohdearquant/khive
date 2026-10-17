@@ -53,6 +53,9 @@ impl KhiveRuntime {
 
         let text_store = self.text_for_notes(token)?;
         let text_fut = async {
+            let _phase = khive_storage::request_context::enter_search_phase(
+                khive_storage::request_context::SearchPhase::TextSearch,
+            );
             if fts_search_inject {
                 return Err(khive_storage::StorageError::Timeout {
                     operation: "fts_search".into(),
@@ -84,6 +87,9 @@ impl KhiveRuntime {
 
         // Vector search filtered to notes; it runs with the text stage, and a text error wins.
         let vector_fut = async {
+            let _phase = khive_storage::request_context::enter_search_phase(
+                khive_storage::request_context::SearchPhase::VectorSearch,
+            );
             if query_vector.is_some() || !self.default_embedder_name().is_empty() {
                 self.note_search_vector_search(token, query_vector, query_text, candidates)
                     .await
@@ -120,14 +126,18 @@ impl KhiveRuntime {
         // `candidates` here would drop a high-salience note ranked just outside
         // the raw RRF cutoff before salience ever applied.
         let fuse_k = text_hits.len() + vector_hits.len();
-        let fused = self
-            .fuse_with_strategy(
+        let fused = {
+            let _phase = khive_storage::request_context::enter_search_phase(
+                khive_storage::request_context::SearchPhase::Fusion,
+            );
+            self.fuse_with_strategy(
                 text_hits,
                 vector_hits,
                 &crate::fusion::FusionStrategy::Rrf { k: RRF_K },
                 fuse_k,
             )
-            .await?;
+            .await?
+        };
 
         let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
@@ -147,7 +157,16 @@ impl KhiveRuntime {
             delegated: false,
         };
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
-        for note in note_store.get_notes_batch(&candidate_ids).await? {
+        let fetched_notes = {
+            let _phase = khive_storage::request_context::enter_search_phase(
+                khive_storage::request_context::SearchPhase::NoteHydration,
+            );
+            note_store.get_notes_batch(&candidate_ids).await?
+        };
+        let _authorization_phase = khive_storage::request_context::enter_search_phase(
+            khive_storage::request_context::SearchPhase::MailboxAuthorization,
+        );
+        for note in fetched_notes {
             search_pool.record_note_candidate_hydration_row();
             if note.deleted_at.is_some() {
                 continue;
@@ -192,26 +211,32 @@ impl KhiveRuntime {
             }
             alive_notes.insert(note.id, note);
         }
+        drop(_authorization_phase);
 
         // Drop superseded notes unless include_superseded is true: any note targeted
         // by a `supersedes` edge is obsolete and excluded from default search.
         if !include_superseded && !alive_notes.is_empty() {
             let graph = self.graph(token)?;
             let note_ids: Vec<Uuid> = alive_notes.keys().copied().collect();
-            let superseded: std::collections::HashSet<Uuid> = graph
-                .batch_neighbors(
-                    &note_ids,
-                    NeighborQuery {
-                        direction: Direction::In,
-                        relations: Some(vec![EdgeRelation::Supersedes]),
-                        limit: Some(1),
-                        min_weight: None,
-                    },
-                )
-                .await?
-                .into_iter()
-                .map(|(note_id, _)| note_id)
-                .collect();
+            let superseded: std::collections::HashSet<Uuid> = {
+                let _phase = khive_storage::request_context::enter_search_phase(
+                    khive_storage::request_context::SearchPhase::SupersededFilter,
+                );
+                graph
+                    .batch_neighbors(
+                        &note_ids,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|(note_id, _)| note_id)
+                    .collect()
+            };
             alive_notes.retain(|id, _| !superseded.contains(id));
         }
 

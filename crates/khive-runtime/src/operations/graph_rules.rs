@@ -285,7 +285,7 @@ pub(super) fn static_impossible_edge_pattern_warnings(
 
 /// `true` if any pack-declared edge endpoint rule allows the
 /// `(source, relation, target)` triple. Pack rules are additive only.
-pub(super) fn pack_rule_allows(
+pub(crate) fn pack_rule_allows(
     rules: &[EdgeEndpointRule],
     relation: EdgeRelation,
     src: Option<&Resolved>,

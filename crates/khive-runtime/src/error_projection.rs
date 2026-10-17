@@ -81,6 +81,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::CanonicalAdmission { op_index, source } => {
+            // Preparation precedes all domain DML. Keep the original typed
+            // refusal (including secret detector/permission receipt) and add
+            // only the constituent's index; never stringify captured input.
+            let mut value = runtime_error_value(*source, DomainDisposition::NotCommitted);
+            value["op_index"] = json!(op_index);
+            value["domain_disposition"] = json!("not_committed");
+            value["retryable"] = json!(false);
+            return value;
+        }
         RuntimeError::LintFix { source, detail } => {
             let mut value = runtime_error_value(*source, DomainDisposition::Unknown);
             let object = value
