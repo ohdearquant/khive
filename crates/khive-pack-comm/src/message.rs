@@ -495,6 +495,28 @@ pub(crate) async fn dual_write_message_with_identity(
                     &format!("external email footer is unavailable: {reason}"),
                 ));
             }
+            // ADR-200 §1 condition 5 and §6: with a remote suppression mirror configured, the
+            // time of its last successful refresh is read from the local store (admission does
+            // no network I/O), and a refresh older than the configured maximum age refuses, so
+            // a long mirror outage stops new external messages from queueing behind it.
+            if let Some(mirror) = policy.suppression_mirror() {
+                let last_refresh = crate::handlers::suppression_mirror_last_refresh(runtime)
+                    .await
+                    .map_err(|_| {
+                        external_email_denied(verb, "suppression mirror check is unavailable")
+                    })?;
+                let fresh = match last_refresh {
+                    None => false,
+                    Some(at) => match (chrono::Utc::now() - at).to_std() {
+                        Ok(age) => age <= mirror.max_age(),
+                        // A refresh stamped ahead of this clock is not older than the maximum.
+                        Err(_) => true,
+                    },
+                };
+                if !fresh {
+                    return Err(external_email_denied(verb, "suppression mirror stale"));
+                }
+            }
         }
     }
 
