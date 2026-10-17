@@ -59,6 +59,7 @@ rand = { workspace = true }
 signal-hook-registry = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["test-support"] }
 khive-request = { version = "0.13.0", path = "../khive-request" }
 # Self dev-dependency: requests this crate's own `fault-injection` and
@@ -82,3 +83,11 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [build-dependencies]
 chrono = { workspace = true }
+
+[[bench]]
+name = "runtime_reads"
+harness = false
+
+[[bench]]
+name = "runtime_writes"
+harness = false
