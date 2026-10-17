@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24 and 2026-09-25)\
-**Date**: 2026-05-23 (last amended 2026-09-25)\
+**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24, 2026-09-25 and 2026-10-17)\
+**Date**: 2026-05-23 (last amended 2026-10-17)\
 **Authors**: khive maintainers
 
 **Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
@@ -13,6 +13,11 @@ adds an optional `attachments` list of blob content references to `comm.send` an
 an `attachments` field to `comm.inbox`, `comm.thread` and `comm.read` results, and two confined
 file-transfer verbs on the blob pack. Existing decisions remain accepted; this proposed addition
 requires acceptance before implementation merges.
+
+**Accepted amendment**: [comm message archival, version 1](#amendment-2026-10-17-comm-message-archival-version-1)
+adds `comm.archive(before, dry_run?)`, which moves whole threads of read, internal message pairs older
+than `before` into an archive file and then deletes them from the live store, and fences `comm.reply`
+and thread-continuing `comm.send` against a concurrent archive of their thread.
 
 **Accepted amendment**: [monthly recurrence keeps its day of month](#amendment-2026-09-25-monthly-recurrence-keeps-its-day-of-month)
 stores a monthly row's anchor so that a clamped short month no longer moves every later
@@ -1481,3 +1486,317 @@ edits, concurrent firing and deletion without a revision advance, plus timestamp
 monotonicity and exhaustion checks. Existing short-ID, non-pending, malformed
 properties and reserved-property regressions must continue to pass. This
 amendment does not change trigger execution or introduce schedule-owned SQL.
+
+## Amendment (2026-10-17): comm message archival, version 1
+
+**Status**: accepted (2026-10-17).
+
+### Context
+
+Ordinary messages have no expiry: the retention section of the file-attachments amendment says so
+for messages and their attachments, and nothing but the ordinary delete verbs removes them.
+Quarantined channel messages are the exception; they carry an expiry and
+`comm.cleanup_expired_quarantine` removes them. The comm backend therefore grows with every send,
+and each `comm.send` writes two notes: an outbound copy for the sender and an inbound copy for the
+recipient ([ADR-057](ADR-057-comm-actor-addressed-delivery.md)).
+
+Archival moves old messages out of the live store into an archive file and then deletes them from
+the live store. A message note is not only a mailbox row. Its UUID can be the canonical
+`thread_id` of a thread; it can be an endpoint of `annotates` and other edges; it can own
+attachment rows that keep blob objects live; it can be an entry in an immutable note stream; its
+outbound copy can be the durable record of an external delivery still in progress; and the pair
+is the evidence that idempotent replay and channel correlation read. Version 1 archives only the
+messages for which none of those roles is in play, and says so for each one it skips.
+
+### Decision
+
+#### 1. The verb and its scope
+
+`comm.archive(before, dry_run?)` runs on the backend that serves comm and acts on every namespace
+in that backend. `before` is a required RFC 3339 timestamp, compared with `created_at`. There is no
+default horizon and no schedule.
+
+`before` has an upper limit: the run reads its clock once, before selection, and refuses (invalid
+input, naming the latest value it would accept) any `before` later than that reading minus a
+minimum age of 24 hours. No message younger than the minimum age is archived, whatever the caller
+passes, and `dry_run` applies the same refusal. The journal records the clock reading beside
+`before`, and a resumed run (§5 step 3) keeps both from its own entry.
+
+The verb is registered `Commissive` with Gate classification `Write`, as `memory.vacuum` and
+`session.vacuum` are. Because it deletes messages of every actor in the backend, granting it is
+granting that deletion; a multi-tenant deployment does not grant it to tenants. It refuses on a
+backend with no database file path, because the archive file and the run lock are written beside
+the database, and on a database not in write-ahead-log mode, because §5 step 6 relies on the log
+keeping commits in order.
+
+`dry_run=true` performs the selection of §2 and returns the counts a run would archive and skip,
+per reason. It writes nothing, takes no lock, and does not resume an earlier run.
+
+#### 2. What a run archives: whole threads of ordinary internal pairs
+
+**Pair.** A pair is a live note `O` and a live note `I`, both of kind `message`, `O` with
+direction `outbound` and `I` with direction `inbound`, such that `I.outbound_ref` is `O`'s id, both
+carry string `from_actor` and `to_actor` values and those values are equal, and both carry a
+`thread_id` naming the same thread (below). The two copies may sit in one namespace (an
+actor-addressed send) or in two (the older placement); the reference defines the pair across the
+whole backend.
+
+**Eligible pair.** A pair is eligible when all of these hold:
+
+- `I.read` is the JSON boolean `true`, and both copies were created before `before`. The outbound
+  copy's own `read` property is never consulted: it is written false and only the inbound copy is
+  ever marked read (core migration 025).
+- No other note in the backend, live or soft-deleted, names `O` in `outbound_ref`.
+- Neither copy is addressed to or from an external channel address, and neither carries channel
+  ingest or delivery properties (`channel_kind`, `delivery`, `delivered_at`, `delivery_hold`,
+  `next_attempt_at`).
+- Neither copy carries quarantine properties or an `expires_at`.
+- Neither copy owns a row in `attachments` or `attachment_quarantine`.
+- Neither copy is an endpoint of any edge, live or soft-deleted.
+- Neither copy is an entry in a note stream.
+
+**Thread id spellings.** A stored `thread_id` names `R` when, with surrounding whitespace removed,
+it is one of the four UUID text forms of `R`: hyphenated (36 characters), simple (32 hex digits),
+braced (hyphenated inside `{}`) or URN (`urn:uuid:` followed by the hyphenated form), with the hex
+digits in any letter case. This is the set `uuid::Uuid::parse_str` accepts, and it is the only
+definition of membership this amendment uses. The canonical spelling is the lower-case hyphenated
+form. A `thread_id` that is in none of the four forms is not parseable (`malformed` below). The
+set is wider than the spellings the thread reader looks up by exact match
+(`thread_id_query_spellings` in the comm pack's handler validation): that lookup finds a
+mixed-case spelling only when the reading starts from the row that stores it, so it cannot serve
+as a membership test.
+
+**Thread.** A thread is named by a root UUID `R`. Its members are every live message note in the
+backend whose `thread_id` names `R` in one of those spellings, together with the note `R` itself.
+Selection (§5 step 4) parses every message note's `thread_id` during its census, so a member in
+any of those spellings is found there. A thread is archivable only when:
+
+- `R` is a live message note whose `thread_id` is `R` in canonical spelling;
+- every member stores its `thread_id` in canonical spelling. Version 1 does not rewrite or
+  interpret older spellings; a thread with any such member stays live as a whole;
+- every member belongs to an eligible pair whose other copy is also a member;
+- the thread's member count and serialized size are within a bound the implementation fixes and
+  records in each run's journal.
+
+One member that fails any condition keeps the whole thread live. This is deliberately
+conservative: an archive never removes a root, whose UUID is what `comm.thread(id=…)` fetches
+first, while a committed member that names it stays. A member written after the archive commits
+is §4's subject.
+
+**Skip reasons.** The counting unit is one live physical message note, counted once. Structural
+checks run per note; the pair-level conditions (read, age, and the exclusions) are attributed to
+both copies of a pair; thread conditions come last. Every note a run examines and does not
+archive is counted under the first reason it meets, in this order:
+
+1. `malformed`: not a message with a valid direction, actor fields and a `thread_id` in one of the
+   four forms above;
+2. `unpaired`: no structural pair, or more than one note naming the same outbound copy;
+3. `unread`, then `too_recent`;
+4. `channel`, `quarantine`, `attachments`, `referenced` (an edge endpoint), `stream`;
+5. `no_root`, then `legacy_thread`: `no_root` when no live message note has the id `R` (a thread
+   opened by a channel-ingested message whose id is not a note's, for example); `legacy_thread`
+   when the census found a member whose stored `thread_id` is not the canonical spelling, or the
+   root does not carry its own `thread_id` in the canonical spelling;
+6. `oversized`: the thread exceeds the bound;
+7. `thread_blocked`: the note qualifies but its thread does not.
+
+A first-reason count is not a census of a class: an unread channel-addressed pair is counted
+`unread`, and an unread ingested message, which has no outbound copy, is counted `unpaired`.
+
+#### 3. Decisions on the skipped classes
+
+- **Attachments.** Messages that own attachment rows are not archived in version 1; their rows and
+  objects stay exactly as today. Both simple alternatives fail. Keeping the rows on main after the
+  note leaves gives them no owner that distinguishes an archived message from a live one: the
+  table is keyed by `(record_uuid, role)` and the blob sweep counts any row, so retiring one archive
+  could remove a pin that a changed live copy or a later archive still needs. Moving the rows into
+  the archive and letting the sweep reclaim the objects leaves the archive naming bytes that may be
+  gone. Archiving attached messages needs an explicit archive-owned pin that the sweep counts,
+  which is a change to the liveness set of [ADR-121](ADR-121-attachments-first-class.md) §5 and
+  [ADR-111](ADR-111-blob-store.md) §8 and belongs to a later amendment of those ADRs.
+- **Channel messages.** An email or Telegram send still writes an inbound copy for the external
+  address, which is never marked read, and its outbound copy carries the delivery state that the
+  transport retries from. Neither local read state nor a missing twin shows that the remote side
+  received the message. Channel-ingested inbound messages have no outbound copy, and ingest
+  deduplicates redelivered external messages against surviving rows. Version 1 archives none of
+  them; their retention needs the transport's lifecycle and is out of scope. An ingested message
+  that joins an internal thread keeps that thread live for as long as it stays.
+- **Quarantine.** Quarantined messages already have their own expiry and cleanup verb, and some own
+  a `quarantine-original` attachment. Version 1 leaves them to that path.
+- **Referenced messages.** Hard deletion removes a note's incident edges, so archiving a message
+  with an `annotates` or other edge would destroy relationship history the archive does not hold.
+  Version 1 skips them.
+- **Stream entries.** A note stream's ledger is immutable and the schema refuses to delete a note
+  that is a stream entry. Version 1 never archives one and never touches the ledger.
+- **Older thread spellings.** Rows written before the versioned message contract may store a
+  thread id in a non-canonical spelling, and they are not rewritten (ADR-057). Version 1 keeps
+  every thread that contains one; archiving them needs a stated normalization and is out of scope.
+- **Idempotent replay ends at archival.** A caller-keyed send replays only while its keyed outbound
+  copy and the inbound copy are live. Archiving the pair releases the key and ends replay, as a
+  hard delete of the outbound copy already does today, and a key is only affected once its pair is
+  older than `before`. A later request with the same key creates a new pair only when it is
+  otherwise valid: a send that supplies the archived thread is refused by the existing
+  missing-thread check, a reply to an archived message is refused as not found, and a send that
+  starts a new thread succeeds.
+
+#### 4. Continuations that race an archive
+
+A reply reads its parent, then writes its new pair later; a send that supplies `thread_id` checks
+that a live message carries that thread, then writes later. Without a fence, an archive that
+commits between those two steps leaves the new pair naming a root that is gone.
+
+`comm.reply` and a `comm.send` that supplies `thread_id` therefore assert, inside the transaction
+that writes their pair, that the note they continue is still live: the parent for a reply, and the
+member the thread check found for a send. This applies on both the keyed and the unkeyed write
+paths. The assertion is a guarded statement in the same atomic unit as the pair's insert,
+evaluated by the atomic runner on the writer like the unit's other guarded statements. It reads
+the note and writes nothing: a select appended to the insert is not counted by that guard, and an
+update of the parent to itself would bump its version. Today only note-update units carry read
+assertions (`atomic_runner.rs`, `plan_statements`); both message pair writers gain one, and its
+refusal is mapped apart from their current rollback error. A failed assertion rolls back the whole
+pair and is reported with the error the verb already returns when its target is missing, distinct
+from a duplicate key or a storage failure: not found for a reply, as for a reply to a deleted
+message today, and the existing missing-thread refusal (invalid input) for a send. A caller sees the
+same error whether the archive committed before the verb's early check or between that check and
+the write. Archival deletes all of a thread's members
+in one transaction, so one of the two commits first. If the archive commits first, the
+continuation is refused. If the continuation commits first, the archive's re-check finds a new
+member and records the thread `changed_since_copy`.
+
+The fence covers those two verbs and no other writer. Three writers can also put a message into an
+existing thread and are not fenced: channel ingest, including a reply it correlates to a local
+outbound copy; generic note creation of kind `message`; and note stream appends of kind
+`message`. A message one of them writes before the archive commits keeps the thread live, because
+the re-check finds it. One written after the archive commits starts with no live root, as a
+message naming a hard-deleted root does today. Fencing them would change those writers'
+contracts and is outside this version.
+
+#### 5. How a run proceeds
+
+1. **Ownership.** A run takes an exclusive lock, without waiting, on one file:
+   `<database path>.khive-comm-archive.lock`, where the database path is the canonical one the
+   storage layer reports, so every alias of one database names the same lock. It holds the lock
+   for the whole run, and the operating system releases it when the process exits, including on a
+   crash. When another holder has the lock, the run refuses and says another archive run is
+   alive. When the lock cannot be taken for any other reason (permissions, an open failure, a file
+   system without locks), the run refuses with that error and never reports it as another run.
+   The lock file is created owner-only (mode `0600`) and opened without following a symbolic link.
+   This lock belongs to archival alone; it is not the blob collector's lock. It is taken before
+   any source writer is admitted and never while one is held. Ownership is the lock and never the
+   journal's state.
+2. **Journal layout.** Runs are recorded in comm-owned tables, `comm_archive_runs` and one row per
+   thread: run id, the database path read, the archive file path and format version, the selection
+   parameters (`before` and the thread bound), the state (`copying`, `verified`, `complete` or
+   `abandoned`), and each thread's outcome.
+3. **Recover earlier runs first.** Holding the lock, and before writing any journal row of its own,
+   a run settles every journal entry left non-terminal by an earlier invocation:
+   - an entry that never reached `verified` deleted nothing, so its file is discarded and the
+     entry is marked `abandoned`;
+   - an entry at `verified` is resumed with its own recorded parameters. Its archive file is
+     re-verified against the journal first: missing, corrupt, or recorded for a different source
+     path, it refuses and deletes nothing more. Threads that already have an outcome keep it.
+     Threads without one go through step 7. The invocation then completes that entry and stops,
+     writing no entry of its own; a new selection waits for the next invocation.
+4. **Select and admit.** The run performs the selection of §2, then estimates the archive's size
+   from the selected rows' serialized size plus the manifest, and requires that much free space on
+   the archive volume with a stated margin. When the space is not there, it refuses with no
+   journal entry and no file. File writes never happen while the source writer is held.
+5. **Journal, then copy.** The run inserts its own journal entry in state `copying`, and only then
+   creates the archive file, so no archive file exists without an entry that owns it. The
+   selected threads are written to that new SQLite file beside the comm database. The file is
+   created exclusively (the run refuses if a file already exists at the path), owner-only (mode
+   `0600`, since it holds message bodies) and without following a symbolic link, and it is written
+   in rollback-journal mode with `synchronous=FULL`. For each thread
+   the file holds its message notes as stored rows, every column including `version`, and a
+   digest per note over that row's canonical serialization. The live store's `notes_seq` identity
+   rows are not copied and never deleted: the sequence row stays the note's durable identity. FTS
+   and vector entries are not copied; they are rebuildable state.
+6. **Make durable, then verify.** The run closes its connection to the archive file, then syncs the
+   file and the directory that holds it to stable storage (`fsync`, or `F_FULLFSYNC` on platforms
+   where `fsync` does not reach the device), as blob publication syncs a blob before it becomes
+   reachable ([ADR-111](ADR-111-blob-store.md) §4). It then opens the file read-only, re-reads it
+   and compares each thread's notes and digests with the rows it selected. A failed sync, a failed
+   read or any difference ends the run with nothing deleted and the entry still `copying`. Only
+   after both syncs and the comparison succeed does the run record `verified` in its journal, in a
+   source transaction, before the first delete. The source's `synchronous=NORMAL` is then
+   sufficient: a write-ahead-log commit lost to a power failure takes every later commit with it,
+   so no delete can persist without the `verified` record before it, and that record is written
+   only after the archive is on stable storage. This is also what makes step 3 safe: an entry found
+   short of `verified` has deleted nothing.
+7. **Delete, one thread per transaction.** For each thread in the file, one atomic unit on the
+   source writer:
+   - re-checks every condition of §2 for every member and compares each member's digest with the
+     copy. Membership is resolved again by exact match on the eight formatter spellings of `R`
+     (lower- and upper-case hyphenated, simple, braced and URN), which the thread index can seek.
+     A member in any other accepted spelling that existed at the census already kept the thread
+     out of the run as `legacy_thread`. One written in such a spelling after the census, which
+     only a writer that stores a caller's spelling verbatim can do, is not found here and ends as
+     a write by an unfenced writer after the commit does (§4): it names a root that is gone;
+   - applies the prepared deletion statements ordinary hard deletion uses for each member: the
+     note row, its FTS document and rowid mapping, its vectors with their provenance and
+     approximate-index delete log for each registered embedding model, and its `NoteDeleted`
+     event, which here commits with the deletion rather than after it. The same prepared set also
+     deletes attachment rows, cascades incident edges and writes lineage warnings for protected
+     edges; for a thread that passed the re-check those statements affect no rows. The schema's
+     stream-entry guard stays in force;
+   - records the thread's outcome in the journal.
+
+   Statement preparation happens before the writer is taken, and the note-mutation hook fires
+   after the commit, as it does for an ordinary hard delete. A thread is never split across
+   transactions, and the transaction does no file I/O and does not call the runtime's per-note
+   delete. Outcomes:
+   - `archived`: every member was deleted;
+   - `changed_since_copy`: any member changed, a member was added, a condition no longer holds,
+     or some members are already gone. Nothing is deleted and the survivors stay live;
+   - `already_absent`: every member was already gone.
+
+   A recorded outcome is never revised, including by a resume.
+8. **Complete.** When every thread has an outcome, the run writes the outcomes into the archive
+   file's manifest, syncs the file again as in step 6, and only then marks its journal entry
+   `complete`.
+
+The result reports the archive file path, threads and notes archived, threads recorded
+`changed_since_copy` and `already_absent`, and the per-reason skip counts. Reclaiming the freed
+pages stays with the backend's vacuum path.
+
+**Selection access.** Selection runs before the writer is taken, as a census over every namespace
+in the backend: message notes in pages, and the outbound-reference check over live and
+soft-deleted rows. The existing outbound-reference index excludes soft-deleted rows and leads with
+namespace, kind, direction and sender, so the implementation adds a non-partial index led by the
+outbound reference itself. The census parses every message note's `thread_id` once, so its cost
+follows the number of message notes. The re-check inside step 7 is bounded by the thread bound,
+except for its two backend-wide lookups: the membership lookup and the check that no other note
+names an outbound copy. The thread index leads with namespace, so the membership lookup walks the
+namespaces that hold notes and seeks each one, as the edge cascade walks the namespaces of
+`graph_edges`; its cost inside the writer follows the number of namespaces, not the size of the
+backend. The outbound-reference lookup seeks the index above directly.
+
+### Consequences
+
+- Old, read, purely internal conversations leave the live store. Everything this version skips
+  stays exactly as today, and the skip counts show how much that is.
+- A message a run deleted is no longer returned by `comm.inbox`, `comm.thread`, `comm.read`,
+  search or graph context, and a reply to it fails as a reply to a hard-deleted message does
+  today. `comm.delivered` for its outbound copy reads zero, and a `comm.probe` poller that lags the
+  archive never sees its metadata: the sequence cursor has a gap, never a regression.
+- A message recorded `changed_since_copy` stays live and searchable. The archive file holds its
+  older copy, which the manifest labels with that outcome; presence in the file alone is not
+  evidence that a message left the live store.
+- Vector cleanup covers the registered embedding models, as ordinary hard deletion does; vectors
+  in tables of models no longer registered are not removed.
+- A reply or a thread-continuing send that races an archive of its thread is refused with the
+  error that verb already returns for a missing target (not found for a reply, the missing-thread
+  refusal for a send); no error code changes. Nothing else about sending, reading or listing live
+  messages changes. A message written
+  into an archived thread by an unfenced writer (§4) has no live root.
+- Integrity probes that report attachment rows without an owner are unaffected, because archived
+  messages own none.
+
+### Out of scope
+
+- Archiving messages with attachments, channel messages, quarantined messages, referenced
+  messages, stream entries, and threads stored in older spellings (§3 names what each needs).
+- Reading, searching or restoring archive files.
+- Automatic schedules and default horizons.
+- Cross-node relayed copies, whose stored shape this amendment does not rely on; a relayed copy that
+  does not form a pair under §2 is counted `unpaired`.
