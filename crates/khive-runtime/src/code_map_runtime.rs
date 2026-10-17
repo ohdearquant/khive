@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -80,6 +81,7 @@ impl std::fmt::Display for RegistrationGeneration {
 pub struct RegisteredCodeMap {
     name: String,
     path: PathBuf,
+    root: PathBuf,
     source_root: PathBuf,
     identity: FileIdentity,
     generation: RegistrationGeneration,
@@ -116,6 +118,7 @@ impl RegisteredCodeMap {
 #[derive(Debug, Default)]
 pub struct CodeMapRegistry {
     entries: HashMap<String, RegisteredCodeMap>,
+    protected_databases: Vec<PathBuf>,
 }
 
 impl CodeMapRegistry {
@@ -192,6 +195,7 @@ impl CodeMapRegistry {
 
         Self {
             entries: registered,
+            protected_databases: protected_databases.to_vec(),
         }
     }
 
@@ -210,6 +214,50 @@ impl CodeMapRegistry {
     /// Return whether no maps were registered.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Run a short read transaction against a currently registered rollback-mode map.
+    /// The connection is closed before this method returns.
+    pub fn with_read<T>(
+        &self,
+        name: &str,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        let map = self.resolve(name)?;
+        let header_records_wal = map.revalidate().map_err(|reason| {
+            RuntimeError::InvalidInput(format!(
+                "code map {name:?} is no longer available: {reason}"
+            ))
+        })?;
+        if header_records_wal || map.has_wal_companion() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "code map {name:?} is in WAL mode and maps are read in rollback mode only; \
+                 run code.ingest on it to settle it, then read again"
+            )));
+        }
+        let connection = StorageBackend::open_code_map_read_only(
+            &map.path,
+            map.identity,
+            &self.protected_databases,
+        )
+        .map_err(|_| RuntimeError::Internal("code map could not be opened safely".to_string()))?;
+        connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(|_| RuntimeError::Internal("code map read could not begin".to_string()))?;
+
+        let result = read(&connection);
+        let result = match result {
+            Ok(value) => connection
+                .execute_batch("COMMIT")
+                .map(|()| value)
+                .map_err(|_| RuntimeError::Internal("code map read could not finish".to_string())),
+            Err(error) => {
+                let _rollback = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        };
+        drop(connection);
+        result
     }
 
     pub(crate) fn load_for_runtime(
@@ -336,10 +384,64 @@ fn validate_code_map(
     Ok(RegisteredCodeMap {
         name: name.to_string(),
         path: canonical_path,
+        root: root.to_path_buf(),
         source_root: source_root_path.to_path_buf(),
         identity,
         generation,
     })
+}
+
+impl RegisteredCodeMap {
+    /// Revalidate the registered file at open time and report whether its
+    /// SQLite header records WAL mode. The header is read from the same
+    /// no-follow descriptor whose identity was just checked.
+    fn revalidate(&self) -> Result<bool, String> {
+        let root = fs::canonicalize(&self.root)
+            .map_err(|_| "registered map root cannot be canonicalized".to_string())?;
+        if root != self.root {
+            return Err("registered map root changed".to_string());
+        }
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|_| "registered map file is unavailable".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err("registered map is not a regular file".to_string());
+        }
+        let canonical = fs::canonicalize(&self.path)
+            .map_err(|_| "registered map file cannot be canonicalized".to_string())?;
+        if canonical != self.path || !canonical.starts_with(&root) {
+            return Err("registered map path changed".to_string());
+        }
+        let file = open_identity_file(&canonical).map_err(|_| {
+            "registered map cannot be opened without following a symlink".to_string()
+        })?;
+        if !file
+            .metadata()
+            .map_err(|_| "registered map metadata cannot be read".to_string())?
+            .file_type()
+            .is_file()
+            || opened_file_identity(&file)? != self.identity
+        {
+            return Err("registered map identity changed".to_string());
+        }
+        // Header bytes 18 and 19 are the write and read format versions; 2 is WAL.
+        let mut header = [0u8; 20];
+        match (&file).read_exact(&mut header) {
+            Ok(()) => Ok(header[18] == 2 || header[19] == 2),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(_) => Err("registered map header cannot be read".to_string()),
+        }
+    }
+
+    /// A `-wal` or `-shm` name beside the map, of any file type, marks it as in
+    /// WAL mode. An entry that cannot be inspected counts as absent here; the
+    /// VFS rollback admission still refuses any sidecar it finds.
+    fn has_wal_companion(&self) -> bool {
+        ["-wal", "-shm"].iter().any(|suffix| {
+            let mut companion = self.path.as_os_str().to_owned();
+            companion.push(suffix);
+            fs::symlink_metadata(PathBuf::from(companion)).is_ok()
+        })
+    }
 }
 
 fn collect_protected_identities(paths: &[PathBuf]) -> Result<HashSet<FileIdentity>, String> {
