@@ -1160,6 +1160,58 @@ fn registered_entity_kinds() -> Result<HashSet<&'static str>> {
     Ok(kinds)
 }
 
+/// Degrade genuinely unknown kinds only on the local snapshot route. The
+/// shared validator stays strict for remote cache publication and hash/pin checks.
+fn degrade_unknown_local_snapshot_kinds(entities: &mut [NdjsonEntity]) -> Result<Vec<String>> {
+    let kinds = registered_entity_kinds()?;
+    let mut warnings = Vec::new();
+    let mut seen_unknown = HashSet::new();
+    for (index, entity) in entities.iter_mut().enumerate() {
+        if entity.kind.trim().is_empty() {
+            bail!("entity {index} ({}): kind must be non-blank", entity.id);
+        }
+        if kinds.contains(entity.kind.as_str())
+            || khive_types::EntityKind::from_str(&entity.kind).is_ok()
+            || kinds
+                .iter()
+                .any(|kind| kind.eq_ignore_ascii_case(entity.kind.trim()))
+        {
+            continue;
+        }
+        // Validate caller-owned reservations before adding server provenance.
+        khive_runtime::secret_gate::reject_reserved_secret_gate_property(
+            entity.properties.as_ref(),
+        )?;
+        let mut properties = match entity.properties.take() {
+            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+            Some(serde_json::Value::Object(properties)) => properties,
+            Some(_) => bail!(
+                "entity {index} ({}): degraded entity properties must be an object",
+                entity.id
+            ),
+        };
+        let raw_kind = std::mem::replace(&mut entity.kind, "concept".into());
+        properties.insert(
+            "khive:original_kind".into(),
+            serde_json::Value::String(raw_kind.clone()),
+        );
+        if let Some(entity_type) = entity.entity_type.take() {
+            properties.insert(
+                "khive:original_entity_type".into(),
+                serde_json::Value::String(entity_type),
+            );
+        }
+        entity.properties = Some(serde_json::Value::Object(properties));
+        if !entity.tags.iter().any(|tag| tag == "khive:degraded_kind") {
+            entity.tags.push("khive:degraded_kind".into());
+        }
+        if seen_unknown.insert(raw_kind.clone()) {
+            warnings.push(raw_kind);
+        }
+    }
+    Ok(warnings)
+}
+
 /// Rebuild `db_path` from `.khive/kg/{entities,edges}.ndjson` under `repo_root`.
 ///
 /// The target must be closed by all SQLite clients. Sync serializes other sync
@@ -1177,7 +1229,7 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     let entities_path = repo_root.join(".khive/kg/entities.ndjson");
     let edges_path = repo_root.join(".khive/kg/edges.ndjson");
 
-    let entity_records = read_entities(&entities_path)
+    let mut entity_records = read_entities(&entities_path)
         .with_context(|| format!("reading {}", entities_path.display()))?;
     let edge_records =
         read_edges(&edges_path).with_context(|| format!("reading {}", edges_path.display()))?;
@@ -1185,9 +1237,17 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     // ── Validate-first gate (#476) ────────────────────────────────────────────
     // Run the full ADR-020 structural validation before creating the temp DB,
     // so any violation leaves the existing DB completely untouched.
+    let degraded_kinds = degrade_unknown_local_snapshot_kinds(&mut entity_records)?;
     validate_ndjson_records(&entity_records, &edge_records).context(
         "validating ADR-020 KG NDJSON before DB rebuild — sync aborted before any DB write",
     )?;
+
+    for kind in degraded_kinds {
+        eprintln!(
+            "warning: degrading unknown local snapshot entity kind {} to concept",
+            khive_runtime::secret_gate::bounded_masked_log_text(&kind)
+        );
+    }
 
     let parent = db_path
         .parent()

@@ -5,7 +5,7 @@
 use crate::adapter::FormatAdapter;
 use crate::error::AdapterError;
 use crate::record::{EdgeRecord, EntityRecord};
-use khive_types::{EdgeRelation, EntityKind};
+use khive_types::{EdgeRelation, EntityKind, ImportKindPolicy};
 use serde_json::Value;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -37,6 +37,18 @@ impl JsonFormatAdapter {
     pub fn new_with_valid_kinds(
         json_input: &str,
         extra_valid_kinds: &[String],
+    ) -> Result<Self, AdapterError> {
+        Self::new_with_kind_policy(json_input, extra_valid_kinds, ImportKindPolicy::Strict)
+    }
+
+    /// Parse records with an explicit unknown-entity-kind policy.
+    ///
+    /// Known aliases and pack kinds retain their normal normalization. Relations
+    /// remain closed under either policy; warnings are emitted by the importer.
+    pub fn new_with_kind_policy(
+        json_input: &str,
+        extra_valid_kinds: &[String],
+        policy: ImportKindPolicy,
     ) -> Result<Self, AdapterError> {
         let value: Value =
             serde_json::from_str(json_input).map_err(|e| AdapterError::Parse(e.to_string()))?;
@@ -84,7 +96,13 @@ impl JsonFormatAdapter {
             if edge_signature {
                 edges.push(parse_edge(index, obj, &mut warnings));
             } else {
-                entities.push(parse_entity(index, obj, &mut warnings, extra_valid_kinds));
+                entities.push(parse_entity(
+                    index,
+                    obj,
+                    &mut warnings,
+                    extra_valid_kinds,
+                    policy,
+                ));
             }
         }
 
@@ -235,6 +253,7 @@ pub(super) fn parse_entity(
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
     extra_valid_kinds: &[String],
+    policy: ImportKindPolicy,
 ) -> Result<EntityRecord, AdapterError> {
     let name = extract_required_string(&mut obj, index, "name")?;
 
@@ -252,6 +271,8 @@ pub(super) fn parse_entity(
                 .any(|k| k.eq_ignore_ascii_case(&normalized))
             {
                 normalized
+            } else if policy == ImportKindPolicy::PreserveUnknown {
+                raw_kind.clone()
             } else {
                 return Err(AdapterError::UnknownKind {
                     index,

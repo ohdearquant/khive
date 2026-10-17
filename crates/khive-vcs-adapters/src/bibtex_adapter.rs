@@ -300,7 +300,13 @@ fn map_entity(
     if let Some(abstract_) = fields.get("abstract") {
         object.insert("description".into(), json!(abstract_));
     }
-    parse_entity(index, object, &mut Vec::new(), &[])
+    parse_entity(
+        index,
+        object,
+        &mut Vec::new(),
+        &[],
+        khive_types::ImportKindPolicy::Strict,
+    )
 }
 
 impl FormatAdapter for BibtexFormatAdapter {
