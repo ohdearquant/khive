@@ -917,7 +917,7 @@ impl SubstrateCoordinator {
                 );
                 let deadline_snapshot_store = std::sync::OnceLock::new();
                 let search_fut = search_with_deadline_snapshot(
-                    search_fut,
+                    Box::pin(search_fut),
                     phase_trace.clone(),
                     request_deadline.async_at(),
                     &deadline_snapshot_store,
@@ -1042,7 +1042,7 @@ impl SubstrateCoordinator {
                 );
                 let deadline_snapshot_store = std::sync::OnceLock::new();
                 let search_fut = search_with_deadline_snapshot(
-                    search_fut,
+                    Box::pin(search_fut),
                     phase_trace.clone(),
                     request_deadline.async_at(),
                     &deadline_snapshot_store,
@@ -1524,7 +1524,9 @@ impl SubstrateCoordinator {
 /// worker does, so a search still in flight at the deadline is reported with the phase it
 /// was in even when it then resolves: a deadline-aware wait (reader admission, checkout)
 /// returns an error at the deadline instead of outliving the outer timeout. The snapshot is
-/// also left in `store` for the arm that sees the outer timeout elapse first.
+/// also left in `store` for the arm that sees the outer timeout elapse first. Callers pass
+/// the search boxed so its state lives on the heap: held inline, it made the caller's
+/// future large enough to overflow a 2 MiB test thread stack in an unoptimized build.
 async fn search_with_deadline_snapshot<F: std::future::Future>(
     search: F,
     trace: khive_storage::request_context::SearchPhaseTrace,
