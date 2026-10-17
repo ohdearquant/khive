@@ -292,6 +292,10 @@ object contains:
   lie beyond the newest-first page, so this is not the oldest row of the whole
   queue. `last_success_at` dates the observation, including after a scan error.
 
+Agent presentation, the MCP default, keeps a null `outbox` and every null field
+inside it, so a channel with no recorded scan, a scan that has not yet
+succeeded and an empty page stay distinct from observed values.
+
 A skipped rate-limit pause does not advance scan evidence. A long deliberate
 pause, slow query or slow delivery can therefore produce `stalled: true`;
 this remains an advisory cadence fact, not a supervisor or overall health verdict.
