@@ -315,6 +315,7 @@ pub struct KhiveRuntime {
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    pub(crate) code_map_registry: Arc<crate::CodeMapRegistry>,
     outbound_email_policy: crate::OutboundEmailPolicy,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
@@ -430,6 +431,11 @@ pub struct KhiveRuntime {
 }
 
 impl KhiveRuntime {
+    /// Return the code maps accepted from the configuration used to construct this runtime.
+    pub fn code_map_registry(&self) -> &crate::CodeMapRegistry {
+        self.code_map_registry.as_ref()
+    }
+
     /// Create a new runtime with the given config.
     ///
     /// The config's `db_path` is used to open or create the SQLite backend.
@@ -661,6 +667,11 @@ impl KhiveRuntime {
         }
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let (registry, default_embedder_name) = build_embedder_registry(&config);
+        let runtime_db_path = backend.pool().canonical_path().map(PathBuf::from);
+        let code_map_registry = Arc::new(crate::CodeMapRegistry::load_for_runtime(
+            &config,
+            runtime_db_path,
+        ));
         let visibility_receipts = Arc::new(
             crate::visibility_receipts::ReceiptCapability::from_config(&config),
         );
@@ -677,6 +688,7 @@ impl KhiveRuntime {
             core_named_vector_stores: None,
             core_backend: None,
             config,
+            code_map_registry,
             outbound_email_policy: Default::default(),
             declared_backend_db_paths: Vec::new().into(),
             diagnostic_backends: Vec::new().into(),
@@ -764,6 +776,16 @@ impl KhiveRuntime {
         self
     }
 
+    /// Share the main runtime's validated code-map registrations.
+    pub fn with_code_map_registry_from(mut self, main: &KhiveRuntime) -> Self {
+        debug_assert!(
+            main.core_backend.is_none(),
+            "with_code_map_registry_from takes the MAIN runtime"
+        );
+        self.code_map_registry = main.code_map_registry.clone();
+        self
+    }
+
     /// Return a runtime handle bound to the main (shared-graph) backend.
     ///
     /// When `self` is already the main runtime (`core_backend` is `None`),
@@ -839,6 +861,7 @@ impl KhiveRuntime {
                     core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
+                    code_map_registry: self.code_map_registry.clone(),
                     outbound_email_policy: self.outbound_email_policy.clone(),
                     declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     diagnostic_backends: self.diagnostic_backends.clone(),
