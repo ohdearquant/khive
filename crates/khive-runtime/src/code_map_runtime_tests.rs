@@ -778,8 +778,7 @@ fn read_only_open_refuses_a_main_file_with_a_second_link() {
 
     std::fs::hard_link(&map, fixture.path().join("second-link.db")).unwrap();
     let error = crate::StorageBackend::open_code_map_read_only(&map, identity, &[])
-        .err()
-        .expect("a second link refuses the read-only open")
+        .expect_err("a second link refuses the read-only open")
         .to_string();
     assert!(error.contains("exactly one link"), "{error}");
 }
