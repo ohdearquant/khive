@@ -2485,7 +2485,9 @@ no_embed = true
         .expect("build shared backend with mixed embedding settings");
         let embedded = &multi.per_pack_runtimes["kg"];
         let no_embed = &multi.per_pack_runtimes["comm"];
-        embedded.register_embedder(RegistryTestEmbedder);
+        embedded
+            .replace_bound_embedder_for_test(RegistryTestEmbedder)
+            .expect("the configured model is bound at startup, so the test backend replaces it");
         let namespace = khive_runtime::Namespace::local();
         let token = embedded.authorize(namespace.clone()).unwrap();
         let note = embedded

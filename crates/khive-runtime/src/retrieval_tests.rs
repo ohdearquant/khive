@@ -1351,6 +1351,45 @@ async fn e5_query_paths_apply_query_prefix() {
 }
 
 #[tokio::test]
+async fn custom_provider_query_paths_receive_raw_text_without_lattice_instructions() {
+    const CUSTOM: &str = "team-custom-query-embedder";
+    assert!(
+        crate::config::parse_embedding_model_alias(CUSTOM).is_none(),
+        "fixture precondition: {CUSTOM} must not name a built-in model"
+    );
+    assert_eq!(CUSTOM_QUERY_ROLE_MODEL.query_instruction(), None);
+    assert_eq!(CUSTOM_QUERY_ROLE_MODEL.document_instruction(), None);
+
+    let single = "single raw query";
+    let batch = vec![
+        "first raw query".to_string(),
+        "second raw query".to_string(),
+    ];
+    let runtime = KhiveRuntime::memory().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    runtime.register_embedder(CapturingEmbedderProvider {
+        name: CUSTOM.to_string(),
+        captured: std::sync::Arc::clone(&captured),
+    });
+
+    runtime
+        .embed_query_with_model(CUSTOM, single)
+        .await
+        .unwrap();
+    runtime
+        .embed_query_batch_with_model(CUSTOM, &batch)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        [vec![single.to_string()], batch],
+        "a custom provider that implements only embed must receive the original query text \
+         through single and batch paths"
+    );
+}
+
+#[tokio::test]
 async fn mixed_document_batch_stays_one_ordered_provider_call() {
     let model = EmbeddingModel::AllMiniLmL6V2;
     let (runtime, captured) = runtime_with_capturing_embedder(model);

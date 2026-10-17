@@ -168,6 +168,22 @@ impl KhiveRuntime {
             .register_test_audited(model, provider);
     }
 
+    /// Replace the provider under an already-bound engine name in a test host.
+    /// See [`EmbedderRegistry::replace_bound_for_test`] for the refusals; this
+    /// API is absent unless `test-internals` is enabled.
+    ///
+    /// [`EmbedderRegistry::replace_bound_for_test`]: crate::embedder_registry::EmbedderRegistry::replace_bound_for_test
+    #[cfg(feature = "test-internals")]
+    pub fn replace_bound_embedder_for_test(
+        &self,
+        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
+    ) -> RuntimeResult<()> {
+        self.embedder_registry
+            .write()
+            .map_err(|_| RuntimeError::Internal("embedder registry lock poisoned".into()))?
+            .replace_bound_for_test(provider)
+    }
+
     /// Bind every configured engine after host and pack provider registration.
     ///
     /// Low-level hosts call this before serving. Validation is atomic within

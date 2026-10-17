@@ -20,6 +20,13 @@ use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
+/// The model value a custom provider's query-role method receives. A custom
+/// provider has no built-in model, but the service trait takes one, and the
+/// trait's default query method prepends that model's query instruction. This
+/// model has neither a query nor a document instruction, so a custom query
+/// keeps its original text whether or not the provider overrides the method.
+const CUSTOM_QUERY_ROLE_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLmL6V2;
+
 pub use khive_retrieval::{
     HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource,
 };
@@ -260,7 +267,8 @@ impl KhiveRuntime {
     /// Applies the pre-0.6 query-role behavior. E5 and Qwen models retain
     /// their query instructions and BGE receives the original unprefixed query
     /// text. A custom provider receives the original text through its
-    /// query-role method and owns its own query preparation.
+    /// query-role method and owns its own query preparation; the trait's
+    /// default query method adds no instruction to it.
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
@@ -298,7 +306,7 @@ impl KhiveRuntime {
             None => self.embedder(model_name).await?,
         };
         let texts = [text.to_string()];
-        let emb_model = model.unwrap_or_default();
+        let emb_model = model.unwrap_or(CUSTOM_QUERY_ROLE_MODEL);
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings = match model {
@@ -560,7 +568,7 @@ impl KhiveRuntime {
         }
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
-        let emb_model = model.unwrap_or_default();
+        let emb_model = model.unwrap_or(CUSTOM_QUERY_ROLE_MODEL);
         let out = match model {
             Some(
                 EmbeddingModel::BgeSmallEnV15

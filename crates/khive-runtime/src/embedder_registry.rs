@@ -489,6 +489,56 @@ impl EmbedderRegistry {
             .expect("test audited provider names must be unique");
     }
 
+    /// Test-only replacement of a provider whose name is already bound.
+    ///
+    /// A test that builds its host through the production startup path finds
+    /// the configured names bound before it can register a deterministic
+    /// backend, and [`Self::register`] refuses a bound name. This swaps the
+    /// provider under such a name and leaves the bound engine list unchanged.
+    /// It refuses a name that is not bound, a provider that is already
+    /// serving, and dimensions that differ from the bound provider's.
+    #[cfg(feature = "test-internals")]
+    pub fn replace_bound_for_test<P: EmbedderProvider + 'static>(
+        &mut self,
+        provider: P,
+    ) -> RuntimeResult<()> {
+        let name = provider.name().to_owned();
+        if !self
+            .bound_engines
+            .as_ref()
+            .is_some_and(|engines| engines.iter().any(|engine| engine.name == name))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is not bound to configured engines"
+            )));
+        }
+        let bound = self.entries.get(&name).ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("embedding provider `{name}` is not registered"))
+        })?;
+        if bound.serving.load(Ordering::Acquire) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is already serving"
+            )));
+        }
+        let expected = bound.provider.dimensions();
+        if provider.dimensions() != expected {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` has dimensions {}, but the bound provider has {expected}",
+                provider.dimensions()
+            )));
+        }
+        self.entries.insert(
+            name,
+            EmbedderEntry {
+                provider: Arc::new(provider),
+                cell: Arc::new(OnceCell::new()),
+                serving: Arc::new(AtomicBool::new(false)),
+                audited_document_preparation: false,
+            },
+        );
+        Ok(())
+    }
+
     fn insert<P: EmbedderProvider + 'static>(
         &mut self,
         provider: P,

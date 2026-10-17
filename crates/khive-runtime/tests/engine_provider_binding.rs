@@ -709,3 +709,48 @@ async fn strategy_and_note_search_use_custom_default_with_keyword_and_error_cont
         Err(RuntimeError::Unconfigured(_))
     ));
 }
+
+#[tokio::test]
+async fn bound_provider_test_replacement_requires_a_bound_idle_name_with_equal_dimensions() {
+    let runtime = make_runtime(vec![peer(CUSTOM, Some(12))]);
+    let calls = Arc::new(Calls::default());
+    register(&runtime, CUSTOM, 12, &calls);
+    let provider = |dims: usize, calls: &Arc<Calls>| Provider {
+        name: CUSTOM.into(),
+        dims,
+        calls: Arc::clone(calls),
+    };
+    invalid(
+        runtime
+            .replace_bound_embedder_for_test(provider(12, &calls))
+            .unwrap_err(),
+        &[CUSTOM, "not bound"],
+    );
+    runtime.finalize_embedding_engines().unwrap();
+    invalid(
+        runtime
+            .replace_bound_embedder_for_test(provider(8, &calls))
+            .unwrap_err(),
+        &[CUSTOM, "dimensions 8", "bound provider has 12"],
+    );
+
+    let replacement = Arc::new(Calls::default());
+    runtime
+        .replace_bound_embedder_for_test(provider(12, &replacement))
+        .unwrap();
+    assert_eq!(runtime.bound_embedding_engine_names().unwrap(), [CUSTOM]);
+    runtime
+        .embed_query_with_model(CUSTOM, "after replacement")
+        .await
+        .unwrap();
+    assert_eq!(replacement.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.builds.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.builds.load(Ordering::SeqCst), 0);
+
+    invalid(
+        runtime
+            .replace_bound_embedder_for_test(provider(12, &calls))
+            .unwrap_err(),
+        &[CUSTOM, "already serving"],
+    );
+}
