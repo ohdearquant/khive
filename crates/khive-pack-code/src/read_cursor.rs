@@ -38,10 +38,7 @@ impl Cursor {
         match &cursor.position {
             Position::List { id, .. } if !search && !id.trim().is_empty() => (),
             Position::Search { score, id }
-                if search && (1..=3).contains(score) && !id.trim().is_empty() =>
-            {
-                ()
-            }
+                if search && (1..=3).contains(score) && !id.trim().is_empty() => {}
             _ => return Err(malformed()),
         }
         Ok(cursor)

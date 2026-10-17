@@ -44,7 +44,7 @@ async fn l1_ingested_projects_support_registered_dependency_reads() {
     std::fs::create_dir(&maps).unwrap();
     std::fs::write(
         source.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"a\", \"b\", \"c\", \"dev\", \"build\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\", \"dev\", \"build_dep\"]\nresolver = \"2\"\n",
     )
     .unwrap();
     write_crate(&source, "a", "crate_a", "");
@@ -68,7 +68,7 @@ async fn l1_ingested_projects_support_registered_dependency_reads() {
     );
     write_crate(
         &source,
-        "build",
+        "build_dep",
         "crate_build",
         "[build-dependencies]\ncrate_a = { path = \"../a\" }",
     );
