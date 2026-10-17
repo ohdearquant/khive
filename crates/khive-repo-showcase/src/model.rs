@@ -81,9 +81,13 @@ impl JsonSchema for Timestamp {
 #[serde(transparent)]
 pub struct Ratio(f64);
 
+fn is_unit_interval(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
 impl Ratio {
     pub fn new(value: f64) -> Result<Self, String> {
-        if value.is_finite() && (0.0..=1.0).contains(&value) {
+        if is_unit_interval(value) {
             Ok(Self(value))
         } else {
             Err(format!(
@@ -166,6 +170,16 @@ pub struct PageBound {
     pub order: String,
 }
 
+impl PageBound {
+    fn all(max_items: u32, order: impl Into<String>) -> Self {
+        Self {
+            kind: BoundKind::All,
+            max_items,
+            order: order.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DisclosureStatus {
@@ -199,11 +213,7 @@ impl<T> Page<T> {
         Self {
             items,
             total_count: Availability::available(total),
-            bound: PageBound {
-                kind: BoundKind::All,
-                max_items,
-                order: order.into(),
-            },
+            bound: PageBound::all(max_items, order),
             next_cursor: None,
             truncated: false,
             disclosure: Disclosure {
@@ -222,11 +232,7 @@ impl<T> Page<T> {
         Self {
             items: Vec::new(),
             total_count: Availability::unavailable(reason.clone()),
-            bound: PageBound {
-                kind: BoundKind::All,
-                max_items,
-                order: order.into(),
-            },
+            bound: PageBound::all(max_items, order),
             next_cursor: None,
             truncated: false,
             disclosure: Disclosure {
@@ -430,11 +436,7 @@ impl SymbolPage {
         Self {
             items: Vec::new(),
             total_count: Availability::unavailable(reason.clone()),
-            bound: PageBound {
-                kind: BoundKind::All,
-                max_items: 0,
-                order: "symbol_id".into(),
-            },
+            bound: PageBound::all(0, "symbol_id"),
             next_cursor: None,
             truncated: false,
             disclosure: Disclosure {
@@ -557,7 +559,7 @@ impl<'de> Deserialize<'de> for GraphEdge {
         D: Deserializer<'de>,
     {
         let wire = GraphEdgeWire::deserialize(deserializer)?;
-        if !wire.weight.is_finite() || !(0.0..=1.0).contains(&wire.weight) {
+        if !is_unit_interval(wire.weight) {
             return Err(serde::de::Error::custom(
                 "graph edge weight must be a finite value in [0,1]",
             ));

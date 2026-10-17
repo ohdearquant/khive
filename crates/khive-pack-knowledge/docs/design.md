@@ -221,17 +221,19 @@
 
 ## Consistency Notes
 
-- `knowledge/vamana.rs` also exceeds 700 lines by design: the ANN lifecycle (SharedAnn type,
-  snapshot persistence, build, search) is tightly coupled through the shared `AnnState`
-  generation and warm-ownership locks and cannot be split without obscuring their ordering.
+- The ANN lifecycle under `knowledge/vamana/` is split by concern: `state.rs` owns `AnnState`,
+  its generation counter and the warm-ownership locks; `bridge_impl.rs` implements the bridge;
+  `persistence.rs`, `fresh_tail.rs` and `snapshot.rs` hold durable state, the fresh-tail read path
+  and snapshot load; `warm_and_rotate.rs` holds warming and segment rotation. The ordering rules
+  stay in the functions that take the locks, and every submodule reaches them through the parent.
 - The `Section` struct and its associated helper functions (`section_from_row`, `section_to_json`)
   are forward-deployed for Phase 3; they carry `#[allow(dead_code)]` with REASON annotations.
 
 ## Module Boundaries
 
 `knowledge/search/ann_search.rs` holds private ANN candidate acquisition, score provenance,
-RRF fusion, and post-hydration filters. The search parent retains reranking and shared
-record types. `search/lexical.rs` owns lexical candidate selection and budgets;
+RRF fusion, and post-hydration filters. `search/rerank.rs` holds the query-embedding cache
+and reranking; the search parent retains shared record types. `search/lexical.rs` owns lexical candidate selection and budgets;
 `search/search_core.rs` combines searches; `search/hydration.rs` joins candidates
 with stored records; `search/compose_helpers.rs` loads compose inputs and scores
 entity additions; `search/handlers.rs` implements search, suggest, and compose.

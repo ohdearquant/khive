@@ -172,6 +172,14 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
 - `cancel` enforces a namespace check (`note.namespace != token.namespace()`)
   before modifying the event. This is the standard namespace isolation gate and
   is consistent with the pattern in other packs.
+- Cancellation uses `NoteStore::replace_note_if_unchanged` with the revision and
+  deletion marker from the validated pending note. A concurrent edit, fire,
+  cancellation or deletion refuses the write with a typed conflict; the caller
+  must read fresh state before retrying. Already non-pending notes retain their
+  existing invalid-input refusal. Cancellation advances `updated_at` strictly,
+  including when the stored timestamp is ahead of the clock; an exhausted
+  `i64::MAX` timestamp fails before any write. Other note fields and properties
+  are retained. See the proposed cancellation amendment in ADR-040.
 - Pagination in `agenda` uses `u64` offsets (not `u32`) to prevent overflow on
   very large stores. This is a defensive coding choice beyond ADR-040's spec.
 - The direct pack handler returns schedule intent only (`events` and `count`).

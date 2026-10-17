@@ -272,12 +272,8 @@ pub fn screen_message(message: &Message<'_>) -> Result<ScreeningOutcome, Screeni
             .map(|text| text.into_owned())
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(first_line) = extracted
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-        {
-            let first_line = normalize(first_line);
+        let paragraph = first_paragraph(extracted.lines());
+        if !paragraph.is_empty() {
             if let Some(rule) = rules()?
                 .rules
                 .iter()
@@ -285,7 +281,7 @@ pub fn screen_message(message: &Message<'_>) -> Result<ScreeningOutcome, Screeni
             {
                 if rule.terms.iter().any(|term| {
                     let needle = normalize(term);
-                    !needle.is_empty() && first_line.contains(&needle)
+                    !needle.is_empty() && paragraph.contains(&needle)
                 }) {
                     // HTML quotation false positives intentionally run toward suppression.
                     outcome.opt_out = true;
@@ -363,19 +359,35 @@ fn opt_out_matches(rules: &[Rule], input: &ScreeningInput) -> bool {
         return false;
     };
     let subject = normalize(&input.subject);
-    let first_line = input
-        .plain_parts
-        .iter()
-        .flat_map(|part| part.lines())
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('>'))
-        .map(normalize)
-        .unwrap_or_default();
+    let paragraph = first_paragraph(input.plain_parts.iter().flat_map(|part| part.lines()));
 
     rule.terms.iter().any(|term| {
         let needle = normalize(term);
-        !needle.is_empty() && (subject.contains(&needle) || first_line.contains(&needle))
+        !needle.is_empty() && (subject.contains(&needle) || paragraph.contains(&needle))
     })
+}
+
+/// The first non-quoted paragraph, normalized: the lines from the first
+/// non-empty line that does not start with `>` up to the next empty or quoted
+/// line, joined with one space. A mail client wraps a sentence across lines,
+/// so a phrase split by the wrap still matches; quoted text and anything
+/// after the first blank line never enter the window.
+fn first_paragraph<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for line in lines.map(str::trim) {
+        let in_window = !line.is_empty() && !line.starts_with('>');
+        if !in_window {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    normalize(&out)
 }
 
 /// Case-fold and collapse ASCII whitespace runs to a single space.
@@ -675,6 +687,9 @@ fn is_executable_attachment(attachment: &AttachmentInput) -> bool {
         .iter()
         .any(|magic| bytes.starts_with(magic))
 }
+
+#[cfg(test)]
+mod reply_fixtures_tests;
 
 #[cfg(test)]
 mod tests {

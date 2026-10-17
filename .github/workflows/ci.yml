@@ -23,12 +23,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Main pushes share one group and run the newest commit only. The run in progress
-# is never cancelled; a newer push replaces any run still waiting in the group, so
-# at most one main run waits. A replaced run's commit is contained in the later
-# run's tree, and the newest main head always reaches a completed run. Commits that
-# land while a run is in progress get no result of their own: a regression between
-# two completed runs is attributed by running CI on the commits in between (#3071).
+# Main pushes share one group and run the newest commit only: a newer push cancels
+# the run in progress and replaces any run still waiting, so a burst of merges
+# leaves one main run, at its newest head, and frees the runners the cancelled runs
+# held for pull request runs. A cancelled run's commit is contained in the later
+# run's tree. While merges keep landing faster than a run completes, main has no
+# completed result; it gets one once merges pause, so a merge batch waits for main
+# to go green before the next batch starts. Commits without a result of their own
+# are attributed by running CI on the commits in between (#3071).
 # https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
 # PR synchronize events keep the same refs/pull/<number>/merge group and cancel
@@ -37,7 +39,7 @@ env:
 # running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   # Replay uses the current workflow against historical source, without a temporary ref:
@@ -119,6 +121,7 @@ jobs:
       actions: read
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      integration_only: ${{ steps.classify.outputs.integration_only }}
     steps:
       - uses: actions/checkout@v7
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -132,11 +135,14 @@ jobs:
           REF: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           docs_only=false
+          integration_only=false
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
@@ -165,7 +171,20 @@ jobs:
           if [[ "$docs_only" != "true" ]]; then
             docs_only=false
           fi
+          # A pull request from this repository's own codex/ branches is built and tested before review
+          # and reaches main only through an integration/** branch, whose push run executes every job on
+          # the merged tree. When it changes crate source and Markdown only, its own run keeps the checks
+          # below and skips the build and test jobs. A change to a workflow, a CI script, a manifest, a
+          # lockfile or toolchain configuration keeps the full suite here (scripts/ci-integration-only.sh).
+          if [[ "$EVENT_NAME" == "pull_request" && "$docs_only" != "true" \
+                && "${HEAD_REF:-}" == codex/* && "${HEAD_REPOSITORY:-}" == "$REPOSITORY" ]]; then
+            integration_only=$(bash scripts/ci-integration-only.sh "$base" "$HEAD_SHA")
+          fi
+          if [[ "$integration_only" != "true" ]]; then
+            integration_only=false
+          fi
           echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+          echo "integration_only=$integration_only" | tee -a "$GITHUB_OUTPUT"
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -249,7 +268,7 @@ jobs:
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -281,6 +300,10 @@ jobs:
       # pull request that runs the three-job matrix above, so the macOS lane
       # runs there, and the many draft pull requests on that prefix no longer
       # hold macOS slots that integration runs wait for.
+      # Pull requests from this repository's `split/` and `docs/` branches run
+      # the two Linux shards only as well. They carry verbatim moves of code
+      # between files and documentation changes; the Linux shards test them,
+      # and the push to main that lands them runs both macOS shards.
       # The head-repository check keeps the rule to branches of this
       # repository: a pull request from a fork runs the three-job matrix
       # whatever its branch is called.
@@ -289,7 +312,9 @@ jobs:
       # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
-          && startsWith(github.head_ref, 'codex/')
+          && (startsWith(github.head_ref, 'codex/')
+            || startsWith(github.head_ref, 'split/')
+            || startsWith(github.head_ref, 'docs/'))
           && github.event.pull_request.head.repo.full_name == github.repository
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
           || github.event_name == 'pull_request'
@@ -505,7 +530,7 @@ jobs:
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -581,7 +606,7 @@ jobs:
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -667,7 +692,7 @@ jobs:
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -855,7 +880,7 @@ jobs:
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -878,7 +903,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
     needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -934,7 +959,7 @@ jobs:
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -1146,7 +1171,7 @@ jobs:
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -1172,7 +1197,7 @@ jobs:
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1340,7 +1365,7 @@ jobs:
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1365,7 +1390,7 @@ jobs:
   core-only:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -1445,7 +1470,7 @@ jobs:
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1520,7 +1545,7 @@ jobs:
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    if: needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1707,7 +1732,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
     needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && needs.changed-paths.outputs.integration_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1784,14 +1809,18 @@ jobs:
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
-          # inputs fail the ratchet. The documentation-lane jobs may skip only
-          # when the classifier succeeded and reported docs_only=true. Any
-          # other skip fails the gate.
+          # inputs fail the ratchet. The lane jobs may skip only when the
+          # classifier succeeded and reported docs_only=true or
+          # integration_only=true. Any other skip fails the gate. On the
+          # integration lane this gate covers the jobs that ran here; the
+          # build and test jobs run in the integration branch's push run.
           echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
+          echo "$NEEDS" | jq -r '"integration lane: \(.["changed-paths"].result) integration_only=\(.["changed-paths"].outputs.integration_only // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
             | (if .["changed-paths"].result == "success"
-                  and .["changed-paths"].outputs.docs_only == "true"
+                  and (.["changed-paths"].outputs.docs_only == "true"
+                       or .["changed-paths"].outputs.integration_only == "true")
                then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",

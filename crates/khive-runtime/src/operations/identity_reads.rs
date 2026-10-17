@@ -240,19 +240,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        // Entity: direct by-UUID fetch (ID-only, no namespace check).
-        if let Some(entity) = self.entities(token)?.get_entity(id).await? {
-            return Ok(Some(Resolved::Entity(entity)));
-        }
-
-        // Note: direct by-UUID fetch (ID-only).
-        if let Some(note) = self.notes(token)?.get_note(id).await? {
-            return Ok(Some(Resolved::Note(note)));
-        }
-
-        // Edges and events are not returned here; the caller's `_` arm handles
-        // those with a separate get_edge / get_event check.
-        Ok(None)
+        self.resolve_records(token, id, false, None, false).await
     }
 
     /// Resolve a UUID to its substrate kind with NO namespace filter, including
@@ -265,23 +253,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        // Entity: including soft-deleted, no namespace check.
-        if let Some(entity) = self
-            .entities(token)?
-            .get_entity_including_deleted(id)
-            .await?
-        {
-            return Ok(Some(Resolved::Entity(entity)));
-        }
-
-        // Note: including soft-deleted, no namespace check.
-        if let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? {
-            return Ok(Some(Resolved::Note(note)));
-        }
-
-        // Edges and events are not returned here; the caller's `_` arm handles
-        // those with a separate get_edge_including_deleted check.
-        Ok(None)
+        self.resolve_records(token, id, true, None, false).await
     }
 
     /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
@@ -332,13 +304,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        if let Some(resolved) = self.resolve_by_id(token, id).await? {
-            return Ok(Some(resolved));
-        }
-        if let Some(event) = self.events(token)?.get_event(id).await? {
-            return Ok(Some(Resolved::Event(event)));
-        }
-        Ok(None)
+        self.resolve_records(token, id, false, None, true).await
     }
 
     /// Resolve a UUID to its substrate kind using primary-namespace-only enforcement.
@@ -350,7 +316,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        self.resolve_primary_inner(token, id, false).await
+        self.resolve_records(token, id, false, Some(token.namespace().as_str()), true)
+            .await
     }
 
     /// Resolve a UUID to its substrate kind, including soft-deleted rows.
@@ -362,20 +329,21 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        self.resolve_primary_inner(token, id, true).await
+        self.resolve_records(token, id, true, Some(token.namespace().as_str()), true)
+            .await
     }
 
-    // Each arm accepts a record only from the caller's primary namespace; a record in a
-    // visible-only namespace is refused and the lookup falls through to the next substrate.
-    // Tombstone selection applies only to entities and notes; events keep their live lookup.
-    async fn resolve_primary_inner(
+    // Preserve entity-before-note-before-event lookup and lazy store access. A namespace
+    // mismatch falls through; None deliberately leaves by-ID reads namespace-agnostic.
+    // Tombstones apply only to entities/notes, and by-ID CRUD never probes events.
+    async fn resolve_records(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         include_deleted: bool,
+        namespace: Option<&str>,
+        include_events: bool,
     ) -> RuntimeResult<Option<Resolved>> {
-        let ns = token.namespace().as_str();
-
         let entity = if include_deleted {
             self.entities(token)?
                 .get_entity_including_deleted(id)
@@ -384,7 +352,7 @@ impl KhiveRuntime {
             self.entities(token)?.get_entity(id).await?
         };
         if let Some(entity) = entity {
-            if Self::ensure_namespace(&entity.namespace, ns).is_ok() {
+            if namespace.is_none_or(|ns| Self::ensure_namespace(&entity.namespace, ns).is_ok()) {
                 return Ok(Some(Resolved::Entity(entity)));
             }
         }
@@ -395,14 +363,16 @@ impl KhiveRuntime {
             self.notes(token)?.get_note(id).await?
         };
         if let Some(note) = note {
-            if Self::ensure_namespace(&note.namespace, ns).is_ok() {
+            if namespace.is_none_or(|ns| Self::ensure_namespace(&note.namespace, ns).is_ok()) {
                 return Ok(Some(Resolved::Note(note)));
             }
         }
 
-        if let Some(event) = self.events(token)?.get_event(id).await? {
-            if Self::ensure_namespace(&event.namespace, ns).is_ok() {
-                return Ok(Some(Resolved::Event(event)));
+        if include_events {
+            if let Some(event) = self.events(token)?.get_event(id).await? {
+                if namespace.is_none_or(|ns| Self::ensure_namespace(&event.namespace, ns).is_ok()) {
+                    return Ok(Some(Resolved::Event(event)));
+                }
             }
         }
 
