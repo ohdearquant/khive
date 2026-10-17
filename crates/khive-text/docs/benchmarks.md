@@ -1,67 +1,95 @@
 # khive-text Benchmark Ledger
 
-## Run command
+## Additional isolated workloads
+
+The additional targets isolate KeywordTokenizer, IdentifierTokenizer and the
+feature-gated UnicodeWordTokenizer, plus the f32 CJK classifier and the legacy
+query entry point. All current baseline values await qualified-host measurement;
+the older release ledger below records historical observations only.
 
 ```bash
-cd crates && cargo bench -p khive-text --bench text_bench
+cd crates
+# Smoke: compile and actually execute every target, including Unicode.
+cargo bench -p khive-text --benches --features unicode -- --test
+# Short Criterion run of all targets.
+cargo bench -p khive-text --benches --features unicode -- --quick --noplot
+# Full additional measurements.
+cargo bench -p khive-text --bench text_additional -- --noplot
+cargo bench -p khive-text --bench text_unicode --features unicode -- --noplot
 ```
 
-To run in test mode (compile-only check, no timing):
+The `text_unicode` target declares `required-features = ["unicode"]`. A command
+without that feature skips its three scenes and is not complete coverage. The
+existing `scoring-retrieval` producer owns this crate; its measuring invocation
+must enable `unicode` to cover this target. Feature defaults and dependencies are
+unchanged. `--list` lists selected IDs without constructing the lazy corpora.
 
-```bash
-cd crates && cargo bench -p khive-text --bench text_bench -- --test
-```
+| Target            | Scene suffix under `tokenize_additional/` | Actual input scalar characters | Witness                                      |
+| ----------------- | ----------------------------------------- | ------------------------------ | -------------------------------------------- |
+| `text_additional` | `keyword/{N}`                             | 200 / 2,000 / 20,000           | Exactly one complete trimmed phrase          |
+| `text_additional` | `identifier/{N}`                          | 204 / 2,006 / 20,026           | Complete ordered original-plus-parts vector  |
+| `text_unicode`    | `unicode_word/{N}`                        | 200 / 2,000 / 20,000           | All accented Latin and Greek words, in order |
 
-## Scenarios
+Sizes include separating whitespace. Each Criterion `Throughput::Elements`
+element is one Unicode scalar value, so throughput is characters/second, not
+UTF-8 bytes/second or tokens/second. The multilingual corpus has more UTF-8 bytes
+than characters. Identifier input repeats `fine_tuning camelCase HTTP2Client`;
+expected output explicitly names the separator, camel-case and digit/acronym
+parts. Keyword/Unicode input repeats `café naïve résumé κόσμος`. Fixtures and
+expected vectors are built once per selected scene. Exact token vectors are
+checked before and after each Criterion callback. `BatchSize::PerIteration`
+keeps returned-vector destruction outside the timer and retains at most one
+result at a time. The timer includes tokenization and its result allocations.
 
-### tokenize
+Four scenes in `text_additional` use the `language_additional/` prefix:
 
-Hot path: raw string → token vec.
+| Suffix                        | Input                             | Expected |
+| ----------------------------- | --------------------------------- | -------- |
+| `legacy_meaningful/normal`    | `transformer attention mechanism` | true     |
+| `legacy_meaningful/gibberish` | `aaaaaaaaa`                       | false    |
+| `contains_cjk_f32/latin`      | `retrieval index search`          | false    |
+| `contains_cjk_f32/mixed`      | `检索系统 retrieval`              | true     |
 
-| ID                           | Input        | Tokenizer             | Description              |
-| ---------------------------- | ------------ | --------------------- | ------------------------ |
-| `tokenize/whitespace/short`  | ~50 chars    | `WhitespaceTokenizer` | 5-word phrase            |
-| `tokenize/whitespace/medium` | ~500 chars   | `WhitespaceTokenizer` | Multi-sentence paragraph |
-| `tokenize/whitespace/long`   | ~5 000 chars | `WhitespaceTokenizer` | Full article-length text |
-| `tokenize/cjk/mixed`         | ~120 chars   | `CjkCharTokenizer`    | Mixed CJK + Latin        |
+`is_meaningful_query` is a deprecated compatibility wrapper around
+`is_meaningful_text_query`, not a separate non-text query policy. The alias is
+called intentionally under a narrowly scoped deprecation allowance and checked
+against the canonical function. The memory pack's recall policy is a different
+API and is outside this benchmark. `contains_cjk_f32` counts the whole input and
+compares its f32 ratio with a strict 15% threshold; no fast early-exit behavior is
+claimed.
 
-### analyze
+Each selected language scene reports the median of 101 actual individually
+timed calls before independent Criterion sampling. The middle sorted duration
+is the reported median; input character/UTF-8 byte lengths accompany it. These
+single-call observations include function-pointer dispatch, black-box and
+`Instant` overhead. Validation, sorting and printing are outside those samples.
+No tail percentile is reported or inferred from Criterion confidence bounds.
+Short calls are especially sensitive to clock overhead; compare like-for-like
+commands, toolchains and hosts. Even smoke mode executes these witnesses.
 
-Full pipeline: tokenize + filter chain via `StandardAnalyzer`.
+## Performance guarantees
 
-| ID                           | Input        | Preset               | Description                                          |
-| ---------------------------- | ------------ | -------------------- | ---------------------------------------------------- |
-| `analyze/standard/short`     | ~50 chars    | `preset::standard()` | Whitespace + lowercase + stop-words + length filters |
-| `analyze/standard/medium`    | ~500 chars   | `preset::standard()` | Same preset, longer input                            |
-| `analyze/standard/long`      | ~5 000 chars | `preset::standard()` | Same preset, article-length input                    |
-| `analyze/simple/short`       | ~50 chars    | `preset::simple()`   | Whitespace + lowercase only                          |
-| `analyze/simple/medium`      | ~500 chars   | `preset::simple()`   | Same preset, longer input                            |
-| `analyze/cjk/mixed`          | ~120 chars   | `preset::cjk()`      | CJK char-level unigrams + Latin whitespace           |
-| `analyze/kg_name/identifier` | 18 chars     | `preset::kg_name()`  | Identifier-aware splitting for entity names          |
+| Operation                       | Input                                                             | Metric            | Bound                                    | Current baseline                                                              |
+| ------------------------------- | ----------------------------------------------------------------- | ----------------- | ---------------------------------------- | ----------------------------------------------------------------------------- |
+| `WhitespaceTokenizer::tokenize` | Existing legacy long fixture (historically labelled ~5,000 chars) | characters/second | Advisory trend against recorded baseline | Awaiting qualified measurement; existing target has no throughput declaration |
+| `IdentifierTokenizer::tokenize` | 2,006 scalar characters                                           | characters/second | Advisory trend against recorded baseline | Awaiting qualified measurement                                                |
+| `is_meaningful_text_query`      | Existing normal fixture                                           | median latency    | Advisory trend against recorded baseline | Historical entry below; no new measurement                                    |
+| `contains_cjk`                  | Existing mixed CJK fixture                                        | median latency    | Advisory trend against recorded baseline | Historical entry below; no new measurement                                    |
 
-### lang_detect
+These rows do not introduce a hard timing gate. Baseline records must include
+the exact commit, toolchain, machine, feature set, command and raw output. Do not
+promote a historical value into a current guarantee. The 13 additional scenes
+have no measured baseline in this change.
 
-Script and quality checks over raw strings.
+## Historical interpretation
 
-| ID                                          | Input        | Function                 | Description                                 |
-| ------------------------------------------- | ------------ | ------------------------ | ------------------------------------------- |
-| `lang_detect/contains_cjk/latin`            | ~500 chars   | `contains_cjk`           | Latin-only text — fast early exit           |
-| `lang_detect/contains_cjk/mixed`            | ~120 chars   | `contains_cjk`           | Mixed CJK + Latin text                      |
-| `lang_detect/script_profile/short`          | ~50 chars    | `ScriptProfile::analyze` | Fraction computation on short text          |
-| `lang_detect/script_profile/long`           | ~5 000 chars | `ScriptProfile::analyze` | Fraction computation on article-length text |
-| `lang_detect/is_meaningful_query/normal`    | 32 chars     | `is_meaningful_query`    | Normal English query — passes all checks    |
-| `lang_detect/is_meaningful_query/gibberish` | 9 chars      | `is_meaningful_query`    | Repeated-char gibberish — rejected early    |
-
-### filter
-
-Individual filter application and chained pipeline over a pre-tokenized medium corpus.
-
-| ID                                | Input      | Component                     | Description                   |
-| --------------------------------- | ---------- | ----------------------------- | ----------------------------- |
-| `filter/lowercase/medium_tokens`  | ~80 tokens | `LowercaseFilter`             | Unicode lowercasing per token |
-| `filter/stopword/medium_tokens`   | ~80 tokens | `StopWordFilter`              | Hash-set lookup per token     |
-| `filter/min_length/medium_tokens` | ~80 tokens | `MinLengthFilter(2)`          | Char-count check per token    |
-| `filter/pipeline_chain/medium`    | ~500 chars | lowercase + stopword + minlen | Full chained pipeline         |
+The old target is preserved byte-for-byte. Its `lang_detect/is_meaningful_query`
+ID currently calls `is_meaningful_text_query`; the new legacy-alias scenes have
+distinct IDs. Its filter setup now uses `iter_batched`, whereas the original
+release note below describes the implementation measured in that release.
+Historical size estimates are labels, not verified current character counts.
+Criterion test mode executes callbacks and assertions; it is not compile-only.
+The original ledger follows unchanged, including its original caveats.
 
 ## Release Ledger
 
