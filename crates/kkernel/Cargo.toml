@@ -69,6 +69,7 @@ lattice-embed = { workspace = true }
 khive-fs = { version = "0.13.0", path = "../khive-fs" }
 
 [dev-dependencies]
+criterion = { workspace = true }
 inventory = { workspace = true }
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-template = { version = "0.13.0", path = "../khive-pack-template" }
@@ -132,3 +133,11 @@ harness = false
 [[test]]
 name = "mounts"
 required-features = ["pack-agent"]
+
+[[bench]]
+name = "locator"
+harness = false
+
+[[bench]]
+name = "coord_locate"
+harness = false
