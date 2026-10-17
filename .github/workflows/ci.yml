@@ -127,7 +127,7 @@ jobs:
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: Classify
         id: classify
         env:
@@ -148,8 +148,21 @@ jobs:
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
           elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
             base=""
-            runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            runs=""
+            # The checkout is one commit deep. The ancestry test below needs main's history, and the
+            # comparison reads paths only, so fetch main's commits and trees without file contents.
+            # A full-depth checkout fetches every branch and tag, and its time grows with their count.
+            # A repository that already holds its history is used as it is.
+            history=true
+            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+              history=false
+              echo "fetching main's history failed"
+            fi
+            if [[ "$history" == "true" ]]; then
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            fi
             while read -r run_id run_sha; do
               [[ -n "$run_id" ]] || continue
               shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \

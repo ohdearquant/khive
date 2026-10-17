@@ -329,6 +329,12 @@ pub struct RuntimeConfig {
     /// builders, which coordinate V21 before constructing runtimes. Tests and
     /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
+    /// Canonicalization boundary for registered code-map database files.
+    pub code_map_root: Option<String>,
+    /// Operator-declared code maps loaded into the runtime registry at construction.
+    pub code_maps: Vec<crate::engine_config::CodeMapConfig>,
+    /// Declared SQLite backend paths protected from code-map registration.
+    pub code_map_protected_database_paths: Vec<std::path::PathBuf>,
     /// The WAL ceiling applied to this runtime's implicit main backend.
     /// Zero means disabled, including for a read-only backend that retains a
     /// nonzero configured value only for operator reporting.
@@ -568,6 +574,9 @@ impl Default for RuntimeConfig {
             credentials: Vec::new(),
             visibility_receipts: None,
             db_path,
+            code_map_root: None,
+            code_maps: Vec::new(),
+            code_map_protected_database_paths: Vec::new(),
             wal_ceiling_bytes: 0,
             wal_ceiling_configured_bytes: 0,
             wal_ceiling_source: WalCeilingSource::Default,
@@ -1030,6 +1039,19 @@ pub fn runtime_config_from_khive_config(
     let mounts = khive_cfg.mounts.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
+    let code_map_root = khive_cfg.code_map_root.clone();
+    let code_maps = khive_cfg.code_maps.clone();
+    let code_map_protected_database_paths = khive_cfg
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == crate::engine_config::BackendKind::Sqlite)
+        .filter_map(|backend| {
+            backend
+                .path
+                .as_deref()
+                .map(|path| expand_tilde(std::path::Path::new(path)))
+        })
+        .collect();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -1155,6 +1177,9 @@ pub fn runtime_config_from_khive_config(
             exec,
             telemetry,
             mounts,
+            code_map_root,
+            code_maps,
+            code_map_protected_database_paths,
             blob_hydration_bytes,
             display_timezone,
             web,
@@ -1190,6 +1215,9 @@ pub fn runtime_config_from_khive_config(
         exec,
         telemetry,
         mounts,
+        code_map_root,
+        code_maps,
+        code_map_protected_database_paths,
         blob_hydration_bytes,
         display_timezone,
         web,

@@ -500,6 +500,28 @@ pub struct BackendConfig {
     pub disk_guard_deadline_ms: Option<u64>,
 }
 
+/// Operator declaration for a readable code map.
+///
+/// Corresponds to one `[[code_maps]]` entry in `config.toml`. Filesystem
+/// validation is performed by the runtime registry loader so one rejected map
+/// does not prevent other declarations from loading.
+/// Known fields with TOML values of the wrong type remain configuration errors.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CodeMapConfig {
+    /// Unique name used to resolve this map.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Absolute database path bounded by `code_map_root`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Absolute source tree described by the map contents.
+    #[serde(default)]
+    pub source_root: Option<String>,
+    /// Unknown keys are retained for per-entry rejection by the registry loader.
+    #[serde(default, flatten)]
+    pub unknown_fields: BTreeMap<String, toml::Value>,
+}
+
 /// Per-pack backend assignment.
 ///
 /// Corresponds to a `[packs.<pack-name>]` entry in `khive.toml`.
@@ -1303,6 +1325,7 @@ impl WebSectionConfig {
 /// - `[telemetry]`: stream and channel carrier policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
+/// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
 ///
@@ -1367,6 +1390,14 @@ pub struct KhiveConfig {
     /// packs share it — identical to pre-ADR-028 behavior.
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
+
+    /// Absolute directory that bounds registered code-map files (ADR-139).
+    #[serde(default)]
+    pub code_map_root: Option<String>,
+
+    /// Operator-registered code-map database files (ADR-139).
+    #[serde(default)]
+    pub code_maps: Vec<CodeMapConfig>,
 
     /// Per-pack backend assignments (ADR-028).
     ///
