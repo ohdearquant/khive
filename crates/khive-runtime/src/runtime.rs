@@ -115,6 +115,29 @@ pub type EntityTypeValidatorFn =
 /// form appears three times and reads as noise at each one.
 pub type EntityKindHooks = Vec<(String, Arc<dyn KindHook>)>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct EntityOwnerHookLookup {
+    hooks: Arc<RwLock<EntityKindHooks>>,
+}
+
+fn find_entity_owner_hook(
+    hooks: &RwLock<EntityKindHooks>,
+    kind: &str,
+) -> Option<Arc<dyn KindHook>> {
+    hooks.read().ok().and_then(|guard| {
+        guard
+            .iter()
+            .find(|(candidate, _)| candidate == kind)
+            .map(|(_, hook)| hook.clone())
+    })
+}
+
+impl EntityOwnerHookLookup {
+    pub(crate) fn has_hook(&self, kind: &str) -> bool {
+        find_entity_owner_hook(&self.hooks, kind).is_some()
+    }
+}
+
 /// Callback type for a pack-installed note-mutation hook.
 ///
 /// Invoked by `update_note` (when the note's text/embedding actually
@@ -2275,12 +2298,13 @@ impl KhiveRuntime {
     /// treats this the same as a hook whose `validate_entity_update`
     /// inherited the trait's `Ok(())` default.
     pub(crate) fn entity_kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-        self.entity_kind_hooks.read().ok().and_then(|guard| {
-            guard
-                .iter()
-                .find(|(k, _)| k == kind)
-                .map(|(_, hook)| hook.clone())
-        })
+        find_entity_owner_hook(&self.entity_kind_hooks, kind)
+    }
+
+    pub(crate) fn canonical_entity_owner_lookup(&self) -> EntityOwnerHookLookup {
+        EntityOwnerHookLookup {
+            hooks: Arc::clone(&self.entity_kind_hooks),
+        }
     }
 
     /// Install a pack-owned note-write validator.

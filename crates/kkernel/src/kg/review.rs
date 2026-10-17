@@ -62,16 +62,12 @@ pub(super) fn cmd_review(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_report(
+pub(super) fn classification_findings(
     changeset: &ChangeSet,
     rule_results: &[RuleResult],
-    rules: &Rules,
-    reviewer_model_family: Option<&str>,
-) -> ReviewReport {
+) -> Vec<ReviewFinding> {
     let mut findings = flatten_findings(rule_results);
-    let coverage_findings = partial_view_coverage_findings(changeset);
-    let has_coverage_failure = !coverage_findings.is_empty();
-    findings.extend(coverage_findings);
+    findings.extend(partial_view_coverage_findings(changeset));
     findings.sort_by(|a, b| {
         severity_rank(&a.severity)
             .cmp(&severity_rank(&b.severity))
@@ -79,6 +75,18 @@ fn build_report(
             .then_with(|| a.subject_id.cmp(&b.subject_id))
             .then_with(|| a.message.cmp(&b.message))
     });
+    findings
+}
+
+fn build_report(
+    changeset: &ChangeSet,
+    rule_results: &[RuleResult],
+    rules: &Rules,
+    reviewer_model_family: Option<&str>,
+) -> ReviewReport {
+    let findings = classification_findings(changeset, rule_results);
+    let coverage_findings = partial_view_coverage_findings(changeset);
+    let has_coverage_failure = !coverage_findings.is_empty();
 
     let failed_rules = rule_results.iter().filter(|result| !result.passed).count()
         + usize::from(has_coverage_failure);

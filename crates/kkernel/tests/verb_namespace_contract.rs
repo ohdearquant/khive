@@ -52,14 +52,16 @@ use khive_pack_schedule::SchedulePack as _;
 /// Bare verb names owned by the kg substrate pack. These are the only names
 /// permitted to omit the `<pack>.` prefix.
 ///
-/// The 24 entries cover CRUD + graph + curation + proposal primitives, plus
+/// The 25 entries cover CRUD + graph + curation + proposal primitives, plus
 /// `stats` for aggregate namespace metrics, `verbs` for verb-registry
 /// introspection (J-help PR #464), `context` for entity-anchored graph
 /// context in one call (ADR-089), `resolve` for reference resolution (S1),
 /// `whoami` for caller identity introspection, and `db_diagnostics` for the
 /// WAL/checkpoint operator diagnostics surface (ADR-091), plus `restore` for
-/// caller-scoped tombstone restoration and `scan` for the secret gate's
-/// write-free verdict on a note body, and `schema` for declared ontology metadata.
+/// caller-scoped tombstone restoration, `scan` for the secret gate's
+/// write-free verdict on a note body, `schema` for declared ontology metadata,
+/// and `apply_changeset`, which lands one canonical change-set as one ordered
+/// writer transaction (ADR-102, tier-1 landing wire amendment).
 const KG_SUBSTRATE_VERBS: &[&str] = &[
     "create",
     "get",
@@ -85,6 +87,7 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
     "whoami",
     "scan",
     "db_diagnostics",
+    "apply_changeset",
 ];
 
 /// Dotted prefixes the kg pack may carry beside its bare verbs. Closed list:
