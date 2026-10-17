@@ -3081,6 +3081,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "criterion",
  "dotenvy",
  "inventory",
  "khive-changeset",
