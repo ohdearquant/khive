@@ -325,7 +325,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.heartbeat",
-        site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::handle_heartbeat",
+        site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::persist_heartbeat",
         expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,

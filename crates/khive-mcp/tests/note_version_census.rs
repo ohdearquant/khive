@@ -794,7 +794,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         COMM_HEARTBEAT,
-        "handle_heartbeat",
+        "persist_heartbeat",
         "insert_note_if_absent",
         MarkerDisposition::FixedNonMemoryKind,
     ),

@@ -349,19 +349,50 @@ pub(super) async fn outbox_once(
         keep_suppression_mirror_fresh(runtime, &mut cycle.mirror).await;
     }
     let (channel_slug, include_legacy) = channels.scan_scope(policy.kind());
-    let notes = runtime
+    const SCAN_PAGE_LIMIT: u32 = 200;
+    let scan_result = runtime
         .list_undelivered_outbound_messages_for_channel(
             &token,
             policy.prefix(),
             &channel_slug,
             include_legacy,
-            200,
+            SCAN_PAGE_LIMIT,
         )
-        .await
-        .map_err(|error| {
-            policy.scan_error(&error, false);
-            ComponentError::Retryable(error.to_string())
-        })?;
+        .await;
+    let outcome = match &scan_result {
+        Ok(notes) => khive_pack_comm::OutboxScanOutcome::Success {
+            pending_rows_seen: notes.len() as u64,
+            pending_rows_limit: SCAN_PAGE_LIMIT,
+            oldest_pending_created_at: notes
+                .iter()
+                .map(|note| note.created_at)
+                .min()
+                .and_then(chrono::DateTime::from_timestamp_micros),
+        },
+        Err(error) => khive_pack_comm::OutboxScanOutcome::Failure {
+            error_message: error.to_string(),
+        },
+    };
+    if let Err(error) = khive_pack_comm::record_outbox_scan(
+        runtime,
+        &token,
+        policy.kind(),
+        &channel_slug,
+        khive_pack_comm::OutboxScan {
+            completed_at: chrono::Utc::now(),
+            interval_secs: OUTBOUND_RETRY_BASE.as_secs(),
+            outcome,
+        },
+    )
+    .await
+    {
+        tracing::warn!(target: "khive_mcp::serve", channel = policy.kind(),
+            channel_slug = %channel_slug, "failed to persist outbox scan outcome: {error}");
+    }
+    let notes = scan_result.map_err(|error| {
+        policy.scan_error(&error, false);
+        ComponentError::Retryable(error.to_string())
+    })?;
     let mut warned = std::collections::HashSet::new();
     for note in notes {
         if cancellation.is_cancelled() {
