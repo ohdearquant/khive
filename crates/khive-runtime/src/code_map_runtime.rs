@@ -11,52 +11,42 @@ use uuid::Uuid;
 
 use crate::{CodeMapConfig, KhiveRuntime, RuntimeConfig, RuntimeError, RuntimeResult};
 
-/// Device and inode recorded from an opened code-map file.
+/// Physical identity recorded from an opened code-map file: device and inode
+/// on Unix, volume serial and file id on Windows.
+#[cfg(any(unix, windows))]
+pub type FileIdentity = khive_db::file_identity::DatabaseFileIdentity;
+
+/// Physical identity recorded from an opened code-map file. This platform
+/// reports none, so every registration is refused.
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileIdentity {
-    device: u64,
-    inode: u64,
+pub struct FileIdentity;
+
+fn opened_file_identity(file: &File) -> Result<FileIdentity, String> {
+    #[cfg(any(unix, windows))]
+    {
+        khive_db::file_identity::database_file_identity_from_file(file)
+            .map_err(|_| "opened file identity could not be read".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err("device and inode identity is unsupported on this platform".to_string())
+    }
 }
 
-impl FileIdentity {
-    /// Return the device component of this identity.
-    pub fn device(self) -> u64 {
-        self.device
+fn path_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        khive_db::file_identity::database_file_identity(path)
     }
-
-    /// Return the inode component of this identity.
-    pub fn inode(self) -> u64 {
-        self.inode
-    }
-
-    fn from_metadata(metadata: &fs::Metadata) -> Result<Self, String> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            let device = metadata
-                .volume_serial_number()
-                .ok_or_else(|| "the file system did not report a device identity".to_string())?;
-            let inode = metadata
-                .file_index()
-                .ok_or_else(|| "the file system did not report a file identity".to_string())?;
-            Ok(Self {
-                device: u64::from(device),
-                inode,
-            })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = metadata;
-            Err("device and inode identity is unsupported on this platform".to_string())
-        }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "device and inode identity is unsupported on this platform",
+        ))
     }
 }
 
@@ -335,7 +325,7 @@ fn validate_code_map(
     if !file_metadata.file_type().is_file() {
         return Err("opened path is not a regular file".to_string());
     }
-    let identity = FileIdentity::from_metadata(&file_metadata)?;
+    let identity = opened_file_identity(&file)?;
     if protected.contains(&identity) {
         return Err("file identity matches a production database or companion".to_string());
     }
@@ -355,9 +345,9 @@ fn validate_code_map(
 fn collect_protected_identities(paths: &[PathBuf]) -> Result<HashSet<FileIdentity>, String> {
     let mut identities = HashSet::new();
     for path in paths {
-        match fs::metadata(path) {
-            Ok(metadata) => {
-                identities.insert(FileIdentity::from_metadata(&metadata)?);
+        match path_identity(path) {
+            Ok(identity) => {
+                identities.insert(identity);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {
@@ -366,9 +356,9 @@ fn collect_protected_identities(paths: &[PathBuf]) -> Result<HashSet<FileIdentit
         }
         for suffix in ["-journal", "-wal", "-shm"] {
             let companion = append_suffix(path, suffix);
-            match fs::metadata(&companion) {
-                Ok(metadata) => {
-                    identities.insert(FileIdentity::from_metadata(&metadata)?);
+            match path_identity(&companion) {
+                Ok(identity) => {
+                    identities.insert(identity);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => {
