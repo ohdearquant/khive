@@ -100,6 +100,7 @@ test-forward-seam = []
 test-channel-timing = ["channel-telegram", "khive-channel-telegram/test-support"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 khive-db = { version = "0.13.0", path = "../khive-db", features = ["test-support"] }
 khive-score = { version = "0.13.0", path = "../khive-score" }
 toml = { workspace = true }
@@ -131,3 +132,7 @@ required-features = ["pack-telemetry"]
 [[test]]
 name = "web_backend_routing"
 required-features = ["pack-web"]
+
+[[bench]]
+name = "serve_startup"
+harness = false

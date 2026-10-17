@@ -2226,6 +2226,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "criterion",
  "futures",
  "inventory",
  "khive-channel",
