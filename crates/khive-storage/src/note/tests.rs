@@ -118,6 +118,7 @@ fn try_with_decay_rejects_negative() {
 #[derive(Default)]
 struct DefaultOnlyNoteStore {
     query_calls: std::sync::atomic::AtomicUsize,
+    record_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl DefaultOnlyNoteStore {
@@ -137,18 +138,26 @@ fn unsupported<T>(operation: &'static str) -> StorageResult<T> {
 #[async_trait]
 impl NoteStore for DefaultOnlyNoteStore {
     async fn upsert_note(&self, _note: Note) -> StorageResult<()> {
+        self.record_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         unsupported("upsert_note")
     }
 
     async fn upsert_notes(&self, _notes: Vec<Note>) -> StorageResult<BatchWriteSummary> {
+        self.record_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         unsupported("upsert_notes")
     }
 
     async fn get_note(&self, _id: Uuid) -> StorageResult<Option<Note>> {
+        self.record_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         unsupported("get_note")
     }
 
     async fn get_note_including_deleted(&self, _id: Uuid) -> StorageResult<Option<Note>> {
+        self.record_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         unsupported("get_note_including_deleted")
     }
 
@@ -231,6 +240,36 @@ impl NoteStore for DefaultOnlyNoteStore {
     async fn try_insert_note(&self, _note: Note) -> StorageResult<bool> {
         unsupported("try_insert_note")
     }
+}
+
+#[tokio::test]
+async fn default_partial_property_patch_is_fail_closed_without_read_or_upsert() {
+    let store = DefaultOnlyNoteStore::default();
+    let patch = NotePropertyPatch {
+        preconditions: Vec::new(),
+        set: [("delivered".into(), Value::Bool(true))].into(),
+        extend_expires_at: Some(123),
+        updated_at: 42,
+    };
+    let result = store
+        .try_patch_note_properties(Uuid::new_v4(), "ns:test", "message", &patch)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::StorageError::Unsupported {
+                capability: crate::StorageCapability::Notes,
+                ref operation,
+                ..
+            }) if operation == "try_patch_note_properties"
+        ),
+        "inherited partial patch must fail closed, got {result:?}"
+    );
+    assert_eq!(
+        store.record_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(store.query_call_count(), 0);
 }
 
 #[tokio::test]

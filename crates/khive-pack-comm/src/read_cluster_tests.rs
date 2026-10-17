@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::{Namespace, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
-use khive_storage::types::DeleteMode;
+use khive_storage::types::{DeleteMode, SqlStatement};
 
 #[derive(Clone)]
 pub(super) enum Phase {
