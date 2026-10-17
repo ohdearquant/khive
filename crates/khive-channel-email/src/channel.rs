@@ -30,8 +30,6 @@ mod email_channel;
 
 use channel_impl::*;
 
-use email_channel::*;
-
 /// Literal IMAP folder this connector selects. Not the configured mailbox
 /// address (which identifies the account/credential, not the folder).
 const IMAP_FOLDER: &str = "INBOX";
