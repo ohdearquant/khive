@@ -150,7 +150,11 @@ pub(crate) fn validate_proposal(
         ProposalChangeset::Canonical {
             schema_version,
             delta,
-        } => validate_canonical_admission(&decode_delta(delta, Some(*schema_version))?, registry),
+        } => {
+            let changeset = decode_delta(delta, Some(*schema_version))?;
+            scan_decoded_delta(&changeset)?;
+            validate_canonical_admission(&changeset, registry)
+        }
         ProposalChangeset::Compound { steps } => {
             for step in steps {
                 reject_nested_canonical(step)?;
@@ -158,6 +162,48 @@ pub(crate) fn validate_proposal(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// The proposal's own scan reads `delta` as one NDJSON string, where a JSON escape keeps a
+/// credential's shape hidden until the text is decoded, so the decoded envelope and every
+/// operation are scanned as well. Runtime-reserved property values are left out, as the
+/// apply-time scans leave them out: their admission is decided against the row each operation
+/// meets.
+fn scan_decoded_delta(changeset: &ChangeSet) -> Result<(), RuntimeError> {
+    let envelope = serde_json::to_value(&changeset.envelope)
+        .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+    khive_runtime::secret_gate::check_json_at(&envelope, "proposal", "changeset")?;
+    for op in &changeset.ops {
+        let mut value =
+            serde_json::to_value(op).map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        strip_reserved_properties(&mut value);
+        khive_runtime::secret_gate::check_json_at(&value, "proposal", "changeset")?;
+    }
+    Ok(())
+}
+
+fn strip_reserved_properties(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(properties)) = map.get_mut("properties") {
+                for key in [
+                    khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY,
+                    khive_runtime::secret_gate::RESERVED_WEB_RECEIPT_KEY,
+                ] {
+                    properties.remove(key);
+                }
+            }
+            for child in map.values_mut() {
+                strip_reserved_properties(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_reserved_properties(item);
+            }
+        }
+        _ => {}
     }
 }
 

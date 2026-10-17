@@ -270,6 +270,67 @@ async fn canonical_proposal_counts_all_creates_before_apply_budget() {
 }
 
 #[tokio::test]
+async fn canonical_proposal_scans_decoded_delta_values_for_secrets() {
+    let (runtime, registry) = setup();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let events = runtime.events(&token).unwrap();
+    let filter = khive_storage::EventFilter {
+        kinds: vec![khive_types::EventKind::ProposalCreated],
+        ..Default::default()
+    };
+    let before = events.count_events(filter.clone()).await.unwrap();
+    let rejected = format!(
+        "postgresql://{}:{}@fixture.example/database",
+        "fixture-user", "<PASSWORD>"
+    );
+    let plain = delta(&[create(701, &rejected)]);
+    // A JSON escape for `@` keeps the credential's shape out of the NDJSON text; decoding the
+    // delta restores it.
+    let escaped = plain.replacen("@fixture.example", "\\u0040fixture.example", 1);
+    assert_ne!(escaped, plain);
+    khive_runtime::secret_gate::check_at(&escaped, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let error = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title":"Escaped credential", "description":"Refuse on the decoded value",
+                "changeset":{"kind":"canonical","schema_version":1,"delta":escaped},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::SecretDetected(_)),
+        "{error:?}"
+    );
+    assert_eq!(events.count_events(filter).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn canonical_proposal_leaves_reserved_property_values_to_apply() {
+    let (_runtime, registry) = setup();
+    // Stamp-shaped: a value under the reserved key that a key-aware scan would read as a
+    // credential. Whether it may be written is decided at apply, against the stored row.
+    let stamp = "Zx8Qp3Lm9Rt2Vb7Nc4Kd1Wf6Hj0Gs5Ya";
+    let update = json!({"op":"update","target_id":Uuid::from_u128(801),
+        "patch":{"target":"entity","properties":{"khive:secret_gate":stamp}},
+        "preimage":{"target":"entity","properties":{"khive:secret_gate":stamp}}});
+    registry
+        .dispatch(
+            "propose",
+            json!({
+                "title":"Reserved echo", "description":"Apply decides reserved values",
+                "changeset":{"kind":"canonical","schema_version":1,"delta":delta(&[update])},
+            }),
+        )
+        .await
+        .expect("propose leaves a reserved value to apply");
+}
+
+#[tokio::test]
 async fn invalid_canonical_proposal_leaves_no_created_history() {
     let (runtime, registry) = setup();
     let token = runtime
