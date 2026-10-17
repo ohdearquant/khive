@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{CodeMapConfig, CodeMapRegistry};
-use crate::{runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, RuntimeConfig};
+use crate::{
+    runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, RuntimeConfig, RuntimeError,
+};
 
 fn entry(name: &str, path: &Path, source_root: &Path) -> CodeMapConfig {
     CodeMapConfig {
@@ -16,6 +18,23 @@ fn entry(name: &str, path: &Path, source_root: &Path) -> CodeMapConfig {
 
 fn create_file(path: &Path) {
     std::fs::write(path, b"map data").unwrap();
+}
+
+fn create_queryable_map(path: &Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE records (value TEXT NOT NULL); INSERT INTO records VALUES ('registered');",
+        )
+        .unwrap();
+}
+
+fn read_map_value(registry: &CodeMapRegistry) -> Result<String, RuntimeError> {
+    registry.with_read("map", |connection| {
+        connection
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .map_err(|_| RuntimeError::Internal("map query failed".to_string()))
+    })
 }
 
 #[derive(Clone)]
@@ -442,5 +461,212 @@ fn core_runtime_shares_the_source_code_map_registration() {
             .expect("core registration")
             .generation(),
         source_generation
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn rollback_map_reads_rows_through_a_short_read_only_handle() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    create_queryable_map(&map);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    let before = crate::StorageBackend::active_code_map_handles_for_test(&map);
+
+    let value = registry
+        .with_read("map", |connection| {
+            assert_eq!(
+                crate::StorageBackend::active_code_map_handles_for_test(&map),
+                before + 1
+            );
+            assert!(connection
+                .execute("INSERT INTO records VALUES ('write')", [])
+                .is_err());
+            connection
+                .query_row("SELECT value FROM records", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|_| RuntimeError::Internal("map query failed".to_string()))
+        })
+        .unwrap();
+
+    assert_eq!(value, "registered");
+    assert_eq!(
+        crate::StorageBackend::active_code_map_handles_for_test(&map),
+        before
+    );
+}
+
+#[test]
+fn replaced_registered_main_file_fails_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    let replacement = maps.join("replacement.db");
+    create_queryable_map(&map);
+    create_queryable_map(&replacement);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+
+    std::fs::rename(&map, maps.join("displaced.db")).unwrap();
+    std::fs::rename(&replacement, &map).unwrap();
+
+    let error = read_map_value(&registry).unwrap_err().to_string();
+    assert!(error.contains("identity") || error.contains("available") || error.contains("safely"));
+    assert!(!error.contains(&map.display().to_string()));
+}
+
+#[test]
+fn removed_registered_main_file_fails_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    create_queryable_map(&map);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+
+    std::fs::remove_file(&map).unwrap();
+
+    assert!(read_map_value(&registry).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn registered_map_refuses_a_companion_symlink_to_a_production_file() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    let production = fixture.path().join("production.db");
+    let production_wal = PathBuf::from(format!("{}-wal", production.display()));
+    create_queryable_map(&map);
+    create_file(&production);
+    // An empty journal is not hot, so without the companion fence this read would succeed.
+    std::fs::write(&production_wal, b"").unwrap();
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        std::slice::from_ref(&production),
+    );
+    let journal = PathBuf::from(format!("{}-journal", map.display()));
+    std::os::unix::fs::symlink(&production_wal, &journal).unwrap();
+
+    assert!(read_map_value(&registry).is_err());
+}
+
+#[test]
+fn registered_map_refuses_a_companion_hard_link_to_a_production_file() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    let production = fixture.path().join("production.db");
+    let production_wal = PathBuf::from(format!("{}-wal", production.display()));
+    create_queryable_map(&map);
+    create_file(&production);
+    // An empty journal is not hot, so without the companion fence this read would succeed.
+    std::fs::write(&production_wal, b"").unwrap();
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        std::slice::from_ref(&production),
+    );
+    let journal = PathBuf::from(format!("{}-journal", map.display()));
+    std::fs::hard_link(&production_wal, &journal).unwrap();
+
+    assert!(read_map_value(&registry).is_err());
+}
+
+#[test]
+fn rollback_map_reads_through_a_legitimate_companion() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    create_queryable_map(&map);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    // SQLite opens an existing journal read-only to learn whether it is hot. The companion has its
+    // own identity and must not be compared against the registered main file.
+    let journal = PathBuf::from(format!("{}-journal", map.display()));
+    std::fs::write(&journal, b"").unwrap();
+
+    assert_eq!(read_map_value(&registry).unwrap(), "registered");
+}
+
+#[test]
+fn wal_mode_map_is_refused_with_code_ingest_as_the_remedy() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    let wal = PathBuf::from(format!("{}-wal", map.display()));
+    let writer = rusqlite::Connection::open(&map).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    writer
+        .execute_batch(
+            "CREATE TABLE records (value TEXT NOT NULL); INSERT INTO records VALUES ('registered');",
+        )
+        .unwrap();
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    assert!(wal.exists());
+    let with_companions = read_map_value(&registry).unwrap_err().to_string();
+
+    // A clean close removes the companions; the header still records WAL mode.
+    drop(writer);
+    assert!(!wal.exists());
+    let header_only = read_map_value(&registry).unwrap_err().to_string();
+
+    for error in [with_companions, header_only] {
+        assert!(
+            error.contains("WAL mode") && error.contains("code.ingest"),
+            "{error}"
+        );
+        assert!(!error.contains(&map.display().to_string()));
+    }
+}
+
+#[test]
+fn rollback_map_with_a_stray_wal_companion_is_refused_as_wal_mode() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    create_queryable_map(&map);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    std::fs::write(format!("{}-wal", map.display()), b"").unwrap();
+
+    let error = read_map_value(&registry).unwrap_err().to_string();
+    assert!(
+        error.contains("WAL mode") && error.contains("code.ingest"),
+        "{error}"
     );
 }
