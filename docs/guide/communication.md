@@ -512,6 +512,22 @@ did before, and the values are ignored entirely.
   `{unsubscribe}`, which the channel replaces with the mailto opt-out
   instruction. External admission is refused while it is unset, unreadable or
   missing the placeholder; policy-recipient messages are unaffected)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` (optional; an `https://` URL that
+  answers the complete set of one-click opt-outs as
+  `{"as_of": "<RFC 3339>", "count": N, "recipient_keys": [...]}`. When set,
+  the outbox reads it at most once per delivery cycle, before any external
+  message goes to SMTP, and adds every missing key to the local suppression
+  list as a `one_click` entry; nothing is written back. A failed read keeps
+  every external message of that cycle pending, never failed. A cycle also
+  reads it when the last successful read is at least half the maximum age old,
+  so an idle deployment stays admissible)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN` (required with the URL; sent as a
+  bearer credential. Secret)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` (required with the URL;
+  positive integer. External admission, which does no network I/O, is refused
+  with `suppression mirror stale` while the last successful read is older than
+  this; policy-recipient messages are unaffected. Either of these two variables
+  without the URL is a configuration error)
 
 Mail from outside senders can be received without enabling external sending:
 `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` admits authenticated non-maintainer mail

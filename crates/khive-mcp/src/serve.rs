@@ -536,6 +536,10 @@ mod reader_pool_tests;
 #[path = "serve_email_policy_tests.rs"]
 mod email_policy_tests;
 
+#[cfg(all(test, feature = "channel-email"))]
+#[path = "serve_suppression_mirror_tests.rs"]
+mod suppression_mirror_tests;
+
 #[cfg(test)]
 #[path = "serve_disk_guard_tests.rs"]
 mod disk_guard_tests;
