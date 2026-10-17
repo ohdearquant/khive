@@ -331,8 +331,8 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.
-#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the four variables
-#   below are read only when it is set and are ignored while it is unset.
+#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the variables below,
+#   through the suppression mirror, are read only when it is set and are ignored while it is unset.
 #   KHIVE_EMAIL_EXTERNAL_SENDERS=lambda:example
 #                                Comma-separated actor ids allowed to send to external recipients.
 #   KHIVE_EMAIL_EXTERNAL_DAILY_CAP=200
@@ -348,6 +348,17 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                contain {unsubscribe}, replaced with the mailto opt-out sentence.
 #                                External admission is refused while it is unset, unreadable or
 #                                missing the placeholder.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_URL=https://example.com/admin/email-suppression
+#                                Optional. https URL answering the complete one-click opt-out set
+#                                ({"as_of", "count", "recipient_keys"}). Read at most once per
+#                                delivery cycle before any external SMTP send; missing keys are
+#                                added locally as one_click entries. A failed read keeps that
+#                                cycle's external messages pending.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN=      Required with the URL. Bearer credential. Secret.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS=3600
+#                                Required with the URL. External admission is refused with
+#                                "suppression mirror stale" while the last successful read is
+#                                older than this; an idle cycle re-reads at half this age.
 #   KHIVE_EMAIL_EXTERNAL_INBOUND=enabled
 #                                Optional. Receives authenticated mail from outside senders without
 #                                setting EXTERNAL_SENDERS, so outbound external sending stays off.

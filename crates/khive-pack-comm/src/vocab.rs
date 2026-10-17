@@ -3,9 +3,10 @@
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 /// The cursor is pack-owned; indexes on notes belong to core migration V52.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
     COMM_SUPPRESSION_SCHEMA_STMT,
+    COMM_SUPPRESSION_MIRROR_SCHEMA_STMT,
 ];
 
 /// Pack-owned auxiliary cursor table for durable channel poll progress (issue
@@ -16,6 +17,11 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
 
 pub(crate) const COMM_SUPPRESSION_SCHEMA_STMT: &str =
     khive_runtime::sql!("comm_suppression_create");
+
+/// One row: the time of the last successful remote suppression mirror refresh (ADR-200 §6),
+/// which external admission reads without network I/O.
+pub(crate) const COMM_SUPPRESSION_MIRROR_SCHEMA_STMT: &str =
+    khive_runtime::sql!("comm_suppression_mirror_create");
 
 const ATTACHMENTS_PARAM: ParamDef = ParamDef {
     name: "attachments", param_type: "array", required: false,

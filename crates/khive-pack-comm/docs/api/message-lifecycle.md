@@ -661,7 +661,7 @@ An id cursor resolves to the full `(created_at, full_id)` tuple of the
 referenced note so ties on equal microsecond timestamps are broken
 deterministically instead of being skipped or duplicated. A timestamp cursor
 is parsed to microseconds via chrono (matching the pattern in
-`khive-pack-brain/src/handlers.rs` and `khive-vcs/src/sync.rs`) rather than
+`khive-pack-brain/src/handlers/event_counts.rs` and `khive-vcs/src/sync.rs`) rather than
 compared as a raw string, so non-canonical but valid RFC 3339 forms
 (whole-second `Z`, `+00:00` offsets, ...) compare correctly against khive's
 canonical microsecond timestamps. An `after` value that is neither a
@@ -1002,7 +1002,9 @@ the reason is never invented.
 
 ## `vocab.rs::COMM_SCHEMA_PLAN_STMTS`
 
-The pack plan contains only the auxiliary `comm_channel_cursor` table. Numbered core migration
+The pack plan contains the auxiliary `comm_channel_cursor`, `comm_suppression` and
+`comm_suppression_mirror` tables; the last holds one row, the time of the last successful remote
+suppression mirror refresh that external admission reads (ADR-200 §6). Numbered core migration
 V52 installs the six comm indexes on `notes`: `idx_comm_message_direction`,
 `idx_comm_message_thread`, `idx_comm_message_to_actor`, `idx_comm_message_outbound_ref`,
 `idx_comm_message_outbound_recipient`, and `idx_comm_quarantine_expiry`. They are available

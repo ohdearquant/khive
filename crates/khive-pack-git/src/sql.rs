@@ -1,4 +1,6 @@
-//! SQL lives beside the code as `sql/<name>.sql`: one statement per file,
-//! `?N` binds only, never string-built, loaded at compile time by `sql!`.
+//! Static SQL assets retain their compile-time `sql!` loading. The seven entity
+//! lookups use a closed typed selector with fixed clauses and bound values.
 
+mod entity_rows;
+pub(crate) use entity_rows::EntityRows;
 pub(crate) use khive_runtime::sql;

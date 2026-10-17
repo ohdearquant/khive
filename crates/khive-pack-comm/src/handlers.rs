@@ -18,7 +18,7 @@ use khive_runtime::{
     RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
@@ -90,12 +90,13 @@ use read_marking::{
 };
 
 pub(crate) use reply::handle_reply;
+pub use suppression::{
+    apply_suppression_mirror_refresh, load_inbound_email_suppressions,
+    load_outbound_email_suppressions, record_mailto_unsubscribe_suppression,
+    record_reply_opt_out_suppression, suppression_mirror_last_refresh,
+};
 pub(crate) use suppression::{
     handle_suppression_add, handle_suppression_list, handle_suppression_remove,
-};
-pub use suppression::{
-    load_inbound_email_suppressions, load_outbound_email_suppressions,
-    record_mailto_unsubscribe_suppression, record_reply_opt_out_suppression,
 };
 pub(crate) use withheld_body::handle_withheld_body;
 
