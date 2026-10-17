@@ -522,14 +522,16 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 class AggregateGateWorkflowTests(unittest.TestCase):
     # The push guard has its own eligibility predicate. The lane jobs carry
-    # exactly DOCS_LANE_PREDICATE and skip on a change that touches only
-    # Markdown no code names, and on an own codex/ pull request that changes
-    # crate source and Markdown only. always() admits a job after failed
-    # dependencies; it is not such a predicate.
+    # DOCS_LANE_PREDICATE and skip on a change that touches only Markdown no
+    # code names. The coverage jobs also carry SCOPE_PREDICATE and skip on a
+    # pull request whose test scope is a crate list (ADR-205). always() admits
+    # a job after failed dependencies; it is not such a predicate.
     CONDITIONAL_JOBS = {"automerge-push-guard"}
     FORGIVEN_SKIPS = {"automerge-push-guard"}
-    DOCS_LANE_PREDICATE = ("needs.changed-paths.outputs.docs_only != 'true'"
-                           " && needs.changed-paths.outputs.integration_only != 'true'")
+    DOCS_LANE_PREDICATE = "needs.changed-paths.outputs.docs_only != 'true'"
+    SCOPE_PREDICATE = ("(needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')")
+    SCOPED_SKIP_JOBS = {"coverage-measurement", "coverage-ratchet"}
     DOCS_LANE_JOBS = {
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
@@ -550,12 +552,15 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results, docs_only="false", classifier=None, integration_only="false"):
+    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full"):
+        """test_scope=None leaves the output unset, as when the scope step did not run."""
         needs = {job: {"result": result} for job, result in results.items()}
         if "changed-paths" in needs:
             if classifier is not None:
                 needs["changed-paths"]["result"] = classifier
-            needs["changed-paths"]["outputs"] = {"docs_only": docs_only, "integration_only": integration_only}
+            needs["changed-paths"]["outputs"] = {"docs_only": docs_only}
+            if test_scope is not None:
+                needs["changed-paths"]["outputs"]["test_scope"] = test_scope
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
             env={**os.environ, "NEEDS": json.dumps(needs)},
@@ -564,6 +569,12 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
     def job_conditions(self, job):
         return re.findall(r"(?m)^    if: (.+)$", indented_block(self.workflow, job, 2))
+
+    def lane_conditions(self, job):
+        predicate = self.DOCS_LANE_PREDICATE
+        if job in self.SCOPED_SKIP_JOBS:
+            predicate = f"{predicate} && {self.SCOPE_PREDICATE}"
+        return [[predicate], [f"always() && {predicate}"]]
 
     def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
         # Every job in the workflow, not only the gate's dependencies: a job that takes the predicate and is
@@ -577,13 +588,17 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         self.assertEqual(carrying, self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS)
         self.assertEqual(carrying & self.needs, self.DOCS_LANE_JOBS)
         self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
-        listed = set(re.findall(r'"([a-z0-9-]+)"', self.script.split("then [", 1)[1].split("]", 1)[0]))
-        self.assertEqual(listed, self.DOCS_LANE_JOBS)
+        lists = [set(re.findall(r'"([a-z0-9-]+)"', block.split("]", 1)[0]))
+                 for block in self.script.split("then [")[1:]]
+        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS])
+        scoped = {
+            job for job in jobs
+            if any(self.SCOPE_PREDICATE in condition for condition in self.job_conditions(job))
+        }
+        self.assertEqual(scoped, self.SCOPED_SKIP_JOBS)
         for job in sorted(self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS):
             with self.subTest(job=job):
-                self.assertIn(self.job_conditions(job), [
-                    [self.DOCS_LANE_PREDICATE], [f"always() && {self.DOCS_LANE_PREDICATE}"],
-                ])
+                self.assertIn(self.job_conditions(job), self.lane_conditions(job))
                 needs_line = re.search(r"(?m)^    needs: (.+)$", indented_block(self.workflow, job, 2))
                 self.assertIn("changed-paths", needs_line.group(1))
         for job in ["changed-paths", "docs", "secret-scan", "data-leak-guard", "marketplace",
@@ -605,24 +620,26 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     def test_gate_forgives_docs_lane_skips_only_after_a_successful_docs_only_classification(self):
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
-                for docs_only, integration_only, classifier in (
-                        ("true", "false", "success"), ("false", "false", "success"),
-                        ("true", "false", "failure"), ("true", "false", "skipped"),
-                        ("TRUE", "false", "success"), ("", "false", "success"),
-                        ("false", "true", "success"), ("false", "true", "failure"),
-                        ("false", "true", "skipped"), ("false", "TRUE", "success"),
-                        ("false", "", "success"), ("", "", "success")):
+                for docs_only, test_scope, classifier in (
+                        ("true", None, "success"), ("false", "full", "success"),
+                        ("true", None, "failure"), ("true", None, "skipped"),
+                        ("TRUE", "full", "success"), ("", "full", "success"),
+                        ("false", "khive-hnsw kkernel", "success"), ("false", "khive-hnsw", "failure"),
+                        ("false", "khive-hnsw", "skipped"), ("false", "FULL", "success"),
+                        ("false", "", "success"), ("false", None, "success"), ("", "", "success")):
                     with self.subTest(job=job, outcome=outcome, docs_only=docs_only,
-                                      integration_only=integration_only, classifier=classifier):
+                                      test_scope=test_scope, classifier=classifier):
                         results = dict.fromkeys(self.needs, "success")
                         results[job] = outcome
                         classifier_result = outcome if job == "changed-paths" else classifier
                         result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result,
-                                               integration_only=integration_only)
-                        lane = classifier_result == "success" and "true" in (docs_only, integration_only)
+                                               test_scope=test_scope)
+                        lane = classifier_result == "success" and docs_only == "true"
+                        scoped = classifier_result == "success" and test_scope not in (None, "", "full", "FULL")
                         accepted = classifier_result == "success" and (outcome == "success" or (
                             outcome == "skipped" and (
-                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS))
+                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS)
+                                or (scoped and job in self.SCOPED_SKIP_JOBS))
                         ))
                         self.assertEqual(
                             result.returncode, 0 if accepted else 1,
@@ -634,7 +651,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
             and "    if: always()" not in indented_block(self.workflow, job, 2)
-            and self.job_conditions(job) != [self.DOCS_LANE_PREDICATE]
+            and self.job_conditions(job) not in self.lane_conditions(job)
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
@@ -699,6 +716,65 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
             "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
+
+
+def steps_before_checkout_in_missing_directory(text: str) -> list[str]:
+    """Name each `run` step that executes before `actions/checkout` in a job whose default
+    working directory is a relative path, without setting its own working directory.
+
+    Such a step runs in a directory the checkout has not created yet and fails with
+    "No such file or directory" before its command starts.
+    """
+    offenders = []
+    jobs = re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text.split("\njobs:\n", 1)[1])
+    for job in jobs:
+        name = job.split(":", 1)[0]
+        workdir = re.search(r"(?m)^    defaults:\n      run:\n(?:        .*\n)*?        working-directory: (\S+)", job)
+        if not workdir or workdir.group(1).startswith(("/", "${{")):
+            continue
+        steps = job.split("\n    steps:\n", 1)
+        if len(steps) < 2:
+            continue
+        for step in re.split(r"(?m)^      - ", steps[1])[1:]:
+            if re.search(r"uses: actions/checkout@", step):
+                break
+            if re.search(r"(?m)^(?:        )?run:", step) and "working-directory:" not in step:
+                offenders.append(f"{name}: {step.splitlines()[0].strip()}")
+    return offenders
+
+
+class StepOrderWorkflowTests(unittest.TestCase):
+    def test_no_run_step_precedes_checkout_in_a_missing_working_directory(self):
+        names = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
+        self.assertIn("ci.yml", names)
+        offenders = {name: steps_before_checkout_in_missing_directory(workflow_text(name)) for name in names}
+        self.assertEqual({name: found for name, found in offenders.items() if found}, {})
+
+    def test_the_check_finds_a_run_step_before_checkout(self):
+        text = textwrap.dedent(
+            """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                defaults:
+                  run:
+                    working-directory: crates
+                steps:
+                  - name: Too early
+                    run: echo early
+                  - uses: actions/checkout@v7
+                  - name: After
+                    run: echo late
+              other:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: No default directory
+                    run: echo fine
+                  - uses: actions/checkout@v7
+            """
+        )
+        self.assertEqual(steps_before_checkout_in_missing_directory(text), ["build: name: Too early"])
 
 
 class CiMatrixWorkflowTests(unittest.TestCase):
@@ -2279,27 +2355,35 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
-        # One job-level predicate is admitted: the documentation and
-        # integration lanes. A job it skips is reported under its unevaluated
-        # name, which is neither a required check name nor an ordinary job
-        # name, so the replay distinction holds; CI gate and the secret scan
-        # never carry it, and the gate accepts those skips only on a successful
-        # docs_only=true or integration_only=true classification
+        # Two job-level predicates are admitted: the documentation lane, and
+        # on the coverage jobs the test scope beside it. A job they skip is
+        # reported under its unevaluated name, which is neither a required
+        # check name nor an ordinary job name, so the replay distinction holds;
+        # CI gate and the secret scan never carry them, and the gate accepts
+        # those skips only on a successful docs_only=true classification or,
+        # for the coverage jobs, a successful crate-list test scope
         # (AggregateGateWorkflowTests). Gating the same jobs per step would
         # still start every runner, the macOS one included.
-        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
-                     " && needs.changed-paths.outputs.integration_only != 'true'")
+        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
+        scoped_lane = (f"{docs_lane} && (needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", job)
                 self.assertNotRegex(job, r"(?m)^    if: [>|]",
                                     "CHECK_NAME_ADMISSION: no folded eligibility predicate")
-                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"]],
+                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"],
+                                           [scoped_lane], [f"always() && {scoped_lane}"]],
                               "CHECK_NAME_ADMISSION: eligibility belongs on steps")
-                if name in {"dependency-review", "coverage-ratchet"}:
+                if name == "dependency-review":
                     self.assertEqual(
                         conditions, [f"always() && {docs_lane}"],
+                        "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
+                    )
+                if name == "coverage-ratchet":
+                    self.assertEqual(
+                        conditions, [f"always() && {scoped_lane}"],
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
                 if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
@@ -2688,8 +2772,8 @@ class DocsOnlyClassifierTests(unittest.TestCase):
 
     def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
                      head_repository=None):
-        """Runs the Classify step and returns its docs_only line; the integration_only value lands in
-        self.integration_only. head_ref and head_repository are left unset unless given, as on a push."""
+        """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
+        unset unless given, as on a push."""
         workflow = workflow_text("ci.yml")
         job = indented_block(workflow, "changed-paths", 2)
         step = job.split("- name: Classify\n", 1)[1]
@@ -2698,8 +2782,6 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         script = textwrap.dedent(match.group(1))
         (self.repo / "scripts").mkdir(exist_ok=True)
         shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
-        shutil.copy(REPO_ROOT / "scripts" / "ci-integration-only.sh",
-                    self.repo / "scripts" / "ci-integration-only.sh")
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -2722,11 +2804,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         lines = output.read_text().splitlines()
-        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only", "integration_only"], lines)
-        self.integration_only = lines[1].split("=", 1)[1]
-        self.assertIn(self.integration_only, ["true", "false"])
-        if event_name != "pull_request":
-            self.assertEqual(self.integration_only, "false", f"{event_name} is never on the integration lane")
+        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only"], lines)
         return lines[0], completed.stdout + completed.stderr
 
     def merge_ref(self, path, text):
@@ -2746,34 +2824,12 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
-        self.assertEqual(self.integration_only, "false")
 
-    def test_job_own_codex_pull_request_with_crate_source_takes_the_integration_lane(self):
+    def test_job_own_codex_pull_request_with_crate_source_is_not_a_lane(self):
+        # The integration-only lane is retired (ADR-205 D7): the branch name changes nothing.
         head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
         verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
-        self.assertEqual((verdict, self.integration_only), ("docs_only=false", "true"), log)
-        self.assertIn("integration lane: crates/k/src/lib.rs", log)
-
-    def test_job_integration_lane_needs_an_own_codex_branch_and_crate_source(self):
-        head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
-        for head_ref, head_repository in (("codex/change", "fork/r"), ("codex/change", ""),
-                                          ("codex/change", None), ("feature/codex/x", "o/r"),
-                                          ("batch/1", "o/r"), ("", "o/r"), (None, None)):
-            with self.subTest(head_ref=head_ref, head_repository=head_repository):
-                verdict, log = self.classify_job("pull_request", head, head_ref=head_ref,
-                                                 head_repository=head_repository)
-                self.assertEqual((verdict, self.integration_only), ("docs_only=false", "false"), log)
-
-    def test_job_own_codex_pull_request_changing_a_ci_script_runs_the_full_suite(self):
-        head = self.merge_ref("scripts/ci.sh", "echo changed\n")
-        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
-        self.assertEqual((verdict, self.integration_only), ("docs_only=false", "false"), log)
-        self.assertIn("outside crate source: scripts/ci.sh", log)
-
-    def test_job_documentation_lane_takes_precedence_over_the_integration_lane(self):
-        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
-        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
-        self.assertEqual((verdict, self.integration_only), ("docs_only=true", "false"), log)
+        self.assertEqual(verdict, "docs_only=false", log)
 
     def gh_listing(self, run_sha, shard_conclusion):
         return (
@@ -2834,42 +2890,93 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                 self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
 
 
-class IntegrationOnlyClassifierTests(unittest.TestCase):
-    """scripts/ci-integration-only.sh on real temporary repositories."""
+FAKE_KKERNEL = r'''#!{python}
+"""A stand-in for `kkernel exec --strict <ops>` answering the three code-map verbs from graph.json."""
+import json, pathlib, re, sys
 
-    CLASSIFIER = REPO_ROOT / "scripts" / "ci-integration-only.sh"
+here = pathlib.Path(__file__).resolve().parent
+spec = json.loads((here / "graph.json").read_text())
+ops = sys.argv[-1]
+with open(here / "calls.log", "a") as log:
+    log.write(ops + "\n")
+if spec.get("exit"):
+    print(json.dumps({"results": [{"ok": False, "error": {"message": "refused"}}]}))
+    sys.exit(spec["exit"])
+results = []
+for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
+    if verb == "ingest":
+        report = spec.get("ingest", {"projects_created": len(spec["projects"]), "edges_created": len(spec["edges"])})
+        results.append({"ok": True, "result": report})
+    elif verb == "list":
+        cursor = re.search(r'cursor="([^"]*)"', args)
+        pages = spec.get("pages") or [sorted(spec["projects"])]
+        index = int(cursor.group(1)) if cursor else 0
+        items = [{"id": spec["projects"][name], "kind": spec.get("list_kind", "project"), "name": name,
+                  "project_id": spec["projects"][name]} for name in pages[index]]
+        following = str(index + 1) if index + 1 < len(pages) else None
+        results.append({"ok": True, "result": {"items": items, "next_cursor": following}})
+    elif verb == "deps":
+        ident = re.search(r'id="([^"]*)"', args).group(1)
+        edges = [{"source": source, "target": target} for source, target in spec["edges"] if target == ident]
+        kinds = spec.get("kinds", {})
+        nodes = [{"id": node, "kind": kinds.get(node, "project")}
+                 for node in sorted({ident} | {edge["source"] for edge in edges})]
+        results.append({"ok": True, "result": {"map": "workspace", "root": ident, "nodes": nodes,
+                                               "edges": edges, "truncated": spec.get("truncated", False)}})
+    else:
+        results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
+print(json.dumps({"results": results}))
+'''
+
+
+class ScopeFixture(unittest.TestCase):
+    """A temporary repository with three crates and a nested one, and a fake kkernel that serves its map."""
+
     TREE = {
+        "crates/Cargo.toml": "[workspace]\nmembers = [\"k\", \"k/sub\", \"j\", \"m\"]\n",
+        "crates/Cargo.lock": "version = 4\n",
+        "crates/k/Cargo.toml": "[package]\nname = \"k\"\n",
         "crates/k/src/lib.rs": "pub fn f() {}\n",
         "crates/k/build.rs": "fn main() {}\n",
         "crates/k/tests/t.rs": "#[test]\nfn t() {}\n",
         "crates/k/README.md": "# k\n",
-        "crates/k/Cargo.toml": "[package]\nname = \"k\"\n",
-        "crates/Cargo.toml": "[workspace]\n",
-        "crates/Cargo.lock": "version = 4\n",
         "crates/k/Cargo.lock": "version = 4\n",
+        "crates/k/clippy.toml": "msrv = \"1.85\"\n",
+        "crates/k/sub/Cargo.toml": "[package]\nname = \"ksub\"\n",
+        "crates/k/sub/src/lib.rs": "pub fn s() {}\n",
+        "crates/j/Cargo.toml": "[package]\nname = \"j\"\n",
+        "crates/j/src/lib.rs": "pub fn g() {}\n",
+        "crates/m/Cargo.toml": "[package]\nname = \"m\"\n",
+        "crates/m/src/lib.rs": "pub fn h() {}\n",
         "crates/.cargo/config.toml": "[build]\n",
         "crates/.config/nextest.toml": "[profile.default]\n",
         "crates/rust-toolchain.toml": "[toolchain]\n",
         "crates/deny.toml": "[bans]\n",
-        "crates/k/clippy.toml": "msrv = \"1.85\"\n",
         "crates/rustfmt.toml": "edition = \"2021\"\n",
-        "docs/guide.md": "# Guide\n",
+        "notes/k-notes.md": "# Notes\n",
         "docs/diagram.svg": "<svg/>\n",
         ".github/workflows/ci.yml": "name: CI\n",
         ".github/actions/a/action.yml": "name: a\n",
         "scripts/ci.sh": "echo ci\n",
         "python/pkg/__init__.py": "\n",
         "tests/contract.py": "\n",
+        "benches/b.rs": "\n",
+        "apps/a/index.ts": "\n",
         "Makefile": "ci:\n",
         "rust-toolchain.toml": "[toolchain]\n",
     }
-    LANE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs", "crates/k/README.md",
-            "docs/guide.md"}
+    # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
+    CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
+                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs"}
+    # j depends on k, and k on ksub.
+    GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
+             "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.repo = pathlib.Path(self.temp.name) / "repo"
+        self.root = pathlib.Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
         self.repo.mkdir()
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
@@ -2879,7 +2986,23 @@ class IntegrationOnlyClassifierTests(unittest.TestCase):
         self.git("init", "-q", "-b", "main")
         for path, text in self.TREE.items():
             self.write(path, text)
+        shutil.copy(REPO_ROOT / "scripts" / "ci-test-scope.py", self.repo / "scripts" / "ci-test-scope.py")
+        shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
+                    self.repo / "tests" / "documented_verb_counts.py")
         self.base = self.commit("base")
+        self.fake = self.root / "fake"
+        self.fake.mkdir()
+        kernel = self.fake / "kkernel"
+        kernel.write_text(FAKE_KKERNEL.replace("{python}", sys.executable, 1))
+        kernel.chmod(0o755)
+        self.set_graph(self.GRAPH)
+
+    def set_graph(self, graph):
+        (self.fake / "graph.json").write_text(json.dumps(graph))
+
+    def calls(self, directory=None):
+        log = (directory or self.fake) / "calls.log"
+        return log.read_text().splitlines() if log.exists() else []
 
     def git(self, *args):
         return subprocess.run(
@@ -2897,65 +3020,238 @@ class IntegrationOnlyClassifierTests(unittest.TestCase):
         self.git("commit", "-q", "--allow-empty", "-m", message)
         return self.git("rev-parse", "HEAD")
 
-    def classify(self, base, head):
+    def change(self, *paths):
+        self.git("checkout", "-q", "--detach", self.base)
+        for path in paths:
+            self.write(path, (self.TREE.get(path) or "") + "// changed\n")
+        return self.commit("change " + " ".join(paths))
+
+
+class TestScopeClassifierTests(ScopeFixture):
+    """scripts/ci-test-scope.py on real temporary repositories, against a fake kkernel."""
+
+    def scope(self, base, head, *mode):
+        mode = mode or ("--kkernel", str(self.fake / "kkernel"))
         completed = subprocess.run(
-            ["bash", str(self.CLASSIFIER), base, head], cwd=self.repo, env=self.env,
-            text=True, capture_output=True, timeout=30, check=False,
+            [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), base, head, *mode],
+            cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=60, check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
+        self.assertEqual(completed.stdout.count("\n"), 1, completed.stdout)
         return completed.stdout.strip(), completed.stderr
 
     def test_fixture_git_turns_off_auto_maintenance(self):
         self.assertEqual(self.git("config", "--get", "maintenance.auto"), "false")
 
-    def test_each_path_alone(self):
-        # Every path in the fixture is classified on its own; the lane set is the allow-list.
+    def test_each_path_alone_under_the_path_rules(self):
+        # Every fixture path changed alone: crate source reaches the map, everything else is the full suite.
         for path in sorted(self.TREE):
             with self.subTest(path=path):
-                self.git("checkout", "-q", "--detach", self.base)
-                self.write(path, self.TREE[path] + "\n")
-                verdict, reasons = self.classify(self.base, self.commit(path))
-                self.assertEqual(verdict, "true" if path in self.LANE else "false", reasons)
+                verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
+                self.assertEqual(verdict, "map" if path in self.CRATE_SOURCE else "full", reasons)
+        self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
 
-    def test_one_full_suite_path_beside_crate_source_runs_the_full_suite(self):
-        self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
-        self.write("docs/guide.md", "# Guide\n\nMore.\n")
-        verdict, reasons = self.classify(self.base, self.commit("source and docs"))
-        self.assertEqual(verdict, "true", reasons)
-        self.write("crates/k/Cargo.toml", "[package]\nname = \"k\"\nversion = \"0.1.0\"\n")
-        verdict, reasons = self.classify(self.base, self.commit("and a manifest"))
-        self.assertEqual(verdict, "false")
-        self.assertIn("manifest or lockfile: crates/k/Cargo.toml", reasons)
+    def test_a_full_suite_path_never_reaches_the_binary(self):
+        # ADR-205 D4 ordering arm: a manifest beside crate source prints its reason and no ingest line.
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml", reasons)
+        self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
 
-    def test_new_and_deleted_paths_are_classified_by_their_own_names(self):
-        self.write("crates/k/src/new.rs", "pub fn n() {}\n")
-        verdict, reasons = self.classify(self.base, self.commit("new source"))
-        self.assertEqual(verdict, "true", reasons)
-        self.git("rm", "-q", "scripts/ci.sh")
-        verdict, reasons = self.classify(self.base, self.commit("removed script"))
-        self.assertEqual(verdict, "false")
-        # A move out of crates/ is a deletion plus an addition, and the addition is outside crate source.
-        self.git("checkout", "-q", "--detach", self.base)
-        self.git("mv", "crates/k/src/lib.rs", "scripts/lib.rs")
-        verdict, reasons = self.classify(self.base, self.commit("moved"))
-        self.assertEqual(verdict, "false")
-        self.assertIn("outside crate source: scripts/lib.rs", reasons)
+    def test_crate_source_prints_the_ingest_line_and_the_closure(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/k/src/lib.rs -> k", reasons)
+        self.assertIn("ingest: ", reasons)
+        self.assertIn("closure (2 of 4 crates): j k", reasons)
+        self.assertTrue(self.calls()[0].startswith("code.ingest("), self.calls())
+
+    def test_a_nested_crate_takes_the_longest_manifest_prefix_and_its_transitive_dependents(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/sub/src/lib.rs"))
+        self.assertEqual(verdict, "j k ksub", reasons)
+        self.assertIn("changed: crates/k/sub/src/lib.rs -> ksub", reasons)
+
+    def test_a_crate_nothing_depends_on_is_its_own_scope(self):
+        self.assertEqual(self.scope(self.base, self.change("crates/m/src/lib.rs"))[0], "m")
+
+    def test_markdown_beside_crate_source(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/lib.rs", "notes/k-notes.md"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: notes/k-notes.md", reasons)
+        # A Markdown file that code names puts the run on the full suite.
+        self.write("crates/m/src/lib.rs", 'pub const DOC: &str = include_str!("../../../notes/k-notes.md");\n')
+        named = self.commit("name the notes")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("notes and source"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("notes/k-notes.md is named by a non-Markdown file", reasons)
+
+    def test_the_map_is_read_across_pages(self):
+        self.set_graph({**self.GRAPH, "pages": [["k"], ["j", "ksub"], ["m"]]})
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertEqual(sum(call.startswith("code.list(") for call in self.calls()), 3)
+
+    def test_every_map_defect_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        projects = self.GRAPH["projects"]
+        for label, graph, reason in (
+                ("refused", {**self.GRAPH, "exit": 1}, "kkernel exec exited 1"),
+                ("warning", {**self.GRAPH, "ingest": {"warnings": ["skipped a file"]}}, "reported warnings"),
+                ("blocked", {**self.GRAPH, "ingest": {"blocked_count": 1}}, "blocked writes"),
+                ("refused manifest", {**self.GRAPH, "ingest": {"manifest_files_refused": 1}},
+                 "manifest_files_refused=1"),
+                ("truncated", {**self.GRAPH, "truncated": True}, "was truncated"),
+                ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
+                 "changed crate k is not a project"),
+                ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
+                 "a project that code.list did not"),
+                ("duplicate name", {**self.GRAPH, "pages": [["k", "j"], ["k"]]}, "two projects in the map"),
+                ("non-project row", {**self.GRAPH, "list_kind": "module"}, "returned a 'module' row"),
+                ("empty map", {"projects": {}, "edges": []}, "the map holds no projects")):
+            with self.subTest(label=label):
+                self.set_graph(graph)
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+        # A dependent that is not a project (a module, say) is not a crate to test.
+        self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
+        self.assertEqual(self.scope(self.base, head)[0], "k")
+        self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_missing_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        verdict, reasons = self.scope(self.base, head, "--kkernel", str(self.root / "absent"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("no executable kkernel binary", reasons)
 
     def test_no_change_an_unknown_revision_and_a_submodule_run_the_full_suite(self):
-        verdict, reasons = self.classify(self.base, self.commit("empty"))
-        self.assertEqual(verdict, "false")
+        verdict, reasons = self.scope(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "full")
         self.assertIn("no changed paths", reasons)
-        verdict, reasons = self.classify("0" * 40, self.base)
-        self.assertEqual(verdict, "false")
+        verdict, reasons = self.scope("0" * 40, self.base)
+        self.assertEqual(verdict, "full")
         self.assertIn("git diff", reasons)
         self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
         self.git("add", "-A")
         self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},crates/vendored")
         self.git("commit", "-q", "-m", "submodule")
-        verdict, reasons = self.classify(self.base, self.git("rev-parse", "HEAD"))
-        self.assertEqual(verdict, "false")
+        verdict, reasons = self.scope(self.base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "full")
         self.assertIn("has a submodule", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_move_out_of_crates_is_classified_by_its_new_name(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "crates/k/src/lib.rs", "scripts/lib.rs")
+        verdict, reasons = self.scope(self.base, self.commit("moved"), "--paths-only")
+        self.assertEqual(verdict, "full")
+        self.assertIn("CI or lint script: scripts/lib.rs", reasons)
+
+    def test_usage(self):
+        for args in ([], ["a", "b"], ["a", "b", "--kkernel"], ["a", "b", "--paths-only", "x"], ["a", "b", "--other"]):
+            with self.subTest(args=args):
+                completed = subprocess.run(
+                    [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), *args],
+                    cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=30, check=False,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("usage:", completed.stderr)
+
+
+class ScopeStepTests(ScopeFixture):
+    """The Classify job's Scope step: the path rules first, then the binary from main, never a failure."""
+
+    FAKE_GH = """#!/bin/bash
+echo "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api "*) [ -n "$GH_RUNS" ] || exit 1; printf '%s\\n' $GH_RUNS ;;
+  "run download")
+    dir="${@: -1}"
+    for run in $GH_ARTIFACT_RUNS; do
+      if [ "$run" = "$3" ]; then mkdir -p "$dir"; cp "$FAKE_DIR/kkernel" "$FAKE_DIR/graph.json" "$dir/"; exit 0; fi
+    done
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {"gh": self.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
+        if shutil.which("timeout") is None:
+            tools["timeout"] = '#!/bin/bash\nshift\nexec "$@"\n'
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.runner_temp = self.root / "runner-temp"
+        self.runner_temp.mkdir()
+        self.gh_log = self.root / "gh.log"
+
+    def run_step(self, event_name, head, runs="201 202", artifact_runs="202"):
+        step = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        output = self.root / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-c", textwrap.dedent(match.group(1))], cwd=self.repo, text=True, capture_output=True,
+            timeout=60, check=False,
+            env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                 "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
+                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake)},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("test_scope="), lines)
+        return lines[0].split("=", 1)[1], completed.stdout + completed.stderr
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def test_a_crate_source_pull_request_is_scoped_with_the_binary_from_main(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "j k", log)
+        self.assertIn("kkernel from main push run 202", log)
+        downloads = [call for call in self.gh_calls() if call.startswith("run download")]
+        self.assertEqual([call.split()[2] for call in downloads], ["201", "202"])
+        self.assertTrue(self.calls(self.runner_temp / "kkernel-main-202"))
+
+    def test_the_path_rules_run_before_any_fetch(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_other_events_are_never_scoped(self):
+        head = self.change("crates/k/src/lib.rs")
+        for event_name in ("push", "schedule", "workflow_dispatch"):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head)
+                self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_an_unavailable_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        for runs, artifact_runs in (("", "202"), ("201 202", ""), ("201", "202")):
+            with self.subTest(runs=runs, artifact_runs=artifact_runs):
+                scope, log = self.run_step("pull_request", head, runs=runs, artifact_runs=artifact_runs)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no successful main push run", log)
+
+    def test_a_failing_classifier_runs_the_full_suite(self):
+        self.set_graph({**self.GRAPH, "exit": 3})
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "full", log)
+        (self.repo / "scripts" / "ci-test-scope.py").write_text("import sys\nsys.exit(1)\n")
+        scope, log = self.run_step("pull_request", self.commit("broken classifier"))
+        self.assertEqual(scope, "full", log)
 
 
 class OptionalWorkflowCodexSkipTests(unittest.TestCase):
