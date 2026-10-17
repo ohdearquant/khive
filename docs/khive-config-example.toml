@@ -348,6 +348,15 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                contain {unsubscribe}, replaced with the mailto opt-out sentence.
 #                                External admission is refused while it is unset, unreadable or
 #                                missing the placeholder.
+#   KHIVE_EMAIL_EXTERNAL_INBOUND=enabled
+#                                Optional. Receives authenticated mail from outside senders without
+#                                setting EXTERNAL_SENDERS, so outbound external sending stays off.
+#                                Requires KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR; any value other than
+#                                enabled or empty refuses start-up.
+#   KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR=lambda:inbox
+#                                Required while external inbound is enabled (EXTERNAL_SENDERS set or
+#                                EXTERNAL_INBOUND=enabled). Receives external mail with no verified
+#                                thread owner and no matching KHIVE_EMAIL_INBOUND_ROUTES alias.
 #   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
 #   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
 #   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.

@@ -59,9 +59,10 @@ const EMAIL_QUARANTINE_SENDER: &str = "email:quarantine";
 /// 2026-07-02) and was quarantined instead of attributed to the maintainer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuarantineReason {
-    /// No `Authentication-Results` header was selected: none were present, or
-    /// none carried the configured `authserv-id`.
+    /// Neither plain nor ARC authentication-results headers were present.
     AuthAbsent,
+    /// Authentication-results headers were present, but none was trusted.
+    AuthUntrusted,
     /// A trusted header was selected but showed no passing, aligned method.
     DmarcFail,
     /// spf or dkim passed, but its alignment domain did not match the From: domain.
@@ -87,6 +88,7 @@ impl std::fmt::Display for QuarantineReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             QuarantineReason::AuthAbsent => "auth-absent",
+            QuarantineReason::AuthUntrusted => "auth-untrusted",
             QuarantineReason::DmarcFail => "dmarc-fail",
             QuarantineReason::Unaligned => "unaligned",
             QuarantineReason::OffAllowlist => "off-allowlist",
@@ -213,6 +215,17 @@ impl EmailChannel {
         self
     }
 
+    /// Whether this channel admits authenticated mail from senders other than the maintainer as
+    /// external inbound: a host is wired that reports external inbound enabled, and inbound
+    /// routing is attached (ADR-200 sections 7 and 8.2).
+    pub fn external_inbound_enabled(&self) -> bool {
+        self.external_inbound.is_some()
+            && self
+                .external_host
+                .as_deref()
+                .is_some_and(|host| host.external_inbound_enabled())
+    }
+
     /// The configured mailbox address (e.g. `mailbox@example.com`).
     ///
     /// Used by the outbox delivery loop to derive the sender address and
@@ -313,7 +326,19 @@ impl EmailChannel {
     fn evaluate_auth(&self, email: &RawEmail) -> Result<(), QuarantineReason> {
         let selected =
             auth_results::select_trusted(&email.authentication_results, &self.config.trust_anchor)
-                .ok_or(QuarantineReason::AuthAbsent)?;
+                .ok_or_else(|| {
+                    if auth_results::observed_auth_header(
+                        &email.authentication_results,
+                        &email.headers,
+                        &email.raw_bytes,
+                    )
+                    .is_some()
+                    {
+                        QuarantineReason::AuthUntrusted
+                    } else {
+                        QuarantineReason::AuthAbsent
+                    }
+                })?;
 
         let from_domain = email
             .from_addrs
@@ -337,7 +362,7 @@ impl EmailChannel {
     /// Run the domain-authentication-then-allowlist gate: ADR-200 §7's steps 3 through 7.
     ///
     /// Steps 1 and 2 (malformed, and the mailto unsubscribe) are decided before this is reached.
-    /// Step 6: once a sender authenticates and the external-sender configuration is on,
+    /// Step 6: once a sender authenticates and external inbound is enabled,
     /// an `inbound` suppression entry matching the sender's address or its exact domain quarantines
     /// the message as `blocked`. Both must pass for a message to be attributed to the maintainer;
     /// any failing step quarantines it (never partially attributed).
@@ -355,12 +380,12 @@ impl EmailChannel {
             return Ok(EmailAttribution::Maintainer);
         }
         // Step 4 (maintainer) is the allowlist passing above and is unchanged. The sender is not
-        // the maintainer, so it is external: step 5 keeps today's outcome while external senders
-        // are unset, and step 6 consults the inbound list only once they are configured.
+        // the maintainer, so it is external: step 5 keeps today's outcome while external inbound
+        // is disabled, and step 6 consults the inbound list only once it is enabled.
         if self
             .external_host
             .as_deref()
-            .is_some_and(|host| host.external_senders_configured())
+            .is_some_and(|host| host.external_inbound_enabled())
         {
             // "the authenticated `From:` address" is a single well-formed From: a message with
             // zero or several is unauthorized on its face, not a candidate for the block list.
@@ -420,6 +445,40 @@ impl EmailChannel {
             .insert("quarantined".to_string(), "true".to_string());
         env.metadata
             .insert("quarantine_reason".to_string(), reason.to_string());
+        if reason == QuarantineReason::AuthUntrusted {
+            if let Some((family, raw)) = auth_results::observed_auth_header(
+                &email.authentication_results,
+                &email.headers,
+                &email.raw_bytes,
+            ) {
+                let mode = match &self.config.trust_anchor {
+                    crate::config::TrustAnchor::AuthservId(_) => "authserv-id",
+                    crate::config::TrustAnchor::TopmostNoAuthservId => "topmost-no-authserv-id",
+                    crate::config::TrustAnchor::TopmostWithAuthservId(_) => {
+                        "topmost-with-authserv-id"
+                    }
+                };
+                env.metadata
+                    .insert("quarantine_auth_anchor_mode".into(), mode.into());
+                env.metadata
+                    .insert("quarantine_auth_header_family".into(), family.into());
+                let (status, truncated) = match auth_results::observed_authserv_id(
+                    raw,
+                    family == "arc-authentication-results",
+                ) {
+                    auth_results::ObservedAuthservId::Present { value, truncated } => {
+                        env.metadata.insert("quarantine_auth_id".into(), value);
+                        ("present", truncated)
+                    }
+                    auth_results::ObservedAuthservId::NoAuthservId => ("no-authserv-id", false),
+                    auth_results::ObservedAuthservId::Unparseable => ("unparseable", false),
+                };
+                env.metadata
+                    .insert("quarantine_auth_id_status".into(), status.into());
+                env.metadata
+                    .insert("quarantine_auth_id_truncated".into(), truncated.to_string());
+            }
+        }
         if let Some(claimed_from) = email.from_addrs.first() {
             env.metadata
                 .insert("quarantine_claimed_from".to_string(), claimed_from.clone());
@@ -778,13 +837,12 @@ impl EmailChannel {
     /// Load the `inbound` suppression check for one poll.
     ///
     /// Loaded once per poll (ADR-200 §7 step 6) and shared across the page's messages. When the
-    /// channel has no host, or external senders are unset, no read happens -- matching today's
-    /// behaviour with `KHIVE_EMAIL_EXTERNAL_SENDERS` unset.
+    /// channel has no host, or external inbound is disabled, no read happens.
     async fn load_inbound_suppression(&self) -> Result<Option<InboundSuppression>, ChannelError> {
         let host = self
             .external_host
             .as_deref()
-            .filter(|host| host.external_senders_configured());
+            .filter(|host| host.external_inbound_enabled());
         match host {
             Some(host) => host.inbound_suppression().await.map(Some),
             None => Ok(None),
@@ -1648,6 +1706,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_auth_headers_disclose_only_bounded_untrusted_evidence() {
+        for (headers, anchor, reason, family, status, seen_id) in [
+            ("", TrustAnchor::AuthservId("mx.example.com".into()), "auth-absent", None, None, None),
+            ("Authentication-Results: forged-mx.evil.com; dmarc=pass header.from=example.com\r\n", TrustAnchor::AuthservId("mx.example.com".into()), "auth-untrusted", Some("authentication-results"), Some("present"), Some("forged-mx.evil.com")),
+            ("Authentication-Results: mx.microsoft.com 1; spf=pass; dkim=pass header.d=example.com; dmarc=pass header.from=example.com\r\n", TrustAnchor::TopmostNoAuthservId, "auth-untrusted", Some("authentication-results"), Some("present"), Some("mx.microsoft.com")),
+            ("ARC-Authentication-Results: i=2; mx.microsoft.com 1; dmarc=pass header.from=example.com\r\n", TrustAnchor::AuthservId("mx.microsoft.com".into()), "auth-untrusted", Some("arc-authentication-results"), Some("present"), Some("mx.microsoft.com")),
+            ("Authentication-Results: spf=pass smtp.mailfrom=example.com\r\n", TrustAnchor::AuthservId("mx.example.com".into()), "auth-untrusted", Some("authentication-results"), Some("no-authserv-id"), None),
+            ("Authentication-Results:\r\n", TrustAnchor::AuthservId("mx.example.com".into()), "auth-untrusted", Some("authentication-results"), Some("unparseable"), None),
+            ("Authentication-Results: other.example.com; dmarc=pass header.from=example.com\r\n", TrustAnchor::TopmostWithAuthservId("mx.example.com".into()), "auth-untrusted", Some("authentication-results"), Some("present"), Some("other.example.com")),
+            ("ARC-Authentication-Results: i=bad; mx.microsoft.com\r\n", TrustAnchor::AuthservId("mx.example.com".into()), "auth-untrusted", Some("arc-authentication-results"), Some("unparseable"), None),
+        ] {
+            let raw = format!("{headers}From: maintainer@example.com\r\nTo: me@example.com\r\nSubject: diagnostic\r\n\r\nbody\r\nARC-Authentication-Results: body text only");
+            let email = parse_raw_bytes(1, raw.as_bytes(), "imap.example.com", 1).unwrap();
+            let mut config = make_config("maintainer@example.com");
+            config.trust_anchor = anchor.clone();
+            let ch = build_channel_from(config, vec![email]);
+            let envs = ch.poll(Utc::now()).await.unwrap();
+            assert_eq!(envs.len(), 1);
+            let env = &envs[0];
+            assert_eq!(env.from, EMAIL_QUARANTINE_SENDER);
+            assert_eq!(env.correlation_external_id, None);
+            assert!(env.quarantine_replay.is_some());
+            assert_eq!(env.metadata.get("quarantine_reason").map(String::as_str), Some(reason));
+            assert_eq!(env.metadata.get("quarantine_auth_header_family").map(String::as_str), family);
+            assert_eq!(env.metadata.get("quarantine_auth_id_status").map(String::as_str), status);
+            assert_eq!(env.metadata.get("quarantine_auth_id").map(String::as_str), seen_id);
+            if family.is_some() {
+                let mode = match anchor {
+                    TrustAnchor::AuthservId(_) => "authserv-id",
+                    TrustAnchor::TopmostNoAuthservId => "topmost-no-authserv-id",
+                    TrustAnchor::TopmostWithAuthservId(_) => "topmost-with-authserv-id",
+                };
+                assert_eq!(env.metadata.get("quarantine_auth_anchor_mode").map(String::as_str), Some(mode));
+                assert_eq!(env.metadata.get("quarantine_auth_id_truncated").map(String::as_str), Some("false"));
+            } else {
+                assert!(!env.metadata.keys().any(|key| key.starts_with("quarantine_auth_")));
+            }
+            assert!(env.metadata.iter().filter(|(key, _)| key.starts_with("quarantine_auth_")).all(|(_, value)| !value.contains("dmarc=pass") && !value.contains("body text")));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_header_id_is_bounded_and_store_off_still_drops() {
+        let raw = format!("Authentication-Results: {}; dmarc=pass header.from=example.com\r\nFrom: maintainer@example.com\r\nTo: me@example.com\r\n\r\nbody", "x".repeat(300));
+        let email = parse_raw_bytes(1, raw.as_bytes(), "imap.example.com", 1).unwrap();
+        let ch = build_channel_from(make_config("maintainer@example.com"), vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(
+            envs[0].metadata.get("quarantine_auth_id"),
+            Some(&"x".repeat(128))
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_auth_id_truncated")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let email = parse_raw_bytes(1, raw.as_bytes(), "imap.example.com", 1).unwrap();
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_store = false;
+        let ch = build_channel_from(config, vec![email]);
+        assert!(ch.poll(Utc::now()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn multi_authentication_results_topmost_trusted_id_wins_over_forged_below() {
         // Two Authentication-Results headers share the trusted authserv-id: the
         // genuine one (dmarc=pass) is topmost (added last, by the final trusted
@@ -1699,11 +1824,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authresults_with_untrusted_authserv_id_is_ignored_quarantines_auth_absent() {
+    async fn authresults_with_untrusted_authserv_id_is_ignored_quarantines_auth_untrusted() {
         // A header is present, but its authserv-id does not match this
         // deployment's configured trust anchor -- it must be ignored entirely
         // (never treated as a partial signal), leaving no trusted header, hence
-        // auth-absent.
+        // auth-untrusted.
         let raw =
             b"Authentication-Results: forged-mx.evil.com; dmarc=pass header.from=example.com\r\n\
                     From: maintainer@example.com\r\n\
@@ -1724,7 +1849,7 @@ mod tests {
                 .metadata
                 .get("quarantine_reason")
                 .map(String::as_str),
-            Some("auth-absent")
+            Some("auth-untrusted")
         );
     }
 
@@ -1862,7 +1987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exo_mode_topmost_carrying_an_authserv_id_quarantines_auth_absent() {
+    async fn exo_mode_topmost_carrying_an_authserv_id_quarantines_auth_untrusted() {
         // If the topmost Authentication-Results unexpectedly carries an
         // authserv-id while this deployment is configured for
         // TopmostNoAuthservId mode, that violates the invariant that EXO's
@@ -1890,7 +2015,7 @@ mod tests {
                 .metadata
                 .get("quarantine_reason")
                 .map(String::as_str),
-            Some("auth-absent")
+            Some("auth-untrusted")
         );
     }
 
@@ -1933,7 +2058,7 @@ mod tests {
                         .metadata
                         .get("quarantine_reason")
                         .map(String::as_str),
-                    Some("auth-absent"),
+                    Some("auth-untrusted"),
                     "{anchor:?}"
                 );
             }

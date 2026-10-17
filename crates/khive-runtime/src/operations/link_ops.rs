@@ -1,3 +1,5 @@
+use khive_storage::{EdgeInsertIfAbsentOutcome, GraphStatementGuard};
+
 use super::{
     accepted_entity_relations_description, base_entity_rule_allows, canonical_edge_endpoint_kinds,
     canonical_edge_endpoints, compose_graph_mutation_events, merge_dependency_kind,
@@ -996,6 +998,7 @@ impl KhiveRuntime {
         if specs.is_empty()
             && preconditions.document.is_none()
             && preconditions.edges.is_empty()
+            && preconditions.statement_guards.is_empty()
             && retirements.is_empty()
         {
             return Ok((Vec::new(), Vec::new()));
@@ -1075,10 +1078,21 @@ impl KhiveRuntime {
         )
         .await?;
         let retired = outcome.retired.into_iter().map(|edge| edge.id).collect();
-        let GraphMutationOutcome::Batch(outcome) = outcome.mutation else {
-            return Err(RuntimeError::Internal(
-                "link_many: unexpected composition outcome".into(),
-            ));
+        let outcome = match outcome.mutation {
+            GraphMutationOutcome::Batch(outcome) => outcome,
+            GraphMutationOutcome::GuardFailed(failure) => {
+                return Err(khive_storage::StorageError::Conflict {
+                    capability: khive_storage::StorageCapability::Graph,
+                    operation: "link_many_guarded_observed".into(),
+                    message: failure.to_string(),
+                }
+                .into());
+            }
+            _ => {
+                return Err(RuntimeError::Internal(
+                    "link_many: unexpected composition outcome".into(),
+                ));
+            }
         };
         if let Some(refusal) = outcome.refusal {
             return match refusal.reason {
@@ -1098,6 +1112,65 @@ impl KhiveRuntime {
             };
         }
         Ok((outcome.rows, retired))
+    }
+
+    /// Create an edge only when its natural key is absent and all supplied guards pass.
+    ///
+    /// Endpoint and namespace validation precede the write. Guards run in order in the
+    /// same writer transaction as insertion; only a created edge emits LinkCreated.
+    /// Existing live edges and tombstones are never changed. Registry link hooks
+    /// remain the dispatch layer's responsibility, as with [`Self::build_edge`].
+    pub async fn link_if_absent_with_guards(
+        &self,
+        token: &NamespaceToken,
+        spec: LinkSpec,
+        guards: Vec<GraphStatementGuard>,
+    ) -> RuntimeResult<EdgeInsertIfAbsentOutcome> {
+        if spec.resurrect {
+            return Err(RuntimeError::InvalidInput(
+                "create-only link does not accept resurrect=true".into(),
+            ));
+        }
+        validate_edge_weight(spec.weight)?;
+        let (edge, (source_kind, target_kind)) =
+            self.build_edge_with_endpoint_kinds(token, &spec).await?;
+        let attribution = crate::EventAttribution::from_token(token);
+        let outcome = compose_graph_mutation_events(
+            self.backend(),
+            GraphMutationRequest::InsertIfAbsent { edge },
+            GraphMutationPreconditions {
+                statement_guards: guards,
+                ..Default::default()
+            },
+            Vec::new(),
+            move |outcome| match &outcome.mutation {
+                GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(edge)) => {
+                    Ok(vec![Self::link_mutation_event(
+                        &attribution,
+                        &EdgeUpsertResult {
+                            edge: edge.clone(),
+                            disposition: EdgeUpsertDisposition::Created,
+                            previous: None,
+                        },
+                        source_kind,
+                        target_kind,
+                    )])
+                }
+                _ => Err(Self::link_composition_shape_error(
+                    "expected a created edge",
+                )),
+            },
+        )
+        .await?;
+        match outcome.mutation {
+            GraphMutationOutcome::InsertIfAbsent(outcome) => Ok(outcome),
+            GraphMutationOutcome::GuardFailed(failure) => {
+                Ok(EdgeInsertIfAbsentOutcome::GuardFailed(failure))
+            }
+            _ => Err(RuntimeError::Internal(
+                "create-only link: unexpected composition outcome".into(),
+            )),
+        }
     }
 
     /// Create a historical commit-to-project annotation without replacing a

@@ -26,6 +26,13 @@ pub(super) struct PreparedEmailChannelLoops {
     default_inbound_actor: String,
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+impl PreparedEmailChannelLoops {
+    pub(super) fn external_inbound_enabled(&self) -> bool {
+        self.channel.external_inbound_enabled()
+    }
+}
+
 #[cfg(feature = "channel-email")]
 pub(super) fn prepare_email_channel_loops(
     server: &KhiveMcpServer,
@@ -36,9 +43,13 @@ pub(super) fn prepare_email_channel_loops(
     use khive_runtime::{EmailMessageIdDomains, Namespace, OutboundEmailPolicy};
     use std::sync::Arc;
 
+    // External inbound without external senders: mail from outside is received and routed
+    // as untrusted, while outbound external sending stays off (ADR-200 Amendment 3).
+    let inbound_only = ExternalInboundConfig::inbound_only_from_env()?;
     let runtime = server.channel_outbox_runtime_clone();
     if !prepare_polling
         && runtime.is_none()
+        && !inbound_only
         && std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_none()
     {
         return Ok(None);
@@ -47,7 +58,9 @@ pub(super) fn prepare_email_channel_loops(
         Some(runtime) => runtime.outbound_email_policy().clone(),
         None => match OutboundEmailPolicy::from_env() {
             Ok(policy) => policy,
-            Err(error) if std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_some() => {
+            Err(error)
+                if inbound_only || std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_some() =>
+            {
                 anyhow::bail!("email policy configuration: {error}");
             }
             Err(error) => {
@@ -56,7 +69,7 @@ pub(super) fn prepare_email_channel_loops(
             }
         },
     };
-    let external = ExternalInboundConfig::from_env(policy.has_external_senders())?;
+    let external = ExternalInboundConfig::from_env(inbound_only || policy.has_external_senders())?;
     if external.is_some() && runtime.is_none() {
         anyhow::bail!("external email requires a comm-routed runtime for verified routing and opt-out commits");
     }
@@ -81,10 +94,17 @@ pub(super) fn prepare_email_channel_loops(
             anyhow::bail!("external email Message-ID configuration: {error}");
         }
     }
-    let host = CommExternalEmailHost::for_ingest(Arc::new(policy), runtime, namespace, domains);
+    let outbound_external = policy.has_external_senders();
+    let host = CommExternalEmailHost::for_ingest(Arc::new(policy), runtime, namespace, domains)
+        .with_external_inbound(external.is_some());
     let mut email_ch = email_ch.with_external_host(Arc::new(host));
     if let Some(external) = external {
         email_ch = email_ch.with_external_inbound_config(external);
+    }
+    if email_ch.external_inbound_enabled() {
+        tracing::info!(target: "khive_mcp::serve", outbound_external,
+            "email channel admits external inbound mail as untrusted"
+        );
     }
     Ok(Some(PreparedEmailChannelLoops {
         channel: Arc::new(email_ch),

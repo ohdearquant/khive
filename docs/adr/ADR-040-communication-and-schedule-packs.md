@@ -1452,3 +1452,32 @@ row check, writes rows on one copy only, or writes rows after the commit.
   delivered message lacks its attachments, and a failure there has no clean recovery.
 - **Let `comm.send` read a server file by path.** Rejected. It would add a second path-reading
   surface. Uploading through the blob verbs keeps one confined surface.
+
+## Amendment (proposed): cancellation revision guard (2026-10-13)
+
+Status: Proposed.
+
+`schedule.cancel` validates one caller-visible, live `scheduled_event` note with
+`properties.status="pending"`, then persists the cancellation through
+`NoteStore::replace_note_if_unchanged`. The expected `updated_at` and `deleted_at`
+come from that same validated snapshot. No later reread substitutes a newer
+pending snapshot before persistence.
+
+A missed guard returns the typed conflict error: the event changed after it was
+read, and the caller must read fresh state before retrying. This includes an
+intervening edit, fire, cancellation or deletion. A note already non-pending at
+the initial read still returns the existing invalid-input error. Namespace, kind,
+malformed-property and reserved-property refusals remain in place.
+
+The replacement preserves all other note fields and properties, changing only
+the cancellation properties and `updated_at`; storage advances the note's
+`version` as on any matched update. `updated_at` is strictly newer than the
+validated snapshot even when that timestamp is ahead of the clock. An exhausted
+`i64::MAX` timestamp fails before persistence. Backends without guarded note
+replacement fail closed rather than falling back to an unconditional upsert.
+
+Acceptance requires the public cancellation race regressions for pending content
+edits, concurrent firing and deletion without a revision advance, plus timestamp
+monotonicity and exhaustion checks. Existing short-ID, non-pending, malformed
+properties and reserved-property regressions must continue to pass. This
+amendment does not change trigger execution or introduce schedule-owned SQL.

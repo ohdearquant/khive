@@ -874,11 +874,11 @@ impl KgPack {
             });
         }
 
-        let (out_anchors, out_edges, truncated, dropped_anchors, dropped_neighbors) =
+        let (out_anchors, out_edges, mut truncated, dropped_anchors, dropped_neighbors, mut used) =
             assemble_within_budget(&blocks, budget);
 
         anchor_edge_records.sort_by_key(|edge| edge.edge_id);
-        let anchor_edges: Vec<Value> = anchor_edge_records
+        let candidates: Vec<Value> = anchor_edge_records
             .into_iter()
             .filter_map(|edge| {
                 let source = entity_meta.get(&edge.source_id)?;
@@ -893,6 +893,27 @@ impl KgPack {
                 }))
             })
             .collect();
+        let admitted_anchors: HashSet<&str> = out_anchors
+            .iter()
+            .filter_map(|anchor| anchor["entity"]["id"].as_str())
+            .collect();
+        let mut anchor_edges = Vec::with_capacity(candidates.len());
+        let mut dropped_anchor_edges = 0usize;
+        for edge in candidates {
+            let endpoints_admitted = ["source_id", "target_id"].iter().all(|field| {
+                edge[*field]
+                    .as_str()
+                    .is_some_and(|id| admitted_anchors.contains(id))
+            });
+            let size = compact_len(&edge)?;
+            if !endpoints_admitted || size > budget - used {
+                dropped_anchor_edges += 1;
+                truncated = true;
+                continue;
+            }
+            used += size;
+            anchor_edges.push(edge);
+        }
 
         if let Some(t) = t4 {
             plog(call_id, "assembly", t.elapsed().as_micros());
@@ -910,6 +931,7 @@ impl KgPack {
                 "anchors": dropped_anchors,
                 "neighbors": dropped_neighbors,
                 "edges": dropped_neighbors,
+                "anchor_edges": dropped_anchor_edges,
                 "stage": "budget",
             },
         });
@@ -950,7 +972,7 @@ impl KgPack {
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
-) -> (Vec<Value>, Vec<Value>, bool, usize, usize) {
+) -> (Vec<Value>, Vec<Value>, bool, usize, usize, usize) {
     let mut running = 0usize;
     let mut truncated = false;
     let mut included: Vec<bool> = vec![false; blocks.len()];
@@ -1002,6 +1024,7 @@ fn assemble_within_budget(
         truncated,
         dropped_anchors,
         dropped_neighbors,
+        running,
     )
 }
 

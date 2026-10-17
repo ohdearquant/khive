@@ -121,11 +121,11 @@ pub fn execute_statements(
 }
 
 mod reader_capability;
-pub(crate) use reader_capability::reader_capability_admits;
 use reader_capability::{
     admit_reader_capability_sql, execute_query_interruptibly, execute_query_page_interruptibly,
     execute_query_row_interruptibly,
 };
+pub(crate) use reader_capability::{reader_capability_admits, statement_guard_select_admits};
 
 mod handles;
 pub(crate) use handles::acquire_in_memory_write_unit;

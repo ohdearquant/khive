@@ -158,7 +158,7 @@ impl TryFrom<EdgeRaw> for Edge {
         if !raw.weight.is_finite() {
             return Err(format!("Edge: weight must be finite, got {}", raw.weight));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !khive_types::validate_edge_weight(raw.weight) {
             return Err(format!(
                 "Edge: weight must be in [0.0, 1.0], got {}",
                 raw.weight
@@ -320,7 +320,7 @@ impl EdgeFilter {
             if !w.is_finite() {
                 return Err(format!("EdgeFilter: min_weight is non-finite ({w})"));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!(
                     "EdgeFilter: min_weight must be in [0.0, 1.0], got {w}"
                 ));
@@ -330,7 +330,7 @@ impl EdgeFilter {
             if !w.is_finite() {
                 return Err(format!("EdgeFilter: max_weight is non-finite ({w})"));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!(
                     "EdgeFilter: max_weight must be in [0.0, 1.0], got {w}"
                 ));
@@ -386,7 +386,7 @@ impl TryFrom<NeighborQueryRaw> for NeighborQuery {
             if !w.is_finite() {
                 return Err(format!("NeighborQuery: min_weight must be finite, got {w}"));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!(
                     "NeighborQuery: min_weight must be in [0.0, 1.0], got {w}"
                 ));
@@ -490,7 +490,7 @@ impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
                     "TraversalOptions: min_weight must be finite, got {w}"
                 ));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!(
                     "TraversalOptions: min_weight must be in [0.0, 1.0], got {w}"
                 ));

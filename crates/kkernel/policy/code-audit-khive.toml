@@ -35,6 +35,7 @@ denied_pairs = []
 [crate_ranks]
 khive-channel = 0
 khive-fs = 0
+khive-lion-core = 0
 khive-quant = 0
 khive-text = 0
 khive-types = 0
@@ -48,7 +49,7 @@ khive-query = 1
 khive-repo-showcase = 1
 khive-request = 1
 khive-score = 1
-khive-vamana = 1
+khive-vamana = 2
 khive-vcs-adapters = 1
 khive-bm25 = 2
 khive-fold = 2

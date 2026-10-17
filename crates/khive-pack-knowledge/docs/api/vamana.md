@@ -1,7 +1,7 @@
 # Vamana ANN bridge internals
 
-Source: `crates/khive-pack-knowledge/src/knowledge/vamana.rs` (entire module is
-`pub(crate)` — internal to the crate, not part of the published API).
+Source: `crates/khive-pack-knowledge/src/knowledge/vamana.rs` and its submodules under
+`vamana/` (entire module is `pub(crate)` — internal to the crate, not part of the published API).
 
 ## Module overview
 
