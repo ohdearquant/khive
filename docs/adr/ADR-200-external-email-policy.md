@@ -432,3 +432,33 @@ symmetric: a false label suppresses a person who wrote "don't email me", which i
 | A20 wrapped opt-out | A recorded decline whose "don't email me" sentence is wrapped onto the second line of its first paragraph is delivered marked with the opt-out label and no other family.                                         |
 | A21 email-me decoy  | A recorded engaged reply containing "email me" twice ("can you email me the setup docs", "you can email me at") is delivered without the opt-out label; a widening to the bare words would turn this fixture red. |
 | A22 quoted opt-out  | A reply whose only opt-out phrase is on a quoted line, followed by an unquoted line, is delivered without the label (existing fixture, unchanged).                                                                |
+
+## Amendment 3 (2026-10-16) -- External inbound without external senders
+
+**Status**: Proposed 2026-10-16.
+
+**Trigger.** §7 step 5 ties external inbound to configured external senders: while `KHIVE_EMAIL_EXTERNAL_SENDERS` is
+unset, every authenticated message from a sender other than the maintainer is quarantined as `off-allowlist`. A
+deployment that has to receive mail from outside senders, such as service notices addressed to its mailbox, but must
+not send outside its policy recipients has no setting for that: configuring external senders also enables outbound
+external sending.
+
+**Decision.**
+
+1. `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` enables external inbound on its own. External inbound is enabled when
+   external senders are configured or this setting is `enabled`. §7 step 5 is read as "External inbound not enabled:
+   quarantine as `off-allowlist`", and steps 6 and 7 apply whenever it is enabled.
+2. The setting changes nothing outbound. While external senders are unset, a send to an address outside the outbound
+   allowlist is refused as before (§2), and no unsubscribe token verifies (§5).
+3. A message admitted under it is delivered exactly as §8 describes: sender `email:<address>`, `origin = external`,
+   `trust = untrusted`, screening per §8.3, routing per §8.2 and Amendment 1 decision 4.
+   `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is required whenever external inbound is enabled, and start-up fails while it
+   is unset or empty.
+4. Unset or empty means disabled. Any other value is a configuration error at start-up, so a misspelled value never
+   reads as disabled.
+
+**Acceptance (added to the ADR's table).**
+
+| Case             | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A23 inbound only | With external senders unset and the setting enabled, an authenticated message from a sender other than the maintainer is delivered to its routed actor marked external and untrusted, an inbound suppression entry still blocks it, a send to an address outside the outbound allowlist is refused, and start-up fails while the inbound actor is unset or empty or the setting holds an unrecognised value. |
