@@ -74,3 +74,11 @@ harness = false
 [[bench]]
 name = "p95_gate"
 harness = false
+
+[[bench]]
+name = "memory_lifecycle"
+harness = false
+
+[[bench]]
+name = "memory_recall_diagnostics"
+harness = false
