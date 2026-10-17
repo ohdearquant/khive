@@ -18,6 +18,27 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 REPLAY_NAME_PREFIX = "${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}"
+# `git commit` and `git fetch` start a detached `git maintenance run --auto` that can still be writing
+# under `.git` when a fixture's temporary directory is removed, which fails the cleanup. Every fixture
+# repository in this file turns automatic maintenance off.
+NO_AUTO_MAINTENANCE = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "maintenance.auto",
+    "GIT_CONFIG_VALUE_0": "false",
+}
+
+
+def commit_maintenance_runs(repo: pathlib.Path, env: dict[str, str], name: str) -> list[str]:
+    """Commit one new file in `repo` under `env`; return the trace2 events naming a `git maintenance run`."""
+    trace = repo.parent / f"{name}.trace2.json"
+    (repo / f"{name}.txt").write_text(f"{name}\n")
+    for args in (["add", "--", f"{name}.txt"], ["commit", "-q", "-m", name]):
+        subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=repo,
+            env={**env, "GIT_TRACE2_EVENT": str(trace)}, text=True, capture_output=True,
+            timeout=10, check=True,
+        )
+    return [line for line in trace.read_text().splitlines() if '"maintenance","run"' in line]
 
 
 def workflow_text(name: str) -> str:
@@ -143,6 +164,7 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             "core.hooksPath": str(hooks),
             "core.autocrlf": "false",
             "core.quotePath": "true",
+            "maintenance.auto": "false",
         }
         env["GIT_CONFIG_COUNT"] = str(len(config))
         for index, (key, value) in enumerate(config.items()):
@@ -221,6 +243,11 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             0,
             "COMPARISON_BASE_WAS_FETCHED",
         )
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        checkout, _base, env = self._shallow_fixture()
+        result = self._git(checkout, env, "config", "--get", "maintenance.auto")
+        self.assertEqual(result.stdout.strip(), "false")
 
     def test_pull_request_nonstorage_change_fetches_missing_base(self):
         checkout, base, env = self._shallow_fixture()
@@ -2091,6 +2118,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                     if not key.startswith("GIT_")}
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GITHUB_OUTPUT=str(self.output), GITHUB_STEP_SUMMARY=str(self.summary))
+        self.env.update(NO_AUTO_MAINTENANCE)
 
     def script(self, job_name, step_name):
         job = indented_block(self.workflow, job_name, 2)
@@ -2142,6 +2170,9 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.git(work, "push", "origin", "main", "side", "--tags")
         return work, {"parent": parent, "tip": tip, "side": side,
                       "tag": tag, "tree": tree, "blob": blob}
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git(self.root, "config", "--get", "maintenance.auto"), "false")
 
     def test_input_is_strict_hex_and_never_shell_source(self):
         script = self.script("resolve-revision", "Validate replay input")
@@ -2401,6 +2432,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
         self.git("init", "-q", "-b", "main")
         self.write("src/lib.rs", "pub fn f() {}\n")
         self.write("notes/guide.md", "# Guide\n")
@@ -2440,6 +2472,13 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         verdict, reasons = self.classify(self.base, self.commit("guide"))
         self.assertEqual(verdict, "true", reasons)
         self.assertIn("documentation only: notes/guide.md", reasons)
+
+    def test_fixture_commits_start_no_background_maintenance(self):
+        # Control: with maintenance kept in the foreground the same commit records the child, so the
+        # empty list for the fixture environment is an absence the trace could have shown.
+        foreground = {**self.env, "GIT_CONFIG_KEY_0": "maintenance.autoDetach"}
+        self.assertNotEqual(commit_maintenance_runs(self.repo, foreground, "control"), [])
+        self.assertEqual(commit_maintenance_runs(self.repo, self.env, "fixture"), [])
 
     def test_markdown_named_by_code_runs_the_full_suite(self):
         self.write("notes/wire.md", "# Wire\n\nChanged.\n")
@@ -2836,6 +2875,7 @@ class IntegrationOnlyClassifierTests(unittest.TestCase):
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
         self.git("init", "-q", "-b", "main")
         for path, text in self.TREE.items():
             self.write(path, text)
@@ -2865,6 +2905,9 @@ class IntegrationOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
         return completed.stdout.strip(), completed.stderr
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git("config", "--get", "maintenance.auto"), "false")
 
     def test_each_path_alone(self):
         # Every path in the fixture is classified on its own; the lane set is the allow-list.
