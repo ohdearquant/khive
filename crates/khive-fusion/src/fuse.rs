@@ -48,7 +48,7 @@ pub fn fuse<Id: Eq + Hash + Clone + Ord>(
 }
 
 fn validate_weighted_rrf(k: usize, weights: &[f64], source_count: usize) -> Result<(), FuseError> {
-    FusionStrategy::try_weighted_rrf(k, weights.to_vec())
+    FusionStrategy::validate_weighted_rrf(k, weights)
         .map_err(FuseError::InvalidWeightedRrfStrategy)?;
     if source_count != weights.len() {
         return Err(FuseError::WeightedRrfWeightCountMismatch {

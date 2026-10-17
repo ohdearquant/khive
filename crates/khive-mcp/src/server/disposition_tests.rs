@@ -1162,7 +1162,7 @@ impl ErrorConstructorCensus {
                             "request_too_large_error",
                         )
                         || self.root_function(
-                            "khive-runtime/src/daemon.rs",
+                            "khive-runtime/src/daemon/connection.rs",
                             "handle_conn_with_lifecycle",
                         ))
             }
@@ -1357,6 +1357,31 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-runtime/src/daemon.rs",
         "wire_frames",
         "khive-runtime/src/daemon/wire_frames.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "dispatch_trait",
+        "khive-runtime/src/daemon/dispatch_trait.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "connection",
+        "khive-runtime/src/daemon/connection.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "run_daemon",
+        "khive-runtime/src/daemon/run_daemon.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "process_files",
+        "khive-runtime/src/daemon/process_files.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "boot_guard",
+        "khive-runtime/src/daemon/boot_guard.rs",
     ),
 ];
 
@@ -1632,17 +1657,17 @@ fn a3_constructor_census_limits_normalized_carrier_to_lifecycle_owner() {
     let frame = r#"DaemonResponseFrame { ok: false, error: Some(error.message), error_detail: Some(error.error_detail) }"#;
     for (source, body, allowed) in [
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("fn handle_conn_with_lifecycle() {{ let error = DaemonDispatchError::new(error.message, Some(error.error_detail)); {frame}; }}"),
             true,
         ),
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("fn handle_conn_with_shutdown() {{ {frame}; }}"),
             false,
         ),
         (
-            "khive-runtime/src/daemon.rs",
+            "khive-runtime/src/daemon/connection.rs",
             format!("mod unchecked {{ fn handle_conn_with_lifecycle() {{ {frame}; }} }}"),
             false,
         ),

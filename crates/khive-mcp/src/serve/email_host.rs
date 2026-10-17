@@ -14,6 +14,9 @@ pub(super) struct CommExternalEmailHost {
     runtime: Option<KhiveRuntime>,
     namespace: Namespace,
     email_domains: Result<Option<EmailMessageIdDomains>, String>,
+    /// External inbound as resolved at boot. Configured external senders enable it as well,
+    /// so a host built without this flag keeps the policy's answer.
+    external_inbound: bool,
 }
 
 impl CommExternalEmailHost {
@@ -38,7 +41,15 @@ impl CommExternalEmailHost {
             runtime,
             namespace,
             email_domains,
+            external_inbound: false,
         }
+    }
+
+    /// Record whether boot enabled external inbound. Outbound external sending is unaffected:
+    /// it stays governed by the policy's external senders.
+    pub(super) fn with_external_inbound(mut self, enabled: bool) -> Self {
+        self.external_inbound = enabled;
+        self
     }
 }
 
@@ -46,6 +57,10 @@ impl CommExternalEmailHost {
 impl ExternalEmailHost for CommExternalEmailHost {
     fn external_senders_configured(&self) -> bool {
         self.policy.has_external_senders()
+    }
+
+    fn external_inbound_enabled(&self) -> bool {
+        self.external_inbound || self.policy.has_external_senders()
     }
 
     fn verify_unsubscribe_token(&self, token: &str) -> Option<String> {
@@ -253,6 +268,27 @@ mod tests {
         assert!(
             owner.is_none(),
             "a thread UUID with no verified outbound email must yield no owner; got {owner:?}"
+        );
+    }
+
+    #[test]
+    fn boot_enabled_external_inbound_leaves_external_senders_unset() {
+        let without_senders = Arc::new(
+            OutboundEmailPolicy::configured(vec!["allowed@example.com".into()])
+                .expect("policy without external senders"),
+        );
+        let host = CommExternalEmailHost::new(without_senders, None);
+        assert!(!host.external_senders_configured());
+        assert!(!host.external_inbound_enabled());
+        let host = host.with_external_inbound(true);
+        assert!(host.external_inbound_enabled());
+        assert!(
+            !host.external_senders_configured(),
+            "enabling external inbound must not configure external senders"
+        );
+        assert!(
+            CommExternalEmailHost::new(policy(), None).external_inbound_enabled(),
+            "configured external senders enable external inbound without the boot flag"
         );
     }
 

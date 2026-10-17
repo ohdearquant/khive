@@ -93,6 +93,7 @@ fn link_plan_guard_is_the_endpoint_existence_probe_itself() {
             AffectedRowGuard::exactly(1),
         )],
         disposition: khive_storage::EdgeUpsertDisposition::Created,
+        dependency_kind_inference_hint: None,
     };
     assert_eq!(plan.source_id, source);
     assert_eq!(plan.target_id, target);

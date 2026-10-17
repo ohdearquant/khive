@@ -655,7 +655,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
 
 class CiConcurrencyWorkflowTests(unittest.TestCase):
-    def test_main_pushes_run_newest_commit_without_cancelling_running_run(self):
+    def test_main_pushes_run_newest_commit_and_cancel_superseded_runs(self):
         concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
         self.assertEqual(
             mapping_entries(concurrency),
@@ -664,11 +664,12 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
                 "github.event_name == 'pull_request' && github.ref || "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main' "
                 "&& github.ref || github.run_id }}",
-                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                "(github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
             },
-            "Main pushes must share one group whose running run is never "
-            "cancelled and whose waiting run is replaced by the newest push "
-            "(the default single-slot queue); PRs retain ref-scoped "
+            "Main pushes must share one group in which the newest push cancels "
+            "the running run and replaces the waiting one, so a burst of merges "
+            "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
 
@@ -713,19 +714,27 @@ class CiMatrixWorkflowTests(unittest.TestCase):
         }
         return json.loads(eval(expression, {"__builtins__": {}}, scope))
 
-    def test_own_codex_branch_pull_requests_run_the_linux_shards_only(self):
-        self.assertEqual(
-            self.matrix_for("pull_request", "codex/some-change", "ohdearquant/khive"),
-            self.UBUNTU,
-        )
+    def test_own_codex_split_and_docs_branch_pull_requests_run_the_linux_shards_only(self):
+        for head_ref in ["codex/some-change", "split/khive-runtime-daemon-3943", "docs/retrieval-crate-doc"]:
+            with self.subTest(head_ref=head_ref):
+                self.assertEqual(
+                    self.matrix_for("pull_request", head_ref, "ohdearquant/khive"),
+                    self.UBUNTU,
+                )
 
     def test_other_pull_requests_keep_the_macos_lane(self):
         expected = self.UBUNTU + [{"os": "macos-latest", "shard": 1}]
         for head_ref, head_repo in [
             ("batch/125", "ohdearquant/khive"),
             ("feature/codex/x", "ohdearquant/khive"),
+            ("feature/split/x", "ohdearquant/khive"),
+            ("splitter/x", "ohdearquant/khive"),
+            ("documents/x", "ohdearquant/khive"),
             ("codex/some-change", "contributor/khive"),
             ("codex/some-change", None),
+            ("split/some-change", "contributor/khive"),
+            ("docs/some-change", "contributor/khive"),
+            ("docs/some-change", None),
         ]:
             with self.subTest(head_ref=head_ref, head_repo=head_repo):
                 self.assertEqual(self.matrix_for("pull_request", head_ref, head_repo), expected)
@@ -778,6 +787,14 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_trend_points_are_nightly_and_per_release_not_per_merge(self):
+        on = indented_block(workflow_text("bench-track.yml"), "on", 0)
+        self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
+        self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
+        push = indented_block(on, "push", 2)
+        self.assertNotIn("branches", push, "a push to a branch must not record a trend point")
+        self.assertIn('tags: ["v*"]', push)
+
     def test_publish_failure_is_advisory_and_records_incident(self):
         for workflow_name, publish_name in (
             ("bench-component.yml", "Publish ledger to perf-data branch"),
@@ -939,7 +956,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
             "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
         ):
             self.assertIn(evidence_path, step(artifact_name))
-        self.assertIn("github.event_name == 'push'", step(publish_name))
+        publish_if = step(publish_name)
+        self.assertIn("github.event_name != 'pull_request'", publish_if)
+        self.assertIn("github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')", publish_if)
 
         # Execute the workflow's real shell and real recorder. Only the native
         # benchmark, remote publisher and upload service are fixture boundaries.

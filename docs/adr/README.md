@@ -231,6 +231,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-201](ADR-201-brain-module-boundaries.md)                           | Brain module boundaries and shared event readers                                                           |
 | [ADR-202](ADR-202-read-only-pack-validation.md)                         | Read-only pack validators in `kkernel kg validate`                                                         |
 | [ADR-203](ADR-203-khive-apps-on-the-base.md)                            | khive Apps on the Base: Manifest, Lifecycle Verbs, Store Classes, Registration and Supervision             |
+| [ADR-204](ADR-204-automatic-freelist-reclamation.md)                    | Automatic freelist reclamation with incremental auto-vacuum                                                |
+| [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)                 | Dependency-Scoped Pull-Request CI from the Code Map                                                        |
 
 <!-- END GENERATED ADR CATALOG -->
 

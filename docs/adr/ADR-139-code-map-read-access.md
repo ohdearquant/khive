@@ -1,6 +1,6 @@
 # ADR-139: Read Access to Registered Code Map Databases
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 
 ## Context

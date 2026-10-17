@@ -49,6 +49,7 @@ pub(super) async fn prepare_link(
         metadata,
         optional_str(args, "dependency_kind").map(String::from),
     )?;
+    let supplied_metadata = metadata.clone();
     validate_edge_metadata(relation, metadata.as_ref())?;
 
     validate_edge_weight(weight)?;
@@ -79,6 +80,11 @@ pub(super) async fn prepare_link(
     }
 
     validate_edge_metadata(relation, metadata.as_ref())?;
+    let dependency_kind_inference_hint = crate::operations::dependency_kind_inference_hint(
+        relation,
+        supplied_metadata.as_ref(),
+        metadata.as_ref(),
+    );
     let namespace = token.namespace().as_str().to_string();
     let previous = runtime
         .get_edge_by_natural_key_including_deleted(
@@ -180,6 +186,7 @@ pub(super) async fn prepare_link(
         target_id: canon_target,
         statements,
         disposition,
+        dependency_kind_inference_hint,
     }))
 }
 

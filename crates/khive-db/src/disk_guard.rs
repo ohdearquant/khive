@@ -16,6 +16,9 @@ use crate::error::SqliteError;
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SYMLINK_DEPTH: usize = 40;
+const LOCK_DIRECTORY_ADVICE: &str = "configure another absolute directory, writable by and \
+    shared by every khive process of this deployment; set KHIVE_VOLUME_LOCK_DIR when using \
+    the default directory resolver, or change the caller-supplied volume-lock directory setting";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum VolumeKey {
@@ -195,9 +198,7 @@ impl VolumeIdentity {
             .ok_or_else(|| LeaseRefusal::Refused(lock_error("volume lease deadline overflow")))?;
         fs::create_dir_all(lock_dir).map_err(|error| {
             LeaseRefusal::Refused(lock_error(format!(
-                "cannot create volume-lock directory {lock_dir:?}: {error}; \
-                 set KHIVE_VOLUME_LOCK_DIR to another absolute directory, writable by and \
-                 shared by every khive process of this deployment"
+                "cannot create volume-lock directory {lock_dir:?}: {error}; {LOCK_DIRECTORY_ADVICE}"
             )))
         })?;
         let lock_path = lock_dir.join(self.lock_filename());
@@ -213,7 +214,9 @@ impl VolumeIdentity {
             .truncate(false)
             .open(&lock_path)
             .map_err(|error| {
-                LeaseRefusal::Refused(lock_error(format!("cannot open volume-lock file: {error}")))
+                LeaseRefusal::Refused(lock_error(format!(
+                    "cannot open volume-lock file {lock_path:?}: {error}; {LOCK_DIRECTORY_ADVICE}"
+                )))
             })?;
         #[cfg(any(unix, windows))]
         loop {
@@ -777,6 +780,8 @@ mod tests {
                     assert!(message.contains(&format!("{lock_dir:?}")), "{message}");
                     assert!(message.contains(&cause.to_string()), "{message}");
                     assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                    assert!(message.contains("default directory resolver"), "{message}");
+                    assert!(message.contains("caller-supplied"), "{message}");
                     assert!(message.contains("another absolute directory"), "{message}");
                     assert!(
                         message.contains("writable by and shared by every khive process"),
@@ -791,6 +796,58 @@ mod tests {
                 "refusal must not create a database"
             );
         }
+    }
+
+    #[test]
+    fn lock_file_open_refusal_names_path_and_setting_and_releases_process_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("a.db");
+        let mut identity = VolumeIdentity::resolve(&database_path).unwrap();
+        identity.key = isolated_test_key(7);
+        let lock_dir = dir.path().join("caller-locks");
+        let lock_path = lock_dir.join(identity.lock_filename());
+        fs::create_dir_all(&lock_path).unwrap();
+        let cause = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap_err();
+        let error = identity
+            .acquire(Duration::from_millis(100), Some(&lock_dir))
+            .err()
+            .expect("an existing directory at the lock-file path must refuse the lease");
+        match error {
+            LeaseRefusal::Refused(SqliteError::CapacityUnavailable {
+                phase: CapacityUnavailablePhase::Lock,
+                message,
+            }) => {
+                assert!(
+                    message.contains("cannot open volume-lock file"),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{lock_path:?}")), "{message}");
+                assert!(message.contains(&cause.to_string()), "{message}");
+                assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                assert!(message.contains("default directory resolver"), "{message}");
+                assert!(message.contains("caller-supplied"), "{message}");
+                assert!(
+                    message.contains("writable by and shared by every khive process"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a non-contention lock refusal, got {other:?}"),
+        }
+        assert!(lock_path.is_dir(), "refusal must preserve the obstruction");
+        assert!(
+            !database_path.exists(),
+            "refusal must not create a database"
+        );
+        fs::remove_dir(&lock_path).unwrap();
+        identity
+            .acquire_in(Duration::from_millis(100), &lock_dir)
+            .expect("failed file open must release the in-process lease slot");
     }
 
     // MUST-FAIL: keying the in-process slot by the volume alone under the test

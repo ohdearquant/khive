@@ -23,12 +23,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Main pushes share one group and run the newest commit only. The run in progress
-# is never cancelled; a newer push replaces any run still waiting in the group, so
-# at most one main run waits. A replaced run's commit is contained in the later
-# run's tree, and the newest main head always reaches a completed run. Commits that
-# land while a run is in progress get no result of their own: a regression between
-# two completed runs is attributed by running CI on the commits in between (#3071).
+# Main pushes share one group and run the newest commit only: a newer push cancels
+# the run in progress and replaces any run still waiting, so a burst of merges
+# leaves one main run, at its newest head, and frees the runners the cancelled runs
+# held for pull request runs. A cancelled run's commit is contained in the later
+# run's tree. While merges keep landing faster than a run completes, main has no
+# completed result; it gets one once merges pause, so a merge batch waits for main
+# to go green before the next batch starts. Commits without a result of their own
+# are attributed by running CI on the commits in between (#3071).
 # https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
 # PR synchronize events keep the same refs/pull/<number>/merge group and cancel
@@ -37,7 +39,7 @@ env:
 # running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   # Replay uses the current workflow against historical source, without a temporary ref:
@@ -298,6 +300,10 @@ jobs:
       # pull request that runs the three-job matrix above, so the macOS lane
       # runs there, and the many draft pull requests on that prefix no longer
       # hold macOS slots that integration runs wait for.
+      # Pull requests from this repository's `split/` and `docs/` branches run
+      # the two Linux shards only as well. They carry verbatim moves of code
+      # between files and documentation changes; the Linux shards test them,
+      # and the push to main that lands them runs both macOS shards.
       # The head-repository check keeps the rule to branches of this
       # repository: a pull request from a fork runs the three-job matrix
       # whatever its branch is called.
@@ -306,7 +312,9 @@ jobs:
       # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
-          && startsWith(github.head_ref, 'codex/')
+          && (startsWith(github.head_ref, 'codex/')
+            || startsWith(github.head_ref, 'split/')
+            || startsWith(github.head_ref, 'docs/'))
           && github.event.pull_request.head.repo.full_name == github.repository
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
           || github.event_name == 'pull_request'

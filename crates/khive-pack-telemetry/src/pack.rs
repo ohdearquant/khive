@@ -5,6 +5,38 @@ use serde_json::Value;
 
 use crate::{handlers, TelemetryPack};
 
+const STREAM_PARAM: ParamDef = ParamDef {
+    name: "stream",
+    param_type: "string",
+    required: true,
+    description: "Arbitrary stream name, in the request namespace.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const READ_ACTOR_PARAM: ParamDef = ParamDef {
+    name: "actor",
+    param_type: "string",
+    required: false,
+    description: "Optional visible actor to read; defaults to the calling actor.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const ALL_ACTORS_PARAM: ParamDef = ParamDef {
+    name: "all_actors",
+    param_type: "boolean",
+    required: false,
+    description: "Read all actors only for a configured brain.fleet_readers caller; cannot combine with actor.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const KINDS_PARAM: ParamDef = ParamDef {
+    name: "kinds",
+    param_type: "array",
+    required: false,
+    description: "Optional nonempty list of up to 100 exact record.kind strings.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
         name: "telemetry.channels",
@@ -66,13 +98,7 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
-            ParamDef {
-                name: "stream",
-                param_type: "string",
-                required: true,
-                description: "Arbitrary stream name, in the request namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            STREAM_PARAM,
             ParamDef {
                 name: "since",
                 param_type: "integer",
@@ -87,27 +113,9 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
                 description: "Maximum stream rows scanned before filtering, 1..1000; default 100.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "actor",
-                param_type: "string",
-                required: false,
-                description: "Optional visible actor to read; defaults to the calling actor.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "all_actors",
-                param_type: "boolean",
-                required: false,
-                description: "Read all actors only for a configured brain.fleet_readers caller; cannot combine with actor.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "kinds",
-                param_type: "array",
-                required: false,
-                description: "Optional nonempty list of up to 100 exact record.kind strings.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            READ_ACTOR_PARAM,
+            ALL_ACTORS_PARAM,
+            KINDS_PARAM,
         ],
     },
     HandlerDef {
@@ -120,13 +128,7 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
-            ParamDef {
-                name: "stream",
-                param_type: "string",
-                required: true,
-                description: "Arbitrary stream name, in the request namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            STREAM_PARAM,
             ParamDef {
                 name: "window",
                 param_type: "object",
@@ -144,27 +146,9 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
                               Paths are at most 128 bytes; a group key is at most 4096 bytes.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "actor",
-                param_type: "string",
-                required: false,
-                description: "Optional visible actor to read; defaults to the calling actor.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "all_actors",
-                param_type: "boolean",
-                required: false,
-                description: "Read all actors only for a configured brain.fleet_readers caller; cannot combine with actor.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "kinds",
-                param_type: "array",
-                required: false,
-                description: "Optional nonempty list of up to 100 exact record.kind strings.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            READ_ACTOR_PARAM,
+            ALL_ACTORS_PARAM,
+            KINDS_PARAM,
         ],
     },
 ];
@@ -199,11 +183,7 @@ impl PackRuntime for TelemetryPack {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        self.runtime
-            .config()
-            .telemetry
-            .validate_activation()
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        <Self as PackRuntime>::validate_config(self)?;
         match verb {
             "telemetry.channels" => handlers::channels(&self.runtime, params),
             "telemetry.emit" => handlers::emit(&self.runtime, token, params, registry).await,

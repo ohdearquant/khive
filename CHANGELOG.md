@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` receives authenticated mail from outside senders
+  (delivered as untrusted external messages and routed as with external senders configured)
+  without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
+  Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
+  empty, and on any other non-empty value.
 ### Changed
 
+- Edge-weight validators use the shared `khive-types` predicate,
+  preserving numeric boundaries and validation diagnostics.
 - With a configured runtime actor, a message the email channel quarantines, whatever its
   reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
   the mailbox recipient check keeps the quarantine record and its content reference out of
@@ -222,6 +231,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host composition register providers before binding ordered peers and their declared
   dimensions, without loading models. Missing providers fail startup; explicit no-embedding
   runtimes keep no configured default while explicit manual named access remains available.
+- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
+  for caller-supplied seal keys. All-zero keys are refused; initialization starts
+  at epoch zero with no previous key and the same empty, deny-all state.
 - Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
   entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
   remains pending acceptance and conformance validation.
