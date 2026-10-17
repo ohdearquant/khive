@@ -43,3 +43,7 @@ serial_test = { workspace = true }
 [[bench]]
 name = "comm_bench"
 harness = false
+
+[[bench]]
+name = "comm_lifecycle"
+harness = false
