@@ -74,6 +74,9 @@ fn outside_entry_is_logged_and_does_not_block_valid_entry() {
         .with_max_level(tracing::Level::WARN)
         .with_writer(move || LogWriter(log_buffer.clone()))
         .finish();
+    // Keep a second dispatcher alive so concurrent tests cannot cache the
+    // rejection callsite as disabled before the capture is registered.
+    let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
 
     let registry = tracing::subscriber::with_default(subscriber, || {
         CodeMapRegistry::load(
@@ -315,6 +318,9 @@ fn malformed_code_map_entries_do_not_block_valid_runtime_registration() {
         .with_max_level(tracing::Level::WARN)
         .with_writer(move || LogWriter(log_buffer.clone()))
         .finish();
+    // Keep a second dispatcher alive so concurrent tests cannot cache the
+    // rejection callsite as disabled before the capture is registered.
+    let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let runtime = tracing::subscriber::with_default(subscriber, || {
         KhiveRuntime::new(runtime_config).expect("runtime starts with malformed map entries")
     });
