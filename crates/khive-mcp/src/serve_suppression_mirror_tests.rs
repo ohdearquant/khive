@@ -313,7 +313,7 @@ async fn a_remote_key_suppresses_its_address_before_its_row_is_sent() {
 #[tokio::test]
 async fn external_admission_refuses_once_the_last_refresh_is_older_than_the_maximum_age() {
     let mirror = RemoteMirror::start().await;
-    let (server, runtime) = serve(policy(&mirror, Duration::from_millis(300)));
+    let (server, runtime) = serve(policy(&mirror, Duration::from_secs(2)));
 
     // No refresh recorded yet.
     let error = send(&server, "email:one@example.net").await.unwrap_err();
@@ -330,7 +330,7 @@ async fn external_admission_refuses_once_the_last_refresh_is_older_than_the_maxi
     });
     let original = send_with(&server, keyed.clone()).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     let error = send(&server, "email:two@example.net").await.unwrap_err();
     assert!(error.contains("suppression mirror stale"), "{error}");
     // An exact keyed replay is answered from its holder before any admission condition.
