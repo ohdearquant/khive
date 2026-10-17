@@ -50,12 +50,12 @@ use khive_storage::graph::{
 };
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
-    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
-    EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
-    GuardedEdgeBatchRefusal, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
-    GuardedWriteOutcome, MissingEndpoints, NeighborCursor, NeighborHit, NeighborQuery, Page,
-    PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue,
-    TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRefusal, EdgeUpsertRequest,
+    EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, NeighborCursor,
+    NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection,
+    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
+    TraversalRequest,
 };
 use khive_storage::LinkId;
 use khive_storage::StorageCapability;
