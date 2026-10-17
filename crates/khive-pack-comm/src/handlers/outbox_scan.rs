@@ -49,6 +49,14 @@ pub async fn record_outbox_scan(
         error_class,
         error_message,
         at: Some(scan.completed_at.to_rfc3339()),
+        // Inbound poll facts: the outbox branch of `persist_heartbeat` never reads them.
+        held_messages: None,
+        quarantined_after_hold: None,
+        originals_not_retained: None,
+        original_not_retained_reason: None,
+        original_retention_state: None,
+        notices_failed: None,
+        notice_config_error: None,
     };
     super::quarantine_heartbeat::persist_heartbeat(runtime, token, params, Some(scan)).await
 }
