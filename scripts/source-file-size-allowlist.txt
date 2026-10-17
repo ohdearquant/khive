@@ -1,0 +1,60 @@
+# Allow-list for scripts/lint-source-file-size.sh (#3931).
+#
+# One row per source file that is already over the line cap: a repo-relative
+# path and a ceiling separated by a single space. The ceiling is the file's
+# line count when it was listed. Blank lines and lines starting with `#` are
+# ignored; any other line that is not exactly `<path> <ceiling>` fails the check.
+#
+# The check fails a file over the cap that is not listed, a listed file over its
+# ceiling, and a row whose file is at or under the cap or is no longer a counted
+# source file (a stale row: delete it). In a pull request a row may be lowered or
+# deleted but never raised or added, judged against the base branch copy of this
+# file, so the list only shrinks. Splitting a file means lowering or deleting its
+# row in the same change; the check reads line counts from the committed tree, so
+# commit the split before running it locally. The script header states the
+# population rule.
+crates/khive-db/src/backend.rs 3800
+crates/khive-db/src/checkpoint.rs 10141
+crates/khive-db/src/diagnostics.rs 4205
+crates/khive-db/src/pool.rs 7805
+crates/khive-db/src/sql_bridge.rs 9634
+crates/khive-db/src/stores/blob.rs 7332
+crates/khive-db/src/stores/graph.rs 3607
+crates/khive-db/src/stores/vectors.rs 6642
+crates/khive-db/src/walpin.rs 6025
+crates/khive-db/src/writer_task.rs 3405
+crates/khive-mcp/src/daemon.rs 10745
+crates/khive-mcp/src/pending_events.rs 10081
+crates/khive-mcp/src/serve.rs 18721
+crates/khive-mcp/src/server.rs 15140
+crates/khive-pack-brain/src/handlers.rs 3859
+crates/khive-pack-brain/src/persist.rs 3110
+crates/khive-pack-code/src/source_ingest.rs 5842
+crates/khive-pack-comm/src/handlers.rs 6605
+crates/khive-pack-git/src/cache.rs 4399
+crates/khive-pack-git/src/ingest.rs 4917
+crates/khive-pack-knowledge/src/knowledge/search.rs 8824
+crates/khive-pack-knowledge/src/knowledge/vamana.rs 7151
+crates/khive-pack-memory/src/ann.rs 9100
+crates/khive-pack-memory/src/handlers/recall.rs 8503
+crates/khive-pack-session/src/mirror/ingest.rs 4913
+crates/khive-pack-session/src/mirror/service.rs 3939
+crates/khive-pack-web/src/extract.rs 3570
+crates/khive-pack-web/src/fetch.rs 3081
+crates/khive-runtime/src/atomic_prepare.rs 6904
+crates/khive-runtime/src/curation.rs 16356
+crates/khive-runtime/src/daemon.rs 7793
+crates/khive-runtime/src/engine_config.rs 4941
+crates/khive-runtime/src/events_split.rs 4467
+crates/khive-runtime/src/operations.rs 22179
+crates/khive-runtime/src/pack.rs 17060
+crates/khive-runtime/src/retrieval.rs 3641
+crates/khive-runtime/src/runtime.rs 5111
+crates/khive-runtime/src/secret_gate.rs 8880
+crates/khive-runtime/src/secret_gate_finalizer/route_census.rs 4146
+crates/khive-vamana/src/index.rs 6835
+crates/khive-vcs/src/sync.rs 4088
+crates/kkernel/src/atomic_apply.rs 3383
+crates/kkernel/src/exec.rs 10291
+crates/kkernel/src/kg/validate.rs 4060
+crates/kkernel/src/reindex.rs 4495
