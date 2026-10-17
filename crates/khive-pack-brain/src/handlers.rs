@@ -20,8 +20,10 @@ mod auto_feedback;
 mod brain_handlers;
 mod event_counts;
 mod event_page;
+#[cfg(feature = "lattice-router")]
 mod router;
 
+#[cfg(feature = "lattice-router")]
 use router::*;
 
 pub(crate) use event_counts::*;
