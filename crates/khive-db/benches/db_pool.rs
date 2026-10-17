@@ -37,8 +37,9 @@ impl Fixture {
         let warm: Vec<_> = (0..READERS)
             .map(|_| pool.reader().expect("warm reader"))
             .collect();
+        // Use the public read-only capability; its dirty-lease cleanup completes
+        // when warm is dropped, before any acquisition timer or worker starts.
         let mode: String = warm[0]
-            .conn()
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .expect("journal mode");
         assert_eq!(mode, "wal", "benchmark requires dedicated pooled readers");
