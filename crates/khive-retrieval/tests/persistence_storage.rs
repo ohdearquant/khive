@@ -170,20 +170,29 @@ async fn queued_snapshots_preserve_bytes_and_clear_only_the_selected_namespace()
 async fn read_only_snapshots_load_and_report_stats_but_refuse_snapshot_clear_and_schema_writes() {
     const NAMESPACE: &str = "snapshots:read-only";
     let scratch = ScratchDir::new();
-    let writable = scratch.queued_backend();
-    let seed = RetrievalPersistence::new(writable.sql(), NAMESPACE);
+    let path = scratch.0.join("snapshots.db");
     let mut bm25 = Bm25Index::default();
     bm25.index_document("retained", "retained snapshot")
         .unwrap();
     let mut hnsw = HnswIndex::new(2);
     let node = NodeId::new([2; 16]);
     hnsw.insert(node, vec![0.0, 1.0]).unwrap();
-    seed.persist_bm25_index(&bm25).await.unwrap();
-    seed.persist_hnsw_snapshot(&hnsw).await.unwrap();
-    let before = serde_json::to_value(snapshot_rows(&writable).await).unwrap();
-    let expected_stats = seed.stats().await.unwrap();
-    let read_only = StorageBackend::sqlite_read_only_for_test(scratch.0.join("snapshots.db"))
-        .expect("open read-only backend");
+    // A read-only open refuses a WAL database that a live writer still holds, so the
+    // writable backend is closed and its sidecars frozen before the snapshot is inspected.
+    let (before, expected_stats) = {
+        let writable = scratch.queued_backend();
+        let seed = RetrievalPersistence::new(writable.sql(), NAMESPACE);
+        seed.persist_bm25_index(&bm25).await.unwrap();
+        seed.persist_hnsw_snapshot(&hnsw).await.unwrap();
+        (
+            serde_json::to_value(snapshot_rows(&writable).await).unwrap(),
+            seed.stats().await.unwrap(),
+        )
+    };
+    #[cfg(unix)]
+    khive_storage::test_support::freeze_snapshot_sidecars(&path);
+    let read_only =
+        StorageBackend::sqlite_read_only_for_test(&path).expect("open read-only backend");
     read_only
         .prepare_core_schema()
         .expect("validate migrated schema");
@@ -232,10 +241,6 @@ async fn read_only_snapshots_load_and_report_stats_but_refuse_snapshot_clear_and
     );
     assert_eq!(
         serde_json::to_value(snapshot_rows(&read_only).await).unwrap(),
-        before
-    );
-    assert_eq!(
-        serde_json::to_value(snapshot_rows(&writable).await).unwrap(),
         before
     );
 }
