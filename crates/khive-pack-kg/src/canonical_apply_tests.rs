@@ -357,6 +357,166 @@ async fn canonical_proposal_scans_values_under_reserved_property_keys() {
     assert_eq!(events.count_events(filter).await.unwrap(), before);
 }
 
+/// The value the secret gate refuses once decoded; the tests below hide it with a JSON
+/// escape so the undecoded text passes a scan of the text alone.
+fn escaped_credential_fixture() -> String {
+    format!(
+        "postgresql://{}:{}@fixture.example/database",
+        "fixture-user", "<PASSWORD>"
+    )
+}
+
+/// Proposes `delta` as a canonical change-set and reports the result beside how many
+/// ProposalCreated events existed before and after.
+async fn propose_canonical(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    delta: String,
+) -> (Result<Value, RuntimeError>, u64, u64) {
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let events = runtime.events(&token).unwrap();
+    let filter = khive_storage::EventFilter {
+        kinds: vec![khive_types::EventKind::ProposalCreated],
+        ..Default::default()
+    };
+    let before = events.count_events(filter.clone()).await.unwrap();
+    let result = registry
+        .dispatch(
+            "propose",
+            json!({
+                "title":"Canonical proposal", "description":"Decoded once, scanned whole",
+                "changeset":{"kind":"canonical","schema_version":1,"delta":delta},
+            }),
+        )
+        .await;
+    let after = events.count_events(filter).await.unwrap();
+    (result, before, after)
+}
+
+fn assert_repeated_member_refusal(result: &Result<Value, RuntimeError>) {
+    let refusal = result.as_ref().err().map(RuntimeError::refusal_source);
+    assert!(
+        matches!(
+            refusal,
+            Some(RuntimeError::InvalidInput(message)) if message.contains("repeats a member name")
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn canonical_proposal_refuses_a_repeated_property_that_hides_an_escaped_credential() {
+    let (runtime, registry) = setup();
+    let op = json!({"op":"create","id":Uuid::from_u128(901),"namespace":"local",
+        "target":{"kind":"entity","entity_kind":"concept","name":"repeated",
+            "properties":{"source":escaped_credential_fixture(),"zz_repeat":"benign"}}});
+    // A decode keeps the last copy of a repeated name, so the escaped credential in the
+    // first copy would be stored with the delta while every decoded scan saw "benign".
+    let repeated = delta(&[op])
+        .replacen("\"zz_repeat\"", "\"source\"", 1)
+        .replacen("@fixture.example", "\\u0040fixture.example", 1);
+    assert_eq!(repeated.matches("\"source\"").count(), 2, "{repeated}");
+    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
+    assert_repeated_member_refusal(&result);
+    assert_eq!(
+        after, before,
+        "a refused proposal writes no ProposalCreated"
+    );
+}
+
+#[tokio::test]
+async fn canonical_proposal_refuses_a_repeated_property_that_hides_an_escaped_token() {
+    let (runtime, registry) = setup();
+    let op = json!({"op":"create","id":Uuid::from_u128(905),"namespace":"local",
+        "target":{"kind":"entity","entity_kind":"concept","name":"repeated",
+            "properties":{"k":format!("ghp_{}", "A".repeat(36)),"zz_repeat":"safe"}}});
+    // `g` decodes to `g`, so the prefix the detector keys on appears only once decoded.
+    let repeated =
+        delta(&[op])
+            .replacen("\"zz_repeat\"", "\"k\"", 1)
+            .replacen("\"ghp_", "\"\\u0067hp_", 1);
+    assert_eq!(repeated.matches("\"k\"").count(), 2, "{repeated}");
+    assert!(!repeated.contains("ghp_"), "{repeated}");
+    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
+    assert_repeated_member_refusal(&result);
+    assert_eq!(
+        after, before,
+        "a refused proposal writes no ProposalCreated"
+    );
+}
+
+#[tokio::test]
+async fn canonical_proposal_refuses_a_repeated_name_spelled_with_an_escape() {
+    let (runtime, registry) = setup();
+    let op = json!({"op":"create","id":Uuid::from_u128(903),"namespace":"local",
+        "target":{"kind":"entity","entity_kind":"concept","name":"respelled",
+            "properties":{"source":escaped_credential_fixture(),"zz_repeat":"benign"}}});
+    // `\u0073ource` decodes to `source`: two spellings, one member name.
+    let respelled = delta(&[op])
+        .replacen("\"zz_repeat\"", "\"\\u0073ource\"", 1)
+        .replacen("@fixture.example", "\\u0040fixture.example", 1);
+    assert_eq!(respelled.matches("\"source\"").count(), 1, "{respelled}");
+    khive_runtime::secret_gate::check_at(&respelled, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let (result, before, after) = propose_canonical(&runtime, &registry, respelled).await;
+    assert_repeated_member_refusal(&result);
+    assert_eq!(
+        after, before,
+        "a refused proposal writes no ProposalCreated"
+    );
+}
+
+#[tokio::test]
+async fn canonical_proposal_refuses_a_repeated_reserved_property_key() {
+    let (runtime, registry) = setup();
+    let stamp = "exempted:content-sha256-manifest-v1";
+    let update = json!({"op":"update","target_id":Uuid::from_u128(902),
+        "patch":{"target":"entity",
+            "properties":{"khive:secret_gate":escaped_credential_fixture(),"zz_repeat":stamp}},
+        "preimage":{"target":"entity","properties":{"khive:secret_gate":stamp}}});
+    // With the last copy kept, the patch would decode to the runtime's own stamp, which
+    // the proposal scan admits, while the stored delta held the credential.
+    let repeated = delta(&[update])
+        .replacen("\"zz_repeat\"", "\"khive:secret_gate\"", 1)
+        .replacen("@fixture.example", "\\u0040fixture.example", 1)
+        .replace("khive:secret_gate", "khive:\\u0073ecret_gate");
+    assert_eq!(
+        repeated.matches("khive:\\u0073ecret_gate").count(),
+        3,
+        "{repeated}"
+    );
+    assert!(!repeated.contains("secret"), "{repeated}");
+    khive_runtime::secret_gate::check_at(&repeated, "proposal", "changeset")
+        .expect("the undecoded text passes a scan of the text alone");
+    let (result, before, after) = propose_canonical(&runtime, &registry, repeated).await;
+    assert_repeated_member_refusal(&result);
+    assert_eq!(
+        after, before,
+        "a refused proposal writes no ProposalCreated"
+    );
+}
+
+#[tokio::test]
+async fn canonical_proposal_with_distinct_property_names_is_admitted() {
+    let (runtime, registry) = setup();
+    let op = json!({"op":"create","id":Uuid::from_u128(904),"namespace":"local",
+        "target":{"kind":"entity","entity_kind":"concept","name":"distinct",
+            "properties":{"source":"benign","zz_repeat":"benign"}}});
+    let (result, before, after) = propose_canonical(&runtime, &registry, delta(&[op])).await;
+    result.expect("distinct property names are admitted");
+    assert_eq!(
+        after,
+        before + 1,
+        "an admitted proposal writes one ProposalCreated"
+    );
+}
+
 #[tokio::test]
 async fn canonical_proposal_admits_the_runtime_secret_gate_stamp() {
     let (_runtime, registry) = setup();
