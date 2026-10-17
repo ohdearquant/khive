@@ -75,6 +75,9 @@ impl ReconciliationStage {
 }
 
 enum ApplyChangesetOutcome {
+    OutcomeUnknown {
+        error: RuntimeError,
+    },
     Applied {
         created_records: Vec<Uuid>,
         embedding_truncation: EmbeddingTruncationReport,
@@ -141,12 +144,31 @@ impl ProposalApplyWorker {
         let changeset = match self.load_changeset(token, proposal_id).await {
             Ok(cs) => cs,
             Err(e) => {
-                self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
+                self.emit_apply_failed(token, proposal_id, e.to_string(), 0, None)
                     .await;
                 return Ok(EmbeddingTruncationReport::default());
             }
         };
 
+        let legacy_preimage = if matches!(changeset, ProposalChangeset::Canonical { .. }) {
+            None
+        } else {
+            Some(khive_types::event::ProposalPreimageStatus::None)
+        };
+        if let Err(error) = crate::canonical_apply::validate_proposal(&changeset, registry) {
+            self.emit_apply_failed(token, proposal_id, error.to_string(), 0, legacy_preimage)
+                .await;
+            return Ok(EmbeddingTruncationReport::default());
+        }
+        let success_preimage = match &changeset {
+            ProposalChangeset::Canonical {
+                schema_version,
+                delta,
+            } => Some(crate::canonical_apply::preimage_status(
+                &crate::canonical_apply::decode_delta(delta, Some(*schema_version))?,
+            )),
+            _ => legacy_preimage,
+        };
         if has_multi_step_compound(&changeset) {
             self.emit_apply_failed(
                 token,
@@ -154,6 +176,7 @@ impl ProposalApplyWorker {
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
                     .to_string(),
                 0,
+                legacy_preimage,
             )
             .await;
             return Ok(EmbeddingTruncationReport::default());
@@ -171,6 +194,7 @@ impl ProposalApplyWorker {
                     }
                     .to_string(),
                     0,
+                    legacy_preimage,
                 )
                 .await;
                 return Ok(EmbeddingTruncationReport::default());
@@ -205,7 +229,7 @@ impl ProposalApplyWorker {
                     .iter()
                     .map(|id| Id128::from_u128(id.as_u128()))
                     .collect();
-                self.finalize_apply_success(token, proposal_id, created_ids)
+                self.finalize_apply_success(token, proposal_id, created_ids, success_preimage)
                     .await;
                 embedding_truncation
             }
@@ -225,8 +249,17 @@ impl ProposalApplyWorker {
                 );
                 embedding_truncation
             }
+            Ok(ApplyChangesetOutcome::OutcomeUnknown { error }) => {
+                tracing::error!(
+                    proposal_id = %proposal_id,
+                    error = %khive_runtime::secret_gate::bounded_masked_log_text(&error.to_string()),
+                    retryable = false,
+                    "canonical apply outcome unknown; leaving proposal applying for reconciliation"
+                );
+                EmbeddingTruncationReport::default()
+            }
             Err(e) => {
-                self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
+                self.emit_apply_failed(token, proposal_id, e.to_string(), 0, legacy_preimage)
                     .await;
                 if let Err(e2) = self
                     .projection
@@ -248,7 +281,7 @@ impl ProposalApplyWorker {
     }
 
     /// Load the ProposalCreated event payload to get the changeset.
-    async fn load_changeset(
+    pub(crate) async fn load_changeset(
         &self,
         token: &NamespaceToken,
         proposal_id: Uuid,
@@ -297,6 +330,51 @@ impl ProposalApplyWorker {
         registry: &VerbRegistry,
         budget: &mut WriteBudget,
     ) -> Result<ApplyChangesetOutcome, RuntimeError> {
+        if let ProposalChangeset::Canonical {
+            schema_version,
+            delta,
+        } = changeset
+        {
+            let decoded = crate::canonical_apply::decode_delta(delta, Some(*schema_version))?;
+            for op in &decoded.ops {
+                if matches!(op, khive_changeset::Op::Create(_)) {
+                    budget.consume_new_entry()?;
+                }
+            }
+            // A direct `apply_changeset` call is gated by registry dispatch; a reviewed
+            // proposal reaches the landing path here instead, so its wrapper is checked
+            // against the applying caller before anything is prepared.
+            registry.authorize_canonical_changeset(token, delta).await?;
+            return match crate::canonical_apply::apply_delta(
+                &self.runtime,
+                registry,
+                token,
+                delta,
+                Some(*schema_version),
+            )
+            .await?
+            {
+                crate::canonical_apply::CanonicalApplyOutcome::Committed {
+                    created_records,
+                    embedding_truncation,
+                    reconciliation,
+                } => match reconciliation {
+                    None => Ok(ApplyChangesetOutcome::Applied {
+                        created_records,
+                        embedding_truncation,
+                    }),
+                    Some(error) => Ok(ApplyChangesetOutcome::CommittedNeedsReconciliation {
+                        stage: ReconciliationStage::PostCommitReindex,
+                        error,
+                        embedding_truncation,
+                    }),
+                },
+                crate::canonical_apply::CanonicalApplyOutcome::RolledBack { error } => Err(error),
+                crate::canonical_apply::CanonicalApplyOutcome::OutcomeUnknown { error } => {
+                    Ok(ApplyChangesetOutcome::OutcomeUnknown { error })
+                }
+            };
+        }
         match self
             .prepare_changeset(token, changeset, registry, budget)
             .await?
@@ -381,6 +459,9 @@ impl ProposalApplyWorker {
     > {
         Box::pin(async move {
             match changeset {
+                ProposalChangeset::Canonical { .. } => Err(RuntimeError::InvalidInput(
+                    "Canonical must use the shared guarded change-set landing path".into(),
+                )),
                 ProposalChangeset::AddEntity { entity } => {
                     let kind =
                         crate::handlers::canonical_entity_kind(entity.kind.as_str(), registry)?;
@@ -584,12 +665,14 @@ impl ProposalApplyWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
         created_records: Vec<Id128>,
+        preimage: Option<khive_types::event::ProposalPreimageStatus>,
     ) {
         let payload = ProposalAppliedPayload {
             proposal_id: Id128::from_u128(proposal_id.as_u128()),
             applied_at: Timestamp::from_micros(chrono::Utc::now().timestamp_micros() as u64),
             applied_by: "system:propose-apply".to_string(),
             result: khive_types::ApplyResult::Success { created_records },
+            preimage,
         };
         let Some(event) = Self::build_apply_event(token, proposal_id, payload) else {
             return;
@@ -625,6 +708,7 @@ impl ProposalApplyWorker {
         proposal_id: Uuid,
         error: String,
         applied_step_count: u32,
+        preimage: Option<khive_types::event::ProposalPreimageStatus>,
     ) {
         let payload = ProposalAppliedPayload {
             proposal_id: Id128::from_u128(proposal_id.as_u128()),
@@ -634,6 +718,7 @@ impl ProposalApplyWorker {
                 error,
                 applied_step_count,
             },
+            preimage,
         };
         self.emit_apply_event(token, proposal_id, payload).await;
     }

@@ -43,6 +43,8 @@ use crate::atomic_plan::{
 /// (`post_commit_effect`).
 #[derive(Debug, Clone)]
 pub enum AtomicOpPlan {
+    /// An admitted canonical operation materialized using the applying writer.
+    Canonical(Box<crate::canonical_apply::CanonicalMutationPlan>),
     AddEntity(AddEntityPlan),
     FinalizeEntity(Box<crate::EntityFinalizationPlan>),
     AddNote(Box<AddNotePlan>),
@@ -67,6 +69,7 @@ impl AtomicOpPlan {
     /// effects; the tuple flag marks a read assertion for `query_all`, never DML.
     fn plan_statements(&self) -> Vec<(PlanStatement, bool)> {
         let statements = match self {
+            AtomicOpPlan::Canonical(_) => Vec::new(),
             AtomicOpPlan::AddEntity(p) => p.statements.clone(),
             // The opaque finalizer applies its own phased statements.
             AtomicOpPlan::FinalizeEntity(_) => Vec::new(),
@@ -149,6 +152,16 @@ impl AtomicOpPlan {
 /// criteria: "the failing op index is recorded").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtomicOpFailure {
+    /// The touched captured value differs from the applying writer record.
+    PreimageMismatch {
+        target_id: uuid::Uuid,
+        field_path: String,
+    },
+    /// An independent owning-kind admission snapshot became stale.
+    OwnerSnapshotConflict {
+        target_id: uuid::Uuid,
+        kind: String,
+    },
     NoteConflict(crate::note_write::NoteWriteConflict),
     EntityConflict(crate::entity_write::EntityVersionConflict),
     /// The statement executed without a SQL error, but its affected-row
@@ -329,6 +342,13 @@ pub(crate) async fn apply_plan_preserving_storage(
     plan: &AtomicOpPlan,
     capture_note_versions: bool,
 ) -> Result<AppliedPlan, PlanExecutionFailure> {
+    if matches!(plan, AtomicOpPlan::Canonical(_)) {
+        return Err(AtomicOpFailure::SqlError {
+            statement_label: Some("canonical-materialize".into()),
+            message: "canonical plan requires the ordered atomic runner".into(),
+        }
+        .into());
+    }
     if let AtomicOpPlan::FinalizeEntity(plan) = plan {
         return plan
             .apply(writer)
@@ -532,7 +552,18 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
             for (op_index, plan) in plans.iter().enumerate() {
                 let savepoint = format!("adr099_atomic_op_{op_index}");
                 begin_savepoint(writer, &savepoint).await?;
-                match apply_plan(writer, plan, capture_note_versions).await {
+                let applied = match plan {
+                    AtomicOpPlan::Canonical(canonical) => {
+                        match crate::canonical_apply::materialize(writer, canonical).await {
+                            Ok(materialized) => {
+                                apply_plan(writer, &materialized, capture_note_versions).await
+                            }
+                            Err(failure) => Err(failure),
+                        }
+                    }
+                    _ => apply_plan(writer, plan, capture_note_versions).await,
+                };
+                match applied {
                     Ok(applied) => {
                         release_savepoint(writer, &savepoint).await?;
                         if let Some(effect) = applied.effect {

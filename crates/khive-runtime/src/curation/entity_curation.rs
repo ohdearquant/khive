@@ -30,6 +30,104 @@ struct PreparedEntityUpdate {
 }
 
 impl KhiveRuntime {
+    pub(crate) async fn validate_canonical_entity_patch(
+        &self,
+        token: &NamespaceToken,
+        current: &Entity,
+        mut patch: EntityPatch,
+    ) -> RuntimeResult<EntityPatch> {
+        crate::atomic_prepare::canonical_refuse_registry_tags(&current.tags, "update")?;
+        if let Some(name) = &patch.name {
+            if name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+            }
+            crate::secret_gate::check_at(name, "entity", "name")?;
+        }
+        if let Some(Some(description)) = &patch.description {
+            crate::secret_gate::check_at(description, "entity", "description")?;
+        }
+        if let Some(properties) = &patch.properties {
+            crate::secret_gate::check_json_at(properties, "entity", "properties")?;
+        }
+        if let Some(tags) = &patch.tags {
+            crate::atomic_prepare::canonical_refuse_registry_tags(tags, "update")?;
+            crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
+        }
+        if let Some(Some(entity_type)) = &patch.entity_type {
+            patch.entity_type =
+                Some(self.validate_entity_type_for_kind(&current.kind, Some(entity_type))?);
+        }
+        // ADR-115 §4 against the prepared row: the writer repeats this against the row it
+        // meets, which also decides whether a stored reserved value carries.
+        if let Some(properties) = &patch.properties {
+            crate::secret_gate::strip_reserved_echo(
+                &mut properties.clone(),
+                current.properties.as_ref(),
+            )?;
+        }
+        let mut projected = current.clone();
+        Self::apply_entity_patch_fields(&mut projected, patch.clone(), &[], true);
+        if let Some(hook) = self.entity_kind_hook(&current.kind) {
+            hook.validate_entity_update(self, token, &projected, projected.properties.as_ref())
+                .await?;
+        }
+        Ok(patch)
+    }
+
+    pub(crate) fn apply_entity_patch_fields(
+        entity: &mut Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+        replace_properties: bool,
+    ) -> (bool, Vec<&'static str>) {
+        let mut reindex_required = false;
+        let mut changed_fields: Vec<&'static str> = Vec::new();
+
+        if let Some(name) = patch.name {
+            reindex_required |= entity.name != name;
+            entity.name = name;
+            changed_fields.push("name");
+        }
+        if let Some(desc_patch) = patch.description {
+            reindex_required |= entity.description != desc_patch;
+            entity.description = desc_patch;
+            changed_fields.push("description");
+        }
+        if let Some(props) = patch.properties {
+            if replace_properties {
+                entity.properties = Some(props);
+            } else {
+                let (merged, _) = merge_properties(
+                    &entity.properties,
+                    &Some(props),
+                    EntityDedupMergePolicy::PreferFrom,
+                );
+                entity.properties = merged;
+            }
+            changed_fields.push("properties");
+        }
+        if let Some(Value::Object(properties)) = entity.properties.as_mut() {
+            let mut removed = false;
+            for key in remove_properties {
+                removed |= properties.remove(*key).is_some();
+            }
+            if removed && !changed_fields.contains(&"properties") {
+                changed_fields.push("properties");
+            }
+        }
+        if let Some(tags) = patch.tags {
+            entity.tags = tags;
+            changed_fields.push("tags");
+        }
+        if let Some(entity_type) = patch.entity_type {
+            reindex_required |= entity.entity_type != entity_type;
+            entity.entity_type = entity_type;
+            changed_fields.push("entity_type");
+        }
+
+        (reindex_required, changed_fields)
+    }
+
     /// Patch-style entity update.
     ///
     /// Only fields set to `Some(_)` are changed. Re-indexes FTS5 (and vectors if configured)
@@ -156,46 +254,12 @@ impl KhiveRuntime {
             None => None,
         };
 
-        let mut reindex_required = false;
-        let mut changed_fields: Vec<&'static str> = Vec::new();
-
-        if let Some(name) = patch.name {
-            reindex_required |= entity.name != name;
-            entity.name = name;
-            changed_fields.push("name");
-        }
-        if let Some(desc_patch) = patch.description {
-            reindex_required |= entity.description != desc_patch;
-            entity.description = desc_patch;
-            changed_fields.push("description");
-        }
-        if let Some(props) = patch.properties {
-            let (merged, _) = merge_properties(
-                &entity.properties,
-                &Some(props),
-                EntityDedupMergePolicy::PreferFrom,
-            );
-            entity.properties = merged;
-            changed_fields.push("properties");
-        }
-        if let Some(Value::Object(properties)) = entity.properties.as_mut() {
-            let mut removed = false;
-            for key in remove_properties {
-                removed |= properties.remove(*key).is_some();
-            }
-            if removed && !changed_fields.contains(&"properties") {
-                changed_fields.push("properties");
-            }
-        }
-        if let Some(tags) = patch.tags {
-            entity.tags = tags;
-            changed_fields.push("tags");
-        }
-        if let Some(entity_type) = validated_entity_type {
-            reindex_required |= entity.entity_type != entity_type;
-            entity.entity_type = entity_type;
-            changed_fields.push("entity_type");
-        }
+        let patch = EntityPatch {
+            entity_type: validated_entity_type,
+            ..patch
+        };
+        let (reindex_required, changed_fields) =
+            Self::apply_entity_patch_fields(&mut entity, patch, remove_properties, false);
 
         // A patch may carry properties from the stored row into the full
         // replacement. Validate the final object, including that carry.

@@ -617,6 +617,14 @@ impl std::error::Error for ResolutionFailureContext {
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A constituent was refused before canonical writer admission. Retain
+    /// its typed source without rendering submitted or captured contents.
+    #[error("canonical operation {op_index} refused")]
+    CanonicalAdmission {
+        op_index: usize,
+        #[source]
+        source: Box<RuntimeError>,
+    },
     /// A lint fix stopped, retaining its exact typed cause and confirmed receipts.
     #[error("{source}")]
     LintFix {
@@ -937,6 +945,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
                 Self::LintFix { source, .. } => source.as_ref(),
+                Self::CanonicalAdmission { source, .. } => source.as_ref(),
                 _ => return error,
             };
         }
@@ -1033,6 +1042,7 @@ impl RuntimeError {
             Self::RefusedWithEvents { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
+            Self::CanonicalAdmission { source, .. } => source.variant_name(),
         }
     }
 

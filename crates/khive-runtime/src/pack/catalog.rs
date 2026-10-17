@@ -23,6 +23,40 @@ use super::{
     Visibility, GENERIC_CRUD_PACK,
 };
 
+#[derive(Clone)]
+pub(crate) struct CanonicalNoteHookLookup {
+    packs: Arc<Vec<Box<dyn PackRuntime>>>,
+}
+
+impl std::fmt::Debug for CanonicalNoteHookLookup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalNoteHookLookup")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CanonicalNoteHookLookup {
+    pub(crate) fn has_hook(&self, kind: &str) -> bool {
+        find_registered_kind_hook(self.packs.as_ref(), kind).is_some()
+    }
+}
+
+fn find_registered_kind_hook(
+    packs: &[Box<dyn PackRuntime>],
+    kind: &str,
+) -> Option<Arc<dyn KindHook>> {
+    for pack in packs {
+        let owns = pack.note_kinds().contains(&kind) || pack.entity_kinds().contains(&kind);
+        if owns {
+            if let Some(hook) = pack.kind_hook(kind) {
+                return Some(hook);
+            }
+        }
+    }
+    None
+}
+
 impl VerbRegistry {
     /// Registered pack-level by-ID resolvers, in registration order.
     ///
@@ -48,15 +82,13 @@ impl VerbRegistry {
     /// a hook from `kind_hook(kind)` wins. Returns `None` if the kind is
     /// unknown to all packs or no owning pack registered a hook.
     pub fn find_kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
-        for pack in self.packs.iter() {
-            let owns = pack.note_kinds().contains(&kind) || pack.entity_kinds().contains(&kind);
-            if owns {
-                if let Some(hook) = pack.kind_hook(kind) {
-                    return Some(hook);
-                }
-            }
+        find_registered_kind_hook(self.packs.as_ref(), kind)
+    }
+
+    pub(crate) fn canonical_note_hook_lookup(&self) -> CanonicalNoteHookLookup {
+        CanonicalNoteHookLookup {
+            packs: Arc::clone(&self.packs),
         }
-        None
     }
 
     /// Every `(entity kind, hook)` pair for which the owning pack declares

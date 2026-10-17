@@ -99,6 +99,15 @@ impl KhiveRuntime {
             }) => Err(RuntimeError::Internal(format!(
                 "hard delete + edge purge for {node_id} failed: {message}"
             ))),
+            // Only canonical change-set plans compare preimages or owner snapshots.
+            Ok(AtomicRunOutcome::RolledBack {
+                failure:
+                    failure @ (AtomicOpFailure::PreimageMismatch { .. }
+                    | AtomicOpFailure::OwnerSnapshotConflict { .. }),
+                ..
+            }) => Err(RuntimeError::Internal(format!(
+                "hard delete + edge purge for {node_id}: unexpected canonical failure {failure:?}"
+            ))),
             Err(e) => Err(RuntimeError::Internal(format!(
                 "hard delete + edge purge for {node_id}: atomic unit seam failure: {}",
                 e.0

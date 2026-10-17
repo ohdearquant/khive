@@ -82,6 +82,17 @@ pub async fn prepare_add_entity(
     token: &NamespaceToken,
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
+    prepare_add_entity_record(runtime, token, args, None)
+        .await
+        .map(|(_, plan)| plan)
+}
+
+pub(crate) async fn prepare_add_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    canonical_id: Option<Uuid>,
+) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     let kind = require_str(args, "kind")?;
     let name = require_str(args, "name")?;
     runtime.validate_entity_kind(kind)?;
@@ -107,6 +118,11 @@ pub async fn prepare_add_entity(
 
     let ns = token.namespace().as_str();
     let mut entity = khive_storage::Entity::new(ns, kind, name);
+    if let Some(id) = canonical_id {
+        entity.id = id;
+        entity.entity_type =
+            runtime.validate_entity_type_for_kind(kind, optional_str(args, "entity_type"))?;
+    }
     if let Some(d) = description {
         entity = entity.with_description(d);
     }
@@ -118,7 +134,11 @@ pub async fn prepare_add_entity(
     }
 
     let mut statements = vec![PlanStatement {
-        statement: entity_upsert_statement(&entity),
+        statement: if canonical_id.is_some() {
+            khive_db::stores::entity::entity_insert_if_absent_statement(&entity)
+        } else {
+            entity_upsert_statement(&entity)
+        },
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
     // Order-sensitive pair — see `insert_document_statements`'s adjacency
@@ -131,13 +151,16 @@ pub async fn prepare_add_entity(
         });
     }
 
-    Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
-        entity_id: entity.id,
-        statements,
-        post_commit: PostCommitEffect::ReindexEntity {
+    Ok((
+        entity.clone(),
+        AtomicOpPlan::AddEntity(AddEntityPlan {
             entity_id: entity.id,
-        },
-    }))
+            statements,
+            post_commit: PostCommitEffect::ReindexEntity {
+                entity_id: entity.id,
+            },
+        }),
+    ))
 }
 
 /// Build the prepared plan for an `AddNote` proposal change. Mirrors
@@ -150,6 +173,17 @@ pub async fn prepare_add_note(
     token: &NamespaceToken,
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
+    prepare_add_note_record(runtime, token, args, None)
+        .await
+        .map(|(_, plan)| plan)
+}
+
+pub(crate) async fn prepare_add_note_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    canonical_id: Option<Uuid>,
+) -> RuntimeResult<(khive_storage::Note, AtomicOpPlan)> {
     let kind = require_str(args, "kind")?;
     let content = require_str(args, "content")?;
     runtime.validate_note_kind(kind)?;
@@ -173,6 +207,22 @@ pub async fn prepare_add_note(
 
     let ns = token.namespace().as_str();
     let mut note = khive_storage::note::Note::new(ns, kind, content);
+    if let Some(id) = canonical_id {
+        note.id = id;
+        note.salience = optional_f64_patch(args, "salience")?.flatten();
+        note.decay_factor = optional_f64_patch(args, "decay_factor")?.flatten();
+        if note
+            .salience
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || note
+                .decay_factor
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "invalid canonical note salience or decay_factor".into(),
+            ));
+        }
+    }
     if let Some(n) = name {
         note = note.with_name(n);
     }
@@ -181,7 +231,11 @@ pub async fn prepare_add_note(
     }
 
     let mut statements = vec![PlanStatement {
-        statement: note_upsert_statement(&note),
+        statement: if canonical_id.is_some() {
+            khive_db::stores::note::note_insert_if_absent_statement(&note)
+        } else {
+            note_upsert_statement(&note)
+        },
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
     // Order-sensitive pair — see `insert_document_statements`'s adjacency
@@ -193,15 +247,18 @@ pub async fn prepare_add_note(
         });
     }
 
-    Ok(AtomicOpPlan::AddNote(Box::new(AddNotePlan {
-        note_guard: None,
-        note_id: note.id,
-        statements,
-        post_commit: PostCommitEffect::ReindexNote {
+    Ok((
+        note.clone(),
+        AtomicOpPlan::AddNote(Box::new(AddNotePlan {
+            note_guard: None,
             note_id: note.id,
-            version: note.version,
-        },
-    })))
+            statements,
+            post_commit: PostCommitEffect::ReindexNote {
+                note_id: note.id,
+                version: note.version,
+            },
+        })),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +520,7 @@ pub async fn prepare_update_from_note_snapshot(
 /// The only companion attachment site. Canonical, CLI atomic, and stream note
 /// updates all enter through `prepare_update_from_note_snapshot` after running
 /// the registry's normalizer/validator on the same snapshot.
-async fn attach_note_update_effects(
+pub(crate) async fn attach_note_update_effects(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     registry: &crate::VerbRegistry,
