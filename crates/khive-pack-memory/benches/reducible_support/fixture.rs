@@ -13,7 +13,7 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 
 #[path = "../../../khive-runtime/tests/support/receipt_credentials.rs"]
-mod receipt_credentials;
+pub(crate) mod receipt_credentials;
 
 pub const SEED: u64 = 0x5713_6d65_6d6f_7279;
 pub const TOPICS: [&str; 8] = [
@@ -33,7 +33,7 @@ pub fn body(i: usize) -> String {
     format!(
         "the and for with {} {} rare{} document{}",
         TOPICS[i % TOPICS.len()],
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             "mediumband"
         } else {
             "alternateband"
