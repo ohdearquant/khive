@@ -159,7 +159,7 @@ pub fn search_scale(c: &mut Criterion) {
         bench(c, &format!("knowledge_search_scale/atoms{count}"), || {
             let prepared = params.clone();
             let (elapsed, result) = fixture.measure(&rt, "knowledge.search", prepared);
-            check_search(&result, count, false);
+            check_search(&result, count, false, false);
             (elapsed, None)
         });
         rt.block_on(fixture.close());
@@ -181,7 +181,7 @@ pub fn search_matrix(c: &mut Criterion) {
                 || {
                     let prepared = params.clone();
                     let (elapsed, result) = fixture.measure(&rt, "knowledge.search", prepared);
-                    check_search(&result, 1000, drafts);
+                    check_search(&result, 1000, true, drafts);
                     (elapsed, None)
                 },
             );

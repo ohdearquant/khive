@@ -24,7 +24,7 @@ fn main() {
         let elapsed = fixture.index(&rt, count);
         let params = json!({"query":QUERY, "kind":"atom", "limit":20, "rerank":true});
         let (_, result) = fixture.measure(&rt, "knowledge.search", params);
-        check_search(&result, count, false);
+        check_search(&result, count, false, false);
         println!(
             "{}",
             json!({"scenario":"knowledge_index_build", "atoms":count,

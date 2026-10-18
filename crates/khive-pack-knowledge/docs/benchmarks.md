@@ -170,9 +170,13 @@ No model is configured for compose/suggest/fold. Search and index use a register
 deterministic normalized 384-dimensional synthetic provider, with no downloads.
 Draft and reviewed vectors occupy distinct neighborhoods; this tests execution
 and filtering, not real-model semantic quality. Search setup fully indexes its
-corpus before timing. Search checks 20 unique real atoms, returned status, ANN
-provenance and successful stored-vector reranking without fallback or degraded
-responses. Suggest rejects missing member costs; fold verifies exact selected
+corpus before timing. Search checks 20 unique real atoms, returned status and
+successful stored-vector reranking without fallback or degraded responses. ANN
+provenance is required for the all-reviewed scale/index corpora and the matrix
+cells that include drafts. When the mixed corpus excludes drafts, filtering and
+final ranking can remove the query-nearest ANN candidates from the returned top
+20; a result without ANN provenance must retain lexical provenance on every row.
+Suggest rejects missing member costs; fold verifies exact selected
 cardinality and summed budget. Writer shutdown is joined before directory removal.
 
 Text, slugs and vectors are deterministic; public upsert assigns fresh UUIDs and

@@ -189,7 +189,11 @@ impl Fixture {
     }
 }
 
-pub fn check_search(result: &Value, count: usize, drafts: bool) {
+pub fn check_search(result: &Value, count: usize, mixed_drafts: bool, include_drafts: bool) {
+    assert!(
+        !include_drafts || mixed_drafts,
+        "drafts require a mixed corpus"
+    );
     assert!(result.get("degraded").is_none(), "{result}");
     assert_ne!(result["ann_unavailable"], true, "{result}");
     let rows = result["results"].as_array().expect("search results");
@@ -213,31 +217,42 @@ pub fn check_search(result: &Value, count: usize, drafts: bool) {
             .unwrap()
             .contains(&format!("subject{index} ")));
         assert_eq!(row["score_provenance"]["embedding_rerank"], true);
-        if drafts {
-            assert_eq!(
-                row["status"],
-                if index.is_multiple_of(2) {
-                    "draft"
-                } else {
-                    "reviewed"
-                }
-            );
-        } else {
+        assert_eq!(
+            row["status"],
+            if mixed_drafts && index.is_multiple_of(2) {
+                "draft"
+            } else {
+                "reviewed"
+            }
+        );
+        if !include_drafts {
             assert_eq!(row["status"], "reviewed");
         }
     }
-    if drafts {
+    if include_drafts {
         assert!(
             rows.iter().any(|row| row["status"] == "draft"),
             "actual draft inclusion"
         );
     }
-    assert!(
-        rows.iter().any(|row| row["score_provenance"]["sources"]
+    let has_ann = rows.iter().any(|row| {
+        row["score_provenance"]["sources"]
             .as_array()
-            .is_some_and(|sources| sources.iter().any(|source| source == "ann"))),
-        "real ANN candidates"
-    );
+            .is_some_and(|sources| sources.iter().any(|source| source == "ann"))
+    });
+    if !mixed_drafts || include_drafts {
+        assert!(has_ann, "real ANN candidates: {result}");
+    } else if !has_ann {
+        // The query points at the draft neighborhood. Status filtering and
+        // final ranking can leave only lexical candidates in the returned top
+        // 20. Stored-vector reranking remains mandatory below.
+        assert!(
+            rows.iter().all(|row| row["score_provenance"]["sources"]
+                .as_array()
+                .is_some_and(|sources| sources.iter().any(|source| source == "lexical"))),
+            "reviewed candidates retain their lexical source: {result}"
+        );
+    }
     let provenance = &result["rerank_provenance"];
     assert_eq!(provenance["stored_vector_lookup"], "supported");
     assert!(provenance["from_stored"].as_u64().unwrap() >= 20);
