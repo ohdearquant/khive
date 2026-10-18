@@ -26,10 +26,18 @@ A changed path resolves to the crate whose manifest directory is its longest pre
 Markdown file resolves to no crate and is admitted under the documentation-lane rule of
 scripts/ci-docs-only.sh: a Markdown file that a non-Markdown file names, that a symlink's target
 names, or whose verb and pack counts the smoke tests check, puts the run on the full suite.
+
+A crate can compile or read another crate's file by naming it: `#[path = "..."]` on a module, or
+`include!`, `include_str!` or `include_bytes!` with a literal path. No dependency edge records that, so
+the closure cannot reach the reader. Every such literal at the head is resolved against the directory
+of the file that holds it, and a changed path that another crate names this way puts the run on the
+full suite. The scan prints how many sites it read; finding none is a broken scan, not a clean one, and
+also puts the run on the full suite. A path assembled at compile time (`concat!`, `env!`) is not read.
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -150,6 +158,50 @@ def check_markdown(path, head, targets):
     if scan.returncode != 1:
         raise Full(f"count scanner failed for {path} (rc {scan.returncode})")
     log(f"documentation only: {path}")
+
+
+INCLUDE_SITE = r"#\[path[[:space:]]*=|include(_str|_bytes)?!\("
+INCLUDE_LITERAL = re.compile(r'#\[path\s*=\s*"([^"]+)"|include(?:_str|_bytes)?!\(\s*"([^"]+)"')
+
+
+def foreign_includes(head, manifests):
+    """{target path: [reader site]} for literal includes whose target lies under a different crate."""
+    grep = subprocess.run(
+        ["git", "grep", "-n", "-I", "-E", "-e", INCLUDE_SITE, head, "--", "crates/*.rs"],
+        cwd=REPO, capture_output=True, text=True, check=False,
+    )
+    if grep.returncode not in (0, 1):
+        raise Full(f"include scan: git grep failed (rc {grep.returncode}): {grep.stderr.strip()}")
+    sites, files, foreign = 0, set(), {}
+    for row in grep.stdout.splitlines():
+        _rev, path, line, text = row.split(":", 3)
+        for literal in (a or b for a, b in INCLUDE_LITERAL.findall(text)):
+            sites += 1
+            files.add(path)
+            if literal.startswith("/") or "../" not in literal:
+                continue
+            target = os.path.normpath(os.path.join(os.path.dirname(path), literal))
+            if target.startswith("../") or not target.startswith(CRATES):
+                continue
+            reader, owner = owner_of(path, head, manifests), owner_of(target, head, manifests)
+            if owner is not None and owner != reader:
+                foreign.setdefault(target, []).append(f"{reader} ({path}:{line})")
+    if sites == 0:
+        raise Full(f"include scan: BROKEN, no #[path] or include! site found under crates/ at {head}")
+    log(f"include scan: {sites} sites in {len(files)} files, {len(foreign)} files named from another crate")
+    for target in sorted(foreign):
+        log(f"named from another crate: {target} <- {', '.join(foreign[target])}")
+    return foreign
+
+
+def owner_of(path, head, manifests):
+    """crate_of, or None for a path under no crate's manifest directory."""
+    try:
+        return crate_of(path, head, manifests)
+    except Full as reason:
+        if str(reason).startswith("under no crate's manifest directory"):
+            return None
+        raise
 
 
 def crate_of(path, head, manifests):
@@ -337,6 +389,10 @@ def classify(base, head, binary, paths_only=False):
         log(f"changed: {path} -> {crate}")
         changed.add(crate)
     log(f"changed crates: {' '.join(sorted(changed))}")
+    foreign = foreign_includes(head, manifests)
+    for path in crate_paths:
+        if path in foreign:
+            raise Full(f"{path} is compiled or read by another crate: {', '.join(foreign[path])}")
     if paths_only:
         return None
 
