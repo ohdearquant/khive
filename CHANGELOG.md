@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Writer contention diagnostics now report per-pool FIFO admission depth, its
-  high-water mark, capacity rejections and bounded lifetime duration histograms.
-  Snapshots identify the FIFO stage and report unavailable call/rotation metrics
-  explicitly. Reading them never starts a writer or changes admission routing.
-
-### Breaking (Rust crates)
-
-- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
-  `writer_admission_unavailable_reason`. Direct struct literals must set them.
-
 ## [0.14.0] - 2026-10-18
 
 ### Added
