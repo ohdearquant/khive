@@ -27,17 +27,21 @@ Markdown file resolves to no crate and is admitted under the documentation-lane 
 scripts/ci-docs-only.sh: a Markdown file that a non-Markdown file names, that a symlink's target
 names, or whose verb and pack counts the smoke tests check, puts the run on the full suite.
 
-A crate can compile or read another crate's file by naming it: `#[path = "..."]` on a module, or
-`include!`, `include_str!` or `include_bytes!` with a literal path. No dependency edge records that, so
-the closure cannot reach the reader. Every such literal at the head is resolved against the directory
-of the file that holds it, and a changed path that another crate names this way puts the run on the
-full suite. The scan prints how many sites it read; finding none is a broken scan, not a clean one, and
-also puts the run on the full suite. A path assembled at compile time (`concat!`, `env!`) is not read.
+A crate can compile or read another crate's file by naming it: `#[path = "..."]` on a module (also
+inside `cfg_attr`), or `include!`, `include_str!` or `include_bytes!`. No dependency edge records that,
+so the closure cannot reach the reader. The scan reads every Rust file under crates/ that names one of
+them, skips comments and string and character literals, and resolves each argument in code: a plain or
+raw string literal on any line after the opener, `concat!` of literals, and `concat!` led by
+`env!("CARGO_MANIFEST_DIR")`, which resolves against the reader's manifest directory. A literal followed
+by a part computed at compile time (a macro argument) names every path that starts with it. Other paths
+resolve against the directory of the file that holds them. A changed path that a reader in another crate
+names this way puts the run on the full suite. An argument in code the scan cannot resolve also does,
+and so does finding no site at all: a broken scan is not a clean one. The scan prints how many sites it
+read and how many it could not.
 """
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -160,38 +164,301 @@ def check_markdown(path, head, targets):
     log(f"documentation only: {path}")
 
 
-INCLUDE_SITE = r"#\[path[[:space:]]*=|include(_str|_bytes)?!\("
-INCLUDE_LITERAL = re.compile(r'#\[path\s*=\s*"([^"]+)"|include(?:_str|_bytes)?!\(\s*"([^"]+)"')
+# A coarse per-line prefilter: any file with a line naming an include macro or a path attribute is read whole, and
+# the lexer below decides which of those names sit in code. It cannot see a `#[` split from `path` across lines.
+INCLUDE_SITE = r"include(_str|_bytes)?[[:space:]]*!|#[[:space:]]*!?[[:space:]]*\[[[:space:]]*(path|cfg_attr)"
+INCLUDE_MACROS = ("include", "include_str", "include_bytes")
+MANIFEST_DIR = "CARGO_MANIFEST_DIR"
+
+
+class Unreadable(Exception):
+    """An include argument the scan cannot resolve to a path or a path prefix."""
+
+
+def skip_trivia(text, i):
+    """Index of the first character at or after i that is not whitespace or a comment."""
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end + 1
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < len(text) and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        else:
+            break
+    return i
+
+
+def word_at(text, i):
+    j = i
+    while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+        j += 1
+    return text[i:j], j
+
+
+def string_at(text, i):
+    """(value, end) for a string literal starting at i, or None. value is None for a byte, C or escaped string."""
+    word, j = word_at(text, i)
+    if word in ("r", "br", "cr"):
+        hashes = len(text[j:]) - len(text[j:].lstrip("#"))
+        if text.startswith('"', j + hashes):
+            close = '"' + "#" * hashes
+            end = text.find(close, j + hashes + 1)
+            if end < 0:
+                return None, len(text)
+            body = text[j + hashes + 1:end]
+            return (body if word == "r" else None), end + len(close)
+        return None
+    if word and word not in ("b", "c"):
+        return None
+    if not text.startswith('"', j):
+        return None
+    k, escaped = j + 1, False
+    while k < len(text) and text[k] != '"':
+        if text[k] == "\\":
+            escaped, k = True, k + 2
+        else:
+            k += 1
+    body = text[j + 1:k]
+    return (None if escaped or word else body), k + 1
+
+
+def include_argument(text, i):
+    """(base, path, complete, end) for the argument of an include macro or path attribute at i.
+    base is "file" (relative to the file's directory) or MANIFEST_DIR; complete is False when a literal prefix is
+    followed by a part computed at compile time (a macro argument), so only the prefix is known."""
+    literal = string_at(text, i)
+    if literal is not None:
+        value, end = literal
+        if value is None:
+            raise Unreadable("a byte, C or escaped string literal")
+        return "file", value, True, end
+    word, j = word_at(text, i)
+    if word != "concat":
+        raise Unreadable(f"an argument that is not a string literal or concat!: {text[i:i + 40]!r}")
+    j = skip_trivia(text, j)
+    k = skip_trivia(text, j + 1) if text.startswith("!", j) else -1
+    if k < 0 or k >= len(text) or text[k] not in "([{":
+        raise Unreadable("concat without its macro delimiter")
+    close = {"(": ")", "[": "]", "{": "}"}[text[k]]
+    base, parts, complete, p = "file", [], True, skip_trivia(text, k + 1)
+    while p < len(text) and text[p] != close:
+        start = p
+        literal = string_at(text, p)
+        if literal is not None and literal[0] is not None and complete:
+            parts.append(literal[0])
+            p = literal[1]
+        elif not parts and base == "file" and word_at(text, p)[0] == "env":
+            q = skip_trivia(text, word_at(text, p)[1])
+            q = skip_trivia(text, q + 1) if text.startswith("!", q) else -1
+            name = string_at(text, skip_trivia(text, q + 1)) if q >= 0 and q < len(text) and text[q] in "([{" else None
+            if name is None or name[0] != MANIFEST_DIR:
+                raise Unreadable("env! of a variable other than CARGO_MANIFEST_DIR")
+            base = MANIFEST_DIR
+            p = skip_trivia(text, name[1])
+            if p >= len(text) or text[p] not in ")]}":
+                raise Unreadable("env! with more than one argument")
+            p += 1
+        else:
+            if not parts:
+                raise Unreadable(f"concat! whose first part is computed: {text[p:p + 40]!r}")
+            complete = False
+            depth = 0
+            while p < len(text) and (depth or text[p] not in ",)]}"):
+                depth += text[p] in "([{"
+                depth -= text[p] in ")]}"
+                p += 1
+        p = skip_trivia(text, p)
+        if p < len(text) and text[p] == ",":
+            p = skip_trivia(text, p + 1)
+        if p == start:
+            raise Unreadable(f"concat! with an unbalanced delimiter: {text[p:p + 40]!r}")
+    if not parts:
+        raise Unreadable("concat! with no literal path part")
+    return base, "".join(parts), complete, p + 1
+
+
+def include_sites(text):
+    """[(line, base, path, complete)] for every include macro and path attribute in code, skipping comments, string
+    and character literals; an argument the scan cannot resolve is returned as (line, None, reason, False)."""
+    sites, i = [], 0
+    def site(start, at):
+        line = text.count("\n", 0, start) + 1
+        try:
+            base, path, complete, _ = include_argument(text, skip_trivia(text, at))
+            sites.append((line, base, path, complete))
+        except Unreadable as reason:
+            sites.append((line, None, str(reason), False))
+    while i < len(text):
+        ch = text[i]
+        if text.startswith("//", i) or text.startswith("/*", i):
+            i = skip_trivia(text, i)
+        elif ch == '"' or ((ch.isalpha() or ch == "_")
+                           and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
+            literal = string_at(text, i)
+            if literal is not None:
+                i = literal[1]
+                continue
+            word, j = word_at(text, i)
+            if word == "r" and text.startswith("#", j):
+                i = word_at(text, j + 1)[1]
+                continue
+            if word in INCLUDE_MACROS:
+                k = skip_trivia(text, j)
+                if text.startswith("!", k):
+                    m = skip_trivia(text, k + 1)
+                    if m < len(text) and text[m] in "([{":
+                        site(i, m + 1)
+            i = j if j > i else i + 1  # every step consumes input, so no edit here can hang the scan
+        elif ch == "'":
+            if text.startswith("\\", i + 1):
+                end = text.find("'", i + 3)
+                i = len(text) if end < 0 else end + 1
+            elif i + 2 < len(text) and text[i + 2] == "'":
+                i += 3
+            else:
+                i += 1
+        elif ch == "#":
+            j = skip_trivia(text, i + 1)
+            if text.startswith("!", j):
+                j = skip_trivia(text, j + 1)
+            if text.startswith("[", j):
+                k = skip_trivia(text, j + 1)
+                word, after = word_at(text, k)
+                m = skip_trivia(text, after)
+                if word == "path" and text.startswith("=", m):
+                    site(i, m + 1)
+                elif word == "cfg_attr" and text.startswith("(", m):
+                    # cfg_attr(<predicate>, <attr>, ...): a `path = ` among the attributes after the predicate.
+                    depth, p, segment = 0, m + 1, 0
+                    while p < len(text) and not (depth == 0 and text[p] == ")"):
+                        literal = string_at(text, p) if text[p] in '"rbc' else None
+                        if literal is not None:
+                            p = literal[1]
+                            continue
+                        if text[p] in "([{":
+                            depth += 1
+                        elif text[p] in ")]}":
+                            depth -= 1
+                        elif text[p] == "," and depth == 0:
+                            segment += 1
+                            q = skip_trivia(text, p + 1)
+                            name, after_name = word_at(text, q)
+                            r = skip_trivia(text, after_name)
+                            if segment >= 1 and name == "path" and text.startswith("=", r):
+                                site(i, r + 1)
+                        p += 1
+            i = j if j > i else i + 1
+        else:
+            i += 1
+    return sites
+
+
+def read_blobs(head, paths):
+    """{path: text} for paths at head, read in one git cat-file process."""
+    request = "".join(f"{head}:{path}\n" for path in paths).encode()
+    result = subprocess.run(["git", "cat-file", "--batch"], cwd=REPO, input=request, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise Full(f"include scan: git cat-file failed (rc {result.returncode})")
+    out, texts, pos = result.stdout, {}, 0
+    for path in paths:
+        header_end = out.index(b"\n", pos)
+        header = out[pos:header_end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise Full(f"include scan: cannot read {path} at {head}: {out[pos:header_end]!r}")
+        size = int(header[2])
+        texts[path] = out[header_end + 1:header_end + 1 + size].decode("utf-8", errors="replace")
+        pos = header_end + 1 + size + 1
+    return texts
+
+
+def load_manifests(head):
+    """Every directory under crates/ at head mapped to its package name, or None: one ls-tree and one cat-file, so
+    crate_of never runs git per directory."""
+    listing = git("ls-tree", "-r", "--name-only", head, "--", CRATES).splitlines()
+    manifests = {}
+    for path in listing:
+        parts = path.split("/")[:-1]
+        while len(parts) >= 2:
+            manifests.setdefault("/".join(parts), None)
+            parts.pop()
+    tomls = [p for p in listing if p.endswith("/Cargo.toml") and p.count("/") >= 2]
+    for path, text in read_blobs(head, tomls).items():
+        try:
+            package = tomllib.loads(text).get("package")
+        except tomllib.TOMLDecodeError as error:
+            raise Full(f"{path} does not parse: {error}") from error
+        if isinstance(package, dict) and isinstance(package.get("name"), str):
+            manifests[path.rsplit("/", 1)[0]] = package["name"]
+    return manifests
 
 
 def foreign_includes(head, manifests):
-    """{target path: [reader site]} for literal includes whose target lies under a different crate."""
+    """[(target, prefix, reader, site)] for every include whose target can lie under a crate other than the reader's.
+    target is an exact path (a file, or a directory a #[path] names); prefix is True when a compile-time part follows
+    the literal, so every path starting with target is named. Raises Full for any include in code it cannot read."""
     grep = subprocess.run(
-        ["git", "grep", "-n", "-I", "-E", "-e", INCLUDE_SITE, head, "--", "crates/*.rs"],
+        ["git", "grep", "-l", "-I", "-E", "-e", INCLUDE_SITE, head, "--", "crates/*.rs"],
         cwd=REPO, capture_output=True, text=True, check=False,
     )
     if grep.returncode not in (0, 1):
         raise Full(f"include scan: git grep failed (rc {grep.returncode}): {grep.stderr.strip()}")
-    sites, files, foreign = 0, set(), {}
-    for row in grep.stdout.splitlines():
-        _rev, path, line, text = row.split(":", 3)
-        for literal in (a or b for a, b in INCLUDE_LITERAL.findall(text)):
+    files = sorted({row.split(":", 1)[1] for row in grep.stdout.splitlines()})
+    sites, unreadable, named = 0, [], []
+    for path, text in read_blobs(head, files).items():
+        reader = owner_of(path, head, manifests)
+        for line, base, literal, complete in include_sites(text):
             sites += 1
-            files.add(path)
-            if literal.startswith("/") or "../" not in literal:
+            if base is None:
+                unreadable.append(f"{path}:{line} ({literal})")
                 continue
-            target = os.path.normpath(os.path.join(os.path.dirname(path), literal))
+            if base == MANIFEST_DIR:
+                if reader is None:
+                    unreadable.append(f"{path}:{line} (CARGO_MANIFEST_DIR outside any crate)")
+                    continue
+                root = next((d for d, n in sorted(manifests.items(), key=lambda kv: -len(kv[0]))
+                             if n == reader and path.startswith(d + "/")), None)
+                if root is None:
+                    unreadable.append(f"{path}:{line} (no manifest directory for {reader})")
+                    continue
+                joined = root + "/" + literal.lstrip("/")
+            else:
+                joined = os.path.join(os.path.dirname(path), literal)
+            target = os.path.normpath(joined) + ("/" if not complete and joined.endswith("/") else "")
             if target.startswith("../") or not target.startswith(CRATES):
                 continue
-            reader, owner = owner_of(path, head, manifests), owner_of(target, head, manifests)
-            if owner is not None and owner != reader:
-                foreign.setdefault(target, []).append(f"{reader} ({path}:{line})")
+            named.append((target, not complete, reader, f"{path}:{line}"))
     if sites == 0:
         raise Full(f"include scan: BROKEN, no #[path] or include! site found under crates/ at {head}")
-    log(f"include scan: {sites} sites in {len(files)} files, {len(foreign)} files named from another crate")
-    for target in sorted(foreign):
-        log(f"named from another crate: {target} <- {', '.join(foreign[target])}")
-    return foreign
+    # Population print: targets whose directory another crate owns. A prefix is printed by the owner of its directory;
+    # a changed path under it is still matched against the reader one by one (named_by_another_crate).
+    foreign = [n for n in named if owner_of(n[0], head, manifests) != n[2]]
+    log(f"include scan: {sites} sites in {len(files)} files, {len(unreadable)} unreadable, "
+        f"{len(foreign)} naming a path outside the reader's crate")
+    for target, prefix, reader, site in sorted(foreign):
+        log(f"named from another crate: {target}{'*' if prefix else ''} <- {reader} ({site})")
+    if unreadable:
+        raise Full(f"include scan: cannot resolve {len(unreadable)} include(s) in code: {'; '.join(unreadable[:10])}")
+    return named
+
+
+def named_by_another_crate(path, crate, named):
+    """The readers in another crate that name path, exactly, as a directory a #[path] names, or by prefix."""
+    hits = []
+    for target, prefix, reader, site in named:
+        if reader == crate:
+            continue
+        if path == target or path.startswith(target.rstrip("/") + "/") or (prefix and path.startswith(target)):
+            hits.append(f"{reader} ({site})")
+    return hits
 
 
 def owner_of(path, head, manifests):
@@ -382,17 +649,18 @@ def classify(base, head, binary, paths_only=False):
             check_markdown(path, head, targets)
     if not crate_paths:
         raise Full("no crate source changed")
-    manifests = {}
+    manifests = load_manifests(head)
     changed = set()
     for path in crate_paths:
         crate = crate_of(path, head, manifests)
         log(f"changed: {path} -> {crate}")
         changed.add(crate)
     log(f"changed crates: {' '.join(sorted(changed))}")
-    foreign = foreign_includes(head, manifests)
+    named = foreign_includes(head, manifests)
     for path in crate_paths:
-        if path in foreign:
-            raise Full(f"{path} is compiled or read by another crate: {', '.join(foreign[path])}")
+        readers = named_by_another_crate(path, crate_of(path, head, manifests), named)
+        if readers:
+            raise Full(f"{path} is compiled or read by another crate: {', '.join(readers)}")
     if paths_only:
         return None
 

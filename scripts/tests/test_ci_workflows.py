@@ -2955,6 +2955,20 @@ class ScopeFixture(unittest.TestCase):
         "crates/j/src/census.rs": "pub const S: &str = include_str!(\"../../m/src/table.txt\");\n",
         # an include inside its own crate is not a foreign reader
         "crates/k/tests/own.rs": "#[path = \"../src/lib.rs\"]\nmod own;\n",
+        # j reads files of m through each argument form the scan resolves: a literal on the line after the opener,
+        # a raw string, concat! led by the manifest directory, and a literal prefix with a computed tail (a partial
+        # file name, so only the prefix rule can match it).
+        "crates/m/src/multi.txt": "rows\n",
+        "crates/j/src/multi.rs": "pub const M: &str = include_str!(\n    \"../../m/src/multi.txt\"\n);\n",
+        "crates/m/src/raw.txt": "rows\n",
+        "crates/j/src/raw.rs": "pub const R: &str = include_str!(r#\"../../m/src/raw.txt\"#);\n",
+        "crates/m/src/env.txt": "rows\n",
+        "crates/j/tests/env.rs": "const E: &str = include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/src/env.txt\"));\n",
+        "crates/m/sql/q.sql": "select 1;\n",
+        "crates/j/src/prefix.rs": "macro_rules! q {\n    ($n:literal) => {\n        include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/sql/q\", $n, \".sql\"))\n    };\n}\n",
+        # the same names inside a string literal and comments are not include sites
+        "crates/m/src/ghost.txt": "rows\n",
+        "crates/k/src/fixture.rs": "pub const F: &str = \"include_str!(\\\"../../m/src/ghost.txt\\\")\";\n// include!(\"../../m/src/ghost.txt\")\n/* #[path = \"../../m/src/ghost.txt\"] */\n",
         "crates/.cargo/config.toml": "[build]\n",
         "crates/.config/nextest.toml": "[profile.default]\n",
         "crates/rust-toolchain.toml": "[toolchain]\n",
@@ -2975,7 +2989,14 @@ class ScopeFixture(unittest.TestCase):
     # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
     CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
                     "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs",
-                    "crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs"}
+                    "crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                    "crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/j/src/multi.rs",
+                    "crates/m/src/multi.txt", "crates/j/src/raw.rs", "crates/m/src/raw.txt", "crates/j/tests/env.rs",
+                    "crates/m/src/env.txt", "crates/j/src/prefix.rs", "crates/m/sql/q.sql", "crates/m/src/ghost.txt",
+                    "crates/k/src/fixture.rs"}
+    # Crate source that a reader in another crate names: the path rules admit it, the include scan sends it to full.
+    NAMED_ELSEWHERE = {"crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/m/src/multi.txt",
+                       "crates/m/src/raw.txt", "crates/m/src/env.txt", "crates/m/sql/q.sql"}
     # j depends on k, and k on ksub.
     GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
              "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
@@ -3056,7 +3077,8 @@ class TestScopeClassifierTests(ScopeFixture):
         for path in sorted(self.TREE):
             with self.subTest(path=path):
                 verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
-                self.assertEqual(verdict, "map" if path in self.CRATE_SOURCE else "full", reasons)
+                admitted = path in self.CRATE_SOURCE and path not in self.NAMED_ELSEWHERE
+                self.assertEqual(verdict, "map" if admitted else "full", reasons)
         self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
 
     def test_a_full_suite_path_never_reaches_the_binary(self):
@@ -3132,7 +3154,11 @@ class TestScopeClassifierTests(ScopeFixture):
     def test_a_file_another_crate_includes_runs_the_full_suite(self):
         # The closure of k (or m) never reaches m (or j): only the include names the file.
         for path, reader in (("crates/k/src/shared.rs", "m (crates/m/tests/reader.rs:1)"),
-                             ("crates/m/src/table.txt", "j (crates/j/src/census.rs:1)")):
+                             ("crates/m/src/table.txt", "j (crates/j/src/census.rs:1)"),
+                             ("crates/m/src/multi.txt", "j (crates/j/src/multi.rs:1)"),
+                             ("crates/m/src/raw.txt", "j (crates/j/src/raw.rs:1)"),
+                             ("crates/m/src/env.txt", "j (crates/j/tests/env.rs:1)"),
+                             ("crates/m/sql/q.sql", "j (crates/j/src/prefix.rs:3)")):
             for mode in (("--paths-only",), ()):
                 with self.subTest(path=path, mode=mode):
                     verdict, reasons = self.scope(self.base, self.change(path), *mode)
@@ -3144,11 +3170,26 @@ class TestScopeClassifierTests(ScopeFixture):
     def test_the_include_scan_prints_its_population_and_skips_same_crate_includes(self):
         verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
         self.assertEqual(verdict, "j k", reasons)
-        self.assertIn("include scan: 3 sites in 3 files, 2 files named from another crate", reasons)
+        self.assertIn("include scan: 7 sites in 8 files, 0 unreadable, 6 naming a path outside the reader's crate", reasons)
         self.assertIn("named from another crate: crates/k/src/shared.rs <- m (crates/m/tests/reader.rs:1)", reasons)
+        self.assertIn("named from another crate: crates/m/sql/q* <- j (crates/j/src/prefix.rs:3)", reasons)
+
+    def test_includes_in_comments_and_string_literals_are_not_sites(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/ghost.txt"), "--paths-only")
+        self.assertEqual(verdict, "map", reasons)
+        self.assertNotIn("ghost.txt <-", reasons)
+
+    def test_an_include_the_scan_cannot_resolve_runs_the_full_suite(self):
+        self.write("crates/j/src/bad.rs", "pub const B: &str = include_str!(chosen_path());\n")
+        unresolved = self.commit("computed include")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(unresolved, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: cannot resolve 1 include(s) in code: crates/j/src/bad.rs:1", reasons)
 
     def test_an_include_scan_that_finds_nothing_runs_the_full_suite(self):
-        for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs"):
+        for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                     "crates/j/src/multi.rs", "crates/j/src/raw.rs", "crates/j/tests/env.rs", "crates/j/src/prefix.rs"):
             (self.repo / path).unlink()
         stripped = self.commit("no include sites")
         self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
