@@ -7,10 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Writer contention diagnostics now report per-pool FIFO admission depth, its
+  high-water mark, capacity rejections and bounded lifetime duration histograms.
+  Snapshots identify the FIFO stage and report unavailable call/rotation metrics
+  explicitly. Reading them never starts a writer or changes admission routing.
+- `db_diagnostics` reports a process-wide `code_map_vfs` block: `quarantine_occupancy`,
+  `quarantine_cap`, `registrations` and `registration_cap`, each read under its ledger's
+  lock without retiring entries. The block is observe-only and has no stability contract.
+- Add the CLI operator `kg.proposal_cleanup(older_than="30d")` to archive old
+  applied and rejected proposals in the selected namespace. The duration uses
+  positive whole seconds, minutes, hours or days, and retention follows the last
+  projection activity. Ordinary lists hide archived proposals; proposal identity,
+  lookups, parent references and lifecycle event history remain available.
+  The operator follows normal write policy and is unavailable through MCP or
+  multi-operation atomic requests. Migration V58 follows V57 from #5185.
+- `khive_query::compile_with_mailbox` compiles a GQL or SPARQL query with a caller-derived
+  `QueryMailboxScope`, filtering every note source, synthetic observation target and graph
+  edge in the compiled SQL by the note store's mailbox rule. `khive_query::compile` keeps
+  its unscoped behavior for callers that supply no scope.
+
 ### Fixed
 
 - `neighbors` now declares its `include_entity_type` parameter, so `verbs()` and `help` list
   it. The handler already accepted it; only the declaration was missing.
+- `query` now applies the caller's mailbox view inside the compiled SQL, before matching,
+  ordering and pagination, as `get`, `search`, `list`, `neighbors` and `context` already
+  did, so another actor's message copies and quarantine records can no longer be read
+  through a query. An edge whose endpoint is a hidden message is dropped.
+
+### Breaking (Rust crates)
+
+- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
+  `writer_admission_unavailable_reason`. Direct struct literals must set them.
+- `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
 
 ## [0.14.0] - 2026-10-18
 
