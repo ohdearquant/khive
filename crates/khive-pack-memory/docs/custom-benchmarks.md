@@ -72,6 +72,14 @@ IDs. Missing half of those IDs scores 0.5; unrelated IDs score zero. A strategy'
 mean overlap is measured, not assumed to clear a production quality threshold.
 These results cannot establish a production tuning default.
 
+The `df-*` benchmark selectors exclude zero-frequency terms, including words
+removed by FTS query sanitization such as `and`. If all matching terms exceed a
+selector's frequency cutoff, it keeps the rarest matching term. This preserves
+the nonempty, bounded-result check for the generated cohort. Frequencies come
+from the actual trigram index: `rare1` also matches `rare10` through `rare19`, so
+its frequency exceeds that of a single rare-token band. Untimed controls cover
+both the cutoff and fallback when a zero-frequency term is present.
+
 A successfully measured p95 row emits one `BENCH-JSON` line with the same ID as
 its listing, `statistic: "p95_ns"`, a finite value, and `n: 200`. Values come from
 actual individual calls, recorded at microsecond resolution and converted to

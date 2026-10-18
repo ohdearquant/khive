@@ -47,8 +47,8 @@ enum Strategy {
 enum Selector {
     /// Keep every term (= production baseline).
     All,
-    /// Drop terms whose document frequency exceeds `frac` of the corpus
-    /// (near-zero-IDF stopwords). Always keeps ≥1 term (the rarest).
+    /// Keep matching terms whose document frequency is at most `frac` of the
+    /// corpus, falling back to the rarest matching term when all exceed it.
     PruneDfFrac(f64),
     /// Keep the `k` highest-IDF (lowest-DF) terms, original order.
     TopIdf(usize),
@@ -158,18 +158,19 @@ fn select(sel: Selector, q: &Query, doc_count: u64) -> Vec<String> {
                 .terms
                 .iter()
                 .zip(q.dfs.iter())
-                .filter(|(_, &df)| df <= threshold)
+                .filter(|(_, &df)| df > 0 && df <= threshold)
                 .map(|(t, _)| t.clone())
                 .collect();
             if kept.is_empty() {
-                // All terms are common — keep the single rarest so the query is non-empty.
+                // Zero DF may mean a removed FTS operator (e.g. "and"), not a rare match.
                 let min_idx = q
                     .dfs
                     .iter()
                     .enumerate()
+                    .filter(|(_, &df)| df > 0)
                     .min_by_key(|(_, &df)| df)
                     .map(|(i, _)| i)
-                    .unwrap_or(0);
+                    .expect("DF pruning requires at least one matching term");
                 vec![q.terms[min_idx].clone()]
             } else {
                 kept
@@ -340,7 +341,11 @@ async fn quality(
     let mut total = 0.0;
     for (i, query) in terms.iter().enumerate() {
         let hits = run(searcher, strategy, query).await;
-        assert!(!hits.is_empty() && hits.len() <= CANDIDATE_LIMIT as usize);
+        assert!(
+            !hits.is_empty() && hits.len() <= CANDIDATE_LIMIT as usize,
+            "query {i} selected {query:?}: {} hits",
+            hits.len()
+        );
         let candidate = hits.iter().take(10).map(|h| h.subject_id).collect();
         total += recall_of(&inputs.reference[i], &candidate);
     }
@@ -348,6 +353,17 @@ async fn quality(
 }
 
 fn quality_controls(inputs: &Inputs) {
+    // An unsearchable term must not defeat either the cutoff or its fallback.
+    for (rare, df, expected) in [("rare0", 64, "rare0"), ("rare1", 704, "rust")] {
+        let query = Query {
+            terms: vec!["and".into(), "rust".into(), rare.into()],
+            dfs: vec![0, 256, df],
+        };
+        assert_eq!(
+            select(Selector::PruneDfFrac(0.10), &query, DOCUMENTS as u64),
+            [expected]
+        );
+    }
     // A proper subset and unrelated UUIDs must not receive perfect quality.
     // These controls use an independently captured baseline, never a candidate
     // set as its own oracle.
