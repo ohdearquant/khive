@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Producer-agnostic KG change-set op-list model and NDJSON-delta serialization"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
@@ -32,3 +35,15 @@ thiserror = { workspace = true }
 # dev-dependencies too, since the test suite itself must run there. "std" is
 # proptest's core, non-platform-specific mode.
 proptest = { version = "1", default-features = false, features = ["std"] }
+
+# Keep Criterion's native benchmark dependencies out of the WASM test graph.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "ndjson_codec"
+harness = false
+
+[[bench]]
+name = "invert"
+harness = false
