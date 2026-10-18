@@ -8,7 +8,7 @@ stored namespace. Their read view additionally follows the caller's mailbox.
 ## Caller and message copies
 
 `KhiveRuntime::authorize_mailbox_view` receives the dispatch-authorized caller token, verb
-and original arguments. `get`, `search`, `list`, `neighbors` and `context` use the caller's
+and original arguments. `get`, `search`, `list`, `neighbors`, `context` and `query` use the caller's
 own view and have no cross-actor selector. Changing a namespace or knowing a full UUID
 does not select another actor's messages. Delegated mailbox selection belongs to the
 separately authorized comm read methods.
@@ -18,6 +18,20 @@ accepts inbound copies whose `to_actor` matches the view and outbound copies who
 `from_actor` matches it. Only the non-delegated anonymous `local` caller retains the
 documented legacy unattributed local pool. Named actors do not inherit that pool.
 `MailboxView::note_scope` expresses the same partition for store-side filtering.
+
+GQL and SPARQL queries apply that partition inside their compiled SQL, before
+matching, projection, ordering and pagination. Both granular message matches and
+broad note matches exclude other actors' message copies, including quarantine
+content and references. Ordinary notes retain their existing query behavior.
+Synthetic observation targets and graph edges use the same message view; a
+recursive path cannot pass through a hidden message. A hidden message does not
+consume page capacity or cause a continuation flag.
+
+The public runtime `query` and `query_with_metadata` methods also derive their
+own-mailbox scope from the supplied token. Compiler options and query text cannot
+select another actor. The compiler itself only constructs SQL from an explicitly
+provided scope; it does not authenticate callers. Query remains a single-backend
+operation and does not search other configured note stores.
 
 Generic `get` returns not found for an unreadable message copy or a direct edge reference
 to one. Its annotations exclude unreadable messages. Note searches apply the view even

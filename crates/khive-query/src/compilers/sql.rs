@@ -5,6 +5,10 @@ use crate::error::QueryError;
 use crate::language::read_only_error;
 use crate::validate::{validate_with_warnings, MAX_DEPTH, SYNTHETIC_RELATIONS};
 
+#[path = "mailbox.rs"]
+mod mailbox;
+use mailbox::MailboxLowering;
+
 fn is_synthetic(rel: &str) -> bool {
     SYNTHETIC_RELATIONS.contains(&rel)
 }
@@ -20,7 +24,11 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
 }
 
 /// Substrate-agnostic source for canonical edge endpoints (issue #467).
-const PRIMARY_NODE_SQL: &str = "\
+fn primary_node_sql(mailbox: Option<&MailboxLowering>) -> String {
+    let note_filter = mailbox.map_or_else(String::new, |scope| scope.note_filter("notes"));
+    let edge_filter = mailbox.map_or_else(String::new, |scope| scope.edge_filter("graph_edges"));
+    format!(
+        "\
     SELECT id, namespace, kind, entity_type, name, description, NULL AS content, \
            NULL AS status, NULL AS salience, NULL AS decay_factor, properties, \
            created_at, updated_at, deleted_at, 'entity' AS substrate_kind \
@@ -29,7 +37,7 @@ const PRIMARY_NODE_SQL: &str = "\
     SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
            content, status, salience, decay_factor, properties, \
            created_at, updated_at, deleted_at, 'note' AS substrate_kind \
-      FROM notes \
+      FROM notes{note_filter} \
     UNION ALL \
     SELECT id, namespace, kind, NULL AS entity_type, verb AS name, \
            NULL AS description, NULL AS content, NULL AS status, \
@@ -42,14 +50,19 @@ const PRIMARY_NODE_SQL: &str = "\
            NULL AS description, NULL AS content, NULL AS status, \
            NULL AS salience, NULL AS decay_factor, metadata AS properties, \
            created_at, updated_at, deleted_at, 'edge' AS substrate_kind \
-      FROM graph_edges";
+      FROM graph_edges{edge_filter}"
+    )
+}
 
-fn primary_node_source(alias: &str) -> String {
-    format!("({PRIMARY_NODE_SQL}) {alias}")
+fn primary_node_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    format!("({}) {alias}", primary_node_sql(mailbox))
 }
 
 /// Entity/note referent source for synthetic observation targets (issue #468).
-const OBSERVATION_TARGET_SQL: &str = "\
+fn observation_target_sql(mailbox: Option<&MailboxLowering>) -> String {
+    let note_filter = mailbox.map_or_else(String::new, |scope| scope.note_filter("notes"));
+    format!(
+        "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \
            NULL AS decay_factor, properties, created_at, updated_at, \
@@ -59,10 +72,22 @@ const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
            content, status, salience, decay_factor, properties, \
            created_at, updated_at, deleted_at, 'note' AS referent_kind \
-      FROM notes";
+      FROM notes{note_filter}"
+    )
+}
 
-fn observation_target_source(alias: &str) -> String {
-    format!("({OBSERVATION_TARGET_SQL}) {alias}")
+fn observation_target_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    format!("({}) {alias}", observation_target_sql(mailbox))
+}
+
+fn edge_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    match mailbox {
+        Some(scope) => format!(
+            "(SELECT * FROM graph_edges{}) {alias}",
+            scope.edge_filter("graph_edges")
+        ),
+        None => format!("graph_edges {alias}"),
+    }
 }
 
 /// Quotes one SQL identifier while preserving the returned column name.
@@ -94,6 +119,18 @@ pub struct TruncationCheck {
     pub max_limit: usize,
     /// Explicit caller limit, retained for diagnostics.
     pub requested_limit: Option<usize>,
+}
+
+/// Caller-derived mailbox partition applied by [`compile_with_mailbox`].
+///
+/// The compiler does not authenticate this scope. The runtime must derive it
+/// from its authorized caller, never from query text or query arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMailboxScope {
+    /// Exact caller actor label; SQL always binds it as a text parameter.
+    pub actor_id: String,
+    /// Whether the anonymous, non-delegated local caller may see legacy rows.
+    pub legacy_local: bool,
 }
 
 /// Runtime options injected by the caller to scope and cap query execution.
@@ -165,6 +202,30 @@ fn effective_limit(
 /// a projection cannot be lowered, or a bound limit/value is invalid.
 /// See `crates/khive-query/docs/api/sql-compilation.md` for compilation paths.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
+    compile_scoped(query, opts, None)
+}
+
+/// Compiles under a caller-derived message partition before matching and paging.
+///
+/// This is a pure lowering API, not an authorization or actor-resolution boundary.
+/// Namespace filtering and all other [`compile`] behavior remain unchanged.
+///
+/// # Errors
+///
+/// Returns the same validation and lowering errors as [`compile`].
+pub fn compile_with_mailbox(
+    query: &GqlQuery,
+    opts: &CompileOptions,
+    mailbox: &QueryMailboxScope,
+) -> Result<CompiledQuery, QueryError> {
+    compile_scoped(query, opts, Some(mailbox))
+}
+
+fn compile_scoped(
+    query: &GqlQuery,
+    opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
+) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
         return Err(QueryError::Compile("empty pattern".into()));
     }
@@ -173,9 +234,9 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     let warnings = validate_with_warnings(&mut query)?;
 
     let mut compiled = if query.pattern.has_variable_length() {
-        compile_variable_length(&query, opts)?
+        compile_variable_length(&query, opts, mailbox)?
     } else {
-        compile_fixed_length(&query, opts)?
+        compile_fixed_length(&query, opts, mailbox)?
     };
     compiled.warnings.extend(warnings);
 
@@ -324,8 +385,11 @@ fn synthetic_endpoint_node_indices(
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
 ) -> Result<CompiledQuery, QueryError> {
     let mut params: Vec<QueryValue> = Vec::new();
+    let mailbox = mailbox.map(|scope| MailboxLowering::bind(scope, &mut params));
+    let mailbox = mailbox.as_ref();
     let mut from_parts: Vec<String> = Vec::new();
     let mut join_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
@@ -369,7 +433,7 @@ fn compile_fixed_length(
                     if is_event_source {
                         from_parts.push(format!("events {alias}"));
                     } else if !is_observation_target {
-                        from_parts.push(primary_node_source(&alias));
+                        from_parts.push(primary_node_source(&alias, mailbox));
                     }
                 }
 
@@ -528,7 +592,7 @@ fn compile_fixed_length(
                     join_parts.push(format!(
                         "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
                          AND {next_alias}.referent_kind = {e_alias}.referent_kind",
-                        observation_target_source(&next_alias)
+                        observation_target_source(&next_alias, mailbox)
                     ));
                     // Enforce the ADR-041 role/substrate matrix.
                     where_parts.push(format!(
@@ -564,7 +628,8 @@ fn compile_fixed_length(
                     };
 
                     join_parts.push(format!(
-                        "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
+                        "JOIN {} ON {source_join} AND {e_alias}.deleted_at IS NULL",
+                        edge_source(&e_alias, mailbox)
                     ));
 
                     let ens_filter = namespace_filter(&e_alias, opts, &mut params);
@@ -574,7 +639,7 @@ fn compile_fixed_length(
 
                     join_parts.push(format!(
                         "JOIN {} ON {next_alias}.id = {next_join_col}",
-                        primary_node_source(&next_alias)
+                        primary_node_source(&next_alias, mailbox)
                     ));
 
                     if !ep.relations.is_empty() {
@@ -1061,8 +1126,11 @@ fn compile_variable_length_where_to_sql(
 fn compile_variable_length(
     query: &GqlQuery,
     opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
 ) -> Result<CompiledQuery, QueryError> {
     let mut params: Vec<QueryValue> = Vec::new();
+    let mailbox = mailbox.map(|scope| MailboxLowering::bind(scope, &mut params));
+    let mailbox = mailbox.as_ref();
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
@@ -1364,7 +1432,7 @@ fn compile_variable_length(
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
                     e.id, e.relation, e.weight \
              FROM primary_nodes s \
-             JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+             JOIN {edges} ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              JOIN primary_nodes next_node ON next_node.id = ({seed_next}) \
                     AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE {start_where} \
@@ -1373,7 +1441,7 @@ fn compile_variable_length(
                     t.path || ',' || {recurse_next}, \
                     t.total_weight + e.weight, \
                     e.id, e.relation, e.weight \
-             FROM traverse t CROSS JOIN graph_edges e \
+             FROM traverse t CROSS JOIN {edges} \
                  ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
                     AND next_node.deleted_at IS NULL{next_node_ns_and} \
@@ -1386,7 +1454,8 @@ fn compile_variable_length(
          WHERE {end_where} \
          ORDER BY {depth_alias}, {total_weight_alias} DESC{projection_order_suffix} \
          LIMIT ?{limit_param} OFFSET ?{offset_param}",
-        primary_nodes = PRIMARY_NODE_SQL,
+        primary_nodes = primary_node_sql(mailbox),
+        edges = edge_source("e", mailbox),
         seed_next = seed_next,
         seed_join = seed_join,
         e_ns_filter = e_ns_filter,
