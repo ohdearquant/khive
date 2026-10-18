@@ -12,7 +12,7 @@ use rusqlite::ffi;
 
 use super::{callbacks, CodeMapHandleGuard, GuardError, Mode, OpenAccess, ProductionKind, Role};
 
-const REGISTRATION_CAP: usize = 512;
+pub(super) const REGISTRATION_CAP: usize = 512;
 
 #[derive(Hash, PartialEq, Eq)]
 struct RollbackKey {
@@ -155,7 +155,6 @@ pub(super) fn take_refusal(name: &str) -> Option<String> {
     guard.take_refusal()
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(super) fn registration_count() -> usize {
     registrations()
         .lock()

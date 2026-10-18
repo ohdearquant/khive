@@ -70,6 +70,50 @@ fn open_code_map(
     )
 }
 
+#[tokio::test]
+async fn diagnostics_reports_process_vfs_counts() {
+    if run_in_child() {
+        return;
+    }
+    let pool = Arc::new(crate::ConnectionPool::new(crate::PoolConfig::for_test()).unwrap());
+    let before = vfs::registration_count();
+    let report = crate::diagnostics::collect_with_audit_append_failures_interruptibly(
+        Arc::clone(&pool),
+        crate::diagnostics::BuildIdentity::from_env("test", None),
+        std::time::Duration::from_secs(30),
+        0,
+    )
+    .await
+    .unwrap();
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(
+        json["code_map_vfs"],
+        serde_json::json!({
+            "quarantine_occupancy": 0,
+            "quarantine_cap": super::QUARANTINE_CAP,
+            "registrations": before,
+            "registration_cap": vfs::REGISTRATION_CAP,
+        })
+    );
+    assert_eq!(vfs::registration_count(), before);
+
+    let dir = fixture();
+    let _backend = open_code_map(dir.path().join("code-map.db"), &[], &[]).unwrap();
+    let observed = vfs::registration_count();
+    assert!(observed > before);
+    let report = crate::diagnostics::collect_with_audit_append_failures_interruptibly(
+        pool,
+        crate::diagnostics::BuildIdentity::from_env("test", None),
+        std::time::Duration::from_secs(30),
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.code_map_vfs.registrations, observed);
+    assert_eq!(vfs::registration_count(), observed);
+    assert_eq!(report.code_map_vfs.quarantine_occupancy, 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_production_parent_alias_is_sampled() {
@@ -577,6 +621,7 @@ fn quarantine_cap_refuses_before_another_native_open() {
         return;
     }
     let dir = fixture();
+    let diagnostic_pool = crate::ConnectionPool::new(crate::PoolConfig::for_test()).unwrap();
     let production = dir.path().join("production.db");
     let target = dir.path().join("code-map.db");
     seed_rollback(&production);
@@ -603,6 +648,14 @@ fn quarantine_cap_refuses_before_another_native_open() {
             matches!(&error, GuardError::ProtectedAlias { .. }),
             "{error}"
         );
+        assert_eq!(super::quarantine_occupancy(), count);
+        let report = crate::diagnostics::collect(
+            &diagnostic_pool,
+            crate::diagnostics::BuildIdentity::from_env("test", None),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(report.code_map_vfs.quarantine_occupancy, count);
+        assert_eq!(report.code_map_vfs.quarantine_cap, super::QUARANTINE_CAP);
         assert_eq!(super::quarantine_occupancy(), count);
     }
     let opened = Arc::new(AtomicBool::new(false));

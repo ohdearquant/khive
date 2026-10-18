@@ -32,6 +32,25 @@ fn count_verb_help_explains_edge_count_scopes_and_ledger_delta() {
     }
 }
 
+#[test]
+fn diagnostics_help_qualifies_process_vfs_counters() {
+    let description = find_handler("db_diagnostics").description;
+    for required in [
+        "code_map_vfs",
+        "process-wide",
+        "quarantine_occupancy",
+        "quarantine_cap",
+        "registrations",
+        "registration_cap",
+        "sampled independently",
+        "observe-only",
+        "no stability contract",
+        "may change",
+    ] {
+        assert!(description.contains(required), "missing {required:?}");
+    }
+}
+
 /// `link`'s id params resolve through `resolve_uuid_unfiltered`, which passes no
 /// namespace predicate at all (`KhiveRuntime::resolve_prefix_unfiltered` ->
 /// `resolve_prefix_inner(None, ..)`). Their help text said the lookup searched "every
