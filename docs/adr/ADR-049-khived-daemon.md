@@ -1327,7 +1327,7 @@ interrupts a `COMMIT` that is already executing.
 ### Events daemon
 
 The main daemon already supervises a separate events daemon. `supervise_events_daemon`
-(`crates/khive-runtime/src/events_split.rs`) spawns the events-daemon subcommand when its socket
+(`crates/khive-runtime/src/events_split/daemon.rs`) spawns the events-daemon subcommand when its socket
 is unreachable, reaps an exited child on every probe so it never accumulates a zombie, and, on
 the main daemon's own shutdown, sends SIGKILL to exactly the child it spawned (`Child::kill`) and
 reaps it; a pre-existing events daemon it did not spawn is left running untouched. The code's own reasoning for the

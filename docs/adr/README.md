@@ -233,6 +233,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-203](ADR-203-khive-apps-on-the-base.md)                            | khive Apps on the Base: Manifest, Lifecycle Verbs, Store Classes, Registration and Supervision             |
 | [ADR-204](ADR-204-automatic-freelist-reclamation.md)                    | Automatic freelist reclamation with incremental auto-vacuum                                                |
 | [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)                 | Dependency-Scoped Pull-Request CI from the Code Map                                                        |
+| [ADR-206](ADR-206-crate-performance-guarantees.md)                      | Crate Performance Guarantees                                                                               |
 
 <!-- END GENERATED ADR CATALOG -->
 

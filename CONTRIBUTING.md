@@ -55,17 +55,17 @@ than depend on the operator's home directory.
 
 Individual targets: `make check`, `make clippy`, `make test`, `make fmt`.
 
+A pull request that changes only crate source under `crates/` and Markdown runs its build, test and
+clippy phases for the crates it changed and every crate that depends on them, and skips the coverage
+jobs; `CI gate` reports the scope it took. The dependents come from the workspace's own code map, and
+`scripts/ci-test-scope.py` states the rules. A change to a workflow, a CI script (including
+`scripts/ci.sh`), a `Cargo.toml` or `Cargo.lock`, cargo and toolchain configuration, or any path
+outside crate source runs the full suite, and so does every push to `main`.
+
 Pull requests from this repository's own `codex/` branches are built and tested on a dedicated host
-before review, and reach `main` only through an `integration/**` branch whose push run executes
-every CI job on the merged tree. When such a pull request changes only crate source under `crates/`
-and Markdown, its own run keeps the classification, secret scan, data-leak, documentation and
-marketplace checks and skips the build and test jobs; `CI gate` reports which lane it took. The
-optional benchmark and audit workflows skip every pull request from those branches and run on the
-integration push instead (the benchmark trend workflow on `main`). A change to a workflow, a CI
-script (including `scripts/ci.sh`), a `Cargo.toml` or `Cargo.lock`, or cargo and toolchain
-configuration keeps the full suite on the pull request itself; the rule is in
-`scripts/ci-integration-only.sh`. Pull requests from forks and from other branches always run the
-full suite.
+before review, and reach `main` through an `integration/**` branch whose push run executes every CI
+job on the merged tree. The optional benchmark and audit workflows skip every pull request from those
+branches and run on the integration push instead (the benchmark trend workflow on `main`).
 
 ## Pull Request Workflow
 

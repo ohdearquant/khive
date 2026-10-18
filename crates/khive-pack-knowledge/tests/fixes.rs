@@ -142,7 +142,10 @@ mod embed_failure_tests {
             _texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-            Ok(vec![vec![1.0_f32; 4]])
+            Ok(vec![vec![
+                1.0_f32;
+                EmbeddingModel::AllMiniLmL6V2.dimensions()
+            ]])
         }
 
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -163,7 +166,7 @@ mod embed_failure_tests {
         }
 
         fn dimensions(&self) -> usize {
-            4
+            EmbeddingModel::AllMiniLmL6V2.dimensions()
         }
 
         async fn build(
@@ -204,7 +207,7 @@ mod embed_failure_tests {
         }
 
         fn dimensions(&self) -> usize {
-            4
+            EmbeddingModel::AllMiniLmL6V2.dimensions()
         }
 
         async fn build(
@@ -246,8 +249,11 @@ mod embed_failure_tests {
             ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
-        // Override the lattice provider with our fake — same key, last-writer wins.
-        rt.register_embedder(fake);
+        // Override the lattice provider with our fake under the same key. A fake
+        // whose dimensions differ from the built-in's is refused, so fail here
+        // rather than let the built-in serve the test.
+        rt.try_register_embedder(fake)
+            .expect("fake provider must replace the built-in under the same key");
         rt
     }
 

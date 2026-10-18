@@ -433,6 +433,8 @@ if query_files:
         # their bodies. Keep this stub out of the DDL validation connections.
         con.create_function("khive_tag_contains", 2, lambda tags, marker: None,
                             deterministic=True)
+        con.create_function("code_name_score", 2, lambda name, query: None,
+                            deterministic=True)
         for path in chain:
             with open(path) as fh:
                 try:

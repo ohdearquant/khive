@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use lattice_embed::{
@@ -445,6 +445,8 @@ impl Clone for EmbedderEntry {
 pub struct EmbedderRegistry {
     entries: HashMap<String, EmbedderEntry>,
     ordered_names: Vec<String>,
+    bound_engines: Option<Vec<crate::engine_config::EngineConfig>>,
+    initialization: Arc<Mutex<()>>,
 }
 
 impl EmbedderRegistry {
@@ -453,14 +455,16 @@ impl EmbedderRegistry {
         Self {
             entries: HashMap::new(),
             ordered_names: Vec::new(),
+            bound_engines: None,
+            initialization: Arc::new(Mutex::new(())),
         }
     }
 
     /// Register a provider, preserving its position for later name enumeration.
     ///
-    /// Before a provider is selected for resolution, registration with the same
-    /// name replaces it in place. Once selected, duplicate registration returns
-    /// an error and leaves the serving provider unchanged.
+    /// Before a provider is configured-bound or selected for resolution,
+    /// registration with the same name replaces it in place. Afterwards,
+    /// duplicate registration leaves the bound or serving provider unchanged.
     pub fn register<P: EmbedderProvider + 'static>(&mut self, provider: P) -> RuntimeResult<()> {
         self.insert(provider, false)
     }
@@ -485,12 +489,71 @@ impl EmbedderRegistry {
             .expect("test audited provider names must be unique");
     }
 
+    /// Test-only replacement of a provider whose name is already bound.
+    ///
+    /// A test that builds its host through the production startup path finds
+    /// the configured names bound before it can register a deterministic
+    /// backend, and [`Self::register`] refuses a bound name. This swaps the
+    /// provider under such a name and leaves the bound engine list unchanged.
+    /// It refuses a name that is not bound, a provider that is already
+    /// serving, and dimensions that differ from the bound provider's.
+    #[cfg(feature = "test-internals")]
+    pub fn replace_bound_for_test<P: EmbedderProvider + 'static>(
+        &mut self,
+        provider: P,
+    ) -> RuntimeResult<()> {
+        let name = provider.name().to_owned();
+        if !self
+            .bound_engines
+            .as_ref()
+            .is_some_and(|engines| engines.iter().any(|engine| engine.name == name))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is not bound to configured engines"
+            )));
+        }
+        let bound = self.entries.get(&name).ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("embedding provider `{name}` is not registered"))
+        })?;
+        if bound.serving.load(Ordering::Acquire) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is already serving"
+            )));
+        }
+        let expected = bound.provider.dimensions();
+        if provider.dimensions() != expected {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` has dimensions {}, but the bound provider has {expected}",
+                provider.dimensions()
+            )));
+        }
+        self.entries.insert(
+            name,
+            EmbedderEntry {
+                provider: Arc::new(provider),
+                cell: Arc::new(OnceCell::new()),
+                serving: Arc::new(AtomicBool::new(false)),
+                audited_document_preparation: false,
+            },
+        );
+        Ok(())
+    }
+
     fn insert<P: EmbedderProvider + 'static>(
         &mut self,
         provider: P,
         audited_document_preparation: bool,
     ) -> RuntimeResult<()> {
         let name = provider.name().to_owned();
+        if self
+            .bound_engines
+            .as_ref()
+            .is_some_and(|engines| engines.iter().any(|engine| engine.name == name))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding provider `{name}` is already bound to configured engines"
+            )));
+        }
         if self
             .entries
             .get(&name)
@@ -528,6 +591,59 @@ impl EmbedderRegistry {
     /// Names of all registered providers, in registration order.
     pub fn names(&self) -> Vec<String> {
         self.ordered_names.clone()
+    }
+
+    pub(crate) fn initialization_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.initialization)
+    }
+
+    pub(crate) fn bound_engines(&self) -> Option<&[crate::engine_config::EngineConfig]> {
+        self.bound_engines.as_deref()
+    }
+
+    pub(crate) fn bind_engines(
+        &mut self,
+        engines: &[crate::engine_config::EngineConfig],
+    ) -> RuntimeResult<()> {
+        if let Some(bound) = &self.bound_engines {
+            return if bound == engines {
+                Ok(())
+            } else {
+                Err(RuntimeError::InvalidInput(
+                    "configured embedding engines are already bound to a different ordered list"
+                        .into(),
+                ))
+            };
+        }
+        for engine in engines {
+            let provider = self.get_provider(&engine.name).ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "embedding provider `{}` is not registered at startup",
+                    engine.name
+                ))
+            })?;
+            let actual = provider.dimensions();
+            if actual == 0 || u32::try_from(actual).is_err() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "embedding provider `{}` has invalid dimensions {actual}; expected 1..=4294967295",
+                    engine.name
+                )));
+            }
+            if let Some(model) = crate::config::parse_embedding_model_alias(&engine.name) {
+                if actual != model.dimensions() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "embedding provider `{}` has dimensions {actual}, but its built-in storage binding requires {}",
+                        engine.name,
+                        model.dimensions()
+                    )));
+                }
+            }
+            engine
+                .check_dimensions(actual)
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        }
+        self.bound_engines = Some(engines.to_vec());
+        Ok(())
     }
 
     /// Return a cloned entry for `name` without holding any lock.
@@ -878,6 +994,16 @@ mod tests {
             }
 
             Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        async fn embed_query(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+        ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+            // This custom service owns its inputs; a built-in instruction must
+            // not rewrite the sentinel that releases its synthetic worker.
+            self.embed(texts, model).await
         }
 
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -1528,6 +1654,41 @@ mod tests {
         assert!(
             matches!(error, RuntimeError::InvalidInput(message) if message.contains("first-custom") && message.contains("serving"))
         );
+    }
+
+    #[test]
+    fn bound_engine_list_is_fixed_once_bound() {
+        let engine = |name: &str, dims: Option<i64>| crate::engine_config::EngineConfig {
+            name: name.to_owned(),
+            weight: 1.0,
+            dims,
+        };
+        let mut reg = EmbedderRegistry::new();
+        for (name, dimensions) in [("bound-a", 8), ("bound-b", 4)] {
+            reg.register(ConstVecProvider::new(name, dimensions))
+                .expect("unique registration should succeed");
+        }
+        let bound = vec![engine("bound-a", Some(8)), engine("bound-b", None)];
+        reg.bind_engines(&bound)
+            .expect("first binding should succeed");
+        reg.bind_engines(&bound)
+            .expect("binding the same ordered list again is idempotent");
+
+        // Another order, a shorter list and a changed field are each a different list.
+        for different in [
+            vec![engine("bound-b", None), engine("bound-a", Some(8))],
+            vec![engine("bound-a", Some(8))],
+            vec![engine("bound-a", Some(8)), engine("bound-b", Some(4))],
+        ] {
+            let error = reg
+                .bind_engines(&different)
+                .expect_err("a bound registry must refuse a different list");
+            assert!(
+                matches!(&error, RuntimeError::InvalidInput(message) if message.contains("different ordered list")),
+                "{error:?}"
+            );
+            assert_eq!(reg.bound_engines(), Some(bound.as_slice()));
+        }
     }
 
     #[test]
