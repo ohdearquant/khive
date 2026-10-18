@@ -752,6 +752,14 @@ impl CodeMapHandleGuard {
                         reason: "main file identity changed since registration",
                     });
                 }
+                // A second link names the registered file from outside the map root.
+                if observed.links != 1 {
+                    os::close_unlocked(file, observed.identity);
+                    return Err(GuardError::Unsafe {
+                        path,
+                        reason: "registered map main file does not have exactly one link",
+                    });
+                }
             }
         }
         if ledger.guarded.has_other_role(observed.identity, role) {

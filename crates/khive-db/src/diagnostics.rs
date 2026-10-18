@@ -62,6 +62,8 @@
 
 #[path = "diagnostics/disk_guard.rs"]
 mod disk_guard;
+#[path = "diagnostics/size_composition.rs"]
+mod size_composition;
 #[path = "diagnostics/writer_contention.rs"]
 mod writer_contention;
 
@@ -1289,12 +1291,17 @@ fn classify_database_object(
     (object_kind, storage_class)
 }
 
-fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSizeComposition> {
+fn database_size_composition(
+    conn: &Connection,
+    accounting: DatabasePageAccounting,
+) -> rusqlite::Result<DatabaseSizeComposition> {
     let DatabasePageAccounting {
         page_size_bytes: page_size,
         page_count,
         freelist_pages,
-    } = database_page_accounting(conn)?;
+    } = accounting;
+    #[cfg(test)]
+    size_composition::before_dbstat();
 
     let mut statement = conn.prepare(
         "SELECT d.name, COALESCE(s.type, 'internal'), s.tbl_name, s.sql, d.pageno, d.pgsize
@@ -2161,11 +2168,10 @@ fn inspect_pool_interruptibly(
     // connection. The scope deliberately refuses double registration, so
     // keep each query's ordinary SQLite result nested inside one guarded
     // execution while allowing the outer cancellation cause to remain typed.
-    let (integrity, page_accounting, size_composition, fts_segments) = scope.run(&conn, || {
+    let (integrity, pages, fts_segments) = scope.run(&conn, || {
         Ok((
             graph_edge_integrity(&conn),
-            database_page_accounting(&conn),
-            collect_size_composition.then(|| database_size_composition(&conn)),
+            size_composition::collect(&conn, collect_size_composition),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))
     })?;
@@ -2177,16 +2183,12 @@ fn inspect_pool_interruptibly(
         ),
     };
     let (fts_segments, fts_segments_error) = split_fts_segments_result(fts_segments);
-    let (page_accounting, page_accounting_error) = split_page_accounting_result(page_accounting);
-
-    let (size_composition, size_composition_error) = match size_composition {
-        Some(Ok(composition)) => (Some(composition), None),
-        Some(Err(error)) => (
-            None,
-            Some(format!("database size composition query failed: {error}")),
-        ),
-        None => (None, Some(SIZE_COMPOSITION_NOT_REQUESTED.to_string())),
-    };
+    let size_composition::PageInspection {
+        page_accounting,
+        page_accounting_error,
+        size_composition,
+        size_composition_error,
+    } = pages;
 
     Ok(PoolInspection {
         checkpoint_probe,
@@ -2396,15 +2398,12 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
-    let (page_accounting, page_accounting_error) =
-        split_page_accounting_result(database_page_accounting(&conn));
-    let (size_composition, size_composition_error) = match database_size_composition(&conn) {
-        Ok(composition) => (Some(composition), None),
-        Err(error) => (
-            None,
-            Some(format!("database size composition query failed: {error}")),
-        ),
-    };
+    let size_composition::PageInspection {
+        page_accounting,
+        page_accounting_error,
+        size_composition,
+        size_composition_error,
+    } = size_composition::collect(&conn, true);
     let (fts_segments, fts_segments_error) =
         split_fts_segments_result(crate::fts_maintenance::inspect_fts_segments(&conn));
 

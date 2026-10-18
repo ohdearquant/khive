@@ -1592,8 +1592,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 29] = [
                       such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
                       row, index, FTS, vector, mixed row-and-embedding, and internal byte totals; \
-                      it reads every page, so size_composition=false skips it and \
-                      size_composition_error says so. page_accounting (page_size_bytes, \
+                      it runs only when the same read snapshot has at most 8192 pages AND \
+                      32 MiB. Larger snapshots have no composition and size_composition_error \
+                      names the observed footprint and limits. These are footprint limits, \
+                      not a latency guarantee. size_composition=false skips the walk regardless \
+                      of size. page_accounting (page_size_bytes, \
                       page_count, freelist_pages) is three pragma reads and is always reported. \
                       WAL checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
@@ -1622,8 +1625,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 29] = [
                 name: "size_composition",
                 param_type: "boolean",
                 required: false,
-                description: "Defaults true. false skips the dbstat walk, whose time grows with \
-                              each file; page_accounting is still reported.",
+                description: "Defaults true. Composition is collected only for snapshots of at \
+                              most 8192 pages AND 32 MiB; larger snapshots carry an explicit \
+                              size_composition_error. false skips the dbstat walk regardless of \
+                              size. page_accounting is still reported.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

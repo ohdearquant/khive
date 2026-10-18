@@ -4,7 +4,9 @@
 **Date**: 2026-10-17\
 **Depends on**: [ADR-166](ADR-166-hot-path-latency-regression-guard.md),
 [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)\
-**Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`
+**Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`\
+**Amendments**: [Amendment 1](#amendment-1-2026-10-17-closure-selection-runs-once-per-merge-train)
+(2026-10-17, Proposed): D6 closure selection runs once per merge train
 
 The maintainers' request of 2026-10-17, translated: "For every performance-critical
 crate I want crate-by-crate benches. Most crates had a bench setup at some point, but it
@@ -23,7 +25,8 @@ Each performance-critical crate owns an executable performance contract in
 contract. Deterministic work bounds gate affected pull requests. Timings on hosted
 runners remain advisory. A published absolute performance promise requires qualified
 reference measurements and fresh evidence before release. Benchmark selection uses
-the code map's dependents closure; complete scheduled and release runs catch omissions.
+the code map's dependents closure, once per merge train (Amendment 1); complete
+scheduled and release runs catch omissions.
 
 This is a new contract built on ADR-166, not a claim that its proposed trend lane or
 ADR-205's selector already exists. Both records are marked Proposed at the grounding
@@ -289,13 +292,25 @@ the promise through that same review; an unrecorded release override is not an o
 
 ### D6. Select by dependents closure and account for the whole cost
 
-For PRs, reuse ADR-205's classifier result for the exact base/head pair and validated
-map. Select changed crates plus their transitive dependents across normal, development
-and build edges, then select their declared PR producers. Bench-only runtime relationships,
-shared fixtures and generator/script inputs that are absent from Cargo's graph are
-declared in manifests and add affected producers. A `covered-by` contract adds its
-producer even when that dependency is not a Cargo edge. The expanded set is the logged
-benchmark scope; execution is never limited to only the directly changed crates.
+_Changed by [Amendment 1](#amendment-1-2026-10-17-closure-selection-runs-once-per-merge-train):
+the closure is taken once per merge train, not per pull request._
+
+The closure runs on the push of a merge train's integration branch (`integration/train-*`),
+over the train's whole range from its merge base with main to its tip. It reuses ADR-205's
+classifier for that range and the validated map. Select changed crates plus their transitive
+dependents across normal, development and build edges, then select their declared
+producers. Bench-only runtime relationships, shared fixtures and generator/script inputs
+that are absent from Cargo's graph are declared in manifests and add affected producers. A
+`covered-by` contract adds its producer even when that dependency is not a Cargo edge. The
+expanded set is the logged benchmark scope; execution is never limited to only the
+directly changed crates. The train run records nothing in the performance ledger.
+
+A pull request run keeps the direct path mapping it had before this record: a component runs
+when the pull request changes a path its crates own, which gives a contributor a cheap
+benchmark before merge. Pull requests from the repository's own automation branches, which
+the workflow already exempts, keep that exemption on pull request runs; their changes are
+benchmarked by the train that carries them. A change merged outside a train is covered by
+its own pull request run (when not exempt) and by the next daily run of the complete set.
 
 Manifests, claims and referenced Markdown fixtures are classified before a docs-only
 exit. A pure prose edit can avoid compilation but must still pass the cheap claims and
@@ -305,11 +320,17 @@ selects the full applicable set. Map failure, warning, missing project or uncert
 input mapping also selects the full set with a reason. If that work cannot fit the
 approved capacity, required checks remain incomplete; safety is not traded for a skip.
 
-The selector is a proposed deliverable until ADR-205's implementation is available.
-Implement benchmark mode by extending `scripts/ci-test-scope.py` or its shared library,
+The train step calls `scripts/ci-test-scope.py` the way the CI workflow's scope step does,
 with the same main-built classifier, refusal-before-ingest ordering, map freshness and
-Cargo parity controls. Do not treat a stale map or the absent script as an empty scope.
-Do not use a branch-name exemption: all PRs follow the same scope rule at activation.
+Cargo parity controls; a workflow test holds the binary lookup lines of the two steps
+equal. Every failure (no merge base with main, no published binary, a classifier error or
+an empty result) selects the full set. Do not treat a stale map or the absent script as an
+empty scope. The closure maps to the benchmark components, each a fixed set of crates
+that shares one build cache with the daily run; a component runs when the closure holds
+one of its crates, and runs only those of its crates that have a bench target
+(Amendment 1, decision 5). A workflow test asserts that every crate with a benchmark
+target belongs to exactly one component and that the pull request path table and the
+component jobs name the same crates.
 
 Selection limits executed benchmark/test targets, not what Cargo must compile as their
 dependencies. Compile selected packages together where feature sets permit, in a reused
@@ -332,8 +353,10 @@ amortize qualification work over the stated window. Track both hosted runner-min
 and all compute-minutes including the build host. Shorter elapsed time from parallelism
 is not a cost reduction.
 
-Both totals must be no greater than their pre-change baselines for comparable volume,
-with no loss of required coverage. Savings come first from removing four overlapping
+Amendment 1 replaces the ceiling "no greater than the pre-change baseline" for the train
+run with its measured envelope; the other windows keep it. Both totals must otherwise be
+no greater than their pre-change baselines for comparable volume, with no loss of
+required coverage. Savings come first from removing four overlapping
 component builds, reusing selection, avoiding duplicate synthetic runs, and sharing
 scheduled/release evidence. New cases are admitted only within the measured envelope.
 There is no savings claim yet: the current workflow is already daily, closure selection
@@ -502,7 +525,8 @@ Acceptance requires recorded evidence for all of these controls:
 5. Map/Cargo closure parity holds for normal/dev/build edges. A shared-layer change
    selects downstream benches; a shared fixture selects every declared consumer; a
    missing map and an unknown executable path select the full set. Docs-only changes
-   still receive claim checking. No branch name exempts a PR.
+   still receive claim checking. A train push runs the closure of the whole train; the
+   automation-branch exemption applies to pull request runs only.
 6. PR timing breaches remain advisory, required deterministic failures block, and
    release evaluation refuses stale/wrong-SHA evidence, missing real data, unqualified
    reference results and expired gaps. Disabling the advisory workflow cannot satisfy
@@ -511,7 +535,8 @@ Acceptance requires recorded evidence for all of these controls:
    PR gate still detects quality/work regressions after its timed speedup is separated.
    Every public performance statement in the migration census is registered, corrected
    or removed; deliberately changing a registered number fails the documentation check.
-8. The measured rollout meets both D6 cost ceilings across the representative PR,
+8. The measured rollout meets the Amendment 1 envelope for train runs over the first
+   sixteen trains, and both D6 cost ceilings for the other windows across the representative PR,
    scheduled and release windows while the planned/observed census proves complete
    required coverage. No savings claim is accepted from fewer recorded scenarios.
 
@@ -523,3 +548,174 @@ against the current repository, approve the companion ADR-166 clarifications, me
 the cost ceilings, identify reservable reference capacity and complete the crate/claim
 registration census. Until qualification exists, numerical timing observations may be
 published with their evidence, but no new absolute timing guarantee is active.
+
+## Amendment 1 (2026-10-17): closure selection runs once per merge train
+
+**Status**: Proposed
+
+D6 as first written selected each pull request's dependents closure and removed the
+automation-branch exemption. Before activation, its own cost rule was applied to the job
+records of the existing benchmark workflow and to the last 80 merged pull requests (46 from
+the repository's own automation branches, 34 from others), with the closure computed from
+`cargo metadata` over normal, development and build edges and the path rules of
+`scripts/ci-test-scope.py`:
+
+| Selection                                                           | Component jobs | Runner-minutes   | Changes benchmarked before merge |
+| ------------------------------------------------------------------- | -------------- | ---------------- | -------------------------------- |
+| Before this record: direct path mapping, automation branches exempt | 18             | about 125 to 220 | 12 of 80                         |
+| Closure per pull request, no exemption (D6 as first written)        | 146            | about 1,000      | 55 of 80                         |
+| Closure once per train of five (union of the members' closures)     | 59             | about 410        | 55 of 80                         |
+| The same, six components (decision 5) once their benchmarks land    | 91             | at least 630     | 71 of 80                         |
+
+Runner-minutes multiply component jobs by the median component job on a pull request, 6.9
+runner-minutes (17 runs, range 3.6 to 8.7). The first row's upper figure instead takes the
+job records of the 46 pull request runs that ran at all (mean 6.4 runner-minutes, selection
+job included) for each of the 34 pull requests from other branches. Under the closure, 25 of
+the 80 pull requests select no benchmarked crate and 8 select the full set; 11 of 16 trains
+of five select all four components. Under both closure rows, every change whose closure
+holds a benchmarked crate is benchmarked before merge; the other 25 have nothing to
+benchmark. The last row applies the same rule to the six components of decision 5 as if
+every crate in them had its benchmark: 9 of the 80 pull requests then select nothing, both
+new components are selected by all 16 trains and 11 trains select all six. Its 6.9
+runner-minutes per job is a floor for the `runtime-mcp` component, whose release build of
+`khive-runtime`, `khive-mcp` and `kkernel` is heavier than any component measured here.
+
+Per-pull-request closure costs about five to eight times the existing spend and fails D6's
+ceiling. Per-train closure costs two to three times the existing spend and benchmarks every
+change that has a benchmark before it reaches main, against 12 of 80 before. The decision:
+
+1. The closure runs once on the push of a merge train's integration branch, over the train's
+   whole range, and never publishes to the performance ledger.
+2. Pull request runs keep the direct path mapping and the automation-branch exemption.
+3. The daily run of the complete set and the release run stay as the backstop.
+4. The train run is accepted at its measured envelope in place of D6's "no greater than
+   the pre-change baseline" for that window: about 410 runner-minutes per 80 merged pull
+   requests on top of the pull request spend for the 20 crates benchmarked at this record,
+   and at least 630 once the crates of decision 5 have their benchmarks. The rollout
+   re-measures the first sixteen trains from job records, re-measures the `runtime-mcp`
+   job cost after the first train that runs it, and reports an overrun as an operational
+   finding.
+5. Two components join the four: `runtime-mcp` (`khive-runtime`, `khive-mcp`, `kkernel`) and
+   `gate-channel-code` (`khive-gate`, `khive-channel`, `khive-pack-code`, `khive-changeset`,
+   `khive-channel-email`, `khive-graph-diff`, `khive-wire-protocol`), each with a 40-minute
+   job budget. A component job runs only the crates that have a bench target, read from
+   `cargo metadata`; a component with none runs nothing, writes no ledger record and opens
+   no tracking incident, so a crate can sit in its component before its first benchmark
+   lands. A name that is not a workspace package fails the job. Every crate with a bench
+   target is in exactly one component (a workflow test).
+6. Before the first train that carries a `runtime-mcp` benchmark lands, that component's
+   quick Criterion pass is timed on the CI build host against the 600-second bound of a
+   component job, and the number is recorded here beside the 6.9-minute floor. The first
+   train that runs `gate-channel-code` after its crates have benchmarks reports the job's
+   wall time; if it exceeds the 40-minute budget, the component is split then.
+
+The 20 crates with a benchmark target at this record are exactly the 20 crates of the four
+original components, which keep their names, cache keys and ledger names, so the train run
+reuses their build caches from the daily run. Chunking the benchmarked crates afresh would
+have changed the cache keys and the ledger's component names for no selection benefit, so it
+was not adopted.
+
+## Amendment 2 (2026-10-18): fixed references are measured on the build host and committed
+
+**Status**: Proposed
+
+D4 allows the Linux build host to give reference measurements during an exclusive reserved window. D4 and D5 require
+a fixed accepted reference before a trend contract reports healthy coverage. Neither names who produces the reference,
+how the window is reserved, or where the accepted numbers live, so no crate has one. This amendment fills that in.
+
+### The host and why a partition alone is not enough
+
+The build host is one bare-metal machine: 8 cores and 16 threads, one 16 MB L3 shared by every core, a 35 W package
+limit, and the `amd-pstate-epp` frequency driver. With the default posture, one read of the per-core clock gave
+2.94 GHz, 5.12 GHz and 2.92 GHz on three cores in the same instant while other jobs ran.
+
+Pinning a benchmark to cores of its own removes scheduler contention. It does not remove the shared cache, the
+shared memory controller or the shared power limit, so pinned cores still slow down when the others are loaded.
+
+The decision:
+
+1. **References come from an exclusive hold.** While a reference is measured, the host admits no other job. Jobs
+   already running finish first; nothing is preempted. A hold has a lease of at most 60 minutes, at most one is live,
+   and the runner ignores an expired hold. A hold waits at most 45 minutes for running work to drain; past that, the
+   attempt records UNMEASURED and names what was still running. A partition of the host may serve advisory
+   pull-request timing; it never produces a reference.
+2. **The frequency posture is fixed and recorded.** For a reference run, every core uses the `performance` governor
+   with its maximum frequency capped below the all-core sustained clock (3.6 GHz at this record). Each second, a
+   sampler records each pinned core's clock and busy share. An arm's clock band is (max - min) / median of the loaded
+   core's clock: per sample, the pinned core with the higher busy share, after every reading at the driver's idle floor
+   (400 MHz on this host) is dropped. An arm whose band exceeds 10% is UNMEASURED. A benchmark loads one pinned core at
+   a time, so the other pinned core idles at the floor; counting its readings would fail an arm on a core the benchmark
+   did not use. Holding the cap is a property the sampler shows per run, not one this record asserts.
+3. **Two runs at one commit.** Every benchmark target runs twice back to back at the same commit, pinned to the same
+   physical cores, with the benchmark's own Criterion configuration (never `--quick`). A benchmark is MEASURED only if
+   all three hold:
+   - the two medians are within D4's `noise_ceiling` (1.15);
+   - the loaded core's clock stays inside its band in both runs;
+   - in at most 5% of either run's one-second samples does another CPU exceed 20% busy. One busy sample a minute
+     passes; another CPU busy for more than 3 seconds of every minute does not. The highest reading in each run is
+     recorded, not judged.
+
+   A crate with any UNMEASURED benchmark gets no reference for that attempt. Its other numbers are not averaged in.
+4. **Every bench target runs.** The job reads `cargo metadata`, enables each target's required features, and fails
+   if any expected target did not execute.
+5. **The reference is committed.** `crates/<crate>/perf/reference.json` (schema `bench-reference/v1`) holds:
+   - the commit;
+   - the comparison class: host CPU, kernel, cores, frequency posture, compiler, profile;
+   - the exact command of each run;
+   - the reduction rule;
+   - both runs' medians and confidence intervals per benchmark;
+   - the host load and frequency posture at the start and end of measurement.
+     It lands by reviewed pull request only. A class change starts a new reference and never edits the old one in place.
+     The raw Criterion output is kept outside the repository, by archive digest.
+6. **Every hold leaves a usage row.** The row holds owner, reason, start and end, drain wait, measured wall time, CPU
+   seconds and peak memory. It goes to the host's usage ledger. How often references are re-measured (once per
+   benchmark change plus one scheduled re-measure per week) is read from that ledger.
+7. **Measurement ends with the hold.** A job's drain wait and its measured runs share one lease, so a job may set
+   a tighter drain bound than 45 minutes to leave room for its runs. A target whose estimated runs would not finish
+   before the hold ends is not started. A run still going when the hold ends is stopped together with every process
+   it started, and its target is recorded as failed. Either way that target's crate gets no reference from the
+   attempt, and the summary names the target and the reason.
+
+### Not decided here
+
+- Instruction counts (Criterion with a hardware-counter measurement, or callgrind) as the load-independent metric
+  for pull-request gating. The host permits user-space counters; adopting them is a separate amendment with its own
+  calibration.
+- Promotion of any reference to an absolute promise. That still follows D4's promotion protocol.
+
+### First references
+
+The first run measured commit `212bf72e498de9fbbda42cc0e2902906c730e3ea` on cores 2 and 3 under the posture above:
+governor `performance`, EPP `performance` and `scaling_max_freq` 3,600,000 kHz on every policy at the start and the end
+of measurement. The pinned cores' readings above the idle floor had a median of 3,549,011 kHz over the measured runs.
+Admissions closed at 03:55:30Z and the drain ended at 03:59:00Z, inside a 04:10Z bound. The runs went from 03:59:00Z to
+04:52:15Z against a 04:58Z limit: 3,195 s of measured wall time, 5,029 CPU-seconds, peak memory 1,769 MB.
+
+That run was judged under items 2 and 3 as first written: the band over both pinned cores' readings, and a single
+sample of another CPU above 20% failing the run. It produced no reference (0 BASELINE, 20 NO-BASELINE). 26 of 28 runs
+failed the band (largest 0.891), every one because of the idle pinned core's 400 MHz floor readings (1,833 of them),
+and 22 failed the busy rule. Items 2 and 3 were then amended to the text above.
+
+The amended rules were applied to the run's stored files without a re-run. As a control, the run's own reduction code,
+over its own stored files and thresholds, first reproduced the recorded verdict and every per-benchmark reason for all 20
+crates; the amended rules ran only after that matched. The stored sampler recorded one mean busy share for the two
+pinned cores, so the loaded core of each sample cannot be recovered, and the band was read on both pinned cores'
+readings with the floor dropped. That set contains every possible loaded-core selection, so (max - min) / min over it
+bounds the loaded-core band: at most 0.0189 across the 28 runs, against 0.10. The verdicts are therefore the ones the
+exact rule gives, and each reference from this run records that its band used this bound.
+
+Result: 10 BASELINE, 10 NO-BASELINE. Band failures went from 26 runs to 0 (largest 0.0186), busy failures from 22 to 3.
+
+- BASELINE: khive-brain-core (12 benchmarks), khive-pack-brain (6), khive-pack-comm (7), khive-pack-gtd (5),
+  khive-pack-knowledge (9), khive-pack-memory (6), khive-pack-schedule (5), khive-quant (13), khive-request (7),
+  khive-text (21).
+- Not started before the run limit (item 7): khive-db `db_hot_path`, khive-fold, khive-fusion, khive-query,
+  khive-retrieval, khive-score, khive-vamana. khive-db's other target, `db_concurrency`, measured all 5 of its
+  benchmarks; the crate has no reference because `db_hot_path` did not run.
+- Busy share above 5%: khive-bm25 (both runs, 0.770 and 0.452) and khive-pack-kg (second run, 0.172). All three runs
+  overlap 04:43:30Z to 04:51:00Z, when a read-only file scan ran on the host outside the job queue. The largest share
+  among passing runs was 0.0208.
+- A/A spread above 1.15: khive-hnsw, 2 of its 17 benchmarks.
+
+No target was still running at the limit, so the stop in item 7 was not exercised. The ten NO-BASELINE crates are
+measured again in a later window.

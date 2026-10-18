@@ -140,7 +140,7 @@ pub(crate) struct WhoamiParams {}
 pub(crate) struct DbDiagnosticsParams {
     /// Inspect only the opened database that serves this backend name.
     pub(crate) backend: Option<String>,
-    /// `false` skips the `dbstat` walk, which reads every page of each file.
+    /// `false` skips the `dbstat` walk. Requested walks also obey the private snapshot footprint caps.
     pub(crate) size_composition: Option<bool>,
 }
 
