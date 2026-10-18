@@ -80,6 +80,16 @@ name = "db_concurrency"
 harness = false
 path = "benches/db_concurrency.rs"
 
+[[bench]]
+name = "db_stores"
+harness = false
+path = "benches/db_stores.rs"
+
+[[bench]]
+name = "db_pool"
+harness = false
+path = "benches/db_pool.rs"
+
 [features]
 # Exposes the task-scoped SQLite progress probe for dependent-crate tests.
 test-support = []
