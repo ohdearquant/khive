@@ -2583,3 +2583,21 @@ source_root = "/work/project"
     assert!(config.code_maps[0].unknown_fields.contains_key("unknown"));
     assert!(config.code_maps[1].path.is_none());
 }
+
+#[test]
+fn code_map_values_of_the_wrong_type_fail_configuration_load() {
+    let dir = tempfile::tempdir().unwrap();
+    for (content, key) in [
+        (
+            "[[code_maps]]\nname = \"workspace\"\npath = 42\nsource_root = \"/src\"\n",
+            "code_maps.path",
+        ),
+        ("code_map_root = 5\n", "code_map_root"),
+    ] {
+        let path = write_toml(&dir, content);
+        let error = KhiveConfig::load(Some(&path))
+            .expect_err("a wrong-typed registry value aborts the configuration load")
+            .to_string();
+        assert!(error.contains(key), "{error}");
+    }
+}
