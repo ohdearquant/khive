@@ -127,4 +127,8 @@ The classifier depends on a binary built by an earlier `main` run; when none is 
 
 ## Implementation Status
 
-Proposed; nothing implemented. Phase 1 is tracked by #5581.
+Phase 1 has landed: the map registry loaded from configuration (#5612) and `code.list`, `code.search` and `code.deps` (#5635), which closed #5581.
+
+Phase 2 has landed in part (#5638): the classifier script and the Classify job's `test_scope` output (D1 to D4), the scoped `ci` job (D5), the gate reading the scope (D6), the debug `kkernel` artifact published by `main` push runs, and the retirement of the integration-only lane (D7). #5717 adds a full-suite rule for a changed file that another crate includes. The escape audit issue is #5637 (D8).
+
+Not implemented: the D3a mechanical range check for `main` pushes, and the D8 parity test against `cargo metadata`. D9's acceptance has not been read. The status stays Proposed until it is.
