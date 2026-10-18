@@ -64,8 +64,9 @@ in `proofs/Retrieval/Distance.lean` cover the ADR-030 phase-2 formalization. The
 
 The conversion tests are the inline `#[cfg(test)]` module in
 [`distance.rs`](../../src/distance.rs). Benchmarks in
-[`benches/score_ops.rs`](../../benches/score_ops.rs) cover the `distance_cosine`, `distance_l2`,
-and `distance_dot` targets.
+[`benches/score_ops.rs`](../../benches/score_ops.rs) cover `score_from_distance_lossy` in the
+`score_from_distance` group (`cosine_scalar`, `l2_scalar`, `dot_scalar` and their
+`_batch_1000` forms).
 
 ```bash
 # Run all distance conversion tests

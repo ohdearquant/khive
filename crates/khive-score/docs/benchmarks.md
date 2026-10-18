@@ -3,16 +3,35 @@
 **Bench targets:** `score_ops` and `arithmetic_paths` under `benches/`.
 **Harness:** Criterion (`harness = false` in `Cargo.toml`).
 
-## Run command
+## Run commands
+
+A qualified-host baseline runs every scenario with its target's own Criterion
+configuration:
+
+```bash
+cd crates
+cargo bench -p khive-score --benches -- --noplot
+```
+
+The pull-request trend lane runs the same targets in Criterion's quick mode:
 
 ```bash
 cd crates
 cargo bench -p khive-score --benches -- --quick --noplot
 ```
 
-Results land under `target/criterion/<group>/`; a target's filename is not a
-Criterion group. Record the median per-operation estimate from each scenario's
-`new/estimates.json`, with its commit, toolchain, features, machine and command.
+Quick mode skips the warm-up and ignores the configured sample count. It doubles
+the iteration count until two consecutive timings agree within the significance
+level, or until the measurement time runs out, and keeps only those two timings,
+so its median and mean rest on two points. Quick-mode results are trend
+observations only and never enter a qualified baseline.
+
+Results land under `target/criterion/`, one directory per Criterion ID, and a
+target's filename is not a Criterion group. Criterion replaces each `/` inside a
+group name with `_`: scenario `10` of group `ops/sum_scores` is written to
+`target/criterion/ops_sum_scores/10/`. Record the median per-operation estimate
+from each scenario's `new/estimates.json` from a baseline run, with its commit,
+toolchain, features, machine and command.
 These are Criterion sample-based estimates, not an empirical percentile of
 individually timed calls. The pure scalar paths use Criterion's iteration timer
 to avoid adding an `Instant` measurement around each nanosecond operation.
@@ -65,8 +84,9 @@ of returned values. Constructor work, including dropping an owned rejected input
 is included. Valid ordered contents, a named all-key constant weighted mean and
 the exact negative-weight error are checked outside timing.
 
-The 35 added scenes use 20 Criterion samples, one-second warmup and three-second
-measurement defaults; command-line options may override these. Preflight checks
+In a baseline run the 35 `arithmetic_paths` scenes use 20 Criterion samples, a
+one-second warm-up and a three-second measurement; command-line options,
+including `--quick`, override these. Preflight checks
 are small and run even when a group is filtered. No database, model, file corpus,
 network, allocation counter or native-memory measurement is involved.
 
@@ -76,9 +96,9 @@ network, allocation counter or native-memory measurement is involved.
 | --------------------------- | ---------------------- | -------------- | -------------------------------------------- |
 | `weighted_sum`              | 32 scores + 32 weights | median latency | Advisory trend against the recorded baseline |
 | `score_from_distance_lossy` | cosine, scalar         | median latency | Advisory trend against the recorded baseline |
-| `rrf_score_one_based`       | k=60, rank 50          | median latency | Advisory trend against the recorded baseline |
-| `Decay` apply               | 1000 timestamps        | median latency | Advisory trend against the recorded baseline |
-| `min_max_band`              | 1000-element vector    | median latency | Advisory trend against the recorded baseline |
+| `rrf_score_one_based`       | k=60, rank 50          | median latency | Advisory trend once its baseline is recorded |
+| `Decay` apply               | 1000 elapsed seconds   | median latency | Advisory trend once its baseline is recorded |
+| `min_max_band`              | 1000-element vector    | median latency | Advisory trend once its baseline is recorded |
 
 Timing is advisory against both a rolling and fixed reference, never a fixed
 percentage gate. A historical observation is not a latency promise. Correctness
