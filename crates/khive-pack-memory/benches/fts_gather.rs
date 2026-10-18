@@ -446,7 +446,7 @@ fn main() {
     if let Some((database, _)) = state {
         executor.block_on(database.close());
     }
-    if let Some(mut criterion) = criterion {
+    if let Some(criterion) = criterion {
         criterion.final_summary();
     }
 }
