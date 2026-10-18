@@ -70,6 +70,8 @@ The conversion tests are the `#[cfg(test)]` module that
 `_batch_1000` forms).
 
 ```bash
+cd crates
+
 # Run all distance conversion tests
 cargo test -p khive-score distance
 
