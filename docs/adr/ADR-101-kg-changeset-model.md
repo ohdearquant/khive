@@ -2,6 +2,9 @@
 
 **Status**: Accepted
 **Date**: 2026-07-08
+**Amendment**: [restore and schema version 2](#amendment-2026-10-13-restore-and-schema-version-2)
+(accepted 2026-10-18) adds a sixth D1 operation, `restore`, and advances the NDJSON schema to
+version 2.
 **Depends on**: ADR-002 (edge ontology), ADR-016 (request DSL — the op shape this format serializes), ADR-017 (pack standard), ADR-020 (git-native KG implementation — `KgArchive` as the import/export envelope this ADR does not replace)
 **Related**: ADR-088 (git-lifecycle pack — the future-work loop below), ADR-100 (store backup and replication — whole-graph snapshots, a different artifact from the change-set this ADR defines)
 
@@ -128,9 +131,9 @@ op-list itself stays producer-agnostic.
 > producer-internal tracking — a producer without its own batching model should not be forced
 > to invent one, and the fallback keeps the trailer's round-trip contract intact either way.
 
-### Proposed amendment (2026-10-13): restore and schema version 2
+### Amendment (2026-10-13): restore and schema version 2
 
-**Status: Proposed; requires approval before adoption.** This amendment extends D1
+**Status: Accepted 2026-10-18.** This amendment extends D1
 with a sixth operation, `restore`, for an existing soft-deleted entity, note or
 edge. It carries the target identifier and the full record expected once live,
 including content, status, expiry, namespace and timestamps. Decoding uses the
