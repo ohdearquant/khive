@@ -1,81 +1,33 @@
-use super::*;
+use super::super::declaration::{
+    Acceptance, Reservation, RouteInventoryEntry, RuntimeTableWriteInventoryEntry, StampCapability,
+    Substrate, TransactionOwner, WriteClass, ROUTE_INVENTORY, RUNTIME_TABLE_WRITE_INVENTORY,
+};
+use super::ast_helpers::{literal_string, test_only};
+use super::model::{
+    DetectedClass, RouteClass, Site, SourcePopulation, NON_PROPERTIES_STORE_METHODS, STORE_WRITES,
+    UNCLASSIFIED_SQL, UNRESOLVED_CONSTANT,
+};
+use super::parsed_sources::{index_module_bindings, parse_production_sources, scan_source};
+use super::sql_routes::{
+    canonical_key_path, detected_keys, runtime_table_write_count, sql_statements, sql_target,
+    sql_unclassified_write, sql_write_occurrences,
+};
+use super::static_sql_source;
+use super::static_sql_source::StaticSqlSources;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+use syn::ItemMod;
 
-pub(super) fn sql_statements(sql: &str) -> Vec<String> {
-    #[derive(Clone, Copy)]
-    enum Mode {
-        Sql,
-        SingleQuote,
-        DoubleQuote,
-        LineComment,
-        BlockComment,
-    }
+const FINALIZED_SITE: &str = "khive-runtime/src/secret_gate_finalizer/entity_transaction.rs::PreparedEntityExemption::into_plan";
 
-    let mut statements = Vec::new();
-    let mut statement = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut mode = Mode::Sql;
-    while let Some(character) = chars.next() {
-        match mode {
-            Mode::Sql => match character {
-                '-' if chars.peek() == Some(&'-') => {
-                    chars.next();
-                    statement.push(' ');
-                    mode = Mode::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    statement.push(' ');
-                    mode = Mode::BlockComment;
-                }
-                '\'' => {
-                    statement.push(character);
-                    mode = Mode::SingleQuote;
-                }
-                '"' => {
-                    statement.push(character);
-                    mode = Mode::DoubleQuote;
-                }
-                ';' => {
-                    if !statement.trim().is_empty() {
-                        statements.push(std::mem::take(&mut statement));
-                    }
-                }
-                _ => statement.push(character),
-            },
-            Mode::SingleQuote | Mode::DoubleQuote => {
-                statement.push(character);
-                let quote = if matches!(mode, Mode::SingleQuote) {
-                    '\''
-                } else {
-                    '"'
-                };
-                if character == quote {
-                    if chars.peek() == Some(&quote) {
-                        statement.push(chars.next().expect("peeked quote"));
-                    } else {
-                        mode = Mode::Sql;
-                    }
-                }
-            }
-            Mode::LineComment => {
-                if character == '\n' {
-                    statement.push(' ');
-                    mode = Mode::Sql;
-                }
-            }
-            Mode::BlockComment => {
-                if character == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    statement.push(' ');
-                    mode = Mode::Sql;
-                }
-            }
-        }
-    }
-    if !statement.trim().is_empty() {
-        statements.push(statement);
-    }
-    statements
+pub(super) fn is_finalized_candidate_site(site: &Site, row: &RouteInventoryEntry) -> bool {
+    site.key == FINALIZED_SITE
+        && row.id == "runtime.finalized.entity"
+        && row.target == Substrate::Entity
+        && row.stamp == StampCapability::AdmissionCapable
+        && row.transaction == TransactionOwner::RunAtomicUnit
+        && site.calls.contains("entity_insert_if_absent_statement")
+        && site.calls.contains("entity_replace_if_unchanged_statement")
 }
 
 pub(super) fn scan_migration_sources(sources: &[(String, String)]) -> Vec<Site> {
@@ -631,8 +583,7 @@ pub(super) fn check_inventory(
                 DetectedClass::WholeObject | DetectedClass::FixedKeySet(_),
             ) => match row.reservation {
                 Reservation::NamedCheck { function, .. } if site.calls.contains(function) => {}
-                Reservation::FinalizedCandidate
-                    if finalization_tests::is_finalized_candidate_site(site, row) => {}
+                Reservation::FinalizedCandidate if is_finalized_candidate_site(site, row) => {}
                 _ => failures.push(format!(
                     "{}: whole-object write lacks its named check/callee",
                     site.key

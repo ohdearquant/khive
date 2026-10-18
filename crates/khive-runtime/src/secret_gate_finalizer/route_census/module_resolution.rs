@@ -1,4 +1,7 @@
-use super::*;
+use super::model::NOTE_PROPERTY_SQL_CONSTANTS;
+use std::collections::{BTreeMap, BTreeSet};
+use syn::visit::Visit;
+use syn::{ItemUse, Pat, PatIdent, UseTree};
 
 /// What a name in scope denotes, as far as the census needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,5 +469,19 @@ pub(super) fn shadow_bindings<'a>(patterns: impl Iterator<Item = &'a Pat>) -> Sq
         .0
         .into_iter()
         .map(|name| (name, Binding::Local))
+        .collect()
+}
+
+pub(super) fn module_parents(module_id: &ModuleId, modules: &ModuleBindings) -> Vec<SqlBindings> {
+    (0..module_id.segments.len())
+        .map(|depth| {
+            modules
+                .get(&ModuleId {
+                    root: module_id.root.clone(),
+                    segments: module_id.segments[..depth].to_vec(),
+                })
+                .cloned()
+                .unwrap_or_default()
+        })
         .collect()
 }

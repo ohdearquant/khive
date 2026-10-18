@@ -1,4 +1,26 @@
-use super::*;
+use super::super::declaration::Substrate;
+use super::ast_helpers::{literal_string, macro_strings, test_only};
+use super::model::{
+    DetectedClass, RouteClass, RuntimeTableSite, Site, SqlConstantReference, ENTITY_BUILDERS,
+    NOTE_BUILDERS, SQL_CONSTANT_EVIDENCE, STORE_WRITES, UNCLASSIFIED_SQL,
+};
+use super::module_resolution::{
+    qualified_target, shadow_bindings, use_bindings, Binding, ModuleBindings, ModuleId, SqlBindings,
+};
+use super::sql_routes::{
+    bare_top_level_path, detected_key_class, detected_keys, entity_first,
+    runtime_table_write_count, sql_fixed_key_paths, sql_write_occurrences,
+};
+use super::static_sql_source;
+use super::static_sql_source::{CanonicalBindings, StaticSqlSources};
+use quote::ToTokens;
+use std::collections::{BTreeMap, BTreeSet};
+use syn::visit::Visit;
+use syn::{
+    Block, Expr, ExprCall, ExprLit, ExprMethodCall, FnArg, ImplItemFn, ItemConst, ItemEnum, ItemFn,
+    ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType, ItemUnion, Lit,
+    Local, Macro, Stmt,
+};
 
 pub(super) struct SourceCollector<'modules> {
     pub(super) sql_sources: &'modules StaticSqlSources,
@@ -501,18 +523,4 @@ pub(super) fn with_declared_types(
         }
     }
     bindings
-}
-
-pub(super) fn module_parents(module_id: &ModuleId, modules: &ModuleBindings) -> Vec<SqlBindings> {
-    (0..module_id.segments.len())
-        .map(|depth| {
-            modules
-                .get(&ModuleId {
-                    root: module_id.root.clone(),
-                    segments: module_id.segments[..depth].to_vec(),
-                })
-                .cloned()
-                .unwrap_or_default()
-        })
-        .collect()
 }
