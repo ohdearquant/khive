@@ -26,7 +26,7 @@ use super::edge_reads::{
     build_edge_filter_sql, build_edge_filter_sql_for_namespaces,
     build_edge_filter_sql_for_namespaces_json, count_neighbor_select, edge_order_clause,
     endpoint_base_case, fold_endpoint_base_row, neighbor_extra_clause, parse_uuid, read_edge,
-    with_live_endpoints,
+    with_live_endpoints, LIVE_ENDPOINTS_CONDITION,
 };
 use super::edge_statements::{
     canonical_edge_endpoints, edge_hard_delete_statement, edge_insert_if_absent_statement,

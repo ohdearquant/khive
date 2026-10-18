@@ -44,8 +44,6 @@ mod write_transaction;
 
 #[path = "graph/guarded_insert.rs"]
 mod guarded_insert;
-#[cfg(test)]
-use guarded_insert::insert_edge_if_absent;
 
 #[path = "graph/symmetric_update.rs"]
 mod symmetric_update;
@@ -59,13 +57,13 @@ pub use symmetric_update::{
 use std::sync::Arc;
 
 #[cfg(test)]
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use khive_storage::error::StorageError;
 #[cfg(test)]
 use khive_storage::types::{
     DeleteMode, EdgeEndpointBaseCounts, EdgeFilter, EdgeSortField, EdgeUpsertRefusal,
-    EdgeUpsertResult, GraphPath, GuardedWriteOutcome, PageRequest, SortDirection, SortOrder,
-    SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    EdgeUpsertResult, GraphPath, PageRequest, SortDirection, SortOrder, SqlStatement, SqlValue,
+    TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
 use khive_storage::types::{
     Direction, Edge, EdgeUpsertRequest, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
