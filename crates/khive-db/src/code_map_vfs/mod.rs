@@ -186,9 +186,22 @@ fn check_quarantine(ledger: &ProcessLedger) -> Result<(), GuardError> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn quarantine_occupancy() -> usize {
-    lock_ledger().quarantined.len()
+    // Diagnostics must not retire ledger entries as the admission lock does.
+    ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .quarantined
+        .len()
+}
+
+pub(crate) fn diagnostics() -> crate::diagnostics::CodeMapVfsDiagnostics {
+    crate::diagnostics::CodeMapVfsDiagnostics {
+        quarantine_occupancy: quarantine_occupancy(),
+        quarantine_cap: QUARANTINE_CAP,
+        registrations: vfs::registration_count(),
+        registration_cap: vfs::REGISTRATION_CAP,
+    }
 }
 
 #[cfg(test)]

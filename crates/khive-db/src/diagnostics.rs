@@ -1506,10 +1506,21 @@ impl WalCeilingDiagnostics {
     }
 }
 
+/// Process-wide code-map VFS counters, sampled independently under each ledger's
+/// mutex. This observe-only diagnostic block has no stability contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CodeMapVfsDiagnostics {
+    pub quarantine_occupancy: usize,
+    pub quarantine_cap: usize,
+    pub registrations: usize,
+    pub registration_cap: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
     pub process: ProcessIdentity,
+    pub code_map_vfs: CodeMapVfsDiagnostics,
     /// Process-lifetime note-search vector route counts, independent of this
     /// report's database file and reset only with the serving process.
     pub note_search_ann_route_total: u64,
@@ -1811,6 +1822,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         return Ok(DbDiagnostics {
             build,
             process,
+            code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
             search_mechanism,
@@ -1873,6 +1885,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     Ok(DbDiagnostics {
         build,
         process,
+        code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
         search_mechanism,
@@ -1947,6 +1960,7 @@ fn collect_inner(
         return DbDiagnostics {
             build,
             process,
+            code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
             search_mechanism,
@@ -2004,6 +2018,7 @@ fn collect_inner(
     DbDiagnostics {
         build,
         process,
+        code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
         search_mechanism,
