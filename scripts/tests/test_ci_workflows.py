@@ -3111,6 +3111,27 @@ class ScopeFixture(unittest.TestCase):
         "crates/j/src/lib.rs": "pub fn g() {}\n",
         "crates/m/Cargo.toml": "[package]\nname = \"m\"\n",
         "crates/m/src/lib.rs": "pub fn h() {}\n",
+        # m compiles a file of k, and j reads a file of m, by naming the path; neither is a dependency edge.
+        "crates/k/src/shared.rs": "pub fn shared() {}\n",
+        "crates/m/tests/reader.rs": "#[path = \"../../k/src/shared.rs\"]\nmod shared;\n",
+        "crates/m/src/table.txt": "rows\n",
+        "crates/j/src/census.rs": "pub const S: &str = include_str!(\"../../m/src/table.txt\");\n",
+        # an include inside its own crate is not a foreign reader
+        "crates/k/tests/own.rs": "#[path = \"../src/lib.rs\"]\nmod own;\n",
+        # j reads files of m through each argument form the scan resolves: a literal on the line after the opener,
+        # a raw string, concat! led by the manifest directory, and a literal prefix with a computed tail (a partial
+        # file name, so only the prefix rule can match it).
+        "crates/m/src/multi.txt": "rows\n",
+        "crates/j/src/multi.rs": "pub const M: &str = include_str!(\n    \"../../m/src/multi.txt\"\n);\n",
+        "crates/m/src/raw.txt": "rows\n",
+        "crates/j/src/raw.rs": "pub const R: &str = include_str!(r#\"../../m/src/raw.txt\"#);\n",
+        "crates/m/src/env.txt": "rows\n",
+        "crates/j/tests/env.rs": "const E: &str = include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/src/env.txt\"));\n",
+        "crates/m/sql/q.sql": "select 1;\n",
+        "crates/j/src/prefix.rs": "macro_rules! q {\n    ($n:literal) => {\n        include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/sql/q\", $n, \".sql\"))\n    };\n}\n",
+        # the same names inside a string literal and comments are not include sites
+        "crates/m/src/ghost.txt": "rows\n",
+        "crates/k/src/fixture.rs": "pub const F: &str = \"include_str!(\\\"../../m/src/ghost.txt\\\")\";\n// include!(\"../../m/src/ghost.txt\")\n/* #[path = \"../../m/src/ghost.txt\"] */\n",
         "crates/.cargo/config.toml": "[build]\n",
         "crates/.config/nextest.toml": "[profile.default]\n",
         "crates/rust-toolchain.toml": "[toolchain]\n",
@@ -3130,7 +3151,15 @@ class ScopeFixture(unittest.TestCase):
     }
     # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
     CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
-                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs"}
+                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs",
+                    "crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                    "crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/j/src/multi.rs",
+                    "crates/m/src/multi.txt", "crates/j/src/raw.rs", "crates/m/src/raw.txt", "crates/j/tests/env.rs",
+                    "crates/m/src/env.txt", "crates/j/src/prefix.rs", "crates/m/sql/q.sql", "crates/m/src/ghost.txt",
+                    "crates/k/src/fixture.rs"}
+    # Crate source that a reader in another crate names: the path rules admit it, the include scan sends it to full.
+    NAMED_ELSEWHERE = {"crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/m/src/multi.txt",
+                       "crates/m/src/raw.txt", "crates/m/src/env.txt", "crates/m/sql/q.sql"}
     # j depends on k, and k on ksub.
     GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
              "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
@@ -3211,7 +3240,8 @@ class TestScopeClassifierTests(ScopeFixture):
         for path in sorted(self.TREE):
             with self.subTest(path=path):
                 verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
-                self.assertEqual(verdict, "map" if path in self.CRATE_SOURCE else "full", reasons)
+                admitted = path in self.CRATE_SOURCE and path not in self.NAMED_ELSEWHERE
+                self.assertEqual(verdict, "map" if admitted else "full", reasons)
         self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
 
     def test_a_full_suite_path_never_reaches_the_binary(self):
@@ -3283,6 +3313,95 @@ class TestScopeClassifierTests(ScopeFixture):
         self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
         self.assertEqual(self.scope(self.base, head)[0], "k")
         self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_file_another_crate_includes_runs_the_full_suite(self):
+        # The closure of k (or m) never reaches m (or j): only the include names the file.
+        for path, reader in (("crates/k/src/shared.rs", "m (crates/m/tests/reader.rs:1)"),
+                             ("crates/m/src/table.txt", "j (crates/j/src/census.rs:1)"),
+                             ("crates/m/src/multi.txt", "j (crates/j/src/multi.rs:1)"),
+                             ("crates/m/src/raw.txt", "j (crates/j/src/raw.rs:1)"),
+                             ("crates/m/src/env.txt", "j (crates/j/tests/env.rs:1)"),
+                             ("crates/m/sql/q.sql", "j (crates/j/src/prefix.rs:3)")):
+            for mode in (("--paths-only",), ()):
+                with self.subTest(path=path, mode=mode):
+                    verdict, reasons = self.scope(self.base, self.change(path), *mode)
+                    self.assertEqual(verdict, "full", reasons)
+                    self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+                    self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_include_scan_prints_its_population_and_skips_same_crate_includes(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("include scan: 7 sites in 8 files, 0 unreadable, 6 naming a path outside the reader's crate", reasons)
+        self.assertIn("named from another crate: crates/k/src/shared.rs <- m (crates/m/tests/reader.rs:1)", reasons)
+        self.assertIn("named from another crate: crates/m/sql/q* <- j (crates/j/src/prefix.rs:3)", reasons)
+
+    def test_includes_in_comments_and_string_literals_are_not_sites(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/ghost.txt"), "--paths-only")
+        self.assertEqual(verdict, "map", reasons)
+        self.assertNotIn("ghost.txt <-", reasons)
+
+    def test_an_include_the_scan_cannot_resolve_runs_the_full_suite(self):
+        self.write("crates/j/src/bad.rs", "pub const B: &str = include_str!(chosen_path());\n")
+        unresolved = self.commit("computed include")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(unresolved, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: cannot resolve 1 include(s) in code: crates/j/src/bad.rs:1", reasons)
+
+    def test_a_path_attribute_inside_an_inline_module_resolves_below_the_module_directory(self):
+        # rustc resolves these below the inline module's directory: from the file's directory for a crate root
+        # (tests/inline.rs), from a directory named after the file otherwise (src/deep.rs). Both name a file of m.
+        self.write("crates/m/src/inl.rs", "pub fn i() {}\n")
+        self.write("crates/m/src/deep.rs", "pub fn d() {}\n")
+        self.write("crates/j/tests/inline.rs", "mod inner {\n    #[path = \"../../../m/src/inl.rs\"]\n    mod x;\n}\n")
+        self.write("crates/j/src/deep.rs", "mod inner {\n    #[path = \"../../../../m/src/deep.rs\"]\n    mod x;\n}\n")
+        # an inline module that carries its own path attribute contributes that path as its directory: only the
+        # two-level "a/b" reaches m, the one-level module name does not
+        self.write("crates/m/src/esc.rs", "pub fn e() {}\n")
+        self.write("crates/j/tests/over.rs",
+                   "#[path = \"a/b\"]\nmod thread {\n    #[path = \"../../../../m/src/esc.rs\"]\n    mod local;\n}\n")
+        base = self.commit("inline module readers")
+        for path, reader in (("crates/m/src/inl.rs", "j (crates/j/tests/inline.rs:2)"),
+                             ("crates/m/src/deep.rs", "j (crates/j/src/deep.rs:2)"),
+                             ("crates/m/src/esc.rs", "j (crates/j/tests/over.rs:3)")):
+            with self.subTest(path=path):
+                self.git("checkout", "-q", "--detach", base)
+                self.write(path, "pub fn changed() {}\n")
+                verdict, reasons = self.scope(base, self.commit("change " + path), "--paths-only")
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+
+    def test_a_path_attribute_nested_in_cfg_attr_at_any_depth_is_a_site(self):
+        self.write("crates/m/src/nested.rs", "pub fn n() {}\n")
+        self.write("crates/j/src/nested.rs",
+                   "#[cfg_attr(all(), cfg_attr(not(any()), path = \"../../m/src/nested.rs\"))]\nmod y;\n")
+        base = self.commit("nested cfg_attr reader")
+        self.write("crates/m/src/nested.rs", "pub fn changed() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change nested"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/m/src/nested.rs is compiled or read by another crate: j (crates/j/src/nested.rs:1)", reasons)
+
+    def test_an_include_path_with_a_line_break_runs_the_full_suite_and_is_never_printed(self):
+        # a raw string can hold a newline; printed as is, the text after it would start a new job-log line
+        self.write("crates/j/src/broken.rs", "pub const B: &str = include_str!(r\"../../m/src/x\n::error::injected\");\n")
+        base = self.commit("include with a line break")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/j/src/broken.rs:1 (a path with a line break)", reasons)
+        self.assertFalse([line for line in reasons.splitlines() if line.startswith("::")], reasons)
+
+    def test_an_include_scan_that_finds_nothing_runs_the_full_suite(self):
+        for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                     "crates/j/src/multi.rs", "crates/j/src/raw.rs", "crates/j/tests/env.rs", "crates/j/src/prefix.rs"):
+            (self.repo / path).unlink()
+        stripped = self.commit("no include sites")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(stripped, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: BROKEN", reasons)
 
     def test_a_missing_binary_runs_the_full_suite(self):
         head = self.change("crates/k/src/lib.rs")
