@@ -47,6 +47,11 @@ impl Fixture {
             dir.path().join("volume-locks"),
         )
         .expect("file-backed WAL backend with two readers");
+        // Entity reads join the attachments table, which only the core migrations install.
+        backend
+            .pool()
+            .run_migrations()
+            .expect("core schema migrations");
         let entities = backend.entities_for_namespace(NAMESPACE).expect("entities");
         let notes = backend.notes_for_namespace(NAMESPACE).expect("notes");
         let graph = backend.graph_for_namespace(NAMESPACE).expect("graph");
