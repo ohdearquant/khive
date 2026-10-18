@@ -108,9 +108,11 @@ jobs:
   # the ADR lints, the marketplace validator, the data-leak guard and the secret scan. The Rust, Python,
   # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
   # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
-  # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
-  # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
-  # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  # ref with its base parent. Pushes to main and to integration branches compare with the newest main
+  # commit whose CI run completed with the Linux test shard green, so a documentation commit that replaces
+  # a waiting run cannot carry an untested code commit past main CI, and a train whose members change
+  # only Markdown skips the suites main already passed. Every other event, and any failed lookup, runs
+  # the full suite.
   #
   # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
   # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
@@ -128,7 +130,7 @@ jobs:
       test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@v7
-        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integration/')))
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
@@ -149,16 +151,21 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
-          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
+          elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
             base=""
             runs=""
             # The checkout is one commit deep. The ancestry test below needs main's history, and the
             # comparison reads paths only, so fetch main's commits and trees without file contents.
+            # An integration branch's own commits sit between its head and main, so its ref is fetched too.
             # A full-depth checkout fetches every branch and tag, and its time grows with their count.
             # A repository that already holds its history is used as it is.
             history=true
+            refspecs=("+refs/heads/main:refs/remotes/origin/main")
+            if [[ "$REF" != "refs/heads/main" ]]; then
+              refspecs+=("+${REF}:refs/remotes/origin/${REF#refs/heads/}")
+            fi
             if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
-                && ! git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "${refspecs[@]}"; then
               history=false
               echo "fetching main's history failed"
             fi
@@ -177,6 +184,7 @@ jobs:
             done <<< "$runs"
             if [[ -n "$base" ]]; then
               echo "Compared with $base, the newest main commit with a completed full run"
+              echo "base=$base" >> "$GITHUB_OUTPUT"
               docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
             else
               echo "full suite: no main commit with a completed full run was found"
@@ -192,24 +200,34 @@ jobs:
       # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
       # successful push run on main published, which ingests this checkout's map and resolves the changed
       # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
-      # and every event other than a pull request writes `full`.
+      # and every event other than a pull request or an integration push writes `full`. An integration push
+      # compares with the newest fully tested main commit that is its ancestor (the Classify step's base).
       - name: Scope
         id: scope
         if: steps.classify.outputs.docs_only != 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
+          TESTED_BASE: ${{ steps.classify.outputs.base }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -uo pipefail
           test_scope=full
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "full suite: $EVENT_NAME runs are never scoped"
-          elif ! base=$(git rev-parse --verify "${HEAD_SHA}^1"); then
-            echo "full suite: the merge ref has no base parent"
+          base=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1") || base=""
+            [[ -n "$base" ]] || echo "full suite: the merge ref has no base parent"
+          elif [[ "$EVENT_NAME" == "push" && "${REF:-}" == refs/heads/integration/* ]]; then
+            # An integration push compares with the newest fully tested main commit the Classify step found.
+            base="${TESTED_BASE:-}"
+            [[ -n "$base" ]] || echo "full suite: no fully tested main commit is an ancestor of this push"
           else
+            echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
+          fi
+          if [[ -n "$base" ]]; then
             mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
             if [[ "$mode" == "map" ]]; then
               binary=""

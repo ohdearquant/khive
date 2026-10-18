@@ -2975,8 +2975,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         lines = output.read_text().splitlines()
-        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only"], lines)
-        return lines[0], completed.stdout + completed.stderr
+        # A push that found a fully tested base also records it, for the Scope step, before docs_only.
+        self.assertIn([line.split("=", 1)[0] for line in lines], (["docs_only"], ["base", "docs_only"]), lines)
+        self.outputs = dict(line.split("=", 1) for line in lines)
+        return lines[-1], completed.stdout + completed.stderr
 
     def merge_ref(self, path, text):
         self.git("checkout", "-q", "-b", "topic")
@@ -3056,9 +3058,64 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
         head = self.commit("documentation")
         for event_name, ref in (("schedule", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main"),
-                                ("push", "refs/heads/integration/train-1")):
+                                ("push", "refs/heads/release/v1")):
             with self.subTest(event_name=event_name, ref=ref):
                 self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
+                self.assertNotIn("base", self.outputs)
+
+    def test_job_integration_push_compares_with_the_newest_fully_tested_main_commit(self):
+        train = "refs/heads/integration/train-1"
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation in the same train")
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(self.base, "success"))
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+        self.assertIn(f"Compared with {untested}", log)
+
+    def test_job_integration_push_fetches_main_and_its_own_branch_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn tested() {}\n")
+        tested = self.commit("main's newest fully tested commit")
+        self.git("checkout", "-q", "-b", "integration/train-1")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a documentation-only train")
+        self.git("checkout", "-q", "main")
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", "-b", "integration/train-1", remote.as_uri(),
+                 str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(tested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), tested, log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
+    def test_job_checks_out_integration_pushes(self):
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        checkout = job.split("- uses: actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+        condition = re.search(r"(?m)^        if: (.+)$", checkout).group(1)
+        self.assertIn("startsWith(github.ref, 'refs/heads/integration/')", condition)
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+
+    def test_job_integration_push_without_a_full_run_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for gh_script in (self.gh_listing(self.base, "skipped"), "exit 1\n"):
+            with self.subTest(gh_script=gh_script):
+                verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                                 gh_script=gh_script)
+                self.assertEqual(verdict, "docs_only=false", log)
+                self.assertNotIn("base", self.outputs)
+                self.assertIn("no main commit with a completed full run", log)
 
 
 FAKE_KKERNEL = r'''#!{python}
@@ -3482,7 +3539,7 @@ esac
         self.runner_temp.mkdir()
         self.gh_log = self.root / "gh.log"
 
-    def run_step(self, event_name, head, runs="201 202", artifact_runs="202"):
+    def run_step(self, event_name, head, runs="201 202", artifact_runs="202", extra_env=None):
         step = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
         match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
         self.assertIsNotNone(match)
@@ -3494,7 +3551,7 @@ esac
             env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
                  "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
-                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake)},
+                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake), **(extra_env or {})},
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         lines = output.read_text().splitlines()
@@ -3525,6 +3582,38 @@ esac
             with self.subTest(event_name=event_name):
                 scope, log = self.run_step(event_name, head)
                 self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def train(self):
+        """Two commits after the tested base: k's source, then m's. The pushed head's parent holds only k's change."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        return self.commit("change crates/m/src/lib.rs")
+
+    def test_an_integration_push_is_scoped_from_the_tested_main_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": self.base})
+        self.assertEqual(scope, "j k m", log)
+        self.assertIn("kkernel from main push run 202", log)
+
+    def test_an_integration_push_without_a_tested_base_runs_the_full_suite(self):
+        head = self.train()
+        for tested_base in ("", None):
+            with self.subTest(tested_base=tested_base):
+                extra = {"REF": "refs/heads/integration/train-1"}
+                if tested_base is not None:
+                    extra["TESTED_BASE"] = tested_base
+                scope, log = self.run_step("push", head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no fully tested main commit is an ancestor of this push", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_main_push_is_never_scoped_even_with_a_tested_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/main", "TESTED_BASE": self.base})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: push runs on refs/heads/main are never scoped", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_an_unavailable_binary_runs_the_full_suite(self):
