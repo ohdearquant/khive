@@ -3090,6 +3090,13 @@ class ScopeFixture(unittest.TestCase):
         "crates/j/src/lib.rs": "pub fn g() {}\n",
         "crates/m/Cargo.toml": "[package]\nname = \"m\"\n",
         "crates/m/src/lib.rs": "pub fn h() {}\n",
+        # m compiles a file of k, and j reads a file of m, by naming the path; neither is a dependency edge.
+        "crates/k/src/shared.rs": "pub fn shared() {}\n",
+        "crates/m/tests/reader.rs": "#[path = \"../../k/src/shared.rs\"]\nmod shared;\n",
+        "crates/m/src/table.txt": "rows\n",
+        "crates/j/src/census.rs": "pub const S: &str = include_str!(\"../../m/src/table.txt\");\n",
+        # an include inside its own crate is not a foreign reader
+        "crates/k/tests/own.rs": "#[path = \"../src/lib.rs\"]\nmod own;\n",
         "crates/.cargo/config.toml": "[build]\n",
         "crates/.config/nextest.toml": "[profile.default]\n",
         "crates/rust-toolchain.toml": "[toolchain]\n",
@@ -3109,7 +3116,8 @@ class ScopeFixture(unittest.TestCase):
     }
     # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
     CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
-                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs"}
+                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs",
+                    "crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs"}
     # j depends on k, and k on ksub.
     GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
              "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
@@ -3262,6 +3270,33 @@ class TestScopeClassifierTests(ScopeFixture):
         self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
         self.assertEqual(self.scope(self.base, head)[0], "k")
         self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_file_another_crate_includes_runs_the_full_suite(self):
+        # The closure of k (or m) never reaches m (or j): only the include names the file.
+        for path, reader in (("crates/k/src/shared.rs", "m (crates/m/tests/reader.rs:1)"),
+                             ("crates/m/src/table.txt", "j (crates/j/src/census.rs:1)")):
+            for mode in (("--paths-only",), ()):
+                with self.subTest(path=path, mode=mode):
+                    verdict, reasons = self.scope(self.base, self.change(path), *mode)
+                    self.assertEqual(verdict, "full", reasons)
+                    self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+                    self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_include_scan_prints_its_population_and_skips_same_crate_includes(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("include scan: 3 sites in 3 files, 2 files named from another crate", reasons)
+        self.assertIn("named from another crate: crates/k/src/shared.rs <- m (crates/m/tests/reader.rs:1)", reasons)
+
+    def test_an_include_scan_that_finds_nothing_runs_the_full_suite(self):
+        for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs"):
+            (self.repo / path).unlink()
+        stripped = self.commit("no include sites")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(stripped, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: BROKEN", reasons)
 
     def test_a_missing_binary_runs_the_full_suite(self):
         head = self.change("crates/k/src/lib.rs")
