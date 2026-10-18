@@ -1489,7 +1489,7 @@ amendment does not change trigger execution or introduce schedule-owned SQL.
 
 ## Amendment (2026-10-17): comm message archival, version 1
 
-**Status**: accepted (2026-10-17).
+**Status**: accepted (2026-10-17; §5 step 7 membership re-resolution revised the same day).
 
 ### Context
 
@@ -1558,13 +1558,14 @@ whole backend.
 **Thread id spellings.** A stored `thread_id` names `R` when, with surrounding whitespace removed,
 it is one of the four UUID text forms of `R`: hyphenated (36 characters), simple (32 hex digits),
 braced (hyphenated inside `{}`) or URN (`urn:uuid:` followed by the hyphenated form), with the hex
-digits in any letter case. This is the set `uuid::Uuid::parse_str` accepts, and it is the only
-definition of membership this amendment uses. The canonical spelling is the lower-case hyphenated
-form. A `thread_id` that is in none of the four forms is not parseable (`malformed` below). The
-set is wider than the spellings the thread reader looks up by exact match
-(`thread_id_query_spellings` in the comm pack's handler validation): that lookup finds a
-mixed-case spelling only when the reading starts from the row that stores it, so it cannot serve
-as a membership test.
+digits in any letter case. This is the set `uuid::Uuid::parse_str` accepts once surrounding
+whitespace is removed (the parser itself does not trim), and it is the only definition of membership
+this amendment uses, at the census (§5 step 4) and at the re-check (§5 step 7) alike. The canonical
+spelling is the lower-case hyphenated form. A `thread_id` that is in none of the four forms is not
+parseable (`malformed` below). The set is wider than the spellings the thread reader looks up by
+exact match (`thread_id_query_spellings` in the comm pack's handler validation): that lookup finds a
+mixed-case spelling only when the reading starts from the row that stores it, so it cannot serve as
+a membership test.
 
 **Thread.** A thread is named by a root UUID `R`. Its members are every live message note in the
 backend whose `thread_id` names `R` in one of those spellings, together with the note `R` itself.
@@ -1665,11 +1666,13 @@ member and records the thread `changed_since_copy`.
 
 The fence covers those two verbs and no other writer. Three writers can also put a message into an
 existing thread and are not fenced: channel ingest, including a reply it correlates to a local
-outbound copy; generic note creation of kind `message`; and note stream appends of kind
-`message`. A message one of them writes before the archive commits keeps the thread live, because
-the re-check finds it. One written after the archive commits starts with no live root, as a
-message naming a hard-deleted root does today. Fencing them would change those writers'
-contracts and is outside this version.
+outbound copy; generic note creation of kind `message`; and note stream appends of kind `message`. A
+message one of them creates before the archive commits keeps the thread live, because the re-check
+finds it (§5 step 7). One created after the archive commits starts with no live root, as a message
+naming a hard-deleted root does today. A rewrite of an existing message's `thread_id` after the
+census is the one case the re-check cannot see; §5 step 7 names the guards that keep the generic
+note verbs from doing it. Fencing them would change those writers' contracts and is outside this
+version.
 
 #### 5. How a run proceeds
 
@@ -1686,8 +1689,9 @@ contracts and is outside this version.
    journal's state.
 2. **Journal layout.** Runs are recorded in comm-owned tables, `comm_archive_runs` and one row per
    thread: run id, the database path read, the archive file path and format version, the selection
-   parameters (`before` and the thread bound), the state (`copying`, `verified`, `complete` or
-   `abandoned`), and each thread's outcome.
+   parameters (`before`, the clock reading of §1 and the thread bound), the census high-water mark
+   of step 4, the state (`copying`, `verified`, `complete` or `abandoned`), and each thread's
+   outcome.
 3. **Recover earlier runs first.** Holding the lock, and before writing any journal row of its own,
    a run settles every journal entry left non-terminal by an earlier invocation:
    - an entry that never reached `verified` deleted nothing, so its file is discarded and the
@@ -1697,9 +1701,13 @@ contracts and is outside this version.
      path, it refuses and deletes nothing more. Threads that already have an outcome keep it.
      Threads without one go through step 7. The invocation then completes that entry and stops,
      writing no entry of its own; a new selection waits for the next invocation.
-4. **Select and admit.** The run performs the selection of §2, then estimates the archive's size
-   from the selected rows' serialized size plus the manifest, and requires that much free space on
-   the archive volume with a stated margin. When the space is not there, it refuses with no
+4. **Select and admit.** The run first reads the census high-water mark: the largest `notes_seq`
+   value in the backend. `notes_seq` assigns each note id one integer when the id is first
+   inserted, in the insert's own transaction, and never reuses a value, even after the row it
+   named is deleted, so every message note created after this read carries a larger value. The run
+   then performs the selection of §2, then estimates the archive's size from the selected rows'
+   serialized size plus the manifest, and requires that much free space on the archive volume with
+   a stated margin. When the space is not there, it refuses with no
    journal entry and no file. File writes never happen while the source writer is held.
 5. **Journal, then copy.** The run inserts its own journal entry in state `copying`, and only then
    creates the archive file, so no archive file exists without an entry that owns it. The
@@ -1725,13 +1733,15 @@ contracts and is outside this version.
    short of `verified` has deleted nothing.
 7. **Delete, one thread per transaction.** For each thread in the file, one atomic unit on the
    source writer:
-   - re-checks every condition of §2 for every member and compares each member's digest with the
-     copy. Membership is resolved again by exact match on the eight formatter spellings of `R`
-     (lower- and upper-case hyphenated, simple, braced and URN), which the thread index can seek.
-     A member in any other accepted spelling that existed at the census already kept the thread
-     out of the run as `legacy_thread`. One written in such a spelling after the census, which
-     only a writer that stores a caller's spelling verbatim can do, is not found here and ends as
-     a write by an unfenced writer after the commit does (§4): it names a root that is gone;
+   - resolves the thread's membership again with the same parse as §2, as the union of two
+     lookups: an exact match on the eight formatter spellings of `R` (lower- and upper-case
+     hyphenated, simple, braced and URN), which the thread index can seek and which finds every
+     member the census admitted, since a thread with a member in any other spelling was skipped as
+     `legacy_thread`; and the parse of §2 applied to the `thread_id` of every message note whose
+     `notes_seq` value is above the census high-water mark, which finds a member created after the
+     census in any accepted spelling;
+   - re-checks every condition of §2 for every member so resolved and compares each member's digest
+     with the copy; a member the copy does not hold is a member added since the copy;
    - applies the prepared deletion statements ordinary hard deletion uses for each member: the
      note row, its FTS document and rowid mapping, its vectors with their provenance and
      approximate-index delete log for each registered embedding model, and its `NoteDeleted`
@@ -1740,6 +1750,16 @@ contracts and is outside this version.
      edges; for a thread that passed the re-check those statements affect no rows. The schema's
      stream-entry guard stays in force;
    - records the thread's outcome in the journal.
+
+   Both lookups run inside the thread's transaction on the source writer, so no write commits
+   between the re-resolution and the deletion: the window between them is empty. What the
+   high-water mark cannot see is a message note that existed at the census, was not a member
+   then, and joins the thread later by a rewrite of its own `thread_id`, because a rewrite assigns
+   no new `notes_seq` value. The generic note update refuses a patch that names `thread_id` on a
+   message (it is an owner-established property), and a merge keeps the surviving record's value,
+   so neither does this; any other path that rewrites an existing message's `thread_id` to a
+   spelling outside the eight is not found here and ends as a write by an unfenced writer after
+   the commit does (§4). This amendment adds no such path.
 
    Statement preparation happens before the writer is taken, and the note-mutation hook fires
    after the commit, as it does for an ordinary hard delete. A thread is never split across
@@ -1765,8 +1785,10 @@ soft-deleted rows. The existing outbound-reference index excludes soft-deleted r
 namespace, kind, direction and sender, so the implementation adds a non-partial index led by the
 outbound reference itself. The census parses every message note's `thread_id` once, so its cost
 follows the number of message notes. The re-check inside step 7 is bounded by the thread bound,
-except for its two backend-wide lookups: the membership lookup and the check that no other note
-names an outbound copy. The thread index leads with namespace, so the membership lookup walks the
+except for its three backend-wide lookups: the formatter-spelling membership lookup, the parse of
+the message notes created since the census, and the check that no other note names an outbound
+copy. The second follows the number of message notes written during the run, through the
+`notes_seq` primary key. The thread index leads with namespace, so the membership lookup walks the
 namespaces that hold notes and seeks each one, as the edge cascade walks the namespaces of
 `graph_edges`; its cost inside the writer follows the number of namespaces, not the size of the
 backend. The outbound-reference lookup seeks the index above directly.
@@ -1791,6 +1813,19 @@ backend. The outbound-reference lookup seeks the index above directly.
   into an archived thread by an unfenced writer (§4) has no live root.
 - Integrity probes that report attachment rows without an owner are unaffected, because archived
   messages own none.
+
+### Acceptance
+
+The implementation carries, besides tests for each rule above:
+
+- crash injection at every step boundary of §5 (after the copy and before `verified`, after
+  `verified` and between thread transactions, and before `complete`), each followed by a new run
+  that settles the earlier entry as step 3 says, with no message absent from both the live store
+  and the archive and none deleted that the archive does not hold;
+- for each of the four spellings in upper, lower and mixed case, a message created into a selected
+  thread after the census, with the thread recorded `changed_since_copy` and its root still live;
+  with the post-census parse removed from step 7, the mixed-case cases must fail;
+- the `before` refusal at the minimum age, for `dry_run` too.
 
 ### Out of scope
 
