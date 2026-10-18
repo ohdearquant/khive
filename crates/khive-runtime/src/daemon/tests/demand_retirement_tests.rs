@@ -189,6 +189,10 @@ fn pool_transaction_probe_detects_own_and_ignores_foreign_database() {
 #[tokio::test(start_paused = true)]
 #[serial(background_tasks, tx_registry, active_phases)]
 async fn retained_raw_sql_writer_blocks_actual_idle_wait_and_persistent_stays() {
+    // Unrelated tests must not contribute process-wide transaction spans.
+    if crate::test_process::run_in_child() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let pool = Arc::new(
         ConnectionPool::new(khive_db::PoolConfig {
@@ -295,6 +299,10 @@ async fn persistent_idle_wait_never_retires_after_writer_release() {
 #[tokio::test(start_paused = true)]
 #[serial(background_tasks, tx_registry, active_phases)]
 async fn explicit_sql_reader_transaction_blocks_retirement_without_writer_hold() {
+    // Unrelated tests must not contribute process-wide transaction spans.
+    if crate::test_process::run_in_child() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let pool = Arc::new(
         ConnectionPool::new(khive_db::PoolConfig {
