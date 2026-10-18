@@ -1180,6 +1180,27 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
 
+    def test_every_benchmarked_library_stays_out_of_cargo_bench(self):
+        # `cargo bench --benches` also runs every target whose `bench` flag is on, and a library's defaults to on.
+        # Its libtest harness rejects the Criterion flags the quick profile passes (`--quick`, `--noplot`), so a
+        # benchmarked crate whose library is not `bench = false` fails the whole component run.
+        import tomllib
+
+        benchmarked, offenders = [], []
+        for manifest in sorted((REPO_ROOT / "crates").glob("*/Cargo.toml")):
+            data = tomllib.loads(manifest.read_text())
+            if "package" not in data:
+                continue
+            auto = data["package"].get("autobenches", True) and list((manifest.parent / "benches").glob("*.rs"))
+            if not (data.get("bench") or auto):
+                continue
+            benchmarked.append(manifest.parent.name)
+            has_lib = "lib" in data or (manifest.parent / "src" / "lib.rs").exists()
+            if has_lib and data.get("lib", {}).get("bench", True) is not False:
+                offenders.append(manifest.parent.name)
+        self.assertTrue(benchmarked, "no benchmarked crate found: the manifest scan read nothing")
+        self.assertEqual(offenders, [], "set `[lib] bench = false` in these crates' Cargo.toml")
+
     SELECT_NAME = "Select the component's crates that have a bench target"
 
     def component_step(self, name):
