@@ -15,8 +15,7 @@ use crate::hook::FindingHook;
 use crate::vocab::{CODE_EDGE_RULES, CODE_HANDLERS, CODE_NOTE_KIND_SPECS};
 
 /// Code ontology pack — additive edge rules over four concept subtypes, the
-/// `finding` audit-observation note kind, and the `code.ingest` verb
-/// (ADR-085 Amendment 2).
+/// `finding` audit-observation note kind, and source ingest plus registered-map read verbs (ADR-085, ADR-139).
 ///
 /// See `crates/khive-pack-code/docs/code-ontology.md`.
 pub struct CodePack {
@@ -39,7 +38,7 @@ impl Pack for CodePack {
 }
 
 impl CodePack {
-    /// Bind the code vocabulary pack to `runtime`; the pack registers no verbs.
+    /// Bind the code vocabulary and source-map verbs to `runtime`.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
@@ -77,6 +76,9 @@ impl PackRuntime for CodePack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "code.ingest" => self.handle_ingest(params).await,
+            "code.list" => self.handle_list(params).await,
+            "code.search" => self.handle_search(params).await,
+            "code.deps" => self.handle_deps(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "code pack does not handle verb {verb:?}"
             ))),

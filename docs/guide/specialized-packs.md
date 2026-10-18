@@ -2,7 +2,8 @@
 
 khive's default install loads fourteen production packs
 (`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob`, per
-`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes one verb, `code.ingest` (L1 manifest + L1.5
+`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes `code.list`, `code.search`, and `code.deps` for registered-map
+reads ([ADR-139](../adr/ADR-139-code-map-read-access.md)), plus `code.ingest` (L1 manifest + L1.5
 import-scan source ingestion into a dedicated map database, see
 [ADR-085](../adr/ADR-085-code-pack.md)), alongside its `finding` note kind and
 edge rules; `findings.json` ingestion remains an admin CLI path. `workspace`
