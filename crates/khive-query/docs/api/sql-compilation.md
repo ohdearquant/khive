@@ -8,6 +8,49 @@ The SQL compiler lowers a validated `GqlQuery` into a read-only, parameterized `
 
 As defense in depth, the final statement must begin with `SELECT` or `WITH`. Parser guards already reject writes, and the database reader is independently read-only; this compiler check prevents a future lowering path from emitting a mutation by mistake.
 
+## `compile_with_mailbox`
+
+`compile_with_mailbox(query, options, mailbox)` additionally applies a
+`QueryMailboxScope { actor_id, legacy_local }` supplied by the runtime. This is a
+pure compilation API: it does not authenticate callers or authorize delegation.
+The runtime derives the partition from its caller identity; query text cannot
+select another mailbox. The original `compile` entry remains available for
+unscoped SQL construction.
+
+The partition is applied to note rows in both the primary-node union and typed
+observation targets. Ordinary note kinds remain visible. Message rows require a
+text `to_actor` matching the caller for `direction = "inbound"`, or a text
+`from_actor` matching the caller for `direction = "outbound"`. JSON arrays,
+objects, numbers and booleans cannot impersonate text actor labels. Only the
+anonymous, non-delegated local caller receives the existing legacy partition:
+missing/null routing for the relevant direction, or missing/null direction with
+neither actor field holding text. A named actor whose label is `local` does not
+receive that legacy access.
+
+Canonical edges are filtered at every source: edge rows projected as nodes,
+fixed joins, and both the seed and step of recursive traversal. For each endpoint,
+an entity with the same UUID takes precedence, including a deleted entity and
+regardless of its namespace. If no such entity exists, a message note with that
+UUID must pass the mailbox partition, including when the note is deleted. Other
+endpoints pass this mailbox check. Missing routing is a refusal rather than SQL
+`NULL` escaping the edge anti-join. This identity check does not make deleted or
+out-of-scope node rows queryable; their existing row filters still apply.
+
+Actual note rows are independently filtered even when an entity shares their
+UUID. Synthetic observation targets keep their explicit `referent_kind`, so an
+entity referent cannot expose the equal-ID hidden note. Event payloads are not
+recursively inspected or redacted by this partition.
+
+The actor is bound once as a text parameter and reused across source predicates.
+Visibility filtering precedes matching, ordering, `DISTINCT`, `LIMIT` and `OFFSET`,
+including intermediate recursive nodes. Paging and sentinel counts therefore
+range over the filtered result. Namespace options and query limits are unchanged.
+
+This compiler operates on one database. Generic graph endpoint resolution can
+search all configured backends. If an entity exists only in another backend,
+the single-database query can withhold an edge that a generic graph read permits.
+This API does not add cross-backend query federation.
+
 ## `CompileOptions`
 
 `scopes` supplies namespace filters. An empty vector means cross-namespace; otherwise every applicable table is filtered with bound parameters. Query text cannot supply this value.

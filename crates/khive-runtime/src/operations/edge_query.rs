@@ -41,7 +41,7 @@ impl KhiveRuntime {
 
     /// Execute a GQL or SPARQL query string, returning raw SQL rows.
     ///
-    /// The query is compiled to SQL with the namespace scope applied.
+    /// The query is compiled to SQL with namespace and own-mailbox scopes applied.
     /// GQL syntax: `MATCH (a:concept)-[e:extends]->(b) RETURN a, b LIMIT 10`
     /// SPARQL syntax: `SELECT ?a WHERE { ?a :kind "concept" . }`
     pub async fn query(&self, token: &NamespaceToken, query: &str) -> RuntimeResult<Vec<SqlRow>> {
@@ -74,7 +74,19 @@ impl KhiveRuntime {
             .iter()
             .map(|ns| ns.as_str().to_string())
             .collect();
-        let compiled = khive_query::compile(&ast, &opts)?;
+        let mailbox = crate::MailboxView {
+            actor_id: token.actor().id.clone(),
+            delegated: false,
+        }
+        .note_scope(token);
+        let compiled = khive_query::compile_with_mailbox(
+            &ast,
+            &opts,
+            &khive_query::QueryMailboxScope {
+                actor_id: mailbox.actor_id,
+                legacy_local: mailbox.legacy_local,
+            },
+        )?;
         let mut warnings = compiled.warnings;
         let truncation_check = compiled.truncation_check;
 

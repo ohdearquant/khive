@@ -113,10 +113,10 @@ impl KhiveRuntime {
             // Generic message reads have no cross-actor selector. The caller
             // still needs the ordinary verb gate decision and a row-level
             // mailbox filter before any message can be returned.
-            "list" | "search" | "get" | "context" | "neighbors" => None,
+            "list" | "search" | "get" | "context" | "neighbors" | "query" => None,
             _ => {
                 return Err(RuntimeError::InvalidInput(
-                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe, list, search, get, context and neighbors"
+                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe, list, search, get, context, neighbors and query"
                         .into(),
                 ));
             }
