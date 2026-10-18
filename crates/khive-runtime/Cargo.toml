@@ -16,6 +16,7 @@ contract-faults = []
 fault-injection = []
 test-internals = ["khive-db/test-support"]
 
+# Disable libtest's bench target: it rejects Criterion flags passed with --benches.
 [lib]
 bench = false
 

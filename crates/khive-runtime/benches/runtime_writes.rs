@@ -275,7 +275,11 @@ fn assert_imported_archive(actual: &mut KgArchive, expected: &KgArchive) {
     assert_eq!(actual.edges.len(), ROWS);
     actual.entities.sort_unstable_by_key(|entity| entity.id);
     actual.edges.sort_unstable_by_key(|edge| edge.edge_id);
-    for (got, want) in actual.entities.iter().zip(&expected.entities) {
+    let mut expected_entities: Vec<_> = expected.entities.iter().collect();
+    let mut expected_edges: Vec<_> = expected.edges.iter().collect();
+    expected_entities.sort_unstable_by_key(|entity| entity.id);
+    expected_edges.sort_unstable_by_key(|edge| edge.edge_id);
+    for (got, want) in actual.entities.iter().zip(expected_entities) {
         assert_eq!(got.id, want.id);
         assert_eq!(
             serde_json::to_value(got).expect("serialize persisted entity"),
@@ -284,7 +288,7 @@ fn assert_imported_archive(actual: &mut KgArchive, expected: &KgArchive) {
             want.id
         );
     }
-    for (got, want) in actual.edges.iter().zip(&expected.edges) {
+    for (got, want) in actual.edges.iter().zip(expected_edges) {
         assert_eq!(got.edge_id, want.edge_id);
         assert_eq!(
             serde_json::to_value(got).expect("serialize persisted edge"),

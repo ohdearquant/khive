@@ -1,11 +1,7 @@
 # Runtime benchmarks
 
 `runtime_reads` and `runtime_writes` measure the composable runtime API with
-Criterion 0.5. Run from `crates/`:
-
-```sh
-cargo bench -p khive-runtime --benches -- --quick --noplot
-```
+Criterion 0.5.1.
 
 These are service-level, in-memory SQLite workloads, not daemon, network, disk
 durability, model inference, or pack-dispatch measurements. Each target uses one
@@ -13,6 +9,28 @@ current-thread Tokio executor; SQLite's own blocking work retains its normal
 execution path. Both targets use ten samples, a 100 ms warmup and a one-second
 measurement target unless Criterion command-line options override them. Setup can
 make total wall time substantially longer than the measured interval.
+
+## Run commands
+
+A qualified-host baseline runs every scenario with its target's own Criterion
+configuration. Run from `crates/`:
+
+```sh
+cargo bench -p khive-runtime --benches -- --noplot
+```
+
+For a quick trend observation, run from the same directory:
+
+```sh
+cargo bench -p khive-runtime --benches -- --quick --noplot
+```
+
+Quick mode skips the warmup, ignores the configured sample count and keeps only
+two timings. It doubles the iteration count until its variation target is met
+after at least 100 ms, or the measurement time runs out. A first iteration that
+exceeds that time yields two nearly identical values from that one timing.
+Quick-mode results are trend observations only and never enter a qualified
+baseline.
 
 ## Scenarios
 
@@ -32,7 +50,7 @@ there are no measured values in this initial ledger.
 | `runtime_entity_attachments`  | `{100,500}`                    | Sequential `create_entity_with_attachments` calls                   | Fresh runtime; one prepublished 1 KiB content blob shared by the batch                    | pending  |
 | `runtime_atomic_unit`         | `{1,3,5}`                      | `run_atomic_unit` for prepared entity-create plans                  | Fresh runtime; prepare excluded, row/FTS writes and commit included                       | pending  |
 | `runtime_keyed_memory_create` | `{100,500}`                    | Sequential `create_keyed_memory` calls                              | Fresh runtime, distinct keys, no embedding provider                                       | pending  |
-| `runtime_import_kg`           | `10k_entities_10k_edges`       | `import_kg`, including validation, writes and reindexing            | Fresh destination, generated archive; entities/sec                                        | pending  |
+| `runtime_import_kg`           | `10k_entities_10k_edges`       | `import_kg`, including validation, writes and FTS reindexing        | Fresh destination, generated archive, no embedding model; entities/sec                    | pending  |
 
 ### Fixture and timing contract
 
@@ -43,12 +61,19 @@ use, so no model is loaded. It measures runtime overhead plus vector allocation,
 not inference speed or embedding quality. Search uses deterministic, nonempty
 matching text. Entity hybrid vectors are seeded, varied and normalized.
 
+Every note-search query matches every note: all notes contain the same query
+terms. The `terms_{1,3,5}` axis varies query length, not match count. The
+`runtime_embed_batch_stub` timings include fixed per-call work: an environment
+read for the deadline, admission/timeout bookkeeping, model-alias parsing and
+usage counting, in addition to warm provider lookup and vector allocation.
+
 Read fixtures are built once per group and each scenario is exercised before its
 timing loop. Those checks reject empty searches, wrong cardinalities and missing
 graph/archive content. The BFS sizes at depths 1–4 are 5, 21, 85 and 341 nodes,
 including the root; the full graph still contains 10K nodes and edges.
 
-The import archive uses `concept -[extends]-> concept`, which the runtime's
+The import fixture has no embedding model, so its reindexing is FTS only. The
+import archive uses `concept -[extends]-> concept`, which the runtime's
 endpoint contract accepts. The read/export fixture retains its original
 `depends_on` relation. Storage seeding alone does not validate endpoint kinds;
 `import_kg` does, so an invalid relation would measure skipped edges. Each import
@@ -71,33 +96,31 @@ result disposal. Executor entry is included throughout.
 The note-create corpus starts with 10K notes and FTS documents, without vectors
 for those existing notes. The timed new note receives one embedding. The entity
 attachment row measures metadata attachment to an existing blob, not upload or
-hashing of 100/500 independent blobs. Atomic timing excludes deferred
+hashing of 100/500 independent blobs. Its fixture also has no embedding model;
+entity indexing is FTS only. Atomic timing excludes deferred
 post-commit effects; its runtime has no embedding provider.
 
-### Corrections to the initial scenario request
+### Search and traversal workloads
 
-`hybrid_search` returns entities (`src/retrieval.rs`), so a note-only fixture
-cannot measure that path. The corresponding group uses 10K **entities** and
-vectors; the separate note-search group covers 10K notes. `neighbors`
-(`src/operations/traversal.rs`) is single-hop and has no depth argument. Depth
-coverage is therefore provided by BFS, with distinct group names. No
-single-hop result is represented as a depth-two traversal measurement.
+`hybrid_search` returns entities (`src/retrieval.rs`); its group uses 10K entities
+and vectors. The separate note-search group covers 10K notes. `neighbors`
+(`src/operations/traversal.rs`) measures one outgoing hop from a root with four
+children. BFS measures traversal at depths 1–4 in its own group.
 
 ## Performance guarantees
 
-The requested advisory rows are retained below, with their scenario corrections
-called out explicitly above. These are measurement goals, not numerical promises
-or enforced latency thresholds. All current baselines, including machine,
-toolchain and measured commit, are pending.
+These rows define advisory measurement goals, not numerical promises or enforced
+latency thresholds. All current baselines, including machine, toolchain and
+measured commit, are pending.
 
-| Operation       | Input                             | Metric         | Bound                                        | Baseline                                 |
-| --------------- | --------------------------------- | -------------- | -------------------------------------------- | ---------------------------------------- |
-| create_note     | single note + 1 embedding         | latency median | Advisory trend against the recorded baseline | pending                                  |
-| search_notes    | 10K notes, 3 terms, top_k=20      | latency median | Advisory trend against the recorded baseline | pending                                  |
-| hybrid_search   | 10K notes + 10K vectors, top_k=10 | latency median | Advisory trend against the recorded baseline | pending; entity fixture correction above |
-| neighbors       | 10K edges, depth=2                | latency median | Advisory trend against the recorded baseline | pending; one-hop/BFS distinction above   |
-| run_atomic_unit | 5-op atomic                       | latency median | Advisory trend against the recorded baseline | pending                                  |
-| export_kg       | 10K entities + 10K edges          | throughput     | Advisory trend against the recorded baseline | pending                                  |
+| Operation       | Input                                                | Metric         | Bound                                        | Baseline |
+| --------------- | ---------------------------------------------------- | -------------- | -------------------------------------------- | -------- |
+| create_note     | single note + 1 embedding                            | latency median | Advisory trend against the recorded baseline | pending  |
+| search_notes    | 10K notes, 3 terms, top_k=20                         | latency median | Advisory trend against the recorded baseline | pending  |
+| hybrid_search   | 10K entities + 10K vectors, top_k=10                 | latency median | Advisory trend against the recorded baseline | pending  |
+| neighbors       | 10K edges, one outgoing hop, root with four children | latency median | Advisory trend against the recorded baseline | pending  |
+| run_atomic_unit | 5-op atomic                                          | latency median | Advisory trend against the recorded baseline | pending  |
+| export_kg       | 10K entities + 10K edges                             | throughput     | Advisory trend against the recorded baseline | pending  |
 
 Criterion's headline time estimate is not automatically a median. Record the
 median estimate from each scenario's `new/estimates.json` for latency rows, and
@@ -105,8 +128,15 @@ derive export/import entities/sec from the recorded time estimate with its
 statistic named. Keep the full Criterion output so dispersion is available.
 
 A recorded baseline must identify the full commit, Rust toolchain, OS, CPU,
-memory, command, Criterion options, runtime/storage configuration and fixture
-seed. Keep a fixed reference alongside later observations. Compare like
+memory, command, Cargo features, Criterion options, runtime/storage configuration
+and fixture seed. The benchmark's self dev-dependency enables `khive-runtime`'s
+`fault-injection` and `test-internals` features; dev-dependencies also enable
+`khive-db/test-support`, `khive-storage/test-support` and Tokio's `test-util`.
+This differs from the shipped binaries' normal dependency on `khive-runtime`,
+which enables none of that crate's optional features. Record these benchmark
+features alongside any additional command-line feature selections.
+
+Keep a fixed reference alongside later observations. Compare like
 scenarios and report uncertainty; no fixed-percentage timing regression gate is
-introduced here. Every requested row is advisory timing or throughput, so this
+introduced here. Every row is advisory timing or throughput, so this
 suite introduces no allocation/count guarantee or associated deterministic gate.
