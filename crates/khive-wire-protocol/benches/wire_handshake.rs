@@ -8,11 +8,11 @@ fn main() {
     use std::time::{Duration, Instant};
     let mut c = Criterion::default()
         .sample_size(10)
-        .sampling_mode(SamplingMode::Flat)
         .warm_up_time(Duration::from_millis(100))
         .measurement_time(Duration::from_secs(1))
         .configure_from_args();
     let mut group = c.benchmark_group("wire_handshake");
+    group.sampling_mode(SamplingMode::Flat);
     group.throughput(Throughput::Elements(1));
     for operation in handshake::Operation::ALL {
         let mut fixture = None;
