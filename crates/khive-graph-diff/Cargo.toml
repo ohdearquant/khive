@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Pure deterministic graph-state diffs over entity, edge, and note NDJSON"
 
 [dependencies]
-khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
