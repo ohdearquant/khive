@@ -62,12 +62,16 @@ in `proofs/Retrieval/Distance.lean` cover the ADR-030 phase-2 formalization. The
 
 ## Verification and benchmarks
 
-The conversion tests are the inline `#[cfg(test)]` module in
-[`distance.rs`](../../src/distance.rs). Benchmarks in
-[`benches/score_ops.rs`](../../benches/score_ops.rs) cover the `distance_cosine`, `distance_l2`,
-and `distance_dot` targets.
+The conversion tests are the `#[cfg(test)]` module that
+[`distance.rs`](../../src/distance.rs) declares, in
+[`distance_tests.rs`](../../src/distance_tests.rs). Benchmarks in
+[`benches/score_ops.rs`](../../benches/score_ops.rs) cover `score_from_distance_lossy` in the
+`score_from_distance` group (`cosine_scalar`, `l2_scalar`, `dot_scalar` and their
+`_batch_1000` forms).
 
 ```bash
+cd crates
+
 # Run all distance conversion tests
 cargo test -p khive-score distance
 
