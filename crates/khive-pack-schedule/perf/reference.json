@@ -1,0 +1,239 @@
+{
+ "benches": {
+  "schedule/agenda/10": {
+   "a": {
+    "ci_hi_ns": 137159.60837438423,
+    "ci_lo_ns": 137037.8501642036,
+    "median_ns": 137105.1855500821
+   },
+   "aa_spread": 1.014,
+   "b": {
+    "ci_hi_ns": 139144.0948771304,
+    "ci_lo_ns": 138913.95988740324,
+    "median_ns": 139029.09106271926
+   },
+   "clock_khz_median": {
+    "a": 3548702.5,
+    "b": 3549174
+   },
+   "median_ns": 138067.138,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.0,
+     "clock_band": 0.004395409308049914,
+     "other_busy_max": 12.1
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.019230769230769232,
+     "clock_band": 0.005116119976084577,
+     "other_busy_max": 23.8
+    }
+   }
+  },
+  "schedule/agenda/100": {
+   "a": {
+    "ci_hi_ns": 359472.25757575757,
+    "ci_lo_ns": 358967.2194510036,
+    "median_ns": 359202.6647727273
+   },
+   "aa_spread": 1.0046,
+   "b": {
+    "ci_hi_ns": 361088.37012987013,
+    "ci_lo_ns": 360667.3772044601,
+    "median_ns": 360860.11363636365
+   },
+   "clock_khz_median": {
+    "a": 3548702.5,
+    "b": 3549174
+   },
+   "median_ns": 360031.389,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.0,
+     "clock_band": 0.004395409308049914,
+     "other_busy_max": 12.1
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.019230769230769232,
+     "clock_band": 0.005116119976084577,
+     "other_busy_max": 23.8
+    }
+   }
+  },
+  "schedule/cancel": {
+   "a": {
+    "ci_hi_ns": 711415.5,
+    "ci_lo_ns": 695190.0,
+    "median_ns": 702617.75
+   },
+   "aa_spread": 1.0182,
+   "b": {
+    "ci_hi_ns": 729165.0,
+    "ci_lo_ns": 704700.5,
+    "median_ns": 715417.5
+   },
+   "clock_khz_median": {
+    "a": 3548702.5,
+    "b": 3549174
+   },
+   "median_ns": 709017.625,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.0,
+     "clock_band": 0.004395409308049914,
+     "other_busy_max": 12.1
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.019230769230769232,
+     "clock_band": 0.005116119976084577,
+     "other_busy_max": 23.8
+    }
+   }
+  },
+  "schedule/remind": {
+   "a": {
+    "ci_hi_ns": 2322650.6666666665,
+    "ci_lo_ns": 2264691.3333333335,
+    "median_ns": 2291184.166666667
+   },
+   "aa_spread": 1.0024,
+   "b": {
+    "ci_hi_ns": 2304420.6666666665,
+    "ci_lo_ns": 2268502.833333333,
+    "median_ns": 2285781.0
+   },
+   "clock_khz_median": {
+    "a": 3548702.5,
+    "b": 3549174
+   },
+   "median_ns": 2288482.583,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.0,
+     "clock_band": 0.004395409308049914,
+     "other_busy_max": 12.1
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.019230769230769232,
+     "clock_band": 0.005116119976084577,
+     "other_busy_max": 23.8
+    }
+   }
+  },
+  "schedule/schedule": {
+   "a": {
+    "ci_hi_ns": 778412.4057971014,
+    "ci_lo_ns": 764174.4137931035,
+    "median_ns": 766614.4708333333
+   },
+   "aa_spread": 1.0075,
+   "b": {
+    "ci_hi_ns": 784588.3074186991,
+    "ci_lo_ns": 768118.4166666666,
+    "median_ns": 772374.1114951357
+   },
+   "clock_khz_median": {
+    "a": 3548702.5,
+    "b": 3549174
+   },
+   "median_ns": 769494.291,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.0,
+     "clock_band": 0.004395409308049914,
+     "other_busy_max": 12.1
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.019230769230769232,
+     "clock_band": 0.005116119976084577,
+     "other_busy_max": 23.8
+    }
+   }
+  }
+ },
+ "class": {
+  "cores": "2,3",
+  "cpu": "AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics",
+  "cpufreq": {
+   "driver": "amd-pstate-epp",
+   "epp": [
+    "performance"
+   ],
+   "governor": [
+    "performance"
+   ],
+   "max_khz": [
+    "3600000"
+   ]
+  },
+  "host": "Ubuntu-noble-latest-amd64-base.zst",
+  "kernel": "6.8.0-142-generic",
+  "mode": "reference",
+  "profile": "bench",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "window": "03:55-05:00Z"
+ },
+ "commands": {
+  "khive-pack-schedule:schedule_bench": {
+   "a": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-schedule --locked --bench schedule_bench -- --save-baseline aa-a --noplot",
+   "b": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-schedule --locked --bench schedule_bench -- --save-baseline aa-b --noplot"
+  }
+ },
+ "crate": "khive-pack-schedule",
+ "criterion": "the benchmark's own configuration (no time or sample-size override)",
+ "evidence": {
+  "archive": {
+   "location": "outside the repository",
+   "manifest": "MANIFEST.sha256 (sha256 of every stored file)",
+   "manifest_sha256": "69943a791885867d7bd34b92e40fcd513662b9281e1d07bb1d68f011aaeac6ca"
+  },
+  "band_bound": {
+   "basis": "both-core-bound",
+   "freq_band": 0.1,
+   "max_over_min_all_runs": 0.0189,
+   "why": "the run's sampler recorded one mean busy share for the pinned cores, so the loaded core per sample is not recoverable; the band was read on both pinned cores' readings with the idle floor dropped, a superset of any loaded-core selection"
+  },
+  "job": "bb-ref-212bf72e",
+  "reduced_from_stored_run": "verdicts applied to the run's stored files after the run's own reduction code reproduced its recorded verdicts for all 20 crates (ADR-206 Amendment 2, First references)"
+ },
+ "excluded_targets": {},
+ "load1": {
+  "end": "1.59",
+  "start": "5.65"
+ },
+ "pin_status": {
+  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3543900\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549747\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3549083\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3539321\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3548464\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3550098\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+ },
+ "reduction": {
+  "aa_spread": "max(a,b)/min(a,b)",
+  "busy": "fraction of samples with a CPU outside the pinned cores above busy_max, judged against busy_frac_max; other_busy_max is logged",
+  "busy_frac_max": 0.05,
+  "busy_max": 20.0,
+  "clock_band": "(max-min)/median of the loaded pinned core's clock per sample, readings equal to clock_floor_khz dropped",
+  "clock_floor_khz": 400000,
+  "freq_band": 0.1,
+  "noise_ceiling": 1.15,
+  "statistic": "Criterion median estimate per arm (estimates.json)"
+ },
+ "schema": "bench-reference/v1",
+ "sha": "212bf72e498de9fbbda42cc0e2902906c730e3ea",
+ "targets": [
+  "khive-pack-schedule:schedule_bench"
+ ]
+}

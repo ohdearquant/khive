@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `RetrievalPersistence::new` now accepts `Arc<dyn SqlAccess>`. Snapshot writes and
-  namespace clears use the backend writer route; loads and statistics use its
-  reader. Core migrations install the snapshot table and namespace index. The
-  existing `init_schema` compatibility bootstrap now uses the admitted writer.
-- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
-  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
-  updates and audit rows commit together through its writer route, and read-only
-  handles refuse updates. Storage failures use `PersistError::Storage`.
-  Core migrations now install `atom_weights` and `weight_events`; the standalone
-  `init_weight_schema` bootstrap remains available for compatibility.
 ### Added
 
 - Add the CLI operator `kg.proposal_cleanup(older_than="30d")` to archive old
@@ -28,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookups, parent references and lifecycle event history remain available.
   The operator follows normal write policy and is unavailable through MCP or
   multi-operation atomic requests. Migration V58 follows V57 from #5185.
+
+## [0.14.0] - 2026-10-18
+
+### Added
 
 - `NoteStore::try_patch_note_properties` applies guarded partial property writes,
   forward-only expiry and a monotonic update timestamp in one storage operation.
@@ -51,9 +43,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host composition register providers before binding ordered peers and their declared
   dimensions, without loading models. Missing providers fail startup; explicit no-embedding
   runtimes keep no configured default while explicit manual named access remains available.
+- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
+  for caller-supplied seal keys. All-zero keys are refused; initialization starts
+  at epoch zero with no previous key and the same empty, deny-all state.
+- Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
+  entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
+  remains pending acceptance and conformance validation.
+- `apply_changeset` applies a complete canonical NDJSON change-set as one bounded, ordered
+  writer transaction. Staged create and link identifiers survive application, updates
+  compare the captured values of the fields they touch, and deletes compare the whole
+  captured record except `updated_at`. `kkernel kg apply` submits the delta through the
+  daemon, and reviewed canonical proposals use the same path. Merge is refused.
+- When a coordinated kg search hits its deadline, the `backend search task timed out` and
+  `backend search task completed after the shared request deadline` warnings add
+  `in_flight_phase`, `phase_elapsed_ms`, `active_phases` and `completed_phases`, naming
+  what the backend search was doing. `khive-storage` gains
+  `request_context::SearchPhaseTrace`. Deadlines, budgets, retries, ordering and results
+  are unchanged.
+- `comm.health` reports an outbox scan health snapshot for the email and Telegram
+  transports: completion and success times of the pending-row query and observations of
+  the bounded eligible page. A failed scan keeps the previous success time.
+- Explicit KG imports honor `[schema].strict`, which defaults to true. Strict mode refuses
+  an unknown entity kind before the destination is set up; relaxed mode keeps its spelling
+  and warns once per distinct kind. Local VCS sync degrades unknown kinds to `concept` and
+  records `khive:degraded_kind`.
+- `code_map_root` and `[[code_maps]]` entries (`name`, `path`, `source_root`) in
+  `config.toml` are validated entry by entry and loaded once into a runtime registry of
+  code maps (ADR-139). A malformed entry is rejected by name without stopping the
+  configuration from loading.
+- `code.list`, `code.search` and `code.deps` read operator-registered code maps: list and
+  search paginate deterministically with a cursor bound to the map registration and
+  filters, search ranks exact, then prefix, then interior name matches, and dependency
+  traversal returns nodes breadth-first with incoming normal, dev and build dependencies,
+  accurate node-limit truncation and every dependency edge among the returned nodes. The
+  three verbs are classified as reads.
+- `link` responses disclose a `dependency_kind` the server inferred, with a hint for each
+  inferred value; a caller-supplied `dependency_kind` suppresses it. Bulk hints keep the
+  caller's input indices across skips and failures, and an atomic link response carries
+  the hint captured while the plan was prepared.
+- The code pack's source ingest records the literal source-file inputs a module names:
+  `include!`, `include_str!` and `include_bytes!` arguments, `#[path]` attributes,
+  `#[doc = include_str!(...)]`, and filesystem read calls whose argument is a string
+  literal.
+- Guarded create-only edge insertion: `khive-storage` adds `GraphStatementGuard`,
+  `GraphStatementGuardFailure` and `EdgeInsertIfAbsentOutcome`; `khive-db` evaluates each
+  read-only guard statement inside the edge's writer transaction; `khive-runtime` adds
+  `link_if_absent_with_guards`.
+- `khive_types::app` declares a khive app as plain data (ADR-203): name, version, signer,
+  the verb inventory with a rights class per handler, and the kinds it contributes.
+  `AppManifest::validate` and `AppManifest::admit` refuse incomplete or conflicting
+  manifests, naming the conflicting owner.
 
 ### Changed
 
+- `RetrievalPersistence::new` now accepts `Arc<dyn SqlAccess>`. Snapshot writes and
+  namespace clears use the backend writer route; loads and statistics use its
+  reader. Core migrations install the snapshot table and namespace index. The
+  existing `init_schema` compatibility bootstrap now uses the admitted writer.
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
 - Edge-weight validators use the shared `khive-types` predicate,
   preserving numeric boundaries and validation diagnostics.
 - With a configured runtime actor, a message the email channel quarantines, whatever its
@@ -68,19 +120,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts, and the phrase list gains the plain asks for no more email ("don't email me",
   "do not contact me", "no more emails" and their spellings). The bare words "email me" are not a
   phrase: a reply asking us to email the docs is delivered without the label.
+- Email quarantine distinguishes `auth-untrusted`, a message whose authentication results
+  headers were present but not trusted, from `auth-absent`. The record carries the anchor
+  mode, the header family and the identifier as an escaped string of at most 128 bytes.
+- Bulk `link` responses report `inferred_count` instead of repeating an inference
+  explanation for every edge; `verbose=true` keeps the indexed hints and per-edge
+  explanations. Singleton `create` edge results disclose inferred dependency kinds.
+- `context` charges anchor-to-anchor edges against the response budget and returns an
+  anchor edge only when both of its anchors were admitted (ADR-140 Amendment 1).
+- A best-effort mark-read failure carries `mark_error_details` (typed code and stage, and
+  the native SQLite write stage and result codes where present) beside `mark_error`.
+- On Linux with glibc, the runtime returns the transient heap of a native embedding
+  model load to the operating system once the built-in embedder has loaded.
 
 ### Fixed
 
-- SQLite volume-lock directory creation refusals name the attempted path and the
-  `KHIVE_VOLUME_LOCK_DIR` override. Headless and containerized deployments require
-  a writable home directory or an absolute, writable lock directory shared by all
-  cooperating khive processes of the deployment; an unusable directory still
-  refuses the open rather than falling back to a database-specific directory.
-
+- SQLite volume-lock refusals name the directory or lock file that could not be used and the
+  underlying I/O error, and name both ways to choose another directory: `KHIVE_VOLUME_LOCK_DIR`
+  for the default directory resolver, or the caller-supplied lock directory setting. Headless and containerized deployments require a writable home
+  directory or an absolute, writable lock directory shared by all cooperating khive processes
+  of the deployment; an unusable directory still refuses the open rather than falling back to
+  a database-specific directory.
 - An authenticated opt-out in a message that screening quarantines as `screened` now records
   the reply-stop suppression for its sender before the quarantine is acknowledged, as a
   delivered opt-out already did. No other quarantine reason records an opt-out, and ingest
   refuses one claimed on them.
+- A registered code map whose main database file has more than one link is refused at
+  registration and on every read, and the guarded read-only file system checks the link
+  count on the file SQLite reads before any row is read (ADR-139 Amendment 2). A
+  wrong-typed `code_maps` or `code_map_root` value fails the configuration load with the
+  key named. `khive_db::file_identity::file_link_count` reads the link count from an open
+  file.
+- `db_diagnostics` collects `size_composition` only when the read snapshot holds at most
+  8,192 pages and 32 MiB, checking both in the same snapshot; a larger store gets no
+  composition and `size_composition_error` names the observed footprint and the limits.
+  The limits bound the work admitted, not elapsed time. `size_composition=false` still
+  skips the walk.
+- The write-path secret gate treats `head=<40-hex>`, `head <40-hex>` and the equals form
+  of the other revision markers (`sha=`, `commit=`, `revision=`, `rev=`) as revision
+  labels instead of refusing them as credential tokens.
+- The web pack's disk ingestion encodes each file name as a URL path segment, so `#`, `?`,
+  `%` and `\` in a name no longer turn into a fragment or query and collapse two files onto
+  one document.
+- `khive-pack-brain` builds without the `lattice-router` feature no longer fail clippy
+  with unused imports.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` adds `schema`, `code_map_root` and `code_maps`, and
+  `khive_runtime::RuntimeConfig` adds `code_map_root`, `code_maps` and
+  `code_map_protected_database_paths`. Direct struct literals must set them.
+- `khive_pack_code::CodeSourceIngestReport` adds `source_reads`,
+  `khive_types::ProposalAppliedPayload` adds `preimage`, and `kkernel::kg::ImportArgs` adds
+  `config`. Direct struct literals must set them.
+- New enum variants: `khive_runtime::AtomicOpFailure::{OwnerSnapshotConflict,
+  PreimageMismatch}`, `khive_runtime::AtomicOpPlan::Canonical`,
+  `khive_runtime::RuntimeError::CanonicalAdmission`, `khive_runtime::ConfigError::SchemaParse`,
+  `khive_types::ProposalChangeset::Canonical` and `kkernel::kg::KgCommand::Apply`. None of
+  these enums is `#[non_exhaustive]`, so downstream exhaustive matches must handle them.
+  `ProposalChangeset::Canonical` precedes `Compound`, whose implicit discriminant moves from
+  6 to 7.
+- `khive_runtime::AtomicOpPlan` is no longer `UnwindSafe` or `RefUnwindSafe`.
+- `khive_pack_brain::persist::PersistenceTracker` no longer has the public
+  `increment_dirty` and `reset_dirty` methods.
 
 ## [0.13.0] - 2026-10-15
 
@@ -264,13 +366,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains unimplemented.
 
 ### Added
-
-- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
-  for caller-supplied seal keys. All-zero keys are refused; initialization starts
-  at epoch zero with no previous key and the same empty, deny-all state.
-- Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
-  entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
-  remains pending acceptance and conformance validation.
 
 - Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
   `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
