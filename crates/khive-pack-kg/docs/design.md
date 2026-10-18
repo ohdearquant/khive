@@ -4,7 +4,7 @@
 
 ## Scope
 
-The KG pack provides 29 verb handlers for the knowledge graph substrate: entity
+The KG pack provides 29 public verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
 entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046),
 grouped event counts (`count`, ADR-022), atomic canonical change-set application (`apply_changeset`,
@@ -13,6 +13,8 @@ note body (`scan`), and writer-contention, graph-edge
 integrity, plus WAL/checkpoint operator diagnostics (`db_diagnostics`,
 ADR-091/ADR-135 — its PASSIVE probe may backfill WAL frames but never changes
 logical state).
+The operator-only `kg.proposal_cleanup` subhandler is a thirtieth handler and is
+not part of the public verb inventory or MCP surface.
 It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
