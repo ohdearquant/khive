@@ -141,7 +141,7 @@ impl Prepared {
                 assert_eq!(result["schema_version"], 1);
                 assert_eq!(
                     result["scope"],
-                    json!({"kind":"task","rows":"live_only","namespaces":["local"]})
+                    json!({"kind":"task","rows":"live_only","namespaces":[ACTOR,"local"]})
                 );
                 assert_eq!(result["total_tasks"], 1000);
                 assert_eq!(result["created_at"]["magnitude_16_digits"], 1000);
