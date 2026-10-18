@@ -34,15 +34,15 @@ The function walks the forward op-list backwards using a private clone of the
 current maps. The forward change-set and supplied maps remain unchanged on both
 success and error. Only a complete inverse is returned.
 
-| Forward operation | Inverse and current-record check |
-| --- | --- |
-| Entity create | Soft delete of the same ID. The live entity must match the staged namespace, kind, type, name, description, properties, and tags. |
-| Note create | Soft delete of the same ID. The live note must match the staged namespace, kind, content, properties, tags, salience, and decay factor; its status must remain the default and its expiry must be absent. |
-| Link | Soft delete of the same edge ID. The live edge must match the staged namespace, endpoints, relation, weight, and properties. |
-| Update | Swap the patch and preimage through `UpdateOp::new`. Every touched working field must equal the forward patch value. Then rewind those working fields to their captured preimage values. |
-| Soft delete | Restore the captured full live record; current tombstoned content must match under the [lifecycle checks](restore.md). |
-| Restore | Soft delete carrying the actual current live record; content must match the captured record. |
-| Hard delete or merge | Refused with `NotInvertible`; use reviewed compensation or the git backstop. |
+| Forward operation    | Inverse and current-record check                                                                                                                                                                          |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Entity create        | Soft delete of the same ID. The live entity must match the staged namespace, kind, type, name, description, properties, and tags.                                                                         |
+| Note create          | Soft delete of the same ID. The live note must match the staged namespace, kind, content, properties, tags, salience, and decay factor; its status must remain the default and its expiry must be absent. |
+| Link                 | Soft delete of the same edge ID. The live edge must match the staged namespace, endpoints, relation, weight, and properties.                                                                              |
+| Update               | Swap the patch and preimage through `UpdateOp::new`. Every touched working field must equal the forward patch value. Then rewind those working fields to their captured preimage values.                  |
+| Soft delete          | Restore the captured full live record; current tombstoned content must match under the [lifecycle checks](restore.md).                                                                                    |
+| Restore              | Soft delete carrying the actual current live record; content must match the captured record.                                                                                                              |
+| Hard delete or merge | Refused with `NotInvertible`; use reviewed compensation or the git backstop.                                                                                                                              |
 
 Create and link also require `deleted_at` to be absent. Their inverse always has
 `hard: false`; its boxed `DeletePreimage` is the checked working record, including
@@ -62,13 +62,13 @@ to check the correct intermediate values.
 `ReusedEnvelope` is checked before any operation. The other errors name the
 zero-based index in the original forward list, even though traversal is reversed.
 
-| Error | Meaning |
-| --- | --- |
-| `NotInvertible { index, op }` | A forward hard `delete` or `merge` cannot be represented exactly. |
-| `MissingCurrent { index, id }` | The required record is absent from its substrate map. |
-| `Invalidated { index, id, field }` | A required current field differs; `field: "id"` identifies an incoherent map key. |
+| Error                              | Meaning                                                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `NotInvertible { index, op }`      | A forward hard `delete` or `merge` cannot be represented exactly.                                |
+| `MissingCurrent { index, id }`     | The required record is absent from its substrate map.                                            |
+| `Invalidated { index, id, field }` | A required current field differs; `field: "id"` identifies an incoherent map key.                |
 | `InverseRestore { index, reason }` | A delete preimage cannot be restored, including an archived note or an already-deleted preimage. |
-| `InverseUpdate { index, reason }` | `UpdateOp::new` rejects the swapped pair, preserving its diagnostic. |
+| `InverseUpdate { index, reason }`  | `UpdateOp::new` rejects the swapped pair, preserving its diagnostic.                             |
 
 A forward note patch can contain an out-of-range new salience or decay factor
 even though its captured values were validated. Swapping makes that value a

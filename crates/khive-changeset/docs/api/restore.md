@@ -12,7 +12,24 @@ tombstone, valid note salience/decay and valid edge weight. A note must have
 Unknown outer and embedded fields are refused. The wire tag is `op: restore`.
 
 ```json
-{"op":"restore","target_id":"00000000-0000-0000-0000-000000000001","record":{"substrate":"entity","id":"00000000-0000-0000-0000-000000000001","namespace":"local","created_at":11,"updated_at":29,"kind":"concept","entity_type":null,"name":"Original","description":null,"properties":{},"tags":[],"deleted_at":null}}
+{
+  "op": "restore",
+  "target_id": "00000000-0000-0000-0000-000000000001",
+  "record": {
+    "substrate": "entity",
+    "id": "00000000-0000-0000-0000-000000000001",
+    "namespace": "local",
+    "created_at": 11,
+    "updated_at": 29,
+    "kind": "concept",
+    "entity_type": null,
+    "name": "Original",
+    "description": null,
+    "properties": {},
+    "tags": [],
+    "deleted_at": null
+  }
+}
 ```
 
 This belongs to schema version 2; the envelope is the sole version carrier.
