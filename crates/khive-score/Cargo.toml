@@ -28,3 +28,7 @@ serde_json = { workspace = true }
 [[bench]]
 name = "score_ops"
 harness = false
+
+[[bench]]
+name = "arithmetic_paths"
+harness = false
