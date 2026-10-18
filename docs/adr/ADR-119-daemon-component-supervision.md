@@ -803,3 +803,160 @@ and that later polling preserves replay and deduplication. Verify cancellation w
 when both selection branches are ready, while cancellation after result selection
 does not interrupt the page's store/commit phases. Preserve the existing interval,
 caller-token, quarantine, cursor, offset, and outbound delivery controls.
+
+## Amendment 7: Process exit when a registered settlement is unknown at shutdown (2026-10-18)
+
+**Status:** Proposed 2026-10-18
+
+### Context
+
+The base decision bounds shutdown per component: the registry cancels each component and joins
+it with a bounded wait, then aborts the task on expiry. The wait the registry actually applies
+is the component's `shutdown_timeout` clamped to 500 ms less than the drain timeout, and to 0
+when the drain timeout is 500 ms or less (`KHIVE_DRAIN_TIMEOUT_SECS`, ADR-106); a registration
+whose timeout is longer is shortened and logged. On a signal, `drain()` returns after the drain
+timeout with any still-busy future outstanding (ADR-106).
+
+A daemon that runs any linked component is never eligible for an idle shutdown: idle retirement
+requires an empty list of idle-ineligible reasons, and every linked component is listed there as
+an unclassified obligation. A daemon with work to register under this amendment therefore shuts
+down on a signal.
+
+Aborting a task does not stop blocking work it started. A closure running on the blocking pool
+keeps running until it returns, and the daemon runs on a Tokio runtime whose `Drop` waits for
+that work without limit (Tokio's `Runtime` documentation, section "Shutdown": the thread
+initiating the shutdown "blocks until all spawned work has been stopped", and "the `Drop`
+implementation waits forever for this"). Today, when such work is still running after the drain
+completes, the entry point runs its normal tail (connection tasks, then socket and PID-file
+cleanup), returns, and the process then stays alive in runtime teardown with its socket and PID
+file already removed. The latency bound in "Shutdown handoff from the daemon runtime" is
+therefore not true for blocking work today.
+
+For most blocking work an unknown outcome costs a retry. For some it does not: an operation
+whose result must be known before a restart may act again (a write whose commit status decides
+whether the next incarnation replays, releases or reconciles) needs the shutdown to say,
+durably and after the process is gone, that its outcome was not settled. That report has to
+come from the host, because the component's own task has already been aborted.
+
+### Decision
+
+1. **Settlement registration.** Any component MAY register an admitted blocking operation as
+   settlement-bearing with the host before the operation starts; the mail mirror (ADR-200
+   Amendment 5) is the first to do so. A component here is one the registry starts from a
+   daemon component registration (`ComponentRegistration`). A background task tracked only by
+   name for the drain (`track_named_background_task`, for example the email and Telegram polling
+   loops) is not a component for this amendment and cannot register; settlement-bearing work in
+   such a task moves into a registered component first. A registration names its component by the
+   `name` of the component's registration, never by a free-form string. The host validates the
+   name before it records anything: it refuses a settlement registration whose name is empty or
+   contains whitespace, `=` or a comma, a refused registration leaves no entry in the host's
+   registrations, and the operation is then not admitted, so every name that can reach the
+   record field below appears there unquoted. A registration is removed only when the
+   operation's outcome is definitely known to its owner (committed, or definitely not
+   committed) and its blocking work has returned. Cancellation, task abort or a timeout does not remove it. Settlement-bearing work that is not
+   registered receives neither the report nor the exit below; a component with such work is
+   expected to register it.
+2. **Deadline.** A component's settlement deadline is the effective shutdown wait the registry
+   applies to it: its `shutdown_timeout`, clamped to 500 ms less than the drain timeout (0 when
+   the drain timeout is 500 ms or less). No component gets a separate, longer settlement window,
+   and a component that derives its own deadline uses this effective value, not the configured
+   one.
+3. **Exit when settlement is unknown.** When the drain completes, the host reads the settlement
+   registrations. If any remain:
+   1. Before the normal shutdown tail, while the PID file still names this process, the host
+      rewrites the daemon exit record (`<pid file>.exit`, ADR-185 Amendment 5). The host retains
+      the most recent `exited` line composed when shutdown began (the text whose write was
+      attempted, whether or not that write succeeded; today the exit record composes and writes
+      it without returning it, so the host must receive it), so the record keeps the trigger that
+      ended the process and its sender, and writes that line again with one trailing field
+      appended after a single space: `unsettled=<component>[,<component>...]`, names sorted and
+      each listed once. It uses the
+      existing same-directory temporary file and rename, and the existing check that the PID
+      file still names this process.
+   2. The host then runs the normal shutdown tail: connection tasks, then socket and PID-file
+      cleanup under the recovery lock, with the existing ownership checks that leave a
+      replacement daemon's paths alone. Cleanup still happens only after the drain, as the base
+      decision requires.
+   3. The host then ends the process with `std::process::exit(75)` without returning from the
+      daemon entry point. A return is not sufficient: the daemon runs inside the CLI's
+      `#[tokio::main]` entry point, whose runtime is dropped when that function returns, and the
+      drop waits for the blocking work. What follows cleanup today (the lifecycle's stopped
+      transition and the `khived stopped` log line) does not run on this path. Log lines on this
+      path are best effort; the exit record and the exit status are the durable report. This
+      amendment assigns status 75 to this exit and to nothing else; it carries no `sysexits`
+      meaning here (in particular not "retry at once"). It is nonzero for the reason
+      ADR-049 gives for nonzero refusals: a later run of this process is the remedy, because the
+      next incarnation reconciles before acting (decision 5), so a supervisor that restarts on
+      failure restarts it.
+
+   With no registration remaining, shutdown is unchanged: the entry point returns and the
+   process exits with status 0. Steps 3.1 and 3.3 apply on the unknown-settlement path only.
+4. **Record format.** This amends the `exited` line that ADR-185 Amendment 5 decision 3 fixes:
+   this amendment adds only the trailing `unsettled=` field above, separated by a single space. Readers that
+   match an `exited` record by its prefix are unaffected. The daemon lifecycle operator page that
+   repeats the line is updated in the same change.
+5. **The record is a report, not the recovery authority.** A component that registers
+   settlement-bearing work MUST make its restart fail closed from its own durable state: the
+   next incarnation reconciles before acting again, whether or not it can read the exit record.
+   If the rewrite in step 3.1 fails (disk error, or the PID file no longer names this process),
+   the host logs the failure on the `khive.boot` target and still exits as in step 3.3; the cost
+   is the report, never the fail-closed restart.
+6. **Scope of the bound.** This is the host's own shutdown path, not one a component registers,
+   so the rule "No component may register a shutdown path outside this handoff" stands. When a
+   registration remains at the end of the drain, the process ends after the drain and its
+   cleanup, whatever the registered blocking call does. Blocking work that is not registered is
+   outside this amendment: after the drain the entry point returns and runtime teardown waits
+   for it, as it does today. For that work the base decision's latency bound remains untrue (see
+   "Not decided here").
+
+The watchdog subprocess in "In-process supervision is not process isolation" remains the
+mandatory fallback when in-process supervision cannot hold a component inside the shutdown
+SLO. It isolates a hung component from the daemon; this amendment covers a different failure:
+registered work that is still outstanding when the process ends.
+
+**Not decided here.** Whether the host should also end the process without waiting for runtime
+teardown after every shutdown, so that unregistered blocking work cannot hold it open either.
+That would bound teardown for all work, but it changes the exit of every shutdown whose drain
+timed out, and it needs its own decision on what such an exit reports. Whether idle retirement
+should ever admit a daemon with components; if it does, decision 3 applies after the idle drain
+unchanged.
+
+### Verify by
+
+Each process-level arm runs the daemon as a child process with `KHIVE_DRAIN_TIMEOUT_SECS=2` and a
+test component whose `shutdown_timeout` is 1 s. The harness sends SIGTERM and waits at most 5 s
+(the drain timeout plus a 3 s margin). A child still alive at 5 s is killed with SIGKILL, and
+the arm fails with "no exit within bound"; the harness never waits on the child without that
+limit.
+
+- **Fault injection.** The test component registers a settlement-bearing operation whose
+  blocking call never returns. The child exits on its own within the bound with status 75. The
+  exit record is the shutdown's `exited` line, with the signal reason and sender unchanged and
+  the field `unsettled=<test component>` appended after a space. The socket and PID file are absent. All of this is
+  read only after the child has exited.
+- **Control.** The same component, with an operation that settles before the deadline, exits
+  with status 0, and its record is the `exited` line with no `unsettled` field.
+- **Mutation.** With step 3.3 replaced by an ordinary return from the daemon's entry point, the
+  fault-injection arm reaches the 5 s bound, the harness kills the child, and the arm fails.
+- **Ownership (fault-injected).** A second daemon cannot boot onto a live PID file, so this
+  state is injected after shutdown has begun: when the test component's task observes the
+  shutdown cancellation (the host has already written the `exited` line), it writes another
+  process's pid into the PID file, with its registered blocking call still outstanding. The
+  child still exits with status 75; the exit record holds the `exited` line with no `unsettled`
+  field, because the rewrite's ownership check refused it; the PID file still holds the injected
+  pid; and the socket is not unlinked.
+- **Release on settlement only.** A unit test holds the registration store outside the
+  component. It aborts the component task while the operation is outstanding and asserts the
+  registration is still present. A second arm lets the operation return with a known outcome
+  and asserts the registration is gone.
+- **Clamped deadline.** A registration whose `shutdown_timeout` exceeds the drain timeout less
+  500 ms reports the clamped value as its settlement deadline, and the registry logs the clamp.
+- **Names.** A settlement registration with an empty name, or a name containing a space, `=` or
+  a comma, is refused: its operation never starts, and the host's registrations are unchanged
+  (no entry remains). One with a valid name is accepted. A test over every
+  `ComponentRegistration` the daemon can construct (the linked registrations, the host's own
+  components and the channel outbound components) asserts that each name is valid. It
+  enumerates each construction path, not only `component_registrations()`: the channel outbound
+  registrations built through `start_channel_component` are included, and the test runs in every
+  feature build that adds a component. Mutation: record the registration before validating it
+  (the refusal arm's no-entry assertion fails).
