@@ -69,7 +69,7 @@ cargo bench -p khive-request --benches -- --quick --noplot
 
 | Group              | Scenarios                                                               | Public operation and actual input                                                                                  | Baseline |
 | ------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------- |
-| `request_pipeline` | `plan/single/{simple,complex}`, `plan/batch/{3,10}`, `plan/chain/{2,5}` | `plan_request` over the six unchanged legacy DSL inputs with a fixed five-verb catalog                             | pending  |
+| `request_pipeline` | `plan/single/{simple,complex}`, `plan/batch/{3,10}`, `plan/chain/{2,5}` | `plan_request` over the six unchanged legacy DSL inputs with a fixed benchmark catalog                             | pending  |
 | `request_pipeline` | `atomic/{eligible,mixed,rejected}/{10,50,100}`                          | `check_atomic_admissible` on prepared operation vectors, covering admitted names and all four rejection categories | pending  |
 | `request_pipeline` | `typed_json/{10,50,100}`                                                | `parse_typed_json_batch` on already-decoded operation vectors with nested JSON scalar/list/object arguments        | pending  |
 | `request_pipeline` | `parse_batch/{50,100}`                                                  | `parse_request` with the original generated batch shape, up to `MAX_OPS=100`                                       | pending  |
