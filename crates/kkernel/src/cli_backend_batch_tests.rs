@@ -247,7 +247,9 @@ mod backend_batch_witnesses {
         .expect("mixed runtimes share a real backend");
         let embedded = &multi.per_pack_runtimes["kg"];
         let text_only = &multi.per_pack_runtimes["comm"];
-        embedded.register_embedder(BatchEmbedder);
+        embedded
+            .replace_bound_embedder_for_test(BatchEmbedder)
+            .expect("the configured model is bound at startup, so the test backend replaces it");
         // Both legacy spellings become one ordered peer, and the first peer is the
         // compatibility default model, so an extra-only configuration projects to it.
         assert_eq!(embedded.config().embedding_model, Some(model));

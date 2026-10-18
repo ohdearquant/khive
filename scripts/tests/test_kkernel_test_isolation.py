@@ -124,12 +124,19 @@ class KkernelTestIsolationTests(unittest.TestCase):
         default = function("code_ingest.rs", "code_ingest_batch")
         setup = function("code_ingest.rs", "code_ingest_batch_with_runtime_setup")
         self.assertIn("code_ingest_batch_with_runtime_setup(args, |_| Ok(()))", default)
-        install = "install_test_embedders(runtime)?;"
+        install = "install_test_embedders,"
         self.assertIn(install, setup, "default ingest must install offline providers")
-        self.assertLess(setup.index(install), setup.index("runtime_setup(runtime)"),
+        self.assertLess(setup.index(install), setup.index("runtime_setup,"),
+                        "offline providers must be the provider setup, ahead of the custom setup")
+        source = (SOURCE / "code_ingest.rs").read_text()
+        opened = source.index("let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!(\"{e}\"))?;")
+        providers = source.index("provider_setup(&runtime)?;", opened)
+        self.assertLess(providers, source.index("build_code_ingest_registry(&runtime)?;", opened),
+                        "offline providers must be installed before the registry is built")
+        self.assertLess(providers, source.index("runtime_setup(&runtime)?;", opened),
                         "custom setup must retain its final override")
         provider = function("code_ingest.rs", "install_test_embedders")
-        self.assertIn("runtime.register_embedder(FixedEmbeddingProvider { name, dimensions })", provider,
+        self.assertIn("runtime.try_register_embedder(FixedEmbeddingProvider { name, dimensions })?;", provider,
                       "offline fixture must replace each configured native provider")
 
     def test_gate_allow_ingest_installs_offline_providers(self):

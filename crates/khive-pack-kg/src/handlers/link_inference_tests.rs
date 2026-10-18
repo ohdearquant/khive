@@ -190,14 +190,15 @@ async fn bulk_hints_preserve_caller_indices_skips_failures_and_verbosity() {
             assert_eq!(response["created"], 3, "{response}");
             assert_eq!(response["skipped"], 1, "{response}");
             assert_eq!(response["failed"], if atomic { 0 } else { 1 });
-            let hints = response["hints"].as_array().unwrap();
-            assert_eq!(hints.len(), 2);
-            assert_eq!(hints[0]["index"], 0);
-            assert_eq!(hints[1]["index"], 3);
-            for hint in hints {
-                assert!(hint["hint"].as_str().unwrap().contains("links_to"));
-            }
+            assert_eq!(response["inferred_count"], 2);
             if verbose {
+                let hints = response["hints"].as_array().unwrap();
+                assert_eq!(hints.len(), 2);
+                assert_eq!(hints[0]["index"], 0);
+                assert_eq!(hints[1]["index"], 3);
+                for hint in hints {
+                    assert!(hint["hint"].as_str().unwrap().contains("links_to"));
+                }
                 let edges = response["edges"].as_array().unwrap();
                 assert_eq!(edges.len(), 3);
                 assert_eq!(edges[0]["hint"], hints[0]["hint"]);
@@ -205,6 +206,34 @@ async fn bulk_hints_preserve_caller_indices_skips_failures_and_verbosity() {
                 assert_eq!(edges[2]["hint"], hints[1]["hint"]);
             } else {
                 assert!(response.get("edges").is_none());
+                assert!(response.get("hints").is_none());
+            }
+            // Re-link the same live natural keys with the qualifier still omitted.
+            // Both canonical bulk modes must disclose the same values on updates.
+            let updated = pack
+                .handle_link(
+                    &token,
+                    json!({"links": entries.clone(), "atomic": atomic, "verbose": verbose}),
+                    &registry,
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated["created"], 0);
+            assert_eq!(updated["updated"], 3);
+            assert_eq!(updated["skipped"], 1);
+            assert_eq!(updated["failed"], if atomic { 0 } else { 1 });
+            assert_eq!(updated["inferred_count"], response["inferred_count"]);
+            assert_eq!(updated.get("hints"), response.get("hints"));
+            if verbose {
+                let before = response["edges"].as_array().unwrap();
+                let after = updated["edges"].as_array().unwrap();
+                assert_eq!(before.len(), after.len());
+                for (before, after) in before.iter().zip(after) {
+                    assert_eq!(after["id"], before["id"]);
+                    assert_eq!(after["mutation"], "updated");
+                    assert_eq!(after.get("hint"), before.get("hint"));
+                    assert_eq!(after["metadata"], before["metadata"]);
+                }
             }
             if !atomic {
                 assert_eq!(response["errors"][0]["index"], 4);
@@ -224,6 +253,7 @@ async fn bulk_hints_preserve_caller_indices_skips_failures_and_verbosity() {
             assert_eq!(explicit["updated"], 3, "{explicit}");
             assert_eq!(explicit["skipped"], 1, "{explicit}");
             assert!(explicit.get("hints").is_none(), "{explicit}");
+            assert!(explicit.get("inferred_count").is_none(), "{explicit}");
             if verbose {
                 assert!(explicit["edges"]
                     .as_array()
@@ -232,5 +262,70 @@ async fn bulk_hints_preserve_caller_indices_skips_failures_and_verbosity() {
                     .all(|edge| edge.get("hint").is_none()));
             }
         }
+    }
+}
+
+#[test]
+fn default_bulk_hint_response_is_bounded_at_the_entry_limit() {
+    let sentence = "dependency_kind was inferred as \"normative\" from endpoint kinds. For references that are not normative, use links_to.";
+    let hints = (0..1000)
+        .map(|index| json!({"index": index, "hint": sentence}))
+        .collect::<Vec<_>>();
+    let mut response = json!({"attempted": 1000, "created": 1000});
+    super::add_bulk_inference_hints(&mut response, hints.clone(), false);
+    assert_eq!(response["inferred_count"], 1000);
+    assert!(response.get("hints").is_none());
+    assert!(serde_json::to_vec(&response).unwrap().len() < 100);
+    super::add_bulk_inference_hints(&mut response, hints, true);
+    assert_eq!(response["hints"].as_array().unwrap().len(), 1000);
+    assert_eq!(response["hints"][999]["index"], 999);
+    assert_eq!(response["hints"][999]["hint"], sentence);
+    let mut empty = json!({"created": 0});
+    super::add_bulk_inference_hints(&mut empty, vec![], false);
+    assert_eq!(empty, json!({"created": 0}));
+}
+
+#[tokio::test]
+async fn create_edges_disclose_inference_without_changing_persisted_edges() {
+    for (source_kind, target_kind, relation, expected) in [
+        ("document", "document", "depends_on", Some("normative")),
+        ("project", "project", "depends_on", Some("build")),
+        ("service", "project", "depends_on", None),
+        ("document", "document", "links_to", None),
+    ] {
+        let (pack, token, registry, base) = pair(source_kind, target_kind).await;
+        let response = pack
+            .handle_create(
+                &token,
+                json!({
+                    "kind": source_kind, "name": "new edge source", "skip_dedup_check": true,
+                    "edges": [{"target_id": base["target_id"], "relation": relation}]
+                }),
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert!(response.get("edge_errors").is_none(), "{response}");
+        let edges = response["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        let edge = &edges[0];
+        if let Some(kind) = expected {
+            let hint = edge["hint"].as_str().expect("create edge inference hint");
+            assert!(hint.contains(&format!("{kind:?}")), "{edge}");
+            assert_eq!(hint.contains("links_to"), kind == "normative");
+            assert_eq!(edge["metadata"]["dependency_kind"], kind);
+        } else {
+            assert!(edge.get("hint").is_none(), "{edge}");
+            assert!(edge["metadata"].get("dependency_kind").is_none());
+        }
+        let stored = pack
+            .runtime
+            .list_edges(&token, Default::default(), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let mut response_edge = edge.clone();
+        response_edge.as_object_mut().unwrap().remove("hint");
+        assert_eq!(response_edge, serde_json::to_value(&stored[0]).unwrap());
     }
 }

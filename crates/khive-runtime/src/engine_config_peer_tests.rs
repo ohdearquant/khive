@@ -244,16 +244,16 @@ mod ordered_peer_engines {
         .expect("syntax validation must not require a lattice enum variant");
         assert_eq!(names(&parsed.engines), ["test-custom-v1", MINILM]);
         let runtime = crate::runtime_config_from_khive_config(&parsed, in_memory_runtime_config());
-        let error = crate::KhiveRuntime::new(runtime)
-            .err()
-            .expect("unregistered custom provider must refuse startup");
+        let runtime =
+            crate::KhiveRuntime::new(runtime).expect("provider hooks run after runtime assembly");
+        let error = runtime
+            .finalize_embedding_engines()
+            .expect_err("unregistered custom provider must refuse serving startup");
         assert!(error.to_string().contains("test-custom-v1"), "{error}");
     }
 
     #[test]
-    fn dimensions_are_checked_before_writable_or_readonly_database_open() {
-        let parsed = load_peers(&format!("[[engines]]\nname = {MINILM:?}\ndims = 385\n"))
-            .expect("positive dimensions are checked against the bound provider");
+    fn invalid_dimension_syntax_is_checked_before_writable_or_readonly_database_open() {
         let dir = tempfile::tempdir().unwrap();
         for (label, constructor) in [
             (
@@ -264,16 +264,20 @@ mod ordered_peer_engines {
             ("readonly", crate::KhiveRuntime::new_readonly),
         ] {
             let unopened = dir.path().join(label);
-            let mut runtime =
-                crate::runtime_config_from_khive_config(&parsed, in_memory_runtime_config());
+            let mut runtime = in_memory_runtime_config();
+            runtime.engines = Some(vec![EngineConfig {
+                name: MINILM.into(),
+                weight: 1.0,
+                dims: Some(0),
+            }]);
             runtime.db_path = Some(unopened.join("khive.db"));
             runtime.volume_lock_dir = Some(dir.path().join("volume-locks"));
             let error = constructor(runtime)
                 .err()
-                .expect("provider dimensions must reject a mismatched assertion");
+                .expect("invalid dimensions must reject before opening storage");
             let message = error.to_string();
             assert!(message.contains(MINILM), "{label}: {message}");
-            assert!(message.contains("dimension"), "{label}: {message}");
+            assert!(message.contains("dims"), "{label}: {message}");
             assert!(!unopened.exists(), "{label} opened storage before binding");
         }
     }
@@ -293,13 +297,13 @@ mod ordered_peer_engines {
             EngineConfig {
                 name: MINILM.into(),
                 weight: 1.0,
-                dims: Some(385),
+                dims: Some(0),
             },
         ]);
         let before = runtime.clone();
         runtime
             .prepare_engines()
-            .expect_err("the later peer's dimensions must fail");
+            .expect_err("the later peer's invalid dimension syntax must fail");
         assert_eq!(runtime.engines, before.engines);
         assert_eq!(runtime.embedding_model, before.embedding_model);
         assert_eq!(

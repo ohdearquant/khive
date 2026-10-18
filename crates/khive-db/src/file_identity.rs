@@ -45,6 +45,15 @@ pub fn database_file_identity_from_file(file: &std::fs::File) -> io::Result<Data
     })
 }
 
+/// Number of directory entries naming the file held open by `file`, read from
+/// the descriptor itself rather than from a path.
+#[cfg(unix)]
+pub fn file_link_count(file: &std::fs::File) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(file.metadata()?.nlink())
+}
+
 #[cfg(windows)]
 pub fn database_file_identity(path: &Path) -> io::Result<DatabaseFileIdentity> {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -67,6 +76,24 @@ pub fn database_file_identity_from_file(file: &std::fs::File) -> io::Result<Data
     use std::os::windows::io::AsRawHandle as _;
 
     identity_from_handle(file.as_raw_handle())
+}
+
+/// Number of directory entries naming the file held open by `file`, read from
+/// the handle itself rather than from a path.
+#[cfg(windows)]
+pub fn file_link_count(file: &std::fs::File) -> io::Result<u64> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the caller retains a live handle; `info` is the correctly sized
+    // output buffer. No ownership is transferred.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(info.nNumberOfLinks))
 }
 
 #[cfg(windows)]

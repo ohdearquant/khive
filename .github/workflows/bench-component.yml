@@ -8,7 +8,9 @@ on:
         required: true
         type: string
       crates:
-        description: Space-separated Criterion crate packages in this component
+        description: >-
+          Space-separated workspace packages in this component. Only those
+          with a bench target run; a component with none records nothing.
         required: true
         type: string
       timeout_minutes:
@@ -40,7 +42,44 @@ jobs:
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
 
+      # A component can name a crate that has no bench target yet. Such a crate
+      # is left out of the -p list, and a component left with no crate runs
+      # nothing, writes no ledger record and pages nobody. A name that is not a
+      # workspace package fails this step, and that failure is recorded and
+      # reported like a compile failure.
+      - name: Select the component's crates that have a bench target
+        id: select
+        working-directory: crates
+        env:
+          COMPONENT: ${{ inputs.component }}
+          COMPONENT_CRATES: ${{ inputs.crates }}
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 > ../component-metadata.json
+          python3 - ../component-metadata.json <<'PY'
+          import json, os, sys
+
+          packages = json.load(open(sys.argv[1]))["packages"]
+          kinds = {p["name"]: {k for t in p["targets"] for k in t["kind"]} for p in packages}
+          named = os.environ["COMPONENT_CRATES"].split()
+          unknown = [c for c in named if c not in kinds]
+          if not named or unknown:
+              print(f"::error::component names no crate or a crate outside the workspace: {' '.join(unknown)}")
+              sys.exit(1)
+          selected = [c for c in named if "bench" in kinds[c]]
+          left_out = [c for c in named if c not in selected]
+          with open("../component-phases.log", "a") as log:
+              print(f"phase=select selected={','.join(selected)} left_out={','.join(left_out)}", file=log)
+          if not selected:
+              print(f"::notice::component {os.environ['COMPONENT']} has no crate with a bench target "
+                    f"({' '.join(named)}); nothing runs and no ledger record is written")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print(f"crates={' '.join(selected)}", file=out)
+              print(f"empty={'false' if selected else 'true'}", file=out)
+          PY
+
       - uses: Swatinem/rust-cache@v2
+        if: steps.select.outputs.empty == 'false'
         with:
           workspaces: crates
           cache-on-failure: true
@@ -49,10 +88,11 @@ jobs:
 
       - name: Compile-check this component's bench targets
         id: compile
+        if: steps.select.outputs.empty == 'false'
         continue-on-error: true
         working-directory: crates
         env:
-          COMPONENT_CRATES: ${{ inputs.crates }}
+          COMPONENT_CRATES: ${{ steps.select.outputs.crates }}
           COMPONENT_JOB_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -euo pipefail
@@ -75,7 +115,7 @@ jobs:
         if: steps.compile.outcome == 'success'
         working-directory: crates
         env:
-          COMPONENT_CRATES: ${{ inputs.crates }}
+          COMPONENT_CRATES: ${{ steps.select.outputs.crates }}
         # Preserve every estimate before reporting execution failure. Trend
         # values remain advisory; a panic or timeout is a failed benchmark run.
         run: |
@@ -103,7 +143,7 @@ jobs:
 
       - name: Record component trend ledger entry
         id: record
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.select.outputs.empty != 'true' }}
         env:
           COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}
           CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}
@@ -131,7 +171,7 @@ jobs:
       # only; the durable trend ledger takes main and release points.
       - name: Publish ledger to perf-data branch
         id: publish
-        if: ${{ !cancelled() && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        if: ${{ !cancelled() && steps.select.outputs.empty != 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
         continue-on-error: true
         run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
 
@@ -177,7 +217,7 @@ jobs:
       # Advisory-lane semantics: publishing happens before this warning on
       # main/release runs, and a data-collection error never paints CI red.
       - name: Warn if trend ledger record errored (advisory, never fails)
-        if: ${{ !cancelled() && steps.record.outputs.exit_code != '0' }}
+        if: ${{ !cancelled() && steps.select.outputs.empty != 'true' && steps.record.outputs.exit_code != '0' }}
         env:
           COMPONENT: ${{ inputs.component }}
           RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
@@ -212,7 +252,7 @@ jobs:
           exit 0
 
       - name: Report benchmark failures after publication
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.select.outputs.empty != 'true' }}
         env:
           COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}
           CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}
