@@ -147,7 +147,7 @@ fn caller_partition_filters_granular_bare_and_predicate_note_queries() {
     assert_eq!(
         run(
             &conn,
-            &compiled("MATCH (n:note) RETURN n.content", &scope("a", false))
+            &compiled("MATCH (n:note) RETURN n.id", &scope("a", false))
         ),
         ["a-in", "a-out", "ordinary"]
     );

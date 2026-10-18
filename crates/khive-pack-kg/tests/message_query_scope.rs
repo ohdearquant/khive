@@ -54,6 +54,24 @@ async fn seed(rt: &KhiveRuntime, notes: &[Note]) {
         .expect("seed notes");
 }
 
+// SPARQL requires an edge; observation targets also expose the stored note body.
+async fn seed_query_observations(rt: &KhiveRuntime, note_ids: &[Uuid]) {
+    let token = rt.authorize(Namespace::local()).expect("observation token");
+    let event = Event::new(
+        "local",
+        "memory.recall",
+        EventKind::RecallExecuted,
+        SubstrateKind::Note,
+        "fixture",
+    )
+    .with_payload(json!({"selected": note_ids}));
+    rt.events(&token)
+        .unwrap()
+        .append_event(event)
+        .await
+        .expect("seed query observations");
+}
+
 async fn query(registry: &VerbRegistry, actor: &str, source: &str, page_size: usize) -> Value {
     registry
         .dispatch_as(
@@ -92,7 +110,10 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
     let sent = registry
         .dispatch_as(
             "comm.send",
-            json!({"to": "recipient", "content": "private message body", "subject": "Query scope"}),
+            json!({
+                "to": "recipient", "content": "private message body", "subject": "Query scope",
+                "idempotency_key": "query-mailbox-copy-fixture",
+            }),
             VerifiedActor::new("sender").unwrap(),
         )
         .await
@@ -120,6 +141,16 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
     );
     let ordinary = note(4, "observation", None);
     seed(&rt, &[quarantine.clone(), ordinary.clone()]).await;
+    seed_query_observations(
+        &rt,
+        &[
+            outbound_id,
+            Uuid::parse_str(&inbound_id).expect("inbound UUID"),
+            quarantine.id,
+            ordinary.id,
+        ],
+    )
+    .await;
 
     for (actor, own) in [
         ("sender", Some(outbound_id.to_string())),
@@ -127,22 +158,32 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
         ("maintainer", Some(quarantine.id.to_string())),
         ("observer", None),
     ] {
-        for (source, column, broad) in [
+        for (source, broad, projects_content) in [
+            ("MATCH (n:message) RETURN n.id, n.properties", false, false),
+            ("MATCH (n:note) RETURN n.id, n.properties", true, false),
             (
-                "MATCH (n:message) RETURN n.id, n.content, n.properties",
-                "n_id",
+                "MATCH (ev:event)-[:observed_as_selected]->(n:message) RETURN n.id, n.content, n.properties",
                 false,
-            ),
-            (
-                "MATCH (n:note) RETURN n.id, n.content, n.properties",
-                "n_id",
                 true,
             ),
-            ("SELECT ?n WHERE { ?n a :message }", "n_id", false),
-            ("SELECT ?n WHERE { ?n a :note }", "n_id", true),
+            (
+                "MATCH (ev:event)-[:observed_as_selected]->(n:note) RETURN n.id, n.content, n.properties",
+                true,
+                true,
+            ),
+            (
+                "SELECT ?n WHERE { ?ev a :event . ?ev :observed_as_selected ?n . ?n a :message }",
+                false,
+                true,
+            ),
+            (
+                "SELECT ?n WHERE { ?ev a :event . ?ev :observed_as_selected ?n . ?n a :note }",
+                true,
+                true,
+            ),
         ] {
             let page = query(&registry, actor, source, 100).await;
-            let mut actual = page_ids(&page, column);
+            let mut actual = page_ids(&page, "n_id");
             let mut expected: Vec<_> = own.iter().cloned().collect();
             if broad {
                 expected.push(ordinary.id.to_string());
@@ -157,7 +198,9 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
                 assert!(!body.contains(&quarantine.content));
             } else {
                 assert!(body.contains("private-quarantine-reference"));
-                assert!(body.contains(&quarantine.content));
+                if projects_content {
+                    assert!(body.contains(&quarantine.content));
+                }
             }
             if own.is_none() {
                 assert!(!body.contains("private message body"));
@@ -166,7 +209,7 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
         let ordinary_page = query(
             &registry,
             actor,
-            "MATCH (n:observation) RETURN n.id, n.content",
+            "MATCH (ev:event)-[:observed_as_selected]->(n:observation) RETURN n.id, n.content",
             10,
         )
         .await;
@@ -176,7 +219,7 @@ async fn query_preserves_only_each_actors_message_and_quarantine_copies() {
 
     for source in [
         "MATCH (n:note) RETURN n.id",
-        "SELECT ?n WHERE { ?n a :note }",
+        "SELECT ?n WHERE { ?ev a :event . ?ev :observed_as_selected ?n . ?n a :note }",
     ] {
         let rows = rt.query(&token, source).await.expect("direct query");
         assert_eq!(raw_ids(&rows, "n_id"), [ordinary.id.to_string()]);
@@ -240,6 +283,8 @@ async fn query_mailbox_matches_rust_and_note_store_for_json_routing_shapes() {
     ] {
         let rt = runtime(actor);
         seed(&rt, &notes).await;
+        let note_ids: Vec<_> = notes.iter().map(|note| note.id).collect();
+        seed_query_observations(&rt, &note_ids).await;
         let token = rt.authorize(Namespace::local()).unwrap();
         assert_eq!(token.actor().is_anonymous(), actor.is_none());
         let scope = MailboxView {
@@ -268,7 +313,7 @@ async fn query_mailbox_matches_rust_and_note_store_for_json_routing_shapes() {
         assert_eq!(stored, expected, "note-store parity for {actor:?}");
         for source in [
             "MATCH (n:note) RETURN n.id",
-            "SELECT ?n WHERE { ?n a :note }",
+            "SELECT ?n WHERE { ?ev a :event . ?ev :observed_as_selected ?n . ?n a :note }",
         ] {
             let page = rt
                 .query_with_metadata(
