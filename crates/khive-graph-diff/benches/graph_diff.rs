@@ -14,11 +14,11 @@ mod native {
     pub fn run() {
         let mut c = Criterion::default()
             .sample_size(10)
-            .sampling_mode(SamplingMode::Flat)
             .warm_up_time(Duration::from_millis(100))
             .measurement_time(Duration::from_secs(1))
             .configure_from_args();
         let mut group = c.benchmark_group("graph_diff");
+        group.sampling_mode(SamplingMode::Flat);
         for relation in Relation::ALL {
             for count in [1_000, 50_000] {
                 // Lazily construct once for a selected scene, then drop before the next.
