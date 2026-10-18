@@ -1,29 +1,96 @@
 # khive-score Benchmark Ledger
 
-**Bench target:** `crates/khive-score/benches/score_ops.rs`
-**Harness:** Criterion (`harness = false` in `Cargo.toml`)
+**Bench targets:** `score_ops` and `arithmetic_paths` under `benches/`.
+**Harness:** Criterion (`harness = false` in `Cargo.toml`).
 
 ## Run command
 
 ```bash
-cd crates && cargo bench -p khive-score --bench score_ops
+cd crates
+cargo bench -p khive-score --benches -- --quick --noplot
 ```
 
-Results land in `target/criterion/score_ops/`.
+Results land under `target/criterion/<group>/`; a target's filename is not a
+Criterion group. Record the median per-operation estimate from each scenario's
+`new/estimates.json`, with its commit, toolchain, features, machine and command.
+These are Criterion sample-based estimates, not an empirical percentile of
+individually timed calls. The pure scalar paths use Criterion's iteration timer
+to avoid adding an `Instant` measurement around each nanosecond operation.
 
 ## Benchmark suite
 
-| Scenario              | What it measures                                                  |
-| --------------------- | ----------------------------------------------------------------- |
-| `distance_cosine`     | `score_from_distance_lossy` with cosine metric, 1000 samples      |
-| `distance_l2`         | `score_from_distance_lossy` with L2 metric, 1000 samples          |
-| `distance_dot`        | `score_from_distance_lossy` with dot-product metric, 1000 samples |
-| `try_distance_cosine` | `try_score_from_distance` with cosine metric, valid inputs        |
-| `sum_scores_100`      | `sum_scores` over 100-element slice                               |
-| `avg_scores_100`      | `avg_scores` over 100-element slice                               |
-| `rrf_score_k60`       | `rrf_score_one_based` at k=60, ranks 1–100                        |
-| `weighted_sum_10`     | `weighted_sum` over 10 scores/weights                             |
-| `ranked_heap_1000`    | `BinaryHeap<Ranked<u64>>` push+pop, 1000 items                    |
+Join the group and scenario columns with `/` to obtain the exact Criterion ID.
+Comma-separated scenarios and brace alternatives each denote separate IDs.
+`score_ops` is unchanged; historical release rows below retain their original
+names and measurements and are not the current scenario inventory.
+
+| Target             | Group                           | Scenarios                                                                                                                                                                     | What it measures                               |
+| ------------------ | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `score_ops`        | `DeterministicScore/from_f64`   | `scalar`, `batch_1000`, `nan`, `pos_inf`                                                                                                                                      | Fixed-point construction                       |
+| `score_ops`        | `DeterministicScore/from_f32`   | `scalar`, `batch_1000`                                                                                                                                                        | Fixed-point construction                       |
+| `score_ops`        | `DeterministicScore/to_f64`     | `scalar`, `batch_1000`                                                                                                                                                        | Floating conversion                            |
+| `score_ops`        | `ops/sum_scores`                | `10`, `100`, `1000`                                                                                                                                                           | Saturating sum                                 |
+| `score_ops`        | `ops/avg_scores`                | `10`, `100`, `1000`                                                                                                                                                           | Mean                                           |
+| `score_ops`        | `ops/max_min`                   | `max_1000`, `min_1000`                                                                                                                                                        | Extrema                                        |
+| `score_ops`        | `ops/rrf_score`                 | `rank_1_k60`, `batch_1000_k60`                                                                                                                                                | Legacy one-based RRF                           |
+| `score_ops`        | `ops/weighted_sum`              | `2`, `8`, `32`                                                                                                                                                                | Weighted aggregation                           |
+| `score_ops`        | `score_from_distance`           | `cosine_scalar`, `l2_scalar`, `dot_scalar`, `cosine_batch_1000`, `l2_batch_1000`, `dot_batch_1000`                                                                            | Lossy metric conversion                        |
+| `score_ops`        | `comparator`                    | `cmp_desc_scalar`, `sort_1000_pairs`, `ranked_heap_1000`                                                                                                                      | Comparison, sorting and heap                   |
+| `score_ops`        | `DeterministicScore/arithmetic` | `add`, `sub`, `mul_i64`, `mul_f64`, `div_i64`                                                                                                                                 | Fixed-point arithmetic                         |
+| `arithmetic_paths` | `strict_cosine`                 | `valid`, `below_range`, `above_range`, `nan`, `infinity`                                                                                                                      | Strict cosine success and four error inputs    |
+| `arithmetic_paths` | `rrf_one_based`                 | `rank_50_k60`, `ranks_1_100_k60`                                                                                                                                              | Typed one-based RRF, scalar and 100-rank batch |
+| `arithmetic_paths` | `decay_apply`                   | `exponential_rate/{100,1000}`, `hyperbolic_rate/{100,1000}`, `exponential_half_life/{100,1000}`, `hyperbolic_half_life/{100,1000}`, `power_law/{100,1000}`, `none/{100,1000}` | Six decay variants on elapsed-time batches     |
+| `arithmetic_paths` | `min_max_band`                  | `f64/{100,1000}`, `f32/{100,1000}`                                                                                                                                            | Normalization in each precision                |
+| `arithmetic_paths` | `weight_validation`             | `ordered_valid/{2,8,32}`, `ordered_invalid/{2,8,32}`, `named_valid/{2,8,32}`, `named_invalid/{2,8,32}`                                                                        | Owned weight construction and validation       |
+
+### Arithmetic workload boundaries
+
+All inputs are generated deterministically before timing. Strict cosine uses
+0.25, -0.25, 2.25, NaN and positive infinity; exact scores or error variants are
+checked first. RRF uses prebuilt `NonZeroUsize` ranks and k=60. The legacy
+`rrf_score` is also one-based; zero-based indexing has a separate public helper.
+
+Decay applies value 0.75 to elapsed seconds 0 through N-1, with rate 1/16 per
+second or half-life 16 seconds. Half-life construction is outside timing. No
+wall-clock reads or timestamp parsing occur. Bands normalize ascending 0 through
+N-1 into [0,1], with tolerance zero and `DegenerateSpan::Ceiling`. Decay formulas,
+lengths, endpoints, finite ranges and monotonicity are checked before timing.
+RRF batches, decay batches and bands include output allocation and destruction.
+
+Ordered weights and named `HashMap<usize, f64>` inputs contain values 1 through N.
+Invalid inputs replace the final ordered/keyed weight with -1. The named map's
+hash seed and invalid-entry scan position are unspecified; it has exactly one
+invalid entry. Input clones are excluded via `iter_batched`, as is destruction
+of returned values. Constructor work, including dropping an owned rejected input,
+is included. Valid ordered contents, a named all-key constant weighted mean and
+the exact negative-weight error are checked outside timing.
+
+The 35 added scenes use 20 Criterion samples, one-second warmup and three-second
+measurement defaults; command-line options may override these. Preflight checks
+are small and run even when a group is filtered. No database, model, file corpus,
+network, allocation counter or native-memory measurement is involved.
+
+## Performance guarantees
+
+| Operation                   | Input                  | Metric         | Bound                                        |
+| --------------------------- | ---------------------- | -------------- | -------------------------------------------- |
+| `weighted_sum`              | 32 scores + 32 weights | median latency | Advisory trend against the recorded baseline |
+| `score_from_distance_lossy` | cosine, scalar         | median latency | Advisory trend against the recorded baseline |
+| `rrf_score_one_based`       | k=60, rank 50          | median latency | Advisory trend against the recorded baseline |
+| `Decay` apply               | 1000 timestamps        | median latency | Advisory trend against the recorded baseline |
+| `min_max_band`              | 1000-element vector    | median latency | Advisory trend against the recorded baseline |
+
+Timing is advisory against both a rolling and fixed reference, never a fixed
+percentage gate. A historical observation is not a latency promise. Correctness
+preflight assertions are separate from performance measurements.
+
+## Current baseline status
+
+The corrected existing-group inventory and all five new groups have a pending
+qualified-host baseline. This source change provides no current timings. Preserve
+Criterion's median estimates per scene, and record the commit, full toolchain,
+machine, features and command for both reference and candidate measurements.
+The earlier release ledger remains a historical observation only.
 
 ## Environment notes
 
