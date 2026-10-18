@@ -83,3 +83,17 @@ khive-storage = { version = "0.14.0", path = "../khive-storage", features = ["te
 name = "fusion_bench"
 path = "benches/fusion_bench.rs"
 harness = false
+
+[[bench]]
+name = "retrieval_lifecycle"
+harness = false
+
+[[bench]]
+name = "retrieval_persistence"
+harness = false
+required-features = ["persist"]
+
+[[bench]]
+name = "retrieval_ann_registry"
+harness = false
+required-features = ["ann"]
