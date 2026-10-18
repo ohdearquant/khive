@@ -126,8 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - SQLite volume-lock refusals name the directory or lock file that could not be used and the
-  underlying I/O error, and say whether `KHIVE_VOLUME_LOCK_DIR` or a caller-supplied setting
-  chose the directory. Headless and containerized deployments require a writable home
+  underlying I/O error, and name both ways to choose another directory: `KHIVE_VOLUME_LOCK_DIR`
+  for the default directory resolver, or the caller-supplied lock directory setting. Headless and containerized deployments require a writable home
   directory or an absolute, writable lock directory shared by all cooperating khive processes
   of the deployment; an unusable directory still refuses the open rather than falling back to
   a database-specific directory.
