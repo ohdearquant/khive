@@ -533,13 +533,14 @@ pub(crate) fn harness_duration_ms(name: &str) -> Option<Duration> {
 /// for [`run_events_daemon`]. The child holds the per-socket advisory lock,
 /// so a probe/spawn race resolves to one survivor.
 ///
-/// Lifecycle: the loop observes the process-wide daemon shutdown token, so
-/// `drain()` never waits on it forever, and it retains the handle of the
-/// child it spawned — reaping it with `try_wait` on every probe (no zombie
-/// accumulation during a persistent startup failure) and never stacking a
-/// second spawn on a still-live child. On shutdown, a child this supervisor
-/// spawned is killed and reaped; a pre-existing events daemon it never
-/// spawned is left alone.
+/// Lifecycle: the loop observes the process-wide daemon shutdown token and
+/// polls its retained child before each socket probe. A successful exit poll
+/// reaps the child. A poll error retains the handle for a later attempt unless
+/// the OS reports `ECHILD`; that handle is cleared without signalling its PID.
+/// No second child is spawned while a handle is retained. On cooperative
+/// shutdown the supervisor attempts to kill and wait for its retained child;
+/// the current cleanup ignores both results. Dropping or cancelling this future
+/// does not run that cleanup. A pre-existing daemon it never spawned is left alone.
 ///
 /// The reachability probe uses the peer-verified connect: a socket answered
 /// by a foreign-uid process is treated as UNREACHABLE (and logged loudly),
@@ -626,22 +627,7 @@ pub async fn supervise_events_daemon_with_readiness(
     let mut respawns: u64 = 0;
     let mut last_spawn: Option<std::time::Instant> = None;
     loop {
-        // Reap first: a child that exited (crashed, lost the advisory lock
-        // race, refused an untrusted directory) must not linger as a zombie,
-        // and clearing the slot is what re-arms the spawn below.
-        if let Some(c) = child.as_mut() {
-            match c.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::info!(%status, "events daemon child exited");
-                    child = None;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(error = %error, "cannot poll events daemon child; dropping handle");
-                    child = None;
-                }
-            }
-        }
+        poll_events_daemon_child(&mut child, std::process::Child::try_wait);
 
         let reachable = match connect_verified(&socket_path).await {
             Ok(_stream) => true,
@@ -714,6 +700,35 @@ pub async fn supervise_events_daemon_with_readiness(
         tracing::info!("events daemon child stopped with supervisor shutdown");
     }
 }
+
+#[cfg(unix)]
+fn poll_events_daemon_child(
+    child: &mut Option<std::process::Child>,
+    poll: impl FnOnce(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    let Some(c) = child.as_mut() else {
+        return;
+    };
+    match poll(c) {
+        Ok(Some(status)) => {
+            tracing::info!(%status, "events daemon child exited");
+            *child = None;
+        }
+        Ok(None) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+            // Another waiter may have reaped it; signalling a recycled PID is unsafe.
+            tracing::warn!(%error, "events daemon child is no longer waitable; clearing handle");
+            *child = None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot poll events daemon child; retaining handle for retry");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "daemon_reaping_tests.rs"]
+mod reaping_tests;
 
 #[cfg(unix)]
 pub(super) fn events_daemon_command(
