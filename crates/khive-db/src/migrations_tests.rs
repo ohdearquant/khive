@@ -12,6 +12,8 @@ mod admission;
 mod atom_weights;
 #[path = "migrations_tests/page_accounting.rs"]
 mod page_accounting;
+#[path = "migrations_tests/proposal_archive.rs"]
+mod proposal_archive;
 #[path = "migrations_tests/retrieval_snapshots.rs"]
 mod retrieval_snapshots;
 

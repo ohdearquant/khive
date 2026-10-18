@@ -6,7 +6,7 @@
 //! additional underscore-delimited segment, NOT a second dot:
 //! `memory.recall_embed`, not `memory.recall.embed`.
 //!
-//! One documented exception: the kg pack also carries the `stream`
+//! The public dotted exception: the kg pack also carries the `stream`
 //! sub-namespace (`stream.append`, `stream.read`, `stream.stat`,
 //! `stream.batch`). ADR-174 section 2 registers those four verbs under kg
 //! because the entries are kg
@@ -14,7 +14,8 @@
 //! transaction, which a separate pack could only do by reaching into kg's
 //! write path. The exception is pack-scoped and closed: kg may carry exactly
 //! the sub-namespaces listed in `KG_SUB_NAMESPACES` and nothing else; no
-//! other pack may borrow a prefix that is not its own name.
+//! other pack may borrow a prefix that is not its own name. ADR-046 C1 also
+//! admits exactly the internal operator name `kg.proposal_cleanup`.
 //!
 //! This test walks every `HandlerDef` across every pack registered in the
 //! `inventory` (i.e. linked into this test binary) and asserts:
@@ -96,6 +97,16 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
 /// needs the ADR line that grants it.
 const KG_SUB_NAMESPACES: &[&str] = &["stream"];
 
+fn documented_kg_dotted_name(name: &str) -> bool {
+    if name == "kg.proposal_cleanup" {
+        return true;
+    }
+    let mut parts = name.split('.');
+    let prefix = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    parts.next().is_none() && !rest.is_empty() && KG_SUB_NAMESPACES.contains(&prefix)
+}
+
 /// The contract's classification, one place for both tests and the decoy
 /// test below: every violation as a sentence naming the pack and the verb.
 fn violations(handlers: &[(String, String)]) -> Vec<String> {
@@ -118,13 +129,16 @@ fn violations(handlers: &[(String, String)]) -> Vec<String> {
             // the kg pack's documented sub-namespaces.
             1 => {
                 let prefix = verb_name.split('.').next().unwrap_or("");
-                let documented_kg_sub_namespace =
-                    pack_name == "kg" && KG_SUB_NAMESPACES.contains(&prefix);
-                if prefix != pack_name && !documented_kg_sub_namespace {
+                let allowed = if pack_name == "kg" {
+                    documented_kg_dotted_name(verb_name)
+                } else {
+                    prefix == pack_name
+                };
+                if !allowed {
                     violations.push(format!(
-                        "pack={pack_name:?} verb={verb_name:?}: prefix {prefix:?} does not \
-                         match pack name {pack_name:?} and is not a documented kg \
-                         sub-namespace ({KG_SUB_NAMESPACES:?}, ADR-174 section 2)."
+                        "pack={pack_name:?} verb={verb_name:?}: dotted name is not permitted \
+                         for its pack; kg permits {KG_SUB_NAMESPACES:?} (ADR-174 section 2) \
+                         and exactly kg.proposal_cleanup (ADR-046 C1)."
                     ));
                 }
             }
@@ -199,6 +213,10 @@ fn a_dotted_kg_verb_outside_the_documented_sub_namespace_still_reddens() {
 
     let decoys: Vec<(String, String)> = vec![
         ("kg".into(), "ledger.append".into()),
+        ("kg".into(), "kg.unregistered".into()),
+        ("kg".into(), "kg.proposal_cleanup_extra".into()),
+        ("kg".into(), "kg.proposal_cleanup.extra".into()),
+        ("memory".into(), "kg.proposal_cleanup".into()),
         ("memory".into(), "stream.read".into()),
         ("kg".into(), "stream.append.now".into()),
     ];
@@ -246,16 +264,11 @@ fn kg_pack_exposes_bare_verbs_or_a_documented_sub_namespace() {
     let undocumented: Vec<&&str> = kg_verbs
         .iter()
         .filter(|v| v.contains('.'))
-        .filter(|v| {
-            let mut parts = v.split('.');
-            let prefix = parts.next().unwrap_or("");
-            let rest = parts.next().unwrap_or("");
-            parts.next().is_some() || rest.is_empty() || !KG_SUB_NAMESPACES.contains(&prefix)
-        })
+        .filter(|v| !documented_kg_dotted_name(v))
         .collect();
     assert!(
         undocumented.is_empty(),
-        "kg pack may carry dotted names only under {KG_SUB_NAMESPACES:?} (ADR-174 section 2); \
-         found: {undocumented:?}"
+        "kg dotted names must use {KG_SUB_NAMESPACES:?} (ADR-174 section 2) or \
+         exactly kg.proposal_cleanup (ADR-046 C1); found: {undocumented:?}"
     );
 }

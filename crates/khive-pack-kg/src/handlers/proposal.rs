@@ -24,6 +24,45 @@ use khive_runtime::micros_to_iso;
 
 const PROPOSAL_LIST_CAP: u32 = 500;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalCleanupParams {
+    older_than: String,
+}
+
+/// Fixed-duration operator input, checked before taking a writer (ADR-046 C4).
+fn proposal_cleanup_cutoff(older_than: &str, now: i64) -> Result<i64, RuntimeError> {
+    let invalid = || {
+        RuntimeError::InvalidInput(
+            "older_than must be a positive ASCII integer followed by s, m, h, or d, within the microsecond timestamp range".into(),
+        )
+    };
+    let bytes = older_than.as_bytes();
+    let (unit, digits) = bytes.split_last().ok_or_else(invalid)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(invalid());
+    }
+    let seconds: i64 = match unit {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        _ => return Err(invalid()),
+    };
+    // ASCII validation above makes the byte boundary a UTF-8 boundary.
+    let amount = older_than[..digits.len()]
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    if amount == 0 {
+        return Err(invalid());
+    }
+    let micros = amount
+        .checked_mul(seconds)
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or_else(invalid)?;
+    now.checked_sub(micros).ok_or_else(invalid)
+}
+
 /// Refuse caller-owned stamps before a draft becomes immutable proposal history.
 fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result<(), RuntimeError> {
     use khive_runtime::secret_gate::reject_reserved_secret_gate_property;
@@ -52,6 +91,43 @@ fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result
 }
 
 impl KgPack {
+    pub(crate) async fn handle_proposal_cleanup(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.handle_proposal_cleanup_at(token, params, chrono::Utc::now().timestamp_micros())
+            .await
+    }
+
+    // The supplied clock is private: the public operator accepts only older_than.
+    async fn handle_proposal_cleanup_at(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        now: i64,
+    ) -> Result<Value, RuntimeError> {
+        let p: ProposalCleanupParams = deser(params)?;
+        let cutoff = proposal_cleanup_cutoff(&p.older_than, now)?;
+        let sql = self.runtime.sql();
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        let archived = writer
+            .execute(
+                SqlStatement::new(
+                    sql!("proposals_archive_resolved"),
+                    vec![
+                        SqlValue::Integer(now),
+                        SqlValue::Text(token.namespace().as_str().to_owned()),
+                        SqlValue::Integer(cutoff),
+                    ],
+                )
+                .labelled("proposals_open.archive_resolved"),
+            )
+            .await
+            .map_err(RuntimeError::Storage)?;
+        Ok(serde_json::json!({"archived": archived}))
+    }
+
     pub(crate) async fn resolve_proposal_uuid(
         &self,
         token: &NamespaceToken,
@@ -592,3 +668,7 @@ impl KgPack {
 #[cfg(test)]
 #[path = "proposal_reservation_tests.rs"]
 mod reservation_tests;
+
+#[cfg(test)]
+#[path = "proposal_cleanup_tests.rs"]
+mod cleanup_tests;
