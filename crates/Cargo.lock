@@ -2025,6 +2025,7 @@ version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "criterion",
  "curve25519-dalek",
  "ring",
  "serde",
