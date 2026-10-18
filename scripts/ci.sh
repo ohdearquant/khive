@@ -545,6 +545,10 @@ phase_content_sweeps() {
     # Named by test id: a renamed test is an error, not an empty selection.
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py" \
         HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set
+    echo "=== Developer Guide Table Checks ==="
+    # The directory map is compared with crates/*/Cargo.toml here, where every change runs it; the
+    # verb tables need a verbs() result and are compared inside smoke_test.py.
+    python3 "$SCRIPT_DIR/../tests/test_documented_guide_tables.py"
 }
 
 phase_macos_pr_check() {

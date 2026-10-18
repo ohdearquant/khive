@@ -27,6 +27,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
+from documented_guide_tables import validate_guide_verb_tables
 from kkernel_binary import REPO_ROOT, resolve_binary_path
 
 BINARY = resolve_binary_path()
@@ -269,6 +270,14 @@ def main():
         assert not documented_count_errors, (
             "published verb/pack counts drifted from the live registry:\n"
             + "\n".join(f"  - {error}" for error in documented_count_errors)
+        )
+        guide_table_errors = validate_guide_verb_tables(
+            Path(__file__).resolve().parent.parent,
+            verbs_result,
+        )
+        assert not guide_table_errors, (
+            "CLAUDE.md pack verb tables drifted from the live registry:\n"
+            + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 14 production packs and exposes 158 MCP-callable verbs
