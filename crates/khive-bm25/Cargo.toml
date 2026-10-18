@@ -30,6 +30,10 @@ rand = { workspace = true }
 name = "bm25_bench"
 harness = false
 
+[[bench]]
+name = "bm25_lifecycle"
+harness = false
+
 [[test]]
 name = "wand_correctness"
 path = "tests/wand_correctness.rs"
