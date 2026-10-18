@@ -397,6 +397,8 @@ impl KgPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.runtime
+            .authorize_mailbox_view(token, "query", None, &params)?;
         let p: QueryParams = deser(params)?;
         let requested_page_size = match (p.page_size, p.limit) {
             (Some(_), Some(_)) => {
