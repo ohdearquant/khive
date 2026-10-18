@@ -614,3 +614,108 @@ original components, which keep their names, cache keys and ledger names, so the
 reuses their build caches from the daily run. Chunking the benchmarked crates afresh would
 have changed the cache keys and the ledger's component names for no selection benefit, so it
 was not adopted.
+
+## Amendment 2 (2026-10-18): fixed references are measured on the build host and committed
+
+**Status**: Proposed
+
+D4 allows the Linux build host to give reference measurements during an exclusive reserved window. D4 and D5 require
+a fixed accepted reference before a trend contract reports healthy coverage. Neither names who produces the reference,
+how the window is reserved, or where the accepted numbers live, so no crate has one. This amendment fills that in.
+
+### The host and why a partition alone is not enough
+
+The build host is one bare-metal machine: 8 cores and 16 threads, one 16 MB L3 shared by every core, a 35 W package
+limit, and the `amd-pstate-epp` frequency driver. With the default posture, one read of the per-core clock gave
+2.94 GHz, 5.12 GHz and 2.92 GHz on three cores in the same instant while other jobs ran.
+
+Pinning a benchmark to cores of its own removes scheduler contention. It does not remove the shared cache, the
+shared memory controller or the shared power limit, so pinned cores still slow down when the others are loaded.
+
+The decision:
+
+1. **References come from an exclusive hold.** While a reference is measured, the host admits no other job. Jobs
+   already running finish first; nothing is preempted. A hold has a lease of at most 60 minutes, at most one is live,
+   and the runner ignores an expired hold. A hold waits at most 45 minutes for running work to drain; past that, the
+   attempt records UNMEASURED and names what was still running. A partition of the host may serve advisory
+   pull-request timing; it never produces a reference.
+2. **The frequency posture is fixed and recorded.** For a reference run, every core uses the `performance` governor
+   with its maximum frequency capped below the all-core sustained clock (3.6 GHz at this record). Each second, a
+   sampler records each pinned core's clock and busy share. An arm's clock band is (max - min) / median of the loaded
+   core's clock: per sample, the pinned core with the higher busy share, after every reading at the driver's idle floor
+   (400 MHz on this host) is dropped. An arm whose band exceeds 10% is UNMEASURED. A benchmark loads one pinned core at
+   a time, so the other pinned core idles at the floor; counting its readings would fail an arm on a core the benchmark
+   did not use. Holding the cap is a property the sampler shows per run, not one this record asserts.
+3. **Two runs at one commit.** Every benchmark target runs twice back to back at the same commit, pinned to the same
+   physical cores, with the benchmark's own Criterion configuration (never `--quick`). A benchmark is MEASURED only if
+   all three hold:
+   - the two medians are within D4's `noise_ceiling` (1.15);
+   - the loaded core's clock stays inside its band in both runs;
+   - in at most 5% of either run's one-second samples does another CPU exceed 20% busy. One busy sample a minute
+     passes; another CPU busy for more than 3 seconds of every minute does not. The highest reading in each run is
+     recorded, not judged.
+
+   A crate with any UNMEASURED benchmark gets no reference for that attempt. Its other numbers are not averaged in.
+4. **Every bench target runs.** The job reads `cargo metadata`, enables each target's required features, and fails
+   if any expected target did not execute.
+5. **The reference is committed.** `crates/<crate>/perf/reference.json` (schema `bench-reference/v1`) holds:
+   - the commit;
+   - the comparison class: host CPU, kernel, cores, frequency posture, compiler, profile;
+   - the exact command of each run;
+   - the reduction rule;
+   - both runs' medians and confidence intervals per benchmark;
+   - the host load and frequency posture at the start and end of measurement.
+     It lands by reviewed pull request only. A class change starts a new reference and never edits the old one in place.
+     The raw Criterion output is kept outside the repository, by archive digest.
+6. **Every hold leaves a usage row.** The row holds owner, reason, start and end, drain wait, measured wall time, CPU
+   seconds and peak memory. It goes to the host's usage ledger. How often references are re-measured (once per
+   benchmark change plus one scheduled re-measure per week) is read from that ledger.
+7. **Measurement ends with the hold.** A job's drain wait and its measured runs share one lease, so a job may set
+   a tighter drain bound than 45 minutes to leave room for its runs. A target whose estimated runs would not finish
+   before the hold ends is not started. A run still going when the hold ends is stopped together with every process
+   it started, and its target is recorded as failed. Either way that target's crate gets no reference from the
+   attempt, and the summary names the target and the reason.
+
+### Not decided here
+
+- Instruction counts (Criterion with a hardware-counter measurement, or callgrind) as the load-independent metric
+  for pull-request gating. The host permits user-space counters; adopting them is a separate amendment with its own
+  calibration.
+- Promotion of any reference to an absolute promise. That still follows D4's promotion protocol.
+
+### First references
+
+The first run measured commit `212bf72e498de9fbbda42cc0e2902906c730e3ea` on cores 2 and 3 under the posture above:
+governor `performance`, EPP `performance` and `scaling_max_freq` 3,600,000 kHz on every policy at the start and the end
+of measurement. The pinned cores' readings above the idle floor had a median of 3,549,011 kHz over the measured runs.
+Admissions closed at 03:55:30Z and the drain ended at 03:59:00Z, inside a 04:10Z bound. The runs went from 03:59:00Z to
+04:52:15Z against a 04:58Z limit: 3,195 s of measured wall time, 5,029 CPU-seconds, peak memory 1,769 MB.
+
+That run was judged under items 2 and 3 as first written: the band over both pinned cores' readings, and a single
+sample of another CPU above 20% failing the run. It produced no reference (0 BASELINE, 20 NO-BASELINE). 26 of 28 runs
+failed the band (largest 0.891), every one because of the idle pinned core's 400 MHz floor readings (1,833 of them),
+and 22 failed the busy rule. Items 2 and 3 were then amended to the text above.
+
+The amended rules were applied to the run's stored files without a re-run. As a control, the run's own reduction code,
+over its own stored files and thresholds, first reproduced the recorded verdict and every per-benchmark reason for all 20
+crates; the amended rules ran only after that matched. The stored sampler recorded one mean busy share for the two
+pinned cores, so the loaded core of each sample cannot be recovered, and the band was read on both pinned cores'
+readings with the floor dropped. That set contains every possible loaded-core selection, so (max - min) / min over it
+bounds the loaded-core band: at most 0.0189 across the 28 runs, against 0.10. The verdicts are therefore the ones the
+exact rule gives, and each reference from this run records that its band used this bound.
+
+Result: 10 BASELINE, 10 NO-BASELINE. Band failures went from 26 runs to 0 (largest 0.0186), busy failures from 22 to 3.
+
+- BASELINE: khive-brain-core (12 benchmarks), khive-pack-brain (6), khive-pack-comm (7), khive-pack-gtd (5),
+  khive-pack-knowledge (9), khive-pack-memory (6), khive-pack-schedule (5), khive-quant (13), khive-request (7),
+  khive-text (21).
+- Not started before the run limit (item 7): khive-db `db_hot_path`, khive-fold, khive-fusion, khive-query,
+  khive-retrieval, khive-score, khive-vamana. khive-db's other target, `db_concurrency`, measured all 5 of its
+  benchmarks; the crate has no reference because `db_hot_path` did not run.
+- Busy share above 5%: khive-bm25 (both runs, 0.770 and 0.452) and khive-pack-kg (second run, 0.172). All three runs
+  overlap 04:43:30Z to 04:51:00Z, when a read-only file scan ran on the host outside the job queue. The largest share
+  among passing runs was 0.0208.
+- A/A spread above 1.15: khive-hnsw, 2 of its 17 benchmarks.
+
+No target was still running at the limit, so the stop in item 7 was not exercised. The ten NO-BASELINE crates are
+measured again in a later window.
