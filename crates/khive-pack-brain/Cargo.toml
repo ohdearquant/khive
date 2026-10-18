@@ -61,3 +61,7 @@ serial_test = { workspace = true }
 [[bench]]
 name = "brain_pack_bench"
 harness = false
+
+[[bench]]
+name = "brain_resolve"
+harness = false
