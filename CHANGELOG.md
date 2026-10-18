@@ -7,16 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Add the CLI operator `kg.proposal_cleanup(older_than="30d")` to archive old
-  applied and rejected proposals in the selected namespace. The duration uses
-  positive whole seconds, minutes, hours or days, and retention follows the last
-  projection activity. Ordinary lists hide archived proposals; proposal identity,
-  lookups, parent references and lifecycle event history remain available.
-  The operator follows normal write policy and is unavailable through MCP or
-  multi-operation atomic requests. Migration V58 follows V57 from #5185.
-
 ## [0.14.0] - 2026-10-18
 
 ### Added
