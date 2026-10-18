@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Code ontology pack - typed edge rules and audit findings vocabulary"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
