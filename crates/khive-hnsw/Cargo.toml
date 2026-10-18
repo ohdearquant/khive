@@ -37,6 +37,14 @@ lattice-embed = { workspace = true }
 name = "hnsw_bench"
 harness = false
 
+[[bench]]
+name = "hnsw_lifecycle"
+harness = false
+
+[[bench]]
+name = "hnsw_rebuild_alloc"
+harness = false
+
 [[test]]
 name = "hnsw_tests"
 
