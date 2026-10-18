@@ -113,6 +113,19 @@ impl FromStr for EntityKind {
     }
 }
 
+/// Entity-kind admission for an explicit archive import.
+///
+/// This policy never changes relation validation or registers new kinds for
+/// ordinary writes. VCS snapshot degradation is a separate policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImportKindPolicy {
+    /// Refuse entity kinds outside the importer's installed vocabulary.
+    #[default]
+    Strict,
+    /// Preserve genuinely unknown, nonblank entity-kind spellings verbatim.
+    PreserveUnknown,
+}
+
 /// A graph node with a type, display name, and key-value properties.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -227,7 +240,7 @@ impl TryFrom<LinkRaw> for Link {
                 raw.weight
             ));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !validate_edge_weight(raw.weight) {
             return Err(alloc::format!(
                 "Link weight must be in [0.0, 1.0], got {}",
                 raw.weight

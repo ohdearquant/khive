@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use khive_types::ParseIdError;
 use serde_json::Value;
@@ -82,15 +82,14 @@ pub(crate) fn records(input: &str, substrate: Substrate) -> Result<Records, Diff
                 line,
                 source,
             })?;
-        if records.contains_key(&id) {
+        let Entry::Vacant(entry) = records.entry(id) else {
             return Err(DiffInputError::DuplicateIdentity {
                 substrate,
                 line,
                 id,
             });
-        }
-        records.insert(
-            id,
+        };
+        entry.insert(
             fields
                 .into_iter()
                 .map(|(key, value)| (key, canonical_value(value)))

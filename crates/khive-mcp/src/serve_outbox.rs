@@ -23,6 +23,24 @@ pub(super) enum OutboxChannels<'a> {
     },
 }
 
+/// What one delivery cycle has learned so far; built fresh by every [`outbox_once`] call.
+#[derive(Default)]
+struct CycleState {
+    #[cfg(feature = "channel-email")]
+    mirror: MirrorCycle,
+}
+
+/// The remote suppression mirror within one delivery cycle (ADR-200 §6): it is refreshed at most
+/// once, and only a cycle whose refresh succeeded hands an external message to SMTP.
+#[cfg(feature = "channel-email")]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum MirrorCycle {
+    #[default]
+    NotRefreshed,
+    Refreshed,
+    Failed,
+}
+
 enum SelectedChannel<'a> {
     #[cfg(all(test, feature = "channel-email"))]
     Borrowed(&'a dyn Channel),
@@ -151,15 +169,16 @@ impl OutboxPolicy<'_> {
         runtime: &KhiveRuntime,
         token: &khive_runtime::NamespaceToken,
         note: &Note,
+        cycle: &mut CycleState,
     ) -> Result<Option<Prepared>, crate::components::ComponentError> {
         match self {
             #[cfg(feature = "channel-email")]
             Self::Email { mailbox, domains } => {
-                prepare_email(runtime, token, note, mailbox, domains).await
+                prepare_email(runtime, token, note, mailbox, domains, &mut cycle.mirror).await
             }
             #[cfg(feature = "channel-telegram")]
             Self::Telegram(_) => {
-                let _ = (runtime, token);
+                let _ = (runtime, token, cycle);
                 let Some(to) = note
                     .properties
                     .as_ref()
@@ -324,20 +343,56 @@ pub(super) async fn outbox_once(
         ComponentError::Permanent(error.to_string())
     })?;
     policy.retry_held_diagnostics(runtime, &token).await?;
+    let mut cycle = CycleState::default();
+    #[cfg(feature = "channel-email")]
+    if matches!(&policy, OutboxPolicy::Email { .. }) {
+        keep_suppression_mirror_fresh(runtime, &mut cycle.mirror).await;
+    }
     let (channel_slug, include_legacy) = channels.scan_scope(policy.kind());
-    let notes = runtime
+    const SCAN_PAGE_LIMIT: u32 = 200;
+    let scan_result = runtime
         .list_undelivered_outbound_messages_for_channel(
             &token,
             policy.prefix(),
             &channel_slug,
             include_legacy,
-            200,
+            SCAN_PAGE_LIMIT,
         )
-        .await
-        .map_err(|error| {
-            policy.scan_error(&error, false);
-            ComponentError::Retryable(error.to_string())
-        })?;
+        .await;
+    let outcome = match &scan_result {
+        Ok(notes) => khive_pack_comm::OutboxScanOutcome::Success {
+            pending_rows_seen: notes.len() as u64,
+            pending_rows_limit: SCAN_PAGE_LIMIT,
+            oldest_pending_created_at: notes
+                .iter()
+                .map(|note| note.created_at)
+                .min()
+                .and_then(chrono::DateTime::from_timestamp_micros),
+        },
+        Err(error) => khive_pack_comm::OutboxScanOutcome::Failure {
+            error_message: error.to_string(),
+        },
+    };
+    if let Err(error) = khive_pack_comm::record_outbox_scan(
+        runtime,
+        &token,
+        policy.kind(),
+        &channel_slug,
+        khive_pack_comm::OutboxScan {
+            completed_at: chrono::Utc::now(),
+            interval_secs: OUTBOUND_RETRY_BASE.as_secs(),
+            outcome,
+        },
+    )
+    .await
+    {
+        tracing::warn!(target: "khive_mcp::serve", channel = policy.kind(),
+            channel_slug = %channel_slug, "failed to persist outbox scan outcome: {error}");
+    }
+    let notes = scan_result.map_err(|error| {
+        policy.scan_error(&error, false);
+        ComponentError::Retryable(error.to_string())
+    })?;
     let mut warned = std::collections::HashSet::new();
     for note in notes {
         if cancellation.is_cancelled() {
@@ -368,7 +423,7 @@ pub(super) async fn outbox_once(
         let Some(channel) = channels.select(policy.kind(), props, &mut warned) else {
             continue;
         };
-        let Some(prepared) = policy.prepare(runtime, &token, &note).await? else {
+        let Some(prepared) = policy.prepare(runtime, &token, &note, &mut cycle).await? else {
             continue;
         };
         match channel.channel().send(prepared.envelope).await {
@@ -414,6 +469,89 @@ pub(super) async fn outbox_once(
     Ok(())
 }
 
+/// Refresh an idle mirror before external admission would read it as stale (ADR-200 §6).
+///
+/// Admission refuses external messages once the last successful refresh is older than the
+/// maximum age, and a cycle with no external message pending has no other reason to refresh, so
+/// an idle daemon would otherwise close external admission and never reopen it. A cycle whose
+/// recorded refresh is missing, unreadable or at least half the maximum age old refreshes here,
+/// and that is its one refresh.
+#[cfg(feature = "channel-email")]
+async fn keep_suppression_mirror_fresh(runtime: &KhiveRuntime, mirror_cycle: &mut MirrorCycle) {
+    let Some(mirror) = runtime.outbound_email_policy().suppression_mirror() else {
+        return;
+    };
+    let due = match khive_pack_comm::handlers::suppression_mirror_last_refresh(runtime).await {
+        Ok(Some(at)) => (chrono::Utc::now() - at)
+            .to_std()
+            .is_ok_and(|age| age >= mirror.max_age() / 2),
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!(target: "khive_mcp::serve", error = %error,
+                "outbox loop: suppression mirror refresh time is unreadable; refreshing"
+            );
+            true
+        }
+    };
+    if due {
+        refresh_suppression_mirror(runtime, mirror_cycle).await;
+    }
+}
+
+/// The cycle's one mirror refresh: read the complete remote set and add any missing key to the
+/// local list. The outcome is kept in `mirror_cycle`, so a failure is not retried until the next
+/// cycle and every external message in this one stays pending.
+#[cfg(feature = "channel-email")]
+async fn refresh_suppression_mirror(runtime: &KhiveRuntime, mirror_cycle: &mut MirrorCycle) {
+    let Some(mirror) = runtime.outbound_email_policy().suppression_mirror() else {
+        return;
+    };
+    // Attribute added entries as the mailto entry point does: the serving actor, or the
+    // channel's own identity when the process has none configured.
+    let actor = runtime
+        .config()
+        .actor_id
+        .clone()
+        .unwrap_or_else(|| "channel:email".to_string());
+    let outcome = async {
+        let set = khive_channel_email::suppression_mirror::fetch_remote_suppression_set(
+            mirror.url(),
+            mirror.credential(),
+        )
+        .await?;
+        let added = khive_pack_comm::handlers::apply_suppression_mirror_refresh(
+            runtime,
+            &set.as_of,
+            &set.recipient_keys,
+            &actor,
+        )
+        .await
+        .map_err(|error| format!("suppression mirror refresh could not be recorded: {error}"))?;
+        Ok::<_, String>((added, set.recipient_keys.len()))
+    }
+    .await;
+    match outcome {
+        Ok((added, remote)) => {
+            *mirror_cycle = MirrorCycle::Refreshed;
+            if added > 0 {
+                tracing::info!(target: "khive_mcp::serve", added, remote,
+                    "outbox loop: suppression mirror refreshed; one-click entries added"
+                );
+            } else {
+                tracing::debug!(target: "khive_mcp::serve", remote,
+                    "outbox loop: suppression mirror refreshed"
+                );
+            }
+        }
+        Err(reason) => {
+            *mirror_cycle = MirrorCycle::Failed;
+            tracing::warn!(target: "khive_mcp::serve", reason = %reason,
+                "outbox loop: suppression mirror refresh failed; external messages in this cycle stay pending"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "channel-email")]
 async fn prepare_email(
     runtime: &KhiveRuntime,
@@ -421,6 +559,7 @@ async fn prepare_email(
     note: &Note,
     mailbox: &str,
     domains: &khive_runtime::EmailMessageIdDomains,
+    mirror_cycle: &mut MirrorCycle,
 ) -> Result<Option<Prepared>, crate::components::ComponentError> {
     use chrono::Utc;
     let Some(props) = note
@@ -517,6 +656,19 @@ async fn prepare_email(
     }
 
     if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
+        // ADR-200 §6: with a remote mirror configured, an external message reaches SMTP only in
+        // a cycle whose refresh succeeded. A failed refresh leaves it pending, never failed.
+        if email_policy.suppression_mirror().is_some() {
+            if *mirror_cycle == MirrorCycle::NotRefreshed {
+                refresh_suppression_mirror(runtime, mirror_cycle).await;
+            }
+            if *mirror_cycle == MirrorCycle::Failed {
+                tracing::debug!(target: "khive_mcp::serve", note_id = %note_id,
+                    "outbox loop: external message stays pending; suppression mirror refresh failed this cycle"
+                );
+                return Ok(None);
+            }
+        }
         let suppressions = khive_pack_comm::handlers::load_outbound_email_suppressions(runtime)
             .await
             .map_err(|error| {

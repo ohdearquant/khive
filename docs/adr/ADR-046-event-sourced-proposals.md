@@ -6,6 +6,8 @@
 **Amendment**: [resolved-proposal cleanup](#amendment-resolved-proposal-cleanup-2026-10-09)
 (accepted 2026-10-09) defines the deferred operator command. Its implementation
 lands on its own gates.
+**Amendment**: [canonical change-set proposals](#amendment-2026-10-14-canonical-change-set-proposals)
+(accepted 2026-10-14) adds the `Canonical` changeset arm, landed through ADR-102's tier-1 verb.
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
@@ -1327,3 +1329,47 @@ tests executed or supplied by this documentation amendment:
 This amendment changes no proposal event taxonomy, review/apply authority,
 approval threshold, durable-apply reconciliation, or governance semantics in
 the accepted base and earlier amendments.
+
+## Amendment (2026-10-14): canonical change-set proposals
+
+**Status**: Accepted (2026-10-14). Adds one `ProposalChangeset` arm; every existing arm and its
+apply behavior are unchanged. Acceptance of this text is not implementation acceptance: the arm
+lands with the apply path as its caller, on its own gates.
+
+Apart from `ClassifyExistingEdgeGovernance`'s expected edge preimage, today's `ProposalChangeset`
+arms capture no stage-time preimage, so the reviewed path cannot refuse a write whose target
+changed after review. This amendment lets a
+proposal carry an [ADR-101](ADR-101-kg-changeset-model.md) change-set, preimages included, and
+lands it through the same implementation as tier-1's `apply_changeset` verb
+([ADR-102](ADR-102-tiered-validate-and-merge.md), amendment of 2026-10-14).
+
+### K1. New arm: `Canonical`
+
+```rust
+/// One ADR-101 change-set, carried as its NDJSON-delta text.
+Canonical { schema_version: u32, delta: String },
+```
+
+The delta is opaque at this layer because `khive-types` cannot depend on `khive-changeset`, which
+depends on it. It is not an unvalidated blob, so the closed-enum rationale above still holds:
+`propose` decodes the delta with the canonical codec in the KG pack and refuses a
+`schema_version` that is unsupported or differs from the envelope's, an undecodable line, any op
+the canonical model rejects, a change-set over [ADR-099](ADR-099-bulk-apply-atomic-units.md) D2's
+op bound, and, until merge parity lands, any `merge` op, with the reason ADR-102's amendment gives.
+`Canonical` is only ever the top-level changeset, never a `Compound` step.
+
+### K2. Apply through the tier-1 landing path
+
+On approval, the apply worker decodes the delta and lands it through the implementation behind
+`apply_changeset`: the same atomic runner, the same preimage comparator and the same refusal
+shape. A preimage mismatch is a failure known to precede commit, so it takes the existing failed
+apply path, and the failure names the op's index and the field path. This ADR's 2026-08-11
+boundary is unchanged: a committed unit whose post-commit processing fails is a reconciliation
+state, never replayed.
+
+### K3. Proposals without preimages
+
+Proposals carried by the other existing arms have no stage-time preimage. They keep applying
+under today's guards, and `review` and apply output state `preimage: none` for them. A preimage is never
+synthesized at apply time: one read at apply would compare live state with itself and certify
+nothing.

@@ -690,6 +690,12 @@ fn describe_failure(failure: &AtomicOpFailure) -> String {
     match failure {
         AtomicOpFailure::NoteConflict(conflict) => conflict.clone().into_error().to_string(),
         AtomicOpFailure::EntityConflict(conflict) => conflict.clone().into_error().to_string(),
+        AtomicOpFailure::PreimageMismatch { target_id, field_path } => {
+            format!("captured preimage mismatch for {target_id} at {field_path}")
+        }
+        AtomicOpFailure::OwnerSnapshotConflict { target_id, kind } => {
+            format!("owner_snapshot_conflict for {target_id} ({kind})")
+        }
         AtomicOpFailure::GuardFailed {
             statement_label,
             expected,
@@ -1173,6 +1179,9 @@ async fn build_op_result(
             }
             if let Some(obj) = raw.as_object_mut() {
                 obj.insert("mutation".to_string(), json!(p.disposition().name()));
+                if let Some(hint) = p.dependency_kind_inference_hint() {
+                    obj.insert("hint".to_string(), json!(hint));
+                }
             }
             Ok(raw)
         }

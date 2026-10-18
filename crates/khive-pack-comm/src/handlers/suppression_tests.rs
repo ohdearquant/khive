@@ -557,3 +557,39 @@ fn suppression_caller_scope_uses_the_runtime_actor_as_current_maintainer() {
     assert!(ensure_suppression_caller_allowed(&external, "actor:external").is_ok());
     assert!(ensure_suppression_caller_allowed(&external, "actor:other").is_err());
 }
+
+#[tokio::test]
+async fn inbound_load_skips_recipient_key_entries() {
+    let runtime = runtime();
+    let token = token(&runtime);
+    let key = "a".repeat(64);
+    add(
+        &runtime,
+        &token,
+        "inbound",
+        "recipient_key",
+        &key,
+        "operator",
+    )
+    .await
+    .expect("an inbound recipient_key entry is accepted");
+    add(
+        &runtime,
+        &token,
+        "inbound",
+        "address",
+        "blocked@example.com",
+        "operator",
+    )
+    .await
+    .expect("an inbound address entry");
+    let entries = load_inbound_email_suppressions(&runtime)
+        .await
+        .expect("an inbound recipient_key entry does not fail the load");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(matches!(
+        entries[0].kind,
+        khive_runtime::EmailSuppressionKind::Address
+    ));
+    assert_eq!(entries[0].value, "blocked@example.com");
+}

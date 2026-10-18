@@ -1,4 +1,4 @@
-//! pack-comm — Communication pack providing fourteen public `comm.*` verbs.
+//! pack-comm — Communication pack providing fifteen public `comm.*` verbs.
 
 mod file_attachments;
 pub mod handlers;
@@ -9,6 +9,7 @@ pub(crate) mod pack;
 pub(crate) mod params;
 pub(crate) mod vocab;
 
+pub use handlers::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
 pub use pack::CommPack;
 
 #[cfg(test)]

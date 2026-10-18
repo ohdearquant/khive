@@ -182,6 +182,23 @@ async fn code_ingest_batch_with_config_runtime_setup_and_gate<F>(
 where
     F: FnOnce(&KhiveRuntime) -> Result<()>,
 {
+    code_ingest_batch_with_provider_setup(args, config, gate_override, |_| Ok(()), runtime_setup)
+        .await
+}
+
+// Host providers must be installed before registry finalization. The separate
+// runtime_setup callback remains inside the allowed gate's direct-write section.
+async fn code_ingest_batch_with_provider_setup<P, F>(
+    args: CodeIngestArgs,
+    config: Option<&Path>,
+    gate_override: Option<GateRef>,
+    provider_setup: P,
+    runtime_setup: F,
+) -> Result<CodeIngestReport>
+where
+    P: FnOnce(&KhiveRuntime) -> Result<()>,
+    F: FnOnce(&KhiveRuntime) -> Result<()>,
+{
     let bytes = std::fs::read(&args.findings)
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
 
@@ -237,6 +254,7 @@ where
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    provider_setup(&runtime)?;
     let registry = build_code_ingest_registry(&runtime)?;
     let gate_args = json!({
         "input_kind": "findings_json",
@@ -616,15 +634,13 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<Vec<EntityCandidateP
     }
     for (index, note) in batch.notes.iter().enumerate() {
         let record = format!("note[{index}]");
-        secret_gate::check_at(&note.content, &record, "content")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(name) = &note.name {
-            secret_gate::check_at(name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if let Some(properties) = &note.properties {
-            secret_gate::check_json_at(properties, &record, "properties")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        secret_gate::check_note_fields_at(
+            &note.content,
+            note.name.as_deref(),
+            note.properties.as_ref(),
+            &record,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -810,6 +826,10 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
 #[cfg(test)]
 #[path = "code_ingest/entity_admission_tests.rs"]
 mod entity_admission_tests;
+
+#[cfg(test)]
+#[path = "code_ingest/note_fields_tests.rs"]
+mod note_fields_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1022,7 +1042,7 @@ mod tests {
     fn install_test_embedders(runtime: &KhiveRuntime) -> Result<()> {
         for name in runtime.registered_embedding_model_names() {
             let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-            runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
+            runtime.try_register_embedder(FixedEmbeddingProvider { name, dimensions })?;
         }
         Ok(())
     }
@@ -1059,10 +1079,13 @@ mod tests {
                 .parent()
                 .expect("findings fixture must have a parent directory"),
         );
-        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), |runtime| {
-            install_test_embedders(runtime)?;
-            runtime_setup(runtime)
-        })
+        super::code_ingest_batch_with_provider_setup(
+            args,
+            Some(&config),
+            None,
+            install_test_embedders,
+            runtime_setup,
+        )
         .await
     }
 
@@ -1306,10 +1329,11 @@ mod tests {
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
 
-        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let err = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(Arc::clone(&gate) as GateRef),
+            install_test_embedders,
             move |_| {
                 setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -1379,11 +1403,12 @@ mod tests {
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
         let gate = Arc::new(AllowFindingsIngestGate);
 
-        let report = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let report = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(gate as GateRef),
             install_test_embedders,
+            |_| Ok(()),
         )
         .await
         .expect("an allowing gate must let the batch proceed");
@@ -1414,10 +1439,11 @@ mod tests {
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
 
-        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let err = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(gate as GateRef),
+            install_test_embedders,
             move |_| {
                 setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -2177,10 +2203,6 @@ mod tests {
                 !model_names.is_empty(),
                 "test requires at least one configured embedding model"
             );
-            for name in model_names {
-                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
-            }
             Ok(())
         })
         .await
@@ -2273,15 +2295,9 @@ mod tests {
         )
         .expect("write long findings fixture");
 
-        let report = code_ingest_batch_with_runtime_setup(base_args(findings, db), |runtime| {
-            for name in runtime.registered_embedding_model_names() {
-                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
-            }
-            Ok(())
-        })
-        .await
-        .expect("ingest with bounded embedding input must succeed");
+        let report = code_ingest_batch_with_runtime_setup(base_args(findings, db), |_| Ok(()))
+            .await
+            .expect("ingest with bounded embedding input must succeed");
 
         assert!(
             !report.truncation_by_model.is_empty(),

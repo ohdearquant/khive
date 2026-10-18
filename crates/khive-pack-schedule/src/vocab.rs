@@ -2,6 +2,30 @@
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
+const REPEAT_PARAM: ParamDef = ParamDef {
+    name: "repeat",
+    param_type: "string",
+    required: false,
+    description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const MISFIRE_POLICY_PARAM: ParamDef = ParamDef {
+    name: "misfire_policy",
+    param_type: "string",
+    required: false,
+    description: "Missed-occurrence policy: \"skip\" (default, existing global grace) or \"catch_up_once\" (consider only the latest due occurrence). catch_up_once always requires explicit max_lateness, for both one-shot and repeating events.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const MAX_LATENESS_PARAM: ParamDef = ParamDef {
+    name: "max_lateness",
+    param_type: "integer",
+    required: false,
+    description: "Required with catch_up_once: a positive, representable integer number of seconds. Equality is admitted. No period-derived default; rejected with skip or omitted misfire_policy.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
         name: "schedule.remind",
@@ -23,13 +47,9 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 description: "Trigger time in RFC 3339 format (e.g. \"2026-06-01T09:00:00Z\"). Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "repeat",
-                param_type: "string",
-                required: false,
-                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            REPEAT_PARAM,
+            MISFIRE_POLICY_PARAM,
+            MAX_LATENESS_PARAM,
         ],
     },
     HandlerDef {
@@ -75,13 +95,9 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                                requires (see the handler description). Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "repeat",
-                param_type: "string",
-                required: false,
-                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            REPEAT_PARAM,
+            MISFIRE_POLICY_PARAM,
+            MAX_LATENESS_PARAM,
         ],
     },
     HandlerDef {

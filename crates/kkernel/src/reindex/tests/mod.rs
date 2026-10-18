@@ -2730,11 +2730,7 @@ async fn run_reindex_snapshot_failure_fails_closed_and_preserves_committed_work(
         let mut writer = rt.sql().writer().await.expect("writer");
         writer
             .execute_script(
-                "CREATE TABLE retrieval_snapshots (
-                        namespace TEXT NOT NULL, index_type TEXT NOT NULL,
-                        snapshot BLOB NOT NULL, created_at INTEGER NOT NULL,
-                        PRIMARY KEY(namespace, index_type));
-                     INSERT INTO retrieval_snapshots VALUES
+                "INSERT INTO retrieval_snapshots VALUES
                         ('local::vamana::test-model', 'vamana', X'00', 0),
                         ('other::vamana::test-model', 'vamana', X'00', 0),
                         ('local::hnsw::test-model', 'hnsw', X'00', 0),
@@ -2820,6 +2816,14 @@ async fn run_reindex_snapshot_missing_table_remains_successful() {
     let args = snapshot_reindex_args(dir.path(), false);
     let rt = snapshot_test_runtime(&args);
     seed_snapshot_test_note(&rt).await;
+    // V57 creates this table; remove it to exercise the absent-table path.
+    {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute_script("DROP TABLE retrieval_snapshots;".into())
+            .await
+            .expect("remove migrated snapshot table for missing-table fixture");
+    }
     let table_count = "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'retrieval_snapshots'";
     assert_eq!(snapshot_test_count(&rt, table_count).await, 0);
     run_reindex_offline(args)

@@ -2824,6 +2824,7 @@ fn knowledge_ann_query_paths_use_query_intent_embed() {
         include_str!("search/hydration.rs"),
         include_str!("search/compose_helpers.rs"),
         include_str!("search/handlers.rs"),
+        include_str!("search/rerank.rs"),
     ]
     .join("\n");
     // Build needle at runtime to avoid self-match in include_str.

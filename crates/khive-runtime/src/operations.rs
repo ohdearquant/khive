@@ -40,6 +40,9 @@ use khive_db::stores::graph::{
 
 use khive_db::stores::text::insert_document_statements;
 
+mod note_search;
+mod quarantine_note_retention;
+
 #[cfg(test)]
 mod batch_edge_tests;
 
@@ -259,7 +262,7 @@ fn record_post_commit_degradation(
 /// Legacy methods cannot return both their original result and the new report.
 /// Give direct callers a typed, non-retryable error with the committed record
 /// handle and every failed stage instead of silently dropping the report.
-fn legacy_post_commit_result<T>(
+pub(crate) fn legacy_post_commit_result<T>(
     operation: &'static str,
     id: Uuid,
     value: T,
@@ -353,17 +356,14 @@ pub use read_helpers::{
 pub use record_ops::NoteCreateSpec;
 
 pub use edge_query::QueryResult;
-use graph_rules::{
-    accepted_entity_relations_description, pack_rule_allows,
-    static_impossible_edge_pattern_warnings,
-};
+use graph_rules::{accepted_entity_relations_description, static_impossible_edge_pattern_warnings};
 pub use graph_rules::{
     accepted_entity_relations_for_entities, accepted_pack_relations_for_entities,
-    merge_entry_metadata,
+    dependency_kind_inference_hint, merge_entry_metadata,
 };
 pub(crate) use graph_rules::{
     canonical_edge_endpoint_kinds, canonical_edge_endpoints, merge_dependency_kind,
-    validate_edge_metadata, validate_edge_weight,
+    pack_rule_allows, validate_edge_metadata, validate_edge_weight,
 };
 #[cfg(test)]
 use link_ops::guarded_link_batch_failure;
@@ -429,148 +429,10 @@ fn resolved_pair(r: Option<&Resolved>) -> Option<(&'static str, &str, Option<&st
     }
 }
 
-/// `true` if `spec` matches the given substrate + kind + entity_type triple.
-///
-/// Pure and DB-free — exposed so offline consumers (e.g. `kkernel kg
-/// validate`, which parses `(substrate, kind, entity_type)` straight out of
-/// NDJSON with no live record to resolve) can apply the exact same
-/// `EdgeEndpointRule` matching semantics `pack_rule_allows` uses internally,
-/// instead of re-deriving a parallel matcher that could drift out of sync.
-pub fn endpoint_matches(
-    spec: &EndpointKind,
-    substrate: &str,
-    kind: &str,
-    entity_type: Option<&str>,
-) -> bool {
-    match spec {
-        EndpointKind::EntityOfKind(k) => substrate == "entity" && *k == kind,
-        EndpointKind::NoteOfKind(k) => substrate == "note" && *k == kind,
-        EndpointKind::EntityOfType {
-            kind: k,
-            entity_type: t,
-        } => substrate == "entity" && *k == kind && entity_type == Some(*t),
-    }
-}
-
-/// Base entity endpoint allowlist — the closed set of permitted entity→entity
-/// relation triples.
-///
-/// Each entry `(src_kind, relation, tgt_kind)` explicitly allows that combination.
-/// `"*"` as `src_kind` means "any entity kind" (used by `instance_of` whose source
-/// is unrestricted).
-///
-/// Pack rules (via `EDGE_RULES`) are additive — they cannot remove rows here.
-/// Exposed via `base_entity_endpoint_rules()` for the ADR-076 certificate tests.
-pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
-    // Structure
-    ("concept", EdgeRelation::Contains, "concept"),
-    ("project", EdgeRelation::Contains, "project"),
-    ("project", EdgeRelation::Contains, "artifact"),
-    ("org", EdgeRelation::Contains, "project"),
-    ("org", EdgeRelation::Contains, "service"),
-    ("concept", EdgeRelation::PartOf, "concept"),
-    ("project", EdgeRelation::PartOf, "project"),
-    ("project", EdgeRelation::PartOf, "org"),
-    ("*", EdgeRelation::InstanceOf, "concept"),
-    ("service", EdgeRelation::InstanceOf, "project"),
-    // ADR-002 amendment (ADR-191): web hyperlink — a document points at
-    // another document it links to. No qualifier inference (unlike
-    // depends_on); the endpoint pair is intentionally narrow (document only,
-    // no service/concept targets — see ADR-191 D2/F10).
-    ("document", EdgeRelation::LinksTo, "document"),
-    // ADR-196 location, amended 2026-10-05: the source occupies or is manifested in the target
-    // without being a constituent of it; base rows for concept and org, packs narrow the rest.
-    ("concept", EdgeRelation::LocatedIn, "concept"),
-    ("org", EdgeRelation::LocatedIn, "concept"),
-    // Ownership
-    ("person", EdgeRelation::Owns, "org"),
-    ("org", EdgeRelation::Owns, "org"),
-    // Derivation
-    ("concept", EdgeRelation::Extends, "concept"),
-    ("concept", EdgeRelation::VariantOf, "concept"),
-    ("artifact", EdgeRelation::VariantOf, "artifact"),
-    ("concept", EdgeRelation::IntroducedBy, "document"),
-    ("concept", EdgeRelation::IntroducedBy, "person"),
-    ("artifact", EdgeRelation::IntroducedBy, "document"),
-    ("project", EdgeRelation::IntroducedBy, "document"),
-    // ADR-002 amendment (ADR-167): service provenance — the document that
-    // introduced a service (its ADR or design record).
-    ("service", EdgeRelation::IntroducedBy, "document"),
-    ("document", EdgeRelation::IntroducedBy, "person"),
-    ("document", EdgeRelation::IntroducedBy, "org"),
-    ("concept", EdgeRelation::IntroducedBy, "org"),
-    // Provenance
-    ("artifact", EdgeRelation::DerivedFrom, "dataset"),
-    ("artifact", EdgeRelation::DerivedFrom, "document"),
-    ("artifact", EdgeRelation::DerivedFrom, "project"),
-    ("artifact", EdgeRelation::DerivedFrom, "artifact"),
-    // ADR-002 amendment 2026-07-27: publication provenance — a curated or
-    // filtered publication copy points at the canonical source document.
-    ("document", EdgeRelation::DerivedFrom, "document"),
-    // Temporal
-    ("document", EdgeRelation::Precedes, "document"),
-    ("dataset", EdgeRelation::Precedes, "dataset"),
-    ("artifact", EdgeRelation::Precedes, "artifact"),
-    ("service", EdgeRelation::Precedes, "service"),
-    ("project", EdgeRelation::Precedes, "project"),
-    // Dependency
-    ("project", EdgeRelation::DependsOn, "project"),
-    ("service", EdgeRelation::DependsOn, "project"),
-    ("service", EdgeRelation::DependsOn, "service"),
-    ("service", EdgeRelation::DependsOn, "artifact"),
-    ("service", EdgeRelation::DependsOn, "dataset"),
-    ("artifact", EdgeRelation::DependsOn, "project"),
-    ("artifact", EdgeRelation::DependsOn, "service"),
-    ("document", EdgeRelation::DependsOn, "document"),
-    ("concept", EdgeRelation::Enables, "concept"),
-    ("service", EdgeRelation::Enables, "concept"),
-    ("dataset", EdgeRelation::Enables, "concept"),
-    // Implementation
-    ("project", EdgeRelation::Implements, "concept"),
-    ("service", EdgeRelation::Implements, "concept"),
-    // Lateral
-    ("concept", EdgeRelation::CompetesWith, "concept"),
-    ("project", EdgeRelation::CompetesWith, "project"),
-    ("service", EdgeRelation::CompetesWith, "service"),
-    ("org", EdgeRelation::CompetesWith, "org"),
-    ("concept", EdgeRelation::ComposedWith, "concept"),
-    ("project", EdgeRelation::ComposedWith, "project"),
-    // Versioning (Supersedes — Concept/Document/Artifact/Service/Dataset only)
-    ("concept", EdgeRelation::Supersedes, "concept"),
-    ("document", EdgeRelation::Supersedes, "document"),
-    ("artifact", EdgeRelation::Supersedes, "artifact"),
-    ("service", EdgeRelation::Supersedes, "service"),
-    ("dataset", EdgeRelation::Supersedes, "dataset"),
-    // Epistemic (Supports/Refutes — evidence sources → Concept claim only)
-    ("concept", EdgeRelation::Supports, "concept"),
-    ("document", EdgeRelation::Supports, "concept"),
-    ("dataset", EdgeRelation::Supports, "concept"),
-    ("artifact", EdgeRelation::Supports, "concept"),
-    ("concept", EdgeRelation::Refutes, "concept"),
-    ("document", EdgeRelation::Refutes, "concept"),
-    ("dataset", EdgeRelation::Refutes, "concept"),
-    ("artifact", EdgeRelation::Refutes, "concept"),
-];
-
-/// Returns the base entity endpoint allowlist.
-///
-/// The returned slice is the same data that `base_entity_rule_allows` consults at
-/// runtime. Exposed for the ADR-076 certificate tests in `khive-pack-kg`, which
-/// must audit live rules rather than hand-copied snapshots.
-pub fn base_entity_endpoint_rules() -> &'static [(&'static str, EdgeRelation, &'static str)] {
-    BASE_ENTITY_ENDPOINT_RULES
-}
-
-/// `true` if `(src_kind, relation, tgt_kind)` is in the base entity endpoint
-/// allowlist. Pure and DB-free — exposed alongside [`base_entity_endpoint_rules`]
-/// so offline consumers (e.g. `kkernel kg validate`) can apply the exact same
-/// base-table membership test the live validator uses, instead of re-deriving
-/// a parallel `.any()` predicate over a hand-copied allowlist.
-pub fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
-    BASE_ENTITY_ENDPOINT_RULES.iter().any(|(src, rel, tgt)| {
-        *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
-    })
-}
+pub use khive_types::{
+    base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
+    BASE_ENTITY_ENDPOINT_RULES,
+};
 
 impl KhiveRuntime {
     // ---- Note operations ----
@@ -1023,72 +885,6 @@ impl KhiveRuntime {
             .await
     }
 
-    /// Like [`Self::try_create_note`] but permits the caller to establish the
-    /// transport-owned `message` properties that `try_create_note` refuses.
-    ///
-    /// This is a deliberately named, separate entry point rather than a flag
-    /// on `try_create_note` so the trust decision is visible at every call
-    /// site: `comm.ingest` (`khive-pack-comm/src/handlers/ingest.rs`) is the sole
-    /// legitimate caller, because it is the only code that has just derived
-    /// quarantine disposition and channel provenance from the inbound
-    /// transport itself. The caller set is bounded by possession, not
-    /// documentation: the required [`crate::ChannelIngestCapability`] is
-    /// constructible only inside this crate and granted at pack registration
-    /// exclusively to channel-transport packs. Every other write path uses
-    /// `try_create_note`, which rejects those properties
-    /// unconditionally.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn try_create_note_as_trusted_ingest(
-        &self,
-        _capability: &crate::pack::ChannelIngestCapability,
-        token: &NamespaceToken,
-        kind: &str,
-        name: Option<&str>,
-        content: &str,
-        properties: Option<serde_json::Value>,
-        expires_after: Option<std::time::Duration>,
-    ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(
-            token,
-            kind,
-            name,
-            content,
-            properties,
-            true,
-            None,
-            expires_after,
-        )
-        .await
-    }
-
-    /// Publish a trusted inbound message and its original-byte attachment in
-    /// one database transaction. Channel quarantine must not advertise a
-    /// reference in note metadata before GC can see its attachment owner.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn try_create_note_as_trusted_ingest_with_attachment(
-        &self,
-        _capability: &crate::pack::ChannelIngestCapability,
-        token: &NamespaceToken,
-        kind: &str,
-        name: Option<&str>,
-        content: &str,
-        properties: Option<serde_json::Value>,
-        attachment: NewAttachment,
-        expires_after: Option<std::time::Duration>,
-    ) -> RuntimeResult<Option<Note>> {
-        self.try_create_note_impl(
-            token,
-            kind,
-            name,
-            content,
-            properties,
-            true,
-            Some(attachment),
-            expires_after,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn try_create_note_impl(
         &self,
@@ -1103,13 +899,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check_at(content, "note", "content")?;
-        if let Some(n) = name {
-            crate::secret_gate::check_at(n, "note", "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, "note", "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(content, name, properties.as_ref(), "note")?;
         if let Some(ref attachment) = attachment {
             // The note and its owner row must share the main database. A
             // secondary pack backend cannot atomically root the reference.
@@ -1315,13 +1105,7 @@ impl KhiveRuntime {
             );
         }
         // Secret gate: scan content, optional name, and structured properties.
-        crate::secret_gate::check_at(content, "note", "content")?;
-        if let Some(n) = name {
-            crate::secret_gate::check_at(n, "note", "name")?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json_at(p, "note", "properties")?;
-        }
+        crate::secret_gate::check_note_fields_at(content, name, properties.as_ref(), "note")?;
         // `embedding_content` is a caller-supplied alternate vector-embedding
         // input: it must be a non-empty proper prefix of `content` (never a
         // superset, an unrelated string, or the full text) and passes the
@@ -1866,241 +1650,6 @@ impl KhiveRuntime {
             )
             .await?;
         Ok(NoteSearchOutcome { hits, vector_error })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn search_notes_inner(
-        &self,
-        token: &NamespaceToken,
-        query_text: &str,
-        query_vector: Option<Vec<f32>>,
-        limit: u32,
-        note_kind: Option<&str>,
-        include_superseded: bool,
-        tags_any: &[String],
-        properties_filter: Option<&serde_json::Value>,
-        text_mode: TextQueryMode,
-        tolerate_vector_error: bool,
-    ) -> RuntimeResult<(Vec<NoteSearchHit>, Option<String>)> {
-        const RRF_K: usize = 60;
-        let candidates = limit.saturating_mul(4).max(limit);
-        let visible_ns: Vec<String> = token
-            .visible_namespaces()
-            .iter()
-            .map(|ns| ns.as_str().to_owned())
-            .collect();
-
-        // FTS5 over the notes index — search all visible namespaces.
-        //
-        // `sanitize_fts5_query` strips known-unsafe FTS5 metacharacters, but
-        // residual punctuation the sanitizer does not strip can still reach
-        // the FTS5 parser and error. This fails loud instead of degrading to
-        // vector-only fusion, so callers see the bad query instead of
-        // silently losing the lexical leg. Errors from any other leg (vector
-        // search, note hydration) still propagate normally.
-        //
-        // Injection: check FTS_SEARCH_FAIL_NS (armed by `arm_fts_search_fail(ns)`),
-        // exercising the propagate branch above. Fires only when the armed
-        // namespace is among this call's visible namespaces, then clears (one-shot).
-        #[cfg(any(test, feature = "fault-injection"))]
-        let fts_search_inject = {
-            let mut g = FTS_SEARCH_FAIL_NS.lock().unwrap();
-            match g.as_deref() {
-                Some(armed) if visible_ns.iter().any(|ns| ns == armed) => {
-                    *g = None;
-                    true
-                }
-                _ => false,
-            }
-        };
-        #[cfg(not(any(test, feature = "fault-injection")))]
-        let fts_search_inject = false;
-
-        let text_store = self.text_for_notes(token)?;
-        let text_fut = async {
-            if fts_search_inject {
-                return Err(khive_storage::StorageError::Timeout {
-                    operation: "fts_search".into(),
-                });
-            }
-            text_store
-                .search(TextSearchRequest {
-                    query: query_text.to_string(),
-                    mode: text_mode,
-                    filter: Some(TextFilter {
-                        namespaces: visible_ns.clone(),
-                        // Push the note-kind filter into the FTS query. Without it the
-                        // text arm returns the top `candidates` rows across EVERY note
-                        // kind in the namespace and the kind is applied post-fetch, so a
-                        // store where short message/session rows outrank task
-                        // descriptions under BM25 hands the caller one or two task hits
-                        // while the store holds many more carrying the literal.
-                        record_kinds: note_kind
-                            .map(|kind| vec![kind.to_string()])
-                            .unwrap_or_default(),
-                        ..TextFilter::default()
-                    }),
-                    top_k: candidates,
-                    snippet_chars: 200,
-                })
-                .await
-        };
-        let text_fut = crate::stage_seam::text_stage(text_fut);
-
-        // Vector search filtered to notes; it runs with the text stage, and a text error wins.
-        let vector_fut = async {
-            if query_vector.is_some() || self.config().embedding_model.is_some() {
-                self.note_search_vector_search(token, query_vector, query_text, candidates)
-                    .await
-            } else {
-                Ok(vec![])
-            }
-        };
-        let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
-
-        // FtsPasses is counted inside the store's `search()` (khive-db
-        // stores/text.rs), only once a real FTS5 statement is prepared —
-        // an empty/fully-sanitized query short-circuits there before any
-        // statement exists and must not count (nor does the injected-failure
-        // branch above, which never reaches the store at all).
-        let text_hits = crate::error::fts_text_leg_or_err(
-            text_search_result.map_err(RuntimeError::from),
-            "search_notes",
-            query_text,
-        )?;
-
-        let mut vector_error: Option<String> = None;
-        let vector_hits = match vector_result {
-            Ok(hits) => hits,
-            Err(e) if tolerate_vector_error => {
-                vector_error = Some(e.to_string());
-                Vec::new()
-            }
-            Err(e) => return Err(e),
-        };
-
-        // Keep the full text∪vector union through RRF — salience weighting and
-        // soft-delete/kind filtering happen *after* this, and the final
-        // `hits.truncate(limit)` is the only result-limiting cut. Truncating to
-        // `candidates` here would drop a high-salience note ranked just outside
-        // the raw RRF cutoff before salience ever applied.
-        let fuse_k = text_hits.len() + vector_hits.len();
-        let fused = self
-            .fuse_with_strategy(
-                text_hits,
-                vector_hits,
-                &crate::fusion::FusionStrategy::Rrf { k: RRF_K },
-                fuse_k,
-            )
-            .await?;
-
-        let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
-        if candidate_ids.is_empty() {
-            return Ok((vec![], vector_error));
-        }
-
-        // Hydrate every candidate note with one batched read to get salience and
-        // apply soft-delete + (optional) kind filtering. The store chunks the read
-        // below its bound-parameter ceiling, so the read costs `ceil(candidates / 900)`
-        // statements instead of one per candidate. Notes whose `kind` doesn't
-        // match `note_kind` are dropped post-fetch — they're a small set
-        // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
-        let note_store = self.notes(token)?;
-        let search_pool = self.backend().pool_arc();
-        let mailbox_view = crate::MailboxView {
-            actor_id: token.actor().id.clone(),
-            delegated: false,
-        };
-        let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
-        for note in note_store.get_notes_batch(&candidate_ids).await? {
-            search_pool.record_note_candidate_hydration_row();
-            if note.deleted_at.is_some() {
-                continue;
-            }
-            if !mailbox_view.permits_message_note(token, &note) {
-                continue;
-            }
-            if let Some(want_kind) = note_kind {
-                if note.kind != want_kind {
-                    continue;
-                }
-            }
-            // Apply tag predicate before adding to alive set: tags on notes live
-            // inside `properties["tags"]` (a JSON array). This pushes the filter
-            // before truncation so matching notes ranked beyond `limit` in the raw
-            // fusion are not silently dropped.
-            if !tags_any.is_empty() {
-                let note_tags: Vec<String> = note
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.get("tags"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !note_tags
-                    .iter()
-                    .any(|t| tags_any.iter().any(|w| t.eq_ignore_ascii_case(w)))
-                {
-                    continue;
-                }
-            }
-            // Apply properties predicate before truncation, same reasoning as tags above.
-            if let Some(pf) = properties_filter {
-                if !crate::retrieval::properties_match(note.properties.as_ref(), pf) {
-                    continue;
-                }
-            }
-            alive_notes.insert(note.id, note);
-        }
-
-        // Drop superseded notes unless include_superseded is true: any note targeted
-        // by a `supersedes` edge is obsolete and excluded from default search.
-        if !include_superseded && !alive_notes.is_empty() {
-            let graph = self.graph(token)?;
-            let note_ids: Vec<Uuid> = alive_notes.keys().copied().collect();
-            let superseded: std::collections::HashSet<Uuid> = graph
-                .batch_neighbors(
-                    &note_ids,
-                    NeighborQuery {
-                        direction: Direction::In,
-                        relations: Some(vec![EdgeRelation::Supersedes]),
-                        limit: Some(1),
-                        min_weight: None,
-                    },
-                )
-                .await?
-                .into_iter()
-                .map(|(note_id, _)| note_id)
-                .collect();
-            alive_notes.retain(|id, _| !superseded.contains(id));
-        }
-
-        // Apply salience weighting and collect final hits.
-        let mut hits: Vec<NoteSearchHit> = fused
-            .into_iter()
-            .filter_map(|hit| {
-                let note = alive_notes.get(&hit.entity_id)?;
-                let weighted = salience_weighted_rank(hit.score, note.salience);
-                Some(NoteSearchHit {
-                    note_id: hit.entity_id,
-                    score: weighted,
-                    rank_score_kind: hit.rank_score_kind,
-                    signals: hit.signals,
-                    source: hit.source,
-                    title: hit.title.or_else(|| note_title(note)),
-                    snippet: hit.snippet.or_else(|| note_snippet(note)),
-                })
-            })
-            .collect();
-
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
-        hits.truncate(limit as usize);
-        Ok((hits, vector_error))
     }
 
     /// Restore a note tombstone owned by the caller's primary namespace.

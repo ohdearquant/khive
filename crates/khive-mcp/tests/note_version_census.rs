@@ -6,6 +6,11 @@ use rusqlite::{params, Connection};
 use syn::parse::Parser;
 use syn::visit::Visit;
 
+use khive_db::stores::note::note_due_key_values;
+
+#[path = "../../khive-db/src/stores/note/guarded_patch.rs"]
+mod guarded_note_patch;
+
 #[path = "../../khive-runtime/tests/support/static_sql_source.rs"]
 mod static_sql_source;
 use static_sql_source::{CanonicalBindings, StaticSqlSources};
@@ -16,11 +21,6 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
     "khive-db/sql/notes-ddl.sql",
 ];
 const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
-    (
-        "khive-pack-comm/sql/quarantine_duplicate_retention_repair.sql",
-        COMM_INGEST,
-        "repair_duplicate_quarantine",
-    ),
     (
         "khive-pack-gtd/sql/task-transition-update.sql",
         GTD,
@@ -40,14 +40,13 @@ const RECLAIM: &str = "khive-mcp/src/pending_events/reclaim.rs";
 const RECEIPTS: &str = "khive-mcp/src/pending_events/receipt.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
-const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
 const CURATION: &str = "khive-runtime/src/curation/merge_sql.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
 const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
 const COMM_HEARTBEAT: &str = "khive-pack-comm/src/handlers/quarantine_heartbeat.rs";
-const COMM_INGEST: &str = "khive-pack-comm/src/handlers/ingest.rs";
+const GUARDED_PATCH: &str = "khive-db/src/stores/note/guarded_patch.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn words(sql: &str) -> Vec<String> {
@@ -795,7 +794,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
     ),
     (
         COMM_HEARTBEAT,
-        "handle_heartbeat",
+        "persist_heartbeat",
         "insert_note_if_absent",
         MarkerDisposition::FixedNonMemoryKind,
     ),
@@ -805,10 +804,19 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         "upsert_note",
         MarkerDisposition::FixedNonMemoryKind,
     ),
+    // The atomic note create and the canonical create share one builder: an
+    // ordinary create upserts, a canonical create inserts under its staged
+    // identifier. Neither carries a key.
     (
         "khive-runtime/src/atomic_prepare/add_update.rs",
-        "prepare_add_note",
+        "prepare_add_note_record",
         "note_upsert_statement",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        "khive-runtime/src/atomic_prepare/add_update.rs",
+        "prepare_add_note_record",
+        "note_insert_if_absent_statement",
         MarkerDisposition::UnkeyedNote,
     ),
     (
@@ -1020,7 +1028,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
         (MIGRATIONS, "migrate_outbound_due_key"),
-        (RECEIPTS, "claim_pending_event"),
+        (RECEIPTS, "claim_pending_event_inner"),
         (RECEIPTS, "mark_dispatch_invoking"),
         (RECEIPTS, "renew_dispatch_lease"),
         (RECEIPTS, "persist_dispatch_outcome"),
@@ -1029,7 +1037,6 @@ fn census() -> BTreeMap<(String, String), String> {
         (RECLAIM, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
-        (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
         (OPERATIONS, "restore_note"),
@@ -1037,9 +1044,8 @@ fn census() -> BTreeMap<(String, String), String> {
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
         (MESSAGE, "create_keyed_message_pair_with_attachments"),
-        // A matching quarantine replay repairs legacy retention metadata in
-        // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM_INGEST, "repair_duplicate_quarantine"),
+        // Guarded partial properties advance through the note version trigger.
+        (GUARDED_PATCH, "note_patch_properties_statement"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -1058,6 +1064,14 @@ fn census() -> BTreeMap<(String, String), String> {
         "property_cas_statements".to_owned(),
     );
     let statement = property_cas_probe_statement();
+    assert!(statement.sql.starts_with(&found[&key]));
+    assert!(note_writer(&statement.sql));
+    found.insert(key, statement.sql);
+    let key = (
+        GUARDED_PATCH.to_owned(),
+        "note_patch_properties_statement".to_owned(),
+    );
+    let statement = guarded_patch_probe_statement();
     assert!(statement.sql.starts_with(&found[&key]));
     assert!(note_writer(&statement.sql));
     found.insert(key, statement.sql);
@@ -1180,12 +1194,6 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"archived"}"#,
         ),
-        (
-            SCHEDULE,
-            "cancel_pending_event",
-            "scheduled_event",
-            r#"{"status":"pending"}"#,
-        ),
         (CURATION, "merge_note_sql", "memory", "{}"),
         (CREATE, "prepare_note_create", "memory", "{}"),
         (OPERATIONS, "restore_note", "memory", "{}"),
@@ -1198,10 +1206,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "{}",
         ),
         (
-            COMM_INGEST,
-            "repair_duplicate_quarantine",
+            GUARDED_PATCH,
+            "note_patch_properties_statement",
             "message",
-            r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
+            "{}",
         ),
         (FAULT, "injected_failure_statement", "memory", "{}"),
     ];
@@ -1282,10 +1290,6 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     r#"{"originals":{}}"#,
                 ],
             ),
-            SCHEDULE => conn.execute(
-                sql,
-                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
-            ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
             OPERATIONS => conn.execute(
@@ -1293,18 +1297,14 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 params!["active", 200_i64, ID, "local", "memory"],
             ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
-            COMM_INGEST => conn.execute(
-                sql,
-                params![
-                    ID,
-                    "local",
-                    "census-ref",
-                    "email",
-                    "census@example.com",
-                    300_i64,
-                    200_i64
-                ],
-            ),
+            GUARDED_PATCH => {
+                let statement = guarded_patch_probe_statement();
+                assert_eq!(statement.sql, *sql);
+                conn.execute(
+                    sql,
+                    rusqlite::params_from_iter(guarded_patch_probe_params(&statement)),
+                )
+            }
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),
         }
@@ -2030,6 +2030,37 @@ fn markerless_route_census_rejects_empty_and_unlisted_production_callers() {
         std::panic::catch_unwind(|| assert_markerless_callers(&scan(transport), &inventory))
             .is_err()
     );
+}
+
+fn guarded_patch_probe_statement() -> khive_storage::SqlStatement {
+    let patch = khive_storage::note::NotePropertyPatch {
+        preconditions: Vec::new(),
+        set: [("checked".into(), serde_json::json!(true))].into(),
+        extend_expires_at: None,
+        updated_at: 200,
+    };
+    guarded_note_patch::note_patch_properties_statement(
+        uuid::Uuid::parse_str(ID).unwrap(),
+        "local",
+        "message",
+        &patch,
+    )
+    .unwrap()
+}
+
+fn guarded_patch_probe_params(
+    statement: &khive_storage::SqlStatement,
+) -> Vec<rusqlite::types::Value> {
+    statement
+        .params
+        .iter()
+        .map(|value| match value {
+            khive_storage::SqlValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+            khive_storage::SqlValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+            khive_storage::SqlValue::Null => rusqlite::types::Value::Null,
+            other => panic!("unexpected real guarded patch probe binding: {other:?}"),
+        })
+        .collect()
 }
 
 // These probes call the real public builder. Only its chosen Uuid/Text fixture

@@ -7,6 +7,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::file_identity::DatabaseFileIdentity;
 use rusqlite::ffi;
 
 use super::{callbacks, CodeMapHandleGuard, GuardError, Mode, OpenAccess, ProductionKind, Role};
@@ -17,6 +18,7 @@ const REGISTRATION_CAP: usize = 512;
 struct RollbackKey {
     target: PathBuf,
     protected: Vec<(PathBuf, ProductionKind)>,
+    expected_main_identity: Option<DatabaseFileIdentity>,
 }
 
 #[derive(Default)]
@@ -49,9 +51,8 @@ struct Registration {
 // SQLite's global registry and these allocations intentionally live for the
 // process lifetime, including after a code-map pool has been dropped.
 pub(super) fn register(guard: Arc<CodeMapHandleGuard>) -> Result<String, GuardError> {
-    // A code.ingest runtime may be constructed on every request. Reuse the
-    // pinned rollback guard for the same exact target/protected contract;
-    // transition guards remain one-shot and never enter this map.
+    // Reuse rollback guards only when their expected identity and protected
+    // path contract also match. Transition guards are always one-shot.
     let mut registrations = registrations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -62,6 +63,7 @@ pub(super) fn register(guard: Arc<CodeMapHandleGuard>) -> Result<String, GuardEr
             .iter()
             .map(|base| (base.path.clone(), base.kind))
             .collect(),
+        expected_main_identity: guard.expected_main_identity,
     });
     if let Some(key) = &key {
         if let Some(existing) = registrations.rollback.get(key) {
@@ -258,6 +260,8 @@ unsafe extern "C" fn open(
     };
     if path_role != flag_role
         || path_role == Role::Shm
+        || (registration.guard.expected_main_identity.is_some()
+            && flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0)
         || (path_role == Role::Main && flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0)
     {
         registration.guard.record_refusal(format!(

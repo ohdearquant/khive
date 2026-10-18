@@ -17,6 +17,37 @@ const UNSUBSCRIBE_PLACEHOLDER: &str = "{unsubscribe}";
 /// A recipient-key secret and every token key must decode to at least this many bytes.
 const MIN_KEY_BYTES: usize = 32;
 
+const MIRROR_URL_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_URL";
+const MIRROR_TOKEN_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN";
+const MIRROR_MAX_AGE_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS";
+
+/// The remote suppression mirror (ADR-200 §6): the URL that answers the complete set of
+/// suppressed recipient keys, the bearer credential that reads it, and how old the last
+/// successful refresh may be before external admission refuses.
+#[derive(Clone)]
+pub struct SuppressionMirror {
+    url: Arc<str>,
+    credential: Arc<str>,
+    max_age: std::time::Duration,
+}
+
+impl SuppressionMirror {
+    /// The URL the delivery component reads the complete remote set from.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The bearer credential for the read. It is never written to a log or an error.
+    pub fn credential(&self) -> &str {
+        &self.credential
+    }
+
+    /// The age past which the last successful refresh no longer admits an external message.
+    pub fn max_age(&self) -> std::time::Duration {
+        self.max_age
+    }
+}
+
 /// Boot-resolved recipient policy shared by comm admission and email delivery.
 /// An absent policy permits queuing without claiming that delivery is configured.
 #[derive(Clone)]
@@ -33,6 +64,9 @@ pub struct OutboundEmailPolicy {
     /// The operator's external footer text, or the reason it is unavailable. `None` while
     /// external senders are unset, in which case no footer is ever consulted.
     external_footer: Option<Result<Arc<str>, Arc<str>>>,
+    /// The remote suppression mirror. `None` when it is not configured or external senders are
+    /// unset.
+    suppression_mirror: Option<SuppressionMirror>,
     external_admission: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -45,6 +79,7 @@ impl Default for OutboundEmailPolicy {
             recipient_key_secret: None,
             token_keys: Arc::default(),
             external_footer: None,
+            suppression_mirror: None,
             external_admission: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -128,6 +163,28 @@ pub fn outbound_email_is_suppressed(
     })
 }
 
+/// Check one already-normalized inbound sender address against the suppression rows supplied by
+/// the caller. Only `inbound` entries can match, and only `address` and `domain` kinds can: an
+/// inbound sender has no recipient key. Address comparison is exact after normalization, and
+/// domain comparison is exact with no subdomain wildcard, so a `domain` entry for `example.com`
+/// never blocks `user@sub.example.com`.
+///
+/// Callers must normalize the sender address with
+/// `khive_types::email_address::normalize_email_recipient` before calling this function.
+pub fn inbound_email_is_suppressed(normalized_sender: &str, entries: &[EmailSuppression]) -> bool {
+    let sender_domain = normalized_sender.rsplit_once('@').map(|(_, domain)| domain);
+    entries.iter().any(|entry| {
+        if entry.scope != EmailSuppressionScope::Inbound {
+            return false;
+        }
+        match entry.kind {
+            EmailSuppressionKind::Address => entry.value == normalized_sender,
+            EmailSuppressionKind::Domain => sender_domain == Some(entry.value.as_str()),
+            EmailSuppressionKind::RecipientKey => false,
+        }
+    })
+}
+
 impl OutboundEmailPolicy {
     /// Install a normalized recipient set; an explicitly empty set denies all recipients.
     pub fn configured(recipients: Vec<String>) -> Result<Self, String> {
@@ -200,19 +257,17 @@ impl OutboundEmailPolicy {
         })
     }
 
+    /// The remote suppression mirror, when one is configured (ADR-200 §6).
+    pub fn suppression_mirror(&self) -> Option<&SuppressionMirror> {
+        self.suppression_mirror.as_ref()
+    }
+
     /// Mint the unsubscribe token for a normalized external recipient, or `None` when the
     /// recipient-key secret or any token key is unavailable. The highest configured key id mints.
     pub fn mint_unsubscribe_token(&self, normalized_recipient: &str) -> Option<String> {
         let recipient_key = self.recipient_key_bytes(normalized_recipient)?;
         let (&key_id, key) = self.token_keys.iter().next_back()?;
-        let mut body = Vec::with_capacity(2 + RECIPIENT_KEY_BYTES);
-        body.push(UNSUBSCRIBE_TOKEN_VERSION);
-        body.push(key_id);
-        body.extend_from_slice(&recipient_key);
-        let tag = hmac_sha256(key, &body);
-        let mut token = body;
-        token.extend_from_slice(&tag[..UNSUBSCRIBE_TAG_BYTES]);
-        Some(URL_SAFE_NO_PAD.encode(token))
+        Some(encode_unsubscribe_token(key_id, key, &recipient_key))
     }
 
     /// Verify an unsubscribe token and return the recipient key text it identifies, or `None`
@@ -238,8 +293,9 @@ impl OutboundEmailPolicy {
 
     /// Read only public policy inputs, without loading a connector or credentials.
     ///
-    /// The unsubscribe key variables and the footer file are read only when external senders
-    /// are configured; while the senders variable is unset none of them is consulted.
+    /// The unsubscribe key variables, the footer file and the suppression mirror variables are
+    /// read only when external senders are configured; while the senders variable is unset none
+    /// of them is consulted.
     pub fn from_env() -> Result<Self, String> {
         fn read(name: &str) -> Result<Option<String>, String> {
             match std::env::var(name) {
@@ -267,7 +323,16 @@ impl OutboundEmailPolicy {
         } else {
             None
         };
-        Self::resolve_with_external(
+        let (mirror_url, mirror_token, mirror_max_age) = if external_senders.is_some() {
+            (
+                read(MIRROR_URL_ENV)?,
+                read(MIRROR_TOKEN_ENV)?,
+                read(MIRROR_MAX_AGE_ENV)?,
+            )
+        } else {
+            (None, None, None)
+        };
+        let mut policy = Self::resolve_with_external(
             explicit.as_deref(),
             maintainer.as_deref(),
             external_senders.as_deref(),
@@ -275,7 +340,13 @@ impl OutboundEmailPolicy {
             recipient_key_secret.as_deref(),
             token_keys.as_deref(),
             footer_file.as_deref(),
-        )
+        )?;
+        policy.suppression_mirror = parse_suppression_mirror(
+            mirror_url.as_deref(),
+            mirror_token.as_deref(),
+            mirror_max_age.as_deref(),
+        )?;
+        Ok(policy)
     }
 
     #[cfg(test)]
@@ -338,6 +409,24 @@ impl OutboundEmailPolicy {
     #[doc(hidden)]
     pub fn with_external_footer_for_tests(mut self, footer: Result<&str, &str>) -> Self {
         self.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
+        self
+    }
+
+    /// Attach a remote suppression mirror to a test policy. Any URL is accepted, so a test can
+    /// point the mirror at a local listener.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn with_suppression_mirror_for_tests(
+        mut self,
+        url: &str,
+        credential: &str,
+        max_age: std::time::Duration,
+    ) -> Self {
+        self.suppression_mirror = Some(SuppressionMirror {
+            url: Arc::from(url),
+            credential: Arc::from(credential),
+            max_age,
+        });
         self
     }
 
@@ -452,6 +541,60 @@ impl OutboundEmailPolicy {
     }
 }
 
+/// Parse the remote suppression mirror's variables (ADR-200 §6). All three unset means no
+/// mirror. The URL requires the other two, and either of the other two without the URL is an
+/// error, so a partly configured mirror is refused at start instead of reading as an absent one.
+/// No error repeats the credential.
+fn parse_suppression_mirror(
+    url: Option<&str>,
+    credential: Option<&str>,
+    max_age: Option<&str>,
+) -> Result<Option<SuppressionMirror>, String> {
+    let Some(url) = url else {
+        if credential.is_some() {
+            return Err(format!(
+                "{MIRROR_TOKEN_ENV} is set but {MIRROR_URL_ENV} is not"
+            ));
+        }
+        if max_age.is_some() {
+            return Err(format!(
+                "{MIRROR_MAX_AGE_ENV} is set but {MIRROR_URL_ENV} is not"
+            ));
+        }
+        return Ok(None);
+    };
+    let host = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("{MIRROR_URL_ENV} must be an https:// URL"))?;
+    if host.is_empty()
+        || host.starts_with('/')
+        || url.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "{MIRROR_URL_ENV} must be an https:// URL with a host"
+        ));
+    }
+    let credential = credential
+        .ok_or_else(|| format!("{MIRROR_TOKEN_ENV} is required when {MIRROR_URL_ENV} is set"))?;
+    if credential.is_empty() || !credential.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(format!(
+            "{MIRROR_TOKEN_ENV} must be non-empty printable ASCII without spaces"
+        ));
+    }
+    let max_age = max_age
+        .ok_or_else(|| format!("{MIRROR_MAX_AGE_ENV} is required when {MIRROR_URL_ENV} is set"))?;
+    let seconds = max_age
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| format!("{MIRROR_MAX_AGE_ENV} must be a positive integer"))?;
+    Ok(Some(SuppressionMirror {
+        url: Arc::from(url),
+        credential: Arc::from(credential),
+        max_age: std::time::Duration::from_secs(seconds),
+    }))
+}
+
 fn parse_external_senders(raw: &str) -> Result<Vec<String>, String> {
     raw.split(',')
         .map(str::trim)
@@ -544,6 +687,23 @@ fn read_external_footer(path: Option<&str>) -> Result<Arc<str>, Arc<str>> {
 }
 
 /// Lowercase hex of a byte slice (no `hex` crate dependency).
+/// Encode an unsubscribe token: `0x01 || key_id || recipient_key || tag`, where the tag is the
+/// first [`UNSUBSCRIBE_TAG_BYTES`] bytes of `HMAC-SHA256(key, 0x01 || key_id || recipient_key)`,
+/// as base64url without padding.
+fn encode_unsubscribe_token(
+    key_id: u8,
+    key: &[u8],
+    recipient_key: &[u8; RECIPIENT_KEY_BYTES],
+) -> String {
+    let mut token = Vec::with_capacity(UNSUBSCRIBE_TOKEN_BYTES);
+    token.push(UNSUBSCRIBE_TOKEN_VERSION);
+    token.push(key_id);
+    token.extend_from_slice(recipient_key);
+    let tag = hmac_sha256(key, &token);
+    token.extend_from_slice(&tag[..UNSUBSCRIBE_TAG_BYTES]);
+    URL_SAFE_NO_PAD.encode(token)
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -749,6 +909,40 @@ mod tests {
             None,
             &entries
         ));
+    }
+
+    #[test]
+    fn inbound_matching_checks_exact_address_and_domain_and_ignores_recipient_keys() {
+        let entries = [
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::Address,
+                value: "a@example.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::Domain,
+                value: "blocked.com".into(),
+            },
+            EmailSuppression {
+                scope: EmailSuppressionScope::Inbound,
+                kind: EmailSuppressionKind::RecipientKey,
+                value: "key-1".into(),
+            },
+            // An outbound-only entry never blocks an inbound sender.
+            EmailSuppression {
+                scope: EmailSuppressionScope::Outbound,
+                kind: EmailSuppressionKind::Address,
+                value: "c@example.com".into(),
+            },
+        ];
+
+        assert!(inbound_email_is_suppressed("a@example.com", &entries));
+        assert!(!inbound_email_is_suppressed("b@example.com", &entries));
+        assert!(inbound_email_is_suppressed("z@blocked.com", &entries));
+        assert!(!inbound_email_is_suppressed("z@sub.blocked.com", &entries));
+        assert!(!inbound_email_is_suppressed("c@example.com", &entries));
+        assert!(!inbound_email_is_suppressed("key-1", &entries));
     }
 
     #[test]
@@ -978,6 +1172,52 @@ mod tests {
         assert!(policy.verify_unsubscribe_token("AAAA").is_none());
     }
 
+    // A published test vector for the token format, shared with an independent verifier so that
+    // a change to how either side mints or verifies fails a suite. The token key is test
+    // material, never deployment key material.
+    const VECTOR_KEY_ID: u8 = 3;
+    const VECTOR_TOKEN_KEY_HEX: &str =
+        "efaaa78a85da8a505a5278b5ad7d202a8b5028bb0b279c7a01f410c0ff84c09d";
+    const VECTOR_RECIPIENT_KEY_HEX: &str =
+        "cd5ac2457bd4442f53a23cfa9972cc3cdf3d0f1bcf1722bd5503ab20acfa3930";
+    const VECTOR_TOKEN: &str =
+        "AQPNWsJFe9REL1OiPPqZcsw83z0PG88XIr1VA6sgrPo5MFRThmznJxzUr1otDEzmcaE";
+    const VECTOR_TOKEN_FLIPPED_TAG: &str =
+        "AQPNWsJFe9REL1OiPPqZcsw83z0PG88XIr1VA6sgrPo5MFRThmznJxzUr1otDEzmcaA";
+
+    #[test]
+    fn shared_vector_mints_and_verifies_byte_for_byte() {
+        let recipient_key: [u8; RECIPIENT_KEY_BYTES] = unhex(VECTOR_RECIPIENT_KEY_HEX)
+            .try_into()
+            .expect("the vector recipient key is 32 bytes");
+        assert_eq!(
+            encode_unsubscribe_token(VECTOR_KEY_ID, &unhex(VECTOR_TOKEN_KEY_HEX), &recipient_key),
+            VECTOR_TOKEN,
+            "minting the vector inputs must reproduce the vector token"
+        );
+
+        let policy = OutboundEmailPolicy::configured_for_tests_with(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+            &rk(),
+            &format!("{VECTOR_KEY_ID}:{VECTOR_TOKEN_KEY_HEX}"),
+            Ok("Reply to unsubscribe: {unsubscribe}"),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.verify_unsubscribe_token(VECTOR_TOKEN).as_deref(),
+            Some(VECTOR_RECIPIENT_KEY_HEX),
+            "the vector token verifies to the vector recipient key"
+        );
+        assert!(
+            policy
+                .verify_unsubscribe_token(VECTOR_TOKEN_FLIPPED_TAG)
+                .is_none(),
+            "the vector token with one tag bit flipped does not verify"
+        );
+    }
+
     #[test]
     fn retired_key_ids_keep_verifying_and_the_highest_id_mints() {
         let policy = enabled();
@@ -1050,5 +1290,108 @@ mod tests {
             "Contact us.\n{unsubscribe}\n"
         );
         assert!(read_external_footer(None).is_err());
+    }
+
+    #[test]
+    fn suppression_mirror_variables_parse_as_one_unit() {
+        let token = "mirror-read-credential-value";
+        assert!(parse_suppression_mirror(None, None, None)
+            .unwrap()
+            .is_none());
+        let mirror = parse_suppression_mirror(
+            Some("https://mirror.example.com/admin/email-suppression"),
+            Some(token),
+            Some("900"),
+        )
+        .unwrap()
+        .expect("a complete mirror configuration parses");
+        assert_eq!(
+            mirror.url(),
+            "https://mirror.example.com/admin/email-suppression"
+        );
+        assert_eq!(mirror.credential(), token);
+        assert_eq!(mirror.max_age(), std::time::Duration::from_secs(900));
+
+        let url = Some("https://mirror.example.com/x");
+        for (url, credential, max_age, needle) in [
+            (
+                None,
+                Some(token),
+                None,
+                "KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN is set but",
+            ),
+            (
+                None,
+                None,
+                Some("60"),
+                "KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS is set but",
+            ),
+            (
+                url,
+                None,
+                Some("60"),
+                "KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN is required",
+            ),
+            (
+                url,
+                Some(token),
+                None,
+                "KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS is required",
+            ),
+            (url, Some(token), Some("0"), "must be a positive integer"),
+            (url, Some(token), Some("-5"), "must be a positive integer"),
+            (url, Some(token), Some("ten"), "must be a positive integer"),
+            (
+                url,
+                Some(""),
+                Some("60"),
+                "must be non-empty printable ASCII",
+            ),
+            (
+                url,
+                Some("two words"),
+                Some("60"),
+                "must be non-empty printable ASCII",
+            ),
+            (
+                Some("http://mirror.example.com/x"),
+                Some(token),
+                Some("60"),
+                "must be an https:// URL",
+            ),
+            (
+                Some("HTTPS://mirror.example.com/x"),
+                Some(token),
+                Some("60"),
+                "must be an https:// URL",
+            ),
+            (Some("https://"), Some(token), Some("60"), "with a host"),
+            (
+                Some("https:///path"),
+                Some(token),
+                Some("60"),
+                "with a host",
+            ),
+            (
+                Some("https://mirror.example.com/a b"),
+                Some(token),
+                Some("60"),
+                "with a host",
+            ),
+        ] {
+            let error = parse_suppression_mirror(url, credential, max_age)
+                .err()
+                .expect("a partial or malformed mirror configuration is refused");
+            assert!(error.contains(needle), "{error}");
+            assert!(!error.contains(token), "credential leaked: {error}");
+        }
+    }
+
+    #[test]
+    fn suppression_mirror_is_off_unless_configured() {
+        assert!(enabled().suppression_mirror().is_none());
+        assert!(OutboundEmailPolicy::default()
+            .suppression_mirror()
+            .is_none());
     }
 }

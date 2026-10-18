@@ -43,6 +43,8 @@ use crate::atomic_plan::{
 /// (`post_commit_effect`).
 #[derive(Debug, Clone)]
 pub enum AtomicOpPlan {
+    /// An admitted canonical operation materialized using the applying writer.
+    Canonical(Box<crate::canonical_apply::CanonicalMutationPlan>),
     AddEntity(AddEntityPlan),
     FinalizeEntity(Box<crate::EntityFinalizationPlan>),
     AddNote(Box<AddNotePlan>),
@@ -67,6 +69,7 @@ impl AtomicOpPlan {
     /// effects; the tuple flag marks a read assertion for `query_all`, never DML.
     fn plan_statements(&self) -> Vec<(PlanStatement, bool)> {
         let statements = match self {
+            AtomicOpPlan::Canonical(_) => Vec::new(),
             AtomicOpPlan::AddEntity(p) => p.statements.clone(),
             // The opaque finalizer applies its own phased statements.
             AtomicOpPlan::FinalizeEntity(_) => Vec::new(),
@@ -149,6 +152,16 @@ impl AtomicOpPlan {
 /// criteria: "the failing op index is recorded").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtomicOpFailure {
+    /// The touched captured value differs from the applying writer record.
+    PreimageMismatch {
+        target_id: uuid::Uuid,
+        field_path: String,
+    },
+    /// An independent owning-kind admission snapshot became stale.
+    OwnerSnapshotConflict {
+        target_id: uuid::Uuid,
+        kind: String,
+    },
     NoteConflict(crate::note_write::NoteWriteConflict),
     EntityConflict(crate::entity_write::EntityVersionConflict),
     /// The statement executed without a SQL error, but its affected-row
@@ -261,33 +274,23 @@ impl std::error::Error for AtomicRunnerError {
     }
 }
 
-fn raw_stmt(sql: String) -> SqlStatement {
-    SqlStatement {
-        sql,
-        params: vec![],
-        label: None,
-    }
+async fn execute_savepoint(writer: &mut dyn SqlWriter, sql: String) -> Result<(), StorageError> {
+    writer
+        .execute(SqlStatement::new(sql, vec![]))
+        .await
+        .map(|_| ())
 }
 
 async fn begin_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("SAVEPOINT {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("SAVEPOINT {name}")).await
 }
 
 async fn release_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("RELEASE {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("RELEASE {name}")).await
 }
 
 async fn rollback_to_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result<(), StorageError> {
-    writer
-        .execute(raw_stmt(format!("ROLLBACK TO {name}")))
-        .await
-        .map(|_| ())
+    execute_savepoint(writer, format!("ROLLBACK TO {name}")).await
 }
 
 /// Apply one op's plan statements in order, checking each guarded
@@ -301,16 +304,60 @@ pub(crate) struct AppliedPlan {
     pub(crate) note_version: Option<i64>,
 }
 
+/// Original runner projection. The lint caller retains native storage errors
+/// through the shared executor instead of converting them to message strings.
 pub(crate) async fn apply_plan(
     writer: &mut dyn SqlWriter,
     plan: &AtomicOpPlan,
     capture_note_versions: bool,
 ) -> Result<AppliedPlan, AtomicOpFailure> {
+    apply_plan_preserving_storage(writer, plan, capture_note_versions)
+        .await
+        .map_err(|failure| match failure {
+            PlanExecutionFailure::Operation(failure) => failure,
+            PlanExecutionFailure::Storage {
+                statement_label,
+                source,
+            } => AtomicOpFailure::SqlError {
+                statement_label,
+                message: source.to_string(),
+            },
+        })
+}
+pub(crate) enum PlanExecutionFailure {
+    Operation(AtomicOpFailure),
+    Storage {
+        statement_label: Option<String>,
+        source: StorageError,
+    },
+}
+impl From<AtomicOpFailure> for PlanExecutionFailure {
+    fn from(failure: AtomicOpFailure) -> Self {
+        Self::Operation(failure)
+    }
+}
+
+pub(crate) async fn apply_plan_preserving_storage(
+    writer: &mut dyn SqlWriter,
+    plan: &AtomicOpPlan,
+    capture_note_versions: bool,
+) -> Result<AppliedPlan, PlanExecutionFailure> {
+    if matches!(plan, AtomicOpPlan::Canonical(_)) {
+        return Err(AtomicOpFailure::SqlError {
+            statement_label: Some("canonical-materialize".into()),
+            message: "canonical plan requires the ordered atomic runner".into(),
+        }
+        .into());
+    }
     if let AtomicOpPlan::FinalizeEntity(plan) = plan {
-        return plan.apply(writer).await.map(|effect| AppliedPlan {
-            effect,
-            note_version: None,
-        });
+        return plan
+            .apply(writer)
+            .await
+            .map(|effect| AppliedPlan {
+                effect,
+                note_version: None,
+            })
+            .map_err(PlanExecutionFailure::Operation);
     }
     if let AtomicOpPlan::Update(plan) = plan {
         if let Some(guard) = &plan.entity_guard {
@@ -318,12 +365,12 @@ pub(crate) async fn apply_plan(
                 guard
                     .check(writer)
                     .await
-                    .map_err(|error| AtomicOpFailure::SqlError {
+                    .map_err(|error| PlanExecutionFailure::Storage {
                         statement_label: Some("entity-version-precondition".into()),
-                        message: error.to_string(),
+                        source: error,
                     })?
             {
-                return Err(AtomicOpFailure::EntityConflict(conflict));
+                return Err(AtomicOpFailure::EntityConflict(conflict).into());
             }
         }
     }
@@ -337,12 +384,12 @@ pub(crate) async fn apply_plan(
             guard
                 .check_fence(writer)
                 .await
-                .map_err(|error| AtomicOpFailure::SqlError {
+                .map_err(|error| PlanExecutionFailure::Storage {
                     statement_label: Some("note-fence".into()),
-                    message: error.to_string(),
+                    source: error,
                 })?
         {
-            return Err(AtomicOpFailure::NoteConflict(conflict));
+            return Err(AtomicOpFailure::NoteConflict(conflict).into());
         }
     }
     let mut post_commit = plan.post_commit_effect();
@@ -352,9 +399,9 @@ pub(crate) async fn apply_plan(
                 .vectors
                 .has_rows(writer)
                 .await
-                .map_err(|error| AtomicOpFailure::SqlError {
+                .map_err(|error| PlanExecutionFailure::Storage {
                     statement_label: Some("note-embedding-inheritance".into()),
-                    message: error.to_string(),
+                    source: error,
                 })?
             {
                 post_commit = Some(PostCommitEffect::NoteChanged {
@@ -379,29 +426,30 @@ pub(crate) async fn apply_plan(
         } else {
             writer.execute(stmt.statement).await
         };
-        let affected = result.map_err(|e| AtomicOpFailure::SqlError {
+        let affected = result.map_err(|e| PlanExecutionFailure::Storage {
             statement_label: label.clone(),
-            message: e.to_string(),
+            source: e,
         })?;
         if let Some(guard) = stmt.guard {
             if !guard.holds_for(affected) {
                 if let Some(note_guard) = note_guard.filter(|_| index == 0) {
                     if let Some(conflict) =
                         note_guard.classify_refusal(writer).await.map_err(|error| {
-                            AtomicOpFailure::SqlError {
+                            PlanExecutionFailure::Storage {
                                 statement_label: label.clone(),
-                                message: error.to_string(),
+                                source: error,
                             }
                         })?
                     {
-                        return Err(AtomicOpFailure::NoteConflict(conflict));
+                        return Err(AtomicOpFailure::NoteConflict(conflict).into());
                     }
                 }
                 return Err(AtomicOpFailure::GuardFailed {
                     statement_label: label,
                     expected: guard,
                     observed: affected,
-                });
+                }
+                .into());
             }
         }
     }
@@ -410,9 +458,9 @@ pub(crate) async fn apply_plan(
             purge
                 .apply(writer)
                 .await
-                .map_err(|error| AtomicOpFailure::SqlError {
+                .map_err(|error| PlanExecutionFailure::Storage {
                     statement_label: Some("note-vector-purge".into()),
-                    message: error.to_string(),
+                    source: error,
                 })?;
         }
     }
@@ -427,15 +475,16 @@ pub(crate) async fn apply_plan(
                     .labelled("note-write-guard"),
                 )
                 .await
-                .map_err(|error| AtomicOpFailure::SqlError {
+                .map_err(|error| PlanExecutionFailure::Storage {
                     statement_label: Some("note-version-receipt".into()),
-                    message: error.to_string(),
+                    source: error,
                 })?;
             let Some(khive_storage::SqlValue::Integer(version)) = current else {
                 return Err(AtomicOpFailure::SqlError {
                     statement_label: Some("note-version-receipt".into()),
                     message: "missing persisted note version".into(),
-                });
+                }
+                .into());
             };
             Some(version)
         } else {
@@ -503,7 +552,18 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
             for (op_index, plan) in plans.iter().enumerate() {
                 let savepoint = format!("adr099_atomic_op_{op_index}");
                 begin_savepoint(writer, &savepoint).await?;
-                match apply_plan(writer, plan, capture_note_versions).await {
+                let applied = match plan {
+                    AtomicOpPlan::Canonical(canonical) => {
+                        match crate::canonical_apply::materialize(writer, canonical).await {
+                            Ok(materialized) => {
+                                apply_plan(writer, &materialized, capture_note_versions).await
+                            }
+                            Err(failure) => Err(failure),
+                        }
+                    }
+                    _ => apply_plan(writer, plan, capture_note_versions).await,
+                };
+                match applied {
                     Ok(applied) => {
                         release_savepoint(writer, &savepoint).await?;
                         if let Some(effect) = applied.effect {

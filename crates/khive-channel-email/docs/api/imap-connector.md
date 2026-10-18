@@ -58,7 +58,34 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.
 
-See `crates/khive-channel-email/src/channel.rs`'s
+See `crates/khive-channel-email/src/channel/tests.rs`'s
 `poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata` test for the
 end-to-end proof that a `Malformed` disposition survives into the `ChannelEnvelope` handed
 to `comm.ingest`, not just this function's intermediate value.
+
+## Authentication quarantine metadata
+
+An `auth-absent` quarantine has neither plain nor ARC authentication-results
+headers. If headers are present but no plain header matches the configured trust
+anchor, `quarantine_reason` is `auth-untrusted`. The latter also carries these
+string-valued diagnostic fields, so an operator does not need a retained original
+to identify an anchor mismatch:
+
+| Field                           | Values                                                                        |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `quarantine_auth_anchor_mode`   | `authserv-id`, `topmost-no-authserv-id`, or `topmost-with-authserv-id`        |
+| `quarantine_auth_header_family` | `authentication-results` or `arc-authentication-results`                      |
+| `quarantine_auth_id_status`     | `present`, `no-authserv-id`, or `unparseable`                                 |
+| `quarantine_auth_id`            | Present only for `present`: a printable escaped identifier, at most 128 bytes |
+| `quarantine_auth_id_truncated`  | `true` or `false`                                                             |
+
+The topmost plain header is described when present, otherwise the topmost ARC
+header. These are observations of untrusted input, not evidence of a passing
+authentication method. ARC never supplies attribution. Only the configured mode
+is disclosed, not credentials or a newly learned anchor. Full raw headers,
+method properties and body text are omitted from the diagnostic fields.
+
+The envelope retains the fixed `email:quarantine` sender and no thread
+correlation. Normal quarantine replay, retention, secret validation and ingest
+gates still apply; these fields add no bypass. With quarantine storage disabled,
+the message is still dropped with only its UID and reason logged.

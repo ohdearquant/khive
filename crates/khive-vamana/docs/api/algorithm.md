@@ -86,7 +86,7 @@ at production scale (n>=250, 384-dim normalized vectors) shows the two-pass
 adjacency diverging from a single alpha=1.0 pass, for both `build` and
 `build_sq8`
 (`build_alpha_one_two_passes_are_not_idempotent_at_scale` and
-`build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale` in `graph.rs`);
+`build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale` in `graph_tests.rs`);
 an earlier revision skipped the second pass on the assumption that it was a
 no-op at `config.alpha == 1.0` and was reverted once this was disproven.
 

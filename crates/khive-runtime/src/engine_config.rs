@@ -42,6 +42,14 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("config TOML policy error in {path}, key {key}: {source}")]
+    SchemaParse {
+        path: PathBuf,
+        key: &'static str,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+
     #[error("exactly one engine must be marked `default = true`; found {found}")]
     DefaultCount { found: usize },
 
@@ -246,6 +254,7 @@ impl ConfigError {
     fn in_file(self, path: &Path) -> Self {
         match self {
             already @ (ConfigError::Parse { .. }
+            | ConfigError::SchemaParse { .. }
             | ConfigError::ExplicitConfigMissing { .. }
             | ConfigError::InFile { .. }) => already,
             other => ConfigError::InFile {
@@ -500,6 +509,28 @@ pub struct BackendConfig {
     pub disk_guard_deadline_ms: Option<u64>,
 }
 
+/// Operator declaration for a readable code map.
+///
+/// Corresponds to one `[[code_maps]]` entry in `config.toml`. Filesystem
+/// validation is performed by the runtime registry loader so one rejected map
+/// does not prevent other declarations from loading.
+/// Known fields with TOML values of the wrong type remain configuration errors.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CodeMapConfig {
+    /// Unique name used to resolve this map.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Absolute database path bounded by `code_map_root`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Absolute source tree described by the map contents.
+    #[serde(default)]
+    pub source_root: Option<String>,
+    /// Unknown keys are retained for per-entry rejection by the registry loader.
+    #[serde(default, flatten)]
+    pub unknown_fields: BTreeMap<String, toml::Value>,
+}
+
 /// Per-pack backend assignment.
 ///
 /// Corresponds to a `[packs.<pack-name>]` entry in `khive.toml`.
@@ -574,6 +605,8 @@ pub enum BlobConfig {
     Fs {
         #[serde(default)]
         root: Option<String>,
+        /// Free-space floor in bytes. Absent: 2% of the volume holding the
+        /// root, at least 5 GiB (ADR-111 Amendment 6); `0` disables it.
         #[serde(default)]
         floor_bytes: Option<u64>,
     },
@@ -1290,17 +1323,67 @@ impl WebSectionConfig {
     }
 }
 
+/// Explicit import schema policy. Missing or empty sections preserve strict
+/// admission. Unknown keys are ignored with a loader warning (ADR-035).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SchemaSectionConfig {
+    #[serde(default = "schema_strict_default")]
+    pub strict: bool,
+}
+
+fn schema_strict_default() -> bool {
+    true
+}
+
+impl Default for SchemaSectionConfig {
+    fn default() -> Self {
+        Self { strict: true }
+    }
+}
+
+// Parse the original text, rather than a TOML Value, so type errors retain the
+// source span. Other sections remain under the full loader's validation.
+#[derive(Deserialize)]
+struct SchemaSyntaxProbe {
+    #[serde(default, deserialize_with = "deserialize_schema_table")]
+    schema: SchemaSectionConfig,
+}
+
+fn deserialize_schema_table<'de, D>(deserializer: D) -> Result<SchemaSectionConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SchemaTableVisitor;
+    impl<'de> serde::de::Visitor<'de> for SchemaTableVisitor {
+        type Value = SchemaSectionConfig;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a schema configuration table")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            SchemaSectionConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(SchemaTableVisitor)
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
+/// - `[schema]`: explicit import unknown-entity-kind admission
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
+/// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
 ///
@@ -1311,6 +1394,10 @@ impl WebSectionConfig {
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    /// Admission policy for explicit KG imports only; never VCS sync or create.
+    #[serde(default)]
+    pub schema: SchemaSectionConfig,
+
     /// Read by `credentials::read_tables` at load, never by this derive.
     #[serde(skip)]
     pub credentials: Vec<crate::credentials::CredentialConfig>,
@@ -1365,6 +1452,14 @@ pub struct KhiveConfig {
     /// packs share it — identical to pre-ADR-028 behavior.
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
+
+    /// Absolute directory that bounds registered code-map files (ADR-139).
+    #[serde(default)]
+    pub code_map_root: Option<String>,
+
+    /// Operator-registered code-map database files (ADR-139).
+    #[serde(default)]
+    pub code_maps: Vec<CodeMapConfig>,
 
     /// Per-pack backend assignments (ADR-028).
     ///
@@ -1511,12 +1606,37 @@ impl KhiveConfig {
                 path: diagnostic_path.clone(),
                 source,
             })?;
+        let schema_probe: SchemaSyntaxProbe =
+            toml::from_str(&raw).map_err(|source| ConfigError::SchemaParse {
+                path: diagnostic_path.clone(),
+                key: if document
+                    .get("schema")
+                    .is_some_and(|value| !value.is_table())
+                {
+                    "schema"
+                } else {
+                    "schema.strict"
+                },
+                source: Box::new(source),
+            })?;
+        let unknown_schema_keys: Vec<String> = document
+            .get("schema")
+            .and_then(toml::Value::as_table)
+            .map(|table| {
+                table
+                    .keys()
+                    .filter(|key| key.as_str() != "strict")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
+        cfg.schema = schema_probe.schema;
         cfg.engines_declared = engines_declared;
         crate::credentials::read_tables(&raw, &mut cfg)
             .map_err(|error| ConfigError::from(error).in_file(&diagnostic_path))?;
@@ -1524,6 +1644,12 @@ impl KhiveConfig {
             .map_err(|error| error.in_file(&diagnostic_path))?;
         for engine in &mut cfg.engines {
             engine.name = canonical_engine_name(&engine.name);
+        }
+        for key in unknown_schema_keys {
+            tracing::warn!(target: "khive.config.schema",
+                key = %crate::secret_gate::bounded_masked_log_text(&key),
+                file = %crate::secret_gate::bounded_masked_log_text(&diagnostic_path.to_string_lossy()),
+                "ignoring unknown schema configuration key");
         }
         Ok(Some(cfg))
     }
@@ -2085,6 +2211,10 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
         ..KhiveConfig::default()
     }
 }
+
+#[cfg(test)]
+#[path = "engine_config_schema_tests.rs"]
+mod schema_tests;
 
 // ---- Tests ----
 

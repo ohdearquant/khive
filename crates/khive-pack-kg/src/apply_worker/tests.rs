@@ -8,6 +8,80 @@ use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
+#[tokio::test]
+async fn canonical_committed_reindex_failure_preserves_applying_and_cannot_replay() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let entity = rt
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "CanonicalBeforeReindexFailure",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap()
+        .0;
+    let envelope = khive_changeset::Envelope::new(
+        "fixture",
+        "fixture-family",
+        khive_types::Timestamp::from_secs(1),
+    );
+    let op = serde_json::json!({"op":"update","target_id":entity.id,
+        "patch":{"target":"entity","name":"CanonicalCommitted"},
+        "preimage":{"target":"entity","name":"CanonicalBeforeReindexFailure"}});
+    let proposal_id = Uuid::new_v4();
+    seed_proposal_created_event(
+        &rt,
+        &tok,
+        proposal_id,
+        ProposalChangeset::Canonical {
+            schema_version: khive_changeset::CURRENT_SCHEMA_VERSION,
+            delta: format!("{}\n{op}\n", serde_json::to_string(&envelope).unwrap()),
+        },
+    )
+    .await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+    replace_fts_entities_with_incompatible_table(&rt).await;
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .unwrap();
+    let committed = rt.get_entity(&tok, entity.id).await.unwrap();
+    assert_eq!(committed.name, "CanonicalCommitted");
+    let row = ProposalsProjectionWorker::new(rt.clone())
+        .get_proposal_row(&tok, proposal_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "applying");
+    let events = rt.events(&tok).unwrap();
+    assert_eq!(
+        events
+            .count_events(EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.get_entity(&tok, entity.id).await.unwrap().updated_at,
+        committed.updated_at
+    );
+}
+
 struct TruncationService;
 
 #[async_trait]

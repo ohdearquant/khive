@@ -128,30 +128,55 @@ async fn direct_busy_diagnostics_serializes_each_pool_counter() {
 #[test]
 fn writer_contention_reports_lease_timeouts_and_the_wait_bound() {
     use crate::pool::PoolConfig;
+    use khive_storage::CapacityUnavailablePhase;
     use std::sync::Arc;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
+    // Identity initialization must not consume the short contention budget.
+    let bootstrap_config = PoolConfig {
+        path: Some(dir.path().join("writer-wait-bound.db")),
+        checkout_timeout: Duration::from_millis(50),
+        disk_guard_config: Some(crate::EffectiveDiskGuardConfig::default()),
+        ..PoolConfig::for_test()
+    };
+    let bootstrap = ConnectionPool::new(bootstrap_config.clone()).unwrap();
+    assert_eq!(
+        bootstrap
+            .effective_disk_guard_config()
+            .unwrap()
+            .guard_deadline_ms,
+        crate::disk_guard_config::DEFAULT_DISK_GUARD_DEADLINE_MS
+    );
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("writer-wait-bound.db")),
-            checkout_timeout: Duration::from_millis(50),
-            // Same-volume pools in this process wait behind the held lease.
             disk_guard_config: Some(crate::EffectiveDiskGuardConfig {
                 guard_deadline_ms: 100,
                 ..Default::default()
             }),
-            ..PoolConfig::for_test()
+            // Test-harness leases contend only within one explicit lock directory.
+            volume_lock_dir: bootstrap_config.volume_lock_dir.clone(),
+            ..bootstrap_config
         })
         .unwrap(),
     );
-    let held = pool.writer().unwrap();
+    let held = bootstrap.writer().unwrap();
     let waiter = Arc::clone(&pool);
-    let refused = std::thread::spawn(move || waiter.writer().is_err())
+    let refusal = std::thread::spawn(move || waiter.writer().map(drop))
         .join()
-        .unwrap();
+        .unwrap()
+        .expect_err("a contended writer must be refused at the lease");
     drop(held);
-    assert!(refused, "a contended writer must be refused at the lease");
+    assert!(
+        matches!(
+            refusal,
+            crate::SqliteError::CapacityUnavailable {
+                phase: CapacityUnavailablePhase::LockContended,
+                ..
+            }
+        ),
+        "expected a lease refusal, got {refusal:?}"
+    );
     let wire =
         serde_json::to_value(WriterContentionDiagnostics::snapshot(&pool, None, None)).unwrap();
     assert_eq!(wire["writer_lease_timeouts"], 1);
@@ -159,6 +184,15 @@ fn writer_contention_reports_lease_timeouts_and_the_wait_bound() {
     assert_eq!(wire["configured_guard_deadline_ms"], 100);
     assert_eq!(wire["configured_checkout_timeout_ms"], 50);
     assert_eq!(wire["effective_writer_wait_bound_ms"], 150);
+    let bootstrap_wire = serde_json::to_value(WriterContentionDiagnostics::snapshot(
+        &bootstrap, None, None,
+    ))
+    .unwrap();
+    assert_eq!(bootstrap_wire["writer_lease_timeouts"], 0);
+    assert_eq!(
+        bootstrap_wire["configured_guard_deadline_ms"],
+        crate::disk_guard_config::DEFAULT_DISK_GUARD_DEADLINE_MS
+    );
 
     let memory = ConnectionPool::new(PoolConfig {
         path: None,

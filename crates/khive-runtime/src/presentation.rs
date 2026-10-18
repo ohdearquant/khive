@@ -659,7 +659,9 @@ pub enum PresentationMode {
 ///
 /// These fields carry state meaning (absent ≠ known-unknown) and must not be
 /// dropped. The channel-health fields distinguish a quarantine-only identity
-/// from a heartbeat row whose liveness facts were actually observed.
+/// from a heartbeat row whose liveness facts were actually observed. The
+/// outbox scan fields distinguish a channel with no recorded scan, a scan that
+/// has not yet succeeded, and an empty pending page from observed values.
 const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "completed_at",
     "deleted_at",
@@ -680,6 +682,25 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "last_failure_at",
     "last_error",
     "consecutive_failures",
+    "consecutive_held_polls",
+    "held_messages",
+    "last_held_at",
+    "last_quarantined_after_hold_at",
+    "originals_not_retained",
+    "last_original_not_retained_at",
+    "last_original_not_retained_reason",
+    "original_retention_state",
+    "notices_failed",
+    "last_notice_failed_at",
+    "notice_config_error",
+    "outbox",
+    "last_scan_completed_at",
+    "last_scan_succeeded",
+    "scan_interval_secs",
+    "pending_rows_seen",
+    "pending_rows_limit",
+    "oldest_pending_created_at",
+    "oldest_pending_age_secs",
 ];
 
 /// Empty collection fields that define a stable response envelope and must

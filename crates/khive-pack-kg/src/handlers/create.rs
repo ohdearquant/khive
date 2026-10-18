@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
     run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
     EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, NoteCreateSpec, RuntimeError,
@@ -1326,7 +1327,16 @@ impl KgPack {
                         .await
                     {
                         Ok(edge) => match to_json(&edge) {
-                            Ok(v) => edge_results.push(v),
+                            Ok(mut value) => {
+                                if let Some(hint) = dependency_kind_inference_hint(
+                                    relation,
+                                    None,
+                                    edge.metadata.as_ref(),
+                                ) {
+                                    value["hint"] = json!(hint);
+                                }
+                                edge_results.push(value);
+                            }
                             Err(e) => edge_errors.push(json!({
                                 "index": idx,
                                 "error": format!("serialize: {e}"),

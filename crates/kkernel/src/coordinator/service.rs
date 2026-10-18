@@ -3,6 +3,8 @@
 //! to the trait interface used by `KhiveMcpServer`.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -18,6 +20,7 @@ use khive_runtime::{BackendId, NamespaceToken, NoteSearchHit, RuntimeError, Sear
 use khive_storage::EdgeRelation;
 
 use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
+use super::search_profile;
 
 /// `CoordinatorService` wrapper around a [`SubstrateCoordinator`].
 ///
@@ -38,6 +41,72 @@ impl SubstrateCoordinatorService {
     /// The primary backend id, if any.
     pub fn primary_backend_id_inner(&self) -> Option<BackendId> {
         self.inner.primary_runtime().map(|_| BackendId::main())
+    }
+
+    // The two search bodies are boxed inside these plain functions so the profiling
+    // scope around them holds a pointer. Nesting the unboxed search future inside
+    // that scope put a second copy of it in the caller's poll frame, which overflowed
+    // a 2 MiB test-thread stack in a debug build.
+    fn search_unscoped<'a>(
+        &'a self,
+        request: &'a ValidatedSearchRequest,
+        namespace: &'a Namespace,
+        extra_visible: &'a [Namespace],
+    ) -> Pin<Box<dyn Future<Output = CoordSearchResult> + Send + 'a>> {
+        Box::pin(async move {
+            let (entity_hits, note_hits, per_backend) = self
+                .inner
+                .fan_out_search_with_visibility(request, namespace, extra_visible)
+                .await;
+
+            let started = search_profile::start();
+            let result = self
+                .hydrate_search_result(namespace, entity_hits, note_hits, per_backend, None, None)
+                .await;
+            search_profile::stage("hydrate", started, &[]);
+            result
+        })
+    }
+
+    fn search_scoped<'a>(
+        &'a self,
+        request: &'a ValidatedSearchRequest,
+        token: &'a NamespaceToken,
+        args: &'a serde_json::Value,
+        extra_visible: &'a [Namespace],
+    ) -> Pin<Box<dyn Future<Output = Result<CoordSearchResult, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
+                return Ok(self
+                    .fan_out_search(request, token.gate_namespace(), extra_visible)
+                    .await);
+            }
+            let mailbox = if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Note {
+                self.inner
+                    .primary_runtime()
+                    .map(|runtime| runtime.authorize_mailbox_view(token, "search", None, args))
+                    .transpose()?
+            } else {
+                None
+            };
+            let (entity_hits, note_hits, per_backend) = self
+                .inner
+                .fan_out_search_with_token(request, token, args, extra_visible)
+                .await;
+            let started = search_profile::start();
+            let result = self
+                .hydrate_search_result(
+                    token.namespace(),
+                    entity_hits,
+                    note_hits,
+                    per_backend,
+                    Some(token),
+                    mailbox,
+                )
+                .await;
+            search_profile::stage("hydrate", started, &[]);
+            Ok(result)
+        })
     }
 
     async fn hydrate_search_result(
@@ -234,13 +303,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         namespace: &Namespace,
         extra_visible: &[Namespace],
     ) -> CoordSearchResult {
-        let (entity_hits, note_hits, per_backend) = self
-            .inner
-            .fan_out_search_with_visibility(request, namespace, extra_visible)
-            .await;
-
-        self.hydrate_search_result(namespace, entity_hits, note_hits, per_backend, None, None)
-            .await
+        search_profile::profiled(self.search_unscoped(request, namespace, extra_visible)).await
     }
 
     async fn fan_out_search_scoped(
@@ -250,33 +313,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         args: &serde_json::Value,
         extra_visible: &[Namespace],
     ) -> Result<CoordSearchResult, RuntimeError> {
-        if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
-            return Ok(self
-                .fan_out_search(request, token.gate_namespace(), extra_visible)
-                .await);
-        }
-        let mailbox = if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Note {
-            self.inner
-                .primary_runtime()
-                .map(|runtime| runtime.authorize_mailbox_view(token, "search", None, args))
-                .transpose()?
-        } else {
-            None
-        };
-        let (entity_hits, note_hits, per_backend) = self
-            .inner
-            .fan_out_search_with_token(request, token, args, extra_visible)
-            .await;
-        Ok(self
-            .hydrate_search_result(
-                token.namespace(),
-                entity_hits,
-                note_hits,
-                per_backend,
-                Some(token),
-                mailbox,
-            )
-            .await)
+        search_profile::profiled(self.search_scoped(request, token, args, extra_visible)).await
     }
 
     fn is_single_backend(&self) -> bool {

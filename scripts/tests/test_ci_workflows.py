@@ -18,6 +18,27 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 REPLAY_NAME_PREFIX = "${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}"
+# `git commit` and `git fetch` start a detached `git maintenance run --auto` that can still be writing
+# under `.git` when a fixture's temporary directory is removed, which fails the cleanup. Every fixture
+# repository in this file turns automatic maintenance off.
+NO_AUTO_MAINTENANCE = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "maintenance.auto",
+    "GIT_CONFIG_VALUE_0": "false",
+}
+
+
+def commit_maintenance_runs(repo: pathlib.Path, env: dict[str, str], name: str) -> list[str]:
+    """Commit one new file in `repo` under `env`; return the trace2 events naming a `git maintenance run`."""
+    trace = repo.parent / f"{name}.trace2.json"
+    (repo / f"{name}.txt").write_text(f"{name}\n")
+    for args in (["add", "--", f"{name}.txt"], ["commit", "-q", "-m", name]):
+        subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=repo,
+            env={**env, "GIT_TRACE2_EVENT": str(trace)}, text=True, capture_output=True,
+            timeout=10, check=True,
+        )
+    return [line for line in trace.read_text().splitlines() if '"maintenance","run"' in line]
 
 
 def workflow_text(name: str) -> str:
@@ -143,6 +164,7 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             "core.hooksPath": str(hooks),
             "core.autocrlf": "false",
             "core.quotePath": "true",
+            "maintenance.auto": "false",
         }
         env["GIT_CONFIG_COUNT"] = str(len(config))
         for index, (key, value) in enumerate(config.items()):
@@ -221,6 +243,11 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             0,
             "COMPARISON_BASE_WAS_FETCHED",
         )
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        checkout, _base, env = self._shallow_fixture()
+        result = self._git(checkout, env, "config", "--get", "maintenance.auto")
+        self.assertEqual(result.stdout.strip(), "false")
 
     def test_pull_request_nonstorage_change_fetches_missing_base(self):
         checkout, base, env = self._shallow_fixture()
@@ -494,13 +521,17 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # The push guard has its own eligibility predicate. The documentation-lane
-    # jobs carry exactly DOCS_LANE_PREDICATE and skip on a change that touches
-    # only Markdown no code names. always() admits a job after failed
-    # dependencies; it is not such a predicate.
+    # The push guard has its own eligibility predicate. The lane jobs carry
+    # DOCS_LANE_PREDICATE and skip on a change that touches only Markdown no
+    # code names. The coverage jobs also carry SCOPE_PREDICATE and skip on a
+    # pull request whose test scope is a crate list (ADR-205). always() admits
+    # a job after failed dependencies; it is not such a predicate.
     CONDITIONAL_JOBS = {"automerge-push-guard"}
     FORGIVEN_SKIPS = {"automerge-push-guard"}
     DOCS_LANE_PREDICATE = "needs.changed-paths.outputs.docs_only != 'true'"
+    SCOPE_PREDICATE = ("(needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')")
+    SCOPED_SKIP_JOBS = {"coverage-measurement", "coverage-ratchet"}
     DOCS_LANE_JOBS = {
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
@@ -521,12 +552,15 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results, docs_only="false", classifier=None):
+    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full"):
+        """test_scope=None leaves the output unset, as when the scope step did not run."""
         needs = {job: {"result": result} for job, result in results.items()}
         if "changed-paths" in needs:
             if classifier is not None:
                 needs["changed-paths"]["result"] = classifier
             needs["changed-paths"]["outputs"] = {"docs_only": docs_only}
+            if test_scope is not None:
+                needs["changed-paths"]["outputs"]["test_scope"] = test_scope
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
             env={**os.environ, "NEEDS": json.dumps(needs)},
@@ -535,6 +569,12 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
     def job_conditions(self, job):
         return re.findall(r"(?m)^    if: (.+)$", indented_block(self.workflow, job, 2))
+
+    def lane_conditions(self, job):
+        predicate = self.DOCS_LANE_PREDICATE
+        if job in self.SCOPED_SKIP_JOBS:
+            predicate = f"{predicate} && {self.SCOPE_PREDICATE}"
+        return [[predicate], [f"always() && {predicate}"]]
 
     def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
         # Every job in the workflow, not only the gate's dependencies: a job that takes the predicate and is
@@ -548,13 +588,17 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         self.assertEqual(carrying, self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS)
         self.assertEqual(carrying & self.needs, self.DOCS_LANE_JOBS)
         self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
-        listed = set(re.findall(r'"([a-z0-9-]+)"', self.script.split("then [", 1)[1].split("]", 1)[0]))
-        self.assertEqual(listed, self.DOCS_LANE_JOBS)
+        lists = [set(re.findall(r'"([a-z0-9-]+)"', block.split("]", 1)[0]))
+                 for block in self.script.split("then [")[1:]]
+        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS])
+        scoped = {
+            job for job in jobs
+            if any(self.SCOPE_PREDICATE in condition for condition in self.job_conditions(job))
+        }
+        self.assertEqual(scoped, self.SCOPED_SKIP_JOBS)
         for job in sorted(self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS):
             with self.subTest(job=job):
-                self.assertIn(self.job_conditions(job), [
-                    [self.DOCS_LANE_PREDICATE], [f"always() && {self.DOCS_LANE_PREDICATE}"],
-                ])
+                self.assertIn(self.job_conditions(job), self.lane_conditions(job))
                 needs_line = re.search(r"(?m)^    needs: (.+)$", indented_block(self.workflow, job, 2))
                 self.assertIn("changed-paths", needs_line.group(1))
         for job in ["changed-paths", "docs", "secret-scan", "data-leak-guard", "marketplace",
@@ -576,18 +620,26 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     def test_gate_forgives_docs_lane_skips_only_after_a_successful_docs_only_classification(self):
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
-                for docs_only, classifier in (("true", "success"), ("false", "success"),
-                                              ("true", "failure"), ("true", "skipped"),
-                                              ("TRUE", "success"), ("", "success")):
-                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only, classifier=classifier):
+                for docs_only, test_scope, classifier in (
+                        ("true", None, "success"), ("false", "full", "success"),
+                        ("true", None, "failure"), ("true", None, "skipped"),
+                        ("TRUE", "full", "success"), ("", "full", "success"),
+                        ("false", "khive-hnsw kkernel", "success"), ("false", "khive-hnsw", "failure"),
+                        ("false", "khive-hnsw", "skipped"), ("false", "FULL", "success"),
+                        ("false", "", "success"), ("false", None, "success"), ("", "", "success")):
+                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only,
+                                      test_scope=test_scope, classifier=classifier):
                         results = dict.fromkeys(self.needs, "success")
                         results[job] = outcome
                         classifier_result = outcome if job == "changed-paths" else classifier
-                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result)
-                        lane = docs_only == "true" and classifier_result == "success"
+                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result,
+                                               test_scope=test_scope)
+                        lane = classifier_result == "success" and docs_only == "true"
+                        scoped = classifier_result == "success" and test_scope not in (None, "", "full", "FULL")
                         accepted = classifier_result == "success" and (outcome == "success" or (
                             outcome == "skipped" and (
-                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS))
+                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS)
+                                or (scoped and job in self.SCOPED_SKIP_JOBS))
                         ))
                         self.assertEqual(
                             result.returncode, 0 if accepted else 1,
@@ -599,7 +651,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
             and "    if: always()" not in indented_block(self.workflow, job, 2)
-            and self.job_conditions(job) != [self.DOCS_LANE_PREDICATE]
+            and self.job_conditions(job) not in self.lane_conditions(job)
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
@@ -647,7 +699,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
 
 class CiConcurrencyWorkflowTests(unittest.TestCase):
-    def test_main_pushes_run_newest_commit_without_cancelling_running_run(self):
+    def test_main_pushes_run_newest_commit_and_cancel_superseded_runs(self):
         concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
         self.assertEqual(
             mapping_entries(concurrency),
@@ -656,13 +708,73 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
                 "github.event_name == 'pull_request' && github.ref || "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main' "
                 "&& github.ref || github.run_id }}",
-                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                "(github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
             },
-            "Main pushes must share one group whose running run is never "
-            "cancelled and whose waiting run is replaced by the newest push "
-            "(the default single-slot queue); PRs retain ref-scoped "
+            "Main pushes must share one group in which the newest push cancels "
+            "the running run and replaces the waiting one, so a burst of merges "
+            "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
+
+
+def steps_before_checkout_in_missing_directory(text: str) -> list[str]:
+    """Name each `run` step that executes before `actions/checkout` in a job whose default
+    working directory is a relative path, without setting its own working directory.
+
+    Such a step runs in a directory the checkout has not created yet and fails with
+    "No such file or directory" before its command starts.
+    """
+    offenders = []
+    jobs = re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text.split("\njobs:\n", 1)[1])
+    for job in jobs:
+        name = job.split(":", 1)[0]
+        workdir = re.search(r"(?m)^    defaults:\n      run:\n(?:        .*\n)*?        working-directory: (\S+)", job)
+        if not workdir or workdir.group(1).startswith(("/", "${{")):
+            continue
+        steps = job.split("\n    steps:\n", 1)
+        if len(steps) < 2:
+            continue
+        for step in re.split(r"(?m)^      - ", steps[1])[1:]:
+            if re.search(r"uses: actions/checkout@", step):
+                break
+            if re.search(r"(?m)^(?:        )?run:", step) and "working-directory:" not in step:
+                offenders.append(f"{name}: {step.splitlines()[0].strip()}")
+    return offenders
+
+
+class StepOrderWorkflowTests(unittest.TestCase):
+    def test_no_run_step_precedes_checkout_in_a_missing_working_directory(self):
+        names = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
+        self.assertIn("ci.yml", names)
+        offenders = {name: steps_before_checkout_in_missing_directory(workflow_text(name)) for name in names}
+        self.assertEqual({name: found for name, found in offenders.items() if found}, {})
+
+    def test_the_check_finds_a_run_step_before_checkout(self):
+        text = textwrap.dedent(
+            """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                defaults:
+                  run:
+                    working-directory: crates
+                steps:
+                  - name: Too early
+                    run: echo early
+                  - uses: actions/checkout@v7
+                  - name: After
+                    run: echo late
+              other:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: No default directory
+                    run: echo fine
+                  - uses: actions/checkout@v7
+            """
+        )
+        self.assertEqual(steps_before_checkout_in_missing_directory(text), ["build: name: Too early"])
 
 
 class CiMatrixWorkflowTests(unittest.TestCase):
@@ -705,19 +817,27 @@ class CiMatrixWorkflowTests(unittest.TestCase):
         }
         return json.loads(eval(expression, {"__builtins__": {}}, scope))
 
-    def test_own_codex_branch_pull_requests_run_the_linux_shards_only(self):
-        self.assertEqual(
-            self.matrix_for("pull_request", "codex/some-change", "ohdearquant/khive"),
-            self.UBUNTU,
-        )
+    def test_own_codex_split_and_docs_branch_pull_requests_run_the_linux_shards_only(self):
+        for head_ref in ["codex/some-change", "split/khive-runtime-daemon-3943", "docs/retrieval-crate-doc"]:
+            with self.subTest(head_ref=head_ref):
+                self.assertEqual(
+                    self.matrix_for("pull_request", head_ref, "ohdearquant/khive"),
+                    self.UBUNTU,
+                )
 
     def test_other_pull_requests_keep_the_macos_lane(self):
         expected = self.UBUNTU + [{"os": "macos-latest", "shard": 1}]
         for head_ref, head_repo in [
             ("batch/125", "ohdearquant/khive"),
             ("feature/codex/x", "ohdearquant/khive"),
+            ("feature/split/x", "ohdearquant/khive"),
+            ("splitter/x", "ohdearquant/khive"),
+            ("documents/x", "ohdearquant/khive"),
             ("codex/some-change", "contributor/khive"),
             ("codex/some-change", None),
+            ("split/some-change", "contributor/khive"),
+            ("docs/some-change", "contributor/khive"),
+            ("docs/some-change", None),
         ]:
             with self.subTest(head_ref=head_ref, head_repo=head_repo):
                 self.assertEqual(self.matrix_for("pull_request", head_ref, head_repo), expected)
@@ -770,6 +890,14 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_trend_points_are_nightly_and_per_release_not_per_merge(self):
+        on = indented_block(workflow_text("bench-track.yml"), "on", 0)
+        self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
+        self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
+        push = indented_block(on, "push", 2)
+        self.assertNotIn("branches", push, "a push to a branch must not record a trend point")
+        self.assertIn('tags: ["v*"]', push)
+
     def test_publish_failure_is_advisory_and_records_incident(self):
         for workflow_name, publish_name in (
             ("bench-component.yml", "Publish ledger to perf-data branch"),
@@ -931,7 +1059,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
             "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
         ):
             self.assertIn(evidence_path, step(artifact_name))
-        self.assertIn("github.event_name == 'push'", step(publish_name))
+        publish_if = step(publish_name)
+        self.assertIn("github.event_name != 'pull_request'", publish_if)
+        self.assertIn("github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')", publish_if)
 
         # Execute the workflow's real shell and real recorder. Only the native
         # benchmark, remote publisher and upload service are fixture boundaries.
@@ -2064,6 +2194,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                     if not key.startswith("GIT_")}
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GITHUB_OUTPUT=str(self.output), GITHUB_STEP_SUMMARY=str(self.summary))
+        self.env.update(NO_AUTO_MAINTENANCE)
 
     def script(self, job_name, step_name):
         job = indented_block(self.workflow, job_name, 2)
@@ -2115,6 +2246,9 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.git(work, "push", "origin", "main", "side", "--tags")
         return work, {"parent": parent, "tip": tip, "side": side,
                       "tag": tag, "tree": tree, "blob": blob}
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git(self.root, "config", "--get", "maintenance.auto"), "false")
 
     def test_input_is_strict_hex_and_never_shell_source(self):
         script = self.script("resolve-revision", "Validate replay input")
@@ -2221,25 +2355,35 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
-        # One job-level predicate is admitted: the documentation lane. A job it
-        # skips is reported under its unevaluated name, which is neither a
-        # required check name nor an ordinary job name, so the replay
-        # distinction holds; CI gate and the secret scan never carry it, and
-        # the gate accepts those skips only on a successful docs_only=true
-        # classification (AggregateGateWorkflowTests). Gating the same jobs per
-        # step would still start every runner, the macOS one included.
+        # Two job-level predicates are admitted: the documentation lane, and
+        # on the coverage jobs the test scope beside it. A job they skip is
+        # reported under its unevaluated name, which is neither a required
+        # check name nor an ordinary job name, so the replay distinction holds;
+        # CI gate and the secret scan never carry them, and the gate accepts
+        # those skips only on a successful docs_only=true classification or,
+        # for the coverage jobs, a successful crate-list test scope
+        # (AggregateGateWorkflowTests). Gating the same jobs per step would
+        # still start every runner, the macOS one included.
         docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
+        scoped_lane = (f"{docs_lane} && (needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", job)
                 self.assertNotRegex(job, r"(?m)^    if: [>|]",
                                     "CHECK_NAME_ADMISSION: no folded eligibility predicate")
-                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"]],
+                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"],
+                                           [scoped_lane], [f"always() && {scoped_lane}"]],
                               "CHECK_NAME_ADMISSION: eligibility belongs on steps")
-                if name in {"dependency-review", "coverage-ratchet"}:
+                if name == "dependency-review":
                     self.assertEqual(
                         conditions, [f"always() && {docs_lane}"],
+                        "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
+                    )
+                if name == "coverage-ratchet":
+                    self.assertEqual(
+                        conditions, [f"always() && {scoped_lane}"],
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
                 if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
@@ -2372,6 +2516,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
         self.git("init", "-q", "-b", "main")
         self.write("src/lib.rs", "pub fn f() {}\n")
         self.write("notes/guide.md", "# Guide\n")
@@ -2411,6 +2556,13 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         verdict, reasons = self.classify(self.base, self.commit("guide"))
         self.assertEqual(verdict, "true", reasons)
         self.assertIn("documentation only: notes/guide.md", reasons)
+
+    def test_fixture_commits_start_no_background_maintenance(self):
+        # Control: with maintenance kept in the foreground the same commit records the child, so the
+        # empty list for the fixture environment is an absence the trace could have shown.
+        foreground = {**self.env, "GIT_CONFIG_KEY_0": "maintenance.autoDetach"}
+        self.assertNotEqual(commit_maintenance_runs(self.repo, foreground, "control"), [])
+        self.assertEqual(commit_maintenance_runs(self.repo, self.env, "fixture"), [])
 
     def test_markdown_named_by_code_runs_the_full_suite(self):
         self.write("notes/wire.md", "# Wire\n\nChanged.\n")
@@ -2618,7 +2770,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         verdict, reasons = self.classify(base, self.commit("guide"))
         self.assertEqual(verdict, "false", reasons)
 
-    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None):
+    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
+                     head_repository=None):
+        """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
+        unset unless given, as on a push."""
         workflow = workflow_text("ci.yml")
         job = indented_block(workflow, "changed-paths", 2)
         step = job.split("- name: Classify\n", 1)[1]
@@ -2638,15 +2793,19 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             gh.chmod(0o755)
         output = pathlib.Path(self.temp.name) / "output"
         output.write_text("")
+        pull = {key: value for key, value in (("HEAD_REF", head_ref), ("HEAD_REPOSITORY", head_repository))
+                if value is not None}
         completed = subprocess.run(
             ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
             env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
-                 "REPOSITORY": "o/r", "GH_TOKEN": "x"},
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", **pull},
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        return output.read_text().strip(), completed.stdout + completed.stderr
+        lines = output.read_text().splitlines()
+        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only"], lines)
+        return lines[0], completed.stdout + completed.stderr
 
     def merge_ref(self, path, text):
         self.git("checkout", "-q", "-b", "topic")
@@ -2665,6 +2824,12 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    def test_job_own_codex_pull_request_with_crate_source_is_not_a_lane(self):
+        # The integration-only lane is retired (ADR-205 D7): the branch name changes nothing.
+        head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
+        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
+        self.assertEqual(verdict, "docs_only=false", log)
 
     def gh_listing(self, run_sha, shard_conclusion):
         return (
@@ -2688,6 +2853,25 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "docs_only=true", log)
         self.assertIn(f"Compared with {untested}", log)
 
+    def test_job_main_push_fetches_main_history_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that replaced a waiting run")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        # The runner checks out the pushed commit alone from a remote that holds main's history.
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", remote.as_uri(), str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertIn(f"Compared with {untested}", log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
     def test_job_main_push_without_a_full_run_or_with_a_failing_api_runs_the_full_suite(self):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
         head = self.commit("documentation")
@@ -2704,6 +2888,448 @@ class DocsOnlyClassifierTests(unittest.TestCase):
                                 ("push", "refs/heads/integration/train-1")):
             with self.subTest(event_name=event_name, ref=ref):
                 self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
+
+
+FAKE_KKERNEL = r'''#!{python}
+"""A stand-in for `kkernel exec --strict <ops>` answering the three code-map verbs from graph.json."""
+import json, pathlib, re, sys
+
+here = pathlib.Path(__file__).resolve().parent
+spec = json.loads((here / "graph.json").read_text())
+ops = sys.argv[-1]
+with open(here / "calls.log", "a") as log:
+    log.write(ops + "\n")
+if spec.get("exit"):
+    print(json.dumps({"results": [{"ok": False, "error": {"message": "refused"}}]}))
+    sys.exit(spec["exit"])
+results = []
+for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
+    if verb == "ingest":
+        report = spec.get("ingest", {"projects_created": len(spec["projects"]), "edges_created": len(spec["edges"])})
+        results.append({"ok": True, "result": report})
+    elif verb == "list":
+        cursor = re.search(r'cursor="([^"]*)"', args)
+        pages = spec.get("pages") or [sorted(spec["projects"])]
+        index = int(cursor.group(1)) if cursor else 0
+        items = [{"id": spec["projects"][name], "kind": spec.get("list_kind", "project"), "name": name,
+                  "project_id": spec["projects"][name]} for name in pages[index]]
+        following = str(index + 1) if index + 1 < len(pages) else None
+        results.append({"ok": True, "result": {"items": items, "next_cursor": following}})
+    elif verb == "deps":
+        ident = re.search(r'id="([^"]*)"', args).group(1)
+        edges = [{"source": source, "target": target} for source, target in spec["edges"] if target == ident]
+        kinds = spec.get("kinds", {})
+        nodes = [{"id": node, "kind": kinds.get(node, "project")}
+                 for node in sorted({ident} | {edge["source"] for edge in edges})]
+        results.append({"ok": True, "result": {"map": "workspace", "root": ident, "nodes": nodes,
+                                               "edges": edges, "truncated": spec.get("truncated", False)}})
+    else:
+        results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
+print(json.dumps({"results": results}))
+'''
+
+
+class ScopeFixture(unittest.TestCase):
+    """A temporary repository with three crates and a nested one, and a fake kkernel that serves its map."""
+
+    TREE = {
+        "crates/Cargo.toml": "[workspace]\nmembers = [\"k\", \"k/sub\", \"j\", \"m\"]\n",
+        "crates/Cargo.lock": "version = 4\n",
+        "crates/k/Cargo.toml": "[package]\nname = \"k\"\n",
+        "crates/k/src/lib.rs": "pub fn f() {}\n",
+        "crates/k/build.rs": "fn main() {}\n",
+        "crates/k/tests/t.rs": "#[test]\nfn t() {}\n",
+        "crates/k/README.md": "# k\n",
+        "crates/k/Cargo.lock": "version = 4\n",
+        "crates/k/clippy.toml": "msrv = \"1.85\"\n",
+        "crates/k/sub/Cargo.toml": "[package]\nname = \"ksub\"\n",
+        "crates/k/sub/src/lib.rs": "pub fn s() {}\n",
+        "crates/j/Cargo.toml": "[package]\nname = \"j\"\n",
+        "crates/j/src/lib.rs": "pub fn g() {}\n",
+        "crates/m/Cargo.toml": "[package]\nname = \"m\"\n",
+        "crates/m/src/lib.rs": "pub fn h() {}\n",
+        "crates/.cargo/config.toml": "[build]\n",
+        "crates/.config/nextest.toml": "[profile.default]\n",
+        "crates/rust-toolchain.toml": "[toolchain]\n",
+        "crates/deny.toml": "[bans]\n",
+        "crates/rustfmt.toml": "edition = \"2021\"\n",
+        "notes/k-notes.md": "# Notes\n",
+        "docs/diagram.svg": "<svg/>\n",
+        ".github/workflows/ci.yml": "name: CI\n",
+        ".github/actions/a/action.yml": "name: a\n",
+        "scripts/ci.sh": "echo ci\n",
+        "python/pkg/__init__.py": "\n",
+        "tests/contract.py": "\n",
+        "benches/b.rs": "\n",
+        "apps/a/index.ts": "\n",
+        "Makefile": "ci:\n",
+        "rust-toolchain.toml": "[toolchain]\n",
+    }
+    # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
+    CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
+                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs"}
+    # j depends on k, and k on ksub.
+    GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
+             "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        for path, text in self.TREE.items():
+            self.write(path, text)
+        shutil.copy(REPO_ROOT / "scripts" / "ci-test-scope.py", self.repo / "scripts" / "ci-test-scope.py")
+        shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
+                    self.repo / "tests" / "documented_verb_counts.py")
+        self.base = self.commit("base")
+        self.fake = self.root / "fake"
+        self.fake.mkdir()
+        kernel = self.fake / "kkernel"
+        kernel.write_text(FAKE_KKERNEL.replace("{python}", sys.executable, 1))
+        kernel.chmod(0o755)
+        self.set_graph(self.GRAPH)
+
+    def set_graph(self, graph):
+        (self.fake / "graph.json").write_text(json.dumps(graph))
+
+    def calls(self, directory=None):
+        log = (directory or self.fake) / "calls.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def change(self, *paths):
+        self.git("checkout", "-q", "--detach", self.base)
+        for path in paths:
+            self.write(path, (self.TREE.get(path) or "") + "// changed\n")
+        return self.commit("change " + " ".join(paths))
+
+
+class TestScopeClassifierTests(ScopeFixture):
+    """scripts/ci-test-scope.py on real temporary repositories, against a fake kkernel."""
+
+    def scope(self, base, head, *mode):
+        mode = mode or ("--kkernel", str(self.fake / "kkernel"))
+        completed = subprocess.run(
+            [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), base, head, *mode],
+            cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=60, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.count("\n"), 1, completed.stdout)
+        return completed.stdout.strip(), completed.stderr
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git("config", "--get", "maintenance.auto"), "false")
+
+    def test_each_path_alone_under_the_path_rules(self):
+        # Every fixture path changed alone: crate source reaches the map, everything else is the full suite.
+        for path in sorted(self.TREE):
+            with self.subTest(path=path):
+                verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
+                self.assertEqual(verdict, "map" if path in self.CRATE_SOURCE else "full", reasons)
+        self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
+
+    def test_a_full_suite_path_never_reaches_the_binary(self):
+        # ADR-205 D4 ordering arm: a manifest beside crate source prints its reason and no ingest line.
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml", reasons)
+        self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_crate_source_prints_the_ingest_line_and_the_closure(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/k/src/lib.rs -> k", reasons)
+        self.assertIn("ingest: ", reasons)
+        self.assertIn("closure (2 of 4 crates): j k", reasons)
+        self.assertTrue(self.calls()[0].startswith("code.ingest("), self.calls())
+
+    def test_a_nested_crate_takes_the_longest_manifest_prefix_and_its_transitive_dependents(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/sub/src/lib.rs"))
+        self.assertEqual(verdict, "j k ksub", reasons)
+        self.assertIn("changed: crates/k/sub/src/lib.rs -> ksub", reasons)
+
+    def test_a_crate_nothing_depends_on_is_its_own_scope(self):
+        self.assertEqual(self.scope(self.base, self.change("crates/m/src/lib.rs"))[0], "m")
+
+    def test_markdown_beside_crate_source(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/lib.rs", "notes/k-notes.md"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: notes/k-notes.md", reasons)
+        # A Markdown file that code names puts the run on the full suite.
+        self.write("crates/m/src/lib.rs", 'pub const DOC: &str = include_str!("../../../notes/k-notes.md");\n')
+        named = self.commit("name the notes")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("notes and source"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("notes/k-notes.md is named by a non-Markdown file", reasons)
+
+    def test_the_map_is_read_across_pages(self):
+        self.set_graph({**self.GRAPH, "pages": [["k"], ["j", "ksub"], ["m"]]})
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertEqual(sum(call.startswith("code.list(") for call in self.calls()), 3)
+
+    def test_every_map_defect_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        projects = self.GRAPH["projects"]
+        for label, graph, reason in (
+                ("refused", {**self.GRAPH, "exit": 1}, "kkernel exec exited 1"),
+                ("warning", {**self.GRAPH, "ingest": {"warnings": ["skipped a file"]}}, "reported warnings"),
+                ("blocked", {**self.GRAPH, "ingest": {"blocked_count": 1}}, "blocked writes"),
+                ("refused manifest", {**self.GRAPH, "ingest": {"manifest_files_refused": 1}},
+                 "manifest_files_refused=1"),
+                ("truncated", {**self.GRAPH, "truncated": True}, "was truncated"),
+                ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
+                 "changed crate k is not a project"),
+                ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
+                 "a project that code.list did not"),
+                ("duplicate name", {**self.GRAPH, "pages": [["k", "j"], ["k"]]}, "two projects in the map"),
+                ("non-project row", {**self.GRAPH, "list_kind": "module"}, "returned a 'module' row"),
+                ("empty map", {"projects": {}, "edges": []}, "the map holds no projects")):
+            with self.subTest(label=label):
+                self.set_graph(graph)
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+        # A dependent that is not a project (a module, say) is not a crate to test.
+        self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
+        self.assertEqual(self.scope(self.base, head)[0], "k")
+        self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_missing_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        verdict, reasons = self.scope(self.base, head, "--kkernel", str(self.root / "absent"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("no executable kkernel binary", reasons)
+
+    def test_no_change_an_unknown_revision_and_a_submodule_run_the_full_suite(self):
+        verdict, reasons = self.scope(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("no changed paths", reasons)
+        verdict, reasons = self.scope("0" * 40, self.base)
+        self.assertEqual(verdict, "full")
+        self.assertIn("git diff", reasons)
+        self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
+        self.git("add", "-A")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},crates/vendored")
+        self.git("commit", "-q", "-m", "submodule")
+        verdict, reasons = self.scope(self.base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("has a submodule", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_move_out_of_crates_is_classified_by_its_new_name(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "crates/k/src/lib.rs", "scripts/lib.rs")
+        verdict, reasons = self.scope(self.base, self.commit("moved"), "--paths-only")
+        self.assertEqual(verdict, "full")
+        self.assertIn("CI or lint script: scripts/lib.rs", reasons)
+
+    def test_usage(self):
+        for args in ([], ["a", "b"], ["a", "b", "--kkernel"], ["a", "b", "--paths-only", "x"], ["a", "b", "--other"]):
+            with self.subTest(args=args):
+                completed = subprocess.run(
+                    [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), *args],
+                    cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=30, check=False,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("usage:", completed.stderr)
+
+
+class ScopeStepTests(ScopeFixture):
+    """The Classify job's Scope step: the path rules first, then the binary from main, never a failure."""
+
+    FAKE_GH = """#!/bin/bash
+echo "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api "*) [ -n "$GH_RUNS" ] || exit 1; printf '%s\\n' $GH_RUNS ;;
+  "run download")
+    dir="${@: -1}"
+    for run in $GH_ARTIFACT_RUNS; do
+      if [ "$run" = "$3" ]; then mkdir -p "$dir"; cp "$FAKE_DIR/kkernel" "$FAKE_DIR/graph.json" "$dir/"; exit 0; fi
+    done
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {"gh": self.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
+        if shutil.which("timeout") is None:
+            tools["timeout"] = '#!/bin/bash\nshift\nexec "$@"\n'
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.runner_temp = self.root / "runner-temp"
+        self.runner_temp.mkdir()
+        self.gh_log = self.root / "gh.log"
+
+    def run_step(self, event_name, head, runs="201 202", artifact_runs="202"):
+        step = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        output = self.root / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-c", textwrap.dedent(match.group(1))], cwd=self.repo, text=True, capture_output=True,
+            timeout=60, check=False,
+            env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                 "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
+                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake)},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("test_scope="), lines)
+        return lines[0].split("=", 1)[1], completed.stdout + completed.stderr
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def test_a_crate_source_pull_request_is_scoped_with_the_binary_from_main(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "j k", log)
+        self.assertIn("kkernel from main push run 202", log)
+        downloads = [call for call in self.gh_calls() if call.startswith("run download")]
+        self.assertEqual([call.split()[2] for call in downloads], ["201", "202"])
+        self.assertTrue(self.calls(self.runner_temp / "kkernel-main-202"))
+
+    def test_the_path_rules_run_before_any_fetch(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_other_events_are_never_scoped(self):
+        head = self.change("crates/k/src/lib.rs")
+        for event_name in ("push", "schedule", "workflow_dispatch"):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head)
+                self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_an_unavailable_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        for runs, artifact_runs in (("", "202"), ("201 202", ""), ("201", "202")):
+            with self.subTest(runs=runs, artifact_runs=artifact_runs):
+                scope, log = self.run_step("pull_request", head, runs=runs, artifact_runs=artifact_runs)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no successful main push run", log)
+
+    def test_a_failing_classifier_runs_the_full_suite(self):
+        self.set_graph({**self.GRAPH, "exit": 3})
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "full", log)
+        (self.repo / "scripts" / "ci-test-scope.py").write_text("import sys\nsys.exit(1)\n")
+        scope, log = self.run_step("pull_request", self.commit("broken classifier"))
+        self.assertEqual(scope, "full", log)
+
+
+class OptionalWorkflowCodexSkipTests(unittest.TestCase):
+    """Optional pull-request workflows skip own codex/ pull requests and still run on the merged tree."""
+
+    SKIP = ("${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') "
+            "&& github.event.pull_request.head.repo.full_name == github.repository) }}")
+    JOBS = {
+        "bench-pipeline.yml": "pipeline-gate",
+        "tz-database-audit.yml": "tz-database-audit",
+        "sqlite-capacity.yml": "sqlite-capacity",
+        "bench-1m.yml": "ann-ci-gate",
+        "bench-track.yml": "changes",
+    }
+    # Each of these has a pull_request trigger with paths and a push trigger on integration/** with the same paths.
+    INTEGRATION_PUSH = ("bench-pipeline.yml", "tz-database-audit.yml", "sqlite-capacity.yml", "bench-1m.yml")
+
+    def evaluate(self, event_name, head_ref, head_repo, repository="ohdearquant/khive"):
+        expression = self.SKIP.removeprefix("${{ ").removesuffix(" }}")
+        for name, local in {
+            "github.event.pull_request.head.repo.full_name": "head_repo",
+            "github.event_name": "event_name",
+            "github.head_ref": "head_ref",
+            "github.repository": "repository",
+        }.items():
+            expression = expression.replace(name, local)
+        expression = expression.replace("!(", "not (").replace("startsWith(", "starts_with(")
+        expression = expression.replace("&&", " and ")
+        self.assertNotRegex(expression, r"github\.|!", "an unmapped name or operator is left in the expression")
+
+        def starts_with(value, prefix):
+            # GitHub's startsWith is case-insensitive and treats null as "".
+            return (value or "").lower().startswith(prefix.lower())
+
+        scope = {"starts_with": starts_with, "event_name": event_name, "head_ref": head_ref,
+                 "head_repo": head_repo, "repository": repository}
+        return eval(expression, {"__builtins__": {}}, scope)
+
+    def trigger(self, text, event):
+        return indented_block(indented_block(text, "on", 0), event, 2)
+
+    def paths(self, block):
+        return [line.strip() for line in indented_block(block, "paths", 4).splitlines()
+                if line.strip().startswith("- ")]
+
+    def test_each_optional_job_carries_the_codex_skip(self):
+        for workflow, job in self.JOBS.items():
+            with self.subTest(workflow=workflow):
+                block = indented_block(workflow_text(workflow), job, 2)
+                self.assertEqual(re.findall(r"(?m)^    if: (.+)$", block), [self.SKIP])
+
+    def test_the_skip_applies_to_own_codex_pull_requests_only(self):
+        self.assertFalse(self.evaluate("pull_request", "codex/change", "ohdearquant/khive"))
+        self.assertFalse(self.evaluate("pull_request", "Codex/change", "ohdearquant/khive"))
+        for event_name, head_ref, head_repo in (
+                ("pull_request", "codex/change", "contributor/khive"),
+                ("pull_request", "codex/change", None),
+                ("pull_request", "feature/codex/x", "ohdearquant/khive"),
+                ("pull_request", "batch/1", "ohdearquant/khive"),
+                ("push", "", None), ("workflow_dispatch", "", None)):
+            with self.subTest(event_name=event_name, head_ref=head_ref, head_repo=head_repo):
+                self.assertTrue(self.evaluate(event_name, head_ref, head_repo))
+
+    def test_skipped_workflows_run_on_integration_pushes_with_their_pull_request_paths(self):
+        for workflow in self.INTEGRATION_PUSH:
+            with self.subTest(workflow=workflow):
+                text = workflow_text(workflow)
+                push = self.trigger(text, "push")
+                branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+                self.assertIsNotNone(branches)
+                self.assertIn('"integration/**"', branches.group(1))
+                self.assertTrue(self.paths(push))
+                self.assertEqual(self.paths(push), self.paths(self.trigger(text, "pull_request")))
+
+    def test_bench_track_publishes_from_main_only(self):
+        # Its push jobs write the performance ledger, so an integration branch must never trigger it.
+        push = self.trigger(workflow_text("bench-track.yml"), "push")
+        self.assertNotIn("integration", push)
 
 
 if __name__ == "__main__":

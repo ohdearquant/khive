@@ -14,7 +14,7 @@ use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, V
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
 };
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::Event;
 use khive_types::{EventKind, SubstrateKind};
 
@@ -23,6 +23,14 @@ use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 #[cfg(test)]
 #[path = "handlers_activation_seam.rs"]
 mod activation_seam;
+
+#[cfg(test)]
+#[path = "handlers_cancel_seam.rs"]
+mod cancel_seam;
+
+#[cfg(test)]
+#[path = "handlers_cancel_tests.rs"]
+mod cancel_tests;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -731,6 +739,10 @@ pub(crate) struct RemindParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -740,6 +752,10 @@ pub(crate) struct ScheduleParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -779,6 +795,7 @@ pub(crate) async fn handle_remind(
         ));
     }
 
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -812,6 +829,12 @@ pub(crate) async fn handle_remind(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // The report-returning variant keeps a truncated embedding input from
     // failing the call after the note is committed: the staged event must
@@ -851,6 +874,7 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -895,6 +919,12 @@ pub(crate) async fn handle_schedule(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // See `handle_remind`: activation must follow a committed note even when
     // its embedding input was truncated.
@@ -1090,13 +1120,13 @@ pub(crate) async fn handle_cancel(
         .await?;
 
     let store = runtime.notes(token)?;
-    let note = store
+    let mut note = store
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("cancel: get_note: {e}")))?
         .ok_or_else(|| RuntimeError::NotFound(format!("cancel: event {id} not found")))?;
 
-    if note.namespace != token.namespace().as_str() {
+    if note.namespace != token.namespace().as_str() || note.deleted_at.is_some() {
         return Err(RuntimeError::NotFound(format!(
             "cancel: event {id} not found"
         )));
@@ -1112,7 +1142,7 @@ pub(crate) async fn handle_cancel(
     // Mutable string-key indexing on a non-object value panics in serde_json;
     // reject corrupt notes here with a clear error instead (SCH-AUD-001).
     let raw_props = note.properties.clone().unwrap_or_else(|| json!({}));
-    let props = match raw_props {
+    let mut props = match raw_props {
         Value::Object(_) => raw_props,
         ref other => {
             let type_name = match other {
@@ -1145,19 +1175,35 @@ pub(crate) async fn handle_cancel(
     }
 
     let cancelled_at = Utc::now().to_rfc3339();
-    // Persist the transition with a conditional (CAS) update on
-    // (id, namespace, kind, current status) instead of a full-row
-    // `upsert_note`/`INSERT OR REPLACE`. This closes the race where a
-    // pending-events dispatch fires the event (writing status="fired" and
-    // fired_at) between our read above and the write below: the CAS only
-    // succeeds if the row is still "pending" at write time, so a concurrent
-    // fire can never be clobbered by a stale cancel (issue #462).
-    let updated =
-        cancel_pending_event(runtime, token.namespace().as_str(), id, &cancelled_at).await?;
+    props["status"] = json!("cancelled");
+    props["cancelled_at"] = json!(cancelled_at);
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
+
+    let expected_updated_at = note.updated_at;
+    let expected_deleted_at = note.deleted_at;
+    let minimum = expected_updated_at.checked_add(1).ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "cancel: event {id} revision cannot advance past i64::MAX"
+        ))
+    })?;
+    note.updated_at = Utc::now().timestamp_micros().max(minimum);
+    note.properties = Some(props);
+
+    #[cfg(test)]
+    cancel_seam::pause_after_read().await;
+
+    // Preserve every other field from the validated snapshot. The shared
+    // revision and deletion guards refuse a concurrent edit, fire, cancel,
+    // or deletion instead of replacing that newer state with this snapshot.
+    let updated = store
+        .replace_note_if_unchanged(note, expected_updated_at, expected_deleted_at)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional replace: {e}")))?;
     if !updated {
-        return Err(RuntimeError::InvalidInput(format!(
-            "cancel: event {id} is no longer pending; it was cancelled or fired concurrently"
-        )));
+        return Err(khive_types::KhiveError::conflict(format!(
+            "cancel: event {id} changed after it was read; retry with fresh state"
+        ))
+        .into());
     }
 
     let note = store
@@ -1174,94 +1220,6 @@ pub(crate) async fn handle_cancel(
         "cancelled_at": cancelled_at,
         "properties": props,
     }))
-}
-
-/// Conditionally transition a `scheduled_event` note from `pending` to
-/// `cancelled`, returning `true` iff the transition was applied.
-///
-/// Uses a `json_set`-on-`properties` UPDATE gated by pending status and the
-/// exact raw properties snapshot that passed the reservation check. A
-/// concurrent fire (or a second cancel) affects zero rows rather than
-/// overwriting the newer state.
-async fn cancel_pending_event(
-    runtime: &KhiveRuntime,
-    namespace: &str,
-    id: Uuid,
-    cancelled_at: &str,
-) -> Result<bool, RuntimeError> {
-    let updated_at = Utc::now().timestamp_micros();
-    let mut writer = runtime
-        .sql()
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: open SQL writer: {e}")))?;
-
-    let snapshot = writer
-        .query_scalar(SqlStatement {
-            sql: "SELECT properties FROM notes \
-                  WHERE id = ?1 \
-                    AND namespace = ?2 \
-                    AND kind = 'scheduled_event' \
-                    AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending'"
-                .into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-            ],
-            label: Some("schedule_cancel_snapshot".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: read properties: {e}")))?;
-    let raw_properties = match snapshot {
-        None => return Ok(false),
-        Some(SqlValue::Text(raw)) => raw,
-        Some(other) => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "cancel: event {id} has malformed properties ({other:?}); cannot mutate"
-            )));
-        }
-    };
-    let mut final_properties: Value = serde_json::from_str(&raw_properties).map_err(|e| {
-        RuntimeError::InvalidInput(format!(
-            "cancel: event {id} has malformed properties ({e}); cannot mutate"
-        ))
-    })?;
-    if !final_properties.is_object() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "cancel: event {id} has malformed properties (expected JSON object); cannot mutate"
-        )));
-    }
-    final_properties["status"] = json!("cancelled");
-    final_properties["cancelled_at"] = json!(cancelled_at);
-    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&final_properties))?;
-
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes \
-                  SET properties = json_set(COALESCE(properties, '{}'), \
-                      '$.status', 'cancelled', '$.cancelled_at', ?1), \
-                      updated_at = ?2 \
-                  WHERE id = ?3 \
-                    AND namespace = ?4 \
-                    AND kind = 'scheduled_event' \
-                    AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending' \
-                    AND properties = ?5"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(cancelled_at.to_string()),
-                SqlValue::Integer(updated_at),
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(raw_properties),
-            ],
-            label: Some("schedule_cancel_pending".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
-
-    Ok(rows == 1)
 }
 
 #[cfg(test)]

@@ -586,20 +586,18 @@ impl ScoringConfig {
 
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {
-    if !score.is_finite() {
-        return Err(crate::config::MinScoreError::NotFinite);
-    }
-    if (0.0..=1.0).contains(&score) {
-        return Ok(score as f32);
-    }
-    if (1.0..=100.0).contains(&score) {
-        return Ok((score / 100.0) as f32);
-    }
-    Err(crate::config::MinScoreError::OutOfRange(score))
+    khive_score::UnitScore::from_fraction_or_percent(score)
+        .map(|score| score.value() as f32)
+        .map_err(|error| match error {
+            khive_score::ArithmeticError::NonFinite { .. } => {
+                crate::config::MinScoreError::NotFinite
+            }
+            _ => crate::config::MinScoreError::OutOfRange(score),
+        })
 }
 
 /// Returns `true` if the query has enough semantic content for meaningful recall.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_recall_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -642,6 +640,12 @@ pub fn is_meaningful_query(query: &str) -> bool {
     true
 }
 
+/// Deprecated name for [`is_meaningful_recall_query`].
+#[deprecated(note = "use is_meaningful_recall_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_recall_query(query)
+}
+
 /// Returns `true` when CJK characters (`is_cjk_char`) outnumber every other letter in `text`.
 ///
 /// Other letters are the alphabetic characters that are not CJK. Digits, whitespace, and
@@ -678,54 +682,27 @@ pub fn normalize_rank_fusion_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,
 ) -> HashMap<Uuid, f32> {
-    if scores.is_empty() {
-        return HashMap::new();
-    }
-    let min_rrf = config.min_rrf_relevance;
-    let filtered: Vec<(Uuid, f32)> = scores
-        .into_iter()
-        .filter(|(_, score)| score.is_finite() && *score >= min_rrf)
-        .collect();
-    if filtered.is_empty() {
-        return HashMap::new();
-    }
-    let max_score = filtered
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::NEG_INFINITY, f32::max);
-    if !max_score.is_finite() || max_score <= 0.0 {
-        return HashMap::new();
-    }
-    let min_score_seen = filtered
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::INFINITY, f32::min);
-    let span = max_score - min_score_seen;
-    let floor = config
-        .baseline_relevance
-        .clamp(0.0, NORMALIZED_RELEVANCE_CEILING);
-    let range = NORMALIZED_RELEVANCE_CEILING - floor;
-
-    let signal_strength = (max_score / RRF_SIGNAL_THRESHOLD).min(1.0);
-
-    filtered
-        .into_iter()
-        .map(|(id, score)| {
-            let calibrated = if span <= f32::EPSILON {
-                max_score.clamp(floor, NORMALIZED_RELEVANCE_CEILING)
-            } else {
-                let percentile = ((score - min_score_seen) / span).clamp(0.0, 1.0);
-                floor + percentile * range
-            };
-            (id, calibrated * signal_strength)
-        })
-        .collect()
+    normalize_relevance_scores(scores, config, RelevanceSource::Single)
 }
 
 /// Normalize RRF-fused scores (dual-source) into a calibrated relevance band.
 pub fn normalize_rrf_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,
+) -> HashMap<Uuid, f32> {
+    normalize_relevance_scores(scores, config, RelevanceSource::Fused)
+}
+
+#[derive(Clone, Copy)]
+enum RelevanceSource {
+    Single,
+    Fused,
+}
+
+fn normalize_relevance_scores(
+    scores: Vec<(Uuid, f32)>,
+    config: &ScoringConfig,
+    source: RelevanceSource,
 ) -> HashMap<Uuid, f32> {
     if scores.is_empty() {
         return HashMap::new();
@@ -755,16 +732,28 @@ pub fn normalize_rrf_scores(
         .clamp(0.0, NORMALIZED_RELEVANCE_CEILING);
     let range = NORMALIZED_RELEVANCE_CEILING - floor;
 
+    let signal_strength = match source {
+        RelevanceSource::Single => Some((max_score / RRF_SIGNAL_THRESHOLD).min(1.0)),
+        RelevanceSource::Fused => None,
+    };
+
     filtered
         .into_iter()
         .map(|(id, score)| {
             let calibrated = if span <= f32::EPSILON {
-                floor + range
+                match source {
+                    RelevanceSource::Single => max_score.clamp(floor, NORMALIZED_RELEVANCE_CEILING),
+                    RelevanceSource::Fused => floor + range,
+                }
             } else {
                 let percentile = ((score - min_score_seen) / span).clamp(0.0, 1.0);
                 floor + percentile * range
             };
-            (id, calibrated)
+            let normalized = match signal_strength {
+                Some(signal) => calibrated * signal,
+                None => calibrated,
+            };
+            (id, normalized)
         })
         .collect()
 }
@@ -865,3 +854,7 @@ mod loop_3711_tests;
 #[cfg(test)]
 #[path = "scoring_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scoring_normalization_tests.rs"]
+mod normalization_tests;

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_score::vector::cosine_similarity;
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::util::{row_str, sql_err, SERVABLE_SECTION};
@@ -175,7 +176,7 @@ pub(super) fn score_sections(
     for (section, &bm25_unnorm) in flat.iter().zip(bm25_raw.iter()) {
         khive_storage::ensure_request_read_active("knowledge.compose")?;
         let sec_cos = match &section.embedding {
-            Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb).max(0.0),
+            Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb, true).max(0.0),
             _ => 0.0,
         };
 
@@ -332,26 +333,6 @@ fn compute_bm25_scores_observed(
 mod bm25_work_tests;
 
 // ─── pure helpers ─────────────────────────────────────────────────────────────
-
-pub(super) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-8 {
-        0.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
-    }
-}
 
 pub(super) fn decode_embedding(blob: &[u8]) -> Vec<f32> {
     khive_storage::decode_f32_le(blob).unwrap_or_default()

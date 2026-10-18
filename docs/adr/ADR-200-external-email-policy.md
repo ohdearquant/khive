@@ -1,10 +1,12 @@
 # ADR-200: External Email Policy: Sender Scope, Suppression, Unsubscribe and Screened Inbound Delivery
 
-- **Status**: Proposed (2026-10-11)
+- **Status**: Accepted (2026-10-11)
 - **Date**: 2026-10-11
 - **Amends**: [ADR-122](ADR-122-email-outbound-delivery.md) (Amendment 4, recipient policy),
   [ADR-056](ADR-056-channel-transport-layer.md) (Amendment 2026-07-02, quarantine disposition)
 - **Addresses**: [#5165](https://github.com/ohdearquant/khive/issues/5165)
+- **Amendments**: Amendment 1 (proposed 2026-10-14), Amendment 2 (proposed 2026-10-16), Amendment 3 (proposed
+  2026-10-16) and Amendment 4 (proposed 2026-10-17), at the end of this record
 
 ## Context
 
@@ -343,3 +345,158 @@ Real request, outbox and ingest paths, with a mock transport and recorded raw me
 - Hard-bounce processing into suppression is not covered here.
 - Whether a forwarding rule (as opposed to an alias on the same mailbox) preserves an authentication
   result that passes §7 step 3 depends on the receiving boundary and is to be measured per deployment.
+
+## Amendment 1 (2026-10-14) -- Withheld originals are read through comm, and external routing is narrowed
+
+**Status**: Proposed 2026-10-14.
+
+**Trigger.** §8.3 keeps a withheld message's original bytes "for an explicit operator read" and names neither the
+read nor its callers. The first implementation keeps the original as a blob, records its content reference in the
+delivered message's properties, and documents `blob.get` as the read. `blob.get` reads any object whose reference the
+caller holds and does not check the caller against a message, and inbox and thread reads return message properties.
+Any actor that can list the recipient's inbox could therefore read text that screening withheld. Two further gaps were
+found in the same review: a thread UUID asserted by an external sender can route to a thread that was never an email
+conversation, and an opt-out inside a message that screening quarantines is not recorded.
+
+**Decision.**
+
+1. **One read for withheld originals.** `comm.withheld_body(id)` returns the original RFC 5322 bytes of a delivered
+   withheld message, base64-encoded, with their size. It refuses an id that is not a delivered withheld external
+   message, and it never returns a content reference.
+2. **Callers.** The read is open to the message's recipient actor (its `to_actor`) and to the maintainer (the
+   runtime's configured actor, the same check `comm.suppression_remove` uses). Any other caller is refused before the
+   original is read, with the typed permission-denied form, and the refusal names neither the sender nor any content.
+   Every call, allowed or refused, writes an audit event naming the caller, the message id and the outcome.
+3. **No reference on the delivered message.** A delivered withheld message does not carry `quarantine_content_ref`
+   or any other blob reference in its properties. The original is owned only by the message's `quarantine-original`
+   attachment, which read surfaces already omit. A retried delivery of the same transport message verifies custody
+   through that attachment. Inbox, thread, read and notice surfaces return no original bytes and no reference.
+4. **Thread routing for external mail.** For an external message, the thread-UUID path of §8.2 (an
+   `X-Khive-Thread-ID` that names a thread rather than a Message-ID) routes only when that thread holds an outbound
+   email message whose Message-ID verifies under ADR-122 Amendment 3, the same proof the Message-ID path requires.
+   A UUID naming any other thread falls through to recipient routes and then the external inbound actor. Maintainer
+   mail keeps today's resolution.
+5. **Opt-out independent of the outcome.** An authenticated external message that screening quarantines as
+   `screened` and that carries the `opt_out` label still adds the §5.4 entry point 3 suppression for its `From:`
+   address before the quarantine is acknowledged. §8.4 already says the label does not change the delivery outcome;
+   this makes the suppression not depend on it either, in the direction §8.4 names as safe.
+6. **Quarantine records are addressed to the maintainer.** At ingest, a message the channel quarantines, whatever
+   its reason, is addressed to the maintainer (the runtime's configured actor) in place of the landing actor that the
+   ingest handler's routing would choose (`khive-pack-comm/src/handlers/ingest.rs`). The recipient check that already
+   governs every mailbox read (`permits_message_note`, `khive-runtime/src/mailbox_view.rs`) then keeps the record and
+   its `quarantine_content_ref` out of every other actor's mailbox reads. The rule applies at ingest, so it covers
+   records ingested once it is deployed: a quarantine record already stored keeps the `to_actor` it was written with,
+   and a replay of the same message does not re-address it. A runtime with no configured actor has no maintainer, so
+   its quarantine records keep today's landing actor and are visible to that actor.
+
+**Unchanged.** Quarantine records keep `quarantine_content_ref` and their existing operator recovery path. The
+screening rules, outcomes and labels of §8.3 and §8.4 are unchanged.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                    | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A16 withheld read       | The recipient actor and the maintainer each read a withheld original byte for byte; a third actor is refused before any read; each call is audited; an ordinary or quarantined message is refused.                                                                                                                                                                                                                                                                                                                                   |
+| A17 no reference        | A delivered withheld message's properties, and every inbox, thread, read and notice result for it, contain no blob reference and no original bytes; a retried delivery of the same transport message is acknowledged through its attachment. A quarantine record ingested under Decision 6 is addressed to the maintainer: a non-maintainer landing actor finds it through no inbox, thread, read, get or search result, and the maintainer finds it through each; on a runtime with no configured actor it keeps its landing actor. |
+| A18 thread routing      | An external message whose thread UUID names a thread with a verified outbound email routes to that thread's actor; one naming a thread with no such email routes by recipient alias or to the external inbound actor.                                                                                                                                                                                                                                                                                                                |
+| A19 quarantined opt-out | An authenticated opt-out in a message quarantined as `screened` suppresses its `From:` address, and the next send to that address is refused.                                                                                                                                                                                                                                                                                                                                                                                        |
+
+Realistic replies from developers that ask the reader to install, run or connect something are A15 fixtures, and the
+change that adds them reports how many each screening family catches.
+
+## Amendment 2 (2026-10-16) -- The opt-out window is the first non-quoted paragraph, and the phrase list names asks for no more email
+
+**Trigger.** A recorded decline ends its first paragraph with "Please don't email me about this again", and the
+sending client wraps that sentence onto a second line. §8.4 reads the subject and the first non-quoted line, so the
+phrase is never seen, and the phrase list does not contain it. Under 15 U.S.C. 7704(a)(3) and (a)(4) a reply to the
+sender's return address asking for no more mail is an opt-out request the sender has ten business days to honour,
+whatever its wording, and a missed one is a second send to a person who asked us to stop. The two errors are not
+symmetric: a false label suppresses a person who wrote "don't email me", which is never wrong.
+
+**Decisions (amending §8.4).**
+
+1. The opt-out window is the subject or the **first non-quoted paragraph** of the plain text: the lines from the
+   first non-empty line that does not start with `>` up to the next empty or quoted line, joined with one space
+   before matching. Quoted text and everything after the first blank line stay outside the window, so a top-posted
+   reply above our own message, and a reply that quotes it, match only on what the person wrote. The HTML-only
+   path reads the same paragraph of the extracted text.
+2. The phrase list gains the plain asks for no more email: "stop contacting", "don't email me" (straight and curly
+   apostrophe), "dont email me", "do not email me", "don't contact me" (both apostrophes), "do not contact me",
+   "no more emails". The bare words "email me" are not a phrase.
+3. Outcome and entry point are unchanged: the label still never changes the delivery outcome, and §5.4 entry
+   point 3 still writes the suppression.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                | Required behaviour                                                                                                                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A20 wrapped opt-out | A recorded decline whose "don't email me" sentence is wrapped onto the second line of its first paragraph is delivered marked with the opt-out label and no other family.                                         |
+| A21 email-me decoy  | A recorded engaged reply containing "email me" twice ("can you email me the setup docs", "you can email me at") is delivered without the opt-out label; a widening to the bare words would turn this fixture red. |
+| A22 quoted opt-out  | A reply whose only opt-out phrase is on a quoted line, followed by an unquoted line, is delivered without the label (existing fixture, unchanged).                                                                |
+
+## Amendment 3 (2026-10-16) -- External inbound without external senders
+
+**Status**: Proposed 2026-10-16.
+
+**Trigger.** §7 step 5 ties external inbound to configured external senders: while `KHIVE_EMAIL_EXTERNAL_SENDERS` is
+unset, every authenticated message from a sender other than the maintainer is quarantined as `off-allowlist`. A
+deployment that has to receive mail from outside senders, such as service notices addressed to its mailbox, but must
+not send outside its policy recipients has no setting for that: configuring external senders also enables outbound
+external sending.
+
+**Decision.**
+
+1. `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` enables external inbound on its own. External inbound is enabled when
+   external senders are configured or this setting is `enabled`. §7 step 5 is read as "External inbound not enabled:
+   quarantine as `off-allowlist`", and steps 6 and 7 apply whenever it is enabled.
+2. The setting changes nothing outbound. While external senders are unset, a send to an address outside the outbound
+   allowlist is refused as before (§2), and no unsubscribe token verifies (§5).
+3. A message admitted under it is delivered exactly as §8 describes: sender `email:<address>`, `origin = external`,
+   `trust = untrusted`, screening per §8.3, routing per §8.2 and Amendment 1 decision 4.
+   `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is required whenever external inbound is enabled, and start-up fails while it
+   is unset or empty.
+4. Unset or empty means disabled. Any other value is a configuration error at start-up, so a misspelled value never
+   reads as disabled.
+
+**Acceptance (added to the ADR's table).**
+
+| Case             | Required behaviour                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A23 inbound only | With external senders unset and the setting enabled, an authenticated message from a sender other than the maintainer is delivered to its routed actor marked external and untrusted, an inbound suppression entry still blocks it, a send to an address outside the outbound allowlist is refused, and start-up fails while the inbound actor is unset or empty or the setting holds an unrecognised value. |
+
+## Amendment 4 (2026-10-17) -- The remote mirror's credential, its answer, and an idle refresh
+
+**Status**: Proposed 2026-10-17.
+
+**Trigger.** §6 names `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` and `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` but leaves
+"its credential" unnamed, and it says nothing about an answer that is only partly well formed. Its refresh is also tied
+to delivery: the mirror is read before an external message is handed to SMTP, and admission refuses once the last
+successful refresh is older than the maximum age. A deployment with no external message pending therefore never
+refreshes, passes the maximum age, and from then on refuses every new external message, so no external message is ever
+pending to trigger the refresh that would reopen admission. [Source: §6, the "At delivery" and "At admission" bullets.]
+
+**Decision.**
+
+1. **Configuration.** The credential is `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN`, sent as a bearer token. The URL, the
+   token and the maximum age are read only while external senders are configured, like the §5 variables. The URL must
+   be `https://`. Setting some of the three but not all, or a maximum age that is not a positive integer, is a
+   configuration error at start-up. No error repeats the credential.
+2. **The read.** One `GET` under one deadline that covers connection, headers and body. Redirects are not followed, so
+   the credential reaches only the configured URL. The answer is `{"as_of": "<RFC 3339>", "recipient_keys": [...]}`
+   with an optional `count`; unknown fields are ignored, so the incremental form §6 allows can be added later. A status
+   other than 200, a body over the size limit the implementation states, an `as_of` that does not parse, a `count` that
+   differs from the number of keys, or any key that is not 64 lowercase hex characters fails the whole refresh. A partly
+   valid set is never applied.
+3. **Recording.** The missing keys are added before the refresh time is recorded, so a failure part way leaves the
+   previous time, which can only make admission refuse sooner. The time is kept in the local store beside the list, so
+   every process that admits external mail reads the same value.
+4. **Idle refresh.** Besides the refresh before an external send, a delivery cycle refreshes when no successful refresh
+   is recorded or the last one is at least half the maximum age old. It is the same refresh, still at most one per
+   cycle, and it changes no other rule: a failed idle refresh records nothing, so admission keeps refusing until one
+   succeeds.
+
+**Acceptance (added to the ADR's table).**
+
+| Case                | Required behaviour                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A24 mirror contract | A partial or non-`https` mirror configuration refuses start-up without repeating the credential. A redirect, a non-200 answer, a count mismatch or one malformed key fails the refresh and adds no key. With nothing pending, a cycle with no recorded refresh reads the mirror and, once that read succeeds, external admission is open; a cycle under half the maximum age reads nothing. |

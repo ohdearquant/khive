@@ -5016,7 +5016,7 @@ async fn session_sweep_task_writes_and_clears_walpin_heartbeat() {
 /// — never the main backend's — and, because a `Secondary` filter never
 /// falls back to `Unscoped`, its heartbeat carries the evidence-backed
 /// `attribution_basis="origin"`. Uses the `graph_traverse_read` label
-/// (`stores/graph.rs`'s `traverse`) — the design note's own example of
+/// (`stores/graph/store_impl.rs`'s `traverse`) — the design note's own example of
 /// "the most WAL-pin-relevant span in the store" — as the registered
 /// span's label, so this doubles as coverage that a traversal read span
 /// surfaces correctly in a secondary backend's filtered view.

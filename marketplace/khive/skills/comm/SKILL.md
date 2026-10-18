@@ -4,11 +4,11 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The surface is fourteen verbs —
+khive comm is how agents and lambdas message each other. The surface is fifteen verbs —
 `comm.send`, `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`,
 `comm.read`, `comm.mark_read`, `comm.reply`,
 `comm.thread`, `comm.health`, `comm.probe`, `comm.suppression_add`,
-`comm.suppression_list`, and `comm.suppression_remove` —
+`comm.suppression_list`, `comm.suppression_remove`, and `comm.withheld_body` —
 but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
 detail is one call away: `request(ops="comm.send(help=true)")`.
 
@@ -77,7 +77,8 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
 `comm.read(id="<full_id>")` to clear one or `comm.mark_read(ids=[...])` to clear up to 500 in one
-operation. `comm.read` is a compatibility mark-read name and does not retrieve content. Pass
+operation. `comm.read` marks a message read and, by default, also returns its subject, content
+and routing fields; `body=false` keeps an acknowledgement-only response. Pass
 `atomic=true` to `comm.mark_read` when the entire supplied set must change or none may change;
 otherwise inspect each best-effort result's `read`/`mark_error`. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks

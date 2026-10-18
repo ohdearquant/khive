@@ -46,7 +46,7 @@ fn init_repo(dir: &Path) {
 
 fn envelope_line() -> String {
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
         "producer": "pipeline:acceptance-test",
         "producer_model_family": "family:sonnet",
         "staged_at": 2_000_000_u64,

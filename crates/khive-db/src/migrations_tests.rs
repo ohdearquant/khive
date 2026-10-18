@@ -12,6 +12,8 @@ mod admission;
 mod atom_weights;
 #[path = "migrations_tests/page_accounting.rs"]
 mod page_accounting;
+#[path = "migrations_tests/retrieval_snapshots.rs"]
+mod retrieval_snapshots;
 
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")

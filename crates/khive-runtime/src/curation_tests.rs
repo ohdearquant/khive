@@ -8542,16 +8542,21 @@ async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure(
         policy: NoteEmbeddingPolicy::DefaultModel,
     }]);
 
-    rt.update_note(
-        &tok,
-        note.id,
-        NotePatch {
-            content: Some("message after policy narrowing".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("best-effort default embed failure does not fail note update");
+    let error = rt
+        .update_note(
+            &tok,
+            note.id,
+            NotePatch {
+                content: Some("message after policy narrowing".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("default embed failure is a committed note-update degradation");
+    let failures =
+        crate::curation::note_reindex::report_tests::committed_update_failures(&error, note.id);
+    assert_eq!(failures.as_array().map(Vec::len), Some(1));
+    assert_eq!(failures[0]["stage"], "embedding");
     assert!(attempts.load(Ordering::SeqCst) > 0);
 
     let table = format!("vec_{model_key}");

@@ -1,6 +1,6 @@
 //! Unified hybrid search interface.
 //!
-//! Combines HNSW vector search and BM25 keyword search with pluggable fusion (RRF by default).
+//! Combines a vector search and a keyword search with pluggable fusion (RRF by default).
 //! VectorSearch, KeywordSearch, HybridSearcher, and Reranker are independent composable traits.
 
 mod config;

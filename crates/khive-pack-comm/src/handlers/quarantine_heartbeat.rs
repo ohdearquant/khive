@@ -19,7 +19,24 @@ use crate::params::{
 
 #[cfg(test)]
 use super::race_seam;
-use super::validation::parse_supplied_timestamp;
+use super::validation::{parse_supplied_timestamp, validate_actor_label};
+
+/// Reasons a record may be written without its original (ADR-056, 2026-10-14
+/// and 2026-10-15 amendments). The heartbeat's `original_not_retained_reason`
+/// accepts exactly these tokens; `secondary-backend` names the drop
+/// `comm.ingest` performs itself when the runtime cannot own the original.
+const ORIGINAL_NOT_RETAINED_REASONS: [&str; 6] = [
+    "retention-limit",
+    "original-unavailable",
+    "retention-count-unreadable",
+    "original-store-failed",
+    "quarantine-write-failed",
+    "secondary-backend",
+];
+
+/// The two `original_retention_state` values: whether the writer kept its
+/// originals this poll, or is failing to.
+const ORIGINAL_RETENTION_STATES: [&str; 2] = ["retained", "failing"];
 
 /// Detach only the main-backend original owned by this already hard-deleted
 /// legacy note. The guarded delete rejects a competing replacement of the
@@ -331,7 +348,10 @@ pub(super) fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slu
 /// Read-modify-write: `created_at` is preserved across updates, `last_error`
 /// is RETAINED across a subsequent success (design review amendment 3), and
 /// `consecutive_failures` resets on success / increments on failure, read from
-/// the prior row (correct across restarts).
+/// the prior row (correct across restarts). A success that reports
+/// `held_messages` also maintains `consecutive_held_polls` (incremented while
+/// a page holds, reset by a poll with no hold) and `last_held_at`; a failure
+/// read no page, so it leaves them as they were.
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -342,6 +362,15 @@ pub(crate) async fn handle_heartbeat(
     let p: HeartbeatParams = serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("heartbeat: bad params: {e}")))?;
 
+    persist_heartbeat(runtime, token, p, None).await
+}
+
+pub(super) async fn persist_heartbeat(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    p: HeartbeatParams,
+    outbox_scan: Option<super::outbox_scan::OutboxScan>,
+) -> Result<Value, RuntimeError> {
     if p.channel_kind.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "heartbeat: `channel_kind` must not be empty".into(),
@@ -376,6 +405,74 @@ pub(crate) async fn handle_heartbeat(
             "heartbeat: `error_class` is required when outcome is \"failure\"".into(),
         ));
     }
+    if outcome == "failure" && (p.held_messages.is_some() || p.quarantined_after_hold.is_some()) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `held_messages` and `quarantined_after_hold` are reported only with \
+             outcome \"success\"; a failed poll read no page"
+                .into(),
+        ));
+    }
+    if outcome == "failure"
+        && (p.originals_not_retained.is_some()
+            || p.original_not_retained_reason.is_some()
+            || p.original_retention_state.is_some()
+            || p.notices_failed.is_some()
+            || p.notice_config_error.is_some())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `originals_not_retained`, `original_not_retained_reason`, \
+             `original_retention_state`, `notices_failed` and `notice_config_error` are \
+             reported only with outcome \"success\"; a failed poll wrote no records and sent \
+             no notices"
+                .into(),
+        ));
+    }
+    match (
+        p.originals_not_retained,
+        p.original_not_retained_reason.as_deref(),
+    ) {
+        (Some(count), _) if count == 0 && p.original_not_retained_reason.is_some() => {
+            return Err(RuntimeError::InvalidInput(
+                "heartbeat: `original_not_retained_reason` is reported only when \
+                 `originals_not_retained` is above zero"
+                    .into(),
+            ));
+        }
+        (Some(count), None) if count > 0 => {
+            return Err(RuntimeError::InvalidInput(
+                "heartbeat: `original_not_retained_reason` is required when \
+                 `originals_not_retained` is above zero"
+                    .into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(RuntimeError::InvalidInput(
+                "heartbeat: `original_not_retained_reason` is reported only when \
+                 `originals_not_retained` is above zero"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(reason) = p.original_not_retained_reason.as_deref() {
+        if !ORIGINAL_NOT_RETAINED_REASONS.contains(&reason) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "heartbeat: unknown `original_not_retained_reason` {reason:?}; expected one of {}",
+                ORIGINAL_NOT_RETAINED_REASONS.join(", ")
+            )));
+        }
+    }
+    if let Some(state) = p.original_retention_state.as_deref() {
+        if !ORIGINAL_RETENTION_STATES.contains(&state) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "heartbeat: `original_retention_state` must be \"retained\" or \"failing\", got \
+                 {state:?}"
+            )));
+        }
+    }
+    if let Some(raw) = p.notice_config_error.as_deref() {
+        validate_actor_label("heartbeat", raw, "notice_config_error")?;
+    }
 
     // Issue #917: heartbeat rows persist under `token.namespace()` — the
     // dispatch-authorized namespace every other comm verb already uses —
@@ -387,6 +484,10 @@ pub(crate) async fn handle_heartbeat(
     // every dispatch (subhandlers included) is the sole authorization
     // boundary here (ADR-018) — this handler must not layer a second,
     // handler-local namespace check on top of it.
+    // The Rust-only outbox writer instead supplies the token its comm-backend
+    // runtime authorized for the scanned message namespace. It shares this
+    // guarded persistence helper, never dispatches a wire verb, and cannot
+    // redirect a write through a JSON namespace field.
     //
     // The local single-tenant poll loop (`khive-mcp`'s
     // `record_channel_heartbeat`) is unaffected: it always passes
@@ -434,31 +535,98 @@ pub(crate) async fn handle_heartbeat(
 
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
-    props["last_poll_attempt_at"] = json!(at);
-    if let Some(poll_interval_secs) = p.poll_interval_secs {
-        props["poll_interval_secs"] = json!(poll_interval_secs);
-    }
+    if let Some(scan) = outbox_scan {
+        super::outbox_scan::update_properties(&mut props, scan)?;
+    } else {
+        props["last_poll_attempt_at"] = json!(at);
+        if let Some(poll_interval_secs) = p.poll_interval_secs {
+            props["poll_interval_secs"] = json!(poll_interval_secs);
+        }
 
-    match outcome {
-        "success" => {
-            props["last_success_at"] = json!(at);
-            props["consecutive_failures"] = json!(0);
-            // last_error is intentionally left untouched — design review amendment 3.
+        match outcome {
+            "success" => {
+                props["last_success_at"] = json!(at);
+                props["consecutive_failures"] = json!(0);
+                // last_error is intentionally left untouched — design review amendment 3.
+                if let Some(held) = p.held_messages {
+                    props["held_messages"] = json!(held);
+                    if held > 0 {
+                        let prev_held_polls = props
+                            .get("consecutive_held_polls")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        props["consecutive_held_polls"] = json!(prev_held_polls.saturating_add(1));
+                        props["last_held_at"] = json!(at);
+                    } else {
+                        props["consecutive_held_polls"] = json!(0);
+                    }
+                }
+                if p.quarantined_after_hold
+                    .is_some_and(|released| released > 0)
+                {
+                    props["last_quarantined_after_hold_at"] = json!(at);
+                }
+                // `originals_not_retained` and `notices_failed` are running totals:
+                // added to, never replaced, so a consumer sees the channel's whole
+                // history rather than the latest poll's slice. The last-reason,
+                // last-timestamp and current-state facts are replaced (or, for
+                // `notice_config_error`, cleared) by each success that reports them.
+                if let Some(not_retained) = p.originals_not_retained {
+                    let prev_total = props
+                        .get("originals_not_retained")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    props["originals_not_retained"] =
+                        json!(prev_total.saturating_add(not_retained));
+                    if not_retained > 0 {
+                        props["last_original_not_retained_at"] = json!(at);
+                        if let Some(reason) = p.original_not_retained_reason.as_deref() {
+                            props["last_original_not_retained_reason"] = json!(reason);
+                        }
+                    }
+                }
+                if let Some(state) = p.original_retention_state.as_deref() {
+                    props["original_retention_state"] = json!(state);
+                }
+                if let Some(failed) = p.notices_failed {
+                    let prev_total = props
+                        .get("notices_failed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    props["notices_failed"] = json!(prev_total.saturating_add(failed));
+                    if failed > 0 {
+                        props["last_notice_failed_at"] = json!(at);
+                    }
+                }
+                // `notice_config_error` is a CURRENT-problem fact, not a historical
+                // one: a success that does not carry it CLEARS the row's value, so a
+                // resolved configuration problem stops being reported. That is
+                // deliberately unlike `last_error`, which a success RETAINS so a
+                // caller can compare it against `last_success_at`.
+                match p.notice_config_error.as_deref() {
+                    Some(problem) => props["notice_config_error"] = json!(problem),
+                    None => {
+                        if let Some(map) = props.as_object_mut() {
+                            map.remove("notice_config_error");
+                        }
+                    }
+                }
+            }
+            "failure" => {
+                props["last_failure_at"] = json!(at);
+                let prev_failures = props
+                    .get("consecutive_failures")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                props["consecutive_failures"] = json!(prev_failures + 1);
+                props["last_error"] = json!({
+                    "class": p.error_class.clone().unwrap_or_default(),
+                    "message": p.error_message.clone().unwrap_or_default(),
+                    "at": at,
+                });
+            }
+            _ => unreachable!("outcome already validated above"),
         }
-        "failure" => {
-            props["last_failure_at"] = json!(at);
-            let prev_failures = props
-                .get("consecutive_failures")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            props["consecutive_failures"] = json!(prev_failures + 1);
-            props["last_error"] = json!({
-                "class": p.error_class.clone().unwrap_or_default(),
-                "message": p.error_message.clone().unwrap_or_default(),
-                "at": at,
-            });
-        }
-        _ => unreachable!("outcome already validated above"),
     }
 
     khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;

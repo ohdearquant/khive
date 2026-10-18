@@ -207,6 +207,25 @@ fn field_level_merge(
     (result, conflicts)
 }
 
+/// Selects a property value while leaving conflict reporting to the caller.
+pub(crate) fn select_property_value<'a>(
+    base: Option<&'a serde_json::Value>,
+    ours: Option<&'a serde_json::Value>,
+    theirs: Option<&'a serde_json::Value>,
+    on_conflict: impl FnOnce(),
+) -> Option<&'a serde_json::Value> {
+    if ours == theirs {
+        ours
+    } else if ours == base {
+        theirs
+    } else if theirs == base {
+        ours
+    } else {
+        on_conflict();
+        ours
+    }
+}
+
 /// Merges object properties per key against the common base.
 ///
 /// Absent keys are values in the three-way comparison, so an unchanged branch
@@ -262,21 +281,14 @@ fn merge_properties(
         let base_value = base_obj.and_then(|object| object.get(key));
         let ours_value = ours_obj.and_then(|object| object.get(key));
         let theirs_value = theirs_obj.and_then(|object| object.get(key));
-        let selected = if ours_value == theirs_value {
-            ours_value
-        } else if ours_value == base_value {
-            theirs_value
-        } else if theirs_value == base_value {
-            ours_value
-        } else {
+        let selected = select_property_value(base_value, ours_value, theirs_value, || {
             conflicts.push(MergeConflict::PropertyMismatch {
                 entity_id: id,
                 key: key.clone(),
                 ours: ours_value.cloned().unwrap_or(Value::Null),
                 theirs: theirs_value.cloned().unwrap_or(Value::Null),
             });
-            ours_value
-        };
+        });
 
         if let Some(value) = selected {
             merged.insert(key.clone(), value.clone());

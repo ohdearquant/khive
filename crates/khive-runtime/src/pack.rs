@@ -186,8 +186,12 @@ mod builder;
 pub use builder::{PackMetadataRegistry, VerbRegistryBuilder};
 
 mod catalog;
+pub(crate) use catalog::CanonicalNoteHookLookup;
 mod dispatch;
+mod graph_lint;
 mod registry_access;
+#[cfg(test)]
+pub(crate) use graph_lint::registry_with_lint_owners;
 mod request_identity;
 pub(crate) use request_identity::is_special_relation;
 pub use request_identity::{

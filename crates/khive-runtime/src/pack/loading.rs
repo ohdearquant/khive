@@ -333,11 +333,12 @@ impl PackRegistry {
     ///
     /// This helper carries only the subset every ingest path duplicated
     /// verbatim. The MCP server's own registry construction additionally
-    /// wires channel-loop admission, `config_id`, embedder/entity-type/
+    /// wires channel-loop admission, `config_id`, entity-type and
     /// note-mutation-hook registration, schema-plan application, and the WAL
     /// checkpoint pool handle — all server-only concerns a one-shot CLI pass
     /// has no use for, so `KhiveMcpServer::with_packs` keeps its own
-    /// construction rather than calling this helper.
+    /// construction rather than calling this helper. Both hosts register pack
+    /// embedding providers and finalize configured engine binding before return.
     pub fn build_ingest_registry(
         runtime: &KhiveRuntime,
         audit_store: IngestAuditStore,
@@ -363,6 +364,7 @@ impl PackRegistry {
         .map_err(|e| RuntimeError::Internal(format!("pack registration failed: {e:?}")))?;
         let registry = builder.build()?;
         runtime.install_edge_rules(registry.all_edge_rules());
+        registry.initialize_embedding_engines(&[runtime])?;
         Ok(registry)
     }
 
