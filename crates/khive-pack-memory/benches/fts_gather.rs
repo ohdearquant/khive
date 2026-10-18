@@ -1,76 +1,30 @@
-//! Real-corpus latency + quality benchmark for the FTS candidate-gather path.
-//!
-//! Why this exists: the prior parameter sweep (`tests/khive-contract/tune/`) ran on a
-//! synthetic corpus that produced a flat recall@10 = 0.9333 for *every* config — it
-//! could not discriminate any parameter, so that gather optimization shipped as
-//! inert infrastructure (`enabled: false`) with no evidence it helps or is safe.
-//!
-//! This benchmark uses the REAL memory corpus (~12k local notes extracted from
-//! `khive-graph.db` into a git-ignored fixture) and the REAL production code path
-//! (`collect_text_hits` → `search` / `search_with_options` / `term_stats`). It measures,
-//! per strategy, latency (p50 / p95 / mean of the FTS candidate-gather leg) and
-//! quality vs the production baseline (recall@10 and candidate-pool recall),
-//! so a default can be chosen on data instead of guesswork.
-//!
-//! Key finding the benchmark surfaces: the FTS OR-match set is dominated by
-//! near-zero-IDF terms (English stopwords like "for"/"and"/"with" each match ~40-57%
-//! of the corpus). Those terms cause the expensive BM25 scan but contribute ~nothing
-//! to ranking, so dropping them is both faster AND coverage-safe — whereas fixed-k
-//! term selection drops *meaningful* terms and loses recall, and the per-term
-//! `term_stats` round-trips cost more than the gather saves.
-//!
-//! It is `#[ignore]`d (a benchmark, not a correctness gate) and skips cleanly when the
-//! fixture is absent, so it never breaks CI. Run it with:
-//!
-//! ```bash
-//! # extract the fixture first (read-only, never mutates the source DB):
-//! sqlite3 'file:'"$HOME"'/.khive/khive-graph.db?mode=ro' \
-//!   "PRAGMA query_only=1; SELECT json_object('id',id,'kind',kind,'title',COALESCE(name,''),'body',content) \
-//!    FROM notes WHERE namespace='local' AND deleted_at IS NULL ORDER BY created_at;" \
-//!   > crates/khive-pack-memory/tests/fixtures/memory_corpus_local.jsonl
-//!
-//! cargo test -p khive-pack-memory --release bench_fts_gather_real_corpus -- --ignored --nocapture
-//! ```
-use std::collections::HashSet;
-use std::time::Instant;
-
-use chrono::Utc;
-use serde::Deserialize;
-use uuid::Uuid;
-
-use khive_db::StorageBackend;
-use khive_storage::types::{
-    TextDocument, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, TextTermStatsRequest,
-};
-use khive_storage::TextSearch;
-use khive_types::SubstrateKind;
-
+//! Criterion FTS gather over a deterministic 2,048-document frequency mixture.
+//! Untimed recall@10 compares each actual result with the full-term ranked top10.
+//! This quality cohort does not establish production quality or a tuning default.
+#[allow(dead_code)]
+#[path = "reducible_support/fixture.rs"]
+mod fixture;
+#[allow(dead_code)]
+#[path = "reducible_support/report.rs"]
+mod report;
+use criterion::Criterion;
 use khive_pack_memory::config::{
     RecallFtsGatherConfig, RecallFtsGatherMode, RecallFtsSelectionRule,
 };
 use khive_pack_memory::handlers::{recall_text_terms, TextSnippetPolicy};
 use khive_pack_memory::text_gather::collect_text_hits;
-
+use khive_storage::types::{
+    TextDocument, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, TextTermStatsRequest,
+};
+use khive_storage::TextSearch;
+use khive_types::SubstrateKind;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 const NS: &str = "local";
-/// Matches `RecallConfig::default().candidate_limit` — the per-leg candidate pool
-/// size production fusion actually sees.
 const CANDIDATE_LIMIT: u32 = 150;
-/// Number of distinct queries sampled from the memory subset.
-const N_QUERIES: usize = 150;
-/// Timed repeats per (strategy, query); percentiles aggregate over query × repeat.
-const REPEATS: usize = 5;
-/// Only use queries with at least this many distinct terms.
-const MIN_QUERY_TERMS: usize = 4;
-
-#[derive(Deserialize)]
-struct CorpusRow {
-    id: String,
-    kind: String,
-    #[serde(default)]
-    title: String,
-    body: String,
-}
-
+const DOCUMENTS: usize = 2_048;
+const QUERIES: usize = 32;
 /// One query: its terms plus the per-term document frequency (computed once,
 /// untimed, so term-pruning strategies don't pay the `term_stats` cost in the
 /// measured path — that cost is measured separately by the PROD strategies).
@@ -99,14 +53,12 @@ enum Selector {
     /// Keep the `k` highest-IDF (lowest-DF) terms, original order.
     TopIdf(usize),
     /// Drop terms in the static stopword set — FREE (no DB round-trip / no DF).
-    /// This is the production-viable approximation of high-DF pruning: stopwords
-    /// are exactly the near-zero-IDF terms that inflate the OR-match set.
+    /// Compare this heuristic with the full-term baseline on the generated corpus.
     DropStopwords,
 }
 
-/// Near-zero-IDF English function words that dominate the OR-match set without
-/// affecting BM25 ranking. Validated against the real corpus: "for"=57%,
-/// "and"=46%, "with"=41%, "the"=38% of docs. Dropping them is coverage-safe.
+/// Fixed function-word list; quality is measured against this generated corpus,
+/// not inferred from any production frequency or safety claim.
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "and", "or", "but", "if", "then", "else", "for", "of", "to", "in", "on",
     "at", "by", "with", "from", "as", "is", "are", "was", "were", "be", "been", "being", "it",
@@ -144,43 +96,43 @@ fn strategies() -> Vec<BenchStrategy> {
     use RecallFtsSelectionRule::*;
     vec![
         BenchStrategy {
-            name: "baseline: all terms, ranked",
+            name: "baseline",
             strategy: Strategy::RankedPruned(Selector::All),
         },
         BenchStrategy {
-            name: "ranked, drop df>50%",
+            name: "df-50",
             strategy: Strategy::RankedPruned(Selector::PruneDfFrac(0.50)),
         },
         BenchStrategy {
-            name: "ranked, drop df>33%",
+            name: "df-33",
             strategy: Strategy::RankedPruned(Selector::PruneDfFrac(0.33)),
         },
         BenchStrategy {
-            name: "ranked, drop df>20%",
+            name: "df-20",
             strategy: Strategy::RankedPruned(Selector::PruneDfFrac(0.20)),
         },
         BenchStrategy {
-            name: "ranked, drop df>10%",
+            name: "df-10",
             strategy: Strategy::RankedPruned(Selector::PruneDfFrac(0.10)),
         },
         BenchStrategy {
-            name: "ranked, drop stopwords (FREE)",
+            name: "stopwords",
             strategy: Strategy::RankedPruned(Selector::DropStopwords),
         },
         BenchStrategy {
-            name: "ranked, top-IDF k5 (no tax)",
+            name: "idf-k5-precomputed",
             strategy: Strategy::RankedPruned(Selector::TopIdf(5)),
         },
         BenchStrategy {
-            name: "PROD idf-k5 (term_stats tax)",
+            name: "idf-k5-production",
             strategy: Strategy::Production(gather(HighestIdf, 5, Ranked)),
         },
         BenchStrategy {
-            name: "PROD unranked all (speed floor)",
+            name: "unranked-production",
             strategy: Strategy::Production(gather(Original, 10, Unranked)),
         },
         BenchStrategy {
-            name: "PROD rank_within_cap m4",
+            name: "rank-within-cap-production",
             strategy: Strategy::Production(gather(Original, 10, RankWithinCap)),
         },
     ]
@@ -289,333 +241,212 @@ async fn production_search(
     .expect("collect_text_hits")
 }
 
-fn percentile(sorted: &[u128], p: f64) -> u128 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
-    sorted[idx]
-}
-
-fn top_k_ids(hits: &[TextSearchHit], k: usize) -> HashSet<Uuid> {
-    hits.iter().take(k).map(|h| h.subject_id).collect()
-}
-
-/// Fraction of `reference` ids that also appear in `candidate` (recall of the
-/// reference set). Returns 1.0 when the reference is empty (vacuously complete).
 fn recall_of(reference: &[Uuid], candidate: &HashSet<Uuid>) -> f64 {
-    if reference.is_empty() {
-        return 1.0;
-    }
-    let found = reference.iter().filter(|id| candidate.contains(id)).count();
-    found as f64 / reference.len() as f64
+    assert_eq!(reference.len(), 10, "nonvacuous full top10 reference");
+    reference.iter().filter(|id| candidate.contains(id)).count() as f64 / reference.len() as f64
 }
 
-struct StratResult {
-    name: &'static str,
-    mean_us: f64,
-    p50_us: u128,
-    p95_us: u128,
-    recall_at_10: f64,
-    recall_pool: f64,
-    avg_returned: f64,
-    avg_terms: f64,
+struct Inputs {
+    queries: Vec<Query>,
+    reference: Vec<Vec<Uuid>>,
 }
 
-#[tokio::main]
-async fn main() {
-    let fixture = std::env::var("KHIVE_BENCH_CORPUS").unwrap_or_else(|_| {
-        format!(
-            "{}/tests/fixtures/memory_corpus_local.jsonl",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    });
-    if !std::path::Path::new(&fixture).exists() {
-        eprintln!(
-            "SKIP bench_fts_gather_real_corpus: fixture not found at {fixture}\n\
-             Extract it (read-only) with the sqlite3 command in this file's module docs."
-        );
-        return;
-    }
-
-    // ── Load corpus ──────────────────────────────────────────────────────────
-    let raw = std::fs::read_to_string(&fixture).expect("read fixture");
-    let mut docs: Vec<TextDocument> = Vec::new();
-    let mut memory_bodies: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(row) = serde_json::from_str::<CorpusRow>(line) else {
-            continue;
-        };
-        let Ok(id) = row.id.parse::<Uuid>() else {
-            continue;
-        };
-        if row.kind == "memory" {
-            memory_bodies.push(row.body.clone());
-        }
-        docs.push(TextDocument {
-            subject_id: id,
+async fn prepare(searcher: &dyn TextSearch) -> Inputs {
+    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed timestamp");
+    let documents = (0..DOCUMENTS)
+        .map(|i| TextDocument {
+            subject_id: Uuid::from_u128((u128::from(fixture::SEED) << 64) | (i as u128 + 1)),
             kind: SubstrateKind::Note,
-            record_kind: Some(row.kind.clone()),
-            title: (!row.title.is_empty()).then_some(row.title),
-            body: row.body,
+            record_kind: Some("memory".into()),
+            title: None,
+            body: fixture::body(i),
             tags: vec![],
-            namespace: NS.to_string(),
+            namespace: NS.into(),
             metadata: None,
-            updated_at: Utc::now(),
-        });
-    }
-    assert!(!docs.is_empty(), "fixture parsed to zero documents");
-
-    // ── Build a file-backed FTS index (production daemon topology) ────────────
-    let db_path =
-        std::env::temp_dir().join(format!("khive_fts_gather_bench_{}.db", std::process::id()));
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{}", db_path.display(), suffix));
-    }
-    let backend = StorageBackend::sqlite_with_volume_lock_dir(
-        &db_path,
-        db_path.parent().unwrap().join("volume-locks"),
-    )
-    .expect("open file-backed backend");
-    let searcher = backend.text("notes_local").expect("text store");
-
-    let total_docs = docs.len();
-    let build_start = Instant::now();
-    for chunk in docs.chunks(2000) {
-        searcher
-            .upsert_documents(chunk.to_vec())
-            .await
-            .expect("batch upsert");
-    }
-    let build_secs = build_start.elapsed().as_secs_f64();
-    let indexed = searcher.count(note_filter()).await.expect("count");
-
-    // ── Build the query set + per-term DFs (untimed) ──────────────────────────
-    // Deterministic stride sampling. recall_text_terms can emit tokens with
-    // internal punctuation (e.g. "a/b"); both baseline and gather FTS paths reject
-    // those equally (sanitize leaves '/' intact → bareword syntax error), so they
-    // are not part of the realistic successful-query distribution. Keep only
-    // FTS5-bareword-safe terms (alphanumeric/underscore/CJK).
-    let mut bodies_for_queries: Vec<Vec<String>> = Vec::new();
-    if !memory_bodies.is_empty() {
-        let stride = (memory_bodies.len() / (N_QUERIES * 2)).max(1);
-        let mut i = 0;
-        while i < memory_bodies.len() && bodies_for_queries.len() < N_QUERIES {
-            let terms: Vec<String> = recall_text_terms(&memory_bodies[i])
-                .into_iter()
-                .filter(|t| t.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                .collect();
-            if terms.len() >= MIN_QUERY_TERMS {
-                bodies_for_queries.push(terms);
-            }
-            i += stride;
-        }
-    }
-    assert!(
-        !bodies_for_queries.is_empty(),
-        "no queries with >= {MIN_QUERY_TERMS} terms"
+            updated_at: timestamp,
+        })
+        .collect();
+    let summary = searcher
+        .upsert_documents(documents)
+        .await
+        .expect("generated FTS corpus");
+    assert_eq!(summary.attempted, DOCUMENTS as u64);
+    assert_eq!(summary.affected, DOCUMENTS as u64);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(
+        searcher.count(note_filter()).await.expect("FTS count"),
+        DOCUMENTS as u64
     );
-
-    let mut doc_count = indexed;
-    let mut queries: Vec<Query> = Vec::with_capacity(bodies_for_queries.len());
-    for terms in bodies_for_queries {
+    let mut queries = Vec::new();
+    let mut reference = Vec::new();
+    for q in 0..QUERIES {
+        let terms = recall_text_terms(&fixture::query(q));
+        assert!(terms.len() >= 6);
         let stats = searcher
             .term_stats(TextTermStatsRequest {
                 terms: terms.clone(),
                 filter: Some(note_filter()),
             })
             .await
-            .expect("term_stats");
-        if let Some(s) = stats.first() {
-            doc_count = s.document_count;
-        }
-        let dfs: Vec<u64> = terms
+            .expect("frequencies");
+        let dfs = terms
             .iter()
-            .map(|t| {
+            .map(|term| {
                 stats
                     .iter()
-                    .find(|s| &s.term == t || &s.sanitized_term == t)
-                    .map(|s| s.document_frequency)
-                    .unwrap_or(0)
+                    .find(|s| &s.term == term || &s.sanitized_term == term)
+                    .expect("every requested term has stats")
+                    .document_frequency
             })
             .collect();
+        let baseline = ranked_search(searcher, &terms).await;
+        let ids: Vec<_> = baseline.iter().take(10).map(|h| h.subject_id).collect();
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.iter().copied().collect::<HashSet<_>>().len(), 10);
         queries.push(Query { terms, dfs });
+        reference.push(ids);
     }
-    let avg_query_terms =
-        queries.iter().map(|q| q.terms.len()).sum::<usize>() as f64 / queries.len() as f64;
-
-    let strats = strategies();
-
-    // Pre-compute pruned term lists for the RankedPruned strategies (untimed).
-    let pruned: Vec<Option<Vec<Vec<String>>>> = strats
-        .iter()
-        .map(|s| match &s.strategy {
-            Strategy::RankedPruned(sel) => {
-                Some(queries.iter().map(|q| select(*sel, q, doc_count)).collect())
-            }
-            Strategy::Production(_) => None,
-        })
-        .collect();
-
-    // ── Warmup: prime OS page cache + FTS internal state for every path ───────
-    for (si, s) in strats.iter().enumerate() {
-        for (qi, q) in queries.iter().enumerate() {
-            let _ = run_strategy(searcher.as_ref(), s, &pruned[si], qi, q).await;
-        }
-    }
-
-    // ── Reference (baseline = all terms ranked) result sets for quality ───────
-    let mut base_top10: Vec<Vec<Uuid>> = Vec::with_capacity(queries.len());
-    let mut base_pool: Vec<Vec<Uuid>> = Vec::with_capacity(queries.len());
-    for q in &queries {
-        let hits = ranked_search(searcher.as_ref(), &q.terms).await;
-        base_top10.push(hits.iter().take(10).map(|h| h.subject_id).collect());
-        base_pool.push(hits.iter().map(|h| h.subject_id).collect());
-    }
-
-    // ── Measure each strategy ──────────────────────────────────────────────────
-    let mut results: Vec<StratResult> = Vec::new();
-    for (si, s) in strats.iter().enumerate() {
-        let mut latencies: Vec<u128> = Vec::with_capacity(queries.len() * REPEATS);
-        let (mut recall10_sum, mut recall_pool_sum) = (0.0, 0.0);
-        let (mut returned_sum, mut terms_sum) = (0usize, 0usize);
-
-        for (qi, q) in queries.iter().enumerate() {
-            // Quality (deterministic): one run.
-            let res = run_strategy(searcher.as_ref(), s, &pruned[si], qi, q).await;
-            let cfg_top10 = top_k_ids(&res, 10);
-            let cfg_pool: HashSet<Uuid> = res.iter().map(|h| h.subject_id).collect();
-            recall10_sum += recall_of(&base_top10[qi], &cfg_top10);
-            recall_pool_sum += recall_of(&base_pool[qi], &cfg_pool);
-            returned_sum += res.len();
-            terms_sum += match &pruned[si] {
-                Some(p) => p[qi].len(),
-                None => q.terms.len(),
-            };
-
-            // Latency: time the gather leg over REPEATS runs.
-            for _ in 0..REPEATS {
-                let t = Instant::now();
-                let _ = run_strategy(searcher.as_ref(), s, &pruned[si], qi, q).await;
-                latencies.push(t.elapsed().as_micros());
-            }
-        }
-
-        latencies.sort_unstable();
-        let n = queries.len() as f64;
-        results.push(StratResult {
-            name: s.name,
-            mean_us: latencies.iter().sum::<u128>() as f64 / latencies.len() as f64,
-            p50_us: percentile(&latencies, 0.50),
-            p95_us: percentile(&latencies, 0.95),
-            recall_at_10: recall10_sum / n,
-            recall_pool: recall_pool_sum / n,
-            avg_returned: returned_sum as f64 / n,
-            avg_terms: terms_sum as f64 / n,
-        });
-    }
-
-    // ── Report ─────────────────────────────────────────────────────────────────
-    let baseline_mean = results[0].mean_us;
-    let report = render_report(
-        &results,
-        baseline_mean,
-        total_docs,
-        indexed,
-        queries.len(),
-        avg_query_terms,
-        build_secs,
-    );
-    println!("{report}");
-
-    let report_path = format!(
-        "{}/../../tests/khive-contract/tune/REPORT-fts-gather.md",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    match std::fs::write(&report_path, &report) {
-        Ok(()) => eprintln!("report written to {report_path}"),
-        Err(e) => eprintln!("note: could not write report to {report_path}: {e}"),
-    }
-
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{}", db_path.display(), suffix));
-    }
+    Inputs { queries, reference }
 }
 
-async fn run_strategy(
+async fn run(
     searcher: &dyn TextSearch,
-    s: &BenchStrategy,
-    pruned: &Option<Vec<Vec<String>>>,
-    qi: usize,
-    q: &Query,
+    strategy: &Strategy,
+    terms: &[String],
 ) -> Vec<TextSearchHit> {
-    match &s.strategy {
-        Strategy::RankedPruned(_) => {
-            let terms = &pruned.as_ref().expect("pruned terms present")[qi];
-            ranked_search(searcher, terms).await
-        }
-        Strategy::Production(cfg) => production_search(searcher, cfg, &q.terms).await,
+    match strategy {
+        Strategy::RankedPruned(_) => ranked_search(searcher, terms).await,
+        Strategy::Production(config) => production_search(searcher, config, terms).await,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_report(
-    results: &[StratResult],
-    baseline_mean: f64,
-    total_docs: usize,
-    indexed: u64,
-    n_queries: usize,
-    avg_terms: f64,
-    build_secs: f64,
-) -> String {
-    let mut s = String::new();
-    s.push_str("# FTS Candidate-Gather Benchmark (PR #625) — real corpus\n\n");
-    s.push_str(
-        "Latency + quality of the `memory.recall` FTS candidate-gather leg, measured on the\n\
-         real local-namespace note corpus via the production code path.\n\n",
-    );
-    s.push_str("## Setup\n\n");
-    s.push_str(&format!(
-        "- Corpus: {total_docs} local notes (FTS-indexed rows: {indexed}), file-backed SQLite + FTS5 trigram\n"
-    ));
-    s.push_str(&format!(
-        "- Index build: {build_secs:.1}s · Queries: {n_queries} (sampled from memory notes, avg {avg_terms:.1} terms, capped at 10)\n"
-    ));
-    s.push_str(&format!(
-        "- candidate_limit: {CANDIDATE_LIMIT} · repeats/query: {REPEATS}\n"
-    ));
-    s.push_str(
-        "- `recall@10` / `pool recall`: fraction of the baseline's top-10 / full candidate pool\n  \
-         that the strategy recovers (1.000 = coverage-safe). `terms` = avg query terms actually used.\n\n",
-    );
-    s.push_str("## Results\n\n");
-    s.push_str(
-        "| strategy | mean | p50 | p95 | speedup | recall@10 | pool recall | avg hits | terms |\n",
-    );
-    s.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
-    for r in results {
-        let speedup = if r.mean_us > 0.0 {
-            baseline_mean / r.mean_us
-        } else {
-            0.0
-        };
-        s.push_str(&format!(
-            "| {} | {:.2}ms | {:.2}ms | {:.2}ms | {:.2}× | {:.3} | {:.3} | {:.0} | {:.1} |\n",
-            r.name,
-            r.mean_us / 1000.0,
-            r.p50_us as f64 / 1000.0,
-            r.p95_us as f64 / 1000.0,
-            speedup,
-            r.recall_at_10,
-            r.recall_pool,
-            r.avg_returned,
-            r.avg_terms,
-        ));
+fn selected_terms(strategy: &Strategy, inputs: &Inputs) -> Vec<Vec<String>> {
+    inputs
+        .queries
+        .iter()
+        .map(|q| match strategy {
+            Strategy::RankedPruned(selector) => select(*selector, q, DOCUMENTS as u64),
+            Strategy::Production(_) => q.terms.clone(),
+        })
+        .collect()
+}
+
+async fn quality(
+    searcher: &dyn TextSearch,
+    strategy: &Strategy,
+    terms: &[Vec<String>],
+    inputs: &Inputs,
+) -> f64 {
+    let mut total = 0.0;
+    for (i, query) in terms.iter().enumerate() {
+        let hits = run(searcher, strategy, query).await;
+        assert!(!hits.is_empty() && hits.len() <= CANDIDATE_LIMIT as usize);
+        let candidate = hits.iter().take(10).map(|h| h.subject_id).collect();
+        total += recall_of(&inputs.reference[i], &candidate);
     }
-    s.push('\n');
-    s
+    total / inputs.queries.len() as f64
+}
+
+fn quality_controls(inputs: &Inputs) {
+    // A proper subset and unrelated UUIDs must not receive perfect quality.
+    // These controls use an independently captured baseline, never a candidate
+    // set as its own oracle.
+    for reference in &inputs.reference {
+        assert_eq!(
+            recall_of(reference, &reference.iter().copied().collect()),
+            1.0
+        );
+        assert_eq!(
+            recall_of(reference, &reference[..5].iter().copied().collect()),
+            0.5
+        );
+        assert_eq!(
+            recall_of(reference, &[Uuid::nil()].into_iter().collect()),
+            0.0
+        );
+    }
+}
+
+fn main() {
+    let strategies = strategies();
+    let ids: Vec<_> = strategies
+        .iter()
+        .map(|s| format!("fts_gather/synthetic-v1/{}", s.name))
+        .collect();
+    if report::list_requested(&ids.iter().map(String::as_str).collect::<Vec<_>>()) {
+        return;
+    }
+    report::assert_not_list_probe();
+    let regression = report::regression_case();
+    if let Some(case) = regression.as_deref() {
+        assert_eq!(case, "quality", "unknown regression case");
+    }
+    let mut criterion = regression.is_none().then(|| {
+        Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(100))
+            .measurement_time(Duration::from_millis(300))
+            .configure_from_args()
+    });
+    let executor = fixture::executor();
+    let mut state = None;
+    for (strategy, id) in strategies.iter().zip(&ids) {
+        let mut reported = false;
+        let mut measure = |bencher: Option<&mut criterion::Bencher<'_>>| {
+            let (database, inputs) = state.get_or_insert_with(|| {
+                executor.block_on(async {
+                    let database = fixture::Fixture::new(&[], true);
+                    let searcher = database.backend.text("notes_local").expect("FTS");
+                    let inputs = prepare(searcher.as_ref()).await;
+                    quality_controls(&inputs);
+                    (database, inputs)
+                })
+            });
+            let searcher = database.backend.text("notes_local").expect("FTS");
+            let terms = selected_terms(&strategy.strategy, inputs);
+            if !reported {
+                let overlap = executor.block_on(quality(
+                    searcher.as_ref(),
+                    &strategy.strategy,
+                    &terms,
+                    inputs,
+                ));
+                assert!((0.0..=1.0).contains(&overlap));
+                if strategy.name == "baseline" {
+                    assert_eq!(overlap, 1.0);
+                }
+                // Exactly one quality observation per selected case. Criterion owns
+                // latency estimates; recall is a dimensionless, untimed statistic.
+                report::emit(id, "recall_at_10", overlap, QUERIES);
+                reported = true;
+            }
+            if let Some(bencher) = bencher {
+                let mut next = 0;
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let query = &terms[next % terms.len()];
+                        next += 1;
+                        let start = Instant::now();
+                        let hits =
+                            executor.block_on(run(searcher.as_ref(), &strategy.strategy, query));
+                        elapsed += start.elapsed();
+                        assert!(!hits.is_empty() && hits.len() <= CANDIDATE_LIMIT as usize);
+                    }
+                    elapsed
+                });
+            }
+        };
+        if let Some(criterion) = &mut criterion {
+            criterion.bench_function(id, |b| measure(Some(b)));
+        } else {
+            measure(None);
+        }
+    }
+    if let Some((database, _)) = state {
+        executor.block_on(database.close());
+    }
+    if let Some(mut criterion) = criterion {
+        criterion.final_summary();
+    }
 }
