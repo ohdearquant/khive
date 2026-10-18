@@ -331,7 +331,10 @@ cannot close the cross-process check/write race or see earlier statements in one
 Such a trigger MUST be limited to rows and relations owned by the pack, MUST ignore unrelated
 core writes, MUST treat soft-deleted rows consistently with live-store reads, and MUST ship
 with migration, fresh-start, atomic-unit, and unrelated-write regression coverage. This does
-not authorize pack `SchemaPlan` DDL against core tables; those plans remain auxiliary-only.
+not authorize pack `SchemaPlan` DDL against core tables; those plans remain auxiliary-only
+except for ADR-017's separately named tool grant-invalidation exception (#4137). That
+exception is not inherited from V16 and grants no general permission for pack plans
+to operate on core tables.
 
 ### Versioned migration model
 
