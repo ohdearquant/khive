@@ -177,17 +177,29 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 29 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/scan/db_diagnostics/restore/schema/apply_changeset
+// KG keeps 29 public verbs and one operator-only proposal cleanup handler.
 #[test]
-fn kg_pack_exposes_29_handlers() {
+fn kg_pack_exposes_29_verbs_and_cleanup_subhandler() {
     use crate::KgPack;
-    use khive_types::Pack;
+    use khive_types::{Pack, Visibility};
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        29,
-        "kg pack must expose 29 handlers including grouped event count"
+        30,
+        "KG handler inventory must stay explicit"
     );
+    let public: Vec<_> = handlers
+        .iter()
+        .filter(|handler| handler.visibility == Visibility::Verb)
+        .collect();
+    assert_eq!(public.len(), 29, "KG must retain 29 public verbs");
+    let subhandlers: Vec<_> = handlers
+        .iter()
+        .filter(|handler| handler.visibility == Visibility::Subhandler)
+        .map(|handler| handler.name)
+        .collect();
+    assert_eq!(subhandlers, ["kg.proposal_cleanup"]);
+    assert_eq!(handlers.len(), public.len() + subhandlers.len());
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"count"), "count must be in KG_HANDLERS");
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");

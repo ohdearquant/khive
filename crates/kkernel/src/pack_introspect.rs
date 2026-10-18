@@ -636,19 +636,20 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 29 verbs (including schema): 11 base + propose/review/withdraw (3) + verbs
-        // + stats (2) + count (1, ADR-022) + context (1, ADR-089) + resolve (1)
-        // + whoami (1) + scan (1)
-        // + db_diagnostics (1, ADR-091) + stream.append/read/stat/batch (4,
-        // ADR-174 section 2 and Amendment 1: registered by kg because the
-        // entries are its notes) + apply_changeset (1, ADR-102 tier-1 landing wire)
-        assert_eq!(
-            info.verbs.len(),
-            29,
-            "kg pack must expose 29 verbs; got {}: {:?}",
-            info.verbs.len(),
-            info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
-        );
+        let public: Vec<_> = info
+            .verbs
+            .iter()
+            .filter(|verb| verb.visibility == VerbVisibility::Verb)
+            .collect();
+        assert_eq!(public.len(), 29, "kg public verb inventory: {public:?}");
+        let internal: Vec<_> = info
+            .verbs
+            .iter()
+            .filter(|verb| verb.visibility == VerbVisibility::Subhandler)
+            .collect();
+        assert_eq!(internal.len(), 1, "kg internal handlers: {internal:?}");
+        assert_eq!(internal[0].name, "kg.proposal_cleanup");
+        assert_eq!(info.verbs.len(), public.len() + internal.len());
         assert!(
             info.verbs.iter().any(|v| v.name == "db_diagnostics"),
             "kg pack must expose db_diagnostics; got {:?}",

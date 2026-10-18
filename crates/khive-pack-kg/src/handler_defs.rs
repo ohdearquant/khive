@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (29 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (30 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,20 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 29] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
+    HandlerDef {
+        name: "kg.proposal_cleanup",
+        description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Declaration,
+        params: &[ParamDef {
+            name: "older_than",
+            param_type: "string",
+            required: true,
+            description: "Positive ASCII integer immediately followed by s, m, h, or d (fixed seconds, minutes, hours, or days). No default; for example 30d.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
+    },
     HandlerDef {
         name: "apply_changeset",
         description: "Apply one bounded canonical NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
