@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("recurrence");
+    group.sampling_mode(SamplingMode::Flat);
     group.throughput(Throughput::Elements(recurrence::STEPS as u64));
     for first_after in [false, true] {
         let name = if first_after {
@@ -43,6 +44,7 @@ fn benches(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("schedule_scale");
+    group.sampling_mode(SamplingMode::Flat);
     let mut fixture = None;
     group.bench_function("agenda/1000_limit20", |b| {
         let fixture = fixture.get_or_insert_with(agenda::Fixture::new);
@@ -70,7 +72,7 @@ fn benches(c: &mut Criterion) {
 
 criterion_group! {
     name = workloads;
-    config = Criterion::default().sample_size(10).sampling_mode(SamplingMode::Flat)
+    config = Criterion::default().sample_size(10)
         .warm_up_time(Duration::from_millis(100)).measurement_time(Duration::from_secs(1));
     targets = benches
 }
