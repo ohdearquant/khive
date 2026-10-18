@@ -126,6 +126,7 @@ pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
 [[bin]]
 name = "kkernel"
 path = "src/main.rs"
+bench = false
 
 [[test]]
 name = "mount_fixture"

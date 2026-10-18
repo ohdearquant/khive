@@ -5,6 +5,7 @@ The routing benchmarks call the public `LocatorCache` and
 5665. They require no external database, embedding model, daemon, or network.
 
 ```sh
+cd crates
 cargo bench -p kkernel --benches -- --quick --noplot
 cargo bench -p kkernel --bench locator -- --list
 cargo bench -p kkernel --bench locator -- 'get_hit/100000' --quick --noplot
@@ -44,7 +45,9 @@ returned backend and resulting cache state are checked after every call. Fixture
 setup verifies all 100 or 1,000 entity identities and their exact backend counts.
 No embedding provider is configured, and in-memory storage has no queued writer.
 
-The locator uses a 24-hour TTL. Hit and purge cases fail if expected entries expire;
+The `locator` benches build their caches with a 24-hour TTL so that no entry expires
+during a run; the coordinator scenarios use the library default of 5 minutes, which
+is also the production default. Hit and purge cases fail if expected entries expire;
 insert cases fail if retained cardinality changes. The insertion stream always
 uses new keys, so it measures saturated insertion with eviction, not overwrite.
 It remains capacity bounded throughout the fixed report and Criterion iterations.
