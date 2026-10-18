@@ -2046,6 +2046,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "criterion",
  "futures",
  "khive-channel",
  "khive-pack-blob",
