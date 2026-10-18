@@ -63,6 +63,11 @@ Revision `domain-effects-v18` classifies `apply_changeset` as `Write`: it applie
 canonical change-set as one writer transaction. The wrapper also checks each constituent
 operation under its own verb and the applying caller.
 
+Revision `domain-effects-v19` classifies `code.deps`, `code.list` and `code.search` as
+`Read`: they query one registered map through its read-only rollback-mode connection.
+Name scoring and pagination tokens are computed in memory; they perform no ingest,
+schema migration, checkpoint or domain write.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -102,7 +107,10 @@ operation under its own verb and the applying caller.
 | `brain.resolve`                   | Read   | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L203)                      |
 | `brain.state`                     | Read   | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L41)                       |
 | `brain.unbind`                    | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L538)                      |
+| `code.deps`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
 | `code.ingest`                     | Write  | Verb       | [khive-pack-code/src/vocab.rs](../../../khive-pack-code/src/vocab.rs#L11)                               |
+| `code.list`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
+| `code.search`                     | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
 | `comm.cleanup_expired_quarantine` | Write  | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L523)                              |
 | `comm.cursor_commit`              | Write  | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L675)                              |
 | `comm.cursor_get`                 | Read   | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L651)                              |

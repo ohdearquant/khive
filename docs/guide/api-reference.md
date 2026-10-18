@@ -28,7 +28,7 @@ An always-machine-readable copy of this page is at
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
+| `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
@@ -60,8 +60,8 @@ one more snapshot attempt; a snapshot still failing after the bounded repairs re
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
+`code` registers the `finding` note kind and edge rules, `code.ingest` (source ingest,
+ADR-085), and `code.list`, `code.search`, `code.deps` (registered-map reads, ADR-139); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
 That admin path is history-preserving: a deterministic entity, finding-note,
@@ -1123,19 +1123,21 @@ all database files already opened by this server. The existing top-level fields 
 main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
 sidecar file size, page-level database size composition, and a WAL-pin holder census.
 
-| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                           |
-| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.   |
-| `size_composition` | boolean | `true`              | `false` skips the `dbstat` walk behind `size_composition`, which reads every page of each file. `size_composition_error` then says it was not collected, and `page_accounting` is still reported. |
+| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                                                                     |
+| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.                                             |
+| `size_composition` | boolean | `true`              | Request exact `dbstat` composition for snapshots of at most 8,192 pages and 32 MiB. Larger snapshots are skipped with an explicit `size_composition_error`. `false` skips the walk regardless of size. `page_accounting` is still reported. |
 
 All selected backends share the request's read deadline. The process that runs the request sets
 it from its own environment (`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds); for a running
 daemon that is the daemon's environment, not the caller's. When the deadline arrives, the report
 keeps the backends already inspected, every remaining entry has `diagnostics: null` and an `error`
 starting with `not inspected: request deadline`, and the top-level `complete` is `false`.
-Inspections stop a tenth of the remaining time before the deadline, at most two seconds, so the
-partial report reaches a caller whose own deadline started a little earlier. `complete` is `true`
-when every selected backend was reached. A cancelled request still fails as a whole.
+Inspections reserve a tenth of the remaining time, at most two seconds, for settling work and
+returning the partial report. This reserve does not guarantee delivery before the caller's
+deadline: blocking filesystem or SQLite work can take longer to settle. `complete` is `true`
+when every selected backend was reached; an unavailable composition section does not change
+that backend-inspection meaning. A cancelled request still fails as a whole.
 
 `databases` is an array with one entry per canonical database file (or distinct in-memory
 pool), main first. Each entry has
@@ -1332,7 +1334,19 @@ unknown sidecar identities, and OS-confirmed holders missing sidecar evidence de
 latter is a forecast: diagnostics never performs the cleanup it reports.
 
 `size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
-It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+Before starting that walk, the collector reads page accounting in an explicit read transaction
+and admits only snapshots with at most **8,192 pages AND 32 MiB**
+(`page_count * page_size_bytes`, checked for overflow). The accounting and admitted walk use
+the same snapshot; the transaction ends before subsequent sections. Above either limit,
+`size_composition` is absent and `size_composition_error` reports the observed page count,
+page size, byte size, and both limits. Unavailable or invalid page metadata also prevents the
+walk. Other diagnostic sections and available page accounting remain in the report.
+
+These limits are a footprint policy, not a latency guarantee. This collector does not provide
+exact per-object composition for stores above the limits, even when `size_composition=true`.
+The policy does not bound the separate PASSIVE checkpoint, graph integrity or holder census.
+
+For admitted snapshots, the report contains page/freelist/accounted/unaccounted byte totals plus operational class totals
 for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
 SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
 in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
@@ -3187,12 +3201,44 @@ observed `from`, requested `to`, whether the move was a fast-forward, and `recei
 | `reason`               | string  | no       | Operator note stored with the receipt.                |
 | `session_id`           | string  | no       | Session label copied to the receipt.                  |
 
-## `code` pack — 1 verb
+## `code` pack — 4 verbs
 
 Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
 set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
 `finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
 ingest (not reachable via this MCP verb surface).
+
+### `code.list`, `code.search`, `code.deps` — Assertive
+
+Read an operator-registered code map by name through the shared read-only registry.
+No verb accepts a database path. Register maps with `code_map_root` and `[[code_maps]]`
+configuration as described in [ADR-139](../adr/ADR-139-code-map-read-access.md).
+
+| Verb          | Required       | Optional                                                                                   | Result                                       |
+| ------------- | -------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `code.list`   | `map`          | `kind`, `project_id`, `cursor`, `limit` (1–500, default 100)                               | `map`, `items`, `next_cursor`                |
+| `code.search` | `map`, `query` | `kind`, `project_id`, `cursor`, `limit` (1–200, default 20)                                | `map`, `items` with `score`, `next_cursor`   |
+| `code.deps`   | `map`, `id`    | `direction` (default `both`), `max_depth` (1–10, default 2), `limit` (1–1000, default 200) | `map`, `root`, `nodes`, `edges`, `truncated` |
+
+All reads expose only live projects and module/function/datatype/interface concepts.
+List and search items contain `id`, `kind`, `name`, and nullable `project_id`; project
+rows return null, while code rows follow live containment edges to their project.
+List orders by name then id. Search uses a non-empty literal, case-insensitive name
+query: exact matches precede prefixes, then interior matches, with id breaking ties.
+Cursors bind the map registration and every filter; stale or malformed tokens fail.
+
+Dependencies follow every live local `depends_on` scope, including normal/dev/build.
+Direction accepts `incoming`, `outgoing`, or `both`. Nodes order by breadth-first
+depth then id, counting the root against the node limit. `truncated` identifies
+omitted reachable nodes within the requested depth; all dependency edges between
+returned nodes are retained. Unknown maps, missing roots and invalid bounds fail
+explicitly. Map paths never appear in responses.
+
+```text
+code.list(map="workspace", kind="project", limit=500)
+code.search(map="workspace", query="parser", limit=20)
+code.deps(map="workspace", id="<project-id>", direction="incoming", max_depth=1)
+```
 
 ### `code.ingest` — Commissive
 

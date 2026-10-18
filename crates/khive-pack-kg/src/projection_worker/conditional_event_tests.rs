@@ -24,15 +24,21 @@ fn event() -> Event {
     event
 }
 
-fn columns(sql: &str) -> String {
-    sql.split_once('(')
-        .unwrap()
-        .1
-        .split_once(')')
-        .unwrap()
-        .0
-        .split_whitespace()
-        .collect::<String>()
+fn normalized_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn unguarded_insert(sql: &str) -> String {
+    let normalized = normalized_sql(sql);
+    let insert = normalized
+        .strip_suffix(" WHERE (changes() = 1)")
+        .expect("conditional insert must end with the proposal CAS guard");
+    let (target, values) = insert
+        .split_once(" SELECT ")
+        .expect("conditional insert must select its bound values");
+    // Undo only the VALUES-to-SELECT conversion required by the guard.
+    // Keep every other token, including insert mode and conflict clauses.
+    format!("{target} VALUES ({values})")
 }
 
 #[test]
@@ -47,8 +53,11 @@ fn conditional_inserts_keep_all_shared_bindings_and_derived_rows() {
             format!("{:?}", canonical.params),
             format!("{:?}", conditional.params)
         );
-        assert_eq!(columns(&canonical.sql), columns(&conditional.sql));
-        assert!(conditional.sql.ends_with("WHERE (changes() = 1)"));
+        assert_eq!(
+            normalized_sql(&canonical.sql),
+            unguarded_insert(&conditional.sql),
+            "guarded inserts must preserve the complete canonical SQL shape"
+        );
     }
     assert_eq!(
         conditional[0].label.as_deref(),

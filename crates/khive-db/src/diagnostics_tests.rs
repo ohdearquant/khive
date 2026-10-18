@@ -1185,7 +1185,9 @@ fn database_size_composition_reports_tables_indexes_fts_and_vectors_separately()
     )
     .expect("seed size classes");
 
-    let composition = database_size_composition(&conn).expect("dbstat composition");
+    let composition = size_composition::collect(&conn, true)
+        .size_composition
+        .expect("dbstat composition");
     let class_for = |name: &str| {
         composition
             .objects
