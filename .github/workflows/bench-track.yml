@@ -11,8 +11,12 @@ name: Bench Trend Tracking
 #   - PRs run only affected Criterion components. The stable component jobs
 #     resolve as skipped when their crate/hotpath mapping has no changes, so
 #     required checks never disappear behind workflow-level path filtering.
-#   - The full four-component + e2e suite runs only after pushes to main and
-#     release tags. Criterion remains quick-profile and wall-clock bounded.
+#   - A push of a merge train (integration/train-*) runs the components that
+#     hold a benchmarked crate in the train's dependents closure, once for the
+#     whole train, and never publishes (ADR-206 Amendment 1).
+#   - The full component + e2e suite runs on the daily schedule, on
+#     dispatch and on release tags. Criterion remains quick-profile and
+#     wall-clock bounded.
 #   - A single repository variable (`BENCH_TRACK_DISABLED`) skips all bench
 #     work while leaving the PR change-detection check visible.
 
@@ -25,7 +29,10 @@ on:
   schedule:
     - cron: "41 7 * * *"
   workflow_dispatch:
+  # A merge train's integration branch runs its dependents closure once before the train merges; it
+  # records nothing (the publish steps run on main and release tags only).
   push:
+    branches: ["integration/train-*"]
     tags: ["v*"]
   # Do not path-filter the workflow itself: a required selector check must be
   # created even when every component resolves to skipped.
@@ -55,45 +62,108 @@ concurrency:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # PR component selector. Each component owns the five crates from one old
-  # shard. The explicit shared files are registered benchmark hotpaths: a
-  # change to the workspace graph, tracker/publisher, or workflow can affect
-  # every component. An unmatched PR path sets no component output, and all
-  # four component jobs skip without doing setup or bench work.
+  # PR component selector. The first four components each own the five crates
+  # from one old shard; runtime-mcp and gate-channel-code hold the crates whose
+  # benchmarks landed later, and a component job runs only the crates that
+  # have a bench target. The explicit shared files are registered benchmark
+  # hotpaths: a change to the workspace graph, tracker/publisher, or workflow
+  # can affect every component. An unmatched PR path sets no component output,
+  # and every component job skips without doing setup or bench work.
   # ─────────────────────────────────────────────────────────────────────────
   changes:
     name: Select changed benchmark components
     # Pull requests from this repository's codex/ branches skip this job, and with it every
-    # component job; the push run on main benchmarks every component after they merge.
+    # component job; the push of the merge train that carries them benchmarks their closure.
     if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
+    # The train step fetches a binary and ingests the workspace map; its own steps are bounded below it.
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     outputs:
+      # true when the component outputs below decide which components run (a pull request or a train
+      # push); every other event runs them all.
+      selective: ${{ steps.paths.outputs.selective }}
       scoring_retrieval: ${{ steps.paths.outputs.scoring_retrieval }}
       ann_query: ${{ steps.paths.outputs.ann_query }}
       storage_brain: ${{ steps.paths.outputs.storage_brain }}
       packs: ${{ steps.paths.outputs.packs }}
+      runtime_mcp: ${{ steps.paths.outputs.runtime_mcp }}
+      gate_channel_code: ${{ steps.paths.outputs.gate_channel_code }}
 
     steps:
       - uses: actions/checkout@v7
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
         with:
           fetch-depth: 0
 
+      # A train push classifies the train's whole range, from its merge base with main to its tip, the
+      # way the CI workflow's Scope step classifies a pull request (scripts/ci-test-scope.py): the path
+      # rules first, then the kkernel binary that the newest successful push run on main published. The
+      # lines from `mode=` to the end of the binary lookup are the Scope step's own (a workflow test
+      # compares them). This step always writes test_scope and never fails: every error and every
+      # timeout writes `full`.
+      - name: Scope the train
+        id: train
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-')
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          MAIN_REF: origin/main
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          test_scope=full
+          if ! base=$(git merge-base "$MAIN_REF" "$HEAD_SHA"); then
+            echo "full set: no merge base between $MAIN_REF and $HEAD_SHA"
+          else
+            echo "train range: $base..$HEAD_SHA"
+            mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            if [[ "$mode" == "map" ]]; then
+              binary=""
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
+                --jq '.workflow_runs[].id') || runs=""
+              for run_id in $runs; do
+                dir="$RUNNER_TEMP/kkernel-main-$run_id"
+                if timeout 120 gh run download "$run_id" -R "$REPOSITORY" -n kkernel-debug-linux -D "$dir" \
+                    && [[ -f "$dir/kkernel" ]]; then
+                  chmod +x "$dir/kkernel"
+                  binary="$dir/kkernel"
+                  echo "kkernel from main push run $run_id"
+                  break
+                fi
+              done
+              if [[ -z "$binary" ]]; then
+                echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
+              else
+                test_scope=$(timeout 300 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                  || test_scope=full
+              fi
+            fi
+          fi
+          if [[ -z "$test_scope" ]]; then
+            test_scope=full
+          fi
+          echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
+
       - name: Map changed paths to components
         id: paths
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRAIN_SCOPE: ${{ steps.train.outputs.test_scope }}
         run: |
           set -euo pipefail
           scoring_retrieval=false
           ann_query=false
           storage_brain=false
           packs=false
+          runtime_mcp=false
+          gate_channel_code=false
           all_components=false
 
           # Fail closed: a process-substitution `< <(git diff ...)` failure is
@@ -103,7 +173,19 @@ jobs:
           # head object trips all_components instead of silently leaving
           # every component flag false.
           diff_file="$(mktemp)"
-          if ! git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$diff_file"; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            # A train push maps the crates of its closure through the same table, as one path per crate.
+            # Every benchmarked crate's directory is its package name (a workflow test checks this).
+            if [ -z "$TRAIN_SCOPE" ] || [ "$TRAIN_SCOPE" = "full" ]; then
+              echo "train scope: full"
+              all_components=true
+            else
+              echo "train scope: $TRAIN_SCOPE"
+              for crate in $TRAIN_SCOPE; do
+                echo "crates/$crate/Cargo.toml"
+              done > "$diff_file"
+            fi
+          elif ! git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$diff_file"; then
             echo "::warning::git diff failed for $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
             all_components=true
           fi
@@ -131,6 +213,12 @@ jobs:
                 crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
                   packs=true
                   ;;
+                crates/khive-runtime/*|crates/khive-mcp/*|crates/kkernel/*)
+                  runtime_mcp=true
+                  ;;
+                crates/khive-gate/*|crates/khive-channel/*|crates/khive-pack-code/*|crates/khive-changeset/*|crates/khive-channel-email/*|crates/khive-graph-diff/*|crates/khive-wire-protocol/*)
+                  gate_channel_code=true
+                  ;;
                 crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/ledger_shards.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
                   all_components=true
                   ;;
@@ -143,13 +231,18 @@ jobs:
             ann_query=true
             storage_brain=true
             packs=true
+            runtime_mcp=true
+            gate_channel_code=true
           fi
 
           {
+            echo "selective=true"
             echo "scoring_retrieval=$scoring_retrieval"
             echo "ann_query=$ann_query"
             echo "storage_brain=$storage_brain"
             echo "packs=$packs"
+            echo "runtime_mcp=$runtime_mcp"
+            echo "gate_channel_code=$gate_channel_code"
           } >> "$GITHUB_OUTPUT"
 
   component-scoring-retrieval:
@@ -157,7 +250,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.scoring_retrieval == 'true')
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.scoring_retrieval == 'true')
     permissions:
       contents: write
       issues: write
@@ -171,7 +264,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.ann_query == 'true')
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.ann_query == 'true')
     permissions:
       contents: write
       issues: write
@@ -185,7 +278,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.storage_brain == 'true')
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.storage_brain == 'true')
     permissions:
       contents: write
       issues: write
@@ -199,7 +292,7 @@ jobs:
     needs: changes
     if: >-
       vars.BENCH_TRACK_DISABLED != 'true' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.packs == 'true')
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.packs == 'true')
     permissions:
       contents: write
       issues: write
@@ -211,6 +304,38 @@ jobs:
       # setup, bounded termination and publishing even after a phase times out.
       timeout_minutes: 40
 
+  # The crates of these two components are gaining their first benchmark targets one change at a
+  # time; until a crate has one, the component job leaves it out (bench-component.yml).
+  component-runtime-mcp:
+    name: Component benches / runtime-mcp
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.runtime_mcp == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: runtime-mcp
+      crates: khive-runtime khive-mcp kkernel
+      timeout_minutes: 40
+
+  component-gate-channel-code:
+    name: Component benches / gate-channel-code
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (needs.changes.outputs.selective != 'true' || needs.changes.outputs.gate_channel_code == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: gate-channel-code
+      crates: khive-gate khive-channel khive-pack-code khive-changeset khive-channel-email khive-graph-diff khive-wire-protocol
+      timeout_minutes: 40
+
   # ─────────────────────────────────────────────────────────────────────────
   # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
   # extractor, reused not duplicated) plus the hermetic bench-1m synthetic
@@ -220,7 +345,10 @@ jobs:
   e2e:
     name: E2E benches (pipeline + bench-1m synthetic)
     runs-on: ubuntu-latest
-    if: vars.BENCH_TRACK_DISABLED != 'true' && github.event_name != 'pull_request'
+    # A train push runs the components only; the daily run carries the e2e suite.
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' && github.event_name != 'pull_request' &&
+      !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/'))
     timeout-minutes: 20
     permissions:
       contents: write
