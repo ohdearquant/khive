@@ -1326,12 +1326,18 @@ interrupts a `COMMIT` that is already executing.
 
 ### Events daemon
 
-The main daemon already supervises a separate events daemon. `supervise_events_daemon`
+The main daemon registers `supervise_events_daemon_with_readiness` as the tracked
+`events_daemon_supervision` task (`crates/khive-mcp/src/serve/startup.rs`). The supervisor
 (`crates/khive-runtime/src/events_split/daemon.rs`) spawns the events-daemon subcommand when its socket
-is unreachable, reaps an exited child on every probe so it never accumulates a zombie, and, on
-the main daemon's own shutdown, sends SIGKILL to exactly the child it spawned (`Child::kill`) and
-reaps it; a pre-existing events daemon it did not spawn is left running untouched. The code's own reasoning for the
-unconditional kill is that durability rests on SQLite, not on the child's in-memory state.
+is unreachable and no child handle is retained, subject to its respawn interval. It polls the retained
+child before each socket probe. A successful exit poll reaps the child; a poll error retains the
+handle for a later attempt unless the OS reports `ECHILD`, which clears the handle without signalling
+its PID. The main daemon cancels its shutdown token before waiting for tracked tasks
+(`crates/khive-runtime/src/daemon/boot_guard.rs`). When the supervisor reaches its cooperative shutdown
+branch, it attempts to kill and wait for its retained child; both results are currently ignored.
+Dropping or cancelling the supervisor future does not run that cleanup. A pre-existing events daemon
+it did not spawn is left alone. The code bases its kill policy on SQLite durability rather than
+volatile child state; these paths do not guarantee reaping after permanent errors or cancellation.
 [ADR-170](ADR-170-events-daemon-split.md), which describes this split, is proposed, not accepted.
 
 Retirement must classify what the events daemon is to this process before deciding what to do
