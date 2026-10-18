@@ -1,0 +1,371 @@
+{
+ "benches": {
+  "knowledge_get/by_slug": {
+   "a": {
+    "ci_hi_ns": 91755.84527836504,
+    "ci_lo_ns": 91327.78768687707,
+    "median_ns": 91547.60699270928
+   },
+   "aa_spread": 1.0011,
+   "b": {
+    "ci_hi_ns": 91890.68010335918,
+    "ci_lo_ns": 91215.2773255814,
+    "median_ns": 91650.90580883858
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 91599.256,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_learn/concept_create": {
+   "a": {
+    "ci_hi_ns": 815268.0,
+    "ci_lo_ns": 803225.0,
+    "median_ns": 806614.8333333334
+   },
+   "aa_spread": 1.0063,
+   "b": {
+    "ci_hi_ns": 819861.6666666666,
+    "ci_lo_ns": 806789.5,
+    "median_ns": 811729.5
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 809172.167,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_list/corpus/10": {
+   "a": {
+    "ci_hi_ns": 165670.5328125,
+    "ci_lo_ns": 165119.67291666666,
+    "median_ns": 165374.85805555555
+   },
+   "aa_spread": 1.0015,
+   "b": {
+    "ci_hi_ns": 165934.8143262987,
+    "ci_lo_ns": 165446.87326388888,
+    "median_ns": 165623.3410794005
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 165499.1,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_list/corpus/100": {
+   "a": {
+    "ci_hi_ns": 223730.52777777778,
+    "ci_lo_ns": 222842.0318287037,
+    "median_ns": 223238.39562289562
+   },
+   "aa_spread": 1.001,
+   "b": {
+    "ci_hi_ns": 223645.2471264368,
+    "ci_lo_ns": 223132.20893719807,
+    "median_ns": 223469.68628747796
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 223354.041,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_search_fts/rerank_false": {
+   "a": {
+    "ci_hi_ns": 1179951.0476190476,
+    "ci_lo_ns": 1172024.0208333335,
+    "median_ns": 1175573.8942669174
+   },
+   "aa_spread": 1.0027,
+   "b": {
+    "ci_hi_ns": 1177409.165,
+    "ci_lo_ns": 1168358.4326923077,
+    "median_ns": 1172437.4347222222
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 1174005.664,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_stats/stats_query": {
+   "a": {
+    "ci_hi_ns": 216445.02911534155,
+    "ci_lo_ns": 215252.1505183413,
+    "median_ns": 215865.6499303815
+   },
+   "aa_spread": 1.0064,
+   "b": {
+    "ci_hi_ns": 214823.34736842106,
+    "ci_lo_ns": 214055.91208133972,
+    "median_ns": 214489.08881578947
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 215177.369,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_upsert_atoms/atoms/1": {
+   "a": {
+    "ci_hi_ns": 519588.75,
+    "ci_lo_ns": 512607.75,
+    "median_ns": 516772.75
+   },
+   "aa_spread": 1.0121,
+   "b": {
+    "ci_hi_ns": 516530.25,
+    "ci_lo_ns": 506530.0,
+    "median_ns": 510603.0
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 513687.875,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_upsert_atoms/atoms/10": {
+   "a": {
+    "ci_hi_ns": 2213641.5,
+    "ci_lo_ns": 2152330.375,
+    "median_ns": 2177019.125
+   },
+   "aa_spread": 1.0026,
+   "b": {
+    "ci_hi_ns": 2195758.625,
+    "ci_lo_ns": 2156345.25,
+    "median_ns": 2182637.875
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 2179828.5,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  },
+  "knowledge_upsert_atoms/atoms/50": {
+   "a": {
+    "ci_hi_ns": 7195713.625,
+    "ci_lo_ns": 7135932.875,
+    "median_ns": 7163091.5
+   },
+   "aa_spread": 1.0047,
+   "b": {
+    "ci_hi_ns": 7211626.25,
+    "ci_lo_ns": 7165698.875,
+    "median_ns": 7197080.125
+   },
+   "clock_khz_median": {
+    "a": 3547739,
+    "b": 3547400
+   },
+   "median_ns": 7180085.812,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.004258205014517697,
+     "other_busy_max": 24.2
+    },
+    "b": {
+     "band_basis": "both-core-bound",
+     "busy_frac": 0.011627906976744186,
+     "clock_band": 0.0098026723797711,
+     "other_busy_max": 22.0
+    }
+   }
+  }
+ },
+ "class": {
+  "cores": "2,3",
+  "cpu": "AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics",
+  "cpufreq": {
+   "driver": "amd-pstate-epp",
+   "epp": [
+    "performance"
+   ],
+   "governor": [
+    "performance"
+   ],
+   "max_khz": [
+    "3600000"
+   ]
+  },
+  "host": "Ubuntu-noble-latest-amd64-base.zst",
+  "kernel": "6.8.0-142-generic",
+  "mode": "reference",
+  "profile": "bench",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "window": "03:55-05:00Z"
+ },
+ "commands": {
+  "khive-pack-knowledge:knowledge_bench": {
+   "a": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-knowledge --locked --bench knowledge_bench -- --save-baseline aa-a --noplot",
+   "b": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-pack-knowledge --locked --bench knowledge_bench -- --save-baseline aa-b --noplot"
+  }
+ },
+ "crate": "khive-pack-knowledge",
+ "criterion": "the benchmark's own configuration (no time or sample-size override)",
+ "evidence": {
+  "archive": {
+   "location": "outside the repository",
+   "manifest": "MANIFEST.sha256 (sha256 of every stored file)",
+   "manifest_sha256": "69943a791885867d7bd34b92e40fcd513662b9281e1d07bb1d68f011aaeac6ca"
+  },
+  "band_bound": {
+   "basis": "both-core-bound",
+   "freq_band": 0.1,
+   "max_over_min_all_runs": 0.0189,
+   "why": "the run's sampler recorded one mean busy share for the pinned cores, so the loaded core per sample is not recoverable; the band was read on both pinned cores' readings with the idle floor dropped, a superset of any loaded-core selection"
+  },
+  "job": "bb-ref-212bf72e",
+  "reduced_from_stored_run": "verdicts applied to the run's stored files after the run's own reduction code reproduced its recorded verdicts for all 20 crates (ADR-206 Amendment 2, First references)"
+ },
+ "excluded_targets": {},
+ "load1": {
+  "end": "1.59",
+  "start": "5.65"
+ },
+ "pin_status": {
+  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3543900\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549747\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3549083\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3539321\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3548464\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3550098\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+ },
+ "reduction": {
+  "aa_spread": "max(a,b)/min(a,b)",
+  "busy": "fraction of samples with a CPU outside the pinned cores above busy_max, judged against busy_frac_max; other_busy_max is logged",
+  "busy_frac_max": 0.05,
+  "busy_max": 20.0,
+  "clock_band": "(max-min)/median of the loaded pinned core's clock per sample, readings equal to clock_floor_khz dropped",
+  "clock_floor_khz": 400000,
+  "freq_band": 0.1,
+  "noise_ceiling": 1.15,
+  "statistic": "Criterion median estimate per arm (estimates.json)"
+ },
+ "schema": "bench-reference/v1",
+ "sha": "212bf72e498de9fbbda42cc0e2902906c730e3ea",
+ "targets": [
+  "khive-pack-knowledge:knowledge_bench"
+ ]
+}
