@@ -16,6 +16,9 @@ contract-faults = []
 fault-injection = []
 test-internals = ["khive-db/test-support"]
 
+[lib]
+bench = false
+
 [dependencies]
 khive-changeset = { version = "0.14.0", path = "../khive-changeset" }
 khive-channel = { version = "0.14.0", path = "../khive-channel" }
