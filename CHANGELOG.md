@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `neighbors` now declares its `include_entity_type` parameter, so `verbs()` and `help` list
+  it. The handler already accepted it; only the declaration was missing.
+
 ## [0.14.0] - 2026-10-18
 
 ### Added

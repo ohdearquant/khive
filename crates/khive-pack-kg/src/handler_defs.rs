@@ -1133,6 +1133,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 29] = [
                 description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "include_entity_type",
+                param_type: "boolean",
+                required: false,
+                description: "If true, each hit carries entity_type when the neighbor has one. Default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     // Assertive: retrieves multi-hop traversal results
