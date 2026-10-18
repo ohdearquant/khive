@@ -1624,7 +1624,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
-                      creates a missing database file or perturbs the reported counters.",
+                      creates a missing database file or perturbs the reported counters. \
+                      code_map_vfs reports process-wide quarantine_occupancy, quarantine_cap, \
+                      registrations, and registration_cap, sampled independently under each \
+                      ledger mutex. This observe-only diagnostics block has no stability \
+                      contract and may change.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
