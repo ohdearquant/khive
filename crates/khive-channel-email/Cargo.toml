@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Email (SMTP/IMAP) channel adapter for khive (ADR-056)"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.14.0", path = "../khive-types" }
 khive-channel = { version = "0.14.0", path = "../khive-channel" }
@@ -33,9 +36,30 @@ base64 = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 khive-pack-comm = { version = "0.14.0", path = "../khive-pack-comm" }
 khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
 khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
 khive-storage = { version = "0.14.0", path = "../khive-storage" }
+
+[[bench]]
+name = "email_routes"
+harness = false
+
+[[bench]]
+name = "email_backoff"
+harness = false
+
+[[bench]]
+name = "email_screen"
+harness = false
+
+[[bench]]
+name = "email_fetch_suppression"
+harness = false
+
+[[bench]]
+name = "email_allocations"
+harness = false
