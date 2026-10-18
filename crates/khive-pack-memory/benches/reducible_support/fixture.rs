@@ -131,8 +131,12 @@ impl Fixture {
             .expect("private WAL backend"),
         );
         backend.prepare_core_schema().expect("schema");
-        assert!(backend.write_queue_active());
-        assert!(backend.pool().writer_task_handle().is_some());
+        assert!(backend.pool().write_queue_active());
+        assert!(backend
+            .pool()
+            .writer_task_handle()
+            .expect("writer runtime")
+            .is_some());
         let runtime = KhiveRuntime::from_prepared_backend(
             backend.clone(),
             RuntimeConfig {
