@@ -51,6 +51,24 @@ impl Write for LogWriter {
     }
 }
 
+/// Run `load` with WARN logs captured; return its value and the captured text.
+fn capture_warnings<T>(load: impl FnOnce() -> T) -> (T, String) {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_buffer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || LogWriter(log_buffer.clone()))
+        .finish();
+    // Keep a second dispatcher alive so concurrent tests cannot cache the
+    // rejection callsite as disabled before the capture is registered.
+    let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let value = tracing::subscriber::with_default(subscriber, load);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
+}
+
 #[test]
 fn valid_entry_registers_and_resolves_by_name() {
     let fixture = tempfile::tempdir().unwrap();
@@ -248,14 +266,22 @@ fn production_companion_identity_is_rejected() {
     create_file(&production_wal);
     std::fs::hard_link(&production_wal, &map).unwrap();
 
-    let registry = CodeMapRegistry::load(
-        Some(maps.to_str().unwrap()),
-        &[entry("map", &map, fixture.path())],
-        std::slice::from_ref(&production),
-    );
+    // The alias is a second link, so the link-count check refuses it too; the
+    // log shows that the production identity check fired first.
+    let (registry, log_text) = capture_warnings(|| {
+        CodeMapRegistry::load(
+            Some(maps.to_str().unwrap()),
+            &[entry("map", &map, fixture.path())],
+            std::slice::from_ref(&production),
+        )
+    });
 
     assert!(registry.is_empty());
     assert!(registry.resolve("map").is_err());
+    assert!(
+        log_text.contains("production database or companion"),
+        "{log_text}"
+    );
 }
 
 #[test]
@@ -276,10 +302,17 @@ fn production_events_database_identity_is_rejected() {
         ..RuntimeConfig::no_embeddings()
     };
 
-    let registry = CodeMapRegistry::load_for_runtime(&config, None);
+    // The alias is a second link, so the link-count check refuses it too; the
+    // log shows that the production identity check fired first.
+    let (registry, log_text) =
+        capture_warnings(|| CodeMapRegistry::load_for_runtime(&config, None));
 
     assert!(registry.is_empty());
     assert!(registry.resolve("map").is_err());
+    assert!(
+        log_text.contains("production database or companion"),
+        "{log_text}"
+    );
 }
 
 #[test]
@@ -669,4 +702,86 @@ fn rollback_map_with_a_stray_wal_companion_is_refused_as_wal_mode() {
         error.contains("WAL mode") && error.contains("code.ingest"),
         "{error}"
     );
+}
+
+#[test]
+fn hard_linked_map_file_is_not_registered() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    // A second link inside the root names a file outside it, and canonical
+    // containment does not resolve hard links.
+    let outside = fixture.path().join("outside.db");
+    create_queryable_map(&outside);
+    let linked = maps.join("linked.db");
+    std::fs::hard_link(&outside, &linked).unwrap();
+    let valid = maps.join("valid.db");
+    create_queryable_map(&valid);
+
+    let (registry, log_text) = capture_warnings(|| {
+        CodeMapRegistry::load(
+            Some(maps.to_str().unwrap()),
+            &[
+                entry("linked", &linked, fixture.path()),
+                entry("valid", &valid, fixture.path()),
+            ],
+            &[],
+        )
+    });
+
+    assert!(registry.resolve("linked").is_err());
+    assert!(registry.resolve("valid").is_ok());
+    assert!(log_text.contains("linked"), "{log_text}");
+    assert!(log_text.contains("exactly one link"), "{log_text}");
+}
+
+#[test]
+fn hard_link_added_after_registration_fails_the_next_read() {
+    let fixture = tempfile::tempdir().unwrap();
+    let maps = fixture.path().join("maps");
+    std::fs::create_dir(&maps).unwrap();
+    let map = maps.join("map.db");
+    create_queryable_map(&map);
+    let registry = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    assert_eq!(read_map_value(&registry).unwrap(), "registered");
+
+    let second = fixture.path().join("second-link.db");
+    std::fs::hard_link(&map, &second).unwrap();
+    let error = read_map_value(&registry).unwrap_err().to_string();
+    assert!(error.contains("\"map\""), "{error}");
+    assert!(error.contains("exactly one link"), "{error}");
+    assert!(!error.contains(&map.display().to_string()), "{error}");
+    assert!(!error.contains(&second.display().to_string()), "{error}");
+
+    std::fs::remove_file(&second).unwrap();
+    let reloaded = CodeMapRegistry::load(
+        Some(maps.to_str().unwrap()),
+        &[entry("map", &map, fixture.path())],
+        &[],
+    );
+    assert_eq!(read_map_value(&reloaded).unwrap(), "registered");
+}
+
+#[test]
+fn read_only_open_refuses_a_main_file_with_a_second_link() {
+    let fixture = tempfile::tempdir().unwrap();
+    // The guarded open refuses symlinked parent components, and the system
+    // temporary directory sits behind one on macOS (/var -> /private/var).
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let map = root.join("map.db");
+    create_queryable_map(&map);
+    let identity = super::path_identity(&map).unwrap();
+    // With one link the guarded open succeeds, so the refusal below is the
+    // link check on the descriptor SQLite reads.
+    drop(crate::StorageBackend::open_code_map_read_only(&map, identity, &[]).unwrap());
+
+    std::fs::hard_link(&map, root.join("second-link.db")).unwrap();
+    let error = crate::StorageBackend::open_code_map_read_only(&map, identity, &[])
+        .expect_err("a second link refuses the read-only open")
+        .to_string();
+    assert!(error.contains("exactly one link"), "{error}");
 }

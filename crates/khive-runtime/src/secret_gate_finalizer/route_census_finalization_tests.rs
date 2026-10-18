@@ -1,22 +1,12 @@
 //! Live inventory and the narrow opaque finalizer writer boundary.
 
-use super::super::declaration::StampCapability;
 use super::*;
-
-const FINALIZED_SITE: &str = "khive-runtime/src/secret_gate_finalizer/entity_transaction.rs::PreparedEntityExemption::into_plan";
-
-pub(super) fn is_finalized_candidate_site(site: &Site, row: &RouteInventoryEntry) -> bool {
-    site.key == FINALIZED_SITE
-        && row.id == "runtime.finalized.entity"
-        && row.target == Substrate::Entity
-        && row.stamp == StampCapability::AdmissionCapable
-        && row.transaction == TransactionOwner::RunAtomicUnit
-        && site.calls.contains("entity_insert_if_absent_statement")
-        && site.calls.contains("entity_replace_if_unchanged_statement")
-}
 
 #[test]
 fn source_census_matches_closed_route_inventory() {
+    let (acceptance_sources, acceptance_roots) = acceptance_sources::live_acceptance_sources();
+    acceptance::check_acceptance_paths(&acceptance_sources, &acceptance_roots, ROUTE_INVENTORY)
+        .unwrap_or_else(|failure| panic!("ADR-115 route acceptance failed:\n{failure}"));
     let sources = live_workspace_sources();
     check_store_trait_methods(&sources).expect("store method surface drifted");
     let sql_sources = live_workspace_sql();

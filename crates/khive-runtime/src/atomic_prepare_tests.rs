@@ -4752,3 +4752,93 @@ async fn atomic_update_null_entity_type_rejected_for_note_and_edge() {
         "expected an InvalidInput naming entity_type for an edge, got: {edge_err:?}"
     );
 }
+
+#[tokio::test]
+async fn atomic_relink_hint_matches_the_canonical_observed_update() {
+    for kind in ["document", "service"] {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let entities = runtime.entities(&token).unwrap();
+        let left = khive_storage::Entity::new("local", kind, "Relink source");
+        let right = khive_storage::Entity::new("local", kind, "Relink target");
+        let (left_id, right_id) = (left.id, right.id);
+        entities.upsert_entity(left).await.unwrap();
+        entities.upsert_entity(right).await.unwrap();
+        // The old row has an explicit value different from both defaults.
+        let initial = runtime
+            .link_observed(
+                &token,
+                left_id,
+                right_id,
+                EdgeRelation::DependsOn,
+                1.0,
+                Some(json!({"dependency_kind": "data"})),
+                false,
+            )
+            .await
+            .unwrap();
+        let plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": left_id.to_string(), "target_id": right_id.to_string(),
+                "relation": "depends_on",
+            }),
+        )
+        .await
+        .unwrap();
+        let AtomicOpPlan::Link(ref link) = plan else {
+            panic!("expected a link plan");
+        };
+        assert_eq!(
+            link.disposition(),
+            khive_storage::EdgeUpsertDisposition::Updated
+        );
+        let prepared_hint = link.dependency_kind_inference_hint().unwrap().to_owned();
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let (_, _, metadata, _) =
+            probe_edge_natural_key(&runtime, "local", left_id, right_id, "depends_on").await;
+        let atomic_metadata: Value = serde_json::from_str(metadata.as_deref().unwrap()).unwrap();
+        let canonical = runtime
+            .link_observed(
+                &token,
+                left_id,
+                right_id,
+                EdgeRelation::DependsOn,
+                1.0,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical.disposition,
+            khive_storage::EdgeUpsertDisposition::Updated
+        );
+        assert_eq!(canonical.edge.id, initial.edge.id);
+        assert_eq!(canonical.edge.metadata.as_ref(), Some(&atomic_metadata));
+        assert_eq!(
+            Some(prepared_hint),
+            crate::operations::dependency_kind_inference_hint(
+                EdgeRelation::DependsOn,
+                None,
+                canonical.edge.metadata.as_ref(),
+            )
+        );
+        assert_eq!(
+            atomic_metadata["dependency_kind"],
+            if kind == "document" {
+                "normative"
+            } else {
+                "runtime"
+            }
+        );
+        assert!(atomic_metadata.get("hint").is_none());
+    }
+}

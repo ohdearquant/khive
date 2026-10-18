@@ -1073,6 +1073,7 @@ async fn hybrid_search_each_kind_matches_per_kind_search_when_one_kind_dominates
 // ---- embed intent tests ----
 
 struct CapturingEmbeddingService {
+    dimensions: usize,
     captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
@@ -1084,7 +1085,7 @@ impl EmbeddingService for CapturingEmbeddingService {
         _model: EmbeddingModel,
     ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
         self.captured.lock().unwrap().push(texts.to_vec());
-        Ok(texts.iter().map(|_| vec![1.0]).collect())
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
     }
 
     fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -1102,6 +1103,7 @@ struct CapturingEmbedderProvider {
 }
 
 struct RewritingPassageService {
+    dimensions: usize,
     captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
@@ -1113,7 +1115,7 @@ impl EmbeddingService for RewritingPassageService {
         _model: EmbeddingModel,
     ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
         self.captured.lock().unwrap().push(texts.to_vec());
-        Ok(texts.iter().map(|_| vec![1.0]).collect())
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
     }
 
     async fn embed_passage(
@@ -1146,11 +1148,14 @@ impl EmbedderProvider for RewritingPassageProvider {
     }
 
     fn dimensions(&self) -> usize {
-        1
+        crate::config::parse_embedding_model_alias(&self.name)
+            .map(|model| model.dimensions())
+            .unwrap_or(1)
     }
 
     async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
         Ok(std::sync::Arc::new(RewritingPassageService {
+            dimensions: self.dimensions(),
             captured: std::sync::Arc::clone(&self.captured),
         }))
     }
@@ -1245,11 +1250,14 @@ impl EmbedderProvider for CapturingEmbedderProvider {
     }
 
     fn dimensions(&self) -> usize {
-        1
+        crate::config::parse_embedding_model_alias(&self.name)
+            .map(|model| model.dimensions())
+            .unwrap_or(1)
     }
 
     async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
         Ok(std::sync::Arc::new(CapturingEmbeddingService {
+            dimensions: self.dimensions(),
             captured: std::sync::Arc::clone(&self.captured),
         }))
     }
@@ -1339,6 +1347,45 @@ async fn e5_query_paths_apply_query_prefix() {
             ],
         ],
         "E5 must receive its query prefix through single and batch paths"
+    );
+}
+
+#[tokio::test]
+async fn custom_provider_query_paths_receive_raw_text_without_lattice_instructions() {
+    const CUSTOM: &str = "team-custom-query-embedder";
+    assert!(
+        crate::config::parse_embedding_model_alias(CUSTOM).is_none(),
+        "fixture precondition: {CUSTOM} must not name a built-in model"
+    );
+    assert_eq!(CUSTOM_QUERY_ROLE_MODEL.query_instruction(), None);
+    assert_eq!(CUSTOM_QUERY_ROLE_MODEL.document_instruction(), None);
+
+    let single = "single raw query";
+    let batch = vec![
+        "first raw query".to_string(),
+        "second raw query".to_string(),
+    ];
+    let runtime = KhiveRuntime::memory().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    runtime.register_embedder(CapturingEmbedderProvider {
+        name: CUSTOM.to_string(),
+        captured: std::sync::Arc::clone(&captured),
+    });
+
+    runtime
+        .embed_query_with_model(CUSTOM, single)
+        .await
+        .unwrap();
+    runtime
+        .embed_query_batch_with_model(CUSTOM, &batch)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        [vec![single.to_string()], batch],
+        "a custom provider that implements only embed must receive the original query text \
+         through single and batch paths"
     );
 }
 

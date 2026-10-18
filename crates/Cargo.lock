@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "khive-bm25"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "khive-brain-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "khive-changeset"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "khive-types",
  "proptest",
@@ -2021,10 +2021,11 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "criterion",
  "curve25519-dalek",
  "ring",
  "serde",
@@ -2037,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-email"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-imap",
  "async-native-tls",
@@ -2067,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-telegram"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2082,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2120,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2135,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2143,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -2153,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -2165,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate-rego"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "khive-gate",
  "khive-types",
@@ -2177,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "khive-graph-diff"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -2187,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "khive-hnsw"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2219,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2277,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mounts"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2297,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-agent"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2313,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-blob"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2335,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-brain"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2365,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-charter"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2379,10 +2380,11 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-code"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "inventory",
@@ -2395,6 +2397,7 @@ dependencies = [
  "libc",
  "quote",
  "regex",
+ "rusqlite",
  "same-file",
  "serde",
  "serde_json",
@@ -2408,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-comm"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2434,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-exec"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2460,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-formal"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2473,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-git"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2507,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-gtd"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2528,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-kg"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2557,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-knowledge"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2594,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-memory"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2629,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-moodboard"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2659,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-schedule"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2685,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-session"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2712,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-telemetry"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2729,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-template"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2742,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-tool"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2765,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-web"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2793,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-workspace"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2811,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "khive-quant"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "rand 0.8.7",
@@ -2820,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2830,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "khive-repo-showcase"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2848,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "khive-request"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2859,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2888,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "khive-rule-evaluator"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "khive-changeset",
@@ -2900,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2953,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2963,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2980,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "khive-text"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "rust-stemmers",
@@ -2989,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2999,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vamana"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -3024,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3052,7 +3055,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs-adapters"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "csv",
@@ -3066,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "khive-wire-protocol"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3075,7 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "kkernel"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",

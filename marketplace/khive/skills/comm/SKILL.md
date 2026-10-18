@@ -77,7 +77,8 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
 `comm.read(id="<full_id>")` to clear one or `comm.mark_read(ids=[...])` to clear up to 500 in one
-operation. `comm.read` is a compatibility mark-read name and does not retrieve content. Pass
+operation. `comm.read` marks a message read and, by default, also returns its subject, content
+and routing fields; `body=false` keeps an acknowledgement-only response. Pass
 `atomic=true` to `comm.mark_read` when the entire supplied set must change or none may change;
 otherwise inspect each best-effort result's `read`/`mark_error`. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
