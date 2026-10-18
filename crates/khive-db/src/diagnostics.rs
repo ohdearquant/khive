@@ -64,6 +64,9 @@
 mod disk_guard;
 #[path = "diagnostics/size_composition.rs"]
 mod size_composition;
+#[path = "diagnostics/writer_admission.rs"]
+mod writer_admission;
+pub use writer_admission::WriterAdmissionDiagnostics;
 #[path = "diagnostics/writer_contention.rs"]
 mod writer_contention;
 
@@ -919,6 +922,10 @@ impl ReaderContentionDiagnostics {
 /// receive `None` plus an explicit reason instead of a fabricated zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WriterContentionDiagnostics {
+    /// FIFO writer lifetime observations; reading never starts the writer.
+    pub writer_admission: Option<WriterAdmissionDiagnostics>,
+    /// Disabled, not initialized, unavailable writer, or invalid telemetry state.
+    pub writer_admission_unavailable_reason: Option<String>,
     /// Successful acquisitions across pooled, standalone, and writer-task
     /// connection classes.
     pub writer_acquisitions: u64,

@@ -14,7 +14,14 @@ impl WriterContentionDiagnostics {
             u64::try_from(pool.config().checkout_timeout.as_millis()).unwrap_or(u64::MAX);
         let unavailable_reason =
             || Some("no audit-batch control is registered with this runtime instance".to_string());
+        let (writer_admission, writer_admission_unavailable_reason) =
+            match pool.writer_admission_snapshot() {
+                Ok(snapshot) => (Some(snapshot.into()), None),
+                Err(reason) => (None, Some(reason.to_string())),
+            };
         Self {
+            writer_admission,
+            writer_admission_unavailable_reason,
             writer_acquisitions: writer.acquisitions,
             pooled_writer_acquisitions: writer.pooled_acquisitions,
             standalone_writer_acquisitions: writer.standalone_acquisitions,

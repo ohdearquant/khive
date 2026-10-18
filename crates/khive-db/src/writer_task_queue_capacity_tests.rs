@@ -11,6 +11,7 @@ async fn full_channel_applies_backpressure_not_immediate_error() {
         db: "test".to_string(),
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
+        admission_metrics: WriterAdmissionMetrics::new(),
     };
 
     // First send fills the sole channel slot. Its reply never arrives
@@ -51,6 +52,7 @@ async fn send_with_timeout_maps_full_channel_to_write_queue_full() {
         db: "test".to_string(),
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
+        admission_metrics: WriterAdmissionMetrics::new(),
     };
 
     let first = tokio::spawn({
@@ -140,6 +142,27 @@ async fn configured_enqueue_timeout_rejects_only_unaccepted_request() {
     }
     assert!(!c_ran.load(Ordering::SeqCst), "C must never run");
 
+    let top_ran = Arc::new(AtomicBool::new(false));
+    let top_ran_in_op = Arc::clone(&top_ran);
+    let top_result = handle
+        .send_top_level_bounded(move |_| {
+            top_ran_in_op.store(true, Ordering::SeqCst);
+            Ok::<_, StorageError>(())
+        })
+        .await;
+    assert!(matches!(
+        top_result,
+        Err(StorageError::WriteQueueFull { .. })
+    ));
+    assert!(!top_ran.load(Ordering::SeqCst));
+    let held = handle.admission_snapshot().unwrap();
+    assert_eq!(held.queue_depth, 1);
+    assert_eq!(held.queue_depth_high_water, 2);
+    assert_eq!(held.saturation_total, 2);
+    assert_eq!(held.admission_wait.count, 2);
+    assert_eq!(held.accepted_queue_age.count, 1);
+    assert_eq!(held.service.count, 0);
+
     // Release A; both A and B must then complete normally.
     release_tx.send(()).expect("release request A");
     tokio::time::timeout(Duration::from_secs(5), a_task)
@@ -152,6 +175,13 @@ async fn configured_enqueue_timeout_rejects_only_unaccepted_request() {
         .expect("B did not reply")
         .expect("B's reply channel must not be dropped")
         .expect("B must complete successfully");
+    let drained = handle.admission_snapshot().unwrap();
+    assert_eq!(drained.queue_depth, 0);
+    assert_eq!(drained.queue_depth_high_water, 2);
+    assert_eq!(drained.saturation_total, 2);
+    assert_eq!(drained.admission_wait.count, 2);
+    assert_eq!(drained.accepted_queue_age.count, 2);
+    assert_eq!(drained.service.count, 2);
 }
 
 // `#[serial(tx_registry)]`: this test deliberately keeps a request (and

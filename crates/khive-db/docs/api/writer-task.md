@@ -304,3 +304,61 @@ request. This check is especially important for top-level requests: because
 they intentionally skip `BEGIN IMMEDIATE`, dispatching one on a connection
 left inside an earlier failed transaction would silently join that stale
 transaction.
+
+## FIFO admission observations
+
+`db_diagnostics.writer_contention.writer_admission` describes one pool writer's
+lifetime. `admission_stage: "fifo_channel"` identifies the current admission stage.
+It does not claim per-call rotation or shared accounting across pools using the
+same database. The snapshot is memory-only and never starts a writer. An absent
+snapshot has `writer_admission_unavailable_reason`: `writer_queue_disabled`,
+`writer_not_initialized`, or `writer_unavailable`. Invalid accounting remains
+unavailable for that writer's lifetime with `telemetry_poisoned`,
+`counter_overflow`, or `telemetry_invariant_violation`; it does not change storage
+results.
+
+The fields follow [ADR-131 Decision 4](../../../../docs/adr/ADR-131-batch-write-admission-control.md)
+with the FIFO stage identified explicitly:
+
+| Field                                         | Population or boundary                                                                                                            |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `writer_admission_queue_depth`                | Offered at entry to bounded channel admission and not yet execution-started, including capacity waiters; excludes executing work. |
+| `queue_depth_high_water`                      | Highest pending depth since this accumulator started.                                                                             |
+| `writer_admission_wait_seconds`               | Entry to channel admission through accepted publication.                                                                          |
+| `writer_admission_accepted_queue_age_seconds` | Accepted publication through normal receiver dequeue, before blocking-pool scheduling.                                            |
+| `writer_admission_service_seconds`            | Execution-start at dequeue through the typed-reply attempt, including blocking-pool, volume-lease and SQLite acquisition time.    |
+| `writer_admission_saturation_total`           | Exactly one per capacity-deadline rejection, with reason `writer_queue_saturated` and stage `channel_capacity`.                   |
+| `writer_admission_active_calls`               | Null, with reason `no_call_identity`.                                                                                             |
+| `writer_admission_scheduler_wait_seconds`     | Null, with reason `no_rotation_stage`.                                                                                            |
+
+The absent rotation stage is unavailable, not a measured zero. A caller cancelled
+before acceptance releases pending membership without a latency sample. After
+acceptance, dropping the caller's reply receiver does not end the request's
+storage lifetime. A terminal queue drain releases its accepted requests without
+inventing execution or service samples. An execution-started refusal still has a
+service sample; an unexpected request drop without a reply attempt does not.
+Channel closure, caller abandonment, execution errors and writer retirement do
+not increment saturation. Existing queue-depth, slow-write and typed-error
+contracts retain their meanings.
+
+Each duration histogram contains 18 disjoint finite buckets with these inclusive
+upper bounds in seconds, followed by a separate overflow count:
+
+```text
+0.000244140625, 0.00048828125, 0.0009765625, 0.001953125,
+0.00390625, 0.0078125, 0.015625, 0.03125, 0.0625, 0.125,
+0.25, 0.5, 1, 2, 4, 8, 16, 32
+```
+
+`buckets` contains `{le_seconds, count}` entries: the first bucket includes zero,
+and each later bucket excludes the preceding upper bound. Samples above 32
+seconds increment `overflow_count`. Finite bucket counts plus overflow equal
+`count`; `sum_seconds` is the sum of measured durations. Accounting stores exact
+`Duration` values and integer counts; only JSON conversion rounds seconds.
+
+`p95_le_seconds` is the upper bound containing nearest rank `ceil(95 * count / 100)`,
+not an exact or interpolated percentile. It is null with
+`p95_le_seconds_unavailable_reason: "no_samples"` when empty, or
+`"overflow_bucket"` when that rank is above the largest finite bound. Finite
+quantiles have a null reason. No samples, identifiers or labels are retained;
+storage is fixed-size and no exporter is installed.

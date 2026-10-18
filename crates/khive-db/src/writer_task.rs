@@ -59,6 +59,9 @@ use khive_storage::error::{StorageError, WriterTaskRequestState};
 
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
+use crate::writer_admission_metrics::{
+    AdmissionObservation, Snapshot, Unavailable, WriterAdmissionMetrics,
+};
 
 #[path = "writer_task_labels.rs"]
 mod labels;
@@ -261,6 +264,7 @@ pub struct WriteRequest<R: Send + 'static> {
     checkpoint_bypass: bool,
     vacuum_copy_headroom: bool,
     telemetry: WriteTelemetry,
+    admission: Option<AdmissionObservation>,
 }
 
 mod sealed {
@@ -269,6 +273,8 @@ mod sealed {
     /// carries the drain loop's internal terminal-state reporting methods
     /// without changing the public execution-method signatures.
     pub trait Sealed {
+        fn start_execution(&mut self);
+
         fn execute_and_reply_reporting_terminal(
             self: Box<Self>,
             conn: &rusqlite::Connection,
@@ -535,7 +541,24 @@ where
     }
 }
 
+fn reply_with_admission<R>(
+    reply: oneshot::Sender<Result<R, StorageError>>,
+    mut admission: Option<AdmissionObservation>,
+    result: Result<R, StorageError>,
+) {
+    if let Some(observation) = admission.as_mut() {
+        observation.reply_attempt();
+    }
+    let _ = reply.send(result);
+}
+
 impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
+    fn start_execution(&mut self) {
+        if let Some(observation) = self.admission.as_mut() {
+            observation.start_execution();
+        }
+    }
+
     fn execute_and_reply_reporting_terminal(
         self: Box<Self>,
         conn: &Connection,
@@ -550,6 +573,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             op,
             reply,
             telemetry,
+            admission,
             ..
         } = *self;
         let profiled = execute_wrapped_transaction_profiled(
@@ -574,7 +598,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         );
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
-        let _ = reply.send(profiled.result);
+        reply_with_admission(reply, admission, profiled.result);
         profiled.terminal_state
     }
 
@@ -587,6 +611,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             op,
             reply,
             telemetry,
+            admission,
             ..
         } = *self;
         let body_started = Instant::now();
@@ -603,7 +628,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                 if let Err(error) = &outcome {
                     crate::timeout_sink::maybe_emit_sqlite_full(&telemetry_db, error);
                 }
-                let _ = reply.send(outcome);
+                reply_with_admission(reply, admission, outcome);
                 None
             }
             Ok(outcome) => {
@@ -620,7 +645,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                     ),
                     Ok(_) => writer_task_terminated(request_state),
                 };
-                let _ = reply.send(Err(error));
+                reply_with_admission(reply, admission, Err(error));
                 Some(request_state)
             }
             Err(_panic_payload) => {
@@ -628,7 +653,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                 // have autocommitted. Report the ambiguity; never invent a
                 // rollback for a request that opened no transaction.
                 let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                let _ = reply.send(Err(writer_task_terminated(request_state)));
+                reply_with_admission(reply, admission, Err(writer_task_terminated(request_state)));
                 Some(request_state)
             }
         }
@@ -641,7 +666,10 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         transaction_acquire: Duration,
     ) {
         let WriteRequest {
-            reply, telemetry, ..
+            reply,
+            telemetry,
+            admission,
+            ..
         } = *self;
         telemetry.finish(
             queue_wait,
@@ -649,13 +677,14 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             Duration::ZERO,
             Duration::ZERO,
         );
-        let _ = reply.send(Err(err));
+        reply_with_admission(reply, admission, Err(err));
     }
 }
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
-    fn execute_and_reply(self: Box<Self>, conn: &Connection) {
+    fn execute_and_reply(mut self: Box<Self>, conn: &Connection) {
         let queue_wait = self.queue_wait();
+        sealed::Sealed::start_execution(self.as_mut());
         let _ = sealed::Sealed::execute_and_reply_reporting_terminal(
             self,
             conn,
@@ -665,8 +694,9 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
         );
     }
 
-    fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
+    fn execute_and_reply_top_level(mut self: Box<Self>, conn: &Connection) {
         let queue_wait = self.queue_wait();
+        sealed::Sealed::start_execution(self.as_mut());
         let _ =
             sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn, queue_wait);
     }
@@ -791,6 +821,7 @@ pub struct WriterTaskHandle {
     /// path, clamp here rather than faking a shorter deadline against a
     /// nonexistent budget.
     enqueue_timeout: std::time::Duration,
+    admission_metrics: Arc<WriterAdmissionMetrics>,
 }
 
 impl WriterTaskHandle {
@@ -854,19 +885,25 @@ impl WriterTaskHandle {
             self.slow_write_threshold,
             labels,
         );
-        let request = WriteRequest {
+        let mut request = Box::new(WriteRequest {
             op: Box::new(op),
             reply: reply_tx,
             top_level,
             checkpoint_bypass,
             vacuum_copy_headroom,
             telemetry,
-        };
-
-        self.tx
-            .send(Box::new(request))
+            admission: None,
+        });
+        request.admission = Some(self.admission_metrics.offer());
+        let permit = self
+            .tx
+            .reserve()
             .await
             .map_err(|_| writer_task_terminated(WriterTaskRequestState::NotStarted))?;
+        if let Some(observation) = request.admission.as_mut() {
+            observation.accepted();
+        }
+        permit.send(request);
 
         Ok(reply_rx)
     }
@@ -938,6 +975,7 @@ impl WriterTaskHandle {
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
                 let timeout_ms = timeout.as_millis() as u64;
+                self.admission_metrics.record_capacity_deadline();
                 crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
                 return Err(StorageError::WriteQueueFull { timeout_ms });
             }
@@ -1045,6 +1083,7 @@ impl WriterTaskHandle {
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
                 let timeout_ms = self.enqueue_timeout.as_millis() as u64;
+                self.admission_metrics.record_capacity_deadline();
                 crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
                 return Err(StorageError::WriteQueueFull { timeout_ms });
             }
@@ -1071,6 +1110,10 @@ impl WriterTaskHandle {
     /// (`PoolConfig::write_queue_capacity`).
     pub fn capacity(&self) -> usize {
         self.tx.max_capacity()
+    }
+
+    pub(crate) fn admission_snapshot(&self) -> Result<Snapshot, Unavailable> {
+        self.admission_metrics.snapshot()
     }
 }
 
@@ -1136,6 +1179,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         enqueue_timeout: std::time::Duration::from_millis(
             pool.config().write_admission_deadline_ms,
         ),
+        admission_metrics: WriterAdmissionMetrics::new(),
     })
 }
 
@@ -1309,11 +1353,12 @@ async fn run_writer_task(
     write_admission: Arc<crate::pool::WriteAdmission>,
     busy_timeout: Duration,
 ) {
-    while let Some(request) = rx.recv().await {
+    while let Some(mut request) = rx.recv().await {
         // The bounded-channel wait ends at this exact dequeue boundary.
         // Sampling inside the blocking closure would misattribute a saturated
         // Tokio blocking pool to writer-queue contention (#1849).
         let queue_wait = request.queue_wait();
+        sealed::Sealed::start_execution(request.as_mut());
         let origin = origin.clone();
         let blocking_counters = Arc::clone(&acquisition_counters);
         let blocking_admission = Arc::clone(&write_admission);
