@@ -10,6 +10,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
