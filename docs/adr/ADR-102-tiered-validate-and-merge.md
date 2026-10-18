@@ -2,8 +2,11 @@
 
 **Status**: Accepted
 **Date**: 2026-07-08
-**Amendment**: [tier-1 landing wire](#amendment-2026-10-14-the-tier-1-landing-wire) (accepted
-2026-10-14) replaces D1's tier-1 wire with one atomic change-set verb.
+**Amendments**: [tier-1 landing wire](#amendment-2026-10-14-the-tier-1-landing-wire) (accepted
+2026-10-14) replaces D1's tier-1 wire with one atomic change-set verb;
+[limits of surgical inversion](#amendment-2026-10-13-limits-of-surgical-inversion) (accepted
+2026-10-18) narrows D4: a soft delete of an entity, an active note or an edge inverts to
+ADR-101's `restore`, which requires Tier 2, and a hard delete or a merge has no surgical inverse.
 **Amends**: [ADR-020](ADR-020-git-native-kg-implementation.md) (restores the `kg commit` CLI
 primitive to the `kkernel kg` subcommand surface; see "Amendment to ADR-020" below)
 **Depends on**: [ADR-101](ADR-101-kg-changeset-model.md) (the change-set artifact this ADR
@@ -156,11 +159,11 @@ for "undo just this one edge without touching anything else that has changed sin
 inversion is the surgical tool; git revert is the blunt one, kept available deliberately for the
 cases the surgical tool cannot reach.
 
-### Proposed amendment (2026-10-13): limits of surgical inversion
+### Amendment (2026-10-13): limits of surgical inversion
 
-**Status: Proposed; requires approval before adoption.** This amendment narrows
+**Status: Accepted 2026-10-18.** This amendment narrows
 D4's claim that every delete or merge has a representable inverse. A soft delete
-of an entity, an active note or an edge inverts to ADR-101's proposed `restore`;
+of an entity, an active note or an edge inverts to ADR-101's `restore`;
 restore inverts to a soft delete of the same record. Both are independently
 reviewed change-sets. Restore requires Tier 2; incomplete rule coverage is a
 blocking finding, not approval to land.
