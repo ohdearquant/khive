@@ -25,3 +25,7 @@ rusqlite = { workspace = true, features = ["bundled"] }
 [[bench]]
 name = "parse_bench"
 harness = false
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
