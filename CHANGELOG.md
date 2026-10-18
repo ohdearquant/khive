@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `init_weight_schema` bootstrap remains available for compatibility.
 ### Added
 
+- `db_diagnostics` reports a process-wide `code_map_vfs` block: `quarantine_occupancy`,
+  `quarantine_cap`, `registrations` and `registration_cap`, each read under its ledger's
+  lock without retiring entries. The block is observe-only and has no stability contract.
+  `DbDiagnostics` gains the public `code_map_vfs` field, so code that builds the struct
+  with a literal must add it.
 - `NoteStore::try_patch_note_properties` applies guarded partial property writes,
   forward-only expiry and a monotonic update timestamp in one storage operation.
   Its provided default returns `Unsupported`; existing implementations remain
