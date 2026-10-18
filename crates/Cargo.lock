@@ -2183,6 +2183,7 @@ dependencies = [
 name = "khive-graph-diff"
 version = "0.14.0"
 dependencies = [
+ "criterion",
  "khive-types",
  "serde",
  "serde_json",
