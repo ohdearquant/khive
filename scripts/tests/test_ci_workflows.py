@@ -3004,14 +3004,18 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
         self.assertEqual(verdict, "docs_only=false", log)
 
-    def gh_listing(self, run_sha, shard_conclusion):
-        return (
-            'case "$2" in\n'
-            '  */workflows/ci.yml/runs*) echo "101 ' + run_sha + '" ;;\n'
-            '  */runs/101/jobs*) [ "' + shard_conclusion + '" = success ] && echo 1 || echo 0 ;;\n'
-            '  *) exit 1 ;;\n'
-            'esac\n'
-        )
+    def gh_listing(self, run_sha, shard_conclusion, conclusion="success", record="test-scope-full"):
+        return self.gh_runs((101, run_sha, conclusion, shard_conclusion, record))
+
+    def gh_runs(self, *runs):
+        """A fake gh answering the tested-base lookup: each run is (id, head sha, run conclusion, Linux shard 1
+        conclusion, recorded scope artifact name or None), newest first, after the step's own jq."""
+        listing = "\\n".join(f"{run_id} {sha} {conclusion}" for run_id, sha, conclusion, _, _ in runs)
+        cases = [f'  */workflows/ci.yml/runs*) printf "{listing}\\n" ;;\n']
+        for run_id, _, _, shard, record in runs:
+            cases.append(f'  */runs/{run_id}/jobs*) echo {1 if shard == "success" else 0} ;;\n')
+            cases.append(f'  */runs/{run_id}/artifacts*) echo {1 if record == "test-scope-full" else 0} ;;\n')
+        return 'case "$2" in\n' + "".join(cases) + '  *) exit 1 ;;\nesac\n'
 
     def test_job_main_push_compares_with_the_newest_fully_tested_main_commit(self):
         self.write("src/lib.rs", "pub fn untested() {}\n")
@@ -3105,6 +3109,66 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         condition = re.search(r"(?m)^        if: (.+)$", checkout).group(1)
         self.assertIn("startsWith(github.ref, 'refs/heads/integration/')", condition)
         self.assertIn("github.ref == 'refs/heads/main'", condition)
+
+    def test_job_tested_base_skips_a_failed_run_an_unrecorded_run_and_a_scoped_run(self):
+        # ADR-205 Amendment 1, verify-by 1: the newest candidate is unusable, an older one is the base. If the
+        # newest were used, only Markdown would follow it and the push would take the documentation lane.
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for label, newest in (("run concluded with a failure", (102, untested, "failure", "success", "test-scope-full")),
+                              ("scope recorded as scoped", (102, untested, "success", "success", "test-scope-scoped")),
+                              ("no scope record", (102, untested, "success", "success", None)),
+                              ("shard 1 failed", (102, untested, "success", "failure", "test-scope-full"))):
+            for ref in ("refs/heads/integration/train-1", "refs/heads/main"):
+                with self.subTest(label=label, ref=ref):
+                    gh = self.gh_runs(newest, (101, self.base, "success", "success", "test-scope-full"))
+                    verdict, log = self.classify_job("push", head, ref=ref, gh_script=gh)
+                    self.assertEqual(verdict, "docs_only=false", log)
+                    self.assertEqual(self.outputs.get("base"), self.base, log)
+        # control: the same newest candidate, usable, is the base
+        gh = self.gh_runs((102, untested, "success", "success", "test-scope-full"),
+                          (101, self.base, "success", "success", "test-scope-full"))
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1", gh_script=gh)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+
+    def record_step(self, event_name, docs_only, test_scope):
+        """Runs the Record step and returns (recorded, the record file's text)."""
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        step = job.split("- name: Record the test scope\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("if: github.event_name != 'pull_request'", step)
+        script = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n").group(1))
+        temp = pathlib.Path(self.temp.name) / f"record-{docs_only}-{test_scope}"
+        temp.mkdir()
+        output = temp / "output"
+        output.write_text("")
+        env = {**self.env, "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output), "DOCS_ONLY": docs_only}
+        if test_scope is not None:
+            env["TEST_SCOPE"] = test_scope
+        subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, timeout=30)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0].split("=", 1)[1], (temp / "test-scope" / "test_scope").read_text()
+
+    def test_record_step_names_the_scope_the_suites_ran(self):
+        for docs_only, test_scope, recorded, text in (("false", "full", "full", "full\n"),
+                                                      ("false", "", "full", "full\n"),
+                                                      ("false", None, "full", "full\n"),
+                                                      ("false", "j k", "scoped", "j k\n"),
+                                                      ("true", None, "docs", "docs\n"),
+                                                      ("true", "", "docs", "docs\n")):
+            with self.subTest(docs_only=docs_only, test_scope=test_scope):
+                self.assertEqual(self.record_step("push", docs_only, test_scope), (recorded, text))
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        upload = job.split("- name: Upload the test scope record\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("name: test-scope-${{ steps.record.outputs.recorded }}", upload)
+        self.assertIn("if: github.event_name != 'pull_request'", upload)
+        self.assertIn("continue-on-error: true", upload)
+        # the lookup reads exactly the name a full run records
+        classify = job.split("- name: Classify\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn('select(.name == "test-scope-full")', classify)
 
     def test_job_integration_push_without_a_full_run_runs_the_full_suite(self):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")

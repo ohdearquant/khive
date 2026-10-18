@@ -109,10 +109,10 @@ jobs:
   # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
   # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
   # ref with its base parent. Pushes to main and to integration branches compare with the newest main
-  # commit whose CI run completed with the Linux test shard green, so a documentation commit that replaces
-  # a waiting run cannot carry an untested code commit past main CI, and a train whose members change
-  # only Markdown skips the suites main already passed. Every other event, and any failed lookup, runs
-  # the full suite.
+  # commit whose CI run concluded successfully, passed the Linux test shard and recorded a full-suite scope
+  # (the Record step), so a documentation commit that replaces a waiting run cannot carry an untested code
+  # commit past main CI, and a train whose members change only Markdown skips the suites main already
+  # passed. Every other event, and any failed lookup, runs the full suite.
   #
   # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
   # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
@@ -171,13 +171,21 @@ jobs:
             fi
             if [[ "$history" == "true" ]]; then
               runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
-                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha) \(.conclusion)"') || runs=""
             fi
-            while read -r run_id run_sha; do
+            # A tested base is a run that concluded successfully as a whole, passed Linux shard 1, recorded
+            # that it ran the full suite (the test-scope-full artifact the Record step below uploads), and
+            # is an ancestor of this head (ADR-205 D3a, Amendment 1). A run without the record is skipped.
+            while read -r run_id run_sha conclusion; do
               [[ -n "$run_id" ]] || continue
+              [[ "$conclusion" == "success" ]] || continue
               shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
                 --jq '[.jobs[] | select(.name == "CI (ubuntu-latest, shard 1/2)" and .conclusion == "success")] | length') || shard=0
-              if [[ "$shard" -ge 1 ]] && git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
+              [[ "$shard" -ge 1 ]] || continue
+              recorded=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+                --jq '[.artifacts[] | select(.name == "test-scope-full")] | length') || recorded=0
+              [[ "$recorded" -ge 1 ]] || continue
+              if git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
                 base=$run_sha
                 break
               fi
@@ -255,6 +263,44 @@ jobs:
             test_scope=full
           fi
           echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
+      # ADR-205 D3a: every run other than a pull request's records the scope its suites ran, and the
+      # tested-base lookup in the Classify step reads that record. The artifact's name carries the value
+      # (test-scope-full, test-scope-scoped or test-scope-docs), so a reader lists names and never
+      # downloads. The value follows the expression the test jobs use (an empty scope runs the full
+      # suite). A failed upload leaves the run without a record, so the lookup skips it rather than
+      # turning the run red.
+      - name: Record the test scope
+        id: record
+        if: github.event_name != 'pull_request'
+        env:
+          DOCS_ONLY: ${{ steps.classify.outputs.docs_only }}
+          TEST_SCOPE: ${{ steps.scope.outputs.test_scope }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${DOCS_ONLY:-}" == "true" ]]; then
+            recorded=docs
+          elif [[ "${TEST_SCOPE:-full}" == "full" ]]; then
+            recorded=full
+          else
+            recorded=scoped
+          fi
+          mkdir -p "$RUNNER_TEMP/test-scope"
+          if [[ "$recorded" == "docs" ]]; then
+            echo docs > "$RUNNER_TEMP/test-scope/test_scope"
+          else
+            printf '%s\n' "${TEST_SCOPE:-full}" > "$RUNNER_TEMP/test-scope/test_scope"
+          fi
+          echo "recorded=$recorded" | tee -a "$GITHUB_OUTPUT"
+      - name: Upload the test scope record
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-scope-${{ steps.record.outputs.recorded }}
+          path: ${{ runner.temp }}/test-scope/test_scope
+          retention-days: 90
+          if-no-files-found: error
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
