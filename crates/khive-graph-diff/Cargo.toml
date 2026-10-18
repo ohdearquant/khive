@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Pure deterministic graph-state diffs over entity, edge, and note NDJSON"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.13.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
