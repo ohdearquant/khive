@@ -30,3 +30,12 @@ full = ["unicode", "stem"]
 [[bench]]
 name = "text_bench"
 harness = false
+
+[[bench]]
+name = "text_additional"
+harness = false
+
+[[bench]]
+name = "text_unicode"
+harness = false
+required-features = ["unicode"]
