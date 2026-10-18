@@ -3187,6 +3187,49 @@ class TestScopeClassifierTests(ScopeFixture):
         self.assertEqual(verdict, "full", reasons)
         self.assertIn("include scan: cannot resolve 1 include(s) in code: crates/j/src/bad.rs:1", reasons)
 
+    def test_a_path_attribute_inside_an_inline_module_resolves_below_the_module_directory(self):
+        # rustc resolves these below the inline module's directory: from the file's directory for a crate root
+        # (tests/inline.rs), from a directory named after the file otherwise (src/deep.rs). Both name a file of m.
+        self.write("crates/m/src/inl.rs", "pub fn i() {}\n")
+        self.write("crates/m/src/deep.rs", "pub fn d() {}\n")
+        self.write("crates/j/tests/inline.rs", "mod inner {\n    #[path = \"../../../m/src/inl.rs\"]\n    mod x;\n}\n")
+        self.write("crates/j/src/deep.rs", "mod inner {\n    #[path = \"../../../../m/src/deep.rs\"]\n    mod x;\n}\n")
+        # an inline module that carries its own path attribute contributes that path as its directory: only the
+        # two-level "a/b" reaches m, the one-level module name does not
+        self.write("crates/m/src/esc.rs", "pub fn e() {}\n")
+        self.write("crates/j/tests/over.rs",
+                   "#[path = \"a/b\"]\nmod thread {\n    #[path = \"../../../../m/src/esc.rs\"]\n    mod local;\n}\n")
+        base = self.commit("inline module readers")
+        for path, reader in (("crates/m/src/inl.rs", "j (crates/j/tests/inline.rs:2)"),
+                             ("crates/m/src/deep.rs", "j (crates/j/src/deep.rs:2)"),
+                             ("crates/m/src/esc.rs", "j (crates/j/tests/over.rs:3)")):
+            with self.subTest(path=path):
+                self.git("checkout", "-q", "--detach", base)
+                self.write(path, "pub fn changed() {}\n")
+                verdict, reasons = self.scope(base, self.commit("change " + path), "--paths-only")
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+
+    def test_a_path_attribute_nested_in_cfg_attr_at_any_depth_is_a_site(self):
+        self.write("crates/m/src/nested.rs", "pub fn n() {}\n")
+        self.write("crates/j/src/nested.rs",
+                   "#[cfg_attr(all(), cfg_attr(not(any()), path = \"../../m/src/nested.rs\"))]\nmod y;\n")
+        base = self.commit("nested cfg_attr reader")
+        self.write("crates/m/src/nested.rs", "pub fn changed() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change nested"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/m/src/nested.rs is compiled or read by another crate: j (crates/j/src/nested.rs:1)", reasons)
+
+    def test_an_include_path_with_a_line_break_runs_the_full_suite_and_is_never_printed(self):
+        # a raw string can hold a newline; printed as is, the text after it would start a new job-log line
+        self.write("crates/j/src/broken.rs", "pub const B: &str = include_str!(r\"../../m/src/x\n::error::injected\");\n")
+        base = self.commit("include with a line break")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/j/src/broken.rs:1 (a path with a line break)", reasons)
+        self.assertFalse([line for line in reasons.splitlines() if line.startswith("::")], reasons)
+
     def test_an_include_scan_that_finds_nothing_runs_the_full_suite(self):
         for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
                      "crates/j/src/multi.rs", "crates/j/src/raw.rs", "crates/j/tests/env.rs", "crates/j/src/prefix.rs"):

@@ -28,13 +28,17 @@ scripts/ci-docs-only.sh: a Markdown file that a non-Markdown file names, that a 
 names, or whose verb and pack counts the smoke tests check, puts the run on the full suite.
 
 A crate can compile or read another crate's file by naming it: `#[path = "..."]` on a module (also
-inside `cfg_attr`), or `include!`, `include_str!` or `include_bytes!`. No dependency edge records that,
+inside `cfg_attr`, at any nesting depth), or `include!`, `include_str!` or `include_bytes!`. No dependency edge records that,
 so the closure cannot reach the reader. The scan reads every Rust file under crates/ that names one of
 them, skips comments and string and character literals, and resolves each argument in code: a plain or
 raw string literal on any line after the opener, `concat!` of literals, and `concat!` led by
 `env!("CARGO_MANIFEST_DIR")`, which resolves against the reader's manifest directory. A literal followed
 by a part computed at compile time (a macro argument) names every path that starts with it. Other paths
-resolve against the directory of the file that holds them. A changed path that a reader in another crate
+resolve against the directory of the file that holds them, except a `#[path]` inside an inline `mod name { }`
+block: rustc resolves that one below the inline modules' directories, starting at the file's directory for a
+mod-rs file (a crate root or `mod.rs`) and at a directory named after the file otherwise. The scan does not
+decide which kind of file it read, so it names both, and an inline module that carries a `#[path]` of its own
+contributes both its name and that path as the directory. A changed path that a reader in another crate
 names this way puts the run on the full suite. An argument in code the scan cannot resolve also does,
 and so does finding no site at all: a broken scan is not a clean one. The scan prints how many sites it
 read and how many it could not.
@@ -287,16 +291,44 @@ def include_argument(text, i):
 
 
 def include_sites(text):
-    """[(line, base, path, complete)] for every include macro and path attribute in code, skipping comments, string
-    and character literals; an argument the scan cannot resolve is returned as (line, None, reason, False)."""
+    """[(line, base, path, complete, inline)] for every include macro and path attribute in code, skipping comments,
+    string and character literals; an argument the scan cannot resolve is returned as (line, None, reason, False, ()).
+    inline is empty except for a path attribute inside inline module blocks: one tuple per enclosing block, outermost
+    first, holding the directory names that block can contribute (its name, and the value of any path attribute it
+    carries)."""
     sites, i = [], 0
-    def site(start, at):
+    depth, inline, recent = 0, [], []  # brace depth in code; open inline modules (depth, names); path values since an item boundary
+    def site(start, at, attribute=False):
         line = text.count("\n", 0, start) + 1
         try:
             base, path, complete, _ = include_argument(text, skip_trivia(text, at))
-            sites.append((line, base, path, complete))
         except Unreadable as reason:
-            sites.append((line, None, str(reason), False))
+            sites.append((line, None, str(reason), False, ()))
+            return
+        sites.append((line, base, path, complete, tuple(names for _, names in inline) if attribute else ()))
+        if attribute:
+            recent.append(path)
+    def cfg_attr_paths(start, open_at):
+        """The path attributes among cfg_attr(<predicate>, <attr>, ...) whose "(" is at open_at, at any nesting."""
+        level, p = 0, open_at + 1
+        while p < len(text) and not (level == 0 and text[p] == ")"):
+            literal = string_at(text, p) if text[p] in '"rbc' else None
+            if literal is not None:
+                p = literal[1]
+                continue
+            if text[p] in "([{":
+                level += 1
+            elif text[p] in ")]}":
+                level -= 1
+            elif text[p] == "," and level == 0:
+                q = skip_trivia(text, p + 1)
+                name, after_name = word_at(text, q)
+                r = skip_trivia(text, after_name)
+                if name == "path" and text.startswith("=", r):
+                    site(start, r + 1, attribute=True)
+                elif name == "cfg_attr" and text.startswith("(", r):
+                    cfg_attr_paths(start, r)
+            p += 1
     while i < len(text):
         ch = text[i]
         if text.startswith("//", i) or text.startswith("/*", i):
@@ -317,6 +349,11 @@ def include_sites(text):
                     m = skip_trivia(text, k + 1)
                     if m < len(text) and text[m] in "([{":
                         site(i, m + 1)
+            elif word == "mod":
+                name, after = word_at(text, skip_trivia(text, j))
+                if name and text.startswith("{", skip_trivia(text, after)):
+                    # the block opens at the next "{", which the brace count below enters
+                    inline.append((depth + 1, (name, *recent)))
             i = j if j > i else i + 1  # every step consumes input, so no edit here can hang the scan
         elif ch == "'":
             if text.startswith("\\", i + 1):
@@ -335,29 +372,21 @@ def include_sites(text):
                 word, after = word_at(text, k)
                 m = skip_trivia(text, after)
                 if word == "path" and text.startswith("=", m):
-                    site(i, m + 1)
+                    site(i, m + 1, attribute=True)
                 elif word == "cfg_attr" and text.startswith("(", m):
-                    # cfg_attr(<predicate>, <attr>, ...): a `path = ` among the attributes after the predicate.
-                    depth, p, segment = 0, m + 1, 0
-                    while p < len(text) and not (depth == 0 and text[p] == ")"):
-                        literal = string_at(text, p) if text[p] in '"rbc' else None
-                        if literal is not None:
-                            p = literal[1]
-                            continue
-                        if text[p] in "([{":
-                            depth += 1
-                        elif text[p] in ")]}":
-                            depth -= 1
-                        elif text[p] == "," and depth == 0:
-                            segment += 1
-                            q = skip_trivia(text, p + 1)
-                            name, after_name = word_at(text, q)
-                            r = skip_trivia(text, after_name)
-                            if segment >= 1 and name == "path" and text.startswith("=", r):
-                                site(i, r + 1)
-                        p += 1
+                    cfg_attr_paths(i, m)
             i = j if j > i else i + 1
         else:
+            if ch == "{":
+                depth += 1
+                recent.clear()
+            elif ch == "}":
+                if inline and inline[-1][0] == depth:
+                    inline.pop()
+                depth -= 1
+                recent.clear()
+            elif ch == ";":
+                recent.clear()
             i += 1
     return sites
 
@@ -415,10 +444,13 @@ def foreign_includes(head, manifests):
     sites, unreadable, named = 0, [], []
     for path, text in read_blobs(head, files).items():
         reader = owner_of(path, head, manifests)
-        for line, base, literal, complete in include_sites(text):
+        for line, base, literal, complete, inline in include_sites(text):
             sites += 1
             if base is None:
                 unreadable.append(f"{path}:{line} ({literal})")
+                continue
+            if any(c in literal for c in "\n\r"):
+                unreadable.append(f"{path}:{line} (a path with a line break)")
                 continue
             if base == MANIFEST_DIR:
                 if reader is None:
@@ -429,13 +461,20 @@ def foreign_includes(head, manifests):
                 if root is None:
                     unreadable.append(f"{path}:{line} (no manifest directory for {reader})")
                     continue
-                joined = root + "/" + literal.lstrip("/")
+                joined = [root + "/" + literal.lstrip("/")]
+            elif inline:
+                # mod-rs file: inline directories start at the file's directory; any other file: at <dir>/<stem>
+                starts = [os.path.dirname(path), os.path.splitext(path)[0]]
+                for names in inline:
+                    starts = [os.path.join(start, name) for start in starts for name in names]
+                joined = [os.path.join(start, literal) for start in starts]
             else:
-                joined = os.path.join(os.path.dirname(path), literal)
-            target = os.path.normpath(joined) + ("/" if not complete and joined.endswith("/") else "")
-            if target.startswith("../") or not target.startswith(CRATES):
-                continue
-            named.append((target, not complete, reader, f"{path}:{line}"))
+                joined = [os.path.join(os.path.dirname(path), literal)]
+            for candidate in dict.fromkeys(joined):
+                target = os.path.normpath(candidate) + ("/" if not complete and candidate.endswith("/") else "")
+                if target.startswith("../") or not target.startswith(CRATES):
+                    continue
+                named.append((target, not complete, reader, f"{path}:{line}"))
     if sites == 0:
         raise Full(f"include scan: BROKEN, no #[path] or include! site found under crates/ at {head}")
     # Population print: targets whose directory another crate owns. A prefix is printed by the owner of its directory;
