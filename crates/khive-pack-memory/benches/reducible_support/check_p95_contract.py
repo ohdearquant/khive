@@ -158,9 +158,31 @@ def check_lifecycle(binary):
         check_case_witnesses(result, [(case, code)])
 
 
+def check_caller_argv(binary):
+    for real in (False, True):
+        environment = dict(os.environ)
+        environment["KHIVE_BENCH_REAL_MODEL"] = "1" if real else "0"
+        cohort = "real-model" if real else "synthetic-v1"
+        expected = {"p95_gate/" + cohort + "/" + case for case in ("m1", "m3", "m4-informational")}
+        # bench-component.yml:98 supplies these flags; listing avoids measurement.
+        listed = probe(binary, ["--list", "--quick", "--noplot"], environment, 5)
+        require_no_measurement(listed)
+        if parse_list(listed.stdout) != expected:
+            raise ValueError("quick arguments change the listing")
+        # bench-component.yml:98 flags must also preserve explicit smoke mode.
+        smoke = probe(binary, ["--test", "--quick", "--noplot"], environment, 15)
+        check_case_witnesses(smoke, CASES, smoke=True)
+        # box_bench.py:423,506 supplies list and baseline arguments.
+        listed = probe(binary, ["--list", "--save-baseline", "aa-x", "--noplot"], environment, 5)
+        require_no_measurement(listed)
+        if parse_list(listed.stdout) != expected:
+            raise ValueError("baseline arguments change the listing")
+
+
 def check(binary, measure=False):
     check_smoke(binary)
     check_argument_refusals(binary)
+    check_caller_argv(binary)
     for real in (False, True):
         environment = dict(os.environ)
         environment["KHIVE_BENCH_REAL_MODEL"] = "1" if real else "0"

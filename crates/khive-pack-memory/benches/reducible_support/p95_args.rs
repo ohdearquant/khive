@@ -12,7 +12,7 @@ pub(super) enum Mode {
 pub(super) fn refuse(message: &str) -> ! {
     eprintln!(
         "{message}\nAccepted: --list, --test, --bench, --regression-case=name, \
-         --noplot, --save-baseline NAME"
+         --quick, --noplot, --save-baseline NAME"
     );
     std::process::exit(2);
 }
@@ -28,7 +28,7 @@ pub(super) fn parse(args: &[String]) -> Result<Mode, String> {
             "--list" => list = true,
             "--test" => test = true,
             "--bench" => bench = true,
-            "--noplot" => {}
+            "--noplot" | "--quick" => {}
             "--save-baseline" => {
                 let value = args.next().ok_or("--save-baseline requires NAME")?;
                 validate_baseline(value)?;
