@@ -25,3 +25,12 @@ curve25519-dalek = { version = "=4.1.3", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "channel_lifecycle"
+harness = false
+
+[[bench]]
+name = "channel_allocations"
+harness = false
