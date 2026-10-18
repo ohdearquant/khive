@@ -7,16 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `db_diagnostics` reports a process-wide `code_map_vfs` block: `quarantine_occupancy`,
-  `quarantine_cap`, `registrations` and `registration_cap`, each read under its ledger's
-  lock without retiring entries. The block is observe-only and has no stability contract.
-
-### Breaking (Rust crates)
-
-- `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
-
 ## [0.14.0] - 2026-10-18
 
 ### Added
