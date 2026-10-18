@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivered opt-out already did. No other quarantine reason records an opt-out, and ingest
   refuses one claimed on them.
 
+- `neighbors` now declares its `include_entity_type` parameter, so `verbs()` and `help` list
+  it. The handler already accepted it; only the declaration was missing.
+
 ## [0.13.0] - 2026-10-15
 
 ### Documentation

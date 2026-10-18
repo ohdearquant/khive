@@ -2053,6 +2053,14 @@ class DocsFormatPhaseTests(unittest.TestCase):
         self.assertTrue(callable(getattr(HarnessEnvironmentTests,
                                          "test_no_new_hand_typed_copy_of_the_shipping_pack_set", None)))
 
+    def test_content_sweeps_phase_runs_the_guide_table_checks(self):
+        # The directory-map comparison needs only the tree, so it runs in the lane every change runs.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('python3 "$SCRIPT_DIR/../tests/test_documented_guide_tables.py"', body)
+        tests = (REPO_ROOT / "tests" / "test_documented_guide_tables.py").read_text()
+        self.assertIn("def test_repository_directory_map_matches_the_tree(", tests)
+
     def test_docs_fmt_refuses_when_deno_is_absent(self):
         # The absence arm decides whether this gate can be emptied in silence: a
         # skip would exit 0 and check nothing. The stub arm runs the identical
