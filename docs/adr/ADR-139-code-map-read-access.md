@@ -270,6 +270,8 @@ The generic code subtype filters read the shared production database, while `cod
 
 **Consequences.** An operator who keeps a hard-linked copy of a map (for example a snapshot made with hard links) has to copy the file instead; the entry is refused until the extra link is removed. The link count is read from the same opened descriptor whose identity registration already records: `st_nlink` on Unix, the handle's link count on Windows.
 
+**Ordering.** The gap was found while reviewing #5612, and that review advised landing this check before the first verbs that read a registered map. Those verbs (`code.list`, `code.search` and `code.deps`, #5635) landed first by the maintainer's decision on 2026-10-18: the exposure needs an operator-writable `code_map_root` and a hard link to a non-production file on the same volume, and the consumer data plane is unchanged. In exchange, the implementation of this amendment merges before the 0.14.0 version bump, so no release ships the read verbs without it.
+
 **Acceptance (added to "Registered map lifecycle").**
 
 | Case                         | Required behaviour                                                                                                                      |
