@@ -2,7 +2,8 @@
 """Check p95_gate listing/output independently of performance or model inference.
 
 Pass an already-built p95_gate executable. --measure additionally runs its actual
-cohort with a 300-second watchdog; contract probes alone never load a model.
+cohort with a 300-second watchdog. Smoke, argument, lifecycle and report probes
+exercise model-free paths, including with a real-model selector.
 """
 import argparse
 import json
@@ -49,7 +50,7 @@ def parse_reports(text, expected):
     return rows
 
 
-def invoke(binary, args, environment, timeout):
+def probe(binary, args, environment, timeout, expected_code=0):
     result = subprocess.run(
         [str(binary)] + args,
         env=environment,
@@ -58,12 +59,108 @@ def invoke(binary, args, environment, timeout):
         timeout=timeout,
         check=False,
     )
-    if result.returncode:
-        raise ValueError("benchmark probe failed: " + result.stderr + result.stdout)
-    return result.stdout
+    if result.returncode != expected_code:
+        raise ValueError(
+            f"benchmark probe {args!r} exited {result.returncode}, expected {expected_code}: "
+            + result.stderr + result.stdout
+        )
+    return result
+
+
+def invoke(binary, args, environment, timeout):
+    return probe(binary, args, environment, timeout).stdout
+
+
+CASES = (
+    ("held-rebuild", 0),
+    ("held-build", 0),
+    ("chained-handoff", 0),
+    ("timeout-gating-row", 2),
+    ("timeout-informational-row", 0),
+    ("unrelated-task", 0),
+    ("failed-task-completion", 0),
+    ("clean-row", 0),
+    ("unmeasurable-gating-row", 2),
+)
+SMOKE_COMPLETE = "p95 smoke: 9 cases passed"
+CASE_PREFIX = "p95 gate regression case "
+MEASUREMENT_MARKERS = (
+    "BENCH-JSON ",
+    "cohort: ",
+    "memory.recall p95 baseline and regression gate",
+    "memory.recall p95 regression gate — file-backed WAL, warm ANN path",
+    "seeded ",
+    "db: isolated file-backed WAL pool",
+)
+
+
+def require_no_measurement(result):
+    combined = result.stdout + "\n" + result.stderr
+    if any(marker in combined for marker in MEASUREMENT_MARKERS):
+        raise ValueError("contract probe entered measurement output")
+
+
+def check_case_witnesses(result, cases, smoke=False):
+    require_no_measurement(result)
+    expected = [f"{CASE_PREFIX}{name}: completed, exit {code}" for name, code in cases]
+    witnessed = [line for line in result.stderr.splitlines() if line.startswith(CASE_PREFIX)]
+    if sorted(witnessed) != sorted(expected):
+        raise ValueError("missing, duplicate or incorrect lifecycle witnesses")
+    if any(line.startswith(CASE_PREFIX) for line in result.stdout.splitlines()):
+        raise ValueError("lifecycle witnesses must be on stderr")
+    completions = result.stderr.splitlines().count(SMOKE_COMPLETE)
+    if completions != int(smoke) or SMOKE_COMPLETE in result.stdout:
+        raise ValueError("missing, duplicate or misplaced smoke completion")
+
+
+def check_smoke(binary):
+    # The invalid selector is intentional: the old harness refuses it before
+    # any fixture, so the first old-head failure cannot load a real model.
+    for selector in ("invalid", "0", "1"):
+        environment = dict(os.environ)
+        environment["KHIVE_BENCH_REAL_MODEL"] = selector
+        for args in (
+            ["--test"],
+            ["--test", "--bench"],
+            [],
+            ["--save-baseline", "contract-probe", "--noplot"],
+        ):
+            result = probe(binary, args, environment, 15)
+            check_case_witnesses(result, CASES, smoke=True)
+
+
+def check_argument_refusals(binary):
+    environment = dict(os.environ)
+    environment["KHIVE_BENCH_REAL_MODEL"] = "invalid"
+    for args in (
+        ["--unknown"],
+        ["unexpected-filter"],
+        ["--regression-case", "clean-row"],
+        ["--regression-case=unknown"],
+        ["--save-baseline"],
+        ["--list", "--unknown"],
+        ["--list", "--regression-case", "clean-row"],
+        ["--test", "--regression-case=clean-row"],
+    ):
+        result = probe(binary, args, environment, 5, expected_code=2)
+        require_no_measurement(result)
+        if "--regression-case=name" not in result.stderr:
+            raise ValueError("argument refusal must name the accepted regression spelling")
+        if CASE_PREFIX in result.stderr or SMOKE_COMPLETE in result.stderr:
+            raise ValueError("invalid arguments reached lifecycle execution")
+
+
+def check_lifecycle(binary):
+    environment = dict(os.environ)
+    environment["KHIVE_BENCH_REAL_MODEL"] = "0"
+    for case, code in CASES:
+        result = probe(binary, ["--regression-case=" + case], environment, 15, expected_code=code)
+        check_case_witnesses(result, [(case, code)])
 
 
 def check(binary, measure=False):
+    check_smoke(binary)
+    check_argument_refusals(binary)
     for real in (False, True):
         environment = dict(os.environ)
         environment["KHIVE_BENCH_REAL_MODEL"] = "1" if real else "0"
@@ -74,10 +171,13 @@ def check(binary, measure=False):
             raise ValueError("listing differs from declared cohort")
         if parse_list(invoke(binary, ["--list", "--save-baseline", "contract-probe", "--noplot", "--bench"], environment, 5)) != expected:
             raise ValueError("compatibility arguments change the listing")
+        if parse_list(invoke(binary, ["--list", "--test", "--bench", "--regression-case=clean-row"], environment, 5)) != expected:
+            raise ValueError("valid modes must not override listing")
         output = invoke(binary, ["--regression-case=report-contract", "--save-baseline", "contract-probe", "--noplot", "--bench"], environment, 5)
         rows = parse_reports(output, expected)
         if any(row["value"] != 250_000.0 for row in rows.values()):
             raise ValueError("known report-contract values changed")
+    check_lifecycle(binary)
     if measure:
         # Run only the caller-selected cohort; real inference is never implicit.
         real = os.environ.get("KHIVE_BENCH_REAL_MODEL", "0") == "1"

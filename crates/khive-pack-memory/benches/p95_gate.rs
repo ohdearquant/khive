@@ -1,10 +1,13 @@
 //! Warm ANN p95 baseline and regression gate for `memory.recall`.
 //!
-//! The default is the generated `synthetic-v1` cohort: deterministic token hashing,
+//! Measurements default to the generated `synthetic-v1` cohort: deterministic token hashing,
 //! no model downloads or inference. `KHIVE_BENCH_REAL_MODEL=1` selects the original
 //! real-model configurations and gate, with distinct `real-model` benchmark IDs.
 //! Never compare synthetic timings with historical real-model numbers.
 //! `--list` returns IDs before constructing Tokio, storage, or embeddings.
+//! Without `--bench`, or with `--test`, run model-free lifecycle controls before
+//! selecting a model cohort. This includes `cargo test --benches -p khive-pack-memory`.
+//! `cargo bench` supplies `--bench` to select the full measurement workload.
 //!
 //! The regression gate compares the warm-hit path against a **file-backed WAL SQLite
 //! database with a warm page cache at one and three queried models**. The model count is
@@ -100,6 +103,8 @@ mod receipt_credentials;
 #[allow(dead_code)]
 #[path = "reducible_support/fixture.rs"]
 mod fixture;
+#[path = "reducible_support/p95_args.rs"]
+mod p95_args;
 #[path = "reducible_support/report.rs"]
 mod report;
 
@@ -530,13 +535,40 @@ const REAL_IDS: [&str; 3] = [
 ];
 
 fn main() {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|_| p95_args::refuse("arguments must be valid UTF-8"));
+    let mode = p95_args::parse(&args).unwrap_or_else(|error| p95_args::refuse(&error));
+    if mode == p95_args::Mode::Smoke {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("p95 smoke executor");
+        executor.block_on(regression::smoke());
+        return;
+    }
+    // Keep a raw-argument witness independent of mode dispatch, before fixtures.
+    let early_probe = args
+        .iter()
+        .any(|arg| arg == "--list" || arg.starts_with("--regression-case="));
+    assert!(
+        early_probe
+            || (args.iter().any(|arg| arg == "--bench") && !args.iter().any(|arg| arg == "--test")),
+        "smoke mode reached measurement boundary"
+    );
     let synthetic = fixture::synthetic_cohort();
     let ids = if synthetic { &SYNTHETIC_IDS } else { &REAL_IDS };
-    if report::list_requested(ids) {
+    if mode == p95_args::Mode::List {
+        assert!(
+            report::list_requested(ids),
+            "--list reached workload boundary"
+        );
         return;
     }
     report::assert_not_list_probe();
-    if report::regression_case().as_deref() == Some("report-contract") {
+    if mode == p95_args::Mode::ReportContract {
         // Exercises the actual emitter with known values, not a timing claim.
         for id in ids {
             report::emit(id, "p95_ns", 250_000.0, RECALL_ITERS);
@@ -553,7 +585,11 @@ fn main() {
             .build()
             .expect("real-model executor")
     };
-    let exit_code = executor.block_on(run(synthetic, ids));
+    let exit_code = match mode {
+        p95_args::Mode::Regression(case) => executor.block_on(regression::run(&case)),
+        p95_args::Mode::Measure => executor.block_on(run(synthetic, ids)),
+        _ => unreachable!("early-return mode reached the measurement executor"),
+    };
     drop(executor);
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -561,11 +597,6 @@ fn main() {
 }
 
 async fn run(synthetic: bool, ids: &[&str; 3]) -> i32 {
-    if let Some(case) =
-        std::env::args().find_map(|arg| arg.strip_prefix("--regression-case=").map(str::to_owned))
-    {
-        return regression::run(&case).await;
-    }
     let configs = gate_configs();
     eprintln!(
         "cohort: {} — compare only matching cohort and M",
@@ -683,6 +714,25 @@ mod regression {
     use std::task::Poll;
 
     const CASE_WATCHDOG: Duration = Duration::from_secs(5);
+
+    pub(super) const CASES: &[(&str, i32)] = &[
+        ("held-rebuild", 0),
+        ("held-build", 0),
+        ("chained-handoff", 0),
+        ("timeout-gating-row", 2),
+        ("timeout-informational-row", 0),
+        ("unrelated-task", 0),
+        ("failed-task-completion", 0),
+        ("clean-row", 0),
+        ("unmeasurable-gating-row", 2),
+    ];
+
+    pub(super) async fn smoke() {
+        for &(case, expected) in CASES {
+            assert_eq!(run(case).await, expected, "p95 smoke case {case}");
+        }
+        eprintln!("p95 smoke: {} cases passed", CASES.len());
+    }
 
     fn held_task(
         name: &'static str,
