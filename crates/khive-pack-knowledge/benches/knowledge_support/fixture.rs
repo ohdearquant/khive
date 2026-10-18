@@ -216,7 +216,11 @@ pub fn check_search(result: &Value, count: usize, drafts: bool) {
         if drafts {
             assert_eq!(
                 row["status"],
-                if index % 2 == 0 { "draft" } else { "reviewed" }
+                if index.is_multiple_of(2) {
+                    "draft"
+                } else {
+                    "reviewed"
+                }
             );
         } else {
             assert_eq!(row["status"], "reviewed");
