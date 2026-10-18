@@ -499,6 +499,21 @@ impl ConnectionPool {
             .clone())
     }
 
+    pub(crate) fn writer_admission_snapshot(
+        &self,
+    ) -> Result<crate::writer_admission_metrics::Snapshot, &'static str> {
+        if !self.config.write_queue_enabled.unwrap_or(false) {
+            return Err("writer_queue_disabled");
+        }
+        match self.writer_task.get() {
+            None => Err("writer_not_initialized"),
+            Some(None) => Err("writer_unavailable"),
+            Some(Some(handle)) => handle
+                .admission_snapshot()
+                .map_err(|reason| reason.reason()),
+        }
+    }
+
     /// Resolve the writer task for a store write at the moment the write is
     /// issued, rather than trusting only a handle cached by a synchronous
     /// store constructor. Construction can legitimately run before Tokio is

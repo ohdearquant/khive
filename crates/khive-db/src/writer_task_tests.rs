@@ -407,6 +407,20 @@ async fn begin_immediate_failure_replies_error_without_running_op() {
              autocommit mode for a request the caller is told failed"
     );
 
+    let refused = handle.admission_snapshot().unwrap();
+    assert_eq!(refused.queue_depth, 0);
+    assert_eq!(refused.admission_wait.count, 1);
+    assert_eq!(refused.accepted_queue_age.count, 1);
+    assert_eq!(
+        refused.service.count, 1,
+        "BEGIN refusal still reaches execution"
+    );
+    assert!(
+        refused.service.sum >= Duration::from_millis(100),
+        "service must include the independently held SQLite lock's 150ms busy budget"
+    );
+    assert_eq!(refused.saturation_total, 0);
+
     // Release the contended lock, then verify no row landed from the
     // failed request.
     lock_holder.execute_batch("ROLLBACK").unwrap();
@@ -831,6 +845,7 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        admission: None,
     };
 
     let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
@@ -881,6 +896,7 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        admission: None,
     };
 
     let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -1005,6 +1021,12 @@ async fn poisoned_connection_retires_before_queued_top_level_request() {
         .await;
     assert_writer_task_terminal_state(future_result, WriterTaskRequestState::NotStarted);
     assert!(!future_ran.load(Ordering::SeqCst));
+    let metrics = handle.admission_snapshot().unwrap();
+    assert_eq!(metrics.queue_depth, 0);
+    assert_eq!(metrics.admission_wait.count, 2);
+    assert_eq!(metrics.accepted_queue_age.count, 1);
+    assert_eq!(metrics.service.count, 1);
+    assert_eq!(metrics.saturation_total, 0);
 }
 
 #[test]
@@ -1032,6 +1054,7 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        admission: None,
     };
 
     let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -1080,6 +1103,7 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        admission: None,
     };
 
     let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -1332,6 +1356,12 @@ async fn top_level_panic_reports_unknown_and_fails_queue_without_running_it() {
         "the completed top-level statement autocommits before the panic"
     );
     assert_eq!(queued_count, 0, "the queued request must never run");
+    let metrics = handle.admission_snapshot().unwrap();
+    assert_eq!(metrics.queue_depth, 0);
+    assert_eq!(metrics.admission_wait.count, 2);
+    assert_eq!(metrics.accepted_queue_age.count, 1);
+    assert_eq!(metrics.service.count, 1);
+    assert_eq!(metrics.saturation_total, 0);
 }
 
 #[tokio::test]
@@ -1348,6 +1378,7 @@ async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
         db: "test".to_string(),
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
+        admission_metrics: WriterAdmissionMetrics::new(),
     };
     let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
     assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1375,6 +1406,7 @@ async fn accepted_request_lost_reply_is_side_effects_unknown() {
         db: "test".to_string(),
         slow_write_threshold: None,
         enqueue_timeout: Duration::from_secs(5),
+        admission_metrics: WriterAdmissionMetrics::new(),
     };
     let request_ran = Arc::new(AtomicBool::new(false));
     let request_ran_in_op = Arc::clone(&request_ran);
@@ -1515,7 +1547,14 @@ fn writer_queue_wait_excludes_blocking_pool_scheduling_delay() {
             .await
             .expect("request must enter the bounded writer channel");
         let dequeue_deadline = Instant::now() + Duration::from_secs(1);
-        while handle.queue_depth() != 0 {
+        while handle.queue_depth() != 0
+            || handle
+                .admission_snapshot()
+                .unwrap()
+                .accepted_queue_age
+                .count
+                == 0
+        {
             assert!(
                 Instant::now() < dequeue_deadline,
                 "writer drain never dequeued the accepted request"
@@ -1523,12 +1562,21 @@ fn writer_queue_wait_excludes_blocking_pool_scheduling_delay() {
             tokio::task::yield_now().await;
         }
 
+        let before_delay = handle.admission_snapshot().unwrap();
+        assert_eq!(before_delay.accepted_queue_age.count, 1);
+        assert_eq!(before_delay.service.count, 0);
+        let service_hold_started = Instant::now();
         let scheduling_delay = Duration::from_millis(150);
         tokio::time::sleep(scheduling_delay).await;
         release_blocker_tx.send(()).unwrap();
         blocker.await.unwrap();
         reply.await.unwrap().unwrap();
 
+        let metrics = handle.admission_snapshot().unwrap();
+        assert_eq!(metrics.service.count, 1);
+        assert!(metrics.service.sum >= scheduling_delay);
+        assert!(service_hold_started.elapsed() >= scheduling_delay);
+        assert_eq!(metrics.accepted_queue_age, before_delay.accepted_queue_age);
         let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
         assert!(
             sample.total_micros.saturating_sub(sample.queue_wait_micros) >= 100_000,
@@ -1655,3 +1703,6 @@ async fn writer_task_failure_counters_are_acquisition_site_exact() {
         );
     }
 }
+
+#[path = "writer_task_admission_metrics_tests.rs"]
+mod admission_metrics_tests;

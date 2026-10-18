@@ -19,8 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles refuse updates. Storage failures use `PersistError::Storage`.
   Core migrations now install `atom_weights` and `weight_events`; the standalone
   `init_weight_schema` bootstrap remains available for compatibility.
+
 ### Added
 
+- Writer contention diagnostics now report per-pool FIFO admission depth, its
+  high-water mark, capacity rejections and bounded lifetime duration histograms.
+  Snapshots identify the FIFO stage and report unavailable call/rotation metrics
+  explicitly. Reading them never starts a writer or changes admission routing.
 - `NoteStore::try_patch_note_properties` applies guarded partial property writes,
   forward-only expiry and a monotonic update timestamp in one storage operation.
   Its provided default returns `Unsupported`; existing implementations remain

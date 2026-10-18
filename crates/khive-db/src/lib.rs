@@ -73,6 +73,7 @@ mod vacuum_capacity;
 /// mode itself requires Unix (see `khive-mcp/src/serve.rs`).
 pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
+mod writer_admission_metrics;
 pub mod writer_task;
 
 #[cfg(test)]
