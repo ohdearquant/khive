@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use criterion::Criterion;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::fixture::{check_search, executor, slug, Fixture, CONTENT, QUERY};
 
