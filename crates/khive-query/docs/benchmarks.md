@@ -119,3 +119,82 @@ Declared in `Cargo.toml` as `[[bench]] name = "parse_bench" harness = false`.
 - Notes: none
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Compilation, validation, and large inputs
+
+`pipeline_bench` adds downstream CPU work to the original `parse_bench` target.
+The parse-only environment notes and release ledger above describe that original
+target. Neither target opens a database or measures SQL execution.
+
+```bash
+cd crates
+cargo bench -p khive-query --bench pipeline_bench -- --quick --noplot
+cargo bench -p khive-query --benches -- --quick --noplot
+```
+
+The owning benchmark component is `ann-query`. New baselines are **pending** a
+qualified-host run of that component, which records the commit, toolchain,
+machine, flags, command, and sample report with the measurements. Historical
+values above remain observations from their recorded release.
+
+| Group            | Scenario names                                             | Measurement                                                                   | Input sizes                                                                                          | Baseline |
+| ---------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- |
+| `query_pipeline` | `compile/{simple,medium,complex}/{fixture}`                | Public `compile` on a parsed AST, including its internal clone and validation | All 15 existing GQL strings; one namespace; `max_limit=500`                                          | pending  |
+| `query_pipeline` | `validate/{simple,medium,complex}/{fixture}`               | Public in-place `validate` on a fresh AST                                     | Same 15 strings                                                                                      | pending  |
+| `query_pipeline` | `validate_with_warnings/{simple,medium,complex}/{fixture}` | Public validation and warning collection on a fresh AST                       | Same 15 strings; these valid fixtures return no warnings                                             | pending  |
+| `query_pipeline` | `large/parse_10_nodes_20_properties`                       | GQL parsing                                                                   | Generated 10-node, nine-edge chain; 20 string-valued properties on its first node                    | pending  |
+| `query_pipeline` | `large/parse_compile_10_nodes_20_properties`               | One parse followed by public compile                                          | Same generated chain; one namespace; `max_limit=500`                                                 | pending  |
+| `query_pipeline` | `sparql_complex/four_edges_six_triples_bounded_paths`      | SPARQL parsing                                                                | Five-node chain; four relation triples, one kind triple, one property triple; `{1,3}` and `+` bounds | pending  |
+
+The 15 GQL fixture suffixes exactly reuse the existing inputs:
+
+- `simple`: `simple_node`, `two_node_edge`, `node_with_limit`.
+- `medium`: `where_eq_string`, `where_and`, `where_or`, `where_and_or`,
+  `where_with_edge_var`, `node_with_properties`.
+- `complex`: `three_node_chain`, `variable_length_multi_rel`,
+  `variable_length_with_where`, `three_node_mixed_direction`,
+  `node_multi_property_map`, `undirected_edge`.
+
+There are 48 new scenarios. Each prints a `query_call_report` from 1,001 actual
+single calls, with median defined as sorted rank 501. This report follows one
+untimed preflight and precedes a separate Criterion run (10 samples, one-second
+warmup, three-second measurement target; `--quick` selects Criterion quick mode).
+Only 1,001 durations are retained at once. Per-call `Instant` overhead is included;
+these short-call observations are advisory and should be compared using the same
+harness and host, rather than treated as interchangeable with the historical
+parse harness estimates.
+
+AST preparation/cloning, result assertions, input/output destruction, sorting,
+and reporting are outside each timer. Validators receive a fresh clone before
+**every** call, including warmup. Compile inputs are preparsed, while the
+compiler's own internal clone and validation remain timed. Parse-plus-compile
+retains both outputs until after timing. Criterion receives the sum of actual
+call durations; reset and checking still consume additional wall time. Compiler
+outputs must preserve requested projections, bind the private namespace, and
+emit SELECT/WITH SQL. Large-input checks verify every generated property value
+in the AST and compiled parameters; SPARQL checks all four relations and bounds.
+Every invocation must succeed.
+
+The complex SPARQL fixture uses supported **flat connected triples with bounded
+paths**. The issue's literal nested property-path or nested WHERE-group syntax
+is unsupported: `parse_predicate` accepts one relation with an optional `+` or
+`{min,max}`, and `triples_to_ast` reconstructs one linear path. That nested-syntax
+portion is not measured. This scene measures parsing only; compilation of a
+mixed fixed/variable multi-edge chain is also unsupported by the current SQL
+compiler. No grammar or compiler behavior is changed for these benchmarks.
+
+## Performance guarantees
+
+All rows are advisory latency trends. No fixed timing threshold, allocation
+promise, or new deterministic count gate is introduced. Existing historical
+values are not current measurements or guarantees. Baselines for the new harness
+remain pending the `ann-query` qualified-host run.
+
+| Operation                    | Input                          | Metric         | Bound                                        | Baseline             |
+| ---------------------------- | ------------------------------ | -------------- | -------------------------------------------- | -------------------- |
+| GQL parse (simple_node)      | inline simple node             | latency median | Advisory trend; last ledger value 497.1 ns   | historical: 497.1 ns |
+| GQL parse (three_node_chain) | complex 3-node chain           | latency median | Advisory trend; last ledger value 1.150 µs   | historical: 1.150 µs |
+| SPARQL parse (two_node)      | 2-node SPARQL                  | latency median | Advisory trend; last ledger value 1.406 µs   | historical: 1.406 µs |
+| compile (simple GQL)         | simple_node AST                | latency median | Advisory trend against the recorded baseline | pending              |
+| validate (medium GQL)        | where_and AST                  | latency median | Advisory trend against the recorded baseline | pending              |
+| parse + compile (large)      | 10-node chain, 20-property map | latency median | Advisory trend against the recorded baseline | pending              |
