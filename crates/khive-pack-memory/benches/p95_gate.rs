@@ -1,5 +1,14 @@
 //! Warm ANN p95 baseline and regression gate for `memory.recall`.
 //!
+//! Measurements default to the generated `synthetic-v1` cohort: deterministic token hashing,
+//! no model downloads or inference. `KHIVE_BENCH_REAL_MODEL=1` selects the original
+//! real-model configurations and gate, with distinct `real-model` benchmark IDs.
+//! Never compare synthetic timings with historical real-model numbers.
+//! `--list` returns IDs before constructing Tokio, storage, or embeddings.
+//! Without `--bench`, or with `--test`, run model-free lifecycle controls before
+//! selecting a model cohort. This includes `cargo test --benches -p khive-pack-memory`.
+//! `cargo bench` supplies `--bench` to select the full measurement workload.
+//!
 //! The regression gate compares the warm-hit path against a **file-backed WAL SQLite
 //! database with a warm page cache at one and three queried models**. The model count is
 //! the number of embedding models a single `memory.recall` call queries, not the total
@@ -88,8 +97,15 @@
 //! in progress. Run the suite twice and require consistent numbers across both runs
 //! before recording or refreshing baselines.
 
-#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
-mod receipt_credentials;
+use fixture::receipt_credentials;
+
+#[allow(dead_code)]
+#[path = "reducible_support/fixture.rs"]
+mod fixture;
+#[path = "reducible_support/p95_args.rs"]
+mod p95_args;
+#[path = "reducible_support/report.rs"]
+mod report;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -394,18 +410,36 @@ fn percentiles(mut latencies_us: Vec<u128>) -> Percentiles {
 /// ending the process. Every condition that used to `assert!` here is a statement about
 /// the SAMPLE, so it belongs to the row, and the run's exit status is decided once, by
 /// role, after every row has been printed.
-async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String> {
-    let tmp = tempfile::Builder::new()
-        .prefix("khive-p95-gate-")
-        .tempdir()
-        .expect("tmpdir");
-    let db_path = tmp.path().join("p95-gate.db");
+async fn bench_configuration(config: &GateConfig, synthetic: bool) -> Result<Percentiles, String> {
+    if synthetic {
+        let database = fixture::Fixture::new(&config.registered_models(), true);
+        let result = measure_configuration(config, &database.runtime, &database.registry).await;
+        database.close().await;
+        result
+    } else {
+        // Preserve the real-model benchmark's original constructor, config,
+        // registry, temporary database and owner-host lifecycle.
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-p95-gate-")
+            .tempdir()
+            .expect("tmpdir");
+        let db_path = tmp.path().join("p95-gate.db");
+        let rt = make_runtime(db_path.clone(), config.primary, config.additional.to_vec());
+        let registry = make_registry(&rt);
+        measure_configuration(config, &rt, &registry).await
+    }
+}
+
+async fn measure_configuration(
+    config: &GateConfig,
+    rt: &KhiveRuntime,
+    registry: &khive_runtime::VerbRegistry,
+) -> Result<Percentiles, String> {
     let registered = config.registered_models();
 
     eprintln!("\n--- {} ({}) ---", config.label, config.gate_note);
     eprintln!(
-        "db: {} (file-backed, WAL pool); registered models ({}): {}",
-        db_path.display(),
+        "db: isolated file-backed WAL pool; registered models ({}): {}",
         registered.len(),
         registered
             .iter()
@@ -424,12 +458,9 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
         }
     );
 
-    let rt = make_runtime(db_path.clone(), config.primary, config.additional.to_vec());
-    let registry = make_registry(&rt);
-
     let t_seed = Instant::now();
     for model in &registered {
-        seed_model(&registry, *model, MEMORIES_PER_MODEL).await;
+        seed_model(registry, *model, MEMORIES_PER_MODEL).await;
     }
     eprintln!(
         "seeded {} memories ({} per model x {} models) in {:.1}s",
@@ -439,14 +470,14 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
         t_seed.elapsed().as_secs_f64()
     );
 
-    wait_until_ann_warm(&registry, config.label, config.recall_model).await?;
+    wait_until_ann_warm(registry, config.label, config.recall_model).await?;
 
     // Let any durable-epoch debounce check already due from seeding fire (see
     // EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more clean
     // call. That call can enqueue a detached rebuild; await its tracked completion
     // before the pre-window snapshot, without treating completion as build success.
     tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
-    let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
+    let (_us, settle_resp) = recall_once(registry, config.recall_model).await;
     if !is_clean_ann_route(&settle_resp) {
         return Err(format!(
             "[{}] post-settle recall observed ann_unavailable degradation (or empty results)",
@@ -457,12 +488,12 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
     let ann_warm_events_before = open_ann_measurement_window(
         config.label,
         ANN_BACKGROUND_WAIT_TIMEOUT,
-        ann_warm_event_count(&rt),
+        ann_warm_event_count(rt),
     )
     .await?;
     let mut latencies = Vec::with_capacity(RECALL_ITERS);
     for i in 0..RECALL_ITERS {
-        let (us, resp) = recall_once(&registry, config.recall_model).await;
+        let (us, resp) = recall_once(registry, config.recall_model).await;
         if !is_clean_ann_route(&resp) {
             return Err(format!(
                 "[{}] timed sample {i} observed ann_unavailable degradation (or empty results) — \
@@ -472,7 +503,7 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
         }
         latencies.push(us);
     }
-    let ann_warm_events_after = ann_warm_event_count(&rt).await;
+    let ann_warm_events_after = ann_warm_event_count(rt).await;
     if ann_warm_events_after != ann_warm_events_before {
         return Err(format!(
             "[{}] a memory.ann_warm phase event fired during the timed window ({} → {}) — an \
@@ -491,14 +522,89 @@ async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String>
     Ok(stats)
 }
 
-#[tokio::main]
-async fn main() {
-    if let Some(case) =
-        std::env::args().find_map(|arg| arg.strip_prefix("--regression-case=").map(str::to_owned))
-    {
-        std::process::exit(regression::run(&case).await);
+const SYNTHETIC_IDS: [&str; 3] = [
+    "p95_gate/synthetic-v1/m1",
+    "p95_gate/synthetic-v1/m3",
+    "p95_gate/synthetic-v1/m4-informational",
+];
+const REAL_IDS: [&str; 3] = [
+    "p95_gate/real-model/m1",
+    "p95_gate/real-model/m3",
+    "p95_gate/real-model/m4-informational",
+];
+
+fn main() {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|_| p95_args::refuse("arguments must be valid UTF-8"));
+    let mode = p95_args::parse(&args).unwrap_or_else(|error| p95_args::refuse(&error));
+    if mode == p95_args::Mode::Smoke {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("p95 smoke executor");
+        executor.block_on(regression::smoke());
+        return;
     }
+    // Keep a raw-argument witness independent of mode dispatch, before fixtures.
+    let early_probe = args
+        .iter()
+        .any(|arg| arg == "--list" || arg.starts_with("--regression-case="));
+    assert!(
+        early_probe
+            || (args.iter().any(|arg| arg == "--bench") && !args.iter().any(|arg| arg == "--test")),
+        "smoke mode reached measurement boundary"
+    );
+    let synthetic = fixture::synthetic_cohort();
+    let ids = if synthetic { &SYNTHETIC_IDS } else { &REAL_IDS };
+    if mode == p95_args::Mode::List {
+        assert!(
+            report::list_requested(ids),
+            "--list reached workload boundary"
+        );
+        return;
+    }
+    report::assert_not_list_probe();
+    if mode == p95_args::Mode::ReportContract {
+        // Exercises the actual emitter with known values, not a timing claim.
+        for id in ids {
+            report::emit(id, "p95_ns", 250_000.0, RECALL_ITERS);
+        }
+        return;
+    }
+    let executor = if synthetic {
+        fixture::reject_fts_overrides();
+        fixture::executor()
+    } else {
+        // Equivalent to the original #[tokio::main] multi-thread executor.
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("real-model executor")
+    };
+    let exit_code = match mode {
+        p95_args::Mode::Regression(case) => executor.block_on(regression::run(&case)),
+        p95_args::Mode::Measure => executor.block_on(run(synthetic, ids)),
+        _ => unreachable!("early-return mode reached the measurement executor"),
+    };
+    drop(executor);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+async fn run(synthetic: bool, ids: &[&str; 3]) -> i32 {
     let configs = gate_configs();
+    eprintln!(
+        "cohort: {} — compare only matching cohort and M",
+        if synthetic {
+            "synthetic-v1 (no real-model inference)"
+        } else {
+            "real-model (explicit opt-in)"
+        }
+    );
 
     eprintln!(
         "memory.recall p95 baseline and regression gate — warm ANN path, \
@@ -521,12 +627,20 @@ async fn main() {
     println!("{}", "-".repeat(96));
 
     let mut contaminated = Vec::new();
-    for config in &configs {
-        match bench_configuration(config).await {
-            Ok(stats) => println!(
-                "{:<45} {:>8.3} {:>8.3} {:>8.3} {:>6}  {}",
-                config.label, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.n, config.gate_note
-            ),
+    for (config, id) in configs.iter().zip(ids) {
+        match bench_configuration(config, synthetic).await {
+            Ok(stats) => {
+                report::emit(id, "p95_ns", stats.p95_ms * 1_000_000.0, stats.n);
+                println!(
+                    "{:<45} {:>8.3} {:>8.3} {:>8.3} {:>6}  {}",
+                    config.label,
+                    stats.p50_ms,
+                    stats.p95_ms,
+                    stats.p99_ms,
+                    stats.n,
+                    config.gate_note
+                );
+            }
             Err(reason) => {
                 println!(
                     "{:<45} {:>8} {:>8} {:>8} {:>6}  {} [{}]",
@@ -546,13 +660,10 @@ async fn main() {
         }
     }
 
-    let exit_code = finish_gate(
+    finish_gate(
         &contaminated,
         configs.iter().filter(|c| c.role == Role::Gating).count(),
-    );
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
+    )
 }
 
 fn finish_gate(contaminated: &[(&str, Role, String)], gating_configs: usize) -> i32 {
@@ -602,6 +713,25 @@ mod regression {
     use std::task::Poll;
 
     const CASE_WATCHDOG: Duration = Duration::from_secs(5);
+
+    pub(super) const CASES: &[(&str, i32)] = &[
+        ("held-rebuild", 0),
+        ("held-build", 0),
+        ("chained-handoff", 0),
+        ("timeout-gating-row", 2),
+        ("timeout-informational-row", 0),
+        ("unrelated-task", 0),
+        ("failed-task-completion", 0),
+        ("clean-row", 0),
+        ("unmeasurable-gating-row", 2),
+    ];
+
+    pub(super) async fn smoke() {
+        for &(case, expected) in CASES {
+            assert_eq!(run(case).await, expected, "p95 smoke case {case}");
+        }
+        eprintln!("p95 smoke: {} cases passed", CASES.len());
+    }
 
     fn held_task(
         name: &'static str,
