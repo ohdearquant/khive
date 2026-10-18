@@ -769,14 +769,17 @@ fn hard_link_added_after_registration_fails_the_next_read() {
 #[test]
 fn read_only_open_refuses_a_main_file_with_a_second_link() {
     let fixture = tempfile::tempdir().unwrap();
-    let map = fixture.path().join("map.db");
+    // The guarded open refuses symlinked parent components, and the system
+    // temporary directory sits behind one on macOS (/var -> /private/var).
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let map = root.join("map.db");
     create_queryable_map(&map);
     let identity = super::path_identity(&map).unwrap();
     // With one link the guarded open succeeds, so the refusal below is the
     // link check on the descriptor SQLite reads.
     drop(crate::StorageBackend::open_code_map_read_only(&map, identity, &[]).unwrap());
 
-    std::fs::hard_link(&map, fixture.path().join("second-link.db")).unwrap();
+    std::fs::hard_link(&map, root.join("second-link.db")).unwrap();
     let error = crate::StorageBackend::open_code_map_read_only(&map, identity, &[])
         .expect_err("a second link refuses the read-only open")
         .to_string();
