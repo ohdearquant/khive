@@ -70,3 +70,4 @@ required-features = ["mmap"]
 [[example]]
 name = "vec_bench"
 required-features = ["mmap"]
+test = true
