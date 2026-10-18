@@ -288,6 +288,57 @@ fn bench_section_weights(c: &mut Criterion) {
     g.finish();
 }
 
+// ── isolated feedback posterior updates ───────────────────────────────────────
+
+fn bench_feedback_posteriors(c: &mut Criterion) {
+    let target = Uuid::from_u128(42);
+    let mut prepared = BalancedRecallState::new(100);
+    for _ in 0..25 {
+        prepared.apply_signal(&recall_hit(target, 10_000));
+        prepared.apply_signal(&BrainSignal::RecallMiss);
+    }
+    let snapshot = prepared.to_snapshot();
+    assert_eq!(snapshot.total_events, 50);
+    assert_eq!(snapshot.entity_posteriors.len(), 1);
+    drop(prepared);
+
+    let mut group = c.benchmark_group("core_primitives/feedback_posteriors");
+    for (name, signal) in [
+        ("useful", FeedbackSignal::Useful),
+        ("not_useful", FeedbackSignal::NotUseful),
+        ("wrong", FeedbackSignal::Wrong),
+    ] {
+        let positive = matches!(signal, FeedbackSignal::Useful);
+        let event = feedback(target, signal);
+
+        // Check the workload once, outside timing. This path changes the
+        // salience and existing entity posterior, not event counters or the
+        // relevance, temporal and exploration state.
+        let mut probe = BalancedRecallState::from_snapshot(snapshot.clone(), 100);
+        probe.apply_feedback_posteriors(&event);
+        let mut expected = snapshot.clone();
+        let entity = expected.entity_posteriors.get_mut(&target).unwrap();
+        if positive {
+            expected.salience.update_success();
+            entity.update_success();
+        } else {
+            expected.salience.update_failure();
+            entity.update_failure();
+        }
+        assert_eq!(probe.to_snapshot(), expected);
+        drop(probe);
+
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || BalancedRecallState::from_snapshot(snapshot.clone(), 100),
+                |state| black_box(state).apply_feedback_posteriors(black_box(&event)),
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 // ── criterion entry points ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -296,5 +347,6 @@ criterion_group!(
     bench_ess_cap_convergence,
     bench_apply_signal,
     bench_section_weights,
+    bench_feedback_posteriors,
 );
 criterion_main!(benches);
