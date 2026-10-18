@@ -2157,6 +2157,7 @@ name = "khive-gate"
 version = "0.14.0"
 dependencies = [
  "chrono",
+ "criterion",
  "khive-types",
  "serde",
  "serde_json",
