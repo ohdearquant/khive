@@ -2387,6 +2387,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "criterion",
  "inventory",
  "khive-db",
  "khive-fs",
