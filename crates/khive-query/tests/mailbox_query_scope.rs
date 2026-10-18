@@ -560,16 +560,38 @@ fn recursive_seed_step_and_intermediate_message_nodes_are_filtered() {
     // the seed and recursive edge sources rather than only note-row filtering.
     event(&conn, "hidden-seed");
     event(&conn, "hidden-step");
+    // Tombstoned entities admit the edges, but only hidden live note rows could
+    // satisfy the recursive node joins if their mailbox filter were removed.
+    for id in ["hidden-seed-collision", "hidden-step-collision"] {
+        entity(&conn, id);
+        conn.execute("UPDATE entities SET deleted_at = 1 WHERE id = ?1", [id])
+            .unwrap();
+        note(
+            &conn,
+            id,
+            "message",
+            Some(r#"{"direction":"inbound","to_actor":"b"}"#),
+        );
+    }
     edge(&conn, "seed-bad", "root", "hidden-seed");
     edge(&conn, "seed-good", "root", "middle");
+    edge(&conn, "seed-node-bad", "root", "hidden-seed-collision");
     edge(&conn, "step-bad", "middle", "hidden-step");
     edge(&conn, "step-good", "middle", "end");
+    edge(&conn, "step-node-bad", "middle", "hidden-step-collision");
     edge(&conn, "intermediate-in", "root", "hidden-intermediate");
     edge(
         &conn,
         "intermediate-out",
         "hidden-intermediate",
         "hidden-path-end",
+    );
+    assert_eq!(
+        run(
+            &conn,
+            &compiled("MATCH (e:edge) RETURN e.id", &scope("a", false))
+        ),
+        ["seed-good", "seed-node-bad", "step-good", "step-node-bad"]
     );
     for (depth, expected) in [(1, vec!["middle"]), (2, vec!["end"])] {
         let result = compiled(
@@ -578,6 +600,13 @@ fn recursive_seed_step_and_intermediate_message_nodes_are_filtered() {
         );
         assert_eq!(run(&conn, &result), expected);
     }
+    // A one-hop maximum uses fixed-length compilation; this range exercises
+    // the recursive seed and step node joins together.
+    let result = compiled(
+        "MATCH (a)-[:extends*1..2]->(b) WHERE a.id = 'root' RETURN b.id",
+        &scope("a", false),
+    );
+    assert_eq!(run(&conn, &result), ["middle", "end"]);
     let query = parse(
         QueryLanguage::Sparql,
         "SELECT ?b WHERE { ?a :name \"root\" . ?a :extends+ ?b . }",
