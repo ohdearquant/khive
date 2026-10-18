@@ -1,6 +1,8 @@
 //! Manual candidate-recall measurements on a fixed eligible set.
 //! The non-ignored case checks fixture/oracle integrity, without latency gates.
 
+#[path = "filtered_search_measure/controls.rs"]
+mod controls;
 #[path = "../../test_support/retrieval_measure.rs"]
 mod measure;
 
@@ -421,6 +423,11 @@ async fn filtered_search_oracle_and_arm_counts_are_non_vacuous() {
             let rows = rows(40, 20, filter);
             seed(&runtime, arm, &rows).await;
             let expected = oracle(&runtime, arm, filter, &rows, 20).await;
+            assert_eq!(
+                expected,
+                (1..=20).map(Uuid::from_u128).collect::<Vec<_>>(),
+                "the small fixture has a strictly ordered, fixed eligible oracle"
+            );
             if matches!(arm, Arm::Vector) {
                 let eligible: HashSet<_> = rows
                     .iter()
@@ -438,6 +445,9 @@ async fn filtered_search_oracle_and_arm_counts_are_non_vacuous() {
                 );
             }
             let result = sample(&runtime, arm, filter, 10, &expected, &rows).await;
+            controls::validate_sanity(&result, arm, filter)
+                .unwrap_or_else(|field| panic!("{arm:?}/{filter:?}: incorrect {field}: {result}"));
+            controls::assert_negative_controls(&result, arm, filter);
             assert!(
                 !result["returned_ids"].as_array().unwrap().is_empty(),
                 "small public search must return a known eligible match"
