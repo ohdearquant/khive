@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use thiserror::Error;
 
+use crate::file_identity::DatabaseFileIdentity;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -249,6 +251,7 @@ pub(crate) struct CodeMapHandleGuard {
     main_leaf: OsString,
     parent: os::PinnedParent,
     mode: Mode,
+    expected_main_identity: Option<DatabaseFileIdentity>,
     protected: Vec<ProductionBase>,
     opened_wal: Mutex<Vec<os::Identity>>,
     // 0 = closed, 1 = authorized for one DELETE PRAGMA, 2 = consumed.
@@ -264,6 +267,20 @@ pub(crate) fn register_rollback(
     protected: Vec<ProductionBase>,
 ) -> Result<String, GuardError> {
     let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, protected)?);
+    vfs::register(guard)
+}
+
+pub(crate) fn register_read_only_rollback(
+    target: PathBuf,
+    expected_identity: DatabaseFileIdentity,
+    protected: Vec<ProductionBase>,
+) -> Result<String, GuardError> {
+    let guard = Arc::new(CodeMapHandleGuard::new_with_expected_identity(
+        target,
+        Mode::Rollback,
+        Some(expected_identity),
+        protected,
+    )?);
     vfs::register(guard)
 }
 
@@ -341,6 +358,15 @@ impl CodeMapHandleGuard {
         mode: Mode,
         protected: Vec<ProductionBase>,
     ) -> Result<Self, GuardError> {
+        Self::new_with_expected_identity(target, mode, None, protected)
+    }
+
+    fn new_with_expected_identity(
+        target: PathBuf,
+        mode: Mode,
+        expected_main_identity: Option<DatabaseFileIdentity>,
+        protected: Vec<ProductionBase>,
+    ) -> Result<Self, GuardError> {
         let ledger = lock_ledger();
         check_quarantine(&ledger)?;
         ensure_absolute_plain(&target)?;
@@ -373,6 +399,7 @@ impl CodeMapHandleGuard {
             main_leaf,
             parent,
             mode,
+            expected_main_identity,
             protected,
             opened_wal: Mutex::new(Vec::new()),
             mode_switch_phase: AtomicU8::new(0),
@@ -504,6 +531,7 @@ impl CodeMapHandleGuard {
     pub(crate) fn delete(&self, role: Role, sync_parent: bool) -> Result<(), GuardError> {
         if !matches!(role, Role::Journal | Role::TransitionWal | Role::Shm)
             || (role != Role::Journal && self.mode != Mode::QuiescentWalTransition)
+            || self.expected_main_identity.is_some()
         {
             return Err(GuardError::RoleNotAllowed {
                 role,
@@ -643,6 +671,12 @@ impl CodeMapHandleGuard {
         role: Role,
         access: OpenAccess,
     ) -> Result<GuardedFile, GuardError> {
+        if self.expected_main_identity.is_some() && access != OpenAccess::ReadOnly {
+            return Err(GuardError::Unsafe {
+                path: self.path(role),
+                reason: "registered code maps require read-only file handles",
+            });
+        }
         if role == Role::Shm
             || (role == Role::TransitionWal && self.mode != Mode::QuiescentWalTransition)
         {
@@ -689,6 +723,24 @@ impl CodeMapHandleGuard {
             ledger.quarantined.push(file);
             return Err(GuardError::ProtectedChanged);
         }
+        if role == Role::Main {
+            if let Some(expected) = self.expected_main_identity {
+                let actual = match crate::file_identity::database_file_identity_from_file(&file) {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        os::close_unlocked(file, observed.identity);
+                        return Err(io_at(&path, error));
+                    }
+                };
+                if actual != expected {
+                    os::close_unlocked(file, observed.identity);
+                    return Err(GuardError::Unsafe {
+                        path,
+                        reason: "main file identity changed since registration",
+                    });
+                }
+            }
+        }
         if ledger.guarded.has_other_role(observed.identity, role) {
             os::close_unlocked(file, observed.identity);
             return Err(GuardError::Unsafe {
@@ -696,7 +748,7 @@ impl CodeMapHandleGuard {
                 reason: "opened code-map member aliases another guarded file role",
             });
         }
-        if role != Role::Main && observed.links > 1 {
+        if role != Role::Main && observed.links > 1 && self.expected_main_identity.is_none() {
             os::close_unlocked(file, observed.identity);
             return Err(GuardError::Unsafe {
                 path,
@@ -824,7 +876,7 @@ impl CodeMapHandleGuard {
             if Self::matches_protected(item.identity, protected) {
                 return Err(GuardError::ProtectedAlias { path });
             }
-            if role != Role::Main && item.links > 1 {
+            if role != Role::Main && item.links > 1 && self.expected_main_identity.is_none() {
                 return Err(GuardError::Unsafe {
                     path,
                     reason: "multiply linked writable code-map sidecar",
@@ -887,4 +939,24 @@ impl CodeMapHandleGuard {
             Role::Shm => snapshot.shm,
         }
     }
+}
+
+/// Open code-map main handles on the file at `path`. Counting one file keeps
+/// the number independent of other code-map handles open in the process. The
+/// identity is read through the parent directory, never by opening the file:
+/// closing a second descriptor would release this process's locks on it.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn active_main_handle_count_for(path: &Path) -> usize {
+    let parent = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .expect("code-map file has a resolvable parent directory");
+    let observed = os::PinnedParent::open(&parent)
+        .and_then(|parent| parent.stat_child(path.file_name().expect("code-map path names a file")))
+        .expect("code-map file identity is readable")
+        .expect("code-map file exists");
+    lock_ledger()
+        .active_main
+        .get(&observed.identity)
+        .map_or(0, |active| active.rollback + active.transition)
 }

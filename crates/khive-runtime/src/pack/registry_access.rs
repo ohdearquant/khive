@@ -118,6 +118,82 @@ impl VerbRegistry {
             verb,
             effective_args,
         );
+        self.authorize_secondary_kg_operation(token, gate_req, Some(effective_id))
+            .await
+    }
+
+    /// Check the canonical wrapper for a proposal worker using its applying caller.
+    pub async fn authorize_canonical_changeset(
+        &self,
+        token: &NamespaceToken,
+        delta: &str,
+    ) -> Result<(), RuntimeError> {
+        let verb = "apply_changeset";
+        if self.is_verb_disabled(verb) {
+            return Err(self.unknown_verb_error(verb));
+        }
+        let mut args = serde_json::json!({"delta": delta});
+        if let Some(namespace) = token.gate_explicit_namespace() {
+            args["namespace"] = Value::String(namespace.to_owned());
+        }
+        let request = GateRequest::new(
+            token.actor().clone(),
+            token.gate_namespace().clone(),
+            verb,
+            args,
+        );
+        self.authorize_secondary_kg_operation(token, request, None)
+            .await
+    }
+
+    pub(crate) async fn authorize_canonical_operation(
+        &self,
+        token: &NamespaceToken,
+        verb: &str,
+        mut args: Value,
+        target_id: uuid::Uuid,
+    ) -> Result<NamespaceToken, RuntimeError> {
+        if !matches!(verb, "create" | "link" | "update" | "delete") {
+            return Err(RuntimeError::InvalidInput(
+                "unsupported canonical constituent verb".into(),
+            ));
+        }
+        if self.is_verb_disabled(verb) {
+            return Err(self.unknown_verb_error(verb));
+        }
+        if args.get("namespace").is_none() {
+            if let Some(namespace) = token.gate_explicit_namespace() {
+                args["namespace"] = Value::String(namespace.to_owned());
+            }
+        }
+        let namespace = match args.get("namespace") {
+            Some(Value::String(value)) => Namespace::parse(value)
+                .map_err(|_| RuntimeError::InvalidInput("invalid namespace".into()))?,
+            Some(_) => return Err(RuntimeError::InvalidInput("invalid namespace".into())),
+            None => token.gate_namespace().clone(),
+        };
+        let request =
+            GateRequest::new(token.actor().clone(), namespace.clone(), verb, args.clone());
+        self.authorize_secondary_kg_operation(token, request, Some(target_id))
+            .await?;
+        Ok(token
+            .with_namespace(namespace.clone())
+            .with_gate_namespace(namespace)
+            .with_gate_explicit_namespace(
+                args.get("namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+            .with_request_id(token.request_id()))
+    }
+
+    async fn authorize_secondary_kg_operation(
+        &self,
+        token: &NamespaceToken,
+        gate_req: GateRequest,
+        effective_id: Option<uuid::Uuid>,
+    ) -> Result<(), RuntimeError> {
+        let verb = gate_req.verb.as_str();
         let decision = khive_gate::check_with_mailbox_policy(self.gate.as_ref(), &gate_req);
         match decision {
             Ok(decision) => {
@@ -125,12 +201,12 @@ impl VerbRegistry {
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
-                    effective_target_id = %effective_id,
+                    effective_target_id = ?effective_id,
                     "gate.check"
                 );
                 let denied = matches!(&decision, GateDecision::Deny { .. });
                 let receipt = if let Some(store) = &self.event_store {
-                    let event = build_audit_storage_event(
+                    let mut event = build_audit_storage_event(
                         &gate_req,
                         &audit,
                         if denied {
@@ -139,8 +215,10 @@ impl VerbRegistry {
                             EventOutcome::Success
                         },
                         Some(crate::cost_unit::base_resource_payload(token.request_id())),
-                    )
-                    .with_target(effective_id);
+                    );
+                    if let Some(id) = effective_id {
+                        event = event.with_target(id);
+                    }
                     if denied {
                         self.append_gate_denied_row(store, event, verb).await
                     } else {
@@ -169,7 +247,7 @@ impl VerbRegistry {
                 }
             }
             Err(error) => Err(self
-                .gate_unavailable_error(&gate_req, &error, token.request_id(), Some(effective_id))
+                .gate_unavailable_error(&gate_req, &error, token.request_id(), effective_id)
                 .await),
         }
     }
@@ -337,6 +415,9 @@ impl VerbRegistry {
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
     ///   `git.gates`, `git.status` and `git.log` dispatch that same check,
     ///   so their read results also carry a required decision write.
+    /// - `comm.withheld_body` writes an access audit event on every call;
+    ///   the record of who read a withheld original is the point of the
+    ///   verb, so its accounting row is never droppable.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -394,6 +475,10 @@ impl VerbRegistry {
         ("brain", "brain.profile"),
         ("brain", "brain.resolve"),
         ("brain", "brain.bindings"),
+        // Registered rollback-mode map reads: no domain or maintenance writes.
+        ("code", "code.deps"),
+        ("code", "code.list"),
+        ("code", "code.search"),
         // comm
         ("comm", "comm.delivered"),
         ("comm", "comm.transport_status"),
@@ -418,6 +503,10 @@ impl VerbRegistry {
         ("kg", "query"),
         ("kg", "resolve"),
         ("kg", "whoami"),
+        // schema reports the loaded vocabulary and the declared endpoint
+        // matrix from the registry's in-memory declarations: no store read,
+        // no store write, no event.
+        ("kg", "schema"),
         // scan runs the secret gate over caller-supplied text in process: no
         // store read, no store write, no event.
         ("kg", "scan"),

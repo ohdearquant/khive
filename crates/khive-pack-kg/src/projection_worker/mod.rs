@@ -2,8 +2,12 @@
 
 mod helpers;
 
+#[cfg(test)]
+#[path = "conditional_event_tests.rs"]
+mod conditional_event_tests;
+
 use crate::sql::sql;
-use helpers::build_conditional_event_insert;
+use helpers::build_conditional_event_inserts;
 
 use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
@@ -306,19 +310,18 @@ impl ProposalsProjectionWorker {
         projection_stmt: SqlStatement,
         event: Event,
     ) -> Result<bool, RuntimeError> {
-        let event_stmt = build_conditional_event_insert(&event);
+        let mut statements = build_conditional_event_inserts(&event)?;
+        statements.insert(0, projection_stmt);
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let result = writer
-            .execute_batch(vec![projection_stmt, event_stmt])
-            .await;
+        let result = writer.execute_batch(statements).await;
         khive_storage::usage::account_event_write(
             result
                 .as_ref()
-                .map(|total_rows| u64::from(*total_rows == 2)),
+                .map(|total_rows| u64::from(*total_rows >= 2)),
         );
         let total_rows = result.map_err(RuntimeError::Storage)?;
-        let event_inserted = total_rows == 2;
+        let event_inserted = total_rows >= 2;
         Ok(event_inserted)
     }
 

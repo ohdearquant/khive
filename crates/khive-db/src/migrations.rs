@@ -412,8 +412,49 @@ const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
 
 const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
 const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
-// V57 is reserved by the retrieval-snapshot migration in #5185; it must land first.
+const V57_UP: &str = include_str!("../sql/057-retrieval-snapshots.sql");
 const V58_UP: &str = include_str!("../sql/058-proposal-archive.sql");
+
+// Ledger-tail replay may retain the physical column; accept only its exact shape.
+fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
+    let migration_error = |error: rusqlite::Error| SqliteError::Migration {
+        version: 58,
+        error: format!("proposals_open.archived_at migration failed: {error}"),
+    };
+    let column = tx
+        .query_row(
+            include_str!("../sql/proposal-archive-column.sql"),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(migration_error)?;
+    match column {
+        None => tx.execute_batch(V58_UP).map_err(migration_error),
+        Some((declared_type, not_null, default, primary_key, hidden))
+            if declared_type.eq_ignore_ascii_case("INTEGER")
+                && not_null == 0
+                && default.is_none()
+                && primary_key == 0
+                && hidden == 0 =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(SqliteError::Migration {
+            version: 58,
+            error: "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key".into(),
+        }),
+    }
+}
+
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -774,6 +815,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 56,
         name: "atom_weight_tables",
         up: V56_UP,
+    },
+    VersionedMigration {
+        version: 57,
+        name: "retrieval_snapshot_tables",
+        up: V57_UP,
     },
     VersionedMigration {
         version: 58,
@@ -2078,6 +2124,8 @@ fn apply_versioned_migration(
             version: migration.version,
             error: error.to_string(),
         })?;
+    } else if migration.version == 58 {
+        migrate_proposal_archive(&tx)?;
     } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
         tx.execute_batch(migration.up)
             .map_err(|error| SqliteError::Migration {

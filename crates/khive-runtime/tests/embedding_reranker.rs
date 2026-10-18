@@ -22,9 +22,10 @@ const DIMS: usize = 384;
 
 struct Calls {
     builds: AtomicUsize,
+    // Query-role calls, built-in and custom alike: a custom provider receives
+    // the query text unchanged and owns its own role preparation.
     queries: Mutex<Vec<String>>,
-    raw_queries: Mutex<Vec<String>>,
-    // This counts raw embed calls, including unprefixed custom-provider queries.
+    // Document-role calls; a rerank never makes one.
     documents: AtomicUsize,
     output: Mutex<Vec<f32>>,
     fail: AtomicBool,
@@ -35,7 +36,6 @@ impl Calls {
         Self {
             builds: AtomicUsize::new(0),
             queries: Mutex::new(Vec::new()),
-            raw_queries: Mutex::new(Vec::new()),
             documents: AtomicUsize::new(0),
             output: Mutex::new(output),
             fail: AtomicBool::new(false),
@@ -49,7 +49,6 @@ struct Provider {
 }
 
 struct Service {
-    name: &'static str,
     calls: Arc<Calls>,
 }
 
@@ -69,22 +68,9 @@ impl Service {
 
 #[async_trait]
 impl EmbeddingService for Service {
-    async fn embed(
-        &self,
-        texts: &[String],
-        model: EmbeddingModel,
-    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn embed(&self, _: &[String], _: EmbeddingModel) -> Result<Vec<Vec<f32>>, EmbedError> {
         self.calls.documents.fetch_add(1, Ordering::SeqCst);
-        if self.name != SECOND {
-            return Err(EmbedError::Internal("unexpected document embedding".into()));
-        }
-        assert_eq!(model, EmbeddingModel::BgeSmallEnV15);
-        self.calls
-            .raw_queries
-            .lock()
-            .unwrap()
-            .extend_from_slice(texts);
-        self.output(texts)
+        Err(EmbedError::Internal("unexpected document embedding".into()))
     }
 
     async fn embed_query(
@@ -92,11 +78,6 @@ impl EmbeddingService for Service {
         texts: &[String],
         _: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.name == SECOND {
-            return Err(EmbedError::Internal(
-                "unexpected query-role embedding".into(),
-            ));
-        }
         self.calls.queries.lock().unwrap().extend_from_slice(texts);
         self.output(texts)
     }
@@ -123,7 +104,6 @@ impl EmbedderProvider for Provider {
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         self.calls.builds.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(Service {
-            name: self.name,
             calls: Arc::clone(&self.calls),
         }))
     }
@@ -376,11 +356,9 @@ async fn equal_dimension_engines_bind_both_query_and_stored_vectors() {
     assert_eq!(first.builds.load(Ordering::SeqCst), 0);
     assert_eq!(first.documents.load(Ordering::SeqCst), 0);
     assert!(first.queries.lock().unwrap().is_empty());
-    assert!(first.raw_queries.lock().unwrap().is_empty());
     assert_eq!(second.builds.load(Ordering::SeqCst), 1);
-    assert!(second.queries.lock().unwrap().is_empty());
-    assert_eq!(*second.raw_queries.lock().unwrap(), ["named query"]);
-    assert_eq!(second.documents.load(Ordering::SeqCst), 1);
+    assert_eq!(*second.queries.lock().unwrap(), ["named query"]);
+    assert_eq!(second.documents.load(Ordering::SeqCst), 0);
     assert_eq!(usage.snapshot()["embed_calls"], 1);
     assert_eq!(
         ids(&alias
@@ -392,7 +370,6 @@ async fn equal_dimension_engines_bind_both_query_and_stored_vectors() {
     assert_eq!(first.builds.load(Ordering::SeqCst), 1);
     assert_eq!(*first.queries.lock().unwrap(), ["alias query"]);
     assert_eq!(first.documents.load(Ordering::SeqCst), 0);
-    assert!(first.raw_queries.lock().unwrap().is_empty());
 
     second.fail.store(true, Ordering::SeqCst);
     let error = named
@@ -409,16 +386,14 @@ async fn equal_dimension_engines_bind_both_query_and_stored_vectors() {
         .unwrap();
     assert_eq!(recovered, result);
     assert_eq!(second.builds.load(Ordering::SeqCst), 1);
-    assert_eq!(second.documents.load(Ordering::SeqCst), 3);
+    assert_eq!(second.documents.load(Ordering::SeqCst), 0);
     assert_eq!(
-        *second.raw_queries.lock().unwrap(),
+        *second.queries.lock().unwrap(),
         ["named query", "failed named query", "recovered named query"]
     );
-    assert!(second.queries.lock().unwrap().is_empty());
     assert_eq!(first.builds.load(Ordering::SeqCst), 1);
     assert_eq!(*first.queries.lock().unwrap(), ["alias query"]);
     assert_eq!(first.documents.load(Ordering::SeqCst), 0);
-    assert!(first.raw_queries.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

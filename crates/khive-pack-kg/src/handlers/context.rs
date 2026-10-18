@@ -292,13 +292,7 @@ async fn fetch_mailbox_neighbors(
     };
     merged.sort_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
     merged.dedup_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
-    merged.sort_by(|a, b| {
-        b.0.weight
-            .partial_cmp(&a.0.weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.node_id.cmp(&b.0.node_id))
-            .then(a.0.edge_id.cmp(&b.0.edge_id))
-    });
+    merged.sort_by(compare_context_neighbors);
     Ok((
         merged
             .into_iter()
@@ -678,12 +672,7 @@ impl KgPack {
                     }
                 }
                 // Deterministic hop-1 stratum ordering; see docs/api/context-verb.md.
-                hop2_pool.sort_by(|a, b| {
-                    b.3.partial_cmp(&a.3)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.0.cmp(&b.0))
-                });
+                hop2_pool.sort_by(compare_hop2_neighbors);
                 for (parent, id, relation, weight, dir) in hop2_pool {
                     if !visited.insert(id) {
                         continue;
@@ -885,11 +874,11 @@ impl KgPack {
             });
         }
 
-        let (out_anchors, out_edges, truncated, dropped_anchors, dropped_neighbors) =
+        let (out_anchors, out_edges, mut truncated, dropped_anchors, dropped_neighbors, mut used) =
             assemble_within_budget(&blocks, budget);
 
         anchor_edge_records.sort_by_key(|edge| edge.edge_id);
-        let anchor_edges: Vec<Value> = anchor_edge_records
+        let candidates: Vec<Value> = anchor_edge_records
             .into_iter()
             .filter_map(|edge| {
                 let source = entity_meta.get(&edge.source_id)?;
@@ -904,6 +893,27 @@ impl KgPack {
                 }))
             })
             .collect();
+        let admitted_anchors: HashSet<&str> = out_anchors
+            .iter()
+            .filter_map(|anchor| anchor["entity"]["id"].as_str())
+            .collect();
+        let mut anchor_edges = Vec::with_capacity(candidates.len());
+        let mut dropped_anchor_edges = 0usize;
+        for edge in candidates {
+            let endpoints_admitted = ["source_id", "target_id"].iter().all(|field| {
+                edge[*field]
+                    .as_str()
+                    .is_some_and(|id| admitted_anchors.contains(id))
+            });
+            let size = compact_len(&edge)?;
+            if !endpoints_admitted || size > budget - used {
+                dropped_anchor_edges += 1;
+                truncated = true;
+                continue;
+            }
+            used += size;
+            anchor_edges.push(edge);
+        }
 
         if let Some(t) = t4 {
             plog(call_id, "assembly", t.elapsed().as_micros());
@@ -921,6 +931,7 @@ impl KgPack {
                 "anchors": dropped_anchors,
                 "neighbors": dropped_neighbors,
                 "edges": dropped_neighbors,
+                "anchor_edges": dropped_anchor_edges,
                 "stage": "budget",
             },
         });
@@ -961,7 +972,7 @@ impl KgPack {
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,
-) -> (Vec<Value>, Vec<Value>, bool, usize, usize) {
+) -> (Vec<Value>, Vec<Value>, bool, usize, usize, usize) {
     let mut running = 0usize;
     let mut truncated = false;
     let mut included: Vec<bool> = vec![false; blocks.len()];
@@ -1013,9 +1024,33 @@ fn assemble_within_budget(
         truncated,
         dropped_anchors,
         dropped_neighbors,
+        running,
     )
+}
+
+fn compare_context_neighbors(
+    a: &(NeighborHit, &str),
+    b: &(NeighborHit, &str),
+) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f64(
+        a.0.weight,
+        &(a.0.node_id, a.0.edge_id),
+        b.0.weight,
+        &(b.0.node_id, b.0.edge_id),
+    )
+}
+
+fn compare_hop2_neighbors(
+    a: &(Uuid, Uuid, EdgeRelation, f64, &str),
+    b: &(Uuid, Uuid, EdgeRelation, f64, &str),
+) -> std::cmp::Ordering {
+    khive_score::cmp_desc_then_id_f64(a.3, &(a.1, a.0), b.3, &(b.1, b.0))
 }
 
 #[cfg(test)]
 #[path = "context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "context_ordering_tests.rs"]
+mod ordering_tests;

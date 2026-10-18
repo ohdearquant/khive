@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (28 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (30 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
     HandlerDef {
         name: "kg.proposal_cleanup",
         description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
@@ -27,6 +27,26 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
             description: "Positive ASCII integer immediately followed by s, m, h, or d (fixed seconds, minutes, hours, or days). No default; for example 30d.",
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
+    },
+    HandlerDef {
+        name: "apply_changeset",
+        description: "Apply one bounded canonical NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text including its supported schema envelope, at most 2000 operations in source order.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "schema",
+        description: "Report the full unfiltered loaded vocabulary and declared endpoint matrix. \
+                      Base * means any entity kind, not any substrate. Rows retain base or pack \
+                      origin, source/target substrate and optional entity-type columns. Returns \
+                      counts and a content hash; accepts no filters. Declarations do not replace \
+                      link validation or authorization.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "count",
@@ -1585,8 +1605,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
                       such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
                       row, index, FTS, vector, mixed row-and-embedding, and internal byte totals; \
-                      it reads every page, so size_composition=false skips it and \
-                      size_composition_error says so. page_accounting (page_size_bytes, \
+                      it runs only when the same read snapshot has at most 8192 pages AND \
+                      32 MiB. Larger snapshots have no composition and size_composition_error \
+                      names the observed footprint and limits. These are footprint limits, \
+                      not a latency guarantee. size_composition=false skips the walk regardless \
+                      of size. page_accounting (page_size_bytes, \
                       page_count, freelist_pages) is three pragma reads and is always reported. \
                       WAL checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
@@ -1611,8 +1634,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 28] = [
                 name: "size_composition",
                 param_type: "boolean",
                 required: false,
-                description: "Defaults true. false skips the dbstat walk, whose time grows with \
-                              each file; page_accounting is still reported.",
+                description: "Defaults true. Composition is collected only for snapshots of at \
+                              most 8192 pages AND 32 MiB; larger snapshots carry an explicit \
+                              size_composition_error. false skips the dbstat walk regardless of \
+                              size. page_accounting is still reported.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

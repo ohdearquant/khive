@@ -20,6 +20,7 @@
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
+#   [schema]        explicit import unknown-entity-kind admission
 #   [runtime]       brain profile + default output format
 #   [display]       rendering timezone (ADR-169)
 #   [gate]          optional static caller-enrollment allowlist
@@ -32,6 +33,17 @@
 # ADR references: ADR-031 (multi-engine retrieval), ADR-035 (unified khive.toml),
 # ADR-028 (pack-scoped backends), ADR-007 (namespace / actor model), ADR-078 (output
 # format), ADR-169 (timezone-correct timestamps).
+
+# ── [schema] — explicit KG import admission ────────────────────────────────────
+# Missing files, sections, or strict keys (including an empty section) use true.
+# false preserves unknown nonblank entity kinds verbatim and warns once per kind.
+# Edge relations remain closed in both modes. Unknown keys warn and are ignored;
+# strict must be a TOML boolean. This controls `kkernel kg import` only: ordinary
+# creates keep their registered vocabulary, while local VCS sync degrades unknown
+# kinds to concept and records original kind/subtype provenance plus the
+# khive:degraded_kind tag.
+[schema]
+strict = true
 
 # ── [actor] — identity and namespace scope ──────────────────────────────────────
 #
@@ -331,8 +343,8 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.
-#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the four variables
-#   below are read only when it is set and are ignored while it is unset.
+#   External recipients are disabled until KHIVE_EMAIL_EXTERNAL_SENDERS is set; the variables below,
+#   through the suppression mirror, are read only when it is set and are ignored while it is unset.
 #   KHIVE_EMAIL_EXTERNAL_SENDERS=lambda:example
 #                                Comma-separated actor ids allowed to send to external recipients.
 #   KHIVE_EMAIL_EXTERNAL_DAILY_CAP=200
@@ -348,6 +360,26 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #                                contain {unsubscribe}, replaced with the mailto opt-out sentence.
 #                                External admission is refused while it is unset, unreadable or
 #                                missing the placeholder.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_URL=https://example.com/admin/email-suppression
+#                                Optional. https URL answering the complete one-click opt-out set
+#                                ({"as_of", "count", "recipient_keys"}). Read at most once per
+#                                delivery cycle before any external SMTP send; missing keys are
+#                                added locally as one_click entries. A failed read keeps that
+#                                cycle's external messages pending.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN=      Required with the URL. Bearer credential. Secret.
+#   KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS=3600
+#                                Required with the URL. External admission is refused with
+#                                "suppression mirror stale" while the last successful read is
+#                                older than this; an idle cycle re-reads at half this age.
+#   KHIVE_EMAIL_EXTERNAL_INBOUND=enabled
+#                                Optional. Receives authenticated mail from outside senders without
+#                                setting EXTERNAL_SENDERS, so outbound external sending stays off.
+#                                Requires KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR; any value other than
+#                                enabled or empty refuses start-up.
+#   KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR=lambda:inbox
+#                                Required while external inbound is enabled (EXTERNAL_SENDERS set or
+#                                EXTERNAL_INBOUND=enabled). Receives external mail with no verified
+#                                thread owner and no matching KHIVE_EMAIL_INBOUND_ROUTES alias.
 #   OAuth (Exchange Online app-only) — all three together select OAuth mode; a partial set errors:
 #   KHIVE_EMAIL_OAUTH_TENANT_ID=              Azure AD tenant GUID.
 #   KHIVE_EMAIL_OAUTH_CLIENT_ID=              Azure AD application (client) GUID. Presence selects OAuth.
@@ -415,6 +447,8 @@ name = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_RECALL_FTS_GATHER_LIMIT=        Explicit row cap for rank_subset mode (> 0). Default: derived.
 #   KHIVE_RECALL_FTS_CJK_BYPASS=true      CJK queries bypass term-K selection. Accepts 1/true/0/false.
 #   KHIVE_RECALL_PROFILE=1                Emit per-stage recall timing JSON to stderr (presence = on).
+#   KHIVE_SEARCH_PROFILE=1                Emit per-stage timing JSON for searches that fan out across
+#                                        [[backends]] to stderr (presence = on; kkernel).
 #   ANN_OVERFETCH_MAX_ROUNDS=3           Max ANN over-fetch retry rounds when post-filtering drops
 #                                        candidates below the requested limit (un-prefixed; pack `memory`).
 #

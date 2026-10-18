@@ -420,7 +420,11 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
 /// considered (position is the sole discriminator when no authserv-id
 /// exists); it is trusted only if it parses AND is itself in the
 /// no-authserv-id form -- any authserv-id on it, or a parse failure, fails
-/// closed to `None` rather than falling through to a lower header. See
+/// closed to `None` rather than falling through to a lower header.
+/// `TrustAnchor::TopmostWithAuthservId` (ADR-056 Amendment 2026-10-15): the
+/// same positional rule, except that the topmost header may also carry the
+/// configured `authserv-id`; any other id on it, or a parse failure, fails
+/// closed the same way. See
 /// crates/khive-channel-email/docs/api/auth-results.md#select_trusted for
 /// the topmost-wins rationale and its receiving-MTA precondition.
 pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Option<AuthResults> {
@@ -442,12 +446,181 @@ pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Op
                 None
             }
         }
+        TrustAnchor::TopmostWithAuthservId(configured_id) => {
+            let topmost = parse_header(raw_headers.first()?)?;
+            match topmost.authserv_id.as_deref() {
+                None => Some(topmost),
+                Some(id) if id.eq_ignore_ascii_case(configured_id) => Some(topmost),
+                Some(_) => None,
+            }
+        }
+    }
+}
+
+/// Observe header presence without making either header family trusted.
+/// Prefer the topmost plain header, whose family the attribution gate uses.
+pub(crate) fn observed_auth_header<'a>(
+    plain_headers: &'a [String],
+    headers: &'a HashMap<String, String>,
+    raw_bytes: &[u8],
+) -> Option<(&'static str, Option<&'a str>)> {
+    let plain = plain_headers
+        .first()
+        .map(String::as_str)
+        .or_else(|| headers.get("authentication-results").map(String::as_str));
+    if plain.is_some() || raw_header_present(raw_bytes, b"authentication-results") {
+        return Some(("authentication-results", plain));
+    }
+    let arc = headers
+        .get("arc-authentication-results")
+        .map(String::as_str);
+    if arc.is_some() || raw_header_present(raw_bytes, b"arc-authentication-results") {
+        return Some(("arc-authentication-results", arc));
+    }
+    None
+}
+
+/// The parser can omit an empty header value. This name-only fallback stops at
+/// the header/body boundary and never supplies a value to the trust selector.
+fn raw_header_present(raw_bytes: &[u8], expected: &[u8]) -> bool {
+    for line in raw_bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            if line[..colon].eq_ignore_ascii_case(expected) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ObservedAuthservId {
+    Present { value: String, truncated: bool },
+    NoAuthservId,
+    Unparseable,
+}
+
+/// Extract only an observed identifier; method verdicts never leave this helper.
+/// ARC's instance prefix is removed for disclosure, never for attribution.
+pub(crate) fn observed_authserv_id(raw: Option<&str>, arc: bool) -> ObservedAuthservId {
+    let Some(raw) = raw else {
+        return ObservedAuthservId::Unparseable;
+    };
+    let segments = split_top_level_segments(raw);
+    let segment = if arc {
+        let Some(instance) = segments.first() else {
+            return ObservedAuthservId::Unparseable;
+        };
+        let instance = normalize_delimiter_cfws(instance, false);
+        let valid_instance = instance
+            .trim()
+            .split_once('=')
+            .is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("i")
+                    && !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u32>().is_ok_and(|instance| instance > 0)
+            });
+        if !valid_instance {
+            return ObservedAuthservId::Unparseable;
+        }
+        segments.get(1)
+    } else {
+        segments.first()
+    };
+    let Some(segment) = segment else {
+        return ObservedAuthservId::Unparseable;
+    };
+    let segment = normalize_delimiter_cfws(segment, false);
+    let Some(token) = split_top_level_ws(&segment).into_iter().next() else {
+        return ObservedAuthservId::Unparseable;
+    };
+    if contains_unquoted(&token, '=') {
+        return ObservedAuthservId::NoAuthservId;
+    }
+    let mut value = String::new();
+    for character in token.chars() {
+        let printable = character.escape_default().to_string();
+        if value.len() + printable.len() > 128 {
+            return ObservedAuthservId::Present {
+                value,
+                truncated: true,
+            };
+        }
+        value.push_str(&printable);
+    }
+    ObservedAuthservId::Present {
+        value,
+        truncated: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_authserv_ids_are_bounded_printable_and_never_select_arc() {
+        let long = format!("{}; dmarc=pass", "x".repeat(300));
+        assert_eq!(
+            observed_authserv_id(Some(&long), false),
+            ObservedAuthservId::Present {
+                value: "x".repeat(128),
+                truncated: true
+            }
+        );
+        let quoted = "\"m\u{e9}x\u{1}id\" 1; dmarc=pass";
+        let ObservedAuthservId::Present { value, truncated } =
+            observed_authserv_id(Some(quoted), false)
+        else {
+            panic!("quoted identifier should be observed")
+        };
+        assert!(value.is_ascii() && value.bytes().all(|byte| byte.is_ascii_graphic()));
+        assert!(value.contains("\\u{e9}") && value.contains("\\u{1}"));
+        assert!(!truncated && value.len() <= 128);
+        assert_eq!(
+            observed_authserv_id(Some("i=2; mx.microsoft.com 1; dmarc=pass"), true),
+            ObservedAuthservId::Present {
+                value: "mx.microsoft.com".into(),
+                truncated: false
+            }
+        );
+        assert_eq!(
+            observed_authserv_id(Some("i=bad; mx.example.com"), true),
+            ObservedAuthservId::Unparseable
+        );
+        assert_eq!(
+            observed_authserv_id(Some("spf=pass smtp.mailfrom=example.com"), false),
+            ObservedAuthservId::NoAuthservId
+        );
+        assert_eq!(
+            observed_authserv_id(Some(""), false),
+            ObservedAuthservId::Unparseable
+        );
+        assert!(select_trusted(&[], &TrustAnchor::AuthservId("mx.microsoft.com".into())).is_none());
+    }
+
+    #[test]
+    fn observed_header_presence_stops_at_body_and_ignores_continuation_names() {
+        let empty = HashMap::new();
+        assert_eq!(
+            observed_auth_header(
+                &[],
+                &empty,
+                b"Authentication-Results:\r\nFrom: a@example.com\r\n\r\nbody"
+            ),
+            Some(("authentication-results", None))
+        );
+        assert_eq!(
+            observed_auth_header(&[], &empty, b"ARC-Authentication-Results:\r\n\r\nbody"),
+            Some(("arc-authentication-results", None))
+        );
+        assert_eq!(observed_auth_header(&[], &empty, b"Subject: text\r\n Authentication-Results: forged\r\n\r\nARC-Authentication-Results: body"), None);
+    }
 
     #[test]
     fn parse_header_extracts_authserv_id_and_dmarc_pass() {
@@ -744,6 +917,73 @@ mod tests {
             !selected.dmarc_pass(),
             "the topmost (failing) no-id header must win over a forged passing header below it"
         );
+    }
+
+    // --- Topmost trust with a shared authserv-id (ADR-056 Amendment 2026-10-15) ---
+
+    /// The plain `Authentication-Results` value Exchange Online stamps on mail
+    /// delivered to a Microsoft 365 mailbox from an external sender, with the
+    /// `mx.microsoft.com` authserv-id and the RFC 8601 version token. Shape
+    /// from a delivered message; the envelope address and domains are
+    /// replaced with example values.
+    const EXO_AUTHSERV_ID_FIXTURE_HEADER_VALUE: &str = "mx.microsoft.com 1; spf=pass (sender IP is 192.0.2.10) smtp.mailfrom=send.example.com; dkim=pass (signature was verified) header.d=example.com;dkim=pass (signature was verified) header.d=amazonses.com;dmarc=pass action=none header.from=example.com;compauth=pass reason=100";
+
+    fn shared_id_anchor() -> TrustAnchor {
+        TrustAnchor::TopmostWithAuthservId("mx.microsoft.com".to_string())
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_picks_the_stamped_topmost() {
+        let headers = vec![EXO_AUTHSERV_ID_FIXTURE_HEADER_VALUE.to_string()];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert_eq!(selected.authserv_id.as_deref(), Some("mx.microsoft.com"));
+        assert!(selected.dmarc_pass_aligned("example.com"));
+        assert!(selected.dkim_pass_aligned("example.com"));
+        // The same header is refused by the no-authserv-id mode.
+        assert!(select_trusted(&headers, &TrustAnchor::TopmostNoAuthservId).is_none());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_matches_the_id_case_insensitively() {
+        let headers = vec!["MX.Microsoft.COM 1; dmarc=pass header.from=example.com".to_string()];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_some());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_still_accepts_an_unstamped_topmost() {
+        let headers = vec![EXO_FIXTURE_HEADER_VALUE.to_string()];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert!(selected.authserv_id.is_none());
+        assert!(selected.dmarc_pass_aligned("gmail.com"));
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_refuses_another_id_at_the_top() {
+        // A different id at the top fails closed even when a lower header
+        // carries the configured id: position, not the id, picks the header.
+        let headers = vec![
+            "mx.example.net; dmarc=pass header.from=example.com".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_none());
+    }
+
+    #[test]
+    fn select_trusted_topmost_with_authserv_id_mode_never_falls_through_below_the_topmost() {
+        // The boundary's own failing stamp is topmost; a forged passing header
+        // with the same shared id sits below it and must not be selected.
+        let headers = vec![
+            "mx.microsoft.com 1; spf=fail smtp.mailfrom=evil.example; dmarc=fail action=quarantine header.from=example.com".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        let selected = select_trusted(&headers, &shared_id_anchor()).unwrap();
+        assert!(!selected.dmarc_pass());
+        // An unparseable topmost fails closed instead of reaching the lower header.
+        let headers = vec![
+            "   ".to_string(),
+            "mx.microsoft.com 1; dmarc=pass header.from=example.com".to_string(),
+        ];
+        assert!(select_trusted(&headers, &shared_id_anchor()).is_none());
     }
 
     #[test]

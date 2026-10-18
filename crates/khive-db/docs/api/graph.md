@@ -1,6 +1,6 @@
 # Graph Store (Edges)
 
-`SqlGraphStore` (`crates/khive-db/src/stores/graph.rs`) implements the
+`SqlGraphStore` (`crates/khive-db/src/stores/graph/store_impl.rs`) implements the
 `GraphStore` capability trait over the `graph_edges` table. This is the
 function-specific technical reference for its write-routing and the
 endpoint-existence guards that back `link`'s atomic-unit safety.
@@ -57,6 +57,43 @@ guarded results) retain their signatures but default to that non-resurrecting
 policy. Batch observed writes preflight every endpoint and tombstone policy
 inside one transaction before changing any row, so refusal remains
 all-or-nothing.
+
+## Caller-supplied statement guards and create-only insertion
+
+`compose_graph_mutation_events` accepts ordered
+`GraphMutationPreconditions.statement_guards`. Each `GraphStatementGuard` carries
+a required caller label and one parameterized SELECT. The caller owns the
+predicate and its tables. Guards run after the existing snapshot checks and
+before mutation, on the connection already enlisted in the writer's IMMEDIATE
+transaction. Both direct and queued routes retain that transaction through edge
+and event insertion.
+
+Each guard must return exactly one row and one column. SQLite INTEGER `1`
+passes; INTEGER `0` refuses with `PredicateFalse`. Empty and multiple-row results,
+wrong column counts, and all other value representations refuse with a typed
+shape reason. Row cardinality is checked before interpreting a false or
+non-boolean value. SELECT and WITH followed by SELECT are accepted; extra
+executable statements and other statement kinds are rejected. Preparation,
+binding and execution errors remain storage errors.
+
+The first refusal returns `GraphMutationOutcome::GuardFailed` with the caller's
+label and reason. Later guards, the mutation, retirements and the event callback
+do not run. Guard failure applies to all composition requests, including an
+otherwise empty batch. The failure's display omits SQL text and bound values.
+
+`GraphMutationRequest::InsertIfAbsent` inserts a live edge without replacement
+or resurrection. A natural-key winner returns `ExistingLive` or `Tombstoned`,
+including when the requested ID also collides. An unrelated ID collision without
+a natural-key winner remains a storage error. `Created` returns the canonical
+stored edge and permits exactly one ordinary lifecycle event; an event append
+failure rolls the edge back. The generic primitive contains no pack-specific
+SHA, repository or cursor checks. The existing commit-annotation path continues
+to enforce its own predicates until its caller migrates.
+
+The neutral guard and four-state `EdgeInsertIfAbsentOutcome` types live in
+`khive-storage`. The DB composition represents guard failure at its top level;
+the runtime wrapper maps that refusal to the public insert outcome's
+`GuardFailed` variant.
 
 ## Atomic `link` statement builders (ADR-099 §B3)
 

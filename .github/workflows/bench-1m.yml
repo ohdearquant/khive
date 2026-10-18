@@ -68,6 +68,9 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   ann-ci-gate:
     name: ANN structural regression gate (synthetic, hermetic)
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

@@ -3,7 +3,7 @@ use khive_gate::{
     classify_operation, OperationAccess, CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION,
 };
 
-// Frozen v13 inventory plus the single reviewed v14 addition. Independent of the
+// Frozen v19 inventory plus the single reviewed v20 addition. Independent of the
 // production lookup table so changing an existing effect is a contract regression.
 const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.kill", OperationAccess::Write),
@@ -11,6 +11,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.resume", OperationAccess::Write),
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
+    ("apply_changeset", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
@@ -44,7 +45,10 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("brain.resolve", OperationAccess::Read),
     ("brain.state", OperationAccess::Read),
     ("brain.unbind", OperationAccess::Write),
+    ("code.deps", OperationAccess::Read),
     ("code.ingest", OperationAccess::Write),
+    ("code.list", OperationAccess::Read),
+    ("code.search", OperationAccess::Read),
     ("comm.cleanup_expired_quarantine", OperationAccess::Write),
     ("comm.cursor_commit", OperationAccess::Write),
     ("comm.cursor_get", OperationAccess::Read),
@@ -64,6 +68,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("comm.thread", OperationAccess::Read),
     ("comm.transport_status", OperationAccess::Read),
     ("comm.unread", OperationAccess::Read),
+    ("comm.withheld_body", OperationAccess::Write),
     ("context", OperationAccess::Read),
     ("count", OperationAccess::Read),
     ("create", OperationAccess::Write),
@@ -118,6 +123,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("knowledge.import", OperationAccess::Write),
     ("knowledge.index", OperationAccess::Write),
     ("knowledge.learn", OperationAccess::Write),
+    ("knowledge.lint", OperationAccess::Write),
     ("knowledge.list", OperationAccess::Read),
     ("knowledge.search", OperationAccess::Read),
     ("knowledge.stats", OperationAccess::Read),
@@ -156,6 +162,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("schedule.cancel", OperationAccess::Write),
     ("schedule.remind", OperationAccess::Write),
     ("schedule.schedule", OperationAccess::Write),
+    ("schema", OperationAccess::Read),
     ("search", OperationAccess::Read),
     ("session.export", OperationAccess::Read),
     ("session.list", OperationAccess::Read),
@@ -201,7 +208,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v14");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v20");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

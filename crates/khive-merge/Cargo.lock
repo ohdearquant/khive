@@ -120,9 +120,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -130,9 +130,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -1252,8 +1252,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-changeset"
+version = "0.13.0"
+dependencies = [
+ "khive-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "khive-channel"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1269,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1300,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1314,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1322,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "khive-score",
  "serde",
@@ -1331,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -1343,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "khive-merge"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "khive-runtime",
@@ -1357,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "khive-types",
  "thiserror",
@@ -1365,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1386,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1396,9 +1406,11 @@ dependencies = [
  "chrono-tz",
  "iana-time-zone",
  "inventory",
+ "khive-changeset",
  "khive-channel",
  "khive-db",
  "khive-fold",
+ "khive-fs",
  "khive-fusion",
  "khive-gate",
  "khive-query",
@@ -1428,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -1436,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1453,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2097,9 +2109,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2162,9 +2174,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",

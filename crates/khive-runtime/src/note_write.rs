@@ -154,12 +154,11 @@ impl From<NoteFence> for NoteFences {
 
 impl NoteFences {
     fn validate_count(count: usize) -> RuntimeResult<()> {
-        if count > MAX_NOTE_FENCES {
-            return Err(RuntimeError::InvalidInput(format!(
+        crate::note_validation::validate_fence_count(count, MAX_NOTE_FENCES, || {
+            format!(
                 "fence list admits at most {MAX_NOTE_FENCES} entries; this call sent {count}: each fence is a read taken while holding the writer"
-            )));
-        }
-        Ok(())
+            )
+        })
     }
 
     pub fn entries(&self) -> &[NoteFence] {
@@ -892,7 +891,6 @@ impl KhiveRuntime {
         snapshot: khive_storage::note::Note,
         patch: crate::curation::NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, crate::atomic_plan::UpdatePlan)> {
-        use crate::atomic_plan::{AffectedRowGuard, PlanStatement, PostCommitEffect, UpdatePlan};
         let options = patch.write_options.clone();
         options.validate()?;
         if options.key.is_some() {
@@ -903,13 +901,51 @@ impl KhiveRuntime {
                 self.validate_note_kind(&fence.kind)?;
             }
         }
+        let (note, text_changed, changed) = self
+            .prepare_update_note_from_snapshot(token, snapshot.clone(), patch)
+            .await?;
+        let metadata_only = self.stream_member_error(&note).await?.is_some();
+        Self::materialize_versioned_note_update(
+            token,
+            snapshot,
+            note,
+            text_changed,
+            changed,
+            options,
+            metadata_only,
+            chrono::Utc::now().timestamp_micros(),
+        )
+    }
+
+    /// Build the existing guarded note plan without acquiring another reader.
+    /// Canonical operations call this with the writer-current row after their
+    /// preimage comparison; ordinary callers pass their prepared snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_versioned_note_update(
+        token: &NamespaceToken,
+        snapshot: khive_storage::Note,
+        mut note: khive_storage::Note,
+        text_changed: bool,
+        changed: bool,
+        options: NoteWriteOptions,
+        metadata_only: bool,
+        now: i64,
+    ) -> RuntimeResult<(khive_storage::Note, crate::atomic_plan::UpdatePlan)> {
+        use crate::atomic_plan::{AffectedRowGuard, PlanStatement, PostCommitEffect, UpdatePlan};
         let expected_updated_at = snapshot.updated_at;
         let expected_deleted_at = snapshot.deleted_at;
         let expected_snapshot_version = snapshot.version;
-        let (mut note, text_changed, changed) = self
-            .prepare_update_note_from_snapshot(token, snapshot, patch)
-            .await?;
         validate_head(&note)?;
+        crate::secret_gate::check_reserved_carry_forward(
+            snapshot.properties.as_ref(),
+            note.properties.as_ref(),
+            note.name == snapshot.name
+                && note.content == snapshot.content
+                && crate::secret_gate::without_reserved_properties(note.properties.as_ref())
+                    == crate::secret_gate::without_reserved_properties(
+                        snapshot.properties.as_ref(),
+                    ),
+        )?;
         // ADR-172 Amendment 5: the no-op answer is for unfenced updates only.
         // A write that names `expected_version` is asking for exactly one
         // accepted write at that version, and the version it mints is the only
@@ -964,16 +1000,14 @@ impl KhiveRuntime {
                     note.id
                 ))
             })?;
-            note.updated_at = chrono::Utc::now()
-                .timestamp_micros()
-                .max(minimum_updated_at);
+            note.updated_at = now.max(minimum_updated_at);
         }
         let next_version = note
             .version
             .checked_add(1)
             .ok_or_else(|| RuntimeError::InvalidInput("note version exhausted".into()))?;
         note.version = next_version;
-        let mut update = if self.stream_member_error(&note).await?.is_some() {
+        let mut update = if metadata_only {
             khive_db::stores::note::note_metadata_replace_if_unchanged_statement(
                 &note,
                 expected_updated_at,

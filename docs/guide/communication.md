@@ -409,6 +409,36 @@ Every channel poller must supply both `Channel::kind()` and `Channel::slug()`;
 kind alone cannot distinguish two accounts using the same adapter. Duplicate
 `external_id` values are ignored, making re-delivery idempotent.
 
+#### Inbound disposition order
+
+Each polled message is disposed in a fixed order (ADR-200 §7). Steps that keep
+the behaviour described above are unchanged:
+
+1. A message that is malformed or over the byte cap is quarantined.
+2. A subject carrying a verified mailto unsubscribe token is a machine record,
+   not mail: the token's recipient key is added to the suppression list
+   (`source = mailto_token`) and the message is neither delivered to an actor
+   nor quarantined. The poll cursor advancing past its UID is how the poller
+   marks it processed, so it is not polled again. A second copy of the same
+   unsubscribe neither fails nor duplicates. This runs before domain
+   authentication, because the token is the authority.
+3. Domain authentication failing is quarantined as before.
+4. A `From:` that is the maintainer is attributed and routed as before.
+5. While external inbound is disabled (neither `KHIVE_EMAIL_EXTERNAL_SENDERS`
+   nor `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` is set), any other authenticated
+   sender is quarantined `off-allowlist`.
+6. With external inbound enabled, an `inbound` suppression entry matching the
+   authenticated sender's address or its exact domain (no subdomain match) is
+   quarantined `blocked`.
+7. Otherwise screening decides between delivery to the routed actor, withheld
+   delivery and quarantine (see the email channel's external inbound
+   documentation).
+
+The `inbound` suppression entries are read from the same comm store the
+`comm.suppression_add` / `comm.suppression_list` / `comm.suppression_remove`
+verbs write, so an operator or the channel itself can add one without a
+restart.
+
 ### Configuration
 
 `EmailChannelConfig::from_env` reads configuration exclusively from
@@ -426,8 +456,10 @@ Required:
 - `KHIVE_EMAIL_AUTHSERV_ID` (the trust anchor for validating inbound
   `Authentication-Results` headers; the reserved value
   `!topmost-no-authserv-id` selects trust of the topmost header when the
-  receiving boundary emits no `authserv-id` at all, as with Exchange Online's
-  internal-hop stamp)
+  receiving boundary emits no `authserv-id` at all; `!topmost:<authserv-id>`
+  also trusts only the topmost header, accepting either no `authserv-id` or the
+  given one, for a boundary such as Exchange Online that stamps
+  `mx.microsoft.com` on its own header for some senders and nothing for others)
 
 Auth mode (choose one):
 
@@ -480,6 +512,33 @@ did before, and the values are ignored entirely.
   `{unsubscribe}`, which the channel replaces with the mailto opt-out
   instruction. External admission is refused while it is unset, unreadable or
   missing the placeholder; policy-recipient messages are unaffected)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` (optional; an `https://` URL that
+  answers the complete set of one-click opt-outs as
+  `{"as_of": "<RFC 3339>", "count": N, "recipient_keys": [...]}`. When set,
+  the outbox reads it at most once per delivery cycle, before any external
+  message goes to SMTP, and adds every missing key to the local suppression
+  list as a `one_click` entry; nothing is written back. A failed read keeps
+  every external message of that cycle pending, never failed. A cycle also
+  reads it when the last successful read is at least half the maximum age old,
+  so an idle deployment stays admissible)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN` (required with the URL; sent as a
+  bearer credential. Secret)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` (required with the URL;
+  positive integer. External admission, which does no network I/O, is refused
+  with `suppression mirror stale` while the last successful read is older than
+  this; policy-recipient messages are unaffected. Either of these two variables
+  without the URL is a configuration error)
+
+Mail from outside senders can be received without enabling external sending:
+`KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` admits authenticated non-maintainer mail
+as external inbound (sender `email:<address>`, `origin=external`,
+`trust=untrusted`, routed by verified thread owner, then
+`KHIVE_EMAIL_INBOUND_ROUTES`, then `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR`) while
+`KHIVE_EMAIL_EXTERNAL_SENDERS` stays unset, so a send to an address outside the
+outbound allowlist is still refused. Start-up fails if
+`KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or empty while external inbound
+is enabled, and any value of `KHIVE_EMAIL_EXTERNAL_INBOUND` other than
+`enabled` or empty is a configuration error.
 
 An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
 the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a

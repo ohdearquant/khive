@@ -34,6 +34,28 @@ on:
       - "scripts/perf/bench_load_harness.py"
       - "scripts/perf/test_bench_load_harness.py"
       - ".github/workflows/bench-pipeline.yml"
+  push:
+    branches: ["integration/**"]
+    paths:
+      - "crates/khive-pack-memory/**"
+      - "crates/khive-pack-kg/**"
+      - "crates/khive-runtime/**"
+      - "crates/khive-db/**"
+      - "crates/khive-retrieval/**"
+      - "crates/khive-fusion/**"
+      - "crates/khive-bm25/**"
+      - "crates/khive-vamana/**"
+      - "crates/khive-hnsw/**"
+      - "crates/khive-score/**"
+      - "crates/khive-mcp/**"
+      - "crates/kkernel/**"
+      - "scripts/perf/bench_pipeline_daemon.py"
+      - "scripts/perf/test_bench_pipeline_daemon.py"
+      - "scripts/perf/mcp_bench_client.py"
+      - "scripts/perf/test_mcp_bench_client.py"
+      - "scripts/perf/bench_load_harness.py"
+      - "scripts/perf/test_bench_load_harness.py"
+      - ".github/workflows/bench-pipeline.yml"
 
 permissions:
   contents: read
@@ -44,6 +66,9 @@ env:
 jobs:
   pipeline-gate:
     name: Pipeline Regression Gate
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:

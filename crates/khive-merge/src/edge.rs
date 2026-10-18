@@ -10,6 +10,7 @@ use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
 use crate::diff_local::{diff_edges, properties_equal, EdgeChange, EdgeKey};
+use crate::entity::select_property_value;
 use crate::types::{BranchSide, MergeConflict, MergeError};
 
 /// Merges edges from `base`, `ours`, and `theirs` by semantic edge key.
@@ -371,16 +372,9 @@ fn merge_edge_properties(
         let base_value = base_object.and_then(|object| object.get(&property_key));
         let ours_value = ours_object.and_then(|object| object.get(&property_key));
         let theirs_value = theirs_object.and_then(|object| object.get(&property_key));
-        let selected = if ours_value == theirs_value {
-            ours_value
-        } else if ours_value == base_value {
-            theirs_value
-        } else if theirs_value == base_value {
-            ours_value
-        } else {
+        let selected = select_property_value(base_value, ours_value, theirs_value, || {
             has_conflict = true;
-            ours_value
-        };
+        });
 
         if let Some(value) = selected {
             merged.insert(property_key, value.clone());

@@ -28,6 +28,8 @@ Decoding requires an envelope line, checks its `schema_version` against `CURRENT
 
 A blank or whitespace-only operation line is malformed rather than ignored. This keeps the invariant “every post-header line is an operation” exception-free. Serde `deny_unknown_fields` mirrors reject extraneous or misspelled envelope, operation, patch, and embedded-preimage keys.
 
+A line in which any JSON object, at any depth, names the same member twice is malformed. Names are compared after JSON unescaping, so `"label"` and `"label"` are one name. A typed decode would keep only the last copy, so a check of the decoded values could not see an earlier one that the text still holds. The error gives a position only, never the member name or its value.
+
 Malformed JSON reports a one-based physical line number. An unsupported schema reports both the found and expected versions.
 
 ## `ChangeSetError`

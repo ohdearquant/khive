@@ -84,10 +84,39 @@ source ownership for the sweep, so files in one package do not reopen the same m
 Both the project and module endpoints of `project contains module` carry the same
 `source_project`, so either endpoint supports ownership aggregation.
 
+## Registered map reads
+
+`code.list(map, kind?, project_id?, cursor?, limit?)`,
+`code.search(map, query, kind?, project_id?, cursor?, limit?)`, and
+`code.deps(map, id, direction?, max_depth?, limit?)` read an operator-registered map
+through the shared read-only registry. They accept a map name, never a filesystem
+path; responses echo that name. Unknown maps and malformed parameters fail before
+opening a database. See [ADR-139](../../../docs/adr/ADR-139-code-map-read-access.md).
+
+List and search expose only live `project` entities and `concept` entities with
+`module`, `function`, `datatype`, or `interface` subtypes. Project rows have a null
+`project_id`; code rows derive their containing project through live, map-local
+`contains` edges, including nested declarations. List orders by name then id, with
+a default page size of 100 and maximum 500. Search treats the non-empty query as a
+literal name substring, using Unicode lowercase comparison; exact matches rank
+above prefixes, then interior matches, with id breaking ties. Its default page
+size is 20 and maximum 200. Both return `items` and a nullable `next_cursor` bound
+to the map's registration generation and all result filters. Reusing a cursor
+with another map, registration or filter is an error.
+
+Dependencies follow live map-local `depends_on` edges of every dependency scope,
+including normal, dev and build dependencies. Direction defaults to `both`;
+`incoming` and `outgoing` are also accepted. Depth defaults to 2 (maximum 10), and
+the total node limit defaults to 200 (maximum 1000), counting the root. Nodes order
+by breadth-first depth then id. `truncated` reports whether the node cap omitted
+reachable nodes within the requested depth. The response retains every dependency
+edge between returned nodes, including cross and back edges.
+
 ## Runtime surface
 
-The pack depends on `kg`, registers the finding hook and vocabulary, and contributes one verb:
-`code.ingest`, the L1 manifest + L1.5 import-scan source ingester targeting a dedicated map
+The pack depends on `kg`, registers the finding hook and vocabulary, and contributes four verbs.
+
+`code.ingest` is the L1 manifest + L1.5 import-scan source ingester targeting a dedicated map
 database, with an opt-in L2 Rust symbol tier. Its optional `tiers` array accepts `l1`, `l1.5`, and
 `l2`. Omission or `null` preserves the L1+L1.5 default with L2 disabled; an empty array performs no
 graph writes. Target opening and schema initialization still occur. When L2 is disabled, its five

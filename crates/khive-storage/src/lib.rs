@@ -43,7 +43,10 @@ pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
 pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
-pub use graph::GraphStore;
+pub use graph::{
+    EdgeInsertIfAbsentOutcome, GraphGuardValueKind, GraphStatementGuard,
+    GraphStatementGuardFailure, GraphStatementGuardFailureReason, GraphStore,
+};
 pub use khive_types::vector::{
     decode_f32_le, decode_f32_native, encode_f32_le, encode_f32_native, VectorCodecError,
 };

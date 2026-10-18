@@ -271,7 +271,7 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 151 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 158 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -289,8 +289,9 @@ def main():
         # stored event rows) are included in the count; git contributes
         # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
         # git.update_ref / git.push (four thin write verbs shelling to system git
-        # with hardened argv construction); code contributes exactly one
-        # verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
+        # with hardened argv construction); code contributes three registered-map
+        # read verbs (`code.list`, `code.search`, `code.deps`, ADR-139) plus
+        # `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
         # L1.5 import-scan tiers; its `finding` note kind and
         # `findings.json` batch ingest remain reachable only via the
         # `kkernel code-ingest` admin CLI, never this MCP verb surface);
@@ -308,11 +309,16 @@ def main():
         # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
         # tool contributes fourteen verbs, including tool.policy_delete, and
-        # exec nine (the tool registry with use policy and sandboxed runs over trees).
+        # exec nine (the tool registry with use policy and sandboxed runs over trees);
+        # knowledge contributes knowledge.lint for graph hygiene inspection;
+        # comm contributes comm.withheld_body, the recipient's or maintainer's
+        # read of a withheld external message's original (ADR-200 Amendment 1);
+        # kg contributes apply_changeset, the atomic apply of one canonical
+        # NDJSON change-set.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 151, (
-            f"expected 151 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 158, (
+            f"expected 158 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -324,7 +330,7 @@ def main():
             f"secret gate without a write; comm.health is #606; comm.probe is #644; "
             f"brain.event_counts is #724/ADR-103; brain.event_page is #4118; git contributes git.digest plus "
             f"git.commit/git.branch/git.update_ref/git.push (ADR-108 and ADR-182); "
-            f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
+            f"code contributes code.ingest and three registered-map reads (ADR-139); "
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes put/get/stat, begin/put_part/commit/abort per ADR-173, "
             f"and opt-in import/export; "
@@ -338,6 +344,7 @@ def main():
             f"and git.ingest_cursor; "
             f"tool contributes fourteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "
+            f"knowledge contributes knowledge.lint; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -353,6 +360,10 @@ def main():
         assert "code.ingest" in verb_names, (
             f"'code.ingest' (ADR-085 Amendment 2, PR #1039) must appear in verbs listing: {verb_names}"
         )
+        for code_read_verb in ("code.list", "code.search", "code.deps"):
+            assert code_read_verb in verb_names, (
+                f"'{code_read_verb}' (ADR-139) must appear in verbs listing: {verb_names}"
+            )
         assert "comm.delivered" in verb_names, (
             f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
         )

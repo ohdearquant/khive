@@ -19,16 +19,16 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 27    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 29    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 14    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
-| `knowledge` | 20    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
+| `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
-| `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
+| `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
@@ -60,8 +60,8 @@ one more snapshot attempt; a snapshot still failing after the bounded repairs re
 creation time and persists nothing when that delivery capability is absent; the other
 three schedule verbs remain available without `comm`.
 
-`code` registers the `finding` note kind and edge rules, plus the `code.ingest` verb (L1
-manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
+`code` registers the `finding` note kind and edge rules, `code.ingest` (source ingest,
+ADR-085), and `code.list`, `code.search`, `code.deps` (registered-map reads, ADR-139); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
 That admin path is history-preserving: a deterministic entity, finding-note,
@@ -238,11 +238,26 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 27 verbs
+## `kg` pack — 29 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
 Declaration = changes institutional status by fiat.
+
+### `schema` — Assertive
+
+Report the full, unfiltered vocabulary and declared endpoint matrix for the loaded
+registry. Accepts no parameters or filters.
+
+```text
+schema()
+```
+
+Returns `entity_kinds`, `note_kinds`, `edge_relations`, `endpoint_rules`,
+`packs_loaded`, their `counts`, and a content hash in `contract_version`. Endpoint
+rows retain their base or pack origin, source and target substrates, and optional
+entity types. A base `*` means any entity kind, not any substrate. These declarations
+do not replace link validation or authorization.
 
 ### `create` — Commissive
 
@@ -1029,6 +1044,20 @@ Withdraw an open proposal (proposer-only).
 request(ops="withdraw(id=\"<proposal-id>\")")
 ```
 
+### `apply_changeset` — Commissive
+
+Apply one canonical change-set atomically. The complete NDJSON delta, its schema envelope plus at
+most 2000 operations in source order, lands through one writer transaction and keeps the
+identifiers its creates and links were staged with. Each operation's captured preimage is compared
+with the live record immediately before that operation writes; the first refusal rolls back the
+whole unit and names its operation index and field. Merge operations are refused before
+preparation. Canonical properties replace the whole map. See
+[the change-set apply reference](../../crates/khive-pack-kg/docs/api/apply-changeset.md).
+
+| Param   | Type   | Required | Notes                                                                              |
+| ------- | ------ | -------- | ---------------------------------------------------------------------------------- |
+| `delta` | string | yes      | Complete NDJSON delta text including its schema envelope, at most 2000 operations. |
+
 ### `resolve` — Assertive
 
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
@@ -1094,19 +1123,21 @@ all database files already opened by this server. The existing top-level fields 
 main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
 sidecar file size, page-level database size composition, and a WAL-pin holder census.
 
-| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                           |
-| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.   |
-| `size_composition` | boolean | `true`              | `false` skips the `dbstat` walk behind `size_composition`, which reads every page of each file. `size_composition_error` then says it was not collected, and `page_accounting` is still reported. |
+| Parameter          | Type    | Default             | Meaning                                                                                                                                                                                                                                     |
+| ------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend`          | string  | all opened backends | Inspect only the opened database serving this backend name. The top-level fields then describe that database. An unknown or not-yet-opened name is `invalid_input` listing the opened backends.                                             |
+| `size_composition` | boolean | `true`              | Request exact `dbstat` composition for snapshots of at most 8,192 pages and 32 MiB. Larger snapshots are skipped with an explicit `size_composition_error`. `false` skips the walk regardless of size. `page_accounting` is still reported. |
 
 All selected backends share the request's read deadline. The process that runs the request sets
 it from its own environment (`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds); for a running
 daemon that is the daemon's environment, not the caller's. When the deadline arrives, the report
 keeps the backends already inspected, every remaining entry has `diagnostics: null` and an `error`
 starting with `not inspected: request deadline`, and the top-level `complete` is `false`.
-Inspections stop a tenth of the remaining time before the deadline, at most two seconds, so the
-partial report reaches a caller whose own deadline started a little earlier. `complete` is `true`
-when every selected backend was reached. A cancelled request still fails as a whole.
+Inspections reserve a tenth of the remaining time, at most two seconds, for settling work and
+returning the partial report. This reserve does not guarantee delivery before the caller's
+deadline: blocking filesystem or SQLite work can take longer to settle. `complete` is `true`
+when every selected backend was reached; an unavailable composition section does not change
+that backend-inspection meaning. A cancelled request still fails as a whole.
 
 `databases` is an array with one entry per canonical database file (or distinct in-memory
 pool), main first. Each entry has
@@ -1303,7 +1334,19 @@ unknown sidecar identities, and OS-confirmed holders missing sidecar evidence de
 latter is a forecast: diagnostics never performs the cleanup it reports.
 
 `size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
-It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+Before starting that walk, the collector reads page accounting in an explicit read transaction
+and admits only snapshots with at most **8,192 pages AND 32 MiB**
+(`page_count * page_size_bytes`, checked for overflow). The accounting and admitted walk use
+the same snapshot; the transaction ends before subsequent sections. Above either limit,
+`size_composition` is absent and `size_composition_error` reports the observed page count,
+page size, byte size, and both limits. Unavailable or invalid page metadata also prevents the
+walk. Other diagnostic sections and available page accounting remain in the report.
+
+These limits are a footprint policy, not a latency guarantee. This collector does not provide
+exact per-object composition for stores above the limits, even when `size_composition=true`.
+The policy does not bound the separate PASSIVE checkpoint, graph integrity or holder census.
+
+For admitted snapshots, the report contains page/freelist/accounted/unaccounted byte totals plus operational class totals
 for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
 SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
 in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
@@ -1978,7 +2021,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 14 verbs
+## `comm` pack — 15 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2322,6 +2365,29 @@ request(ops="comm.suppression_remove(id=\"<entry-id>\", reason=\"operator reques
 
 Returns `{id, removed, audit_event_id}`.
 
+### `comm.withheld_body` — Assertive
+
+Read the original RFC 5322 bytes of a delivered withheld message: an external message whose
+body a screening rule replaced with a rule-ID placeholder. Open to the message's recipient
+actor (its `to_actor`) and to the configured maintainer actor. Any other caller is refused
+before the original is read, and the refusal names neither the sender nor any content. An id
+that is not a delivered withheld external message, a quarantine record included, is refused.
+Every call, allowed or refused, writes an audit event naming the caller, the message id and
+the outcome (`allowed`, `not_found`, `refused_caller`, `refused_not_withheld` or
+`original_unavailable`).
+
+| Param | Type   | Required | Notes                                                      |
+| ----- | ------ | -------- | ---------------------------------------------------------- |
+| `id`  | string | yes      | Short 8-char prefix or full UUID of the delivered message. |
+
+```
+request(ops="comm.withheld_body(id=\"<message-id>\")")
+```
+
+Returns `{id, size_bytes, original_base64, audit_event_id}`. The response never carries a
+content reference. An original larger than the blob store's whole-object read limit is
+refused with that limit named, never returned truncated.
+
 ---
 
 ## `schedule` pack — 4 verbs
@@ -2385,7 +2451,7 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ---
 
-## `knowledge` pack — 20 verbs
+## `knowledge` pack — 21 verbs
 
 The knowledge-atom corpus: bulk ingest, TF-IDF + embedding search, domain composition,
 section-level review/dispute, and KG-sugar verbs for citing sources. Optional; load
@@ -2765,6 +2831,27 @@ retain their own meanings and are independent of both counts.
 request(ops="knowledge.topic(domain=\"attention\")")
 ```
 
+### `knowledge.lint` — Commissive
+
+Inspect the caller-visible graph of entities, notes and edges with thirteen built-in hygiene rules,
+and optionally apply three guarded repair families. Knowledge corpus atoms, domains and sections are
+separate records and stay outside its statistics. Classified Write, including inspection-only and
+stats-only calls. Rule table, fix semantics and partial-failure evidence:
+[Graph lint](../../crates/khive-pack-knowledge/docs/api/lint.md).
+
+| Param      | Type            | Required | Notes                                                                                                                                                                               |
+| ---------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rules`    | array of string | no       | Omit for all thirteen built-ins, or a nonempty array of exact rule IDs. Repeated IDs run once. `["stats-only"]` alone returns exactly `{stats}` and cannot combine with `fix=true`. |
+| `fix`      | boolean         | no       | Default `false`. `true` adds `fixes` (per-action `committed`, `conflict` or `unsupported` receipts) and `summary.fixed`. Never merges entities.                                     |
+| `severity` | string          | no       | `error`, `warn` (default) or `info`: the minimum severity reported. Statistics always cover the complete observation before fixes.                                                  |
+
+Returns `violations`, `summary` and `stats`. Nulls, unknown rule IDs, invalid severities and wrong
+types are refused.
+
+```
+request(ops="knowledge.lint(rules=[\"orphan-entity\", \"dangling-edge\"], severity=\"error\")")
+```
+
 ### `knowledge.feedback` — Commissive
 
 Record judgments on live knowledge atoms/domains and optionally update section weights.
@@ -3114,12 +3201,44 @@ observed `from`, requested `to`, whether the move was a fast-forward, and `recei
 | `reason`               | string  | no       | Operator note stored with the receipt.                |
 | `session_id`           | string  | no       | Session label copied to the receipt.                  |
 
-## `code` pack — 1 verb
+## `code` pack — 4 verbs
 
 Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
 set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
 `finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
 ingest (not reachable via this MCP verb surface).
+
+### `code.list`, `code.search`, `code.deps` — Assertive
+
+Read an operator-registered code map by name through the shared read-only registry.
+No verb accepts a database path. Register maps with `code_map_root` and `[[code_maps]]`
+configuration as described in [ADR-139](../adr/ADR-139-code-map-read-access.md).
+
+| Verb          | Required       | Optional                                                                                   | Result                                       |
+| ------------- | -------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `code.list`   | `map`          | `kind`, `project_id`, `cursor`, `limit` (1–500, default 100)                               | `map`, `items`, `next_cursor`                |
+| `code.search` | `map`, `query` | `kind`, `project_id`, `cursor`, `limit` (1–200, default 20)                                | `map`, `items` with `score`, `next_cursor`   |
+| `code.deps`   | `map`, `id`    | `direction` (default `both`), `max_depth` (1–10, default 2), `limit` (1–1000, default 200) | `map`, `root`, `nodes`, `edges`, `truncated` |
+
+All reads expose only live projects and module/function/datatype/interface concepts.
+List and search items contain `id`, `kind`, `name`, and nullable `project_id`; project
+rows return null, while code rows follow live containment edges to their project.
+List orders by name then id. Search uses a non-empty literal, case-insensitive name
+query: exact matches precede prefixes, then interior matches, with id breaking ties.
+Cursors bind the map registration and every filter; stale or malformed tokens fail.
+
+Dependencies follow every live local `depends_on` scope, including normal/dev/build.
+Direction accepts `incoming`, `outgoing`, or `both`. Nodes order by breadth-first
+depth then id, counting the root against the node limit. `truncated` identifies
+omitted reachable nodes within the requested depth; all dependency edges between
+returned nodes are retained. Unknown maps, missing roots and invalid bounds fail
+explicitly. Map paths never appear in responses.
+
+```text
+code.list(map="workspace", kind="project", limit=500)
+code.search(map="workspace", query="parser", limit=20)
+code.deps(map="workspace", id="<project-id>", direction="incoming", max_depth=1)
+```
 
 ### `code.ingest` — Commissive
 

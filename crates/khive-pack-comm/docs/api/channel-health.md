@@ -76,6 +76,36 @@ Read-modify-write against the existing row (if any) so that:
   cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
   remains accepted for a mixed-version internal writer and preserves any
   previously recorded cadence on that row.
+- `held_messages` and `quarantined_after_hold` are accepted only with a
+  success outcome; a failed poll read no page, so it carries neither. A
+  success that reports `held_messages` records it on the row and maintains
+  `consecutive_held_polls`: incremented, with `last_held_at` set, when at
+  least one message held the page; reset to 0 by a poll with no hold. A
+  failure leaves both untouched, so a hold that is interrupted by a transport
+  outage still reads as unresolved. `quarantined_after_hold` greater than 0
+  sets `last_quarantined_after_hold_at`. The shipped email loop reports both
+  on every success; a writer that omits them leaves the row's hold facts as
+  they were.
+- `originals_not_retained`, `original_not_retained_reason`,
+  `original_retention_state`, `notices_failed` and `notice_config_error` are
+  accepted only with a success outcome; a failed poll wrote no records and
+  sent no notices. `originals_not_retained` (records written this poll without
+  their original, every reason including the retention limit) and
+  `notices_failed` (failed notice sends) are running totals: each success that
+  reports them ADDS to the row's value rather than replacing it.
+  `original_not_retained_reason` is required exactly when
+  `originals_not_retained` is above zero and refused otherwise; it must be one
+  of `retention-limit`, `original-unavailable`, `retention-count-unreadable`,
+  `original-store-failed`, `quarantine-write-failed` or `secondary-backend`,
+  and when present (with a count above zero) it sets
+  `last_original_not_retained_reason` alongside `last_original_not_retained_at`.
+  `original_retention_state` is exactly `retained` or `failing` and replaces
+  the row's value. `notices_failed` above zero sets `last_notice_failed_at`.
+  `notice_config_error` is a short current-problem string (non-blank, at most
+  255 bytes, no control characters); a success that carries it sets the row's
+  value and a success that omits it CLEARS the row, so a resolved
+  configuration problem stops being reported. A failure leaves every one of
+  these facts unchanged.
 
 Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists
 under `token.namespace()` (khive #917) — the dispatch-authorized namespace
@@ -112,6 +142,20 @@ missing cadence/timestamp facts produce `poll_interval_secs: null` and/or
 `stalled: null`. Quarantine-only entries are distinct: all heartbeat facts,
 including `consecutive_failures`, are explicitly `null` because no heartbeat
 was observed.
+
+`consecutive_held_polls`, `held_messages`, `last_held_at` and
+`last_quarantined_after_hold_at` are `null` on a row whose writer never
+reported holds, and on quarantine-only entries. A channel holds its page while
+a message in it cannot be recorded yet; the email loop bounds each message's
+failed polls (ADR-056), so a `consecutive_held_polls` that keeps growing means
+the store itself cannot record even the bounded quarantine row.
+
+`originals_not_retained`, `last_original_not_retained_at`,
+`last_original_not_retained_reason`, `original_retention_state`,
+`notices_failed`, `last_notice_failed_at` and `notice_config_error` are `null`
+on a row whose writer never reported them, and on quarantine-only entries,
+the same rule as the hold fields. A writer that only reports some of them
+leaves the others `null` on its row.
 
 `quarantined_count` is independent of those liveness facts. It is the number
 of live `message` rows in the authorized namespace whose generic
@@ -213,6 +257,59 @@ transport operations can be slow, so `true` can also mean a long in-flight or
 delayed sweep. ADR-119's component supervisor remains authoritative for hung
 task detection and restart. All channel projections use the same captured
 `as_of`, so a multi-channel response has one consistent comparison instant.
+
+### Outbox scan observations
+
+Issue #5213 adds `outbox` beside the inbound poll fields. It is `null` when
+no outbox scan has been recorded, including legacy and quarantine-only rows.
+An outbox-only channel has null inbound poll facts; an outbox report never
+establishes an inbound poll or resets its failures.
+
+The email and Telegram delivery paths record the result immediately after the
+pending-row query completes, before attempting any delivery. Empty successful
+scans still update `last_scan_completed_at` and `last_success_at`. The nested
+object contains:
+
+- `last_scan_completed_at` and `last_scan_succeeded`: time and result of the
+  latest completed query attempt, including failed queries.
+- `last_success_at`, `last_failure_at`, `consecutive_failures` and `last_error`:
+  independent outbox scan evidence. Failure preserves the success timestamp
+  and last successful page observations; success resets the failure count and
+  retains the prior error with its timestamp.
+- `scan_interval_secs`: the positive nominal scan cadence, currently five
+  seconds. `stalled` is true when `as_of` is strictly more than three nominal
+  intervals after `last_scan_completed_at`. Invalid, missing, overflowing or
+  future clock facts produce null. Scan failure remains visible independently
+  of this schedule fact.
+- `pending_rows_seen` and `pending_rows_limit`: the row count in the last
+  successful channel-scoped page and its bound, currently 200. Only due,
+  undelivered, non-held rows eligible for this channel enter the page. These are
+  page observations, not a total queue count.
+- `oldest_pending_created_at` and `oldest_pending_age_secs`: the earliest
+  creation time among those observed rows, and its whole-second age at the
+  response `as_of`. Both are null for an empty page; invalid/future timestamps
+  have unknown age. The queue may change after the scan, and an older row may
+  lie beyond the newest-first page, so this is not the oldest row of the whole
+  queue. `last_success_at` dates the observation, including after a scan error.
+
+Agent presentation, the MCP default, keeps a null `outbox` and every null field
+inside it, so a channel with no recorded scan, a scan that has not yet
+succeeded and an empty page stay distinct from observed values.
+
+A skipped rate-limit pause does not advance scan evidence. A long deliberate
+pause, slow query or slow delivery can therefore produce `stalled: true`;
+this remains an advisory cadence fact, not a supervisor or overall health verdict.
+Send outcomes do not change scan success. Health writes are best-effort: a
+failure is logged without changing delivery or retry behavior.
+
+The Rust-only `record_outbox_scan` helper shares the heartbeat row's guarded
+insert/replace and preserves inbound properties. Its `NamespaceToken` is
+authorized by the same comm-backend runtime that scanned the message rows;
+there is no new wire verb or caller-controlled JSON namespace. Outbox evidence
+is stored and read in that scanned message namespace. Inbound polls retain
+their existing namespace convention, so deployments with separate operational
+and message namespaces must read each scope explicitly. No fallback to `local`
+is performed.
 
 `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report of
 this process's own cumulative CPU time and RSS (via `getrusage`,

@@ -59,8 +59,7 @@ pub struct ScriptProfile {
 impl ScriptProfile {
     /// Analyze `text` and return a ScriptProfile.
     pub fn analyze(text: &str) -> Self {
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
+        let (cjk, n) = cjk_counts(text);
         if n == 0 {
             return Self {
                 cjk_fraction: 0.0,
@@ -68,8 +67,7 @@ impl ScriptProfile {
                 char_count: 0,
             };
         }
-        let cjk = chars.iter().filter(|&&c| is_cjk_char(c)).count();
-        let latin = chars.iter().filter(|&&c| c.is_ascii_alphabetic()).count();
+        let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
         Self {
             cjk_fraction: cjk as f64 / n as f64,
             latin_fraction: latin as f64 / n as f64,
@@ -87,7 +85,7 @@ impl ScriptProfile {
 /// Rejects empty, symbol-only, single ASCII letter, and repeated-char (>80%) gibberish.
 ///
 /// See `crates/khive-text/docs/api/identifier-and-script.md`.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_text_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -124,6 +122,12 @@ pub fn is_meaningful_query(query: &str) -> bool {
     }
 
     true
+}
+
+/// Deprecated name for [`is_meaningful_text_query`].
+#[deprecated(note = "use is_meaningful_text_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_text_query(query)
 }
 
 #[cfg(test)]

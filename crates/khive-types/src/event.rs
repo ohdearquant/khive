@@ -765,6 +765,10 @@ pub enum ProposalChangeset {
         old: Id128,
         new: Id128,
     },
+    Canonical {
+        schema_version: u32,
+        delta: String,
+    },
     Compound {
         steps: Vec<ProposalChangeset>,
     },
@@ -791,6 +795,9 @@ impl ProposalChangeset {
             }
             Self::Compound { steps } => {
                 for step in steps {
+                    if matches!(step, Self::Canonical { .. }) {
+                        return Err("Canonical proposal changesets must be top-level".into());
+                    }
                     step.validate()?;
                 }
                 Ok(())
@@ -806,6 +813,13 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
     where
         D: serde::Deserializer<'de>,
     {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CanonicalFields {
+            schema_version: u32,
+            delta: String,
+        }
+
         #[derive(serde::Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case")]
         enum ProposalChangesetRaw {
@@ -833,6 +847,7 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 old: Id128,
                 new: Id128,
             },
+            Canonical(CanonicalFields),
             Compound {
                 steps: Vec<ProposalChangeset>,
             },
@@ -860,6 +875,13 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
             ProposalChangesetRaw::SupersedeEntity { old, new } => {
                 Self::SupersedeEntity { old, new }
             }
+            ProposalChangesetRaw::Canonical(CanonicalFields {
+                schema_version,
+                delta,
+            }) => Self::Canonical {
+                schema_version,
+                delta,
+            },
             ProposalChangesetRaw::Compound { steps } => Self::Compound { steps },
         };
         cs.validate().map_err(serde::de::Error::custom)?;
@@ -883,6 +905,10 @@ pub enum ProposalChangeset {
     SupersedeEntity {
         old: Id128,
         new: Id128,
+    },
+    Canonical {
+        schema_version: u32,
+        delta: String,
     },
     Compound {
         steps: Vec<ProposalChangeset>,
@@ -937,6 +963,20 @@ pub struct ProposalAppliedPayload {
     pub applied_at: crate::Timestamp,
     pub applied_by: String,
     pub result: ApplyResult,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub preimage: Option<ProposalPreimageStatus>,
+}
+
+/// Whether an apply result carries checked stage-time preimages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ProposalPreimageStatus {
+    None,
+    Captured,
 }
 
 /// Outcome of applying a proposal: either all steps succeeded or the apply failed with an error.
@@ -1042,3 +1082,7 @@ impl EventBuilder {
 #[cfg(test)]
 #[path = "event_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "serde"))]
+#[path = "event_canonical_tests.rs"]
+mod canonical_tests;

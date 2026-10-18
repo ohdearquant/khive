@@ -32,6 +32,82 @@ fn dependency_kind_inference_preserves_unmatched_metadata() {
 }
 
 #[test]
+fn dependency_kind_hints_cover_existing_defaults_without_changing_metadata() {
+    for (source, target, expected) in [
+        ("project", "project", "build"),
+        ("service", "service", "runtime"),
+        ("service", "dataset", "data"),
+        ("service", "artifact", "artifact"),
+        ("artifact", "project", "tooling"),
+        ("artifact", "service", "tooling"),
+        ("document", "document", "normative"),
+    ] {
+        let supplied = serde_json::json!({"optional": false, "note": "keep"});
+        let effective = merge_dependency_kind(source, target, Some(supplied.clone()));
+        let before_hint = effective.clone();
+        let hint = dependency_kind_inference_hint(
+            EdgeRelation::DependsOn,
+            Some(&supplied),
+            effective.as_ref(),
+        )
+        .expect("each existing default produces a hint");
+        assert!(hint.contains(&format!("{expected:?}")), "{hint}");
+        assert_eq!(hint.contains("links_to"), expected == "normative");
+        assert_eq!(effective, before_hint, "a hint must not mutate metadata");
+        assert_eq!(
+            effective,
+            Some(serde_json::json!({
+                "optional": false,
+                "note": "keep",
+                "dependency_kind": expected,
+            }))
+        );
+    }
+}
+
+#[test]
+fn dependency_kind_hints_respect_explicit_keys_and_absent_inference() {
+    let effective = serde_json::json!({"dependency_kind": "normative"});
+    for supplied in [
+        serde_json::json!({"dependency_kind": "normative"}),
+        serde_json::json!({"dependency_kind": "build"}),
+        serde_json::json!({"dependency_kind": null}),
+    ] {
+        assert_eq!(
+            dependency_kind_inference_hint(
+                EdgeRelation::DependsOn,
+                Some(&supplied),
+                Some(&effective),
+            ),
+            None
+        );
+    }
+    assert_eq!(
+        dependency_kind_inference_hint(EdgeRelation::LinksTo, None, Some(&effective)),
+        None
+    );
+    for effective in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!({"dependency_kind": null})),
+        Some(serde_json::json!({"dependency_kind": "unknown"})),
+    ] {
+        assert_eq!(
+            dependency_kind_inference_hint(EdgeRelation::DependsOn, None, effective.as_ref()),
+            None
+        );
+    }
+    assert_eq!(
+        dependency_kind_inference_hint(
+            EdgeRelation::DependsOn,
+            Some(&serde_json::Value::Null),
+            Some(&effective),
+        ),
+        dependency_kind_inference_hint(EdgeRelation::DependsOn, None, Some(&effective))
+    );
+}
+
+#[test]
 fn edge_metadata_requires_object_and_boolean_optional() {
     for invalid in [
         serde_json::json!(false),
@@ -12366,7 +12442,7 @@ async fn default_document_embedding_discloses_truncation() {
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     rt.register_embedder(CapturingVecProvider {
         provider_name: model.to_string(),
-        dims: 4,
+        dims: model.dimensions(),
         captured: Arc::clone(&captured),
     });
     let content = "x".repeat(MAX_TEXT_BYTES + 1);

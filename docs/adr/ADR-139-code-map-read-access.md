@@ -1,6 +1,6 @@
 # ADR-139: Read Access to Registered Code Map Databases
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 
 ## Context
@@ -234,3 +234,25 @@ The generic code subtype filters read the shared production database, while `cod
 - `crates/khive-pack-code/src/pack.rs:106-120` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
 - `crates/khive-pack-code/src/source_ingest.rs:296-312` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
 - `crates/khive-runtime/src/engine_config.rs:341-401` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
+
+## Amendment 1 (2026-10-17) -- Registered maps are read in rollback mode, and a WAL-mode map is refused with `code.ingest` as the remedy
+
+**Trigger.** "Read-only open contract" required a positive acceptance test that reads a WAL-mode map whose `-wal` and `-shm` companions exist on disk. Every open goes through the code-map VFS, which refuses all shared-memory calls, and its rollback registration refuses a target that has a `-wal` or `-shm` companion, so no WAL-mode map can be read through it. Reading one would need a read-only WAL mode in the VFS: a no-follow shared-memory open, its mapping lifecycle, shared-memory locking and per-descriptor production fencing, on Unix and on Windows. No map the product writes is in WAL mode: the code-map store opener converts an existing target from WAL to DELETE before it registers the rollback VFS, so every map `code.ingest` has opened is in rollback mode at rest. [Source: `crates/khive-db/src/code_map_vfs/callbacks.rs:482-517`, `crates/khive-db/src/code_map_vfs/mod.rs:620-626`, `crates/khive-db/src/backend/code_map.rs:62` and `:72` at commit `5490cd7f3b7a6966c940a2fd0067a3c8a7a03491`]
+
+**Decisions (amending "Read-only open contract").**
+
+1. A read verb opens a registered map in rollback mode only. A map in WAL mode, with a `-wal` or `-shm` companion present at open time or a database header that records WAL mode, SHALL be refused before any row is read, with an error that names the map, states that it is in WAL mode and names `code.ingest` on that map as the remedy. The refusal SHALL NOT include a filesystem path. Previously the section required that such a map be readable.
+2. The per-open fence is unchanged: every descriptor the connection opens, main and companions alike, is checked against the production identity set, the registered-identity check applies to the main descriptor only, and any failed check closes the handle and fails the request.
+3. The positive acceptance test is replaced. Was: register a valid WAL-mode map whose legitimate `-wal` and `-shm` companions exist on disk and assert that a read returns rows. Now: register a valid rollback-mode map, place a legitimate empty `-journal` beside it, and assert that a read returns rows. SQLite opens an existing journal read-only to learn whether it is hot, so this read takes a companion descriptor through the fence. An implementation that compares companion descriptors with the registered main-file identity fails this test; the test suite SHALL carry a control that introduces exactly that comparison and turns the test red.
+4. The companion-swap acceptance test keeps its shape, and the production companion it links to SHALL be one SQLite reads without error (an empty file), so that the read would succeed if the fence did not refuse it.
+5. Read-only WAL support in the VFS is not built. It is reopened when a supported product path produces a WAL-mode map that `code.ingest` cannot settle, or when a map must be read while a writer holds it in WAL mode. Until then decision 1 applies.
+
+**Consequences.** Each fence refusal keeps the refused descriptor open in a process-wide quarantine, so a read verb lets a caller who can replace a map's companion files consume that budget; this is tracked in #5614 and does not change this amendment.
+
+**Acceptance (added to the read-only open contract).**
+
+| Case                      | Required behaviour                                                                                                                                                             |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| WAL-mode map refused      | A registered map with `-wal` and `-shm` companions on disk is refused before any row is read; the error names the map and `code.ingest`, and contains no filesystem path.      |
+| Legitimate companion read | A rollback-mode map with an empty `-journal` beside it returns rows; with a control that compares the journal descriptor to the registered main identity, the same test fails. |
+| Companion swap            | After registration, the map's `-journal` replaced by a hard link to, or a symlink to, an empty production companion makes the next read fail without reading through it.       |

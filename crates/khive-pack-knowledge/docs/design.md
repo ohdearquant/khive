@@ -16,7 +16,7 @@
 
 ### Knowledge Pack Verb Surface (ADR-047)
 
-- This pack implements the 20 verb corpus surface: atoms/domains CRUD, TF-IDF search with
+- This pack implements the 21 verb corpus surface: atoms/domains CRUD, TF-IDF search with
   embedding rerank, fold, import, edit, challenge, adjudicate, and concept-tier sugar.
 - Domain matching is case-insensitive: domain values are trimmed and lowercased before storage
   and comparison. The same normalized value is used in `properties.domain`, promoted tags,
@@ -216,22 +216,24 @@
 
 ### ADR-016: Request DSL
 
-- All 20 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
+- All 21 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
   only — `handlers` and `knowledge` modules are `pub(crate)`.
 
 ## Consistency Notes
 
-- `knowledge/vamana.rs` also exceeds 700 lines by design: the ANN lifecycle (SharedAnn type,
-  snapshot persistence, build, search) is tightly coupled through the shared `AnnState`
-  generation and warm-ownership locks and cannot be split without obscuring their ordering.
+- The ANN lifecycle under `knowledge/vamana/` is split by concern: `state.rs` owns `AnnState`,
+  its generation counter and the warm-ownership locks; `bridge_impl.rs` implements the bridge;
+  `persistence.rs`, `fresh_tail.rs` and `snapshot.rs` hold durable state, the fresh-tail read path
+  and snapshot load; `warm_and_rotate.rs` holds warming and segment rotation. The ordering rules
+  stay in the functions that take the locks, and every submodule reaches them through the parent.
 - The `Section` struct and its associated helper functions (`section_from_row`, `section_to_json`)
   are forward-deployed for Phase 3; they carry `#[allow(dead_code)]` with REASON annotations.
 
 ## Module Boundaries
 
 `knowledge/search/ann_search.rs` holds private ANN candidate acquisition, score provenance,
-RRF fusion, and post-hydration filters. The search parent retains reranking and shared
-record types. `search/lexical.rs` owns lexical candidate selection and budgets;
+RRF fusion, and post-hydration filters. `search/rerank.rs` holds the query-embedding cache
+and reranking; the search parent retains shared record types. `search/lexical.rs` owns lexical candidate selection and budgets;
 `search/search_core.rs` combines searches; `search/hydration.rs` joins candidates
 with stored records; `search/compose_helpers.rs` loads compose inputs and scores
 entity additions; `search/handlers.rs` implements search, suggest, and compose.
@@ -240,7 +242,7 @@ entity additions; `search/handlers.rs` implements search, suggest, and compose.
 | ----------------------- | ---------------------------------------------------------------------------------------- |
 | `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry                 |
 | `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim                       |
-| `vocab.rs`              | Pack schema statements and the handler descriptor table (20 public verbs + 1 subhandler) |
+| `vocab.rs`              | Pack schema statements and the handler descriptor table (21 public verbs + 1 subhandler) |
 | `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                                   |
 | `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                                   |
 | `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence                |

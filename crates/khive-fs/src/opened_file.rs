@@ -52,6 +52,37 @@ pub fn open_regular_file_nofollow(path: &Path) -> Result<File, ContainedOpenErro
     Ok(file)
 }
 
+/// Open a writable path without following its final component on Unix.
+///
+/// Uses the same access, creation, nonblocking and umask-filtered mode choices as
+/// `fd_relative::open_file_at`, without requiring an open parent directory.
+/// Earlier components resolve normally. Existing contents are never truncated;
+/// no regular-file or containment policy is added. Native open errors are returned
+/// unchanged, with the standard library's interrupted-open retry.
+#[cfg(unix)]
+pub fn open_writable_file_nofollow(
+    path: &Path,
+    opts: crate::fd_relative::OpenFileOptions,
+) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).read(opts.read_write);
+    match opts.create {
+        crate::fd_relative::Create::No => {}
+        crate::fd_relative::Create::IfMissing => {
+            options.create(true);
+        }
+        crate::fd_relative::Create::Exclusive => {
+            options.create_new(true);
+        }
+    }
+    options.mode(opts.mode).custom_flags(
+        libc::O_NOFOLLOW | libc::O_CLOEXEC | if opts.nonblock { libc::O_NONBLOCK } else { 0 },
+    );
+    options.open(path)
+}
+
 /// Open `path` read-only and return the file only if it is a regular file inside `canonical_root`.
 ///
 /// The check reads the opened handle, not the pathname, so a source that was swapped for a

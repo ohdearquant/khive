@@ -2,6 +2,8 @@
 
 **Status**: Accepted
 **Date**: 2026-07-08
+**Amendment**: [tier-1 landing wire](#amendment-2026-10-14-the-tier-1-landing-wire) (accepted
+2026-10-14) replaces D1's tier-1 wire with one atomic change-set verb.
 **Amends**: [ADR-020](ADR-020-git-native-kg-implementation.md) (restores the `kg commit` CLI
 primitive to the `kkernel kg` subcommand surface; see "Amendment to ADR-020" below)
 **Depends on**: [ADR-101](ADR-101-kg-changeset-model.md) (the change-set artifact this ADR
@@ -60,6 +62,10 @@ inventing beside them:
 ## Decision
 
 ### D1 — Tier split of the write path
+
+> **Amendment proposed 2026-10-14**: tier-1's wire is the `apply_changeset` verb, not the live
+> batch write named below, because that batch cannot land stage-time identifiers. See
+> [the amendment](#amendment-2026-10-14-the-tier-1-landing-wire).
 
 Every staged change-set operation resolves, before it is applied, to exactly one of two tiers:
 
@@ -150,6 +156,36 @@ for "undo just this one edge without touching anything else that has changed sin
 inversion is the surgical tool; git revert is the blunt one, kept available deliberately for the
 cases the surgical tool cannot reach.
 
+### Proposed amendment (2026-10-13): limits of surgical inversion
+
+**Status: Proposed; requires approval before adoption.** This amendment narrows
+D4's claim that every delete or merge has a representable inverse. A soft delete
+of an entity, an active note or an edge inverts to ADR-101's proposed `restore`;
+restore inverts to a soft delete of the same record. Both are independently
+reviewed change-sets. Restore requires Tier 2; incomplete rule coverage is a
+blocking finding, not approval to land.
+
+A hard delete has no surgical inverse because the live surface has no full-record
+insert. A merge has no surgical inverse because live restore refuses merge
+tombstones and no operation moves rewired edges back. An archived-note soft
+delete also cannot recover its original status: live restore always makes notes
+active. These cases refuse with their operation index and use a reviewed
+compensating change-set against current state or D4's existing git backstop.
+
+Inversion compares all captured content while accounting only for the lifecycle
+fields the live operations actually change: deletion sets `deleted_at`, note
+deletion sets status `deleted`, edge deletion advances `updated_at`, and every
+restore clears `deleted_at` and advances `updated_at` (note restore sets status
+`active`). Entity/note delete checks their unchanged `updated_at`; restore checks
+live content independently of its new update timestamp. Creation timestamps and
+all other captured fields remain comparison evidence. Intervening content changes
+refuse; this is a stage-time check, not the atomic landing check.
+
+Rewinding a mixed delete/restore list tracks a known tombstoned state separately
+from its unknown timestamp. It never fabricates a deletion time. Full-record
+content survives inversion twice; exact historical lifecycle timestamps are not
+promised after real live mutations.
+
 ### D5 — Topology: MCP-client-only access to the live graph
 
 Tooling built for this ADR (the headless CLI and any future reviewer surface) accesses the
@@ -218,6 +254,75 @@ from the durable state. Only failures known to precede commit, including an
 atomic rollback, use the ordinary failed/revert path. This boundary preserves
 the tier-2 audit gate without turning a derived-index or reconciliation read
 failure into a duplicate live mutation.
+
+### Amendment (2026-10-14): the tier-1 landing wire
+
+**Status**: Accepted (2026-10-14). Amends D1 only; D2 to D6 and the earlier amendments are
+unchanged. Acceptance of this text is not implementation acceptance: the verb lands together with
+its first caller ([#4887](https://github.com/ohdearquant/khive/issues/4887)) on its own gates.
+
+D1 names the existing live batch write as tier-1's wire. That wire cannot honor
+[ADR-101](ADR-101-kg-changeset-model.md) D1's stage-time stable identifiers, because live `create`
+accepts no caller-supplied identifier: a staged `link` to a staged `create` is unresolvable on it,
+with or without preimages. The live `[...]` batch is also parallel, with no operation order and no
+all-or-nothing ([ADR-016](ADR-016-request-dsl.md)), so ADR-101 D2's ordered op-list cannot be
+expressed on it either. This amendment gives tier-1 a wire that carries both.
+
+#### W1. One verb lands one change-set
+
+Tier-1's wire is a KG-pack verb, `apply_changeset`, that takes one change-set in ADR-101 D2's
+NDJSON-delta serialization, verbatim, including its envelope and `schema_version`, and lands it as
+one atomic unit through the [ADR-099](ADR-099-bulk-apply-atomic-units.md) runner. An unsupported
+`schema_version` is refused before anything is prepared. This is the form ADR-016 prescribes when
+a sequence must succeed or fail as a whole: one verb that runs the sequence as a unit, not a batch
+that only looks atomic.
+
+- **Identifiers.** A `create` op lands under the identifier minted when it was staged. This verb is
+  the only path that lands a caller-minted identifier; live `create` is unchanged and still mints
+  its own. An identifier that already names a record, live or soft-deleted, refuses the unit, so a
+  change-set that already landed cannot land twice.
+- **Bound.** The unit is bounded by ADR-099 D2's maximum op count. A larger change-set is refused
+  before preparation and must be split.
+- **Preimage comparison** ([#5156](https://github.com/ohdearquant/khive/issues/5156)). Inside the
+  applying writer transaction, before each op writes, its stage-time preimage is compared with live
+  state: for `update`, the fields the op touches; for `delete`, the full captured record except
+  `updated_at`. The first mismatch refuses the whole unit, naming the op's index and the field
+  path, and nothing is written.
+- **`properties`.** On this route a touched `properties` field is the whole map: the op replaces
+  the map, and its preimage is the whole prior map, which is what the comparison reads. Live
+  `update` keeps its merge semantics.
+- **Reserved properties** ([ADR-115](ADR-115-secret-gate-content-manifest-exemption.md) §4). A
+  whole `properties` map may repeat a runtime-reserved key byte for byte or leave it out. Leaving
+  it out carries the stored value forward only while every field it vouches for is unchanged
+  (entity: name, description, tags and the map outside the reserved keys; note: content, name and
+  the map outside the reserved keys). A differing value, or a value the stored row does not carry,
+  refuses the unit. Canonical ops take no manifest exemption, so a canonical write that changes
+  exempted bytes drops the stamp, and the row must then pass the ordinary secret scans as a whole.
+  The preimage comparison reads a reserved key the captured map leaves out as not captured.
+- **`merge`.** `merge` is on ADR-099 D3's admissible list but has no full-parity plan under the
+  runner yet, and the runner's admissibility check refuses it as `KnownUnimplemented`. A
+  change-set containing a `merge` op is refused before preparation with that reason until merge
+  parity lands; the verb never applies part of a unit. D2's floor keeps
+  `merge` out of tier-1, so tier-1 is unaffected; the reviewed path inherits the refusal and says
+  so in its output.
+- **`merge` preimage, once admitted.** Both participant entities are compared like a `delete`,
+  the full captured record except `updated_at`, before the edge-set check. The edge comparison
+  fails closed. It refuses when the live incident edge set, across every namespace
+  ([ADR-007](ADR-007-namespace.md)), holds an edge the op did not list, refuses duplicate entries
+  in the list, and compares edges by identifier, never by list position.
+- **Authorization.** The gate evaluates the request as `apply_changeset` and also evaluates each op
+  under its constituent verb (`create`, `link`, `update`, `delete`) with that op's arguments, before
+  anything is written. A refusal of any op refuses the unit and names the op's index. A policy that
+  refuses a verb to an actor therefore cannot be bypassed by wrapping that verb in a change-set.
+
+#### W2. Callers and topology
+
+D5 is unchanged: `apply_changeset` is an MCP verb, so the headless CLI reaches it as an MCP client
+of the daemon and opens no second handle on the live store. Its first caller is `kkernel kg apply`
+(#4887), and the verb lands in the same change as that caller. Reviewed proposals that carry a
+canonical change-set land through the same implementation
+([ADR-046](ADR-046-event-sourced-proposals.md), amendment of 2026-10-14): one comparator with two
+entry points, never a second landing implementation.
 
 ---
 

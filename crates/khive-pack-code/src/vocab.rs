@@ -7,8 +7,15 @@ use khive_types::{
     VerbCategory, Visibility,
 };
 
-/// `code.ingest` — the pack's first verb (ADR-085 Amendment 2 B1).
-pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+/// Source ingest and registered-map reads (ADR-085, ADR-139).
+pub(crate) static CODE_HANDLERS: [HandlerDef; 4] = [
+    INGEST,
+    crate::read_vocab::LIST,
+    crate::read_vocab::SEARCH,
+    crate::read_vocab::DEPS,
+];
+
+const INGEST: HandlerDef = HandlerDef {
     name: "code.ingest",
     description: "Ingest L1 manifest edges and L1.5 regex import-scan edges from a source \
                    folder into a dedicated map database (never the shared production graph). \
@@ -53,7 +60,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             resolution_mode: IdResolutionMode::NotApplicable,
         },
     ],
-}];
+};
 
 pub(crate) const VALID_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 pub(crate) const VALID_CONFIDENCES: &[&str] = &["high", "medium", "low"];
@@ -216,57 +223,5 @@ pub(crate) static CODE_EDGE_RULES: [EdgeEndpointRule; 22] = [
 ];
 
 #[cfg(test)]
-mod tests {
-    use khive_types::{EdgeRelation, EndpointKind};
-
-    use super::{CODE_EDGE_RULES, CODE_HANDLERS};
-
-    #[test]
-    fn code_ingest_declares_optional_tiers() {
-        let tiers = CODE_HANDLERS[0]
-            .params
-            .iter()
-            .find(|param| param.name == "tiers")
-            .expect("code.ingest must declare the tiers parameter");
-
-        assert_eq!(tiers.param_type, "array of string");
-        assert!(!tiers.required);
-    }
-
-    #[test]
-    fn code_edge_rules_has_22_rows() {
-        assert_eq!(CODE_EDGE_RULES.len(), 22);
-    }
-
-    #[test]
-    fn code_edge_rules_contains_function_depends_on_datatype() {
-        let found = CODE_EDGE_RULES.iter().any(|r| {
-            r.relation == EdgeRelation::DependsOn
-                && r.source
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "function",
-                    }
-                && r.target
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "datatype",
-                    }
-        });
-        assert!(found, "must contain function depends_on datatype");
-    }
-
-    #[test]
-    fn code_edge_rules_contains_project_contains_module() {
-        let found = CODE_EDGE_RULES.iter().any(|r| {
-            r.relation == EdgeRelation::Contains
-                && r.source == EndpointKind::EntityOfKind("project")
-                && r.target
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "module",
-                    }
-        });
-        assert!(found, "must contain project contains module");
-    }
-}
+#[path = "vocab_tests.rs"]
+mod tests;

@@ -8,8 +8,49 @@ use super::{StorageBackend, StoreSchemaGate};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::stores::blob::DatabaseGcOwnerGuard;
+use rusqlite::{Connection, OpenFlags};
 
 impl StorageBackend {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn active_code_map_handles_for_test(path: impl AsRef<Path>) -> usize {
+        crate::code_map_vfs::active_main_handle_count_for(path.as_ref())
+    }
+
+    /// Open a registered rollback-mode map through the handle-proving VFS.
+    /// This opens an existing file read-only and does not run migrations.
+    pub fn open_code_map_read_only(
+        path: impl AsRef<Path>,
+        expected_identity: crate::file_identity::DatabaseFileIdentity,
+        protected_databases: &[std::path::PathBuf],
+    ) -> Result<Connection, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
+        let path = path.as_ref().to_path_buf();
+        let protected = protected_databases
+            .iter()
+            .map(|path| crate::code_map_vfs::ProductionBase {
+                path: path.clone(),
+                kind: crate::code_map_vfs::ProductionKind::Main,
+            })
+            .collect();
+        let vfs = crate::code_map_vfs::register_read_only_rollback(
+            path.clone(),
+            expected_identity,
+            protected,
+        )
+        .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+        let connection = crate::code_map_vfs::naming_refusal(&vfs, || {
+            Connection::open_with_flags_and_vfs(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                vfs.as_str(),
+            )
+            .map_err(Into::into)
+        })?;
+        connection.pragma_update(None, "query_only", true)?;
+        Ok(connection)
+    }
+
     /// Open the dedicated code-map store through the native handle-proving
     /// VFS. `protected_main` and `protected_events` are configured production
     /// names; the guard also samples each name's SQLite companions. Disk policy

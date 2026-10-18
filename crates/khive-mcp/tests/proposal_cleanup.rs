@@ -84,7 +84,9 @@ fn proposal_cleanup_mcp_visibility_and_help() {
 }
 
 async fn wire_case() {
+    let database = tempfile::tempdir().unwrap();
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(database.path().join("proposals.db")),
         packs: vec!["kg".into()],
         brain_profile: None,
         ..RuntimeConfig::no_embeddings()
@@ -207,4 +209,5 @@ async fn wire_case() {
     );
     client.cancel().await.unwrap();
     server_task.abort();
+    let _ = server_task.await;
 }

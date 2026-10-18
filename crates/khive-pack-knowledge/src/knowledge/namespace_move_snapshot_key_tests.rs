@@ -13,12 +13,6 @@ use rusqlite::Connection;
 fn the_move_deletes_the_key_the_vamana_module_writes_and_only_that() {
     let mut conn = Connection::open_in_memory().expect("open");
     run_migrations(&mut conn).expect("migrate");
-    conn.execute_batch(
-        "CREATE TABLE retrieval_snapshots (\
-         namespace TEXT NOT NULL, index_type TEXT NOT NULL, snapshot BLOB NOT NULL, \
-         created_at INTEGER NOT NULL, PRIMARY KEY (namespace, index_type))",
-    )
-    .expect("snapshot table");
     for namespace in ["local", "localized"] {
         conn.execute(
             "INSERT INTO retrieval_snapshots (namespace, index_type, snapshot, created_at) \

@@ -2,6 +2,236 @@ use super::*;
 use khive_runtime::{Namespace, RequestIdentity};
 use serde_json::{json, Value};
 
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_external_enabled_requires_actor_in_both_host_entrypoints() {
+    isolated_case(
+        "startup_external_enabled_requires_actor_in_both_host_entrypoints",
+        async {
+            use clap::Parser as _;
+            let footer = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(footer.path(), "Reply to unsubscribe: {unsubscribe}").unwrap();
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_SENDERS", "actor:sender");
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_DAILY_CAP", "5");
+            std::env::set_var("KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY", "cc".repeat(32));
+            std::env::set_var(
+                "KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS",
+                format!("0:{}", "11".repeat(32)),
+            );
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE", footer.path());
+            let args = Args::parse_from([
+                "mcp",
+                "--db",
+                ":memory:",
+                "--no-embed",
+                "--pack",
+                "kg",
+                "--pack",
+                "comm",
+            ]);
+            for actor in [None, Some("")] {
+                if let Some(actor) = actor {
+                    std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", actor);
+                } else {
+                    std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+                }
+                let runtime = KhiveRuntime::memory()
+                    .unwrap()
+                    .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+                let server =
+                    KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+                let before = khive_runtime::daemon::background_task_count();
+                let error = serve_server(server, &args, &TransportRegistry::new(), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"));
+                let error = run(
+                    Args::parse_from([
+                        "mcp",
+                        "--db",
+                        ":memory:",
+                        "--no-embed",
+                        "--pack",
+                        "kg",
+                        "--pack",
+                        "comm",
+                    ]),
+                    &TransportRegistry::new(),
+                )
+                .await
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"));
+                assert_eq!(
+                    khive_runtime::daemon::background_task_count(),
+                    before,
+                    "no channel loop starts on refusal"
+                );
+            }
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let runtime = KhiveRuntime::memory()
+                .unwrap()
+                .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+            let server =
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+            assert!(
+                prepare_host_background_tasks(&args, &server)
+                    .unwrap()
+                    .email
+                    .is_none(),
+                "valid client config does not acquire a poll loop"
+            );
+        },
+    );
+}
+
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_disabled_external_does_not_require_actor_or_parse_routes() {
+    isolated_case(
+        "startup_disabled_external_does_not_require_actor_or_parse_routes",
+        async {
+            use clap::Parser as _;
+            std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+            std::env::set_var("KHIVE_EMAIL_INBOUND_ROUTES", "invalid route");
+            let runtime = KhiveRuntime::memory().unwrap();
+            let server =
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap();
+            let args = Args::parse_from(["mcp"]);
+            assert!(prepare_host_background_tasks(&args, &server)
+                .unwrap()
+                .email
+                .is_none());
+        },
+    );
+}
+
+#[cfg(feature = "channel-email")]
+#[test]
+fn startup_inbound_only_requires_actor_and_leaves_outbound_external_refused() {
+    isolated_case(
+        "startup_inbound_only_requires_actor_and_leaves_outbound_external_refused",
+        async {
+            use clap::Parser as _;
+            assert!(std::env::var_os("KHIVE_EMAIL_EXTERNAL_SENDERS").is_none());
+            let args = || {
+                Args::parse_from([
+                    "mcp",
+                    "--db",
+                    ":memory:",
+                    "--no-embed",
+                    "--pack",
+                    "kg",
+                    "--pack",
+                    "comm",
+                ])
+            };
+            let server = || {
+                let runtime = KhiveRuntime::memory()
+                    .unwrap()
+                    .with_outbound_email_policy(OutboundEmailPolicy::from_env().unwrap());
+                KhiveMcpServer::with_packs(runtime, &["kg".into(), "comm".into()]).unwrap()
+            };
+
+            // An unrecognised switch value refuses start-up rather than reading as disabled.
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "yes");
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let error = serve_server(server(), &args(), &TransportRegistry::new(), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not recognised"), "{error}");
+
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "enabled");
+            for actor in [None, Some("")] {
+                if let Some(actor) = actor {
+                    std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", actor);
+                } else {
+                    std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR");
+                }
+                let before = khive_runtime::daemon::background_task_count();
+                let error = serve_server(server(), &args(), &TransportRegistry::new(), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"),
+                    "{error}"
+                );
+                let error = run(args(), &TransportRegistry::new()).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR"),
+                    "{error}"
+                );
+                assert_eq!(
+                    khive_runtime::daemon::background_task_count(),
+                    before,
+                    "no channel loop starts on refusal"
+                );
+            }
+
+            // Control: the same configuration with the actor set starts.
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR", "actor:external");
+            let server = server();
+            assert!(prepare_host_background_tasks(&args(), &server)
+                .unwrap()
+                .email
+                .is_none());
+
+            // A polling host hands the switch to the channel it builds; without the switch the
+            // same configuration builds a channel that keeps external mail off the allowlist.
+            for name in [
+                "KHIVE_EMAIL_SMTP_HOST",
+                "KHIVE_EMAIL_IMAP_HOST",
+                "KHIVE_EMAIL_PASSWORD",
+                "KHIVE_EMAIL_AUTHSERV_ID",
+            ] {
+                std::env::set_var(name, "unused.example.com");
+            }
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            let prepared = prepare_email_channel_loops(&server, true)
+                .unwrap()
+                .expect("a complete configuration prepares the polling channel");
+            assert!(prepared.external_inbound_enabled());
+            std::env::remove_var("KHIVE_EMAIL_EXTERNAL_INBOUND");
+            let prepared = prepare_email_channel_loops(&server, true)
+                .unwrap()
+                .expect("a complete configuration prepares the polling channel");
+            assert!(!prepared.external_inbound_enabled());
+            std::env::set_var("KHIVE_EMAIL_EXTERNAL_INBOUND", "enabled");
+
+            // Outbound external sending stays disabled: an address outside the policy is
+            // refused, while a policy recipient is still admitted.
+            let registry = server.verb_registry_clone();
+            registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to":"email:allowed@example.com","content":"policy recipient"}),
+                )
+                .await
+                .unwrap();
+            let refused = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to":"email:visitor@outside.example","content":"no outbound"}),
+                )
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(khive_runtime::RuntimeError::PermissionDenied { .. })
+                ),
+                "{refused:?}"
+            );
+        },
+    );
+}
+
 /// Collects formatted log output so a test can read what a code path reported.
 #[cfg(feature = "channel-email")]
 #[derive(Clone, Default)]
@@ -498,7 +728,8 @@ async fn assert_unset_maintainer_admission(server: &KhiveMcpServer, runtime: &Kh
         let log = CapturedLog::default();
         {
             let _capture = log.capture();
-            spawn_email_channel_loops(server, crate::server::ChannelLoopAdmission::default());
+            let _ = prepare_email_channel_loops(server, true)
+                .expect("disabled external connector remains optional");
         }
         let logged = log.text();
         assert!(

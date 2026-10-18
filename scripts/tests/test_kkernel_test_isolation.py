@@ -17,12 +17,16 @@ TRIGGERS = (
     "execute_atomic_ops_file(", "run_reindex(",
     "run_reindex_without_embeddings(", "run_reindex_offline(",
 )
+# Concern files `exec_tests.rs` pulls in with `include!`. They are read from the parent so a new part joins
+# the census without an edit here; a part dropped from the parent lowers the count below its floor.
+EXEC_TEST_PARTS = tuple(re.findall(r'(?m)^include!\("(exec_tests/[^"]+)"\);$',
+                                   (SOURCE / "exec_tests.rs").read_text()))
 MODULES = ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "cli.rs", "code_ingest.rs",
            "reindex/tests/mod.rs", "pack_introspect.rs", "atomic_apply.rs", "atomic_apply_tests.rs",
-           "atomic_apply_validate_atomic_args_tests.rs", "atomic_project_origin_tests.rs")
+           "atomic_apply_validate_atomic_args_tests.rs", "atomic_project_origin_tests.rs") + EXEC_TEST_PARTS
 # Test files included at column zero rather than as an inline module.
 COLUMN_ZERO = ("exec_tests.rs", "exec_atomic_result_shape_tests.rs", "reindex/tests/mod.rs",
-               "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs")
+               "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs") + EXEC_TEST_PARTS
 
 
 def functions(source, indent="    "):
@@ -31,8 +35,9 @@ def functions(source, indent="    "):
     for match in re.finditer(r"(?m)^" + re.escape(indent) + r"(?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
         end = source.index("\n" + indent + "}", match.end())
         start = source.index("{", match.end(), end) + 1
+        # The first function of a file has neither boundary above it; its attributes start at offset 0.
         before = max(source.rfind("\n" + indent + "}", 0, match.start()),
-                     source.rfind("\n" + indent + "//", 0, match.start()))
+                     source.rfind("\n" + indent + "//", 0, match.start()), 0)
         yield match.group(1), source[before:match.start()], source[start:end]
 
 
@@ -81,7 +86,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
                 count += 1
                 self.assertTrue(body.strip().startswith(isolation(filename)),
                                 f"{filename}:{name} atomic caller must enter exact child")
-        self.assertEqual(count, 24, "all direct atomic execution witnesses must be counted")
+        self.assertEqual(count, 25, "all direct atomic execution witnesses must be counted")
 
     def test_reindex_command_cases_choose_explicit_offline_setup(self):
         zero_model_cases = {
@@ -119,12 +124,19 @@ class KkernelTestIsolationTests(unittest.TestCase):
         default = function("code_ingest.rs", "code_ingest_batch")
         setup = function("code_ingest.rs", "code_ingest_batch_with_runtime_setup")
         self.assertIn("code_ingest_batch_with_runtime_setup(args, |_| Ok(()))", default)
-        install = "install_test_embedders(runtime)?;"
+        install = "install_test_embedders,"
         self.assertIn(install, setup, "default ingest must install offline providers")
-        self.assertLess(setup.index(install), setup.index("runtime_setup(runtime)"),
+        self.assertLess(setup.index(install), setup.index("runtime_setup,"),
+                        "offline providers must be the provider setup, ahead of the custom setup")
+        source = (SOURCE / "code_ingest.rs").read_text()
+        opened = source.index("let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!(\"{e}\"))?;")
+        providers = source.index("provider_setup(&runtime)?;", opened)
+        self.assertLess(providers, source.index("build_code_ingest_registry(&runtime)?;", opened),
+                        "offline providers must be installed before the registry is built")
+        self.assertLess(providers, source.index("runtime_setup(&runtime)?;", opened),
                         "custom setup must retain its final override")
         provider = function("code_ingest.rs", "install_test_embedders")
-        self.assertIn("runtime.register_embedder(FixedEmbeddingProvider { name, dimensions })", provider,
+        self.assertIn("runtime.try_register_embedder(FixedEmbeddingProvider { name, dimensions })?;", provider,
                       "offline fixture must replace each configured native provider")
 
     def test_gate_allow_ingest_installs_offline_providers(self):

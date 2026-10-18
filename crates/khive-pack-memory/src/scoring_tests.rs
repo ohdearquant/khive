@@ -1,29 +1,34 @@
 use super::*;
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_empty() {
     assert!(!is_meaningful_query(""));
     assert!(!is_meaningful_query("   "));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_symbols_only() {
     assert!(!is_meaningful_query("!@#$%"));
     assert!(!is_meaningful_query("..."));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_single_latin_char() {
     assert!(!is_meaningful_query("a"));
     assert!(!is_meaningful_query("Z"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_rejects_repeated_gibberish() {
     assert!(!is_meaningful_query("aaaa bbbb cccc"));
 }
 
 #[test]
+#[allow(deprecated)]
 fn is_meaningful_query_accepts_normal_queries() {
     assert!(is_meaningful_query("what is the capital of France"));
     assert!(is_meaningful_query("rust async runtime"));
@@ -211,107 +216,7 @@ fn calculate_score_floors_nonfinite_adjustment_chain() {
     assert_eq!(score, 0.0, "non-finite composite must rank at the floor");
 }
 
-#[test]
-fn calculate_score_high_salience_ranks_higher() {
-    let config = ScoringConfig {
-        adjustments: vec![],
-        ..ScoringConfig::default()
-    };
-    let now_ms = 1_000_000i64;
-    let score_high = calculate_score(
-        &ScoreInput {
-            salience: 0.9,
-            memory_type_str: "episodic",
-            content: "content",
-            created_at_millis: 0,
-            decay_factor: 0.01,
-            now_millis: now_ms,
-            relevance_score: 0.7,
-            entity_names: &[],
-        },
-        &config,
-    );
-    let score_low = calculate_score(
-        &ScoreInput {
-            salience: 0.1,
-            memory_type_str: "episodic",
-            content: "content",
-            created_at_millis: 0,
-            decay_factor: 0.01,
-            now_millis: now_ms,
-            relevance_score: 0.7,
-            entity_names: &[],
-        },
-        &config,
-    );
-    assert!(score_high > score_low, "high salience should rank higher");
-}
-
-#[test]
-fn calculate_score_entity_match_from_auto_extraction_lifts_equal_relevance_candidate() {
-    // Wires `extract_entity_candidates` straight into `calculate_score` with
-    // the default adjustments (EntityMatch ×1.3 included) — everything else
-    // held identical between the two candidates — to isolate exactly what
-    // the entity boost contributes, decoupled from retrieval-stage relevance
-    // differences (which the handler-level tests in recall.rs cover instead).
-    let config = ScoringConfig::default();
-    let now_ms = 1_000_000i64;
-
-    // Capitalized-signal query so extraction yields a single isolated
-    // candidate ("gamma") — that keeps this test's two candidates
-    // differing by exactly one factor (does the content mention the
-    // named entity or not).
-    let query = "sibling transfer to Gamma university";
-    let entity_names = extract_entity_candidates(query);
-    assert_eq!(
-        entity_names,
-        vec!["gamma"],
-        "capitalized-signal query must extract exactly the one proper noun: {entity_names:?}"
-    );
-
-    let matching_score = calculate_score(
-        &ScoreInput {
-            salience: 0.5,
-            memory_type_str: "semantic",
-            content: "sibling transferred to gamma university this fall",
-            created_at_millis: 0,
-            decay_factor: 0.005,
-            now_millis: now_ms,
-            relevance_score: 0.5,
-            entity_names: &entity_names,
-        },
-        &config,
-    );
-    let non_matching_score = calculate_score(
-        &ScoreInput {
-            salience: 0.5,
-            memory_type_str: "semantic",
-            content: "sibling transferred to a different university this fall",
-            created_at_millis: 0,
-            decay_factor: 0.005,
-            now_millis: now_ms,
-            relevance_score: 0.5,
-            entity_names: &entity_names,
-        },
-        &config,
-    );
-
-    assert!(
-        matching_score > non_matching_score,
-        "memory matching an auto-extracted entity name must outrank an \
-             equal-relevance memory that doesn't: matching={matching_score} \
-             non_matching={non_matching_score}"
-    );
-    // The EntityMatch adjustment is a flat ×1.3 multiply applied after the
-    // base formula and the other (inactive, for this age/salience combo)
-    // adjustments — assert the lift is approximately that factor, not just
-    // "higher", so a future change to the adjustment order/weights is caught.
-    let ratio = matching_score / non_matching_score;
-    assert!(
-        (ratio - 1.3).abs() < 0.01,
-        "expected ~1.3x lift from the EntityMatch adjustment, got ratio {ratio}"
-    );
-}
+include!("scoring_tests/positive_candidate_ranking_tests.rs");
 
 #[test]
 fn dos_caps_enforce_limits() {
@@ -605,4 +510,60 @@ fn entity_posterior_term_moves_monotonically_with_mean() {
     let high = entity_posterior_term(Some(0.8), ENTITY_POSTERIOR_WEIGHT);
     assert!(low < mid, "low={low} mid={mid}");
     assert!(mid < high, "mid={mid} high={high}");
+}
+
+#[test]
+fn meaningful_query_policies_keep_distinct_admission_rules() {
+    let cases = [
+        ("aaaa bbbb cccc", true, false),
+        ("12345", true, false),
+        ("e", false, false),
+        ("", false, false),
+        (" \t\n", false, false),
+        ("...", false, false),
+        ("😀", false, false),
+        ("5", true, false),
+        ("１", true, false),
+        ("11111", false, false),
+        ("é", true, false),
+        ("Ω", true, false),
+        ("ｅ", true, false),
+        ("你", true, true),
+        ("你你", false, true),
+        ("你好世界", true, true),
+        ("你好你好你好", true, false),
+        ("BM25", true, true),
+        ("a1", true, false),
+        ("a!", true, false),
+        ("aa", false, true),
+        ("a a", false, true),
+        ("a\u{00A0}a", false, true),
+        ("aaa", false, false),
+        ("aaab", true, true),
+        ("aaaab", true, true),
+        ("aaaaab", false, false),
+        ("aaaaaaaa b", false, true),
+        ("aaaaaaaab", false, false),
+        ("aaaaAAAA", true, false),
+        ("aaaa1111", true, false),
+        ("ab!!!!!!!!!!", false, true),
+        ("e\u{0301}", true, false),
+        ("ééé", false, false),
+        ("e\u{0301}e\u{0301}e\u{0301}", true, false),
+        ("the and", true, true),
+        ("hello", true, true),
+    ];
+
+    for (query, text_expected, recall_expected) in cases {
+        assert_eq!(
+            khive_text::is_meaningful_text_query(query),
+            text_expected,
+            "text policy for {query:?}"
+        );
+        assert_eq!(
+            is_meaningful_recall_query(query),
+            recall_expected,
+            "recall policy for {query:?}"
+        );
+    }
 }

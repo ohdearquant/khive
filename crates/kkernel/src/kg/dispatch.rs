@@ -16,6 +16,7 @@ use super::validate;
 /// Dispatch `kkernel kg` subcommands to their implementations.
 pub async fn run_kg(cmd: KgCommand) -> Result<()> {
     match cmd {
+        KgCommand::Apply(args) => super::apply::cmd_apply(args).await,
         KgCommand::Validate(args) => validate::cmd_validate(args),
         KgCommand::Init(args) => init::cmd_init(args),
         KgCommand::Fetch(args) => fetch::cmd_fetch(args).await,

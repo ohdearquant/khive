@@ -23,12 +23,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Main pushes share one group and run the newest commit only. The run in progress
-# is never cancelled; a newer push replaces any run still waiting in the group, so
-# at most one main run waits. A replaced run's commit is contained in the later
-# run's tree, and the newest main head always reaches a completed run. Commits that
-# land while a run is in progress get no result of their own: a regression between
-# two completed runs is attributed by running CI on the commits in between (#3071).
+# Main pushes share one group and run the newest commit only: a newer push cancels
+# the run in progress and replaces any run still waiting, so a burst of merges
+# leaves one main run, at its newest head, and frees the runners the cancelled runs
+# held for pull request runs. A cancelled run's commit is contained in the later
+# run's tree. While merges keep landing faster than a run completes, main has no
+# completed result; it gets one once merges pause, so a merge batch waits for main
+# to go green before the next batch starts. Commits without a result of their own
+# are attributed by running CI on the commits in between (#3071).
 # https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
 # PR synchronize events keep the same refs/pull/<number>/merge group and cancel
@@ -37,7 +39,7 @@ env:
 # running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   # Replay uses the current workflow against historical source, without a temporary ref:
@@ -109,22 +111,27 @@ jobs:
   # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
   # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
   # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  #
+  # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
+  # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
   changed-paths:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
     needs: resolve-revision
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The scope step fetches a binary and ingests the workspace map; its own steps are bounded below it.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@v7
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: Classify
         id: classify
         env:
@@ -132,6 +139,8 @@ jobs:
           REF: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -142,8 +151,21 @@ jobs:
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
           elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
             base=""
-            runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            runs=""
+            # The checkout is one commit deep. The ancestry test below needs main's history, and the
+            # comparison reads paths only, so fetch main's commits and trees without file contents.
+            # A full-depth checkout fetches every branch and tag, and its time grows with their count.
+            # A repository that already holds its history is used as it is.
+            history=true
+            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+              history=false
+              echo "fetching main's history failed"
+            fi
+            if [[ "$history" == "true" ]]; then
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+            fi
             while read -r run_id run_sha; do
               [[ -n "$run_id" ]] || continue
               shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
@@ -166,6 +188,55 @@ jobs:
             docs_only=false
           fi
           echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+      # The path rules run first, on the changed paths alone (--paths-only prints `full` or `map`). Only a
+      # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
+      # successful push run on main published, which ingests this checkout's map and resolves the changed
+      # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
+      # and every event other than a pull request writes `full`.
+      - name: Scope
+        id: scope
+        if: steps.classify.outputs.docs_only != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          test_scope=full
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "full suite: $EVENT_NAME runs are never scoped"
+          elif ! base=$(git rev-parse --verify "${HEAD_SHA}^1"); then
+            echo "full suite: the merge ref has no base parent"
+          else
+            mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            if [[ "$mode" == "map" ]]; then
+              binary=""
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
+                --jq '.workflow_runs[].id') || runs=""
+              for run_id in $runs; do
+                dir="$RUNNER_TEMP/kkernel-main-$run_id"
+                if timeout 120 gh run download "$run_id" -R "$REPOSITORY" -n kkernel-debug-linux -D "$dir" \
+                    && [[ -f "$dir/kkernel" ]]; then
+                  chmod +x "$dir/kkernel"
+                  binary="$dir/kkernel"
+                  echo "kkernel from main push run $run_id"
+                  break
+                fi
+              done
+              if [[ -z "$binary" ]]; then
+                echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
+              else
+                test_scope=$(timeout 300 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                  || test_scope=full
+              fi
+            fi
+          fi
+          if [[ -z "$test_scope" ]]; then
+            test_scope=full
+          fi
+          echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -281,6 +352,10 @@ jobs:
       # pull request that runs the three-job matrix above, so the macOS lane
       # runs there, and the many draft pull requests on that prefix no longer
       # hold macOS slots that integration runs wait for.
+      # Pull requests from this repository's `split/` and `docs/` branches run
+      # the two Linux shards only as well. They carry verbatim moves of code
+      # between files and documentation changes; the Linux shards test them,
+      # and the push to main that lands them runs both macOS shards.
       # The head-repository check keeps the rule to branches of this
       # repository: a pull request from a fork runs the three-job matrix
       # whatever its branch is called.
@@ -289,7 +364,9 @@ jobs:
       # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
-          && startsWith(github.head_ref, 'codex/')
+          && (startsWith(github.head_ref, 'codex/')
+            || startsWith(github.head_ref, 'split/')
+            || startsWith(github.head_ref, 'docs/'))
           && github.event.pull_request.head.repo.full_name == github.repository
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
           || github.event_name == 'pull_request'
@@ -307,14 +384,21 @@ jobs:
       # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
       # `ld terminated with signal 7 [Bus error]`, e.g. run 28604091732).
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # `full`, or the crates this pull request changed plus their dependents (ADR-205); scripts/ci.sh
+      # passes them to the test and clippy phases as -p arguments. An unset scope runs the full suite.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
       # The model cache below is load-bearing, not an optimisation: with this
       # set, a phase whose model is missing fails naming the directory instead
       # of fetching from huggingface.co.
       LATTICE_OFFLINE: "1"
     steps:
+      # Steps before the checkout cannot use the job's default working directory: `crates` does
+      # not exist until the repository is checked out.
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
       # check + clippy + test + release passes exceed that, and ld's mmap'd
       # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
@@ -501,6 +585,23 @@ jobs:
       - name: khive-contract suite
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
+      # The pull-request scope step runs this kkernel to ingest the workspace map (ADR-205 D4). It is the
+      # debug build the workspace tests just ran, published only by a main push run whose shard 1 passed
+      # every step above, with its debug sections stripped.
+      - name: Strip the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/kkernel-scope"
+          strip --strip-debug -o "$RUNNER_TEMP/kkernel-scope/kkernel" target/debug/kkernel
+          ls -l target/debug/kkernel "$RUNNER_TEMP/kkernel-scope/kkernel"
+      - name: Publish the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kkernel-debug-linux
+          path: ${{ runner.temp }}/kkernel-scope/kkernel
+          retention-days: 7
+          if-no-files-found: error
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
@@ -998,6 +1099,68 @@ jobs:
           fi
           echo "$actual_output"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Rule evaluator wasm32 compile check (ADR-101 D5)
+        run: cargo check --locked -p khive-rule-evaluator --target wasm32-unknown-unknown
+      - name: Rule evaluator native suite and result transcripts
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-native.log
+      - name: Rule evaluator wasm32-wasip1 suite and result transcripts
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator --target wasm32-wasip1 -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-wasm.log
+      - name: Assert full rule-result bytes match on native and wasm32
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          prefix = "RULE_EVALUATOR_GOLDEN:"
+          expected = {"full", "partial"}
+
+          def transcripts(log):
+              rows = [line for line in log.splitlines() if line.startswith(prefix)]
+              if len(rows) != 2:
+                  raise ValueError("expected exactly two nonempty result transcripts")
+              values = {}
+              for line in rows:
+                  label, payload = line[len(prefix):].split(":", 1)
+                  if label in values or label not in expected:
+                      raise ValueError("duplicate or unexpected result transcript")
+                  decoded = json.loads(payload)
+                  if not isinstance(decoded, list) or not decoded:
+                      raise ValueError("empty or invalid result transcript")
+                  values[label] = payload
+              if set(values) != expected:
+                  raise ValueError("missing named result transcript")
+              return values
+
+          def compare(native, wasm):
+              if transcripts(native) != transcripts(wasm):
+                  raise ValueError("native and wasm32 rule-result bytes differ")
+
+          native = Path("/tmp/rules-native.log").read_text()
+          wasm = Path("/tmp/rules-wasm.log").read_text()
+          compare(native, wasm)
+          # Comparator controls: status-only, missing and two-empty captures
+          # must never make a parity gate vacuously pass.
+          changed = native.replace('"passed":false', '"passed":true', 1)
+          if changed == native:
+              raise ValueError("fixture lost its failing-rule positive control")
+          missing = "\n".join(line for line in native.splitlines()
+                              if not line.startswith(prefix + "partial:"))
+          for left, right in [(native, changed), (native, missing), ("", "")]:
+              try:
+                  compare(left, right)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError("parity comparator accepted a negative control")
+          print("native and wasm32: two complete rule-result JSON transcripts match")
+          PY
+
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown
       # ADR-101 D5 requires CI to run the SAME test suite against native and
@@ -1458,7 +1621,9 @@ jobs:
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
     needs: [resolve-revision, changed-paths]
-    if: needs.changed-paths.outputs.docs_only != 'true'
+    # A scoped pull request skips coverage: a number over a subset is not comparable with the baseline
+    # (ADR-205 D5). Every run on main keeps it.
+    if: needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
@@ -1645,7 +1810,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
     needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always() && needs.changed-paths.outputs.docs_only != 'true'
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1722,10 +1887,12 @@ jobs:
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
-          # inputs fail the ratchet. The documentation-lane jobs may skip only
-          # when the classifier succeeded and reported docs_only=true. Any
-          # other skip fails the gate.
+          # inputs fail the ratchet. The lane jobs may skip only when the
+          # classifier succeeded and reported docs_only=true. The coverage
+          # jobs may also skip when the classifier succeeded with a crate-list
+          # test scope (ADR-205 D6). Any other skip fails the gate.
           echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
+          echo "$NEEDS" | jq -r '"test scope: \(.["changed-paths"].result) test_scope=\(.["changed-paths"].outputs.test_scope // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
             | (if .["changed-paths"].result == "success"
@@ -1735,10 +1902,15 @@ jobs:
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
                      "msrv-check", "core-only"]
                else [] end) as $docs_lane_skips
+            | (.["changed-paths"].outputs.test_scope // "") as $scope
+            | (if .["changed-paths"].result == "success"
+                  and $scope != "" and ($scope | ascii_downcase) != "full"
+               then ["coverage-measurement", "coverage-ratchet"]
+               else [] end) as $scoped_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped"
-                  or (($allowed_skips + $docs_lane_skips) | index($job) | not)))
+                  or (($allowed_skips + $docs_lane_skips + $scoped_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"

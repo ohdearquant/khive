@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::types::{
@@ -256,6 +257,35 @@ pub struct PropertyFilter {
     pub json_path: String,
     pub op: FilterOp,
     pub value: SqlValue,
+}
+
+/// A predicate on one literal top-level property key, rechecked at write time.
+/// Explicit JSON null is present and never matches an absent-key branch.
+#[derive(Clone, Debug)]
+pub enum NotePropertyPrecondition {
+    /// `json_extract(properties, path) = value`, with the ordinary [`SqlValue`]
+    /// binding rules. SQL NULL equality does not match; this is not typed JSON equality.
+    ExtractEquals { key: String, value: SqlValue },
+    /// An absent key (`json_type IS NULL`) or [`Self::ExtractEquals`].
+    AbsentOrExtractEquals { key: String, value: SqlValue },
+    /// An absent key, or a JSON text value exactly equal to `value`.
+    AbsentOrTextEquals { key: String, value: String },
+    /// JSON boolean `true` or the exact JSON string `"true"`; numeric 1 is excluded.
+    TrueOrTextTrue { key: String },
+}
+
+/// A bounded, atomic partial update of a note's properties and retention metadata.
+#[derive(Clone, Debug)]
+pub struct NotePropertyPatch {
+    /// AND-combined predicates, at most 32. Keys are literal top-level keys.
+    pub preconditions: Vec<NotePropertyPrecondition>,
+    /// Between 1 and 32 literal top-level writes, preserving each JSON value's type.
+    /// Keys in either collection must not contain U+0000.
+    pub set: BTreeMap<String, Value>,
+    /// Install or extend this expiry; `None` preserves the stored expiry.
+    pub extend_expires_at: Option<i64>,
+    /// Applied as the maximum of the stored and supplied timestamps.
+    pub updated_at: i64,
 }
 
 /// Keyset pagination boundary over the notes store's default total order
@@ -589,6 +619,33 @@ pub trait NoteStore: Send + Sync + 'static {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool>;
+    /// Atomically apply a bounded partial property update to one live note.
+    ///
+    /// The current row must match the id, exact namespace, exact kind, and all
+    /// preconditions in the same operation that merges the writes. Namespace
+    /// is an equality guard, not an authorization boundary. A SQL-NULL property
+    /// document starts as `{}`; non-object documents and any other nonmatch
+    /// return `false` without changing the row. Unrelated properties, immutable
+    /// key, row identity, and non-target columns survive. A matched update
+    /// advances the persisted version, even when the supplied timestamp is older.
+    ///
+    /// Validate bounds, keys and write values before writer admission. Maintain
+    /// derived retry-deadline fields when `next_attempt_at` is written, and leave
+    /// them untouched otherwise. Unsupported backends must fail closed without
+    /// a read/replace or upsert fallback.
+    async fn try_patch_note_properties(
+        &self,
+        _id: Uuid,
+        _namespace: &str,
+        _kind: &str,
+        _patch: &NotePropertyPatch,
+    ) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "try_patch_note_properties".into(),
+            message: "this backend does not implement guarded partial note updates".into(),
+        })
+    }
     /// Atomically patch one JSON property on every supplied note.
     ///
     /// Each target is rechecked against `namespace` and `filter` inside the
