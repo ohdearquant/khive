@@ -341,9 +341,8 @@ struct Waiting {
     responder: oneshot::Sender<Result<AuditCommitOutcome, AuditTerminalReason>>,
 }
 
-/// A committed/failed generation's accounting, retained for the lifetime of
-/// the process (bounded in practice by process lifetime and generation
-/// volume; this slice makes no attempt to prune history).
+/// A committed/failed generation's accounting. Detailed history is retained when
+/// compiled for tests or with `test-internals`; ordinary builds keep cumulative counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditGenerationSnapshot {
     pub generation_id: u64,
@@ -362,6 +361,7 @@ struct State {
     submitted_rows: u64,
     committed_rows: u64,
     store_batch_calls: u64,
+    #[cfg(any(test, feature = "test-internals"))]
     generations: Vec<AuditGenerationSnapshot>,
     flush_failures: u64,
     degraded_rows: u64,
@@ -387,6 +387,7 @@ impl State {
             submitted_rows: 0,
             committed_rows: 0,
             store_batch_calls: 0,
+            #[cfg(any(test, feature = "test-internals"))]
             generations: Vec::new(),
             flush_failures: 0,
             degraded_rows: 0,
@@ -395,6 +396,13 @@ impl State {
             late_append_commits: 0,
             late_append_failures: 0,
         }
+    }
+
+    fn record_generation(&mut self, generation: AuditGenerationSnapshot) {
+        #[cfg(any(test, feature = "test-internals"))]
+        self.generations.push(generation);
+        #[cfg(not(any(test, feature = "test-internals")))]
+        let _ = generation;
     }
 
     fn is_idle(&self) -> bool {
@@ -425,7 +433,7 @@ impl Inner {
             state.flush_failures += 1;
             state.degraded = true;
             let generation_id = state.next_generation_id;
-            state.generations.push(AuditGenerationSnapshot {
+            state.record_generation(AuditGenerationSnapshot {
                 generation_id,
                 submitted_rows: (in_flight_waiters.len() + drained.len()) as u64,
                 committed_rows: 0,
@@ -872,7 +880,7 @@ async fn supervisor_loop(
             {
                 let mut state = inner.state.lock();
                 state.flush_failures += 1;
-                state.generations.push(AuditGenerationSnapshot {
+                state.record_generation(AuditGenerationSnapshot {
                     generation_id,
                     submitted_rows: submitted,
                     committed_rows: 0,
@@ -949,7 +957,7 @@ async fn supervisor_loop(
                     state.flush_failures += 1;
                     state.outstanding_abandoned_appends += 1;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: 0,
@@ -1000,7 +1008,7 @@ async fn supervisor_loop(
                     state.flush_failures += 1;
                     state.degraded = true;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: 0,
@@ -1040,7 +1048,7 @@ async fn supervisor_loop(
                     state.store_batch_calls += 1;
                     state.committed_rows += committed_n;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: committed_n,
