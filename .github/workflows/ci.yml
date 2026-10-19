@@ -108,9 +108,11 @@ jobs:
   # the ADR lints, the marketplace validator, the data-leak guard and the secret scan. The Rust, Python,
   # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
   # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
-  # ref with its base parent. Pushes to main compare with the newest main commit whose CI run completed
-  # with the Linux test shard green, so a documentation commit that replaces a waiting run cannot carry an
-  # untested code commit past main CI. Every other event, and any failed lookup, runs the full suite.
+  # ref with its base parent. Pushes to main and to integration branches compare with the newest main
+  # commit whose CI run concluded successfully, passed the Linux test shard and recorded a full-suite scope
+  # (the Record step), so a documentation commit that replaces a waiting run cannot carry an untested code
+  # commit past main CI, and a train whose members change only Markdown skips the suites main already
+  # passed. Every other event, and any failed lookup, runs the full suite.
   #
   # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
   # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
@@ -128,7 +130,7 @@ jobs:
       test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@v7
-        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integration/')))
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
@@ -149,34 +151,48 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
             docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
-          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
+          elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
             base=""
             runs=""
             # The checkout is one commit deep. The ancestry test below needs main's history, and the
             # comparison reads paths only, so fetch main's commits and trees without file contents.
+            # An integration branch's own commits sit between its head and main, so its ref is fetched too.
             # A full-depth checkout fetches every branch and tag, and its time grows with their count.
             # A repository that already holds its history is used as it is.
             history=true
+            refspecs=("+refs/heads/main:refs/remotes/origin/main")
+            if [[ "$REF" != "refs/heads/main" ]]; then
+              refspecs+=("+${REF}:refs/remotes/origin/${REF#refs/heads/}")
+            fi
             if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
-                && ! git fetch --no-tags --filter=blob:none --unshallow origin "+refs/heads/main:refs/remotes/origin/main"; then
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "${refspecs[@]}"; then
               history=false
               echo "fetching main's history failed"
             fi
             if [[ "$history" == "true" ]]; then
               runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
-                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha)"') || runs=""
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha) \(.conclusion)"') || runs=""
             fi
-            while read -r run_id run_sha; do
+            # A tested base is a run that concluded successfully as a whole, passed Linux shard 1, recorded
+            # that it ran the full suite (the test-scope-full artifact the Record step below uploads), and
+            # is an ancestor of this head (ADR-205 D3a, Amendment 1). A run without the record is skipped.
+            while read -r run_id run_sha conclusion; do
               [[ -n "$run_id" ]] || continue
+              [[ "$conclusion" == "success" ]] || continue
               shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
                 --jq '[.jobs[] | select(.name == "CI (ubuntu-latest, shard 1/2)" and .conclusion == "success")] | length') || shard=0
-              if [[ "$shard" -ge 1 ]] && git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
+              [[ "$shard" -ge 1 ]] || continue
+              recorded=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+                --jq '[.artifacts[] | select(.name == "test-scope-full")] | length') || recorded=0
+              [[ "$recorded" -ge 1 ]] || continue
+              if git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
                 base=$run_sha
                 break
               fi
             done <<< "$runs"
             if [[ -n "$base" ]]; then
               echo "Compared with $base, the newest main commit with a completed full run"
+              echo "base=$base" >> "$GITHUB_OUTPUT"
               docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
             else
               echo "full suite: no main commit with a completed full run was found"
@@ -192,24 +208,34 @@ jobs:
       # change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
       # successful push run on main published, which ingests this checkout's map and resolves the changed
       # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
-      # and every event other than a pull request writes `full`.
+      # and every event other than a pull request or an integration push writes `full`. An integration push
+      # compares with the newest fully tested main commit that is its ancestor (the Classify step's base).
       - name: Scope
         id: scope
         if: steps.classify.outputs.docs_only != 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
+          TESTED_BASE: ${{ steps.classify.outputs.base }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -uo pipefail
           test_scope=full
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "full suite: $EVENT_NAME runs are never scoped"
-          elif ! base=$(git rev-parse --verify "${HEAD_SHA}^1"); then
-            echo "full suite: the merge ref has no base parent"
+          base=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1") || base=""
+            [[ -n "$base" ]] || echo "full suite: the merge ref has no base parent"
+          elif [[ "$EVENT_NAME" == "push" && "${REF:-}" == refs/heads/integration/* ]]; then
+            # An integration push compares with the newest fully tested main commit the Classify step found.
+            base="${TESTED_BASE:-}"
+            [[ -n "$base" ]] || echo "full suite: no fully tested main commit is an ancestor of this push"
           else
+            echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
+          fi
+          if [[ -n "$base" ]]; then
             mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
             if [[ "$mode" == "map" ]]; then
               binary=""
@@ -237,6 +263,44 @@ jobs:
             test_scope=full
           fi
           echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
+      # ADR-205 D3a: every run other than a pull request's records the scope its suites ran, and the
+      # tested-base lookup in the Classify step reads that record. The artifact's name carries the value
+      # (test-scope-full, test-scope-scoped or test-scope-docs), so a reader lists names and never
+      # downloads. The value follows the expression the test jobs use (an empty scope runs the full
+      # suite). A failed upload leaves the run without a record, so the lookup skips it rather than
+      # turning the run red.
+      - name: Record the test scope
+        id: record
+        if: github.event_name != 'pull_request'
+        env:
+          DOCS_ONLY: ${{ steps.classify.outputs.docs_only }}
+          TEST_SCOPE: ${{ steps.scope.outputs.test_scope }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${DOCS_ONLY:-}" == "true" ]]; then
+            recorded=docs
+          elif [[ "${TEST_SCOPE:-full}" == "full" ]]; then
+            recorded=full
+          else
+            recorded=scoped
+          fi
+          mkdir -p "$RUNNER_TEMP/test-scope"
+          if [[ "$recorded" == "docs" ]]; then
+            echo docs > "$RUNNER_TEMP/test-scope/test_scope"
+          else
+            printf '%s\n' "${TEST_SCOPE:-full}" > "$RUNNER_TEMP/test-scope/test_scope"
+          fi
+          echo "recorded=$recorded" | tee -a "$GITHUB_OUTPUT"
+      - name: Upload the test scope record
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-scope-${{ steps.record.outputs.recorded }}
+          path: ${{ runner.temp }}/test-scope/test_scope
+          retention-days: 90
+          if-no-files-found: error
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -1607,6 +1671,16 @@ jobs:
         run: |
           cargo test -p khive-db --lib windows_code_map_pool_reports_retained_main_identity 2>&1 | tee "$RUNNER_TEMP/windows-code-map-handle-identity.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-code-map-handle-identity.log" 1
+      - name: khive-db Windows handle lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe windows::windows_handle_interaction_does_not_release_another_handles_lock -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-windows-handle.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-windows-handle.log" 1
+      - name: khive-db Windows stale-path lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe stale_path::stale_path_truncate_after_rename_changes_the_replacement_while_original_lock_survives -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-stale-path.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-stale-path.log" 1
       # #2149: exercise real Windows sharing/reparse semantics and Git's
       # consumption of the pinned path; a compile check cannot prove either.
       - name: khive-pack-git Windows cache slot pins

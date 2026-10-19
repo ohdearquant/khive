@@ -10,16 +10,34 @@ to, the dependents closure, and the reason for every `full`. Every failure print
 classifier can only fail toward the full suite (ADR-205 D3).
 
 The order is fixed (ADR-205 D4). The path rules run on the list of changed paths alone, before the
-binary is touched or any manifest is read, so a change to a manifest, a lockfile, a workflow, a script
-or anything else outside crate source goes to the full suite and the code pack never reads a tree in
-which the pull request changed a manifest. Only then does the classifier run `code.ingest` with the
+binary is touched, so a change to the workspace manifest, a workflow, a script or anything else outside
+crate source goes to the full suite. Two path classes are read as data before the binary runs
+(ADR-205 Amendment 1, D2 and D3):
+
+- A crate's own `Cargo.toml` is admitted only when every difference between its base and head copies is
+  inside a dependency table (plain or under `[target.*]`) or a target table; no dependency entry gains,
+  loses or changes `features`, `default-features` or `optional` (a `workspace = true` entry is read
+  together with the workspace manifest's entry it inherits); and every target table that differs keeps
+  its `required-features` and has a `path` that, with `..` segments and symbolic links followed in the
+  head tree, lies inside the crate. The crate counts as changed, and so does every workspace member
+  whose resolved dependencies in the base or head lockfile reach a package a changed dependency entry
+  names. The binary then ingests the base commit's tree, never the head's.
+- `crates/Cargo.lock` is parsed on both sides with each package entry keyed by name, version and
+  source. An entry on one side only, or one that differs, is changed; every workspace member whose own
+  entry changed, or whose resolved dependencies in either lockfile reach a changed entry, counts as
+  changed. A changed `version` header, any other changed top-level key, or a change reaching every
+  workspace member goes to the full suite.
+
+Any other difference, and every failure to read either side, goes to the full suite. Only then does
+the classifier run `code.ingest` with the
 given `kkernel` binary (the one the newest successful push run on main built), register the map it
 writes, resolve each changed crate to its project with `code.list(kind="project")`, and take the
 incoming `depends_on` closure with `code.deps(direction="incoming", max_depth=1)`, one depth at a
 time until the set stops growing, so the verb's depth bound never truncates a closure.
 
-`--paths-only` stops after the path rules and prints `full` or `map`: `map` means the change is crate
-source and Markdown only, so the caller should fetch the binary and run the full classification. The
+`--paths-only` stops after the path rules and the manifest and lockfile reads and prints `full` or
+`map`: `map` means the change is crate source, admitted manifest and lockfile changes and Markdown
+only, so the caller should fetch the binary and run the full classification. The
 workflow runs it first, so a pull request the path rules send to the full suite never downloads one.
 
 A changed path resolves to the crate whose manifest directory is its longest prefix (ADR-205 D2). A
@@ -63,7 +81,16 @@ OPS_PER_CALL = 50
 EXEC_TIMEOUT_SECONDS = 600
 
 # Paths that change what the build or CI does (ADR-205 D3, the list scripts/ci-integration-only.sh
-# carried before this script replaced it). Any of them puts the run on the full suite.
+# carried before this script replaced it). Any of them puts the run on the full suite, except a crate's own
+# Cargo.toml and crates/Cargo.lock, which are read as data (ADR-205 Amendment 1, D2 and D3).
+WORKSPACE_MANIFEST = "crates/Cargo.toml"
+LOCKFILE = "crates/Cargo.lock"
+DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+TARGET_TABLES = ("lib", "bin", "test", "bench", "example")
+# Cargo also reads the underscore spellings, so each counts as a flag of its own.
+DEPENDENCY_FLAGS = ("features", "default-features", "default_features", "optional")
+REQUIRED_FEATURES = ("required-features", "required_features")
+SYMLINK_HOPS = 40
 FULL_SUITE_NAMES = {
     "Cargo.toml": "manifest",
     "Cargo.lock": "lockfile",
@@ -118,8 +145,13 @@ def assert_no_submodule(head):
 
 
 def path_rule(path):
-    """Return 'markdown' or 'crate'; raise Full for every path the rules do not admit."""
+    """Return 'markdown', 'crate', 'crate-manifest' or 'lockfile'; raise Full for every path the rules do not admit."""
     name = path.rsplit("/", 1)[-1]
+    if path == LOCKFILE:
+        return "lockfile"
+    if (name == "Cargo.toml" and path.startswith(CRATES) and path != WORKSPACE_MANIFEST
+            and not any(path.startswith(prefix) for prefix in FULL_SUITE_PREFIXES)):
+        return "crate-manifest"
     if name in FULL_SUITE_NAMES:
         raise Full(f"{FULL_SUITE_NAMES[name]}: {path}")
     if path == "Makefile":
@@ -424,7 +456,7 @@ def load_manifests(head):
         try:
             package = tomllib.loads(text).get("package")
         except tomllib.TOMLDecodeError as error:
-            raise Full(f"{path} does not parse: {error}") from error
+            raise Full(f"manifest: {path} does not parse at {head}: {error}") from error
         if isinstance(package, dict) and isinstance(package.get("name"), str):
             manifests[path.rsplit("/", 1)[0]] = package["name"]
     return manifests
@@ -523,13 +555,307 @@ def crate_of(path, head, manifests):
                 try:
                     package = tomllib.loads(text).get("package")
                 except tomllib.TOMLDecodeError as error:
-                    raise Full(f"{directory}/Cargo.toml does not parse: {error}") from error
+                    raise Full(f"manifest: {directory}/Cargo.toml does not parse at {head}: {error}") from error
                 if isinstance(package, dict) and isinstance(package.get("name"), str):
                     manifests[directory] = package["name"]
         if manifests[directory] is not None:
             return manifests[directory]
         parts.pop()
     raise Full(f"under no crate's manifest directory: {path}")
+
+
+def read_toml(revision, path, label):
+    """The parsed TOML at revision:path; raise Full when it is absent or does not parse."""
+    try:
+        text = git("show", f"{revision}:{path}")
+    except Full as reason:
+        raise Full(f"{label}: {path} cannot be read at {revision}: {reason}") from reason
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Full(f"{label}: {path} does not parse at {revision}: {error}") from error
+
+
+def changed_keys(key, before, after):
+    """The dotted names of the keys that differ under key, one level down where both sides are tables."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        return [f"{key}.{sub}" for sub in sorted(set(before) | set(after)) if before.get(sub) != after.get(sub)]
+    return [key]
+
+
+def symbolic_links(revision, paths):
+    """The paths among paths that are symbolic links (mode 120000) at revision."""
+    if not paths:
+        return set()
+    raw = git("--literal-pathspecs", "ls-tree", "-r", "-z", "--format=%(objectmode) %(path)", revision, "--", *paths)
+    return {row.split(" ", 1)[1] for row in raw.split("\0") if row.startswith("120000 ")}
+
+
+def symlink_map(head):
+    """{path: target} for every symbolic link in the head tree."""
+    raw = git("ls-tree", "-r", "-z", "--format=%(objectmode) %(path)", head)
+    links = [row.split(" ", 1)[1] for row in raw.split("\0") if row.startswith("120000 ")]
+    return read_blobs(head, links) if links else {}
+
+
+def resolve_in_tree(path, links):
+    """path with every `..` segment and every symbolic link of the head tree followed, as rustc would open it."""
+    parts, resolved, hops = path.split("/"), [], 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise Full(f"{path} leaves the repository")
+            resolved.pop()
+            continue
+        resolved.append(part)
+        target = links.get("/".join(resolved))
+        if target is None:
+            continue
+        hops += 1
+        if hops > SYMLINK_HOPS or target.startswith("/"):
+            raise Full(f"{path} follows an absolute symbolic link or more than {SYMLINK_HOPS} links")
+        resolved.pop()
+        parts = target.split("/") + parts
+    return "/".join(resolved)
+
+
+def workspace_dependencies(head):
+    table = read_toml(head, WORKSPACE_MANIFEST, "manifest").get("workspace", {}).get("dependencies", {})
+    if not isinstance(table, dict):
+        raise Full(f"manifest: {WORKSPACE_MANIFEST} has a [workspace.dependencies] that is not a table")
+    return table
+
+
+def dependency_flags(name, entry, inherited):
+    """The feature-bearing keys of one dependency entry, a `workspace = true` entry's inherited ones kept apart."""
+    if isinstance(entry, str):
+        return {}
+    if not isinstance(entry, dict):
+        raise Full(f"dependency {name} is neither a version string nor a table")
+    flags = {("local", flag): entry[flag] for flag in DEPENDENCY_FLAGS if flag in entry}
+    if entry.get("workspace") is True:
+        if name not in inherited:
+            raise Full(f"dependency {name} inherits an entry {WORKSPACE_MANIFEST} does not declare")
+        if isinstance(inherited[name], dict):
+            flags.update({("workspace", flag): inherited[name][flag] for flag in DEPENDENCY_FLAGS
+                          if flag in inherited[name]})
+    return flags
+
+
+def dependency_package(name, entry, inherited):
+    """The package a dependency entry names: its `package` key, the inherited entry's, or its own key."""
+    for table in (entry, inherited.get(name) if isinstance(entry, dict) and entry.get("workspace") is True else None):
+        if isinstance(table, dict) and isinstance(table.get("package"), str):
+            return table["package"]
+    return name
+
+
+def dependency_change(path, label, before, after, inherited):
+    """The packages named by the entries a dependency table's change adds, removes or edits."""
+    before, after = before or {}, after or {}
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise Full(f"manifest: {path} has a [{label}] that is not a table")
+    named = set()
+    for name in sorted(set(before) | set(after)):
+        old, new = before.get(name), after.get(name)
+        if old == new:
+            continue
+        old_flags = dependency_flags(name, old, inherited) if old is not None else {}
+        new_flags = dependency_flags(name, new, inherited) if new is not None else {}
+        if old_flags != new_flags:
+            raise Full(f"manifest: {path} changes features, default-features or optional of {label}.{name}")
+        named.update(dependency_package(name, entry, inherited) for entry in (old, new) if entry is not None)
+    return named
+
+
+def targets_by_name(path, key, value):
+    if value is None:
+        return {}
+    if not isinstance(value, list) or not all(isinstance(t, dict) and isinstance(t.get("name"), str) for t in value):
+        raise Full(f"manifest: {path} has a [[{key}]] entry without a name")
+    names = [t["name"] for t in value]
+    if len(set(names)) != len(names):
+        raise Full(f"manifest: {path} declares two [[{key}]] targets with one name")
+    return {t["name"]: t for t in value}
+
+
+def target_change(path, key, before, after, crate, head, manifests, links):
+    """Raise Full unless every target that differs keeps its required features and its file inside the crate."""
+    if key == "lib":
+        if not isinstance(before or {}, dict) or not isinstance(after or {}, dict):
+            raise Full(f"manifest: {path} has a [lib] that is not a table")
+        pairs = [("[lib]", before, after)]
+    else:
+        old, new = targets_by_name(path, key, before), targets_by_name(path, key, after)
+        pairs = [(f"[[{key}]] {name}", old.get(name), new.get(name))
+                 for name in sorted(set(old) | set(new)) if old.get(name) != new.get(name)]
+    directory = path.rsplit("/", 1)[0]
+    for label, old, new in pairs:
+        if new is None:
+            continue
+        if any((old or {}).get(field) != new.get(field) for field in REQUIRED_FEATURES):
+            raise Full(f"manifest: {path} changes the required features of {label}")
+        target = new.get("path")
+        if target is None:
+            continue
+        if not isinstance(target, str) or target.startswith("/"):
+            raise Full(f"manifest: {path} gives {label} a path that is not relative: {target!r}")
+        resolved = resolve_in_tree(f"{directory}/{target}", links)
+        owner = owner_of(resolved, head, manifests) if resolved.startswith(directory + "/") else None
+        if owner != crate:
+            raise Full(f"manifest: {path} gives {label} the path {target}, which resolves to {resolved}, "
+                       f"outside the crate")
+
+
+def manifest_change(path, base, head, manifests, links, inherited):
+    """(crate, packages) for an admitted change to a crate's own manifest: the packages its changed dependency
+    entries name. Raise Full for any other difference (ADR-205 Amendment 1, D2)."""
+    crate = manifests.get(path.rsplit("/", 1)[0])
+    if crate is None:
+        raise Full(f"manifest: {path} is not the manifest of a crate at {head}")
+    old, new = read_toml(base, path, "manifest"), read_toml(head, path, "manifest")
+    named = set()
+    for key in sorted(set(old) | set(new)):
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        if key in DEPENDENCY_TABLES:
+            named |= dependency_change(path, key, before, after, inherited)
+        elif key == "target":
+            before, after = before or {}, after or {}
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                raise Full(f"manifest: {path} has a [target] that is not a table")
+            for cfg in sorted(set(before) | set(after)):
+                old_cfg, new_cfg = before.get(cfg) or {}, after.get(cfg) or {}
+                if not isinstance(old_cfg, dict) or not isinstance(new_cfg, dict):
+                    raise Full(f"manifest: {path} has a [target.{cfg}] that is not a table")
+                for table in sorted(set(old_cfg) | set(new_cfg)):
+                    if old_cfg.get(table) == new_cfg.get(table):
+                        continue
+                    if table not in DEPENDENCY_TABLES:
+                        raise Full(f"manifest: {path} changes target.{cfg}.{table}, outside the dependency tables")
+                    named |= dependency_change(path, f"target.{cfg}.{table}", old_cfg.get(table),
+                                               new_cfg.get(table), inherited)
+        elif key in TARGET_TABLES:
+            target_change(path, key, before, after, crate, head, manifests, links)
+        else:
+            raise Full(f"manifest: {path} changes {', '.join(changed_keys(key, before, after))}, outside the "
+                       f"dependency and target tables")
+    return crate, named
+
+
+def read_lock(revision):
+    """(document, {(name, version, source): entry}) for crates/Cargo.lock at revision."""
+    lock = read_toml(revision, LOCKFILE, "lockfile")
+    packages = lock.get("package")
+    if not isinstance(packages, list) or not all(
+            isinstance(p, dict) and isinstance(p.get("name"), str) and isinstance(p.get("version"), str)
+            for p in packages):
+        raise Full(f"lockfile: {LOCKFILE} at {revision} has a package entry without a name and a version")
+    entries = {}
+    for package in packages:
+        key = (package["name"], package["version"], package.get("source", ""))
+        if key in entries:
+            raise Full(f"lockfile: {LOCKFILE} at {revision} lists {key[0]} {key[1]} twice")
+        entries[key] = {**package, "dependencies": sorted(package.get("dependencies", []))}
+    return lock, entries
+
+
+def lock_graph(entries, revision):
+    """{key: {dependency keys}}, each dependency resolved by name, then version, then source as the lockfile writes."""
+    by_name = {}
+    for key in entries:
+        by_name.setdefault(key[0], []).append(key)
+    graph = {}
+    for key, entry in entries.items():
+        edges = set()
+        for text in entry["dependencies"]:
+            name, _, rest = text.partition(" ")
+            version, _, source = rest.partition(" ")
+            matches = [k for k in by_name.get(name, []) if (not version or k[1] == version)
+                       and (not source or f"({k[2]})" == source)]
+            if len(matches) != 1:
+                raise Full(f"lockfile: {key[0]} {key[1]} at {revision} depends on {text!r}, which matches "
+                           f"{len(matches)} entries")
+            edges.add(matches[0])
+        graph[key] = edges
+    return graph
+
+
+def reachable(graph, start):
+    seen, stack = {start}, [start]
+    while stack:
+        for following in graph[stack.pop()]:
+            if following not in seen:
+                seen.add(following)
+                stack.append(following)
+    return seen
+
+
+def members(entries, crates):
+    return [key for key in entries if not key[2] and key[0] in crates]
+
+
+def lockfiles(base, head):
+    """[(revision, document, entries, graph)] for the base and head lockfiles."""
+    sides = []
+    for revision in (base, head):
+        document, entries = read_lock(revision)
+        sides.append((revision, document, entries, lock_graph(entries, revision)))
+    return sides
+
+
+def members_reaching(packages, sides, crates):
+    """Every workspace member whose resolved dependencies in either lockfile reach one of packages, itself included."""
+    listed = {key[0] for _, _, entries, _ in sides for key in entries}
+    missing = sorted(packages - listed)
+    if missing:
+        raise Full(f"lockfile: neither side lists {', '.join(missing)}, which a changed dependency entry names")
+    return {member[0] for _, _, entries, graph in sides for member in members(entries, crates)
+            if any(key[0] in packages for key in reachable(graph, member))}
+
+
+def lockfile_change(sides, crates):
+    """The workspace members a lockfile change reaches (ADR-205 Amendment 1, D3)."""
+    (_, old_doc, old, old_graph), (_, new_doc, new, new_graph) = sides
+    if old_doc.get("version") != new_doc.get("version"):
+        raise Full(f"lockfile: {LOCKFILE} changes its version header")
+    other = sorted(key for key in set(old_doc) | set(new_doc)
+                   if key not in ("version", "package") and old_doc.get(key) != new_doc.get(key))
+    if other:
+        raise Full(f"lockfile: {LOCKFILE} changes {', '.join(other)}")
+    changed = {key for key in set(old) | set(new) if old.get(key) != new.get(key)}
+    everyone = {member[0] for entries in (old, new) for member in members(entries, crates)}
+    if not everyone:
+        raise Full(f"lockfile: {LOCKFILE} lists no workspace member")
+    reached = {member[0] for entries, graph in ((old, old_graph), (new, new_graph))
+               for member in members(entries, crates) if reachable(graph, member) & changed}
+    log(f"lockfile: {len(changed)} changed entries: "
+        f"{' '.join(sorted(f'{k[0]}@{k[1]}' for k in changed))}")
+    log(f"lockfile: {len(reached)} of {len(everyone)} workspace members reach them: {' '.join(sorted(reached))}")
+    if reached == everyone:
+        raise Full(f"lockfile: the change reaches every workspace member ({len(everyone)})")
+    return reached
+
+
+def export_tree(revision, destination):
+    """Write revision's crates/ under destination and check every file arrived."""
+    archive = subprocess.run(["git", "archive", "--format=tar", revision, "crates"], cwd=REPO,
+                             capture_output=True, check=False)
+    if archive.returncode != 0:
+        raise Full(f"git archive of {revision} failed (rc {archive.returncode})")
+    unpack = subprocess.run(["tar", "-x", "-f", "-", "-C", str(destination)], input=archive.stdout,
+                            capture_output=True, check=False)
+    if unpack.returncode != 0:
+        raise Full(f"unpacking {revision}'s crates/ failed (rc {unpack.returncode})")
+    expected = len(git("ls-tree", "-r", "-z", "--name-only", revision, "--", CRATES).split("\0")) - 1
+    written = sum(len(files) + sum(os.path.islink(os.path.join(root, d)) for d in dirs)
+                  for root, dirs, files in os.walk(destination / "crates"))
+    if written != expected:
+        raise Full(f"{revision}'s crates/ unpacked {written} files where the tree has {expected}")
 
 
 class Kkernel:
@@ -579,13 +905,22 @@ def quote(value):
     return json.dumps(value)
 
 
-def ingest(kernel, workdir):
+def ingest(kernel, workdir, base=None):
+    """Ingest the head checkout's crates/, or base's when a crate manifest changed, so the binary never parses a
+    manifest the change wrote (ADR-205 D4, Amendment 1 D2)."""
     maps = workdir / "maps"
     maps.mkdir()
     db = maps / "workspace.db"
     # An explicit db must name an existing regular file; an empty one initializes.
     db.touch()
-    source = REPO / "crates"
+    if base is None:
+        source = REPO / "crates"
+    else:
+        tree = workdir / "base-tree"
+        tree.mkdir()
+        export_tree(base, tree)
+        source = tree / "crates"
+        log(f"ingest: the base tree {base}, because a crate manifest changed")
     (report,) = kernel.exec(
         f'code.ingest(path={quote(str(source))}, db={quote(str(db))}, '
         f'languages=["rust"], tiers=["l1"])'
@@ -679,27 +1014,58 @@ def closure(kernel, changed, by_name):
 def classify(base, head, binary, paths_only=False):
     paths = changed_paths(base, head)
     assert_no_submodule(head)
-    markdown, crate_paths = [], []
+    sorted_paths = {"markdown": [], "crate": [], "crate-manifest": [], "lockfile": []}
     for path in paths:
-        (markdown if path_rule(path) == "markdown" else crate_paths).append(path)
+        sorted_paths[path_rule(path)].append(path)
+    markdown, crate_paths = sorted_paths["markdown"], sorted_paths["crate"]
+    manifest_paths, lockfile = sorted_paths["crate-manifest"], bool(sorted_paths["lockfile"])
     if markdown:
         targets = symlink_targets(head)
         for path in markdown:
             check_markdown(path, head, targets)
-    if not crate_paths:
+    if not crate_paths and not manifest_paths and not lockfile:
         raise Full("no crate source changed")
+    # git show returns a link's target text while cargo reads the file the link names, so a manifest or lockfile
+    # that is a link on either side is never read as data.
+    for revision in (base, head):
+        for path in sorted(symbolic_links(revision, manifest_paths + sorted_paths["lockfile"])):
+            raise Full(f"{path} is a symbolic link at {revision}")
     manifests = load_manifests(head)
     changed = set()
     for path in crate_paths:
         crate = crate_of(path, head, manifests)
         log(f"changed: {path} -> {crate}")
         changed.add(crate)
+    packages = set()
+    if manifest_paths:
+        links, inherited = symlink_map(head), workspace_dependencies(head)
+        for path in manifest_paths:
+            crate, named_packages = manifest_change(path, base, head, manifests, links, inherited)
+            log(f"changed: {path} -> {crate} (manifest; changed dependency entries name: "
+                f"{' '.join(sorted(named_packages)) or 'none'})")
+            changed.add(crate)
+            packages |= named_packages
+    if packages or lockfile:
+        crates = {name for name in manifests.values() if name is not None}
+        sides = lockfiles(base, head)
+        if packages:
+            reaching = members_reaching(packages, sides, crates)
+            log(f"members reaching {' '.join(sorted(packages))} in either lockfile: {' '.join(sorted(reaching))}")
+            changed |= reaching
+        if lockfile:
+            changed |= lockfile_change(sides, crates)
+    if not changed:
+        raise Full("the change reaches no crate")
     log(f"changed crates: {' '.join(sorted(changed))}")
     named = foreign_includes(head, manifests)
-    for path in crate_paths:
+    for path in crate_paths + manifest_paths:
         readers = named_by_another_crate(path, crate_of(path, head, manifests), named)
         if readers:
             raise Full(f"{path} is compiled or read by another crate: {', '.join(readers)}")
+    if lockfile:
+        readers = named_by_another_crate(LOCKFILE, None, named)
+        if readers:
+            raise Full(f"{LOCKFILE} is read by a crate: {', '.join(readers)}")
     if paths_only:
         return None
 
@@ -709,7 +1075,7 @@ def classify(base, head, binary, paths_only=False):
         # The map's VFS refuses a path with a symlinked parent; macOS /tmp and /var are symlinks.
         workdir = Path(tmp).resolve()
         kernel = Kkernel(binary, workdir)
-        ingest(kernel, workdir)
+        ingest(kernel, workdir, base if manifest_paths else None)
         by_name = projects(kernel)
         scope = closure(kernel, changed, by_name)
     if not scope:
