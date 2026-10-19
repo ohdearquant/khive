@@ -4,8 +4,8 @@ use khive_types::EdgeRelation;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
-// sibling block for the full rationale. `upsert_edge`/`delete_edge` in `store_impl.rs` and
+// Pure statement builders (ADR-099 B3 r6 structural cut) — see
+// `crate::stores::entity` for the full rationale. `upsert_edge`/`delete_edge` in `store_impl.rs` and
 // `purge_incident_edges` (plus ADR-099's atomic prepare path in
 // `khive-runtime`, and `khive-runtime::operations::update_edge`'s
 // non-symmetric branch) all call these.
