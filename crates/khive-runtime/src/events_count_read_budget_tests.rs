@@ -485,14 +485,15 @@ impl SqlFixture {
         );
         pool.writer()
             .unwrap()
-            .conn()
-            .execute_batch(
-                "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
              WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) \
              INSERT INTO count_fixture SELECT x FROM n; \
              CREATE VIEW events AS SELECT 'local' AS namespace FROM count_fixture a \
              CROSS JOIN count_fixture b CROSS JOIN count_fixture c;",
-            )
+                )?)
+            })
             .unwrap();
         let sql: Arc<dyn SqlAccess> = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
         let store = CountStore::new(CountWork::Sql(Arc::clone(&sql)));

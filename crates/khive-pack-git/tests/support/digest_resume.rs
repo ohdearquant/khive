@@ -361,7 +361,7 @@ async fn digest_resume_first_page_survives_second_fetch_failure() {
         let rows: Vec<_> = (1..=1000).map(|n| make(n, "existing", TIE)).collect();
         {
             let writer = rt.backend().pool().try_writer().unwrap();
-            writer.conn().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO notes(id,namespace,kind,name,content,properties,created_at,updated_at) SELECT printf('10000000-0000-4000-8000-%012x',i),'local',?1,'existing','existing',json_object('number',i,'project_id',?2),i,i FROM n", (kind,project.to_string())).unwrap();
+            writer.autocommit(|conn| Ok(conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO notes(id,namespace,kind,name,content,properties,created_at,updated_at) SELECT printf('10000000-0000-4000-8000-%012x',i),'local',?1,'existing','existing',json_object('number',i,'project_id',?2),i,i FROM n", (kind,project.to_string()))?)).unwrap();
         }
         let (pr_rows, issue_rows) = if prs { (rows, vec![]) } else { (vec![], rows) };
         let (dir, repo, logs, _path) = remote_fixture(&pr_rows, &issue_rows);
@@ -602,7 +602,7 @@ async fn digest_resume_undated_acknowledgments_do_not_fill_across_windows() {
             .collect();
         {
             let writer = rt.backend().pool().try_writer().unwrap();
-            writer.conn().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO notes(id,namespace,kind,name,content,properties,created_at,updated_at) SELECT printf('10000000-0000-4000-8000-%012x',i),'local',?1,'existing','existing',json_object('number',i,'project_id',?2),i,i FROM n", (kind,project.to_string())).unwrap();
+            writer.autocommit(|conn| Ok(conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO notes(id,namespace,kind,name,content,properties,created_at,updated_at) SELECT printf('10000000-0000-4000-8000-%012x',i),'local',?1,'existing','existing',json_object('number',i,'project_id',?2),i,i FROM n", (kind,project.to_string()))?)).unwrap();
         }
         let (pr_rows, issue_rows) = if prs { (rows, vec![]) } else { (vec![], rows) };
         let (_dir, repo, logs, _path) = remote_fixture(&pr_rows, &issue_rows);

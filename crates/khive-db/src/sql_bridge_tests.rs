@@ -4512,9 +4512,11 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
         {
             let guard = pool.writer().unwrap();
             guard
+                .conn()
                 .execute_batch("CREATE TABLE atomic_terminal_probe (id INTEGER PRIMARY KEY)")
                 .unwrap();
             guard
+                .conn()
                 .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Transaction {
                         operation: TransactionOperation::Rollback,
@@ -4597,6 +4599,7 @@ async fn in_memory_atomic_unit_holds_writer_guard_through_rollback() {
     );
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE atomic_guard_probe (id INTEGER PRIMARY KEY)")
         .unwrap();
     let bridge = SqlBridge::new(Arc::clone(&pool), false);
@@ -4665,6 +4668,7 @@ async fn in_memory_atomic_unit_pending_op_rolls_back_and_releases_guard() {
     );
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE atomic_pending_probe (id INTEGER PRIMARY KEY)")
         .unwrap();
     let bridge = SqlBridge::new(Arc::clone(&pool), false);
@@ -4712,7 +4716,7 @@ async fn in_memory_atomic_unit_pending_op_rolls_back_and_releases_guard() {
         .await
         .unwrap();
     assert!(matches!(sum, Some(SqlValue::Integer(2))), "{sum:?}");
-    assert!(pool.writer().unwrap().is_autocommit());
+    assert!(pool.writer().unwrap().conn().is_autocommit());
 }
 
 /// ADR-067 Component A: before

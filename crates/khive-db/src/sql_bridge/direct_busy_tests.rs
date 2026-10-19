@@ -41,6 +41,7 @@ fn memory_pool() -> Arc<ConnectionPool> {
     );
     pool.try_writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE direct_busy_fixture (id INTEGER PRIMARY KEY)")
         .unwrap();
     pool
@@ -200,8 +201,12 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                 }
             }
             let guard = pool.try_writer().unwrap();
-            assert!(guard.is_autocommit(), "outer unit cleanup did not finish");
+            assert!(
+                guard.conn().is_autocommit(),
+                "outer unit cleanup did not finish"
+            );
             let rows: i64 = guard
+                .conn()
                 .query_row("SELECT COUNT(*) FROM direct_busy_fixture", [], |row| {
                     row.get(0)
                 })
@@ -382,8 +387,12 @@ async fn manual_atomic_cyclic_source_returns_original_error_and_rolls_back() {
         );
         assert_eq!(pool.writer_acquisition_snapshot().direct_busy_refusals, 0);
         let guard = pool.try_writer().unwrap();
-        assert!(guard.is_autocommit(), "manual rollback did not finish");
+        assert!(
+            guard.conn().is_autocommit(),
+            "manual rollback did not finish"
+        );
         let rows: i64 = guard
+            .conn()
             .query_row("SELECT COUNT(*) FROM direct_busy_fixture", [], |row| {
                 row.get(0)
             })

@@ -1466,57 +1466,59 @@ mod tests {
 
         let backend =
             khive_db::StorageBackend::sqlite_for_test(path).expect("open V20 fixture backend");
-        let mut writer = backend
+        backend
             .pool()
             .try_writer()
-            .expect("open V20 fixture writer");
-        let conn = writer.conn_mut();
-        conn.execute_batch(
-            "CREATE TABLE _schema_migrations (\
+            .expect("open V20 fixture writer")
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE _schema_migrations (\
                  version INTEGER PRIMARY KEY, \
                  name TEXT NOT NULL, \
                  applied_at INTEGER NOT NULL\
              ) STRICT;",
-        )
-        .expect("create V20 ledger");
-        for migration in MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-        {
-            let tx = conn.transaction().expect("begin V20 migration");
-            tx.execute_batch(migration.up)
-                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-            tx.execute(
-                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                )
+                .expect("create V20 ledger");
+                for migration in MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+                {
+                    let tx = conn.unchecked_transaction().expect("begin V20 migration");
+                    tx.execute_batch(migration.up)
+                        .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+                    tx.execute(
+                        "INSERT INTO _schema_migrations (version, name, applied_at) \
                  VALUES (?1, ?2, ?3)",
-                (
-                    migration.version,
-                    migration.name,
-                    i64::from(migration.version),
-                ),
-            )
-            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-            tx.commit().expect("commit V20 migration");
-        }
+                        (
+                            migration.version,
+                            migration.name,
+                            i64::from(migration.version),
+                        ),
+                    )
+                    .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+                    tx.commit().expect("commit V20 migration");
+                }
 
-        legacy.map(|(entity_type, deleted_at)| {
-            let content_ref =
-                khive_storage::ContentRef::from_hex("a".repeat(64)).expect("canonical legacy ref");
-            conn.execute(
-                "INSERT INTO entities (\
+                Ok(legacy.map(|(entity_type, deleted_at)| {
+                    let content_ref = khive_storage::ContentRef::from_hex("a".repeat(64))
+                        .expect("canonical legacy ref");
+                    conn.execute(
+                        "INSERT INTO entities (\
                      id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
                      deleted_at, content_ref\
                  ) VALUES (?1, 'local', 'artifact', ?2, 'legacy fixture', '[]', 1, 1, ?3, ?4)",
-                (
-                    uuid::Uuid::new_v4().to_string(),
-                    entity_type,
-                    deleted_at,
-                    content_ref.as_str(),
-                ),
-            )
-            .expect("insert legacy entity");
-            content_ref
-        })
+                        (
+                            uuid::Uuid::new_v4().to_string(),
+                            entity_type,
+                            deleted_at,
+                            content_ref.as_str(),
+                        ),
+                    )
+                    .expect("insert legacy entity");
+                    content_ref
+                }))
+            })
+            .expect("seed V20 fixture")
     }
 
     fn write_topology_config(
@@ -1720,14 +1722,15 @@ mod tests {
             .prepare_core_schema()
             .expect("prepare canonical V21");
         {
-            let mut writer = backend.pool().try_writer().expect("tamper V21 fixture");
+            let writer = backend.pool().try_writer().expect("tamper V21 fixture");
             writer
-                .conn_mut()
-                .execute("DELETE FROM attachment_cutover_state", [])
+                .autocommit(|conn| Ok(conn.execute("DELETE FROM attachment_cutover_state", [])?))
                 .expect("remove completion marker");
-            writer
-                .conn_mut()
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            backend
+                .pool()
+                .try_checkpoint_nowait()
+                .expect("checkpoint guard")
+                .truncate()
                 .expect("checkpoint tampered fixture");
         }
         drop(backend);
@@ -1898,44 +1901,53 @@ mod tests {
 
         let backend = StorageBackend::sqlite_for_test(&path).expect("open V20 fixture backend");
         {
-            let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
-            let conn = writer.conn_mut();
-            conn.execute_batch(
-                "CREATE TABLE _schema_migrations (\
+            backend
+                .pool()
+                .try_writer()
+                .expect("V20 fixture writer")
+                .autocommit(|conn| {
+                    conn.execute_batch(
+                        "CREATE TABLE _schema_migrations (\
                      version INTEGER PRIMARY KEY, \
                      name TEXT NOT NULL, \
                      applied_at INTEGER NOT NULL\
                  ) STRICT;",
-            )
-            .expect("create V20 migration ledger");
-            for migration in MIGRATIONS
-                .iter()
-                .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-            {
-                let tx = conn.transaction().expect("begin V20 fixture migration");
-                tx.execute_batch(migration.up)
-                    .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-                tx.execute(
-                    "INSERT INTO _schema_migrations (version, name, applied_at) \
+                    )
+                    .expect("create V20 migration ledger");
+                    for migration in MIGRATIONS
+                        .iter()
+                        .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+                    {
+                        let tx = conn
+                            .unchecked_transaction()
+                            .expect("begin V20 fixture migration");
+                        tx.execute_batch(migration.up).unwrap_or_else(|error| {
+                            panic!("apply V{}: {error}", migration.version)
+                        });
+                        tx.execute(
+                            "INSERT INTO _schema_migrations (version, name, applied_at) \
                      VALUES (?1, ?2, ?3)",
-                    (
-                        migration.version,
-                        migration.name,
-                        i64::from(migration.version),
-                    ),
-                )
-                .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-                tx.commit().expect("commit V20 fixture migration");
-            }
-            conn.execute(
-                "INSERT INTO entities (\
+                            (
+                                migration.version,
+                                migration.name,
+                                i64::from(migration.version),
+                            ),
+                        )
+                        .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+                        tx.commit().expect("commit V20 fixture migration");
+                    }
+                    conn.execute(
+                        "INSERT INTO entities (\
                      id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
                      content_ref\
                  ) VALUES (?1, 'local', 'artifact', 'visual_asset', 'legacy visual', '[]', \
                      1, 1, ?2)",
-                (entity_id.to_string(), content_ref.as_str()),
-            )
-            .expect("insert legacy attachment-bearing entity");
+                        (entity_id.to_string(), content_ref.as_str()),
+                    )
+                    .expect("insert legacy attachment-bearing entity");
+                    Ok(())
+                })
+                .expect("seed V20 fixture");
         }
         drop(backend);
 
@@ -2009,8 +2021,7 @@ mod tests {
             .pool()
             .try_writer()
             .expect("secondary writer")
-            .conn_mut()
-            .execute("UPDATE entities SET content_ref = NULL", [])
+            .autocommit(|conn| Ok(conn.execute("UPDATE entities SET content_ref = NULL", [])?))
             .expect("relocate legacy secondary attachment authority");
         drop(secondary_backend);
 

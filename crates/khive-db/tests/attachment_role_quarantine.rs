@@ -309,21 +309,26 @@ async fn migrated_v47_gc_preserves_exact_v21_admission_refusal() {
     let orphan = store.put(orphan_bytes.clone()).await.expect("orphan blob");
     {
         let writer = backend.pool().writer().expect("fixture writer");
-        restore_legacy_attachment_schema(writer.conn());
-        insert_row(
-            writer.conn(),
-            &row(
-                "quarantined-owner",
-                "message-attachment:0\u{85}",
-                quarantined.as_str(),
-            ),
-        )
-        .expect("legacy quarantined owner");
-        insert_row(
-            writer.conn(),
-            &row("live-owner", "message-attachment:0", live.as_str()),
-        )
-        .expect("live attachment owner");
+        writer
+            .autocommit(|conn| {
+                restore_legacy_attachment_schema(conn);
+                insert_row(
+                    conn,
+                    &row(
+                        "quarantined-owner",
+                        "message-attachment:0\u{85}",
+                        quarantined.as_str(),
+                    ),
+                )
+                .expect("legacy quarantined owner");
+                insert_row(
+                    conn,
+                    &row("live-owner", "message-attachment:0", live.as_str()),
+                )
+                .expect("live attachment owner");
+                Ok(())
+            })
+            .expect("admitted legacy attachment fixture");
     }
     assert_eq!(
         backend.prepare_core_schema().expect("migrate quarantine"),

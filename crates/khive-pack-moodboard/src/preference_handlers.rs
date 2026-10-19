@@ -1697,36 +1697,43 @@ mod tests {
     fn canonical_v20_backend(db_path: &Path) -> Arc<StorageBackend> {
         let backend =
             Arc::new(StorageBackend::sqlite_for_test(db_path).expect("V20 fixture backend"));
-        let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
-        let conn = writer.conn_mut();
-        conn.execute_batch(
-            "CREATE TABLE _schema_migrations (\
+        backend
+            .pool()
+            .try_writer()
+            .expect("V20 fixture writer")
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE _schema_migrations (\
                  version INTEGER PRIMARY KEY, \
                  name TEXT NOT NULL, \
                  applied_at INTEGER NOT NULL\
              ) STRICT;",
-        )
-        .expect("create V20 fixture migration ledger");
-        for migration in MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-        {
-            let tx = conn.transaction().expect("begin V20 fixture migration");
-            tx.execute_batch(migration.up)
-                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-            tx.execute(
-                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                )
+                .expect("create V20 fixture migration ledger");
+                for migration in MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+                {
+                    let tx = conn
+                        .unchecked_transaction()
+                        .expect("begin V20 fixture migration");
+                    tx.execute_batch(migration.up)
+                        .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+                    tx.execute(
+                        "INSERT INTO _schema_migrations (version, name, applied_at) \
                  VALUES (?1, ?2, ?3)",
-                (
-                    migration.version,
-                    migration.name,
-                    i64::from(migration.version),
-                ),
-            )
-            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-            tx.commit().expect("commit V20 fixture migration");
-        }
-        drop(writer);
+                        (
+                            migration.version,
+                            migration.name,
+                            i64::from(migration.version),
+                        ),
+                    )
+                    .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+                    tx.commit().expect("commit V20 fixture migration");
+                }
+                Ok(())
+            })
+            .expect("seed V20 fixture");
         backend
     }
 
@@ -2398,9 +2405,9 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .conn()
-                .execute(
-                    "INSERT INTO entities (\
+                .autocommit(|conn| {
+                    Ok(conn.execute(
+                        "INSERT INTO entities (\
                          id, namespace, kind, entity_type, name, description, properties, tags, \
                          created_at, updated_at, deleted_at, merged_into, merge_event_id, \
                          content_ref\
@@ -2408,17 +2415,18 @@ mod tests {
                          ?1, 'local', 'artifact', 'moodboard_model', 'legacy preference model', \
                          NULL, ?2, '[]', ?3, ?3, NULL, NULL, NULL, ?4\
                      )",
-                    (
-                        model_id.to_string(),
-                        entity
-                            .properties
-                            .as_ref()
-                            .expect("model property mirror")
-                            .to_string(),
-                        entity.created_at,
-                        bundle_content_ref.to_string(),
-                    ),
-                )
+                        (
+                            model_id.to_string(),
+                            entity
+                                .properties
+                                .as_ref()
+                                .expect("model property mirror")
+                                .to_string(),
+                            entity.created_at,
+                            bundle_content_ref.to_string(),
+                        ),
+                    )?)
+                })
                 .expect("insert pre-V21 legacy model");
         }
         {
@@ -2430,8 +2438,7 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .conn()
-                .execute(
+                .autocommit(|conn| Ok(conn.execute(
                     "INSERT INTO events (\
                          id, namespace, verb, substrate, actor, kind, outcome, payload, \
                          payload_schema_version, profile_state_version, duration_us, target_id, \
@@ -2457,7 +2464,7 @@ mod tests {
                         published_event.aggregate_id.map(|id| id.to_string()),
                         published_event.created_at,
                     ),
-                )
+                )?))
                 .expect("insert immutable legacy model event");
         }
 

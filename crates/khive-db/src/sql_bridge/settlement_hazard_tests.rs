@@ -258,6 +258,7 @@ async fn pool_backed_failed_call_whose_rollback_fails_reports_side_effects_unkno
     {
         let guard = pool.try_writer().unwrap();
         guard
+            .conn()
             .authorizer(Some(|context: AuthContext<'_>| match context.action {
                 AuthAction::Transaction {
                     operation: TransactionOperation::Rollback,
@@ -316,13 +317,14 @@ fn writer_guard_drop_inside_a_transaction_is_counted() {
     {
         let guard = pool.try_writer().unwrap();
         guard
+            .conn()
             .execute_batch(concat!(
                 "CREATE TABLE dropped_rows (x INTEGER); ",
                 "BEGIN; INSERT INTO dropped_rows VALUES (1);"
             ))
             .unwrap();
         assert!(
-            !guard.is_autocommit(),
+            !guard.conn().is_autocommit(),
             "fixture: the guard must drop inside a transaction"
         );
     }
@@ -333,10 +335,11 @@ fn writer_guard_drop_inside_a_transaction_is_counted() {
     );
     let guard = pool.try_writer().unwrap();
     assert!(
-        guard.is_autocommit(),
+        guard.conn().is_autocommit(),
         "the drop must leave the writer in autocommit"
     );
     let rows: i64 = guard
+        .conn()
         .query_row("SELECT COUNT(*) FROM dropped_rows", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "the drop must roll the open transaction back");

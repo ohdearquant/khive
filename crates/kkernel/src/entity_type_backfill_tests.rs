@@ -60,11 +60,12 @@ async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity
     let second = Uuid::from_u128(2);
     {
         let writer = runtime.backend().pool().writer().unwrap();
+        writer.autocommit(|conn| {
         for (id, name, description) in [
             (first, "First", description.as_str()),
             (second, "Second", "short description"),
         ] {
-            writer
+            conn
                     .execute(
                         "INSERT INTO entities \
                          (id, namespace, kind, name, description, properties, created_at, updated_at) \
@@ -73,6 +74,8 @@ async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity
                     )
                     .unwrap();
         }
+        Ok(())
+        }).unwrap();
     }
     // Only this injected-provider fixture enables the latent embedding
     // branch. Production target resolution remains model-free.
@@ -340,28 +343,32 @@ async fn nullable_census_counts_only_live_null_types_in_the_exact_namespace() {
     runtime.backend().entities().unwrap();
     {
         let writer = runtime.backend().pool().writer().unwrap();
-        for (index, namespace, entity_type, deleted_at) in [
-            (1, "census", None, None),
-            (2, "census", None, None),
-            (3, "census", Some("paper"), None),
-            (4, "census", Some("NULL"), None),
-            (5, "other", None, None),
-            (6, "census", None, Some(2_i64)),
-        ] {
-            writer
-                .execute(
-                    "INSERT INTO entities \
+        writer
+            .autocommit(|conn| {
+                for (index, namespace, entity_type, deleted_at) in [
+                    (1, "census", None, None),
+                    (2, "census", None, None),
+                    (3, "census", Some("paper"), None),
+                    (4, "census", Some("NULL"), None),
+                    (5, "other", None, None),
+                    (6, "census", None, Some(2_i64)),
+                ] {
+                    conn.execute(
+                        "INSERT INTO entities \
                      (id, namespace, kind, entity_type, name, created_at, updated_at, deleted_at) \
                      VALUES (?1, ?2, 'document', ?3, 'census fixture', 1, 1, ?4)",
-                    (
-                        Uuid::from_u128(index).to_string(),
-                        namespace,
-                        entity_type,
-                        deleted_at,
-                    ),
-                )
-                .unwrap();
-        }
+                        (
+                            Uuid::from_u128(index).to_string(),
+                            namespace,
+                            entity_type,
+                            deleted_at,
+                        ),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     assert_eq!(nullable_count(&runtime, "census").await.unwrap(), 2);
@@ -373,11 +380,13 @@ async fn nullable_census_counts_only_live_null_types_in_the_exact_namespace() {
         .pool()
         .writer()
         .unwrap()
-        .execute(
-            "UPDATE entities SET entity_type = 'paper', version = version + 1 \
+        .autocommit(|conn| {
+            Ok(conn.execute(
+                "UPDATE entities SET entity_type = 'paper', version = version + 1 \
              WHERE namespace = 'census' AND entity_type IS NULL AND deleted_at IS NULL",
-            [],
-        )
+                [],
+            )?)
+        })
         .unwrap();
     assert_eq!(nullable_count(&runtime, "census").await.unwrap(), 0);
 }
@@ -409,7 +418,7 @@ async fn nullable_census_propagates_storage_failure_instead_of_reporting_zero() 
         .pool()
         .writer()
         .unwrap()
-        .execute("DROP TABLE entities", [])
+        .autocommit(|conn| Ok(conn.execute("DROP TABLE entities", [])?))
         .unwrap();
 
     let error = nullable_count(&runtime, "local").await.unwrap_err();

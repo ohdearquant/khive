@@ -4131,10 +4131,7 @@ fn build_crossns_registry(
 
 fn shared_backend() -> Arc<khive_db::StorageBackend> {
     let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
-    {
-        let mut writer = backend.pool().try_writer().expect("writer");
-        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-    }
+    backend.pool().run_migrations().expect("migrations");
     Arc::new(backend)
 }
 
@@ -17338,19 +17335,23 @@ async fn wire_ingest_cannot_select_verified_recipient_commit() {
     let (registry, runtime) = build_registry();
     registry.dispatch("comm.ingest",serde_json::json!({"from":"remote","to":"local","content":"ordinary wire message","verified":true,"verified_recipient":true,"receipt_ticket":{"logical_message_id":uuid::Uuid::new_v4(),"sender_agent_id":uuid::Uuid::new_v4()},"disposition":"stored"})).await.expect("ordinary ingest remains accepted");
     let guard = runtime.backend().pool().writer().unwrap();
-    for table in [
-        "comm_recipient_replay",
-        "comm_ack_work",
-        "comm_recipient_quarantine",
-    ] {
-        let count: i64 = guard
-            .conn()
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0, "wire parameters must not select verified ingest");
-    }
+    guard
+        .autocommit(|conn| {
+            for table in [
+                "comm_recipient_replay",
+                "comm_ack_work",
+                "comm_recipient_quarantine",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "wire parameters must not select verified ingest");
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 mod transport_status_tests {

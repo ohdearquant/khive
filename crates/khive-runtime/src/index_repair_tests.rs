@@ -415,12 +415,12 @@ async fn degraded_note_insert_recovers_keyword_search_without_substrate_rewrite(
     let observed = attempts.clone();
     {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        runtime.backend().pool().writer().unwrap().conn().authorizer(Some(move |context: AuthContext<'_>| {
+        runtime.backend().pool().writer().unwrap().autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Insert { table_name } if table_name == "fts_notes_rowids") {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
             } else { Authorization::Allow }
-        })).unwrap();
+        }))?)).unwrap();
     }
     let result = runtime
         .try_create_note(
@@ -436,8 +436,11 @@ async fn degraded_note_insert_recovers_keyword_search_without_substrate_rewrite(
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>)
+        .autocommit(|conn| {
+            Ok(conn.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )?)
+        })
         .unwrap();
     assert!(
         attempts.load(Ordering::SeqCst) > 0,

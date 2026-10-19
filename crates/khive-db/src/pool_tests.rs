@@ -82,7 +82,7 @@ fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
     let before = pool.writer_acquisition_snapshot();
     let checks = Cell::new(0);
     let stopped = pool
-        .writer_until(|| {
+        .writer_until_for_admitted_operation(|| {
             checks.set(checks.get() + 1);
             checks.get() == 2
         })
@@ -112,7 +112,7 @@ async fn constructor_writer_observes_absolute_blocking_deadline() {
     let before = pool.writer_acquisition_snapshot();
     let started = Instant::now();
     let stopped = pool
-        .writer_until(|| context.blocking_stop_reason().is_some())
+        .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())
         .unwrap();
     assert!(stopped.is_none());
     if let Some(bound) = timing::duration_bound(Duration::from_secs(1), None) {
@@ -135,7 +135,7 @@ fn constructor_writer_preserves_uncancelled_checkout_timeout() {
     .unwrap();
     let held = pool.writer().unwrap();
     let before = pool.writer_acquisition_snapshot();
-    let result = pool.writer_until(|| false);
+    let result = pool.writer_until_for_admitted_operation(|| false);
     assert!(
         matches!(result, Err(SqliteError::WriterPoolCheckoutTimeout { timeout }) if timeout == Duration::from_millis(5))
     );
@@ -1171,6 +1171,7 @@ fn pool_drop_never_leaves_a_reader_as_the_last_connection_closed() {
 
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE close_order_row(id INTEGER PRIMARY KEY);\
              INSERT INTO close_order_row DEFAULT VALUES;",
@@ -1533,6 +1534,7 @@ fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
     .unwrap();
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE identity_marker (value INTEGER); \
                         INSERT INTO identity_marker (value) VALUES (11)",
@@ -1944,15 +1946,18 @@ fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint_once_claimed() {
         .expect("claim ownership for the dedicated-owner posture");
     let writer = pool.writer().expect("pooled writer");
     writer
+        .conn()
         .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
         .expect("create fixture table");
 
     let page_size: i64 = writer
+        .conn()
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .expect("read page size");
     let payload_bytes = page_size * 32;
     for _ in 0..160 {
         writer
+            .conn()
             .execute(
                 "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
                 [payload_bytes],
@@ -1961,6 +1966,7 @@ fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint_once_claimed() {
     }
 
     let log_frames: i64 = writer
+        .conn()
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
         .expect("observe WAL frame count");
     assert!(
@@ -1989,15 +1995,18 @@ fn unclaimed_pool_retains_bounded_autocheckpoint_reclamation() {
     .expect("pool open");
     let writer = pool.writer().expect("pooled writer");
     writer
+        .conn()
         .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
         .expect("create fixture table");
 
     let page_size: i64 = writer
+        .conn()
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .expect("read page size");
     let payload_bytes = page_size * 32;
     for _ in 0..160 {
         writer
+            .conn()
             .execute(
                 "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
                 [payload_bytes],
@@ -2011,6 +2020,7 @@ fn unclaimed_pool_retains_bounded_autocheckpoint_reclamation() {
     // fired on a threshold-crossing commit already drained the WAL, so
     // far fewer than the threshold's frames remain.
     let log_frames: i64 = writer
+        .conn()
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
         .expect("observe WAL frame count");
     assert!(
@@ -2389,7 +2399,9 @@ fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
     assert_eq!(exists, 0, "low-space startup must not write a nonce");
     drop(reader);
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(SqliteError::CapacityFloor { .. })
     ));
     pool.open_checkpoint_file()
@@ -2542,6 +2554,7 @@ fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
     pool.set_test_write_admission(0, |_| Ok(0));
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE checkpoint_floor (id INTEGER); \
              INSERT INTO checkpoint_floor VALUES (1)",
@@ -2552,7 +2565,9 @@ fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
     assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
     pool.set_test_write_admission(100, |_| Ok(99));
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(SqliteError::CapacityFloor { .. })
     ));
     let before = pool.writer_acquisition_snapshot();

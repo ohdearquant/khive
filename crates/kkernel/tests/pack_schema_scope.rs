@@ -583,7 +583,12 @@ fn nullable_column_scope_checks_precede_existing_column_noops() {
         )
         .unwrap();
     let writer = backend.pool().writer().unwrap();
-    check_column_shapes(writer.conn(), "fixture", &auxiliary).unwrap();
+    writer
+        .autocommit(|conn| {
+            check_column_shapes(conn, "fixture", &auxiliary).unwrap();
+            Ok(())
+        })
+        .expect("column shape scope");
     for table in CORE_TABLES {
         let forbidden = [PackColumnAddition {
             table,

@@ -46,14 +46,16 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
     // #1848 makes the central task the only routine checkpoint owner. Keep
     // autocheckpoint disabled on this writer so progress below is attributable
     // to `checkpoint_once`, never to a threshold-crossing commit.
-    let writer = pool.writer().expect("fixture writer");
-    writer
-        .conn()
-        .execute_batch(
-            "PRAGMA wal_autocheckpoint = 0; \
+    pool.writer()
+        .expect("fixture writer")
+        .autocommit(|conn| {
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint = 0; \
              CREATE TABLE bridge_writes \
              (cycle INTEGER NOT NULL, row_no INTEGER NOT NULL, payload BLOB NOT NULL);",
-        )
+            )?;
+            Ok(())
+        })
         .expect("initialize WAL fixture");
 
     let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -91,22 +93,17 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
     let mut first_cycle_wal_bytes = None;
 
     for cycle in 0..WRITE_CYCLES {
-        writer
-            .conn()
-            .execute_batch("BEGIN IMMEDIATE")
-            .expect("begin fixture write cycle");
-        for row_no in 0..ROWS_PER_CYCLE {
-            writer
-                .conn()
-                .execute(
-                    "INSERT INTO bridge_writes (cycle, row_no, payload) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![cycle, row_no, payload.as_slice()],
-                )
-                .expect("append fixture row");
-        }
-        writer
-            .conn()
-            .execute_batch("COMMIT")
+        pool.writer()
+            .expect("fixture cycle writer")
+            .transaction(|conn| {
+                for row_no in 0..ROWS_PER_CYCLE {
+                    conn.execute(
+                        "INSERT INTO bridge_writes (cycle, row_no, payload) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![cycle, row_no, payload.as_slice()],
+                    )?;
+                }
+                Ok(())
+            })
             .expect("commit fixture write cycle");
 
         checkpoint_conn

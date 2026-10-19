@@ -47,8 +47,7 @@ fn setup() -> (Arc<ConnectionPool>, SqlNoteStore) {
     );
     pool.writer()
         .unwrap()
-        .conn()
-        .execute_batch(include_str!("../sql/notes-ddl.sql"))
+        .autocommit(|conn| Ok(conn.execute_batch(include_str!("../sql/notes-ddl.sql"))?))
         .unwrap();
     let store = SqlNoteStore::new(pool.clone(), false);
     (pool, store)

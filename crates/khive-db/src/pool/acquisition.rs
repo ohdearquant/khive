@@ -256,30 +256,31 @@ impl ConnectionPool {
     /// Waits up to `checkout_timeout` for the writer Mutex and returns
     /// `Err(SqliteError::WriterPoolCheckoutTimeout)` if the timeout is
     /// exceeded.
+    ///
+    /// Checkout owns exclusion, not a capacity sample. Consume the returned
+    /// guard with [`WriterGuard::autocommit`] or [`WriterGuard::transaction`];
+    /// those operations sample at execution and retain ownership through
+    /// settlement. Raw connection access is crate-private.
     #[track_caller]
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_with_checkout_probe(true, false)
+        self.writer_checkout(false)
     }
 
     /// Callers that own an explicit §4 logical-write boundary probe there,
     /// so checkout must not refuse ahead of their BEGIN/bootstrap statement.
     #[track_caller]
     pub(crate) fn writer_for_admitted_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_with_checkout_probe(false, false)
+        self.writer_checkout(false)
     }
 
     /// Checkpoint ownership setup changes only SQLite's checkpoint policy.
     /// Its bounded checkout must remain available below the write reserve.
     pub(super) fn writer_for_checkpoint_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_with_checkout_probe(false, true)
+        self.writer_checkout(true)
     }
 
     #[track_caller]
-    fn writer_with_checkout_probe(
-        &self,
-        compatibility_probe: bool,
-        checkpoint_bypass: bool,
-    ) -> Result<WriterGuard<'_>, SqliteError> {
+    fn writer_checkout(&self, checkpoint_bypass: bool) -> Result<WriterGuard<'_>, SqliteError> {
         if !checkpoint_bypass {
             self.write_admission.ensure_settled()?;
         }
@@ -318,12 +319,6 @@ impl ConnectionPool {
             self.verify_opened_file_identity(path)?;
             self.verify_connection_file_identity(&guard, path)?;
         }
-        // Public raw-Connection/Deref compatibility callers may issue an
-        // autocommit write without another seam. Keep the old coarse sample
-        // until those sites migrate; explicit admitted operations skip it.
-        if compatibility_probe && !checkpoint_bypass {
-            self.write_admission.check()?;
-        }
         self.writer_acquisition_counters
             .pooled_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -345,36 +340,10 @@ impl ConnectionPool {
         self.writer()
     }
 
-    // Retain the compatibility-probe path only for its focused regression
-    // fixtures; production callers use the execution-boundary admission seam.
-    #[cfg(test)]
-    #[track_caller]
-    pub(super) fn writer_until<C>(
-        &self,
-        should_stop: C,
-    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
-    where
-        C: Fn() -> bool,
-    {
-        self.writer_until_with_checkout_probe(should_stop, true)
-    }
-
     #[track_caller]
     pub(crate) fn writer_until_for_admitted_operation<C>(
         &self,
         should_stop: C,
-    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
-    where
-        C: Fn() -> bool,
-    {
-        self.writer_until_with_checkout_probe(should_stop, false)
-    }
-
-    #[track_caller]
-    fn writer_until_with_checkout_probe<C>(
-        &self,
-        should_stop: C,
-        compatibility_probe: bool,
     ) -> Result<Option<WriterGuard<'_>>, SqliteError>
     where
         C: Fn() -> bool,
@@ -407,9 +376,6 @@ impl ConnectionPool {
                 if let Some(path) = self.identity_path.as_deref() {
                     self.verify_opened_file_identity(path)?;
                     self.verify_connection_file_identity(&guard, path)?;
-                }
-                if compatibility_probe {
-                    self.write_admission.check()?;
                 }
                 self.writer_acquisition_counters
                     .pooled_acquisitions

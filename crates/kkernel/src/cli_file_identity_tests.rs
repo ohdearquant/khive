@@ -62,10 +62,11 @@ mod file_identity_tests {
     fn checkpoint_fixture(path: &std::path::Path) {
         let backend = khive_db::StorageBackend::sqlite_for_test(path).expect("fixture backend");
         {
-            let writer = backend.pool().try_writer().expect("checkpoint writer");
-            writer
-                .conn()
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            backend
+                .pool()
+                .try_checkpoint_nowait()
+                .expect("checkpoint guard")
+                .truncate()
                 .expect("checkpoint fixture before hardlink inspection");
         }
         drop(backend);

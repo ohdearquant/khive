@@ -100,8 +100,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
             .try_writer()
             .expect("pooled writer");
         writer
-            .conn()
-            .busy_timeout(Duration::ZERO)
+            .autocommit(|conn| Ok(conn.busy_timeout(Duration::ZERO)?))
             .expect("zero busy timeout");
     }
     // Deliberately uncooperative external SQLite writer: this fixture must

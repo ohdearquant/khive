@@ -299,6 +299,30 @@ impl WriteAdmission {
 /// A writer connection checked out from the pool.
 /// The Mutex ensures only one writer at a time.
 ///
+/// Checkout retains exclusion; each consuming operation samples capacity at
+/// its execution boundary. Raw connection access is not a public capability:
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw(pool: &ConnectionPool) {
+///     let writer = pool.writer().unwrap();
+///     let _connection = writer.conn();
+/// }
+/// ```
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw_mut(pool: &ConnectionPool) {
+///     let mut writer = pool.writer().unwrap();
+///     let _connection = writer.conn_mut();
+/// }
+/// ```
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw_mut(pool: &ConnectionPool) {
+///     let mut writer = pool.writer().unwrap();
+///     let _connection: &mut rusqlite::Connection = &mut *writer;
+/// }
+/// ```
+///
 /// # Terminal settlement
 /// Dropping a retired writer settles its connection before the volume lease is
 /// released. If cleanup cannot restore autocommit and owned SQLite close also
@@ -330,6 +354,10 @@ pub(crate) struct PooledAutocommitWriteUnit<'pool> {
 impl PooledAutocommitWriteUnit<'_> {
     pub(crate) fn conn(&self) -> &Connection {
         self.writer.conn()
+    }
+
+    pub(crate) fn rollback_or_retire(&self, context: &str) -> Result<(), SqliteError> {
+        self.writer.rollback_or_retire(context)
     }
 }
 
@@ -539,7 +567,10 @@ impl<'pool> WriterGuard<'pool> {
                 "pooled autocommit write began on a connection in a transaction".to_string(),
             ));
         }
-        if self._volume_lease.is_none() && self.pool.canonical_path().is_some() {
+        if self._volume_lease.is_none()
+            && self.pool.canonical_path().is_some()
+            && !self.pool.config.read_only
+        {
             return Err(SqliteError::InvalidData(
                 "checkpoint writer checkout cannot admit a logical write".to_string(),
             ));
@@ -548,45 +579,115 @@ impl<'pool> WriterGuard<'pool> {
         Ok(PooledAutocommitWriteUnit { writer: self })
     }
 
-    /// Returns a shared reference to the underlying connection.
-    pub fn conn(&self) -> &Connection {
+    /// Borrow inside an already owned internal write boundary.
+    pub(crate) fn conn(&self) -> &Connection {
         &self.guard
     }
 
-    /// Returns a mutable reference to the underlying connection.
-    pub fn conn_mut(&mut self) -> &mut Connection {
+    /// Borrow for the internal migration owner that retains this guard.
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.guard
     }
 
+    /// Own one autocommit operation or complete SQL script.
+    ///
+    /// Capacity is checked immediately before the callback. A script must
+    /// finish every transaction it starts; an unfinished one is rolled back
+    /// and refused. The consumed guard retains its lease through settlement,
+    /// including if the callback unwinds.
+    ///
+    /// ```no_run
+    /// use khive_db::{ConnectionPool, SqliteError};
+    /// fn seed(pool: &ConnectionPool) -> Result<(), SqliteError> {
+    ///     pool.writer()?.autocommit(|conn| {
+    ///         conn.execute_batch("CREATE TABLE example(value INTEGER)")?;
+    ///         Ok(())
+    ///     })
+    /// }
+    /// ```
+    /// The callback cannot return a connection borrow:
+    /// ```compile_fail
+    /// use khive_db::ConnectionPool;
+    /// fn escape(pool: &ConnectionPool) {
+    ///     let _connection = pool.writer().unwrap().autocommit(|conn| Ok(conn));
+    /// }
+    /// ```
+    pub fn autocommit<R>(
+        self,
+        operation: impl FnOnce(&Connection) -> Result<R, SqliteError>,
+    ) -> Result<R, SqliteError> {
+        let unit = self.admit_autocommit()?;
+        let result = operation(unit.conn()).map_err(statement_error);
+        if unit.conn().is_autocommit() {
+            return result;
+        }
+        if unit
+            .writer
+            .rollback_or_retire("autocommit script left its transaction open")
+            .is_err()
+        {
+            return Err(match result {
+                Err(error) => SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Statement,
+                ),
+                Ok(_) => SqliteError::WriterSettlementUnknown,
+            });
+        }
+        result.and(Err(SqliteError::InvalidData(
+            "pooled script left a transaction open; rolled back".into(),
+        )))
+    }
+
     /// Execute a write transaction.
-    /// Wraps the closure in BEGIN IMMEDIATE ... COMMIT.
-    pub fn transaction<F, R>(&self, f: F) -> Result<R, SqliteError>
+    /// Consumes this guard through BEGIN IMMEDIATE, post-BEGIN admission and
+    /// COMMIT/ROLLBACK. A panic settles the writer before releasing its lease
+    /// or transaction registry evidence.
+    /// The callback must not settle the outer transaction itself.
+    pub fn transaction<F, R>(self, f: F) -> Result<R, SqliteError>
     where
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
-        if self._volume_lease.is_none() && self.pool.canonical_path().is_some() {
+        let mut tx_handle = None;
+        let writer = self;
+        if writer._volume_lease.is_none()
+            && writer.pool.canonical_path().is_some()
+            && !writer.pool.config.read_only
+        {
             return Err(SqliteError::InvalidData(
                 "checkpoint writer checkout cannot start a logical transaction".to_string(),
             ));
         }
-        self.guard
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|error| {
-                SqliteError::write(error, khive_storage::error::SqliteWriteStage::Begin)
-            })?;
-        if let Err(error) = self.admission.check() {
-            self.rollback_or_retire("capacity admission")?;
+        if !writer.guard.is_autocommit() {
+            writer.pool.retire_pooled_writer(&writer.guard);
+            return Err(SqliteError::InheritedWriterTransaction);
+        }
+        if let Err(error) = writer.guard.execute_batch("BEGIN IMMEDIATE") {
+            if !writer.guard.is_autocommit() {
+                writer.pool.retire_pooled_writer(&writer.guard);
+                return Err(SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Begin,
+                ));
+            }
+            return Err(SqliteError::write(
+                error,
+                khive_storage::error::SqliteWriteStage::Begin,
+            ));
+        }
+        if let Err(error) = writer.admission.check() {
+            writer.rollback_or_retire("capacity admission")?;
             return Err(error);
         }
-        let _tx_handle = khive_storage::tx_registry::register_scoped(
+        let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
             Some("writer_guard_tx".to_string()),
-            self.origin.clone(),
-        );
+            writer.origin.clone(),
+        ));
 
-        match f(&self.guard) {
+        match f(&writer.guard) {
             Ok(result) => {
-                if let Err(err) = self.guard.execute_batch("COMMIT") {
-                    if self.rollback_or_retire("commit failure").is_err() {
+                if let Err(err) = writer.guard.execute_batch("COMMIT") {
+                    if writer.rollback_or_retire("commit failure").is_err() {
                         return Err(SqliteError::settlement_with_cause(
                             &err,
                             khive_storage::error::SqliteWriteStage::Commit,
@@ -597,10 +698,17 @@ impl<'pool> WriterGuard<'pool> {
                         khive_storage::error::SqliteWriteStage::Commit,
                     ));
                 }
+                if !writer.guard.is_autocommit() {
+                    writer.pool.retire_pooled_writer(&writer.guard);
+                    return Err(SqliteError::WriterSettlementUnknown);
+                }
                 Ok(result)
             }
             Err(err) => {
-                if self.rollback_or_retire("transaction body failure").is_err() {
+                if writer
+                    .rollback_or_retire("transaction body failure")
+                    .is_err()
+                {
                     return Err(SqliteError::settlement_with_cause(
                         &err,
                         khive_storage::error::SqliteWriteStage::Statement,
@@ -664,20 +772,6 @@ impl Drop for WriterGuard<'_> {
                 let _ = self.admission.close_retired_connection(original);
             }
         }
-    }
-}
-
-impl<'pool> Deref for WriterGuard<'pool> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn()
-    }
-}
-
-impl<'pool> DerefMut for WriterGuard<'pool> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn_mut()
     }
 }
 
@@ -974,3 +1068,7 @@ fn statement_error(error: SqliteError) -> SqliteError {
 #[cfg(test)]
 #[path = "standalone_write_tests.rs"]
 mod standalone_write_tests;
+
+#[cfg(test)]
+#[path = "pooled_write_tests.rs"]
+mod pooled_write_tests;

@@ -17,12 +17,13 @@ async fn metrics_snapshot_wal_pages_reflects_recent_write() {
     {
         let writer = pool.try_writer().expect("writer");
         writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE t (x INTEGER); \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "CREATE TABLE t (x INTEGER); \
                      INSERT INTO t VALUES (1); \
                      INSERT INTO t VALUES (2);",
-            )
+                )?)
+            })
             .expect("seed writes");
     }
 
@@ -122,8 +123,9 @@ async fn metrics_checkpoint_timing_keeps_stores_separate_and_scrapes_read_only()
         );
         pool.try_writer()
             .unwrap()
-            .conn()
-            .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .autocommit(|conn| {
+                Ok(conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")?)
+            })
             .unwrap();
         pools.push(pool);
     }
@@ -268,8 +270,7 @@ async fn metrics_snapshot_exposes_decomposed_writer_stages() {
     {
         let writer = pool.try_writer().unwrap();
         writer
-            .conn()
-            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .autocommit(|conn| Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?))
             .unwrap();
     }
     let handle = pool

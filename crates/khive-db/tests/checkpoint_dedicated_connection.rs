@@ -80,41 +80,40 @@ fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
     // autocheckpoint fallback and lets the WAL grow for the fixture.
     pool.claim_checkpoint_ownership()
         .expect("claim checkpoint ownership for the dedicated-owner posture");
-    let writer = pool.writer().expect("acquire writer to seed the WAL");
-    let autocheckpoint: u32 = writer
-        .conn()
-        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
-        .expect("read writer wal_autocheckpoint");
-    assert_eq!(
-        autocheckpoint, 0,
-        "fixture requires the claimed-owner writer invariant before allocating WAL bytes"
-    );
-    writer
-        .conn()
-        .execute_batch("CREATE TABLE blobs (v BLOB NOT NULL)")
-        .expect("create table");
+    pool.writer()
+        .expect("acquire writer to seed the WAL")
+        .autocommit(|conn| {
+            let autocheckpoint: u32 = conn
+                .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+                .expect("read writer wal_autocheckpoint");
+            assert_eq!(
+                autocheckpoint, 0,
+                "fixture requires the claimed-owner writer invariant before allocating WAL bytes"
+            );
+            conn.execute_batch("CREATE TABLE blobs (v BLOB NOT NULL)")
+                .expect("create table");
 
-    let payload = vec![0xABu8; 64 * 1024];
-    let wal = wal_path(db_path);
-    for row in 0..MAX_FATTEN_ROWS {
-        writer
-            .conn()
-            .execute("INSERT INTO blobs (v) VALUES (?1)", [payload.as_slice()])
-            .expect("insert blob row");
-        // Checking file size on every insert is wasteful syscall churn;
-        // every 32 rows (~2 MiB) is fine granularity for a 32 MiB target.
-        if row % 32 != 0 {
-            continue;
-        }
-        let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-        if size >= MIN_WAL_BYTES {
-            return;
-        }
-    }
-    panic!(
-        "fixture safety bound: inserted {MAX_FATTEN_ROWS} rows without the -wal file \
+            let payload = vec![0xABu8; 64 * 1024];
+            let wal = wal_path(db_path);
+            for row in 0..MAX_FATTEN_ROWS {
+                conn.execute("INSERT INTO blobs (v) VALUES (?1)", [payload.as_slice()])
+                    .expect("insert blob row");
+                // Checking file size on every insert is wasteful syscall churn;
+                // every 32 rows (~2 MiB) is fine granularity for a 32 MiB target.
+                if row % 32 != 0 {
+                    continue;
+                }
+                let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                if size >= MIN_WAL_BYTES {
+                    return Ok(());
+                }
+            }
+            panic!(
+                "fixture safety bound: inserted {MAX_FATTEN_ROWS} rows without the -wal file \
          reaching {MIN_WAL_BYTES} bytes; wal_autocheckpoint may not be disabled as expected"
-    );
+            );
+        })
+        .expect("seed WAL under the admitted writer owner");
 }
 
 #[test]

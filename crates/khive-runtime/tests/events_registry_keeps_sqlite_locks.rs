@@ -210,60 +210,70 @@ fn events_registry_lock_child() {
     .unwrap();
     // A read-only pool cannot legally own a write transaction. In that order,
     // a separate SQLite-owned connection witnesses the process's held locks.
-    let external_writer = read_only_first.then(|| rusqlite::Connection::open(&db).unwrap());
-    let writer = if read_only_first {
-        None
-    } else {
-        Some(first.pool().writer().unwrap())
+    let hold_through_reopen = |conn: &rusqlite::Connection| -> Result<(), khive_db::SqliteError> {
+        if !read_only_first {
+            conn.execute_batch("CREATE TABLE lock_witness(id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before_mode = std::fs::metadata(&db).unwrap().permissions().mode();
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        wait_for_parent(&dir.join("construct"));
+        std::fs::create_dir(dir.join("alias-parent")).unwrap();
+        let alias = dir.join("alias-parent").join("..").join("events.db");
+        assert_ne!(alias, db, "fixture must use a distinct lexical path");
+        let incompatible = if read_only_first {
+            direct_backend_for(&alias)
+        } else {
+            direct_backend_read_only_for(&alias)
+        };
+        let error = incompatible.err().map(|error| error.to_string());
+        let same = if read_only_first {
+            direct_backend_read_only_for(&alias)
+        } else {
+            direct_backend_for(&alias)
+        }
+        .unwrap();
+        let read_only_write_refused = read_only_first
+            && first
+                .pool()
+                .writer()
+                .unwrap()
+                .autocommit(|conn| {
+                    Ok(conn
+                        .execute("INSERT INTO lock_witness DEFAULT VALUES", [])
+                        .is_err_and(|error| {
+                            error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
+                        }))
+                })
+                .unwrap();
+        let observation = json!({
+            "error": error,
+            "same_mode_reused": Arc::ptr_eq(&first, &same),
+            "read_only_write_refused": read_only_write_refused,
+            "permissions_unchanged": before_mode == std::fs::metadata(&db).unwrap().permissions().mode(),
+        });
+        std::fs::write(
+            dir.join("observation.json"),
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("checked"), b"").unwrap();
+        wait_for_parent(&dir.join("release"));
+        conn.execute_batch("ROLLBACK").unwrap();
+        Ok(())
     };
-    let conn = external_writer
-        .as_ref()
-        .unwrap_or_else(|| writer.as_ref().unwrap().conn());
-    if !read_only_first {
-        conn.execute_batch("CREATE TABLE lock_witness(id INTEGER PRIMARY KEY)")
-            .unwrap();
-    }
-    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let before_mode = std::fs::metadata(&db).unwrap().permissions().mode();
-    std::fs::write(dir.join("ready"), b"").unwrap();
-    wait_for_parent(&dir.join("construct"));
-    std::fs::create_dir(dir.join("alias-parent")).unwrap();
-    let alias = dir.join("alias-parent").join("..").join("events.db");
-    assert_ne!(alias, db, "fixture must use a distinct lexical path");
-    let incompatible = if read_only_first {
-        direct_backend_for(&alias)
+    if read_only_first {
+        let external_writer = rusqlite::Connection::open(&db).unwrap();
+        hold_through_reopen(&external_writer).unwrap();
     } else {
-        direct_backend_read_only_for(&alias)
-    };
-    let error = incompatible.err().map(|error| error.to_string());
-    let same = if read_only_first {
-        direct_backend_read_only_for(&alias)
-    } else {
-        direct_backend_for(&alias)
-    }
-    .unwrap();
-    let read_only_write_refused = read_only_first
-        && first
+        first
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .execute("INSERT INTO lock_witness DEFAULT VALUES", [])
-            .is_err_and(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly));
-    let observation = json!({
-        "error": error,
-        "same_mode_reused": Arc::ptr_eq(&first, &same),
-        "read_only_write_refused": read_only_write_refused,
-        "permissions_unchanged": before_mode == std::fs::metadata(&db).unwrap().permissions().mode(),
-    });
-    std::fs::write(
-        dir.join("observation.json"),
-        serde_json::to_vec(&observation).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(dir.join("checked"), b"").unwrap();
-    wait_for_parent(&dir.join("release"));
-    conn.execute_batch("ROLLBACK").unwrap();
+            .autocommit(hold_through_reopen)
+            .unwrap();
+    }
 }
 
 #[test]
@@ -318,14 +328,16 @@ fn read_only_initialization_preserves_missing_and_frozen_files() {
     assert!(read_only.is_read_only());
     let writer = read_only.pool().writer().unwrap();
     let error = writer
-        .conn()
-        .execute("INSERT INTO frozen_row DEFAULT VALUES", [])
-        .unwrap_err();
+        .autocommit(|conn| {
+            Ok(conn
+                .execute("INSERT INTO frozen_row DEFAULT VALUES", [])
+                .unwrap_err())
+        })
+        .unwrap();
     assert_eq!(
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::ReadOnly)
     );
-    drop(writer);
     assert!(direct_backend_for(&db).is_err());
     assert_eq!(
         std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,

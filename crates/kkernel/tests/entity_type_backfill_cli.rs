@@ -82,8 +82,9 @@ impl Fixture {
         ];
         {
             let writer = runtime.backend().pool().writer().expect("seed writer");
+            writer.autocommit(|conn| {
             for (index, (kind, entity_type, properties)) in rows.into_iter().enumerate() {
-                writer
+                conn
                     .execute(
                         "INSERT INTO entities \
                          (id, namespace, kind, entity_type, name, description, properties, tags, \
@@ -105,7 +106,7 @@ impl Fixture {
             for (index, namespace, deleted_at) in
                 [(11, "other", None), (12, NAMESPACE, Some(99_i64))]
             {
-                writer
+                conn
                     .execute(
                         "INSERT INTO entities \
                          (id, namespace, kind, name, properties, created_at, updated_at, deleted_at) \
@@ -114,6 +115,8 @@ impl Fixture {
                     )
                     .expect("seed namespace and tombstone controls");
             }
+            Ok(())
+            }).expect("seed fixture scope");
         }
         Self {
             root,
@@ -345,20 +348,24 @@ fn entity_type_backfill_apply_scans_two_rows_after_a_long_description_without_em
     let description = "d".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
     {
         let writer = fixture.runtime.backend().pool().writer().unwrap();
-        writer.execute("DELETE FROM entities", []).unwrap();
-        for (index, name, description) in [
-            (1, "First", description.as_str()),
-            (2, "Second", "short description"),
-        ] {
-            writer
-                .execute(
-                    "INSERT INTO entities \
+        writer
+            .autocommit(|conn| {
+                conn.execute("DELETE FROM entities", []).unwrap();
+                for (index, name, description) in [
+                    (1, "First", description.as_str()),
+                    (2, "Second", "short description"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO entities \
                      (id, namespace, kind, name, description, properties, created_at, updated_at) \
                      VALUES (?1, ?2, 'document', ?3, ?4, '{\"type\":\"paper\"}', ?5, ?5)",
-                    (id(index), NAMESPACE, name, description, index as i64),
-                )
-                .unwrap();
-        }
+                        (id(index), NAMESPACE, name, description, index as i64),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
     }
     // Target resolution disables every embedding provider for this command.
     // The injected-provider scan regression separately exercises its latent
@@ -416,28 +423,32 @@ fn entity_type_backfill_applies_across_pages_and_second_scan_is_idempotent() {
             .pool()
             .writer()
             .expect("page fixture writer");
-        for offset in 0..260 {
-            let index = offset + 13;
-            let (kind, legacy_type) = if offset % 2 == 0 {
-                ("document", " Article ")
-            } else {
-                ("concept", " CONCEPT ")
-            };
-            writer
-                .execute(
-                    "INSERT INTO entities \
+        writer
+            .autocommit(|conn| {
+                for offset in 0..260 {
+                    let index = offset + 13;
+                    let (kind, legacy_type) = if offset % 2 == 0 {
+                        ("document", " Article ")
+                    } else {
+                        ("concept", " CONCEPT ")
+                    };
+                    conn.execute(
+                        "INSERT INTO entities \
                      (id, namespace, kind, name, properties, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, 'Page boundary entity', ?4, ?5, ?5)",
-                    (
-                        id(index),
-                        NAMESPACE,
-                        kind,
-                        json!({"type":legacy_type, "keep":{"index":index}}).to_string(),
-                        index as i64,
-                    ),
-                )
-                .expect("seed bounded multi-page legacy population");
-        }
+                        (
+                            id(index),
+                            NAMESPACE,
+                            kind,
+                            json!({"type":legacy_type, "keep":{"index":index}}).to_string(),
+                            index as i64,
+                        ),
+                    )
+                    .expect("seed bounded multi-page legacy population");
+                }
+                Ok(())
+            })
+            .expect("seed page fixture scope");
     }
     let value = report(&fixture.run(&["--apply"]));
     assert_eq!(value["scanned"], 270);

@@ -105,6 +105,12 @@ checkout as proof that a later write was admitted. Symbols are under
   before releasing the lease, including on terminal return or unwind.
 - **Pooled transaction:** hold the lease before the writer mutex and sample
   after BEGIN. Roll back on refusal; replace a poisoned pooled connection.
+- **Public pooled calls:** `writer` and `try_writer` return an exclusion owner
+  without raw `conn`/`conn_mut` access or dereference coercions. Consuming
+  `autocommit` samples before its callback and refuses unfinished scripts;
+  consuming `transaction` samples after BEGIN and owns COMMIT/ROLLBACK. Both
+  retain the lease through settlement, including unwind. A delayed checkout
+  never substitutes its old capacity observation for execution admission.
 - **Standalone transaction:** own the connection and lease, then sample after
   BEGIN. Close or restore autocommit before releasing the lease.
 - **Public standalone calls:** `standalone_autocommit` owns one callback or
@@ -152,8 +158,6 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 
 ## Remaining work
 
-- **#3594:** Public raw pooled writers can issue SQL outside the typed
-  transaction boundary; checkout-time sampling is insufficient.
 - **#3597:** Cached `SqlWriter` handles still need their remaining per-write
   classification work. File-backed manual atomic SQL now runs in one blocking
   owner with its permit, lease, connection and transaction evidence retained
@@ -167,8 +171,8 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 can execute. Backend/pool-owned
 migration entry points carry the captured policy.
 
-The raw standalone opener from #3595 and the internal raw factory escapes from
-#3596 have been replaced by the boundaries above. Native lock, corruption and
+The raw pooled writer API from #3594, raw standalone opener from #3595 and
+internal raw factory escapes from #3596 have been replaced by the boundaries above. Native lock, corruption and
 settlement fault fixtures open their own external SQLite connections explicitly;
 they are not production escape hatches or substitutes for admission and identity
 tests.

@@ -465,15 +465,16 @@ mod receipt_read_tests {
                 // Model a damaged epoch value as well as valid but incomplete
                 // provenance. Restore constraint checks before reading it.
                 let writer = runtime.backend().pool().try_writer().unwrap();
-                writer
-                    .conn()
+                writer.autocommit(|conn| {
+                conn
                     .pragma_update(None, "ignore_check_constraints", true)
                     .unwrap();
-                writer.conn().execute(mutation, [holder.id.to_string()]).unwrap();
-                writer
-                    .conn()
+                conn.execute(mutation, [holder.id.to_string()]).unwrap();
+                conn
                     .pragma_update(None, "ignore_check_constraints", false)
                     .unwrap();
+                Ok(())
+                }).unwrap();
             }
             assert!(runtime
                 .notes(&token)

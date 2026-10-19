@@ -53,9 +53,9 @@ fn scratch_pool(name: &str) -> TestPool {
 fn seed_schema(pool: &ConnectionPool) {
     let writer = pool.try_writer().expect("writer");
     writer
-        .conn()
-        .execute_batch(
-            "CREATE TABLE entities (
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TABLE entities (
                     id             TEXT PRIMARY KEY,
                     namespace      TEXT NOT NULL,
                     kind           TEXT NOT NULL,
@@ -85,32 +85,35 @@ fn seed_schema(pool: &ConnectionPool) {
                     target_backend TEXT,
                     PRIMARY KEY (namespace, id)
                 );",
-        )
+            )?)
+        })
         .expect("seed schema");
 }
 
 fn insert_entity(pool: &ConnectionPool, id: Uuid, name: &str) {
     let writer = pool.try_writer().expect("writer");
     writer
-        .conn()
-        .execute(
-            "INSERT INTO entities \
+        .autocommit(|conn| {
+            Ok(conn.execute(
+                "INSERT INTO entities \
                  (id, namespace, kind, name, created_at, updated_at) \
                  VALUES (?1, 'local', 'concept', ?2, 0, 0)",
-            rusqlite::params![id.to_string(), name],
-        )
+                rusqlite::params![id.to_string(), name],
+            )?)
+        })
         .expect("insert entity");
 }
 
 fn entity_exists(pool: &ConnectionPool, id: Uuid) -> bool {
     let writer = pool.try_writer().expect("writer");
     let count: i64 = writer
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM entities WHERE id = ?1 AND deleted_at IS NULL",
-            rusqlite::params![id.to_string()],
-            |row| row.get(0),
-        )
+        .autocommit(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )?)
+        })
         .expect("query entity");
     count > 0
 }
@@ -118,32 +121,37 @@ fn entity_exists(pool: &ConnectionPool, id: Uuid) -> bool {
 fn edge_count(pool: &ConnectionPool, source: Uuid, target: Uuid) -> i64 {
     let writer = pool.try_writer().expect("writer");
     writer
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM graph_edges \
+        .autocommit(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM graph_edges \
                  WHERE source_id = ?1 AND target_id = ?2 AND deleted_at IS NULL",
-            rusqlite::params![source.to_string(), target.to_string()],
-            |row| row.get(0),
-        )
+                rusqlite::params![source.to_string(), target.to_string()],
+                |row| row.get(0),
+            )?)
+        })
         .expect("query edge")
 }
 
 fn entities_snapshot(pool: &ConnectionPool) -> Vec<String> {
     let writer = pool.try_writer().expect("writer");
-    let mut stmt = writer
-        .conn()
-        .prepare("SELECT id, name, deleted_at FROM entities ORDER BY id")
-        .expect("prepare snapshot");
-    let rows = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let deleted_at: Option<i64> = row.get(2)?;
-            Ok(format!("{id}:{name}:{deleted_at:?}"))
+    writer
+        .autocommit(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, name, deleted_at FROM entities ORDER BY id")
+                .expect("prepare snapshot");
+            let rows = stmt
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let deleted_at: Option<i64> = row.get(2)?;
+                    Ok(format!("{id}:{name}:{deleted_at:?}"))
+                })
+                .expect("query snapshot");
+            Ok(rows
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect snapshot"))
         })
-        .expect("query snapshot");
-    rows.collect::<Result<Vec<_>, _>>()
-        .expect("collect snapshot")
+        .expect("snapshot scope")
 }
 
 fn delete_plan(id: Uuid, label: &str) -> AtomicOpPlan {
@@ -318,12 +326,13 @@ async fn commit_pass_resolves_on_first_poll_and_commits() {
 
     let writer = pool.try_writer().expect("writer");
     let name: String = writer
-        .conn()
-        .query_row(
-            "SELECT name FROM entities WHERE id = ?1",
-            rusqlite::params![a.to_string()],
-            |row| row.get(0),
-        )
+        .autocommit(|conn| {
+            Ok(conn.query_row(
+                "SELECT name FROM entities WHERE id = ?1",
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )?)
+        })
         .expect("query renamed entity");
     assert_eq!(name, "alpha-v2");
 }
@@ -378,11 +387,12 @@ async fn concurrent_mutation_between_prepare_and_apply_trips_guard_and_rolls_bac
     {
         let writer = pool.try_writer().expect("writer");
         writer
-            .conn()
-            .execute(
-                "DELETE FROM entities WHERE id = ?1",
-                rusqlite::params![a.to_string()],
-            )
+            .autocommit(|conn| {
+                Ok(conn.execute(
+                    "DELETE FROM entities WHERE id = ?1",
+                    rusqlite::params![a.to_string()],
+                )?)
+            })
             .expect("concurrent delete");
     }
 
@@ -703,12 +713,13 @@ async fn atomic_unit_and_concurrent_normal_write_share_the_same_writer_queue() {
         // rather than against anything the writer task/occupier hold.
         let writer = pool.try_writer().expect("writer");
         let renamed: String = writer
-            .conn()
-            .query_row(
-                "SELECT name FROM entities WHERE id = ?1",
-                rusqlite::params![a.to_string()],
-                |row| row.get(0),
-            )
+            .autocommit(|conn| {
+                Ok(conn.query_row(
+                    "SELECT name FROM entities WHERE id = ?1",
+                    rusqlite::params![a.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
             .expect("query renamed entity");
         assert_eq!(renamed, "alpha-atomic");
     }
@@ -983,12 +994,13 @@ mod acknowledgement {
             assert_eq!(*access.callback_result.lock().unwrap(), Some(true));
             let writer = pool.try_writer().expect("writer");
             let name: String = writer
-                .conn()
-                .query_row(
-                    "SELECT name FROM entities WHERE id=?1",
-                    rusqlite::params![id.to_string()],
-                    |row| row.get(0),
-                )
+                .autocommit(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT name FROM entities WHERE id=?1",
+                        rusqlite::params![id.to_string()],
+                        |row| row.get(0),
+                    )?)
+                })
                 .expect("persisted write");
             assert_eq!(
                 name, "changed",

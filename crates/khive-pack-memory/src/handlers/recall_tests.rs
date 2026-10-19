@@ -1980,8 +1980,9 @@ async fn recall_event_store_acquisition_failure_warns_without_failing_response()
     {
         let writer = backend.pool().writer().expect("fault injection writer");
         writer
-            .conn()
-            .execute_batch("DROP TABLE events; PRAGMA query_only = ON;")
+            .autocommit(
+                |conn| Ok(conn.execute_batch("DROP TABLE events; PRAGMA query_only = ON;")?),
+            )
             .expect("remove only the event schema and reject its recreation");
     }
 
