@@ -341,7 +341,16 @@ fn edge_vectors_follow_the_resolved_relation_not_both_matching_routes() {
              embedding float[2] distance_metric=cosine)",
         )
         .unwrap();
-        for index in [0, 1, 2, 3, 4, 100, 101] {
+        // Neither kind nor field follows the specific or fallback edge route.
+        for (index, kind, field) in [
+            (0, "entity", "knowledge.atom"),
+            (1, "note", "description"),
+            (2, "entity", "description"),
+            (3, "note", "knowledge.atom"),
+            (4, "entity", "knowledge.atom"),
+            (100, "note", "knowledge.atom"),
+            (101, "entity", "description"),
+        ] {
             let namespace = match index {
                 100 => "target-a",
                 101 => "foreign",
@@ -350,19 +359,27 @@ fn edge_vectors_follow_the_resolved_relation_not_both_matching_routes() {
             conn.execute(
                 "INSERT INTO vec_edge_route \
                  (subject_id, namespace, kind, field, embedding_model, embedding) \
-                 VALUES (?1, ?2, 'entity', 'knowledge.atom', 'edge_route', '[0.1,0.2]')",
-                rusqlite::params![id(index), namespace],
+                 VALUES (?1, ?2, ?3, ?4, 'edge_route', '[0.1,0.2]')",
+                rusqlite::params![id(index), namespace, kind, field],
             )
             .unwrap();
         }
-        let read_vectors = |conn: &Connection| -> BTreeMap<String, (String, Vec<u8>)> {
-            conn.prepare("SELECT subject_id, namespace, embedding FROM vec_edge_route")
+        let read_vectors =
+            |conn: &Connection| -> BTreeMap<String, (String, Vec<u8>, String, String)> {
+                conn.prepare(
+                    "SELECT subject_id, namespace, embedding, kind, field FROM vec_edge_route",
+                )
                 .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                    ))
+                })
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap()
-        };
+            };
         let before = read_vectors(&conn);
         let request = split_routes(fallback_first);
         let tx = conn.transaction().unwrap();
@@ -384,6 +401,8 @@ fn edge_vectors_follow_the_resolved_relation_not_both_matching_routes() {
             let subject = id(index);
             assert_eq!(after[&subject].0, target);
             assert_eq!(after[&subject].1, before[&subject].1);
+            assert_eq!(after[&subject].2, before[&subject].2);
+            assert_eq!(after[&subject].3, before[&subject].3);
             let log: Vec<(i64, String, String)> = tx
                 .prepare(
                     "SELECT seq, namespace, op FROM ann_write_log \
