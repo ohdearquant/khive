@@ -4331,5 +4331,23 @@ class OptionalWorkflowCodexSkipTests(unittest.TestCase):
         self.assertIn("!(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/'))", e2e)
 
 
+class PipelineGateCacheTests(unittest.TestCase):
+    """A pull request run can restore only a cache saved by its own ref or by main, so the pipeline gate saves
+    from main alone and main pushes run it; without that every run builds from cold against the time limit."""
+
+    def test_main_pushes_run_the_gate_and_only_main_saves_its_cache(self):
+        text = workflow_text("bench-pipeline.yml")
+        push = indented_block(indented_block(text, "on", 0), "push", 2)
+        branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+        self.assertIsNotNone(branches)
+        self.assertIn('"main"', branches.group(1))
+        job = indented_block(indented_block(text, "jobs", 0), "pipeline-gate", 2)
+        caches = [step for step in re.split(r"(?m)^      - ", job)[1:] if step.startswith("uses: Swatinem/rust-cache@")]
+        self.assertEqual(len(caches), 1)
+        self.assertEqual(re.findall(r"(?m)^          save-if: (.+)$", caches[0]),
+                         ["${{ github.ref == 'refs/heads/main' }}"])
+        self.assertEqual(re.findall(r"(?m)^    timeout-minutes: (.+)$", job), ["25"])
+
+
 if __name__ == "__main__":
     unittest.main()
