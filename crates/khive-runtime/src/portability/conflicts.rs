@@ -11,8 +11,8 @@ use uuid::Uuid;
 use super::{ExportedEdge, ExportedEntity, ImportValidation, KgArchive};
 use crate::atomic_plan::PostCommitEffect;
 use crate::atomic_prepare::{
-    apply_post_commit_effects_with_report, prepare_import_entity_record,
-    prepare_update_entity_record, validate_import_entity_record,
+    apply_post_commit_effects_with_report, canonical_refuse_registry_tags,
+    prepare_import_entity_record, prepare_update_entity_record, validate_import_entity_record,
 };
 use crate::atomic_runner::{
     apply_plan_preserving_storage, run_prepared_atomic_unit, AtomicOpPlan, PlanExecutionFailure,
@@ -481,6 +481,9 @@ impl KhiveRuntime {
                             record.id
                         ))
                     })?;
+                // The archive's tags cannot attest ownership of the stored row.
+                // Refuse before a patch can replace its properties or tags.
+                canonical_refuse_registry_tags(&current.tags, "update")?;
                 if current.kind != record.kind {
                     return Err(invalid(format!(
                         "archive entity {} kind differs from the stored kind",

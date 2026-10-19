@@ -551,10 +551,9 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
     Ok(())
 }
 
-/// Install the merged pack/runtime entity- and note-kind registry on `runtime`
-/// so that `runtime.import_kg` (and any other runtime-layer kind validation)
-/// accepts pack-registered kinds such as `resource`, not just the eight base
-/// `khive_types::EntityKind` variants.
+/// Install merged pack kind and edge-endpoint metadata on both import runtimes.
+/// This admits pack-registered kinds such as `resource` and additive endpoint
+/// rules during validation as well as destination import.
 ///
 /// Returns the merged entity-kind list so callers can also thread it into
 /// adapter-layer validation (see `JsonFormatAdapter::new_with_valid_kinds`,
@@ -581,6 +580,7 @@ fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<Vec<String>> {
         .map(str::to_string)
         .collect();
     runtime.install_kind_registry(entity_kinds.clone(), note_kinds);
+    runtime.install_edge_rules(registry.all_edge_rules());
     Ok(entity_kinds)
 }
 
