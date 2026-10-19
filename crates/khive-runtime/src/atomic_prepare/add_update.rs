@@ -13,6 +13,10 @@ use super::{
     UpdatePlan, Uuid, Value,
 };
 
+#[cfg(test)]
+#[path = "import_entity_tests.rs"]
+mod import_entity_tests;
+
 // ---------------------------------------------------------------------------
 // dispatch
 // ---------------------------------------------------------------------------
@@ -133,34 +137,108 @@ pub(crate) async fn prepare_add_entity_record(
         entity = entity.with_tags(tags);
     }
 
+    let plan = add_entity_plan(&entity, canonical_id.is_some())?;
+    Ok((entity, plan))
+}
+
+/// Prepare one fresh archive entity without regenerating its identity or timestamps.
+///
+/// The caller validates the complete archive vocabulary before preparing any plans.
+/// `PreserveUnknown` therefore retains an admitted kind and subtype verbatim; the
+/// pack's subtype normalizer is not an archive transformation. Destination-state
+/// checks and this plan's conditional insert are applied by the owning import unit.
+pub(crate) fn prepare_import_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    entity: khive_storage::Entity,
+    policy: khive_types::ImportKindPolicy,
+) -> RuntimeResult<AtomicOpPlan> {
+    validate_import_entity_record(runtime, token, &entity, policy)?;
+    add_entity_plan(&entity, true)
+}
+
+/// Validate an exact archive entity without building a plan or accessing storage.
+pub(crate) fn validate_import_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    entity: &khive_storage::Entity,
+    policy: khive_types::ImportKindPolicy,
+) -> RuntimeResult<()> {
+    if entity.namespace != token.namespace().as_str() {
+        return Err(RuntimeError::InvalidInput(
+            "import entity namespace must match the authorized namespace".into(),
+        ));
+    }
+    if entity.deleted_at.is_some()
+        || entity.merged_into.is_some()
+        || entity.merge_event_id.is_some()
+    {
+        return Err(RuntimeError::InvalidInput(
+            "import entity must be a live record without merge tombstone fields".into(),
+        ));
+    }
+    if entity.version != 1 || entity.content_ref.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "import entity must have revision one and no attachment projection".into(),
+        ));
+    }
+    if entity.kind.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "import entity kind must not be empty".into(),
+        ));
+    }
+    if entity.name.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+    }
+    if policy == khive_types::ImportKindPolicy::Strict {
+        runtime.validate_entity_kind(&entity.kind)?;
+    }
+    refuse_pack_registry_tags(&entity.tags, "import")?;
+    crate::secret_gate::check_at(&entity.name, "entity", "name")?;
+    if let Some(description) = &entity.description {
+        crate::secret_gate::check_at(description, "entity", "description")?;
+    }
+    if let Some(properties) = &entity.properties {
+        crate::secret_gate::check_json_at(properties, "entity", "properties")?;
+    }
+    crate::secret_gate::check_tags_at(&entity.tags, "entity", "tags")?;
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
+
+    Ok(())
+}
+
+fn add_entity_plan(
+    entity: &khive_storage::Entity,
+    insert_if_absent: bool,
+) -> RuntimeResult<AtomicOpPlan> {
+    // Keep the check at the write owner as well as the callers' early validation
+    // boundaries, which preserve their established refusal order.
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     let mut statements = vec![PlanStatement {
-        statement: if canonical_id.is_some() {
-            khive_db::stores::entity::entity_insert_if_absent_statement(&entity)
+        statement: if insert_if_absent {
+            khive_db::stores::entity::entity_insert_if_absent_statement(entity)
         } else {
-            entity_upsert_statement(&entity)
+            entity_upsert_statement(entity)
         },
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
     // Order-sensitive pair — see `insert_document_statements`'s adjacency
     // contract: the map upsert's `last_insert_rowid()` must read back the
     // FTS insert immediately before it.
-    for statement in insert_document_statements("fts_entities", &entity_fts_document(&entity)) {
+    for statement in insert_document_statements("fts_entities", &entity_fts_document(entity)) {
         statements.push(PlanStatement {
             statement,
             guard: None,
         });
     }
 
-    Ok((
-        entity.clone(),
-        AtomicOpPlan::AddEntity(AddEntityPlan {
+    Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
+        entity_id: entity.id,
+        statements,
+        post_commit: PostCommitEffect::ReindexEntity {
             entity_id: entity.id,
-            statements,
-            post_commit: PostCommitEffect::ReindexEntity {
-                entity_id: entity.id,
-            },
-        }),
-    ))
+        },
+    }))
 }
 
 /// Build the prepared plan for an `AddNote` proposal change. Mirrors
@@ -827,6 +905,49 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
     expected_version: Option<i64>,
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<AtomicOpPlan> {
+    prepare_update_entity_record_with_version_and_type(
+        runtime,
+        token,
+        id,
+        patch,
+        expected_version,
+        required_entity_type,
+    )
+    .await
+    .map(|(_, plan)| plan)
+}
+
+/// Return the canonical prepared record together with the plan bound to it.
+///
+/// Import uses this projection for endpoint validation without applying the
+/// patch or invoking kind hooks again. Its version remains the captured row
+/// revision; applying the plan advances the persisted revision once.
+pub(crate) async fn prepare_update_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    expected_version: Option<i64>,
+) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
+    prepare_update_entity_record_with_version_and_type(
+        runtime,
+        token,
+        id,
+        patch,
+        expected_version,
+        None,
+    )
+    .await
+}
+
+async fn prepare_update_entity_record_with_version_and_type(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    expected_version: Option<i64>,
+    required_entity_type: Option<&str>,
+) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     crate::entity_write::validate_expected_version(expected_version)?;
     let explicit_entity_type_patch = patch.entity_type.is_some();
     let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
@@ -856,7 +977,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
         id,
         serde_json::json!({
             "id": id,
-            "namespace": entity.namespace,
+            "namespace": &entity.namespace,
             "changed_fields": changed_fields,
         }),
     )?);
@@ -865,7 +986,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
     } else {
         PostCommitEffect::None
     };
-    Ok(AtomicOpPlan::Update(Box::new(UpdatePlan {
+    let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
         graph_effects: Vec::new(),
         note_vector_purge: None,
         note_embedding_inheritance: None,
@@ -881,5 +1002,6 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
         post_commit,
         edge_natural_key: None,
         idempotent_noop: false,
-    })))
+    }));
+    Ok((entity, plan))
 }

@@ -39,7 +39,7 @@ fn import(tmp: &TempDir, archive: &Value, db: &Path) -> Value {
     let output = command(tmp)
         .args(["kg", "import"])
         .arg(source)
-        .args(["--format", "archive", "--db"])
+        .args(["--format", "archive", "--force", "--db"])
         .arg(db)
         .output()
         .unwrap();
@@ -104,6 +104,8 @@ fn cli_reports_all_three_skip_causes_and_exports_only_the_retained_edge() {
         summary,
         json!({
             "entities_imported":2,"edges_imported":1,"edges_skipped":3,
+            "entities_inserted":2,"entities_updated":0,"entities_skipped":0,
+            "edges_inserted":1,"edges_updated":0,
             "embedding_truncation":{"truncated":0,"discarded_bytes":0},
             "skipped_edges":[
                 {"edge_id":Uuid::from_u128(100),"source":absent,"target":source,
@@ -149,6 +151,8 @@ fn cli_omits_empty_details_for_all_valid_and_empty_imports() {
             import(&tmp, &input, &db),
             json!({
                 "entities_imported":entities,"edges_imported":edges,"edges_skipped":0,
+                "entities_inserted":entities,"entities_updated":0,"entities_skipped":0,
+                "edges_inserted":edges,"edges_updated":0,
                 "embedding_truncation":{"truncated":0,"discarded_bytes":0}
             })
         );
@@ -183,6 +187,8 @@ fn cli_preserves_duplicate_skip_entries_and_both_missing_source_precedence() {
         import(&tmp, &input, &db),
         json!({
             "entities_imported":1,"edges_imported":0,"edges_skipped":5,
+            "entities_inserted":1,"entities_updated":0,"entities_skipped":0,
+            "edges_inserted":0,"edges_updated":0,
             "embedding_truncation":{"truncated":0,"discarded_bytes":0},
             "skipped_edges":[
                 {"edge_id":Uuid::from_u128(110),"source":present,"target":absent,

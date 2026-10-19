@@ -163,7 +163,7 @@ fn explicit_format_overrides_extension_and_json_is_not_inferred() {
 }
 
 #[test]
-fn standalone_edge_list_retains_existing_same_import_endpoint_refusal() {
+fn standalone_edge_list_resolves_existing_destination_endpoints() {
     let tmp = TempDir::new().unwrap();
     let source = tmp.path().join("entities.csv");
     let db = tmp.path().join("target.db");
@@ -177,7 +177,7 @@ fn standalone_edge_list_retains_existing_same_import_endpoint_refusal() {
             .output()
             .unwrap(),
     );
-    let before = std::fs::read(&db).unwrap();
+    let before = export(&tmp, &db);
     let edges = tmp.path().join("edges.csv");
     std::fs::write(&edges, "source,target,relation\n11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222,extends\n").unwrap();
     let output = command(&tmp)
@@ -187,10 +187,25 @@ fn standalone_edge_list_retains_existing_same_import_endpoint_refusal() {
         .arg(&db)
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("is not present in adapter entities"));
-    assert_eq!(std::fs::read(&db).unwrap(), before);
+    assert_success(&output);
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        summary,
+        json!({
+            "entities_imported": 0, "entities_inserted": 0,
+            "entities_updated": 0, "entities_skipped": 0,
+            "edges_imported": 1, "edges_inserted": 1,
+            "edges_updated": 0, "edges_skipped": 0,
+            "embedding_truncation": {"truncated": 0, "discarded_bytes": 0}
+        })
+    );
     let archive = export(&tmp, &db);
-    assert_eq!(archive["entities"].as_array().unwrap().len(), 2);
-    assert_eq!(archive["edges"], json!([]));
+    assert_eq!(archive["entities"], before["entities"]);
+    let edges = archive["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["source"], "11111111-1111-1111-1111-111111111111");
+    assert_eq!(edges[0]["target"], "22222222-2222-2222-2222-222222222222");
+    assert_eq!(edges[0]["relation"], "extends");
+    let id = edges[0]["edge_id"].as_str().unwrap();
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap().to_string(), id);
 }
