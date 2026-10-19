@@ -941,3 +941,86 @@ moves the schema remote's Git `commit` pin. The current `kg fetch` path remains
 explicit-argument-only as recorded in [ADR-037](ADR-037-remote-resolution-and-hash-verification.md):
 it does not load schema remotes. Its optional archive-content `pin` is a separate SHA-256
 value; moving a Git commit does not implicitly repin archive content or fetch an archive.
+
+## Amendment (2026-10-19): import conflict modes over edges, the update projection and the force flag (#4766)
+
+**Status: Proposed.** Refs #4766.
+
+§13 names the three `--on-conflict` modes and §5 names `--force`, but neither says how a mode
+applies to edges, what `update` writes, or what `--force` bypasses. #4766 adds both flags to
+`kkernel kg import`; this amendment settles those three points for that command. It does not
+change the
+[ADR-035 import policy boundary](ADR-035-cli-config-and-auto-embed.md#import-policy-boundary):
+unknown entity kinds follow `[schema].strict`, and unknown relations are refused in every mode.
+
+### The mode applies to every UUID the archive carries
+
+The mode governs records and edges alike, and is decided before any write:
+
+- `error`: an archive record or edge whose UUID already exists fails the import, and nothing is
+  written.
+- `skip`: the existing row is left untouched and counted as skipped. Edges incident to a skipped
+  record are omitted and counted, as §13 states.
+- `update`: an existing record is patched as described below, and an existing edge is updated
+  in place under its own UUID, keeping its creation time.
+
+No mode mints a replacement UUID, matches an edge by its source, relation and target instead of
+its UUID, or turns a storage uniqueness refusal into a skip. An archive edge whose UUID is new
+but whose triple is already held by a stored edge fails the import in every mode, and nothing is
+written.
+
+### What `update` writes
+
+The archive record is applied as an `EntityPatch` or `NotePatch`
+([ADR-014](ADR-014-curation-operations.md)):
+
+- An omitted or null optional field leaves the stored value unchanged. Import never clears a
+  field; unlike the MCP wire mapping, where `null` clears, an archive `null` reads as omitted.
+- Present record `properties` follow ADR-014's update semantics: a top-level merge with archive
+  values winning at their keys, where a nested object at an archive key replaces the stored value
+  at that key. Present edge `properties` replace the stored edge properties, as `EdgePatch` does.
+- A non-empty `tags` array replaces the stored tags. An empty array leaves them unchanged: an
+  archive cannot tell "no tags" from "tags not recorded", and clearing tags stays a curation act.
+- Kind, creation time, namespace and deletion state are never written by import.
+- An archive record whose kind differs from the stored record's kind, or an archive edge whose
+  endpoints differ from the stored edge's, fails the import before any write. A patch cannot
+  express either change, and dropping the difference would report an update that did not happen.
+
+Index maintenance after a committed update follows the existing entity update path. As the
+ADR-035 amendment states, the refusal-before-write guarantee does not make later index work part
+of the import's all-or-nothing unit.
+
+### What `--force` bypasses
+
+Without `--force`, §13 holds: an edge whose source or target does not resolve, or that fails the
+endpoint contract, refuses the whole import before any write. With `--force` the import proceeds
+without those edges and reports each one with its edge UUID and cause (missing source, missing
+target or endpoint contract). `--force` relaxes nothing else: unknown relations, malformed weights
+or reserved fields, unknown entity kinds under a strict schema, and `error`-mode collisions are
+refused with or without it.
+
+### Scope
+
+This amendment governs `kkernel kg import`. The library import entry points keep their present
+behavior, which skips such edges and reports them; that difference from §13 is recorded here, not
+ruled on. [ADR-036](ADR-036-kg-import-export-adapters.md) adapter imports keep `--continue` as
+sugar for `skip`.
+
+### Acceptance
+
+- An archive holding one entity already stored under a different name: the default mode fails
+  with nothing written, `skip` keeps the stored name, `update` writes the archive name, and the
+  summary reports a count per outcome.
+- An archive edge whose UUID is stored: `error` refuses with nothing written, `skip` leaves the
+  stored edge unchanged and counts it, and `update` rewrites it in place under the same UUID.
+- An archive edge with a new UUID and a stored triple is refused in all three modes with nothing
+  written.
+- `update` with an omitted field, a null field, new and nested properties, a non-empty and an
+  empty tags array, and a kind mismatch: the first two leave the stored values, properties merge
+  at the top level with a nested object replaced, the non-empty tags replace, the empty array
+  leaves the stored tags, and the kind mismatch refuses with nothing written.
+- An edge with an unresolved endpoint is refused without `--force` with nothing written; with
+  `--force` the remaining rows import and the edge is reported with its cause. An unknown
+  relation is refused with and without `--force`.
+- `--dry-run` reports the same per-outcome counts and skipped edges the real run produces, and
+  writes nothing.
