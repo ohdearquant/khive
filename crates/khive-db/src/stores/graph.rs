@@ -10,16 +10,12 @@ mod traversal;
 #[cfg(test)]
 use traversal::{run_bounded_traversal, traversal_neighbor_sql};
 
-use edge_upserts::{
-    edge_by_natural_key_including_deleted, observed_edge_batch_upsert, observed_edge_upsert,
-};
+use edge_upserts::{observed_edge_batch_upsert, observed_edge_upsert};
 
 use edge_reads::{count_neighbor_select, neighbor_extra_clause, parse_uuid};
 #[cfg(test)]
 use edge_reads::{neighbor_select_count, reset_neighbor_select_count};
-use edge_statements::canonical_edge_endpoints;
 pub(crate) use edge_statements::EDGE_NAMESPACES_CTE;
-use mutation_plans::GRAPH_MUTATION_EVENTS_OP;
 
 pub use mutation_plans::{
     compose_graph_mutation_events, edge_symmetric_absorb_or_update_inplace_statement,
@@ -58,7 +54,6 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use chrono::{DateTime, TimeZone, Utc};
-use khive_storage::error::StorageError;
 #[cfg(test)]
 use khive_storage::types::{
     DeleteMode, EdgeEndpointBaseCounts, EdgeFilter, EdgeSortField, EdgeUpsertRefusal,
@@ -69,9 +64,9 @@ use khive_storage::types::{
     Direction, Edge, EdgeUpsertRequest, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
     NeighborCursor, NeighborHit, NeighborQuery,
 };
-use khive_storage::StorageCapability;
 #[cfg(test)]
 use khive_storage::{Event, GraphStore, LinkId, StorageResult};
+use khive_storage::{StorageCapability, StorageError};
 use khive_types::EdgeRelation;
 use uuid::Uuid;
 
@@ -185,7 +180,7 @@ WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,
-    index_repair: Option<super::index_repair::IndexRepairContext>,
+    index_repair: Option<crate::stores::index_repair::IndexRepairContext>,
     is_file_backed: bool,
     /// Default namespace for multi-record queries (ADR-007 PARAM-ONLY: used as a
     /// WHERE filter on `query_edges`/`neighbors`/`traverse`, never as an
@@ -225,7 +220,7 @@ impl SqlGraphStore {
 
     pub(crate) fn with_index_repair(
         mut self,
-        repair: super::index_repair::IndexRepairContext,
+        repair: crate::stores::index_repair::IndexRepairContext,
     ) -> Self {
         self.index_repair = Some(repair);
         self
@@ -236,7 +231,7 @@ impl SqlGraphStore {
         F: FnMut(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        super::index_repair::run_indexed_read(
+        crate::stores::index_repair::run_indexed_read(
             Arc::clone(&self.pool),
             self.index_repair.clone(),
             StorageCapability::Graph,
