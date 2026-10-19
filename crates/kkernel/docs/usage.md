@@ -597,6 +597,67 @@ newer build. Recreate it from the current schema; in-place downgrade is unsuppor
 
 ---
 
+## `kkernel kg import` — import with explicit collision policies
+
+```bash
+kkernel kg import archive.json --db knowledge.db
+kkernel kg import archive.json --db knowledge.db --on-conflict skip --dry-run
+kkernel kg import archive.json --db knowledge.db --on-conflict update --force
+```
+
+The default `--on-conflict error` refuses an existing entity or edge UUID before
+importing rows. `skip` preserves existing rows and omits edges incident to a skipped
+entity. `update` patches entities and updates edges under their existing UUIDs.
+A new edge UUID whose canonical source/relation/target tuple is already stored
+refuses every mode. Import never substitutes another UUID or restores a tombstone.
+
+Entity updates preserve kind, namespace, creation time and deletion state. Omitted
+or null optional values remain unchanged. Properties merge at the top level, with
+an archive value replacing the stored value at each supplied key, including nested
+objects. Non-empty tags replace stored tags; empty tags leave them unchanged.
+Edge properties replace the stored properties when present. An update with a
+different entity kind or different edge endpoints refuses the complete import.
+
+Without `--force`, unresolved edge endpoints and endpoint-contract failures refuse
+the complete import. `--force` skips those edges and reports each input edge's UUID
+and cause. It still refuses unknown relations, invalid weights, reserved fields,
+strict-schema unknown kinds and UUID collisions in `error` mode. Adapter formats
+also accept `--continue` as shorthand for `--on-conflict skip`; it cannot be combined
+with an explicit conflict mode and is not an archive flag.
+
+Existing endpoints follow the normal by-ID link rules, including stored notes and
+events and a stored edge as an `annotates` target. Adapter edges may refer to
+endpoints already present in the destination; they need not repeat those records
+in the input. The archive still imports entity records and edges only.
+
+`--dry-run` uses the same preflight and outcome counts without importing rows. It
+opens an existing target read-only and never creates a missing target. On an
+unchanged destination, its inserted/updated/skipped counts and edge skip details
+match the real import. A real import refuses a target that changes during preflight,
+which can be retried against the new state. Each invocation admits at most 10,000
+entities plus edges and 64 MiB of serialized archive data; larger inputs must be
+partitioned into separate invocations with the required endpoints available.
+
+The JSON summary retains `entities_imported`, `edges_imported`, `edges_skipped`,
+`embedding_truncation` and non-empty `skipped_edges`, adding
+`entities_inserted`, `entities_updated`, `entities_skipped`, `edges_inserted`
+and `edges_updated`. Missing-source/target reports carry the cause; endpoint-contract
+reports additionally carry the validation error. A skipped stored edge uses
+`existing_edge`, and an edge incident to a skipped entity uses `skipped_record`.
+Repeated skipped input edges retain separate report entries. Duplicate entity UUIDs,
+or duplicate edge UUIDs/tuples among edges that would be written, refuse preflight.
+
+Row writes share one existing atomic storage owner. A concurrent destination change
+refuses before row changes; a later SQLite statement failure rolls back that unit.
+Index maintenance follows the existing deferred entity update path after commit,
+so a later indexing failure can be reported after row changes have committed.
+Library `import_kg` and its policy/JSON wrappers retain their existing upsert and
+edge-skipping behavior. These CLI rules implement the
+[ADR-020 import amendment](../../../docs/adr/ADR-020-git-native-kg-implementation.md)
+proposed in PR #5758; merging this implementation depends on that specification landing.
+
+---
+
 ## `kkernel sync` — build a DB from NDJSON sources
 
 ```bash

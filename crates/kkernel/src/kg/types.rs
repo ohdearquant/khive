@@ -238,9 +238,33 @@ pub struct ImportArgs {
     #[arg(long)]
     pub default_kind: Option<String>,
 
+    /// Action when an archive UUID already exists in the destination.
+    #[arg(long, value_enum, default_value = "error")]
+    pub on_conflict: ImportConflict,
+
+    /// Skip and report edges with missing endpoints or an invalid endpoint contract.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Validate and report the planned outcomes without importing rows.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Adapter-import shorthand for --on-conflict skip.
+    #[arg(long = "continue", conflicts_with = "on_conflict")]
+    pub continue_on_error: bool,
+
     /// Print adapter warnings to stderr.
     #[arg(long)]
     pub verbose: bool,
+}
+
+/// Collision policy for the import command; library imports retain their existing behavior.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportConflict {
+    Error,
+    Skip,
+    Update,
 }
 
 /// Supported input formats for `kkernel kg import`.

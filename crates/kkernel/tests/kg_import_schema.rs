@@ -245,8 +245,33 @@ fn identical_snapshot_distinguishes_strict_relaxed_and_actual_local_sync() {
                 seed(&tmp, &relaxed_db, &strict);
                 seed(&tmp, &sync_db, &strict);
             }
-            let output = import(&tmp, &source, &relaxed_db, &relaxed, "ndjson", "off");
+            // Replaying the known UUID is an explicit update; default Error must refuse it.
+            let update_started = chrono::Utc::now();
+            let output = command(&tmp)
+                .args(["--log", "off", "kg", "import"])
+                .arg(&source)
+                .arg("--db")
+                .arg(&relaxed_db)
+                .arg("--config")
+                .arg(&relaxed)
+                .args(["--format", "ndjson", "--on-conflict", "update"])
+                .output()
+                .unwrap();
+            let update_finished = chrono::Utc::now();
             assert_success(&output);
+            let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                summary,
+                json!({
+                    "entities_imported": 3,
+                    "entities_inserted": if existing { 2 } else { 3 },
+                    "entities_updated": if existing { 1 } else { 0 },
+                    "entities_skipped": 0,
+                    "edges_imported": 0, "edges_inserted": 0,
+                    "edges_updated": 0, "edges_skipped": 0,
+                    "embedding_truncation": {"truncated": 0, "discarded_bytes": 0}
+                })
+            );
             assert_eq!(
                 stderr(&output)
                     .matches("preserving unknown entity kind during explicit import")
@@ -285,9 +310,24 @@ fn identical_snapshot_distinguishes_strict_relaxed_and_actual_local_sync() {
                 };
                 let explicit = find(&preserved);
                 let local = find(&degraded);
-                for field in ["id", "name", "description", "created_at", "updated_at"] {
+                for field in ["id", "name", "description", "created_at"] {
                     assert_eq!(local[field], expected[field]);
                     assert_eq!(explicit[field], expected[field]);
+                }
+                assert_eq!(local["updated_at"], expected["updated_at"]);
+                if existing && expected["id"] == KNOWN {
+                    let updated = chrono::DateTime::parse_from_rfc3339(
+                        explicit["updated_at"].as_str().unwrap(),
+                    )
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+                    assert!(
+                        (update_started.timestamp_micros()..=update_finished.timestamp_micros())
+                            .contains(&updated.timestamp_micros()),
+                        "updated record must use the canonical update clock: {explicit}"
+                    );
+                } else {
+                    assert_eq!(explicit["updated_at"], expected["updated_at"]);
                 }
                 assert_eq!(explicit["kind"], expected["kind"]);
                 assert_eq!(explicit["entity_type"], expected["entity_type"]);
