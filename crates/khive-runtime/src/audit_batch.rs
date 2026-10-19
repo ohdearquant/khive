@@ -398,6 +398,7 @@ impl State {
         }
     }
 
+    /// No-op outside `test`/`test-internals`; operators read [`AuditBatch::health_metrics`].
     fn record_generation(&mut self, generation: AuditGenerationSnapshot) {
         #[cfg(any(test, feature = "test-internals"))]
         self.generations.push(generation);
