@@ -285,6 +285,7 @@ Amendments to accepted records:
 - [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
+- [ADR-020 amendment: import conflict modes](ADR-020-git-native-kg-implementation.md#amendment-2026-10-19-import-conflict-modes-over-edges-the-update-projection-and-the-force-flag-4766) (2026-10-19): proposed `kkernel kg import` conflict modes applied to edge UUIDs as well as records, the `update` projection, and what `--force` bypasses (#4766).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14) (2026-09-14): resolve fallback-limit disclosure.
 - [ADR-026 Amendment 4](ADR-026-rust-binary-packaging.md#amendment-4-2026-09-12-two-different-webassembly-questions-separated) (2026-09-12): two different WebAssembly questions, separated.
