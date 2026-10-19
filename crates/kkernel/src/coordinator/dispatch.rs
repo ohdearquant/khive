@@ -567,8 +567,8 @@ impl SubstrateCoordinator {
     ///
     /// Locates both `source_id` and `target_id`. When they are on different backends,
     /// the edge is written on the source backend with `target_backend` stamped to the
-    /// target backend id. When both endpoints are on the same backend, delegates to
-    /// the normal `link` path (no `target_backend` stamp).
+    /// target backend id. Endpoints on the same backend have no `target_backend`
+    /// stamp and retain the runtime's local metadata inference.
     ///
     /// The coordinator validates endpoints via `validate_link_endpoints` on the source
     /// backend's runtime before writing the edge.
@@ -624,12 +624,13 @@ impl SubstrateCoordinator {
 
         let cross_backend = src_backend.as_str() != tgt_backend.as_str();
 
-        if !cross_backend {
+        let metadata = if !cross_backend {
             // Same-backend: full endpoint validation including existence and kind checks.
             src_runtime
                 .validate_link_endpoints(&token, source_id, target_id, relation)
                 .await
                 .map_err(|e| e.to_string())?;
+            metadata
         } else if relation == EdgeRelation::Annotates {
             // Cross-backend annotates: `locate_endpoint` already resolved each
             // endpoint's substrate kind using the same by-ID order `get` uses
@@ -644,6 +645,7 @@ impl SubstrateCoordinator {
                     Some(tgt_located.kind),
                 )
                 .map_err(|e| e.to_string())?;
+            metadata
         } else {
             // Cross-backend, non-annotates: the target entity lives on a different backend so the source
             // runtime cannot resolve it via its own DB. Fetch each endpoint from its
@@ -674,7 +676,21 @@ impl SubstrateCoordinator {
                     tgt_resolved.as_ref(),
                 )
                 .map_err(|e| e.to_string())?;
-        }
+            let source_entity_kind = match src_resolved.as_ref() {
+                Some(Resolved::Entity(entity)) => Some(entity.kind.as_str()),
+                _ => None,
+            };
+            let target_entity_kind = match tgt_resolved.as_ref() {
+                Some(Resolved::Entity(entity)) => Some(entity.kind.as_str()),
+                _ => None,
+            };
+            KhiveRuntime::prepare_link_metadata(
+                relation,
+                source_entity_kind,
+                target_entity_kind,
+                metadata,
+            )
+        };
         let target_backend_stamp = if cross_backend {
             Some(tgt_backend.as_str().to_string())
         } else {
