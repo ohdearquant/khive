@@ -1387,37 +1387,30 @@ async fn orphan_fences_are_unknown_even_with_a_legacy_or_modern_marker() {
         {
             let writer = runtime.backend().pool().try_writer().unwrap();
             writer
-                .conn()
-                .pragma_update(None, "foreign_keys", false)
-                .unwrap();
-            writer
-                .conn()
-                .execute(
-                    "DELETE FROM memory_visibility_receipts WHERE note_id = ?1",
-                    [note.id.to_string()],
-                )
-                .unwrap();
-            writer
-                .conn()
-                .execute(
-                    concat!(
-                        "INSERT INTO memory_visibility_fences",
-                        "(namespace, note_id, model, ann_write_log_seq) ",
-                        "VALUES (?1, ?2, 'original-model', 7)"
-                    ),
-                    rusqlite::params![token.namespace().as_str(), note.id.to_string()],
-                )
-                .unwrap();
-            writer
-                .conn()
-                .execute(
-                    "UPDATE memory_visibility_epochs SET epoch = ?1 WHERE note_id = ?2",
-                    rusqlite::params![epoch, note.id.to_string()],
-                )
-                .unwrap();
-            writer
-                .conn()
-                .pragma_update(None, "foreign_keys", true)
+                .autocommit(|conn| {
+                    conn.pragma_update(None, "foreign_keys", false).unwrap();
+                    conn.execute(
+                        "DELETE FROM memory_visibility_receipts WHERE note_id = ?1",
+                        [note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        concat!(
+                            "INSERT INTO memory_visibility_fences",
+                            "(namespace, note_id, model, ann_write_log_seq) ",
+                            "VALUES (?1, ?2, 'original-model', 7)"
+                        ),
+                        rusqlite::params![token.namespace().as_str(), note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "UPDATE memory_visibility_epochs SET epoch = ?1 WHERE note_id = ?2",
+                        rusqlite::params![epoch, note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.pragma_update(None, "foreign_keys", true).unwrap();
+                    Ok(())
+                })
                 .unwrap();
         }
         assert_unknown_replay(&runtime, &token, &note).await;

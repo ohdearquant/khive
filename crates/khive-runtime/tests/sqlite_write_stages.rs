@@ -103,10 +103,10 @@ fn native_begin_statement_and_commit_failures_reach_the_wire() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("stages.db");
             let pool = Arc::new(ConnectionPool::new(fixture_config(path.clone())).unwrap());
-            pool.writer().unwrap().execute_batch(
+            pool.writer().unwrap().autocommit(|conn| Ok(conn.execute_batch(
                 "CREATE TABLE parent(id INTEGER PRIMARY KEY); \
                  CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);"
-            ).unwrap();
+            )?)).unwrap();
             let handle = queued.then(|| writer_task::spawn(&pool, 8).unwrap());
             let bridge = SqlBridge::new(Arc::clone(&pool), true);
             let mut writer = bridge.writer().await.unwrap();
@@ -168,9 +168,12 @@ fn pooled_guard_preserves_native_stages_and_read_errors_stay_unstaged() {
         return;
     }
     let pool = ConnectionPool::new(fixture_config(dir.path().join("pooled.db"))).unwrap();
-    let guard = pool.writer().unwrap();
-    guard.execute_batch("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
-    let statement = guard
+    pool.writer().unwrap().autocommit(|conn| {
+        Ok(conn.execute_batch("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")?)
+    }).unwrap();
+    let statement = pool
+        .writer()
+        .unwrap()
         .transaction(|conn| {
             conn.execute("INSERT INTO parent VALUES (1)", [])?;
             conn.execute("INSERT INTO parent VALUES (1)", [])?;
@@ -181,7 +184,9 @@ fn pooled_guard_preserves_native_stages_and_read_errors_stay_unstaged() {
         statement.write_failure().unwrap().stage,
         SqliteWriteStage::Statement
     );
-    let commit = guard
+    let commit = pool
+        .writer()
+        .unwrap()
         .transaction(|conn| {
             conn.execute("INSERT INTO child VALUES (2)", [])?;
             Ok(())
@@ -193,9 +198,15 @@ fn pooled_guard_preserves_native_stages_and_read_errors_stay_unstaged() {
         value["sqlite_extended_code"],
         rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
     );
-    let read = guard
-        .query_row::<i64, _, _>("SELECT missing_column", [], |row| row.get(0))
-        .unwrap_err();
+    let read = pool
+        .writer()
+        .unwrap()
+        .autocommit(|conn| {
+            Ok(conn
+                .query_row::<i64, _, _>("SELECT missing_column", [], |row| row.get(0))
+                .unwrap_err())
+        })
+        .unwrap();
     let read = runtime_error_value(
         RuntimeError::from(khive_db::SqliteError::from(read)),
         DomainDisposition::Unknown,
@@ -232,11 +243,13 @@ fn failed_pooled_settlement_retains_cause_without_claiming_definite_commit_failu
             dir.path().join(format!("unknown-{commit}.db")),
         ))
         .unwrap();
-        let guard = pool.writer().unwrap();
-        guard
-            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        pool.writer()
+            .unwrap()
+            .autocommit(|conn| Ok(conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY)")?))
             .unwrap();
-        let error = guard
+        let error = pool
+            .writer()
+            .unwrap()
             .transaction(|conn| {
                 conn.execute("INSERT INTO t VALUES (1)", [])?;
                 if commit {
@@ -278,7 +291,6 @@ fn failed_pooled_settlement_retains_cause_without_claiming_definite_commit_failu
         assert_eq!(value["request_state"], "side_effects_unknown");
         assert_eq!(value["task_terminated"], true);
         assert_eq!(value["retryable"], false);
-        drop(guard);
         assert!(matches!(
             pool.writer(),
             Err(khive_db::SqliteError::InvalidData(message))

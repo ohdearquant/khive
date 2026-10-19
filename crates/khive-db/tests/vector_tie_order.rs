@@ -32,22 +32,19 @@ fn open(path: &Path) -> (Arc<ConnectionPool>, SqliteVecStore) {
         })
         .expect("private file-backed pool"),
     );
-    {
-        let writer = pool.writer().unwrap();
-        writer
-            .conn()
-            .execute_batch(khive_db::migrations::ANN_WRITE_LOG_DDL)
-            .unwrap();
-        writer
-            .conn()
-            .execute_batch(
+    pool.writer()
+        .unwrap()
+        .autocommit(|conn| {
+            conn.execute_batch(khive_db::migrations::ANN_WRITE_LOG_DDL)?;
+            conn.execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS vec_tie_order USING vec0(\
              subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, \
              field TEXT NOT NULL, embedding_model TEXT NOT NULL, \
              embedding float[3] distance_metric=cosine)",
-            )
-            .unwrap();
-    }
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let store = store(&pool, MODEL);
     (pool, store)
 }

@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use khive_db::checkpoint::{checkpoint_once, TruncateState};
+use khive_db::checkpoint::TruncateState;
 use khive_db::{CheckpointConfig, ConnectionPool, PoolConfig, SqlBridge};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess as _;
@@ -46,14 +46,16 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
     // #1848 makes the central task the only routine checkpoint owner. Keep
     // autocheckpoint disabled on this writer so progress below is attributable
     // to `checkpoint_once`, never to a threshold-crossing commit.
-    let writer = pool.writer().expect("fixture writer");
-    writer
-        .conn()
-        .execute_batch(
-            "PRAGMA wal_autocheckpoint = 0; \
+    pool.writer()
+        .expect("fixture writer")
+        .autocommit(|conn| {
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint = 0; \
              CREATE TABLE bridge_writes \
              (cycle INTEGER NOT NULL, row_no INTEGER NOT NULL, payload BLOB NOT NULL);",
-        )
+            )?;
+            Ok(())
+        })
         .expect("initialize WAL fixture");
 
     let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -78,7 +80,7 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
     );
 
     let checkpoint_conn = pool
-        .open_standalone_writer()
+        .open_standalone_checkpoint()
         .expect("dedicated checkpoint connection");
     let checkpoint_config = CheckpointConfig {
         // This regression observes the central task's ordinary PASSIVE path;
@@ -91,36 +93,29 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
     let mut first_cycle_wal_bytes = None;
 
     for cycle in 0..WRITE_CYCLES {
-        writer
-            .conn()
-            .execute_batch("BEGIN IMMEDIATE")
-            .expect("begin fixture write cycle");
-        for row_no in 0..ROWS_PER_CYCLE {
-            writer
-                .conn()
-                .execute(
-                    "INSERT INTO bridge_writes (cycle, row_no, payload) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![cycle, row_no, payload.as_slice()],
-                )
-                .expect("append fixture row");
-        }
-        writer
-            .conn()
-            .execute_batch("COMMIT")
+        pool.writer()
+            .expect("fixture cycle writer")
+            .transaction(|conn| {
+                for row_no in 0..ROWS_PER_CYCLE {
+                    conn.execute(
+                        "INSERT INTO bridge_writes (cycle, row_no, payload) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![cycle, row_no, payload.as_slice()],
+                    )?;
+                }
+                Ok(())
+            })
             .expect("commit fixture write cycle");
 
-        checkpoint_once(
-            &pool,
-            &checkpoint_conn,
-            &checkpoint_config,
-            &mut truncate_state,
-        )
-        .expect("central PASSIVE checkpoint must run with idle sessions retained");
+        checkpoint_conn
+            .run(&checkpoint_config, &mut truncate_state)
+            .expect("central PASSIVE checkpoint must run with idle sessions retained");
 
-        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = checkpoint_conn
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+        let khive_db::CheckpointResult {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        } = checkpoint_conn
+            .passive()
             .expect("observe checkpoint progress");
         assert_eq!(busy, 0, "PASSIVE checkpoint unexpectedly reported busy");
         assert!(log_frames > 0, "write cycle produced no WAL frames");

@@ -2510,11 +2510,13 @@ mod tests {
                     .try_writer()
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 writer
-                    .execute_batch(
-                        "CREATE TRIGGER code_ingest_test_block_notes \
+                    .autocommit(|conn| {
+                        Ok(conn.execute_batch(
+                            "CREATE TRIGGER code_ingest_test_block_notes \
                      BEFORE INSERT ON notes \
                      BEGIN SELECT RAISE(ABORT, 'synthetic notes insert failure'); END",
-                    )
+                        )?)
+                    })
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(())
             })

@@ -603,22 +603,23 @@ fn receipt_cutover_validates_on_first_use_and_skips_the_validator_until_a_failed
         let reads = reads.clone();
         let writer = backend.pool().writer().unwrap();
         writer
-            .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| {
-                if matches!(
-                    context.action,
-                    AuthAction::Read {
-                        table_name: "memory_visibility_epochs",
-                        ..
+            .autocommit(|conn| {
+                Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Read {
+                            table_name: "memory_visibility_epochs",
+                            ..
+                        }
+                    ) {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        if deny.load(Ordering::SeqCst) {
+                            return Authorization::Deny;
+                        }
                     }
-                ) {
-                    reads.fetch_add(1, Ordering::SeqCst);
-                    if deny.load(Ordering::SeqCst) {
-                        return Authorization::Deny;
-                    }
-                }
-                Authorization::Allow
-            }))
+                    Authorization::Allow
+                }))?)
+            })
             .unwrap();
     }
     let runtime = cutover_runtime(backend.clone(), BackendId::MAIN);
@@ -671,8 +672,7 @@ fn receipt_cutover_validates_on_first_use_and_skips_the_validator_until_a_failed
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
 }
 

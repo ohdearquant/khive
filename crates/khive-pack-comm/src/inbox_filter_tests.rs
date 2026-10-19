@@ -53,10 +53,7 @@ fn actor_registry(
 
 fn parties() -> (VerbRegistry, VerbRegistry, KhiveRuntime) {
     let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
-    {
-        let mut writer = backend.pool().try_writer().expect("migration writer");
-        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-    }
+    backend.pool().run_migrations().expect("migrations");
     let backend = Arc::new(backend);
     let (sender, runtime) = actor_registry(Arc::clone(&backend), "actor:sender");
     let (recipient, _) = actor_registry(backend, "actor:recipient");

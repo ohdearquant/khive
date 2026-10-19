@@ -110,7 +110,7 @@ async fn passive_diagnostics_and_holder_census_bypass_an_active_floor() {
     })
     .unwrap();
     pool.set_test_write_admission(0, |_| Ok(0));
-    pool.writer().unwrap().execute_batch(
+    pool.writer().unwrap().conn().execute_batch(
         "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
          CREATE TABLE graph_edges (namespace TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(namespace, id));
          CREATE TABLE graph_edges_seq (seq INTEGER PRIMARY KEY AUTOINCREMENT, edge_id TEXT NOT NULL UNIQUE);
@@ -131,7 +131,9 @@ async fn passive_diagnostics_and_holder_census_bypass_an_active_floor() {
         Ok(0)
     });
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(crate::SqliteError::CapacityFloor {
             available_bytes: 0,
             floor_bytes: 100,

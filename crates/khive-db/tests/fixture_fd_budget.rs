@@ -84,8 +84,7 @@ fn hold_fixture_databases() {
         .unwrap_or_else(|error| panic!("FD_BUDGET_POOL_OPEN {index}: {error:?}"));
         pool.writer()
             .expect("fixture writer")
-            .conn()
-            .execute_batch("CREATE TABLE fixture_row (id INTEGER PRIMARY KEY); INSERT INTO fixture_row VALUES (1)")
+            .autocommit(|conn| Ok(conn.execute_batch("CREATE TABLE fixture_row (id INTEGER PRIMARY KEY); INSERT INTO fixture_row VALUES (1)")?))
             .expect("seed real WAL database");
         let readers: Vec<_> = (0..pool.max_readers())
             .map(|_| pool.reader().expect("fixture reader"))

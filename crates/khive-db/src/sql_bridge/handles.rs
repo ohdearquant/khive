@@ -92,22 +92,33 @@ pub(super) fn open_standalone_reader(
 }
 
 #[cfg(test)]
-pub(super) fn open_standalone_writer(
+pub(super) fn open_external_writer_fixture(
     pool: &ConnectionPool,
 ) -> Result<rusqlite::Connection, StorageError> {
-    let conn = pool
-        .open_standalone_writer()
+    let conn = crate::pool::open_external_writer_fixture(pool)
         .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
     configure_standalone_writer(pool, conn)
 }
 
-fn open_admitted_standalone_writer(
-    pool: &ConnectionPool,
-) -> Result<rusqlite::Connection, StorageError> {
-    let conn = pool
-        .open_standalone_writer_for_admitted_operation()
-        .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
-    configure_standalone_writer(pool, conn)
+pub(crate) fn build_standalone_writer(
+    pool: Arc<ConnectionPool>,
+    conn: rusqlite::Connection,
+    slot: OwnedSemaphorePermit,
+) -> Result<Box<dyn khive_storage::SqlWriter>, StorageError> {
+    let conn = configure_standalone_writer(&pool, conn)?;
+    Ok(Box::new(super::SqliteWriter {
+        observe_direct_errors: true,
+        event_rows: None,
+        handle: Some(super::StandaloneHandle {
+            conn,
+            _retained_slot: Some(slot),
+            read_transaction_slot: None,
+        }),
+        writer_task: None,
+        origin: pool.origin(),
+        db: crate::timeout_sink::db_label(&pool),
+        pool,
+    }))
 }
 
 fn configure_standalone_writer(
@@ -167,6 +178,8 @@ pub(super) async fn open_standalone_reader_on_blocking(
 pub(super) async fn open_standalone_writer_on_blocking(
     pool: Arc<ConnectionPool>,
     slot: OwnedSemaphorePermit,
-) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)> {
-    open_standalone_on_blocking(pool, slot, "open_writer", open_admitted_standalone_writer).await
+) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlWriter>> {
+    tokio::task::spawn_blocking(move || pool.open_sql_bridge_writer(slot))
+        .await
+        .map_err(|error| StorageError::driver(StorageCapability::Sql, "open_writer", error))?
 }

@@ -43,28 +43,25 @@ fn history_ddl(name: &str) -> &str {
 
 fn configure(runtime: &KhiveRuntime, schema: Schema) {
     let writer = runtime.backend().pool().try_writer().unwrap();
-    writer
-        .conn()
+    writer.autocommit(|conn| {
+    conn
         .execute_batch(&format!(
             "DROP INDEX IF EXISTS {CANONICAL}; DROP INDEX IF EXISTS {NONCANONICAL}"
         ))
         .unwrap();
     if matches!(schema, Schema::Absent) {
-        return;
+        return Ok(());
     }
-    writer.conn().execute_batch(GIT_CORE_INDEXES).unwrap();
+    conn.execute_batch(GIT_CORE_INDEXES).unwrap();
     match schema {
-        Schema::CanonicalOnly => writer
-            .conn()
+        Schema::CanonicalOnly => conn
             .execute_batch(&format!("DROP INDEX {NONCANONICAL}"))
             .unwrap(),
-        Schema::NoncanonicalOnly => writer
-            .conn()
+        Schema::NoncanonicalOnly => conn
             .execute_batch(&format!("DROP INDEX {CANONICAL}"))
             .unwrap(),
         Schema::Aliases | Schema::WrongTable | Schema::WrongDefinitions => {
-            writer
-                .conn()
+            conn
                 .execute_batch(&format!(
                     "DROP INDEX {CANONICAL}; DROP INDEX {NONCANONICAL}"
                 ))
@@ -75,13 +72,13 @@ fn configure(runtime: &KhiveRuntime, schema: Schema) {
                         history_ddl(CANONICAL),
                         history_ddl(NONCANONICAL),
                     ] {
-                        writer.conn().execute_batch(&ddl.replace("idx_git_notes_history_", "idx_fixture_alias_")).unwrap();
+                        conn.execute_batch(&ddl.replace("idx_git_notes_history_", "idx_fixture_alias_")).unwrap();
                     }
                 }
-                Schema::WrongTable => writer.conn().execute_batch(&format!(
+                Schema::WrongTable => conn.execute_batch(&format!(
                     "CREATE INDEX {CANONICAL} ON entities(namespace); CREATE INDEX {NONCANONICAL} ON entities(kind)"
                 )).unwrap(),
-                Schema::WrongDefinitions => writer.conn().execute_batch(&format!(
+                Schema::WrongDefinitions => conn.execute_batch(&format!(
                     "CREATE INDEX {CANONICAL} ON notes(namespace); CREATE INDEX {NONCANONICAL} ON notes(kind)"
                 )).unwrap(),
                 _ => unreachable!(),
@@ -89,6 +86,8 @@ fn configure(runtime: &KhiveRuntime, schema: Schema) {
         }
         Schema::Absent | Schema::Both => {}
     }
+    Ok(())
+    }).unwrap();
 }
 
 fn raw_note(
@@ -102,22 +101,24 @@ fn raw_note(
     let writer = runtime.backend().pool().try_writer().unwrap();
     let sql = "INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at,deleted_at) VALUES(?1,?2,?3,?4,1,1,?5)";
     let deleted = deleted.then_some(1_i64);
-    match value {
-        SqlValue::Text(value) => writer.conn().execute(sql, (id, ns, kind, value, deleted)),
-        SqlValue::Blob(value) => writer.conn().execute(sql, (id, ns, kind, value, deleted)),
-        SqlValue::Null => writer
-            .conn()
-            .execute(sql, (id, ns, kind, None::<&str>, deleted)),
-        other => panic!("fixture property representation: {other:?}"),
-    }
-    .unwrap();
+    writer
+        .autocommit(|conn| {
+            match value {
+                SqlValue::Text(value) => conn.execute(sql, (id, ns, kind, value, deleted)),
+                SqlValue::Blob(value) => conn.execute(sql, (id, ns, kind, value, deleted)),
+                SqlValue::Null => conn.execute(sql, (id, ns, kind, None::<&str>, deleted)),
+                other => panic!("fixture property representation: {other:?}"),
+            }
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn jsonb(runtime: &KhiveRuntime, json: &str) -> SqlValue {
     let writer = runtime.backend().pool().try_writer().unwrap();
     let bytes: Vec<u8> = writer
-        .conn()
-        .query_row("SELECT jsonb(?1)", [json], |row| row.get(0))
+        .autocommit(|conn| Ok(conn.query_row("SELECT jsonb(?1)", [json], |row| row.get(0))?))
         .unwrap();
     SqlValue::Blob(bytes)
 }
@@ -185,23 +186,25 @@ fn insert_edge(
 ) -> Result<usize, String> {
     let writer = runtime.backend().pool().try_writer().unwrap();
     writer
-        .conn()
-        .execute(
-            sql,
-            (
-                "local",
-                "candidate-edge",
-                source,
-                target,
-                1.0,
-                1_i64,
-                1_i64,
-                "{}",
-                "match",
-                "owner/repo",
-                cursor,
-            ),
-        )
+        .autocommit(|conn| {
+            Ok(conn.execute(
+                sql,
+                (
+                    "local",
+                    "candidate-edge",
+                    source,
+                    target,
+                    1.0,
+                    1_i64,
+                    1_i64,
+                    "{}",
+                    "match",
+                    "owner/repo",
+                    cursor,
+                ),
+            ))
+        })
+        .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
 }
 
@@ -220,24 +223,21 @@ fn instruction_work(runtime: &KhiveRuntime, sql: &str) -> u64 {
     let counted = Arc::clone(&work);
     let writer = runtime.backend().pool().try_writer().unwrap();
     writer
-        .conn()
-        .progress_handler(
-            1,
-            Some(move || {
-                counted.fetch_add(1, Ordering::Relaxed);
-                false
-            }),
-        )
-        .unwrap();
-    let result: Result<i64, _> = writer
-        .conn()
-        .query_row(sql, ["local", "match"], |row| row.get(0));
-    writer
-        .conn()
-        .progress_handler(0, None::<fn() -> bool>)
-        .unwrap();
-    assert_eq!(result.unwrap(), 1);
-    work.load(Ordering::Relaxed)
+        .autocommit(|conn| {
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+            let result: Result<i64, _> = conn.query_row(sql, ["local", "match"], |row| row.get(0));
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            assert_eq!(result.unwrap(), 1);
+            Ok(work.load(Ordering::Relaxed))
+        })
+        .unwrap()
 }
 
 #[tokio::test]
@@ -268,8 +268,7 @@ async fn actual_file_count_and_source_plans_search_both_history_partitions() {
                 .pool()
                 .try_writer()
                 .unwrap()
-                .conn()
-                .execute_batch("ANALYZE")
+                .autocommit(|conn| Ok(conn.execute_batch("ANALYZE")?))
                 .unwrap();
         }
         for sha in ["match", "legacy"] {
@@ -504,9 +503,9 @@ async fn whole_insert_and_failure_classification_preserve_holder_and_guard_outco
                     };
                     raw_note(&runtime, "duplicate", "local", "commit", value, true);
                 }
-                runtime.backend().pool().try_writer().unwrap().conn().execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", []).unwrap();
+                runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", [])?)).unwrap();
                 if matches!(history, "existing-live" | "existing-deleted") {
-                    runtime.backend().pool().try_writer().unwrap().conn().execute("INSERT INTO graph_edges(id,namespace,source_id,target_id,relation,weight,created_at,updated_at,deleted_at,metadata) VALUES('curated','local','source','project','annotates',0.42,7,8,?1,'{\"curated\":true}')", [if history == "existing-deleted" { Some(9_i64) } else { None }]).unwrap();
+                    runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO graph_edges(id,namespace,source_id,target_id,relation,weight,created_at,updated_at,deleted_at,metadata) VALUES('curated','local','source','project','annotates',0.42,7,8,?1,'{\"curated\":true}')", [if history == "existing-deleted" { Some(9_i64) } else { None }])?)).unwrap();
                 }
                 let curated = snapshot(
                     &query(
@@ -526,8 +525,9 @@ async fn whole_insert_and_failure_classification_preserve_holder_and_guard_outco
                     .pool()
                     .try_writer()
                     .unwrap()
-                    .conn()
-                    .execute("DELETE FROM graph_edges WHERE id='candidate-edge'", [])
+                    .autocommit(|conn| {
+                        Ok(conn.execute("DELETE FROM graph_edges WHERE id='candidate-edge'", [])?)
+                    })
                     .unwrap();
                 let new = insert_edge(&runtime, INSERT, "source", "project", cursor).unwrap();
                 assert_eq!(new, old, "whole INSERT {schema:?} {history} {cursor}");
@@ -595,15 +595,18 @@ async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_wri
         assert!(!indexes.is_empty());
         {
             let writer = runtime.backend().pool().try_writer().unwrap();
-            for row in indexes {
-                writer
-                    .conn()
-                    .execute_batch(&format!(
-                        "DROP INDEX \"{}\"",
-                        row.text("name").unwrap().replace('"', "\"\"")
-                    ))
-                    .unwrap();
-            }
+            writer
+                .autocommit(|conn| {
+                    for row in indexes {
+                        conn.execute_batch(&format!(
+                            "DROP INDEX \"{}\"",
+                            row.text("name").unwrap().replace('"', "\"\"")
+                        ))
+                        .unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
         }
         raw_note(
             &runtime,
@@ -620,7 +623,7 @@ async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_wri
         ] {
             raw_note(&runtime, id, ns, kind, SqlValue::Text("{".into()), true);
         }
-        runtime.backend().pool().try_writer().unwrap().conn().execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", []).unwrap();
+        runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", [])?)).unwrap();
         let before = snapshot(
             &query(
                 &runtime,
@@ -681,8 +684,7 @@ async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_wri
             .pool()
             .try_writer()
             .unwrap()
-            .conn()
-            .execute("DELETE FROM notes WHERE id='bad-local'", [])
+            .autocommit(|conn| Ok(conn.execute("DELETE FROM notes WHERE id='bad-local'", [])?))
             .unwrap();
         assert_eq!(
             annotation_count(&runtime, "match").await,
@@ -746,8 +748,7 @@ async fn instruction_growth_avoids_ordinary_history_and_absent_pack_double_scan(
                 .pool()
                 .try_writer()
                 .unwrap()
-                .conn()
-                .execute_batch("ANALYZE")
+                .autocommit(|conn| Ok(conn.execute_batch("ANALYZE")?))
                 .unwrap();
             let analyzed = instruction_work(&runtime, &annotation_count_sql());
             assert!(
@@ -858,8 +859,9 @@ async fn low_level_readonly_old_snapshot_reaches_original_count_fallback() {
         .pool()
         .try_writer()
         .unwrap()
-        .conn()
-        .execute("DELETE FROM _schema_migrations WHERE version>=49", [])
+        .autocommit(
+            |conn| Ok(conn.execute("DELETE FROM _schema_migrations WHERE version>=49", [])?),
+        )
         .unwrap();
     close_file_runtime(runtime).await;
     // The helper calls the real read-only backend constructor and from_backend;

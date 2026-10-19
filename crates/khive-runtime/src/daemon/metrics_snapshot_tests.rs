@@ -17,25 +17,26 @@ async fn metrics_snapshot_wal_pages_reflects_recent_write() {
     {
         let writer = pool.try_writer().expect("writer");
         writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE t (x INTEGER); \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "CREATE TABLE t (x INTEGER); \
                      INSERT INTO t VALUES (1); \
                      INSERT INTO t VALUES (2);",
-            )
+                )?)
+            })
             .expect("seed writes");
     }
 
     let dedicated_conn = pool
-        .open_standalone_writer()
+        .open_standalone_checkpoint()
         .expect("open dedicated checkpoint connection");
-    khive_db::checkpoint_once(
-        &pool,
-        &dedicated_conn,
-        &CheckpointConfig::default(),
-        &mut khive_db::checkpoint::TruncateState::default(),
-    )
-    .expect("checkpoint_once must observe on a healthy dedicated connection");
+    dedicated_conn
+        .run(
+            &CheckpointConfig::default(),
+            &mut khive_db::checkpoint::TruncateState::default(),
+        )
+        .expect("checkpoint_once must observe on a healthy dedicated connection");
+    drop(dedicated_conn);
 
     let dispatcher = MockDispatch {
         namespace: "local".to_string(),
@@ -122,8 +123,9 @@ async fn metrics_checkpoint_timing_keeps_stores_separate_and_scrapes_read_only()
         );
         pool.try_writer()
             .unwrap()
-            .conn()
-            .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .autocommit(|conn| {
+                Ok(conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")?)
+            })
             .unwrap();
         pools.push(pool);
     }
@@ -138,11 +140,9 @@ async fn metrics_checkpoint_timing_keeps_stores_separate_and_scrapes_read_only()
         .iter()
         .all(|store| store.timing.ticks == 0));
     for (index, pool) in pools.iter().enumerate() {
-        let conn = pool.open_standalone_writer().unwrap();
+        let conn = pool.open_standalone_checkpoint().unwrap();
         for _ in 0..=index {
-            khive_db::checkpoint_once(
-                pool,
-                &conn,
+            conn.run(
                 &CheckpointConfig {
                     truncate_high_water_pages: u64::MAX,
                     ..CheckpointConfig::default()
@@ -270,8 +270,7 @@ async fn metrics_snapshot_exposes_decomposed_writer_stages() {
     {
         let writer = pool.try_writer().unwrap();
         writer
-            .conn()
-            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .autocommit(|conn| Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?))
             .unwrap();
     }
     let handle = pool

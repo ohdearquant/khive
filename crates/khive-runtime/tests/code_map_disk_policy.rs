@@ -67,17 +67,20 @@ fn code_map_runtime_uses_captured_policy_and_lock_directory() {
     assert!(!pool.config().wal_mode);
     {
         let writer = pool.try_writer().unwrap();
-        assert_eq!(
-            writer
-                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
-                .unwrap(),
-            "delete"
-        );
         writer
-            .execute_batch(
-                "CREATE TABLE captured_policy_write (id INTEGER); \
+            .autocommit(|conn| {
+                assert_eq!(
+                    conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "delete"
+                );
+                conn.execute_batch(
+                    "CREATE TABLE captured_policy_write (id INTEGER); \
                  INSERT INTO captured_policy_write VALUES (7)",
-            )
+                )
+                .unwrap();
+                Ok(())
+            })
             .unwrap();
     }
     drop(runtime);

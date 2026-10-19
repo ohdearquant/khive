@@ -116,15 +116,13 @@ fn legacy_env_cannot_change_wal_autocheckpoint() {
     }
     // The pooled writer takes its setting at pool open; every later
     // writer-capable connection selects it from the ownership state.
-    let standalone = pool
-        .open_standalone_writer_untracked()
+    let standalone_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer before the claim");
     assert_eq!(
-        wal_autocheckpoint_pages(&standalone),
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+        standalone_pages, FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
         "the removed env override must not change a later writer's unclaimed fallback"
     );
-    drop(standalone);
     pool.claim_checkpoint_ownership().expect("claim ownership");
     let writer = pool.writer().expect("writer after claim");
     assert_eq!(
@@ -133,12 +131,11 @@ fn legacy_env_cannot_change_wal_autocheckpoint() {
         "the removed env override must not change the claimed-owner setting"
     );
     drop(writer);
-    let standalone = pool
-        .open_standalone_writer_untracked()
+    let standalone_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer after the claim");
     assert_eq!(
-        wal_autocheckpoint_pages(&standalone),
-        0,
+        standalone_pages, 0,
         "the removed env override must not change a later writer's claimed-owner setting"
     );
 }

@@ -212,6 +212,7 @@ async fn disabled_telemetry_does_not_change_committed_storage_result() {
         .unwrap();
         pool.writer()
             .unwrap()
+            .conn()
             .execute_batch("CREATE TABLE witness(value INTEGER)")
             .unwrap();
         let handle = spawn(&pool, 1).unwrap();

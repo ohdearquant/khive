@@ -94,8 +94,15 @@ key selects the cooperative lease, while the path is diagnostic/probe metadata.
 An admitted pooled checkout takes the volume lease before the writer mutex and
 leaves capacity sampling to the logical-write boundary: a transaction samples
 after successful `BEGIN IMMEDIATE`, before its body; an autocommit unit samples
-immediately before its write. The public compatibility `writer()` path also
-samples at checkout, which alone cannot authorize arbitrary later raw SQL.
+immediately before its callback. Public `writer()` and `try_writer()` return
+an exclusion owner, with no checkout-time capacity sample or public raw
+connection access. Consume it with `autocommit` for one operation or complete
+script, or `transaction` for an owned BEGIN IMMEDIATE/body/COMMIT unit. An
+unfinished script is rolled back and refused. `conn`, `conn_mut`, `Deref` and
+`DerefMut` are unavailable to callers outside `khive-db`; a callback cannot
+return a borrow of its connection or prepared statement. Existing callers that
+need schema migration use the pool/backend migration methods, which retain
+the captured policy, rather than acquiring a second lease through a raw wrapper.
 Writer-task transactional requests sample after `BEGIN`, and admitted standalone
 transactions follow the same order; writer-task top-level requests run without a
 transaction and sample before they run. Standalone autocommit statements/scripts
@@ -141,7 +148,7 @@ An already-admitted large transaction or another filesystem consumer can still
 exhaust space. The sampled floor is neither reserved capacity nor guaranteed
 recovery headroom, and it is not a transaction-size quota. See
 [SQLite disk admission](disk-admission.md) for the boundary inventory and remaining
-raw-connection work. Full ADR-154 conformance remains tracked by
+admission work. Full ADR-154 conformance remains tracked by
 [#3551](https://github.com/ohdearquant/khive/issues/3551); native `SQLITE_FULL`
 code propagation after automatic rollback remains separate work in
 [#4405](https://github.com/ohdearquant/khive/issues/4405).

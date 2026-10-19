@@ -783,10 +783,9 @@ async fn missing_table_degrades_affected_signals_instead_of_aborting() {
     build_fixture(&db, [0, 1]).await;
     {
         let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
-        let mut writer = backend.pool().writer().expect("writer guard");
+        let writer = backend.pool().writer().expect("writer guard");
         writer
-            .conn_mut()
-            .execute_batch("DROP TABLE graph_edges;")
+            .autocommit(|conn| Ok(conn.execute_batch("DROP TABLE graph_edges;")?))
             .expect("drop graph_edges to simulate a partial/older map");
     }
     let policy = test_policy(tmp.path());
@@ -830,15 +829,16 @@ async fn missing_column_degrades_affected_signals_instead_of_aborting() {
     build_fixture(&db, [0, 1]).await;
     {
         let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
-        let mut writer = backend.pool().writer().expect("writer guard");
+        let writer = backend.pool().writer().expect("writer guard");
         writer
-            .conn_mut()
-            .execute_batch(
-                "DROP INDEX IF EXISTS idx_entities_kind_entity_type; \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_entities_kind_entity_type; \
                      DROP INDEX IF EXISTS idx_entities_legacy_type; \
                      DROP INDEX IF EXISTS idx_entities_live_namespace_type_order; \
                      ALTER TABLE entities DROP COLUMN entity_type;",
-            )
+                )?)
+            })
             .expect("drop entity_type to simulate an older map schema");
     }
     let policy = test_policy(tmp.path());
@@ -868,10 +868,11 @@ async fn missing_edge_metadata_column_degrades_only_metadata_dependent_signals()
     build_fixture(&db, [0, 1]).await;
     {
         let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
-        let mut writer = backend.pool().writer().expect("writer guard");
+        let writer = backend.pool().writer().expect("writer guard");
         writer
-            .conn_mut()
-            .execute_batch("ALTER TABLE graph_edges DROP COLUMN metadata;")
+            .autocommit(|conn| {
+                Ok(conn.execute_batch("ALTER TABLE graph_edges DROP COLUMN metadata;")?)
+            })
             .expect(
                 "drop metadata to simulate a map missing dependency-kind classification \
                      while every other edge column is intact",
@@ -924,7 +925,7 @@ async fn missing_edge_id_column_degrades_only_id_dependent_signals() {
     build_fixture(&db, [0, 1]).await;
     {
         let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
-        let mut writer = backend.pool().writer().expect("writer guard");
+        let writer = backend.pool().writer().expect("writer guard");
         // `id` is part of `graph_edges`'s composite PRIMARY KEY
         // (namespace, id), so SQLite's `ALTER TABLE ... DROP COLUMN`
         // refuses it ("cannot drop PRIMARY KEY column"); rebuild the
@@ -933,9 +934,9 @@ async fn missing_edge_id_column_degrades_only_id_dependent_signals() {
         // they intentionally depend on `graph_edges`, while this fixture
         // intentionally replaces that table with a malformed schema.
         writer
-            .conn_mut()
-            .execute_batch(
-                "DROP TRIGGER gtd_task_dependency_cycle_notes_bi;
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "DROP TRIGGER gtd_task_dependency_cycle_notes_bi;
                      DROP TRIGGER gtd_task_dependency_cycle_notes_bu;
                      DROP TRIGGER gtd_task_dependency_cycle_note_activation_bi;
                      DROP TRIGGER gtd_task_dependency_cycle_note_activation_bu;
@@ -962,7 +963,8 @@ async fn missing_edge_id_column_degrades_only_id_dependent_signals() {
                      FROM graph_edges;
                      DROP TABLE graph_edges;
                      ALTER TABLE graph_edges_no_id RENAME TO graph_edges;",
-            )
+                )?)
+            })
             .expect("rebuild graph_edges without id to simulate a map missing only that column");
     }
     let policy = test_policy(tmp.path());

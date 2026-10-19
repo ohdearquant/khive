@@ -26,29 +26,25 @@ use super::{
 /// SQLite incremental-merge I/O against a trigram index over a corpus of
 /// hundreds of thousands of rows — the same class of blocking work the
 /// WAL-pin beacon writes above already move off the worker via
-/// `tokio::task::spawn_blocking`. `conn` and `state` are moved into the
-/// blocking closure and handed back to the caller whenever the step returns,
-/// so the checkpoint task can restore its dedicated connection and scheduler
-/// state on every non-panicking path. A panic inside the step surfaces as the
-/// `JoinError`, like the beacon writes above: the connection and scheduler
-/// state moved into the task are gone with it, and the caller reopens both
-/// on the next tick instead of taking the checkpoint task down.
+/// `tokio::task::spawn_blocking`. An ordinary write owner is constructed
+/// inside the blocking closure; the checkpoint file is never lent to FTS DML.
+/// Scheduler state returns on non-panicking paths. A panic surfaces as the
+/// `JoinError`, and the owner settles before releasing its lease.
 pub(super) async fn run_fts_maintenance_off_worker(
-    conn: rusqlite::Connection,
+    pool: Arc<ConnectionPool>,
     config: crate::fts_maintenance::FtsMaintenanceConfig,
     mut state: crate::fts_maintenance::FtsMaintenanceState,
     now: Instant,
 ) -> Result<
     (
-        rusqlite::Connection,
         crate::fts_maintenance::FtsMaintenanceState,
         Result<Option<crate::fts_maintenance::FtsMaintenanceStep>, String>,
     ),
     tokio::task::JoinError,
 > {
     tokio::task::spawn_blocking(move || {
-        let result = crate::fts_maintenance::run_if_due(&conn, &config, &mut state, now);
-        (conn, state, result)
+        let result = pool.run_fts_maintenance(&config, &mut state, now);
+        (state, result)
     })
     .await
 }
@@ -187,8 +183,8 @@ pub async fn run_checkpoint_task(
     // in-memory/read-only pool) retries the open on every subsequent tick.
     let mut checkpoint_conn = CheckpointConnection::new();
     checkpoint_conn.ensure_open(&pool);
-    // FTS5 segment maintenance shares this task's standalone connection, but
-    // not its 500 ms cadence. Each due call performs at most one bounded
+    // FTS5 segment maintenance uses an admitted write owner at its own
+    // cadence. Each due call performs at most one bounded
     // merge step on one table and refuses immediately when another writer
     // owns SQLite's write lock.
     let mut fts_maintenance_config = crate::fts_maintenance::FtsMaintenanceConfig::from_env();
@@ -246,33 +242,32 @@ pub async fn run_checkpoint_task(
                     #[cfg(not(unix))]
                     let _ = outcome.sidecar_attribution;
 
-                    // Only a due tick moves the connection onto a blocking
-                    // thread; an ordinary tick between maintenance intervals
-                    // keeps it here and records a no-op.
+                    // Restore the recovery file before starting independent
+                    // FTS work. Only a due tick constructs an admitted writer
+                    // on a blocking thread; other ticks record a no-op.
+                    checkpoint_conn.conn = Some(conn);
                     let fts_result = if !fts_maintenance_state
                         .is_due(&fts_maintenance_config, Instant::now())
                     {
-                        checkpoint_conn.conn = Some(conn);
                         Ok(None)
                     } else {
                         match run_fts_maintenance_off_worker(
-                            conn,
+                            Arc::clone(&pool),
                             fts_maintenance_config.clone(),
                             fts_maintenance_state,
                             Instant::now(),
                         )
                         .await
                         {
-                            Ok((conn, state, fts_result)) => {
+                            Ok((state, fts_result)) => {
                                 fts_maintenance_state = state;
-                                checkpoint_conn.conn = Some(conn);
                                 fts_result
                             }
                             Err(join_err) => {
                                 // The step panicked on the blocking thread. The
-                                // connection and scheduler state moved into it
-                                // are gone; `ensure_open` reopens the connection
-                                // next tick and the schedule restarts from now.
+                                // scheduler state moved into it is gone; its
+                                // admitted writer has settled. The independent
+                                // checkpoint connection remains usable.
                                 // The checkpoint pragma itself already succeeded.
                                 fts_maintenance_state =
                                     crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
