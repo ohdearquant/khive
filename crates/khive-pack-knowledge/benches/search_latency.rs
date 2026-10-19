@@ -45,7 +45,7 @@ async fn fixture(real_model: bool) -> VerbRegistry {
     registry.apply_schema_plans(runtime.backend());
     runtime.install_edge_rules(registry.all_edge_rules());
     let atoms: Vec<Value> = (0..100).map(|i| json!({
-        "slug": format!("bench-atom-{i}"), "name": format!("Bench Atom {i}"),
+        "slug": format!("bench-atom-{i}"), "name": format!("Bench Atom {i}"), "finalized": true,
         "content": format!("subject{i} visiblemarker0 knowledge retrieval embedding reranking benchmark atom tensor neural dense sparse retrieval corpus benchmark search latency gradient transformer semantic index query score rank precision recall vector")
     })).collect();
     let seeded = registry
@@ -53,6 +53,12 @@ async fn fixture(real_model: bool) -> VerbRegistry {
         .await
         .expect("seed atoms");
     assert_eq!(seeded["created"], 100);
+    // Search returns finalized atoms only, and the rerank cases read the indexed vectors.
+    let indexed = registry
+        .dispatch("knowledge.index", json!({"rebuild_ann": false}))
+        .await
+        .expect("index atoms");
+    assert_eq!(indexed["indexed"], 100);
     registry
 }
 
