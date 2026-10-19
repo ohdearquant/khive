@@ -1751,6 +1751,10 @@ is absent, so that the first run on a fresh host still works; and an audit of th
 file writers (vector segment directories, the events sidecar, the attachment cutover). It is left
 to its own change. Forwarding clients keep the eager build.
 
+The narrower boot-admission property is proposed in [Amendment 15](#amendment-15-2026-10-19-conditional-client-boot-without-writer-admission).
+That partial amendment is Proposed; it does not restore the withdrawn lazy-registry design or
+change the status of this decision or Decisions 2 and 3.
+
 **2. Strict by default when a rendezvous is present.** `KHIVE_DAEMON_STRICT` becomes a tri-state:
 a truthy value is strict, an explicit false value (`0`, `false`, `no`, `off`) is not strict, and
 unset means strict exactly when a daemon rendezvous was present when the request entered the
@@ -1820,3 +1824,159 @@ write is blocked by a held store lock.
 Daemon and client timeouts keep their current values; this amendment names outcomes, it does not
 tune them. Daemon ownership of stores (Amendment 13) and the reconnect rules (Amendments 9 and 10)
 are unchanged.
+
+## Amendment 15 (2026-10-19): conditional client boot without writer admission
+
+**Status**: Proposed. **Disposition**: partial amendment of Amendment 14, Decision 1's deferred
+no-create and migration-free boot property, for #5223. The base ADR remains Accepted. The lazy
+registry design stays withdrawn; Amendment 14, Decisions 2 and 3, and the other amendments remain
+in force. Dependent implementation does not merge before this amendment's acceptance gate.
+
+### Context and boundary
+
+The eager registry is retained, including discovery, mount resolution, pack dependency and
+collision checks, and every mounted pack's schema plan. Idempotent DDL still acquires a writer:
+the writable pack-catalog path calls `apply_pack_ddl_statements_with_columns` for a nonempty plan.
+Pool identity bootstrap, vector-table preparation and direct events-sidecar open can also write
+before the first request. Skipping core migrations alone therefore does not establish the
+deferred property.
+
+This amendment proposes a boot-admission policy separate from configured store mode. A configured
+writable store remains writable, with the same configuration identity, routes and capabilities.
+Read-only **validation operations** during boot do not turn it into a configured read-only
+snapshot. There is no new public request flag, built-in-only catalog or lazy registry.
+
+### Decision 1: select the conditional boot once, preserve request forwarding
+
+For a file-backed stdio forwarding client, select the conditional boot when a rendezvous is
+present at boot, strict forwarding is not explicitly disabled, and `KHIVE_NO_DAEMON=1` is not
+selected. A rendezvous means either the resolved socket path or PID file exists, as in Amendment
+14. A daemon process and an in-memory main backend do not select this client policy.
+
+An absent rendezvous, explicit strict false (`0`, `false`, `no`, `off`), or `KHIVE_NO_DAEMON=1`
+keeps today's eager boot. Explicit strict true without a rendezvous still has its existing
+request semantics; it does not, by itself, select this boot policy. Boot selection must not use
+the broader `is_forwarding_client()` predicate, which does not establish these conditions.
+
+The boot decision is not permission to dispatch a request locally. Request entry and fallback
+retain Amendment 14's rendezvous readings and entry latch, including recovery removing a stale
+socket or PID file. Ordinary **boot** fallback below does not add any local **request** fallback.
+`daemon_slow`, unknown post-write outcomes, and all existing no-retry rules are unchanged.
+
+### Decision 2: no-create validation, with explicit ordinary-boot exits
+
+Under the conditional policy, open every configured store without creating its database or parent
+directories. Retain physical-file, volume, path-trust and backend-identity checks. Do not bootstrap
+a database nonce, change journal mode, apply core migrations or pack DDL, prepare vector tables
+through a writer, run attachment conversion, or acquire a volume write lease during successful
+boot. No partly validated runtime may become the serving registry.
+
+Use the existing reader-side core compatibility check and pack declared-column validation for
+all selected plans, including mounts. The pack check validates `PackColumnAddition` declarations;
+an empty declaration list does no work. It does **not** prove that arbitrary SQL tables, indexes
+or triggers exist. This amendment keeps that existing validation contract rather than executing
+SQL as a probe or claiming complete validation of undeclared pack SQL. Eager plan collection and
+collision checks still run.
+
+The following exits are explicit:
+
+- A missing configured database, including a configured direct events sidecar, first asks the
+  daemon to start through the existing startup/recovery protocol. The client holds no store
+  writer or volume lease while it does so. Retry the no-create validation after startup; a store
+  still absent then takes today's ordinary eager boot.
+- A core schema behind this build, missing declared pack columns or configured vector tables,
+  or an incomplete attachment cutover requires ordinary eager boot. A configured writable
+  database without its persistent identity nonce also takes that path; the conditional path
+  does not mint one or substitute weaker physical-identity checks.
+- A direct events sidecar whose existing permissions require the ordinary hardening procedure
+  takes ordinary eager boot. Conditional validation must not expose a sink that the existing
+  permission policy would first have hardened.
+- A newer or incompatible schema, malformed configuration, identity or volume change, path-trust
+  refusal, or failed audit capability check retains its existing error. Such errors are not a
+  general excuse to retry with more write authority.
+
+Before an ordinary-boot exit, discard provisional boot state and its handles; do not mix a partly
+validated catalog with a writable fallback catalog. Preserve configured modes and `config_id`
+through both paths. The ordinary path performs its normal repairs and readiness checks, and its
+own writes acquire the ordinary leases. A failed daemon start never authorizes a local request
+that strict forwarding would refuse.
+
+### Decision 3: account for each boot writer
+
+Each row is part of the implementation and acceptance population. A no-create flag on the main
+database alone is insufficient.
+
+| Surface                          | Conditional-boot disposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database connection and identity | No CREATE, directory bootstrap, nonce initialization or journal-mode change. Keep physical identity, volume admission, path checks and existing WAL/SHM safety rules. Connection pragmas needed for reads must not execute schema or application writes.                                                                                                                                                                                                                                                                                                               |
+| Core and pack schema             | Reader validation with the coverage stated above. No migration, idempotent DDL transaction or catalog omission. Missing/behind prerequisites take Decision 2's ordinary path.                                                                                                                                                                                                                                                                                                                                                                                          |
+| Configured vectors and ANN files | Validate existing vector tables and columns through a reader, without forcing configured read-only mode or relying on a new instance's empty preparation cache. Do not warm a client ANN, register its checkpoint consumer, or create segment directories/checkpoint locks at boot. Path calculation is not evidence of file creation.                                                                                                                                                                                                                                 |
+| Events sidecar                   | A direct binding needs an existing-file, no-create validation route retaining configured writable mode, canonical-path cache policy and trust checks. Validate existing permissions against the same policy; required hardening takes Decision 2's ordinary path, so conditional boot does not chmod or admit insecure backing. The frozen-snapshot read-only opener, which rejects live-writer SHM, is not a substitute, and its guards must not be weakened. Socket-backed events retain their existing forwarding route. Missing direct storage follows Decision 2. |
+| Attachment cutover and hydration | Read and require complete cutover, including the existing secondary-store legacy-attachment check. No GC-owner acquisition, staging, importing or finalization at conditional boot. Hydrator setup must obey the same no-create policy; its construction cannot be assumed pure merely because cutover is complete.                                                                                                                                                                                                                                                    |
+| Audit sink                       | Retain the configured sink and idempotent-audit capability preflight, using no-create validated backing. Do not call `with_read_only_audit_store` for a configured writable client: that drops the sink and changes request behavior. Missing backing follows Decision 2; incompatible capability remains an error.                                                                                                                                                                                                                                                    |
+
+SQLite's coordination with an existing live WAL/SHM retains its existing rules. The claim here is
+no store creation, application/schema initialization or client volume-lease acquisition during
+conditional boot, not zero operating-system writes. Lease counts do not prove filesystem purity;
+the acceptance checks observe database contents, paths and permissions separately. Do not weaken
+read-only snapshot, daemon-ownership or file-pinning guards to obtain a green count.
+
+Requests local by design (`save_to`, request planning and bridge diagnostics) retain their normal
+routes on the read-validated runtime. A local request that writes acquires its ordinary lease and
+retains its audit obligations. A successful forward executes in the daemon and does not append a
+second client dispatch audit. These request effects are outside the boot-only no-write claim.
+
+### Acceptance: client attribution and controls
+
+These are deterministic required witnesses, not measured performance results. All run through the
+existing host validation queue; this Proposed text claims no native result.
+
+1. A test-support-only observer at the khive-db volume-lease acquisition point counts attempts in
+   the **client process**, across every configured store and boot phase, including identity,
+   schema, vectors and a direct events sidecar. It must observe the real acquisition path, not
+   a wrapper that a boot writer can bypass. An uninstalled observer fails the witness. The
+   daemon's own acquisitions are separately attributed.
+2. Use one persistent, already-current fixture with a persistent identity, configured vectors,
+   complete attachment cutover, audit backing, and a mounted nonempty schema plan with declared
+   columns. With the condition true, eager boot plus one actual forwarded request records zero
+   client acquisitions. With the **same fixture** and only the boot condition made false,
+   ordinary boot records at least one. A normal forward must reach the daemon, not an injected
+   response. Removing conditional selection or executing the writable pack plan must make the
+   zero-count witness fail; disabling the observer must also fail.
+3. Compare client boot before/after images independently: database identity and schema/version,
+   configured vector tables, sidecar and segment/checkpoint paths, attachment state and relevant
+   permissions. Observe before the forwarded request so a legitimate daemon write is not
+   attributed to client boot. Existing WAL/SHM safety checks and configured `config_id` must
+   match ordinary boot. A forced read-only configuration must fail the identity/capability
+   witness.
+4. Exercise socket-only and PID-only rendezvous, unset/truthy/explicit-false strict values,
+   absent rendezvous, `KHIVE_NO_DAEMON=1`, daemon role and in-memory main. Check Decision 1's
+   selection and the unchanged strict request fallback contract, including stale rendezvous
+   removal. A failed forward in strict mode must not execute the local mutation, including
+   after an ordinary-boot exit.
+5. Independently remove a configured store, identity nonce, declared pack column, vector table
+   or direct sidecar, and provide behind-schema/incomplete-cutover fixtures. Check the specified
+   daemon-first or ordinary-boot exit, without serving the provisional runtime. Identity swap,
+   volume/path-trust refusal and incompatible schema remain must-refuse controls, not repair
+   opportunities. A sidecar requiring permission hardening must leave the conditional path
+   before exposing its sink. Include a mounted pack in these checks; built-in-only coverage is
+   insufficient.
+6. After validated conditional boot, exercise local planning/diagnostics and a local `save_to`
+   request that writes and audits. Require its real lease and audit record. Require exactly the
+   existing daemon-side dispatch audit for a forwarded write and no duplicate client dispatch
+   audit. Dropping the configured sink or bypassing idempotent-audit preflight must fail.
+
+The acceptance gate needs executed baseline and independent mutation controls, with compilation
+or setup failures distinguished from the intended assertion failures. In particular, removal of
+strict fallback refusal must fail a must-refuse request witness. Neither a named test nor a
+zero count from an inactive observer is a passing result.
+
+### Scope and acceptance status
+
+This is the narrower property left open by Amendment 14, not a latency or memory optimization
+claim. No historical timings are extrapolated. Store ownership, daemon protocol, request retry
+semantics, timeouts, configured modes, full discovery and mount visibility are unchanged.
+
+The docs-only proposal carries no implementation or executed acceptance. Independent spec review
+and Leo's acceptance are required before dependent implementation merges; a merged Proposed text
+does not itself grant that acceptance.
