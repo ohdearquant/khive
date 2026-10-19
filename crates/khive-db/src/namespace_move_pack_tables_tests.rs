@@ -211,6 +211,15 @@ fn image(conn: &Connection, table: &str, id: &str) -> Vec<rusqlite::types::Value
     .expect("row image")
 }
 
+fn pack_rows_in_namespace(conn: &Connection, table: &str, namespace: &str) -> i64 {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE namespace = ?1"),
+        [namespace],
+        |row| row.get(0),
+    )
+    .expect("count pack rows")
+}
+
 fn events_matching_their_run(conn: &Connection, namespace: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM exec_events AS event \
@@ -247,6 +256,31 @@ fn seeded_source() -> Connection {
     grant(&conn, "grant-past", "source", Some(NOW - 1));
     grant(&conn, "grant-edge", "source", Some(NOW));
     grant(&conn, "grant-elsewhere", "elsewhere", None);
+    conn
+}
+
+/// One total-move source holding rows in all eight pack tables.
+fn total_seeded_source() -> Connection {
+    let conn = seeded_source();
+    for statement in [GTD_AUDIT_DDL, EVAL_RUNS_DDL, SNAPSHOTS_DDL] {
+        conn.execute_batch(statement).expect("pack table");
+    }
+    seed_note(&conn, "n-other", "elsewhere", "observation");
+    audit(&conn, "n1", 1, Some("source"));
+    audit(&conn, "n2", 2, Some("source"));
+    audit(&conn, "n-other", 3, Some("elsewhere"));
+    eval_run(&conn, "eval-1", "source");
+    eval_run(&conn, "eval-other", "elsewhere");
+    for namespace in [
+        "source",
+        "source::vamana::model-a",
+        "elsewhere",
+        "elsewhere::vamana::model-a",
+    ] {
+        snapshot(&conn, namespace, "vamana");
+    }
+    grant_with_status(&conn, "grant-undecided", "source", "requested");
+    grant_with_status(&conn, "grant-revoked", "source", "revoked");
     conn
 }
 
@@ -592,16 +626,74 @@ fn a_store_without_the_snapshot_table_moves_cleanly() {
 
 #[test]
 fn a_total_move_carries_receipts_and_leaves_authorization_rows_where_they_are() {
-    let conn = seeded_source();
-    let policy_before = image(&conn, "tool_policy", "policy-live");
-    let grant_before = image(&conn, "tool_grants", "grant-open");
+    let conn = total_seeded_source();
+    for (table, expected) in [
+        ("gtd_lifecycle_audit", 2),
+        ("knowledge_eval_runs", 1),
+        ("retrieval_snapshots", 1),
+        ("exec_runs", 2),
+        ("exec_events", 3),
+        ("git_receipts", 1),
+        ("tool_policy", 3),
+        ("tool_grants", 6),
+    ] {
+        assert_eq!(
+            pack_rows_in_namespace(&conn, table, "source"),
+            expected,
+            "source fixture rows in {table}"
+        );
+    }
+    assert_eq!(
+        snapshot_namespaces(&conn),
+        [
+            "elsewhere",
+            "elsewhere::vamana::model-a",
+            "source",
+            "source::vamana::model-a",
+        ]
+    );
+    let authorization_before: Vec<_> = [
+        ("tool_policy", "policy-live"),
+        ("tool_policy", "policy-live-2"),
+        ("tool_policy", "policy-gone"),
+        ("tool_grants", "grant-open"),
+        ("tool_grants", "grant-future"),
+        ("tool_grants", "grant-past"),
+        ("tool_grants", "grant-edge"),
+        ("tool_grants", "grant-undecided"),
+        ("tool_grants", "grant-revoked"),
+    ]
+    .into_iter()
+    .map(|(table, id)| (table, id, image(&conn, table, id)))
+    .collect();
 
     let request = total_request();
     let counts = move_namespace(&conn, &request).expect("a total single-target move");
 
-    assert_eq!(counts.rows.get("exec_runs"), Some(&2));
-    assert_eq!(counts.rows.get("exec_events"), Some(&3));
-    assert_eq!(counts.rows.get("git_receipts"), Some(&1));
+    for (table, moved) in [
+        ("gtd_lifecycle_audit", 2_u64),
+        ("knowledge_eval_runs", 1),
+        ("exec_runs", 2),
+        ("exec_events", 3),
+        ("git_receipts", 1),
+    ] {
+        assert_eq!(counts.rows.get(table), Some(&moved), "{table}");
+        assert_eq!(pack_rows_in_namespace(&conn, table, "source"), 0, "{table}");
+        assert_eq!(
+            pack_rows_in_namespace(&conn, table, "target"),
+            moved as i64,
+            "{table}"
+        );
+        assert!(!counts.left_behind.contains_key(table), "{table}");
+    }
+    assert_eq!(audit_namespace(&conn, "n1", 1).as_deref(), Some("target"));
+    assert_eq!(audit_namespace(&conn, "n2", 2).as_deref(), Some("target"));
+    assert_eq!(
+        audit_namespace(&conn, "n-other", 3).as_deref(),
+        Some("elsewhere")
+    );
+    assert_eq!(eval_namespace(&conn, "eval-1"), "target");
+    assert_eq!(eval_namespace(&conn, "eval-other"), "elsewhere");
     assert_eq!(ns(&conn, "exec_runs", "run-1"), "target");
     assert_eq!(ns(&conn, "exec_runs", "run-2"), "target");
     assert_eq!(ns(&conn, "exec_runs", "run-other"), "elsewhere");
@@ -609,17 +701,26 @@ fn a_total_move_carries_receipts_and_leaves_authorization_rows_where_they_are() 
     assert_eq!(ns(&conn, "git_receipts", "receipt-other"), "elsewhere");
     assert_eq!(events_matching_their_run(&conn, "target"), 3);
     assert_eq!(events_matching_their_run(&conn, "source"), 0);
+    assert_eq!(events_matching_their_run(&conn, "elsewhere"), 1);
+    assert_eq!(
+        snapshot_namespaces(&conn),
+        ["elsewhere", "elsewhere::vamana::model-a"]
+    );
 
     assert!(!counts.rows.contains_key("tool_policy"));
     assert!(!counts.rows.contains_key("tool_grants"));
+    assert_eq!(counts.left_behind.len(), 2);
     assert_eq!(counts.left_behind.get("tool_policy"), Some(&3));
-    assert_eq!(counts.left_behind.get("tool_grants"), Some(&4));
+    assert_eq!(counts.left_behind.get("tool_grants"), Some(&6));
     assert_eq!(counts.live_policies_left_behind, 2);
     assert_eq!(counts.grants_in_force_left_behind, 2);
-    assert_eq!(ns(&conn, "tool_policy", "policy-live"), "source");
-    assert_eq!(ns(&conn, "tool_grants", "grant-open"), "source");
-    assert_eq!(image(&conn, "tool_policy", "policy-live"), policy_before);
-    assert_eq!(image(&conn, "tool_grants", "grant-open"), grant_before);
+    for table in ["tool_policy", "tool_grants"] {
+        assert_eq!(pack_rows_in_namespace(&conn, table, "target"), 0, "{table}");
+    }
+    for (table, id, before) in authorization_before {
+        assert_eq!(ns(&conn, table, id), "source", "{table}:{id}");
+        assert_eq!(image(&conn, table, id), before, "{table}:{id}");
+    }
 }
 
 #[test]
