@@ -15,6 +15,6 @@ pub use invert::{CurrentState, InvertError};
 pub use op::{
     CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage, EntityCreateFields,
     EntityPatch, EntityPreimage, LinkOp, MergeOp, MergePreimage, NoteCreateFields, NotePatch,
-    NotePreimage, Op, UpdateOp, UpdatePatch, UpdatePreimage,
+    NotePreimage, Op, RestoreOp, UpdateOp, UpdatePatch, UpdatePreimage,
 };
 pub use preimage::{check_delete, check_update, CanonicalRecordRef, PreimageMismatch};

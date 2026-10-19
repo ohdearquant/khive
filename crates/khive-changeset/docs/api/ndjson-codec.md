@@ -11,7 +11,7 @@ A change-set contains one `Envelope` and an ordered `Vec<Op>`. Order is semantic
 Line 1 is the envelope. Each following line is one internally tagged operation in stage order:
 
 ```text
-{"schema_version":1,"producer":"agent:x",...}
+{"schema_version":2,"producer":"agent:x",...}
 {"op":"create",...}
 {"op":"link",...}
 ```
@@ -20,7 +20,7 @@ Line 1 is the envelope. Each following line is one internally tagged operation i
 
 ## `to_ndjson`
 
-Encoding serializes the envelope first and then visits `ops` in slice order. Any serde failure becomes `ChangeSetError::Serialize`. No partial output escapes on error because the function returns only after completing the string.
+Encoding first refuses an envelope version other than `CURRENT_SCHEMA_VERSION`, then serializes the envelope first and then visits `ops` in slice order. Any serde failure becomes `ChangeSetError::Serialize`. No partial output escapes on error because the function returns only after completing the string.
 
 ## `from_ndjson`
 

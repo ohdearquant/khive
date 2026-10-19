@@ -18,7 +18,7 @@ fn kkernel_bin() -> &'static str {
 
 fn envelope(family: &str) -> String {
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
         "producer": "lambda:atlas",
         "producer_model_family": family,
         "staged_at": 2_000_000_u64,
@@ -164,8 +164,10 @@ fn json_report_is_ordered_versioned_and_read_only() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = parse_stdout(&output);
-    let golden: serde_json::Value =
+    let mut golden: serde_json::Value =
         serde_json::from_str(CHANGESET_REVIEW_GOLDEN).expect("parse shared review golden");
+    golden["change_set"]["envelope"]["schema_version"] =
+        serde_json::json!(khive_changeset::CURRENT_SCHEMA_VERSION);
 
     assert_eq!(
         report, golden,
@@ -248,7 +250,7 @@ fn strict_changeset_parse_rejects_unknown_fields() {
         format!(
             "{}\n",
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
                 "producer": "lambda:atlas",
                 "producer_model_family": "family:atlas",
                 "staged_at": 2_000_000_u64,
@@ -326,3 +328,6 @@ fn uncovered_update_rules_fail_closed_in_partial_view() {
 
 #[path = "kg_review/configurable_tiers.rs"]
 mod configurable_tiers;
+
+#[path = "kg_review/restore_controls.rs"]
+mod restore_controls;

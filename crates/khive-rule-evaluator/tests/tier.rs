@@ -129,3 +129,5 @@ include!("tier_tests/policy_default_tests.rs");
 include!("tier_tests/operation_floor_tests.rs");
 
 include!("tier_tests/findings_and_errors_tests.rs");
+
+include!("tier_tests/restore_tests.rs");

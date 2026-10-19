@@ -145,7 +145,7 @@ impl Record {
 
 /// Prepare a bounded canonical changeset without admitting any writer work.
 ///
-/// Schema, count, and unsupported merge checks run before asynchronous preparation.
+/// Schema, count, and unsupported operation checks run before asynchronous preparation.
 /// Every constituent is authorized with the applying caller. The returned opaque
 /// plans must run together through [`crate::run_atomic_unit`].
 pub async fn prepare_canonical_changeset(
@@ -365,7 +365,7 @@ pub async fn prepare_canonical_changeset(
                         None => Mutation::Unresolved(op.clone()),
                     }
                 }
-                Op::Merge(_) => unreachable!("validated before prepare"),
+                Op::Merge(_) | Op::Restore(_) => unreachable!("validated before prepare"),
             };
             Ok(AtomicOpPlan::Canonical(Box::new(CanonicalMutationPlan {
                 token: op_token,
@@ -407,18 +407,24 @@ fn validate(changeset: &ChangeSet) -> RuntimeResult<()> {
             "canonical changeset exceeds {max} operations"
         )));
     }
-    if let Some((op_index, _)) = changeset
-        .ops
-        .iter()
-        .enumerate()
-        .find(|(_, op)| matches!(op, Op::Merge(_)))
-    {
-        return Err(RuntimeError::CanonicalAdmission {
-            op_index,
-            source: Box::new(RuntimeError::InvalidInput(
-                "KnownUnimplemented: canonical merge".into(),
-            )),
-        });
+    for (op_index, op) in changeset.ops.iter().enumerate() {
+        match op {
+            Op::Restore(_) => {
+                return Err(RuntimeError::CanonicalUnsupportedOperation {
+                    op_index,
+                    operation: "restore",
+                });
+            }
+            Op::Merge(_) => {
+                return Err(RuntimeError::CanonicalAdmission {
+                    op_index,
+                    source: Box::new(RuntimeError::InvalidInput(
+                        "KnownUnimplemented: canonical merge".into(),
+                    )),
+                });
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -502,6 +508,7 @@ fn gate_args(op: &Op) -> RuntimeResult<(&'static str, Uuid, Value)> {
             uuid(x.target_id),
             json!({"id":x.target_id,"hard":x.hard}),
         ),
+        Op::Restore(_) => unreachable!("validated before gate arguments"),
         Op::Merge(_) => {
             return Err(RuntimeError::InvalidInput(
                 "KnownUnimplemented: canonical merge".into(),
