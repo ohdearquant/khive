@@ -107,11 +107,23 @@ checkout as proof that a later write was admitted. Symbols are under
   after BEGIN. Roll back on refusal; replace a poisoned pooled connection.
 - **Standalone transaction:** own the connection and lease, then sample after
   BEGIN. Close or restore autocommit before releasing the lease.
+- **Public standalone calls:** `standalone_autocommit` owns one callback or
+  complete script; `standalone_transaction` also owns BEGIN IMMEDIATE and
+  COMMIT/ROLLBACK. Neither returns a connection. An unfinished script is rolled
+  back and refused, and unwinding closes the owned connection under its lease.
+- **Standalone factories:** one private native opener supplies complete owners
+  for typed write units, the lifetime writer task and cached SQL bridge handles.
+  Diagnostics return collected data; checkpoints return only fixed checkpoint
+  operations. No factory returns a raw pool-opened writer to another module.
 - **Autocommit writes:** admit backend constructor DDL and entity, note,
   attachment, and sparse helpers before the first SQLite write. Retain the guard
   through the script and retire an unfinished transaction.
 - **FTS rowid-map backfill:** retain the constructor lease and sample after
   BEGIN. Refusal rolls back without filling the map or stamping completion.
+- **FTS merge maintenance:** use a separate ordinary write owner, retain its
+  lease and sample immediately before the bounded merge INSERT. The dedicated
+  checkpoint connection is never used for this DML. Maintenance keeps its zero
+  SQLite busy wait; acquiring the cooperative lease uses the guard deadline.
 - **Graph mutation plus events:** retain a standalone lease or pooled guard
   through the closure. The transaction helper samples after BEGIN.
 - **Schema bootstrap:** sample immediately before each ledger-table DDL and
@@ -142,12 +154,10 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 
 - **#3594:** Public raw pooled writers can issue SQL outside the typed
   transaction boundary; checkout-time sampling is insufficient.
-- **#3595:** `open_standalone_writer` returns a raw connection whose later
-  writes are not an owned logical unit.
-- **#3596:** Internal raw standalone connection escapes need call-site
-  conversion and inventory.
-- **#3597:** Cached `SqlWriter` handles and manual atomic SQL need per-write
-  leases and SQLite-aware classification.
+- **#3597:** Cached `SqlWriter` handles still need their remaining per-write
+  classification work. File-backed manual atomic SQL now runs in one blocking
+  owner with its permit, lease, connection and transaction evidence retained
+  through settlement, including when the async observer is aborted.
 - **#3551:** The code-map WAL-to-DELETE transition, including checkpoint and
   sidecar work before pool construction, remains outside this slice. A later
   ADR-154 slice must decide its admission classification.
@@ -156,6 +166,12 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 #3551 open; the foundation does not claim a universal guard over all SQL a caller
 can execute. Backend/pool-owned
 migration entry points carry the captured policy.
+
+The raw standalone opener from #3595 and the internal raw factory escapes from
+#3596 have been replaced by the boundaries above. Native lock, corruption and
+settlement fault fixtures open their own external SQLite connections explicitly;
+they are not production escape hatches or substitutes for admission and identity
+tests.
 
 Caller-owned raw connections can use `MigrationWritePolicy::new(effective_policy,
 absolute_lock_dir)` and `run_migrations_with_policy`, `apply_schema_plan_with_policy`,

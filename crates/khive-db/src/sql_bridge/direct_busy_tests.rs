@@ -223,7 +223,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poisoned_batch_wrapper_preserves_real_busy_cause_and_counts_once() {
     let fixture = Fixture::new(true, false);
-    let conn = fixture.pool.open_standalone_writer().unwrap();
+    let conn = crate::pool::open_external_writer_fixture(&fixture.pool).unwrap();
     let holder = fixture.lock(false);
     let raw = conn.execute(INSERT, []).unwrap_err();
     assert_eq!(
@@ -238,7 +238,6 @@ async fn poisoned_batch_wrapper_preserves_real_busy_cause_and_counts_once() {
         origin: fixture.pool.origin(),
         db: crate::timeout_sink::db_label(&fixture.pool),
         pool: Arc::clone(&fixture.pool),
-        held_lease: None,
     };
     let mapped = writer.map_direct_batch_failure(BatchFailure {
         stage: khive_storage::error::SqliteWriteStage::Statement,
@@ -406,7 +405,7 @@ fn poisoned_commit_preserves_native_evidence_and_existing_driver_policy() {
         }
     }
     let fixture = Fixture::new(true, false);
-    let conn = fixture.pool.open_standalone_writer().unwrap();
+    let conn = crate::pool::open_external_writer_fixture(&fixture.pool).unwrap();
     conn.authorizer(Some(deny_settlement)).unwrap();
     let (disposition, result) = execute_standalone_batch(
         &conn,
@@ -432,7 +431,6 @@ fn poisoned_commit_preserves_native_evidence_and_existing_driver_policy() {
         origin: fixture.pool.origin(),
         db: crate::timeout_sink::db_label(&fixture.pool),
         pool: Arc::clone(&fixture.pool),
-        held_lease: None,
     };
     let error = writer.map_direct_batch_failure(failure);
     let evidence = error.sqlite_write_failure().unwrap();

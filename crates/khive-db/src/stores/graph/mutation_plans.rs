@@ -12,6 +12,7 @@ use khive_types::EdgeRelation;
 use uuid::Uuid;
 
 use crate::sql_bridge::bind_params;
+use crate::stores::event;
 
 use super::edge_statements::edge_soft_delete_statement;
 use super::edge_upserts::{
@@ -21,7 +22,9 @@ use super::edge_upserts::{
 use super::guarded_insert::{check_statement_guards, insert_edge_if_absent};
 #[cfg(test)]
 use super::statement_guard_tests;
-use super::write_transaction::run_graph_mutation_transaction;
+use super::write_transaction::{
+    run_graph_mutation_transaction, run_standalone_graph_mutation_transaction,
+};
 use super::{map_err, map_sqlite_err};
 
 // ---------------------------------------------------------------------------
@@ -371,14 +374,7 @@ where
     let is_file_backed = backend.is_file_backed();
     tokio::task::spawn_blocking(move || {
         if is_file_backed {
-            let admission = pool.write_admission();
-            let _lease = admission
-                .acquire()
-                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
-            let conn = pool
-                .open_standalone_writer_for_admitted_operation()
-                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
-            run_graph_mutation_transaction(&pool, &conn, false, move |conn| {
+            run_standalone_graph_mutation_transaction(&pool, move |conn| {
                 graph_mutation_events_enlisted(
                     conn,
                     mutation,
@@ -608,7 +604,7 @@ where
         ));
     }
     for event in &events {
-        crate::stores::event::append_event_in_transaction(conn, event).map_err(|error| {
+        event::append_event_in_transaction(conn, event).map_err(|error| {
             StorageError::driver(StorageCapability::Events, GRAPH_MUTATION_EVENTS_OP, error)
         })?;
     }

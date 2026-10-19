@@ -1,8 +1,6 @@
 use super::off_worker::run_checkpoint_core_off_worker;
 use super::tests::{checkpoint_conn, file_pool, wait_for};
-use super::{
-    checkpoint_once_core, run_checkpoint_task, truncate_attempts, CheckpointConfig, TruncateState,
-};
+use super::{run_checkpoint_task, truncate_attempts, CheckpointConfig, TruncateState};
 use crate::pool::ConnectionPool;
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +36,8 @@ async fn checkpoint_core_off_worker_matches_the_direct_call() {
     let (_direct_dir, direct_pool) = seeded_pool();
     let direct_conn = checkpoint_conn(&direct_pool);
     let mut direct_state = TruncateState::default();
-    let direct = checkpoint_once_core(&direct_pool, &direct_conn, &config, &mut direct_state)
+    let direct = direct_conn
+        .run_core(&direct_pool, &config, &mut direct_state)
         .expect("direct checkpoint core");
 
     let (_wrapped_dir, wrapped_pool) = seeded_pool();
@@ -408,16 +407,16 @@ async fn checkpoint_once_bypasses_an_active_floor_on_its_real_dedicated_connecti
         .ensure_open(&pool)
         .expect("dedicated recovery open bypasses admission");
     let mut state = TruncateState::default();
-    let pages = super::checkpoint_once(
-        &pool,
-        conn,
-        &CheckpointConfig {
-            truncate_high_water_pages: 0,
-            ..CheckpointConfig::default()
-        },
-        &mut state,
-    )
-    .unwrap();
+    let pages = conn
+        .run(
+            &pool,
+            &CheckpointConfig {
+                truncate_high_water_pages: 0,
+                ..CheckpointConfig::default()
+            },
+            &mut state,
+        )
+        .unwrap();
     assert!(pages > 0, "the PASSIVE pass must observe the seeded WAL");
     assert!(
         state.last_attempt.is_some(),

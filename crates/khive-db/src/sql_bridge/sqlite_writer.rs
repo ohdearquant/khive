@@ -55,10 +55,6 @@ pub(super) struct SqliteWriter {
     /// Reader-pool owner and explicit-transaction exception source.
     pub(super) pool: Arc<ConnectionPool>,
     pub(super) event_rows: Option<Arc<AtomicEventRows>>,
-    /// The volume lease an enclosing manual atomic unit holds for its whole
-    /// transaction, so the unit's own statements do not request it again.
-    /// Declared last: the connection closes before the lease is released.
-    pub(super) held_lease: Option<crate::disk_guard::DetachedVolumeLease>,
 }
 
 pub(super) fn execute_top_level_maintenance(
@@ -375,13 +371,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
-        // ADR-067 Component A (Fork C slice 2): a single statement is
-        // self-contained, just like `execute_batch`'s full statement list —
-        // on the writer task, transaction-control rejection remains an
-        // `execute_batch` contract; the standalone branch below refuses it
-        // unless a unit holds the volume lease, because this primitive is also
-        // used by internal atomic transaction owners.
-        // route it through the writer task when available. `self.handle` is
+        // A single statement is self-contained, just like execute_batch.
+        // Manual atomic units use their own synchronous InlineWriter; this
+        // cached handle never borrows a transaction-wide volume lease.
+        // Route through the writer task when available. `self.handle` is
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
@@ -409,24 +402,18 @@ impl khive_storage::SqlWriter for SqliteWriter {
         }
 
         self.require_standalone_handle("execute")?;
-        let unit_holds_lease = self.held_lease.is_some();
-        // ADR-154: a standalone statement holds the volume lease only for the
-        // call, so a transaction it opened would continue after the lease was
-        // released. Only a unit that already holds the lease for its whole
-        // span (`atomic_unit`'s manual transaction) may send transaction
-        // control through `execute`.
-        if !unit_holds_lease {
-            if let Some(keyword) = transaction_control_head(&statement.sql) {
-                return Err(StorageError::InvalidInput {
-                    capability: StorageCapability::Sql,
-                    operation: "execute".into(),
-                    message: format!(
-                        "statement is transaction control ({keyword}); a standalone \
-                         statement holds the volume lease only for the call — use \
-                         atomic_unit to run statements as one transaction"
-                    ),
-                });
-            }
+        // A cached standalone statement owns the lease for this call only.
+        // Cross-statement transactions belong to atomic_unit's owner.
+        if let Some(keyword) = transaction_control_head(&statement.sql) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "execute".into(),
+                message: format!(
+                    "statement is transaction control ({keyword}); a standalone \
+                     statement holds the volume lease only for the call — use \
+                     atomic_unit to run statements as one transaction"
+                ),
+            });
         }
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
@@ -440,7 +427,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         let event_rows = self.event_rows.clone();
         let pool = Arc::clone(&self.pool);
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            run_standalone_statement(handle, pool, unit_holds_lease, statement, event_rows)
+            run_standalone_statement(handle, pool, statement, event_rows)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute", e))?;
@@ -496,16 +483,8 @@ impl khive_storage::SqlWriter for SqliteWriter {
         let origin = self.origin.clone();
         let event_rows = self.event_rows.clone();
         let pool = Arc::clone(&self.pool);
-        let unit_holds_lease = self.held_lease.is_some();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            run_standalone_batch(
-                handle,
-                pool,
-                unit_holds_lease,
-                statements,
-                origin,
-                event_rows,
-            )
+            run_standalone_batch(handle, pool, statements, origin, event_rows)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
@@ -547,12 +526,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
             message: "connection already consumed".into(),
         })?;
         let pool = Arc::clone(&self.pool);
-        let unit_holds_lease = self.held_lease.is_some();
-        let (handle, result) = tokio::task::spawn_blocking(move || {
-            run_standalone_script(handle, pool, unit_holds_lease, script)
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
+        let (handle, result) =
+            tokio::task::spawn_blocking(move || run_standalone_script(handle, pool, script))
+                .await
+                .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
         self.handle = handle;
         result.map_err(|failure| match failure {
             StandaloneWriteError::Refused(error) => error,
@@ -598,9 +575,8 @@ impl khive_storage::SqlWriter for SqliteWriter {
             message: "connection already consumed".into(),
         })?;
         let pool = Arc::clone(&self.pool);
-        let unit_holds_lease = self.held_lease.is_some();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            run_standalone_top_level(handle, pool, unit_holds_lease, maintenance)
+            run_standalone_top_level(handle, pool, maintenance)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;

@@ -1175,9 +1175,9 @@ async fn writer_task_wal_autocheckpoint_pages(handle: &WriterTaskHandle) -> u32 
 
 /// Test helper: open the same dedicated standalone connection
 /// `run_checkpoint_task` opens in production, for tests that drive
-/// `checkpoint_once` directly.
-pub(super) fn checkpoint_conn(pool: &ConnectionPool) -> rusqlite::Connection {
-    pool.open_standalone_writer()
+/// its fixed checkpoint operations directly.
+pub(super) fn checkpoint_conn(pool: &ConnectionPool) -> crate::pool::CheckpointFile {
+    pool.open_checkpoint_file()
         .expect("open dedicated checkpoint connection")
 }
 
@@ -1388,7 +1388,7 @@ async fn progressing_truncate_releases_full_scan_reservation_to_housekeeping() {
     };
 
     assert!(
-        maybe_truncate(&pool, &conn, &config, u64::MAX, &mut state).is_none(),
+        !conn.truncate_requests_attribution_for_test(&pool, &config, u64::MAX, &mut state),
         "a progressing TRUNCATE must not schedule no-progress attribution"
     );
     assert!(
@@ -1424,7 +1424,8 @@ async fn erroring_truncate_releases_full_scan_reservation_to_housekeeping() {
             .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
             .unwrap();
     }
-    let conn = checkpoint_conn(&pool);
+    let conn =
+        crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.authorizer(Some(
         |context: rusqlite::hooks::AuthContext<'_>| match context.action {
             AuthAction::Pragma { pragma_name, .. }
@@ -1707,9 +1708,8 @@ async fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
         };
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let mut state = TruncateState::default();
-        let result = checkpoint_once_core(
+        let result = dedicated_conn.run_core(
             &checkpoint_pool,
-            &dedicated_conn,
             &CheckpointConfig {
                 truncate_high_water_pages: 0,
                 truncate_min_interval: Duration::ZERO,
@@ -2064,10 +2064,22 @@ async fn fts_maintenance_off_worker_matches_the_direct_call() {
     .expect("direct maintenance step")
     .expect("fragmented fixture has a due step");
 
-    let (_wrapped_dir, wrapped_conn) = fragmented_fixture();
+    let (wrapped_dir, wrapped_conn) = fragmented_fixture();
+    let wrapped_path = std::path::PathBuf::from(wrapped_conn.path().unwrap());
+    drop(wrapped_conn);
+    let wrapped_pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(wrapped_path),
+            volume_lock_dir: Some(wrapped_dir.path().join("volume-locks")),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("admitted FTS maintenance pool"),
+    );
     let wrapped_state = crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
-    let (_conn, _state, wrapped_result) =
-        run_fts_maintenance_off_worker(wrapped_conn, config, wrapped_state, Instant::now())
+    let (_state, wrapped_result) =
+        run_fts_maintenance_off_worker(wrapped_pool, config, wrapped_state, Instant::now())
             .await
             .expect("maintenance step did not panic");
     let wrapped_step = wrapped_result
@@ -2108,9 +2120,8 @@ fn checkpoint_once_succeeds_on_file_backed_pool() {
     }
 
     let conn = checkpoint_conn(&pool);
-    checkpoint_once(
+    conn.run(
         &pool,
-        &conn,
         &CheckpointConfig::default(),
         &mut TruncateState::default(),
     )
@@ -2123,14 +2134,14 @@ fn checkpoint_once_succeeds_on_file_backed_pool() {
 /// `run_checkpoint_task` report the tick `Skipped`, so `checkpoint_once`
 /// is never even called for one.
 #[test]
-fn open_standalone_writer_fails_on_in_memory_pool() {
+fn open_checkpoint_file_fails_on_in_memory_pool() {
     let cfg = PoolConfig {
         path: None,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(cfg).expect("in-memory pool"));
     assert!(
-        pool.open_standalone_writer().is_err(),
+        pool.open_checkpoint_file().is_err(),
         "an in-memory pool must not be able to open a dedicated checkpoint connection"
     );
 }
@@ -2179,7 +2190,7 @@ fn checkpoint_connection_disables_wal_autocheckpoint_on_open_and_reopen() {
     let initial: u32 = checkpoint_conn
         .ensure_open(&pool)
         .expect("dedicated checkpoint connection must open")
-        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+        .wal_autocheckpoint_pages_for_test()
         .expect("read initial autocheckpoint setting");
     assert_eq!(initial, 0);
 
@@ -2187,7 +2198,7 @@ fn checkpoint_connection_disables_wal_autocheckpoint_on_open_and_reopen() {
     let reopened: u32 = checkpoint_conn
         .ensure_open(&pool)
         .expect("dedicated checkpoint connection must reopen")
-        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+        .wal_autocheckpoint_pages_for_test()
         .expect("read reopened autocheckpoint setting");
     assert_eq!(reopened, 0);
 }
@@ -2434,13 +2445,8 @@ fn checkpoint_high_water_does_not_block_behind_reader() {
     let checkpoint_config = CheckpointConfig::default();
     let conn = checkpoint_conn(&pool);
     let start = std::time::Instant::now();
-    checkpoint_once(
-        &pool,
-        &conn,
-        &checkpoint_config,
-        &mut TruncateState::default(),
-    )
-    .expect("checkpoint_once must succeed against a healthy dedicated connection");
+    conn.run(&pool, &checkpoint_config, &mut TruncateState::default())
+        .expect("checkpoint_once must succeed against a healthy dedicated connection");
     let elapsed = start.elapsed();
 
     // Commit and release the read snapshot only after checkpoint_once returns.
@@ -2570,7 +2576,7 @@ fn truncate_attempts_when_high_water_crossed_with_no_prior_attempt() {
     );
 
     let conn = checkpoint_conn(&pool);
-    checkpoint_once(&pool, &conn, &config, &mut state)
+    conn.run(&pool, &config, &mut state)
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
     assert!(
         state.last_attempt.is_some(),
@@ -2603,7 +2609,7 @@ fn truncate_does_not_attempt_below_high_water() {
     let mut state = TruncateState::default();
 
     let conn = checkpoint_conn(&pool);
-    checkpoint_once(&pool, &conn, &config, &mut state)
+    conn.run(&pool, &config, &mut state)
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
 
     assert!(
@@ -2638,7 +2644,7 @@ fn truncate_min_interval_skip_does_not_restamp_last_attempt() {
     let mut state = TruncateState::default();
     let conn = checkpoint_conn(&pool);
 
-    checkpoint_once(&pool, &conn, &config, &mut state)
+    conn.run(&pool, &config, &mut state)
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
     let first_attempt = state.last_attempt.expect("first tick must attempt");
 
@@ -2646,7 +2652,7 @@ fn truncate_min_interval_skip_does_not_restamp_last_attempt() {
     // (mirroring how `run_checkpoint_task` reuses one connection across
     // ticks): still above threshold, but the min-interval has clearly
     // not elapsed — must skip and leave last_attempt exactly as it was.
-    checkpoint_once(&pool, &conn, &config, &mut state)
+    conn.run(&pool, &config, &mut state)
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
     let second_attempt = state.last_attempt.expect("attempt timestamp must persist");
 
@@ -2697,7 +2703,7 @@ fn checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held() {
     };
     let mut state = TruncateState::default();
 
-    checkpoint_once(&pool, &conn, &config, &mut state).expect(
+    conn.run(&pool, &config, &mut state).expect(
         "checkpoint_once must observe normally on its own dedicated connection even \
              while a concurrent caller holds the pool's writer mutex",
     );
@@ -2772,6 +2778,8 @@ fn all_checkpoint_metrics_callers_are_serial_tagged() {
         let touches_shared_metrics = span.iter().any(|l| {
             l.contains("checkpoint_once(")
                 || l.contains("checkpoint_once_core(")
+                || l.contains(".run(")
+                || l.contains(".run_core(")
                 || l.contains("run_checkpoint_task(")
         });
         if !touches_shared_metrics {
@@ -2861,7 +2869,7 @@ fn observed_tick_resets_consecutive_skips_but_not_lifetime_total() {
     // reset the streak.
     let conn = checkpoint_conn(&pool);
     let mut state = TruncateState::default();
-    checkpoint_once(&pool, &conn, &CheckpointConfig::default(), &mut state)
+    conn.run(&pool, &CheckpointConfig::default(), &mut state)
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
 
     assert_eq!(
@@ -3442,7 +3450,8 @@ fn tx_age_sweep_names_long_lived_reader_pinning_wal_past_high_water() {
     }
 
     let conn = checkpoint_conn(&pool);
-    let wal_pages = checkpoint_once(&pool, &conn, &config, &mut TruncateState::default())
+    let wal_pages = conn
+        .run(&pool, &config, &mut TruncateState::default())
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
     assert!(
         wal_pages >= config.high_water_pages,
@@ -3859,9 +3868,8 @@ fn inconsistent_nonbusy_row_is_not_reported_as_sqlite_busy() {
 
     let mut result = None;
     let events = capture(|| {
-        result = Some(checkpoint_once(
+        result = Some(conn.run(
             &pool,
-            &conn,
             &CheckpointConfig::default(),
             &mut TruncateState::default(),
         ));
@@ -4584,7 +4592,7 @@ async fn checkpoint_task_emits_no_age_alert_for_an_empty_registry() {
 /// mutex no longer produces a Skipped tick at all (see
 /// `checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held`),
 /// so this drives Skipped the way it now actually happens in production:
-/// a read-only pool, on which `ConnectionPool::open_standalone_writer`
+/// a read-only pool, on which `ConnectionPool::open_checkpoint_file`
 /// always fails, so `CheckpointConnection::ensure_open` can never open a
 /// dedicated connection and every tick reports `Skipped`. Asserts the age
 /// alert still fires across several such ticks alongside a stale
@@ -4625,7 +4633,7 @@ async fn checkpoint_task_sweeps_stale_entry_even_when_dedicated_connection_is_un
         .expect("read-only pool open"),
     );
     assert!(
-        pool.open_standalone_writer().is_err(),
+        pool.open_checkpoint_file().is_err(),
         "test precondition: a read-only pool must never be able to open a dedicated \
              checkpoint connection"
     );
@@ -5407,36 +5415,30 @@ fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
         writer.conn().execute_batch("COMMIT").unwrap();
     }
 
-    let checkpoint_conn = pool.open_standalone_writer().unwrap();
-    let pragma_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let pragma_calls_from_hook = Arc::clone(&pragma_calls);
+    let checkpoint_conn = pool.open_checkpoint_file().unwrap();
+    let statements = pool.observe_test_statement_starts(256).unwrap();
     checkpoint_conn
-        .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-            if matches!(
-                context.action,
-                AuthAction::Pragma { pragma_name, .. }
-                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint")
-            ) {
-                pragma_calls_from_hook.fetch_add(1, Ordering::SeqCst);
-            }
-            Authorization::Allow
-        }))
+        .run(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
         .unwrap();
-
-    checkpoint_once(
-        &pool,
-        &checkpoint_conn,
-        &CheckpointConfig::default(),
-        &mut TruncateState::default(),
-    )
-    .unwrap();
-    checkpoint_conn
-        .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
-        .unwrap();
+    let pragma_calls = statements
+        .started_statements()
+        .unwrap()
+        .into_iter()
+        .filter(|statement| {
+            statement
+                .sql
+                .to_ascii_lowercase()
+                .contains("wal_checkpoint")
+        })
+        .count();
+    drop(statements);
 
     assert_eq!(
-        pragma_calls.load(Ordering::SeqCst),
-        1,
+        pragma_calls, 1,
         "one routine tick must issue exactly one PASSIVE checkpoint"
     );
     let pinned = routine_wal_observation(&pool).expect("routine sample");
@@ -5465,13 +5467,13 @@ fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
     );
 
     reader.execute_batch("COMMIT").unwrap();
-    checkpoint_once(
-        &pool,
-        &checkpoint_conn,
-        &CheckpointConfig::default(),
-        &mut TruncateState::default(),
-    )
-    .unwrap();
+    checkpoint_conn
+        .run(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
     let drained = routine_wal_observation(&pool).expect("drained routine sample");
     let drained_timing = checkpoint_timing(&pool);
     assert_eq!(drained_timing.ticks, first_timing.ticks + 1);
@@ -5491,7 +5493,8 @@ fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
 fn routine_checkpoint_timing_records_real_call_and_debug_fields() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("timed_tick.db"));
-    let conn = checkpoint_conn(&pool);
+    let conn =
+        crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
@@ -5579,7 +5582,8 @@ fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("busy_checkpoint.db");
     let pool = file_pool(&path);
-    let conn = checkpoint_conn(&pool);
+    let conn =
+        crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.execute_batch(
         "PRAGMA wal_autocheckpoint=0; CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);",
     )
@@ -5673,7 +5677,8 @@ fn routine_checkpoint_timing_counts_sqlite_busy_from_competing_checkpoint() {
 fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("failed_tick.db"));
-    let conn = checkpoint_conn(&pool);
+    let conn =
+        crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
         if matches!(context.action, AuthAction::Pragma { pragma_name, .. }
             if pragma_name.eq_ignore_ascii_case("wal_checkpoint"))
@@ -5710,7 +5715,8 @@ fn routine_checkpoint_timing_counts_errors_and_excludes_post_truncate_probes() {
 fn failed_post_truncate_measurement_preserves_last_sample_and_failure_streak() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("unmeasured_truncate.db"));
-    let conn = checkpoint_conn(&pool);
+    let conn =
+        crate::pool::open_external_writer_fixture(&pool).expect("native checkpoint fault fixture");
     let previous_pages = LAST_WAL_PAGES.swap(73, Ordering::Relaxed);
     let previous_attempts = TRUNCATE_ATTEMPTS.load(Ordering::Relaxed);
     let previous_failures = TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed);

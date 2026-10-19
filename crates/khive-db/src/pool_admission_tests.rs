@@ -506,7 +506,9 @@ fn db_capacity_floor_covers_standalone_and_cancellable_writer_transaction() {
     pool.set_test_write_admission(100, |_| Ok(99));
 
     assert!(matches!(
-        pool.open_standalone_writer(),
+        pool.standalone_transaction::<()>(|_| {
+            panic!("a refused standalone transaction must not execute its body")
+        }),
         Err(SqliteError::CapacityFloor { .. })
     ));
     assert!(matches!(
@@ -514,7 +516,7 @@ fn db_capacity_floor_covers_standalone_and_cancellable_writer_transaction() {
         Err(SqliteError::CapacityFloor { .. })
     ));
     let counters = pool.writer_acquisition_snapshot();
-    assert_eq!(counters.standalone_acquisitions, 0);
+    assert_eq!(counters.standalone_acquisitions, 1);
     assert_eq!(counters.pooled_acquisitions, 0);
 }
 
