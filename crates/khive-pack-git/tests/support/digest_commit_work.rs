@@ -70,26 +70,25 @@ fn lookup_work(rt: &KhiveRuntime, sha: &str) -> (Vec<String>, u64) {
     let work = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&work);
     let writer = rt.backend().pool().try_writer().unwrap();
-    let mut statement = writer.conn().prepare(COMMIT_LOOKUP).unwrap();
     writer
-        .conn()
-        .progress_handler(
-            1,
-            Some(move || {
-                counted.fetch_add(1, Ordering::Relaxed);
-                false
-            }),
-        )
-        .unwrap();
-    let rows = statement
-        .query_map(["local", sha], |row| row.get::<_, String>(0))
+        .autocommit(|conn| {
+            let mut statement = conn.prepare(COMMIT_LOOKUP).unwrap();
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+            let rows = statement
+                .query_map(["local", sha], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>();
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            Ok((rows.unwrap(), work.load(Ordering::Relaxed)))
+        })
         .unwrap()
-        .collect::<Result<Vec<_>, _>>();
-    writer
-        .conn()
-        .progress_handler(0, None::<fn() -> bool>)
-        .unwrap();
-    (rows.unwrap(), work.load(Ordering::Relaxed))
 }
 
 async fn stored_commits(rt: &KhiveRuntime) -> BTreeMap<String, String> {

@@ -359,8 +359,8 @@ impl Drop for CheckpointLifecycleEmitter {
 /// `direct_route_violation` — see the classification table in
 /// `writer_task`'s module doc.
 pub(super) struct CheckpointConnection {
-    pub(super) conn: Option<rusqlite::Connection>,
-    /// Consecutive failed `open_standalone_writer` attempts since the last
+    pub(super) conn: Option<crate::pool::CheckpointFile>,
+    /// Consecutive failed `open_checkpoint_file` attempts since the last
     /// successful open (or since task startup). Drives the WARN-once /
     /// debug-thereafter log rate-limiting in `ensure_open`: a file-backed
     /// pool that transiently loses its dedicated connection would otherwise
@@ -380,7 +380,7 @@ impl CheckpointConnection {
 
     /// Ensure a usable connection is open, lazily (re)opening from `pool`
     /// when the current one is absent. Reuses the crate's existing untracked
-    /// standalone-connection open path (`ConnectionPool::open_standalone_writer_untracked`),
+    /// fixed-operation connection factory (`ConnectionPool::open_checkpoint_file`),
     /// which applies the same pragmas (including `busy_timeout` from the pool
     /// config) as any other standalone connection, without counting this
     /// infrastructure connection as write-operation traffic. Returns `None` if
@@ -393,23 +393,13 @@ impl CheckpointConnection {
     /// ends a streak logs one `info!` recovery line. Without this, a
     /// permanently-unopenable pool (read-only or in-memory, selected by
     /// `checkpoint_pool_for`) would WARN on every tick forever.
-    pub(super) fn ensure_open(&mut self, pool: &ConnectionPool) -> Option<&rusqlite::Connection> {
+    pub(super) fn ensure_open(
+        &mut self,
+        pool: &ConnectionPool,
+    ) -> Option<&crate::pool::CheckpointFile> {
         if self.conn.is_none() {
-            match pool.open_standalone_writer_untracked() {
+            match pool.open_checkpoint_file() {
                 Ok(conn) => {
-                    // This is the dedicated owner's own connection: disable
-                    // autocheckpoint on it unconditionally, independent of
-                    // whether the pool-level ownership claim has landed yet
-                    // (the standalone open applies the claim-dependent
-                    // value; this connection must never run an implicit
-                    // checkpoint inside its own PASSIVE/TRUNCATE work).
-                    if let Err(e) = conn.pragma_update(None, "wal_autocheckpoint", 0) {
-                        tracing::warn!(target: "khive_db::checkpoint",
-                            error = %e,
-                            "could not disable autocheckpoint on the dedicated checkpoint \
-                             connection"
-                        );
-                    }
                     if self.consecutive_open_failures > 0 {
                         tracing::info!(target: "khive_db::checkpoint",
                             prior_consecutive_failures = self.consecutive_open_failures,

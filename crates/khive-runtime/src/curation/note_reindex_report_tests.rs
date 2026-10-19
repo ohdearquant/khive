@@ -121,14 +121,14 @@ async fn assert_report(fault: Fault, stage: ReindexModelStage) {
     if matches!(fault, Fault::Store | Fault::Publication) {
         let observed = sql_attempts.clone();
         let writer = runtime.backend().pool().writer().unwrap();
-        writer.conn().authorizer(Some(move |context: AuthContext<'_>| {
+        writer.autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
             let deny = match fault {
                 Fault::Store => matches!(context.action, AuthAction::CreateVtable { table_name, .. } if table_name == "vec_broken"),
                 Fault::Publication => matches!(context.action, AuthAction::Insert { table_name } if table_name == "vec_broken"),
                 _ => false,
             };
             if deny { observed.fetch_add(1, Ordering::SeqCst); Authorization::Deny } else { Authorization::Allow }
-        })).unwrap();
+        }))?)).unwrap();
     }
     let report = runtime
         .reindex_note_report_with_plan(&token, &note, &plan)
@@ -137,8 +137,7 @@ async fn assert_report(fault: Fault, stage: ReindexModelStage) {
     if matches!(fault, Fault::Store | Fault::Publication) {
         let writer = runtime.backend().pool().writer().unwrap();
         writer
-            .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
             .unwrap();
         assert!(
             sql_attempts.load(Ordering::SeqCst) > 0,
@@ -768,14 +767,14 @@ async fn public_note_update_reports_real_vector_publication_refusal_after_commit
     {
         let observed = denied.clone();
         let writer = runtime.backend().pool().writer().unwrap();
-        writer.conn().authorizer(Some(move |context: AuthContext<'_>| {
+        writer.autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Insert { table_name } if table_name == "vec_broken") {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
             } else {
                 Authorization::Allow
             }
-        })).unwrap();
+        }))?)).unwrap();
     }
     let content = "committed canonical update despite refused vector publication";
     let result = runtime
@@ -795,8 +794,7 @@ async fn public_note_update_reports_real_vector_publication_refusal_after_commit
     {
         let writer = runtime.backend().pool().writer().unwrap();
         writer
-            .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
             .unwrap();
     }
     assert!(

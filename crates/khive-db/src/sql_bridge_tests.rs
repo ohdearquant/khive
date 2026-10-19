@@ -1183,6 +1183,7 @@ fn inline_execute_batch_prepares_each_statement_once() {
     let mut writer = InlineWriter {
         event_rows: None,
         conn: &conn as *const rusqlite::Connection,
+        standalone_db: None,
     };
     let affected = block_on_sync(khive_storage::SqlWriter::execute_batch(
         &mut writer,
@@ -1211,6 +1212,7 @@ fn inline_execute_batch_preserves_schema_dependencies_between_statements() {
     let mut writer = InlineWriter {
         event_rows: None,
         conn: &conn as *const rusqlite::Connection,
+        standalone_db: None,
     };
 
     let affected = block_on_sync(khive_storage::SqlWriter::execute_batch(
@@ -2380,7 +2382,7 @@ async fn cancelled_cached_reader_rolls_back_releases_wal_and_clears_handler() {
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     let bridge = SqlBridge::new(Arc::clone(&pool), true);
-    let writer = open_standalone_writer(&pool).unwrap();
+    let writer = open_external_writer_fixture(&pool).unwrap();
     writer
         .execute_batch(
             "CREATE TABLE snapshot_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
@@ -2525,7 +2527,7 @@ async fn abandoned_read_past_grace_recovers_admission_after_bounded_join() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    let writer = open_standalone_writer(&pool).unwrap();
+    let writer = open_external_writer_fixture(&pool).unwrap();
     writer
         .execute_batch(
             "CREATE TABLE grace_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
@@ -2951,102 +2953,6 @@ async fn request_cancellation_preserves_file_backed_manual_atomic_read_and_commi
     assert_eq!(rows, 2, "both writes around the SELECT must commit");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_standalone_writer_transaction_retains_active_reader_admission() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = Arc::new(
-        ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("sql_bridge_writer_tx_admission.db")),
-            write_queue_enabled: Some(false),
-            max_readers: 1,
-            checkout_timeout: std::time::Duration::from_millis(250),
-            // The unit lease is held across the gated read below, so it
-            // takes a lock namespace of its own instead of the one the
-            // other tests in this binary share.
-            volume_lock_dir: Some(dir.path().join("volume-locks")),
-            ..PoolConfig::default()
-        })
-        .unwrap(),
-    );
-    let writer_slot = pool
-        .sql_bridge_writer_slots()
-        .acquire_owned()
-        .await
-        .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
-    let (entered, release, _completed) = blocking_non_interrupting_progress_gate(&conn);
-    // A manual transaction holds its unit lease for the whole span, as
-    // `atomic_unit`'s manual branch does; without it `execute` refuses BEGIN.
-    let unit_lease = acquire_unit_lease(Arc::clone(&pool)).await.unwrap();
-    let mut writer = SqliteWriter {
-        observe_direct_errors: true,
-        event_rows: None,
-        handle: Some(StandaloneHandle {
-            conn,
-            _retained_slot: Some(writer_slot),
-            read_transaction_slot: None,
-        }),
-        writer_task: None,
-        origin: pool.origin(),
-        db: crate::timeout_sink::db_label(&pool),
-        pool: Arc::clone(&pool),
-        held_lease: unit_lease,
-    };
-    khive_storage::SqlWriter::execute(
-        &mut writer,
-        SqlStatement {
-            sql: "BEGIN IMMEDIATE".into(),
-            params: vec![],
-            label: None,
-        },
-    )
-    .await
-    .unwrap();
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    cancel_tx.send(true).unwrap();
-
-    let query = tokio::spawn(crate::scope_request_read_cancellation(
-        cancel_rx,
-        async move {
-            let result =
-                khive_storage::SqlReader::query_all(&mut writer, progress_gate_statement()).await;
-            let rollback = khive_storage::SqlWriter::execute(
-                &mut writer,
-                SqlStatement {
-                    sql: "ROLLBACK".into(),
-                    params: vec![],
-                    label: None,
-                },
-            )
-            .await;
-            (result, rollback)
-        },
-    ));
-    tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
-        .await
-        .expect("cancelled writer-transaction SELECT never reached SQLite");
-    assert_eq!(
-        pool.sql_bridge_reader_slots().available_permits(),
-        0,
-        "a writer-supertrait SELECT must retain ordinary active-reader admission"
-    );
-
-    tokio::task::spawn_blocking(move || release.wait())
-        .await
-        .unwrap();
-    let (rows, rollback) = tokio::time::timeout(std::time::Duration::from_secs(2), query)
-        .await
-        .expect("writer-transaction SELECT did not finish after its gate opened")
-        .unwrap();
-    assert_eq!(
-        rows.expect("request cancellation interrupted the admitted writer transaction")
-            .len(),
-        1
-    );
-    rollback.expect("writer transaction did not return to autocommit");
-    assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
-}
-
 #[tokio::test]
 async fn expired_deadline_preserves_pool_backed_manual_atomic_read_and_commit() {
     let pool = Arc::new(ConnectionPool::new(PoolConfig::default()).unwrap());
@@ -3185,7 +3091,7 @@ async fn abandoned_writer_read_interrupts_and_releases_writer_handle() {
         .acquire_owned()
         .await
         .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
@@ -3198,7 +3104,6 @@ async fn abandoned_writer_read_interrupts_and_releases_writer_handle() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
     let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let query = tokio::spawn(crate::scope_test_read_progress(
@@ -3253,7 +3158,7 @@ async fn request_cancellation_never_interrupts_admitted_execute_batch() {
         .acquire_owned()
         .await
         .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
@@ -3267,7 +3172,6 @@ async fn request_cancellation_never_interrupts_admitted_execute_batch() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let query = tokio::spawn(crate::scope_request_read_cancellation(
@@ -3348,7 +3252,7 @@ async fn request_cancellation_never_interrupts_dml_returning_via_sql_reader() {
         .acquire_owned()
         .await
         .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
@@ -3362,7 +3266,6 @@ async fn request_cancellation_never_interrupts_dml_returning_via_sql_reader() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let query = tokio::spawn(crate::scope_request_read_cancellation(
@@ -3442,7 +3345,7 @@ async fn cancelled_call_invalidates_handle_reuse_fails_loud() {
     )
     .await
     .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
     let writer = Arc::new(tokio::sync::Mutex::new(SqliteWriter {
         observe_direct_errors: true,
@@ -3456,7 +3359,6 @@ async fn cancelled_call_invalidates_handle_reuse_fails_loud() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     }));
     let writer_clone = Arc::clone(&writer);
     let query = tokio::spawn(async move {
@@ -3530,33 +3432,12 @@ async fn execute_batch_rejects_transaction_control_before_executing_anything() {
             .unwrap();
     }
 
-    let handle_slot = acquire_handle_slot(
-        pool.sql_bridge_writer_slots(),
-        pool.config().checkout_timeout,
-        "sql_bridge.writer_handle",
-        SlotTimeoutClass::Admission,
-    )
-    .await
-    .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
-    let mut writer = SqliteWriter {
-        observe_direct_errors: true,
-        event_rows: None,
-        handle: Some(StandaloneHandle {
-            conn,
-            _retained_slot: Some(handle_slot),
-            read_transaction_slot: None,
-        }),
-        writer_task: None,
-        origin: pool.origin(),
-        db: crate::timeout_sink::db_label(&pool),
-        pool: Arc::clone(&pool),
-        held_lease: None,
-    };
+    let bridge = SqlBridge::new(Arc::clone(&pool), true);
+    let mut writer = bridge.writer().await.unwrap();
 
     for tail in ["COMMIT", "BEGIN"] {
         let multi = khive_storage::SqlWriter::execute_batch(
-            &mut writer,
+            &mut *writer,
             vec![SqlStatement {
                 sql: format!("INSERT INTO tx_reject_test (id, val) VALUES (10, 'tail'); {tail}"),
                 params: vec![],
@@ -3578,7 +3459,7 @@ async fn execute_batch_rejects_transaction_control_before_executing_anything() {
     // A valid INSERT first, then a bare COMMIT: the whole batch must be
     // rejected and the INSERT must NOT have run.
     let batch = khive_storage::SqlWriter::execute_batch(
-        &mut writer,
+        &mut *writer,
         vec![
             SqlStatement {
                 sql: "INSERT INTO tx_reject_test (id, val) VALUES (1, 'a')".into(),
@@ -3622,7 +3503,7 @@ async fn execute_batch_rejects_transaction_control_before_executing_anything() {
         "/* block */ rollback to savepoint sp1",
     ] {
         let rejected = khive_storage::SqlWriter::execute_batch(
-            &mut writer,
+            &mut *writer,
             vec![SqlStatement {
                 sql: sql.into(),
                 params: vec![],
@@ -3649,7 +3530,7 @@ async fn execute_batch_rejects_transaction_control_before_executing_anything() {
     assert_eq!(count, 0, "a rejected batch must not have executed anything");
 
     let affected = khive_storage::SqlWriter::execute(
-        &mut writer,
+        &mut *writer,
         SqlStatement {
             sql: "INSERT INTO tx_reject_test (id, val) VALUES (2, 'b')".into(),
             params: vec![],
@@ -4111,7 +3992,7 @@ async fn failed_rollback_poisons_handle_reuse_fails_loud() {
     )
     .await
     .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     conn.authorizer(Some(deny_rollback)).unwrap();
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
@@ -4125,7 +4006,6 @@ async fn failed_rollback_poisons_handle_reuse_fails_loud() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
 
     let batch = khive_storage::SqlWriter::execute_batch(
@@ -4222,7 +4102,7 @@ async fn non_transient_begin_failure_poisons_handle() {
     )
     .await
     .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     // A caller-driven open transaction on the same connection: the
     // batch's own `BEGIN IMMEDIATE` fails non-transiently.
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -4238,7 +4118,6 @@ async fn non_transient_begin_failure_poisons_handle() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
 
     let batch = khive_storage::SqlWriter::execute_batch(
@@ -4326,7 +4205,7 @@ async fn busy_begin_failure_restores_handle_reusable() {
     // Hold SQLite's write lock from a separate connection so the batch's
     // `BEGIN IMMEDIATE` genuinely fails with SQLITE_BUSY after the short
     // busy timeout.
-    let lock_conn = pool.open_standalone_writer().unwrap();
+    let lock_conn = crate::pool::open_external_writer_fixture(&pool).unwrap();
     lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let handle_slot = acquire_handle_slot(
@@ -4337,7 +4216,7 @@ async fn busy_begin_failure_restores_handle_reusable() {
     )
     .await
     .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
+    let conn = open_external_writer_fixture(&pool).unwrap();
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
@@ -4350,7 +4229,6 @@ async fn busy_begin_failure_restores_handle_reusable() {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
 
     let batch = khive_storage::SqlWriter::execute_batch(
@@ -4634,9 +4512,11 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
         {
             let guard = pool.writer().unwrap();
             guard
+                .conn()
                 .execute_batch("CREATE TABLE atomic_terminal_probe (id INTEGER PRIMARY KEY)")
                 .unwrap();
             guard
+                .conn()
                 .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Transaction {
                         operation: TransactionOperation::Rollback,
@@ -4719,6 +4599,7 @@ async fn in_memory_atomic_unit_holds_writer_guard_through_rollback() {
     );
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE atomic_guard_probe (id INTEGER PRIMARY KEY)")
         .unwrap();
     let bridge = SqlBridge::new(Arc::clone(&pool), false);
@@ -4787,6 +4668,7 @@ async fn in_memory_atomic_unit_pending_op_rolls_back_and_releases_guard() {
     );
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE atomic_pending_probe (id INTEGER PRIMARY KEY)")
         .unwrap();
     let bridge = SqlBridge::new(Arc::clone(&pool), false);
@@ -4834,7 +4716,7 @@ async fn in_memory_atomic_unit_pending_op_rolls_back_and_releases_guard() {
         .await
         .unwrap();
     assert!(matches!(sum, Some(SqlValue::Integer(2))), "{sum:?}");
-    assert!(pool.writer().unwrap().is_autocommit());
+    assert!(pool.writer().unwrap().conn().is_autocommit());
 }
 
 /// ADR-067 Component A: before
@@ -5152,7 +5034,6 @@ async fn queue_backed_read_uses_pool_budget_and_remains_reusable_after_saturatio
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(&pool),
         pool: Arc::clone(&pool),
-        held_lease: None,
     };
     let row = post_cancel
         .query_row(SqlStatement {
@@ -5702,8 +5583,8 @@ async fn max_completed_hold_operation_names_the_caller_read_not_a_bridge_constan
 
 /// The standalone writer takes the same page-cache and map settings as the
 /// pooled connections rather than a copy of its own.
-#[test]
-fn standalone_writer_takes_the_configured_page_cache_and_map() {
+#[tokio::test]
+async fn standalone_writer_takes_the_configured_page_cache_and_map() {
     if crate::test_process::run_in_child(|command| {
         command.env("KHIVE_SQLITE_CACHE_KIB", "1024");
         command.env("KHIVE_SQLITE_MMAP_BYTES", "4096");
@@ -5719,12 +5600,16 @@ fn standalone_writer_takes_the_configured_page_cache_and_map() {
         ..PoolConfig::default()
     })
     .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
-    let cache: i64 = conn
-        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+    let bridge = SqlBridge::new(Arc::new(pool), true);
+    let mut writer = bridge.writer().await.unwrap();
+    let cache = writer
+        .query_scalar(SqlStatement::new("PRAGMA cache_size", vec![]))
+        .await
         .unwrap();
-    let mmap: i64 = conn
-        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+    let mmap = writer
+        .query_scalar(SqlStatement::new("PRAGMA mmap_size", vec![]))
+        .await
         .unwrap();
-    assert_eq!((cache, mmap), (-1024, 4096));
+    assert!(matches!(cache, Some(SqlValue::Integer(-1024))));
+    assert!(matches!(mmap, Some(SqlValue::Integer(4096))));
 }

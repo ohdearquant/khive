@@ -3,9 +3,9 @@ use super::{
     execute_prepared_batch, execute_query_interruptibly, execute_query_page_interruptibly,
     execute_query_row_interruptibly, map_write_boundary_err, map_write_err,
     prepare_batch_statements, prepare_cached_sql_statement, reject_transaction_control_statements,
-    settle_pooled_call, transaction_control_head, Arc, CachedReadTransactionControl,
-    ConnectionPool, PageRequest, SharedReaderTransactionGuard, SqlRow, SqlStatement, SqlValue,
-    SqliteError, StorageCapability, StorageError,
+    settle_pooled_call, transaction_control_head, writer_query_requires_admission, Arc,
+    CachedReadTransactionControl, ConnectionPool, PageRequest, SharedReaderTransactionGuard,
+    SqlRow, SqlStatement, SqlValue, SqliteError, StorageCapability, StorageError,
 };
 
 // =============================================================================
@@ -60,6 +60,7 @@ where
 async fn run_pool_writer_query<T, F>(
     pool: Arc<ConnectionPool>,
     operation: &'static str,
+    requires_admission: bool,
     query: F,
 ) -> khive_storage::types::StorageResult<T>
 where
@@ -79,6 +80,16 @@ where
             let guard = pool.try_writer().map_err(|error: SqliteError| {
                 error.into_storage_error(StorageCapability::Sql, operation)
             })?;
+            if requires_admission {
+                let unit = guard
+                    .admit_autocommit()
+                    .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))?;
+                let result = scope.with_pooled_write_unit(&pool, &unit, |conn| {
+                    query(scope, conn, conn.is_autocommit())
+                });
+                return settle_pooled_call(&unit, operation, result)
+                    .inspect_err(|error| pool.record_direct_writer_error(error));
+            }
             scope.with_pooled_writer(&pool, &guard, |conn| {
                 let interruptible = conn.is_autocommit();
                 query(scope, conn, interruptible)
@@ -392,6 +403,7 @@ impl khive_storage::SqlReader for PoolBackedWriter {
         run_pool_writer_query(
             pool,
             "pool_writer.query_row",
+            writer_query_requires_admission(&statement),
             move |scope, conn, interruptible| {
                 execute_query_row_interruptibly(
                     scope,
@@ -414,6 +426,7 @@ impl khive_storage::SqlReader for PoolBackedWriter {
         run_pool_writer_query(
             pool,
             "pool_writer.query_all",
+            writer_query_requires_admission(&statement),
             move |scope, conn, interruptible| {
                 execute_query_interruptibly(
                     scope,
@@ -437,6 +450,7 @@ impl khive_storage::SqlReader for PoolBackedWriter {
         run_pool_writer_query(
             pool,
             "pool_writer.query_page",
+            writer_query_requires_admission(&statement),
             move |scope, conn, interruptible| {
                 execute_query_page_interruptibly(
                     scope,
@@ -498,11 +512,11 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         }
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e: SqliteError| {
+            let guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
             let result = (|| {
-                let mut stmt = prepare_cached_sql_statement(&guard, &statement.sql)
+                let mut stmt = prepare_cached_sql_statement(guard.conn(), &statement.sql)
                     .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
                 bind_params(&mut stmt, &statement.params)
                     .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
@@ -528,30 +542,45 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         reject_transaction_control_statements(&statements, "pool_writer.execute_batch")?;
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e: SqliteError| {
-                StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
-            })?;
+            let mut tx_handle = None;
+            let guard = pool
+                .writer_for_admitted_operation()
+                .map_err(|e: SqliteError| {
+                    StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
+                })?;
             let result = (|| {
-                let prepared = prepare_batch_statements(&guard, &statements)
+                let prepared = prepare_batch_statements(guard.conn(), &statements)
                     .map_err(|e| map_write_err(e, "pool_writer.execute_batch"))?;
-                guard.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+                guard.conn().execute_batch("BEGIN IMMEDIATE").map_err(|e| {
                     map_write_boundary_err(
                         e,
                         "pool_writer.execute_batch",
                         khive_storage::error::SqliteWriteStage::Begin,
                     )
                 })?;
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                if let Err(refused) = pool.write_admission().check() {
+                    guard
+                        .rollback_or_retire("pooled batch capacity admission")
+                        .map_err(|error| {
+                            error.into_storage_error(
+                                StorageCapability::Sql,
+                                "pool_writer.execute_batch",
+                            )
+                        })?;
+                    return Err(refused
+                        .into_storage_error(StorageCapability::Sql, "pool_writer.execute_batch"));
+                }
+                let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
                     Some("pool_writer.execute_batch".to_string()),
                     pool.origin(),
-                );
-                let result = execute_prepared_batch(&guard, prepared, &statements, None)
+                ));
+                let result = execute_prepared_batch(guard.conn(), prepared, &statements, None)
                     .map_err(|e| map_write_err(e, "pool_writer.execute_batch"));
                 match result {
                     Ok(total) => {
-                        if let Err(e) = guard.execute_batch("COMMIT") {
-                            let unsettled =
-                                guard.execute_batch("ROLLBACK").is_err() || !guard.is_autocommit();
+                        if let Err(e) = guard.conn().execute_batch("COMMIT") {
+                            let unsettled = guard.conn().execute_batch("ROLLBACK").is_err()
+                                || !guard.conn().is_autocommit();
                             let error = map_write_boundary_err(
                                 e,
                                 "pool_writer.execute_batch",
@@ -567,8 +596,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                         }
                     }
                     Err(e) => {
-                        let unsettled =
-                            guard.execute_batch("ROLLBACK").is_err() || !guard.is_autocommit();
+                        let unsettled = guard.conn().execute_batch("ROLLBACK").is_err()
+                            || !guard.conn().is_autocommit();
                         Err(if unsettled {
                             crate::error::unknown_write_settlement(e)
                         } else {
@@ -590,10 +619,11 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         // refused before the pooled writer is released.
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e: SqliteError| {
+            let guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_script", e)
             })?;
             let result = guard
+                .conn()
                 .execute_batch(&script)
                 .map_err(|e| map_write_err(e, "pool_writer.execute_script"));
             settle_pooled_call(&guard, "pool_writer.execute_script", result)

@@ -204,12 +204,13 @@ async fn batch_backfill_keeps_successful_peers_and_restores_refused_note_and_ent
             // This private in-memory fixture refuses the rowid-map insertion
             // after the FTS replacement, exercising savepoint restoration.
             writer
-                .conn()
-                .execute_batch(&format!(
-                    "CREATE TRIGGER refuse_backfill BEFORE INSERT ON {table} \
+                .autocommit(|conn| {
+                    Ok(conn.execute_batch(&format!(
+                        "CREATE TRIGGER refuse_backfill BEFORE INSERT ON {table} \
                  WHEN NEW.subject_id = '{}' BEGIN SELECT RAISE(FAIL, 'refused backfill'); END",
-                    docs[1].subject_id
-                ))
+                        docs[1].subject_id
+                    ))?)
+                })
                 .unwrap();
         }
         let failed = if is_note {
@@ -239,8 +240,7 @@ async fn batch_backfill_keeps_successful_peers_and_restores_refused_note_and_ent
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .execute_batch("DROP TRIGGER refuse_backfill")
+            .autocommit(|conn| Ok(conn.execute_batch("DROP TRIGGER refuse_backfill")?))
             .unwrap();
         let failed = if is_note {
             fts_backfill_notes_batch(&rt, &token, &notes).await

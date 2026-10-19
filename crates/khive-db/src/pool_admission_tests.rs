@@ -217,7 +217,7 @@ fn zero_reserve_disables_refusal_but_still_samples_the_volume() {
         .expect("zero reserve writer checkout")
         .transaction(|_| Ok(()))
         .expect("zero reserve does not refuse zero free bytes");
-    assert_eq!(samples.load(Ordering::SeqCst), 2);
+    assert_eq!(samples.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -255,6 +255,7 @@ fn poisoned_pooled_connection_closes_before_its_volume_lease_is_released() {
     .unwrap();
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
         .unwrap();
     let identity = VolumeIdentity::resolve(&path).unwrap();
@@ -274,12 +275,10 @@ fn poisoned_pooled_connection_closes_before_its_volume_lease_is_released() {
         Err(SqliteError::InvalidData("force rollback denial".into()))
     });
     assert!(result.is_err());
-    assert_eq!(closed.load(Ordering::SeqCst), 0);
-    drop(guard);
     assert_eq!(
         closed.load(Ordering::SeqCst),
         1,
-        "SQLite must destroy its closure while the original OS lease is still locked"
+        "the consuming transaction must close under its lease before returning"
     );
     assert!(
         pool.try_writer().is_err(),
@@ -339,12 +338,15 @@ fn native_sqlite_full_survives_guarded_transaction_classification() {
     {
         let writer = pool.writer().unwrap();
         writer
+            .conn()
             .execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
             .unwrap();
         let pages: i64 = writer
+            .conn()
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .unwrap();
         writer
+            .conn()
             .pragma_update(None, "max_page_count", pages + 1)
             .unwrap();
     }
@@ -436,7 +438,13 @@ fn db_capacity_floor_refuses_pooled_transaction_after_begin() {
     let error = writer
         .transaction::<_, ()>(|_| panic!("the refused transaction body must not run"))
         .expect_err("the reserve must refuse after BEGIN");
-    assert!(writer.is_autocommit(), "refusal must finish rollback");
+    assert!(
+        pool.writer
+            .try_lock()
+            .expect("the consuming transaction must return the pooled writer")
+            .is_autocommit(),
+        "refusal must finish rollback"
+    );
     let mapped = error.into_storage_error(StorageCapability::Sql, "test_write");
     assert!(
         matches!(
@@ -506,16 +514,21 @@ fn db_capacity_floor_covers_standalone_and_cancellable_writer_transaction() {
     pool.set_test_write_admission(100, |_| Ok(99));
 
     assert!(matches!(
-        pool.open_standalone_writer(),
+        pool.standalone_transaction::<()>(|_| {
+            panic!("a refused standalone transaction must not execute its body")
+        }),
         Err(SqliteError::CapacityFloor { .. })
     ));
     assert!(matches!(
-        pool.writer_until(|| false),
+        pool.writer_until_for_admitted_operation(|| false)
+            .unwrap()
+            .unwrap()
+            .transaction::<_, ()>(|_| panic!("refused body must not run")),
         Err(SqliteError::CapacityFloor { .. })
     ));
     let counters = pool.writer_acquisition_snapshot();
-    assert_eq!(counters.standalone_acquisitions, 0);
-    assert_eq!(counters.pooled_acquisitions, 0);
+    assert_eq!(counters.standalone_acquisitions, 1);
+    assert_eq!(counters.pooled_acquisitions, 1);
 }
 
 #[test]

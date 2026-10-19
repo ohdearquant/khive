@@ -953,14 +953,15 @@ async fn daemon_disconnect_interrupts_pooled_stats_count() {
     );
     pool.writer()
         .unwrap()
-        .conn()
-        .execute_batch(
-            "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
              WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) \
              INSERT INTO count_fixture SELECT x FROM n; \
              CREATE VIEW events AS SELECT 'local' AS namespace, 'knowledge.learn' AS verb \
              FROM count_fixture a CROSS JOIN count_fixture b CROSS JOIN count_fixture c;",
-        )
+            )?)
+        })
         .unwrap();
     let sql = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
     let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));

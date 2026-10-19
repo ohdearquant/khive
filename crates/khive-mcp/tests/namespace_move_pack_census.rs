@@ -30,7 +30,9 @@ async fn every_built_in_pack_table_has_a_move_disposition_or_an_exclusion() {
     let _server = KhiveMcpServer::new(runtime.clone()).expect("every built-in pack boots");
 
     let writer = runtime.backend().pool().writer().expect("writer");
-    let inventory = census(writer.conn()).expect("census");
+    let inventory = writer
+        .autocommit(|conn| Ok(census(conn).expect("census")))
+        .expect("census scope");
 
     // The census must contain the tables this guard exists for, or an empty
     // result below would mean the boot applied no pack schema at all.

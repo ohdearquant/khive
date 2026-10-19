@@ -67,19 +67,31 @@ use backfill_queries::{
 use backfill_queries::{
     query_backfill_gap, query_checkpoint_observation, test_arm_passive_row, test_take_passive_row,
 };
-use checkpoint_core::{
-    checkpoint_once_core, log_tx_registry_oldest_debug, log_tx_registry_oldest_warn,
-    log_tx_registry_snapshot_warn, log_wal_high_water_warn, CheckpointCoreOutcome,
-};
+pub(crate) use checkpoint_core::{checkpoint_once_core, CheckpointCoreOutcome};
 #[cfg(test)]
 use checkpoint_core::{
     log_truncate_no_progress_warn, maybe_truncate, note_truncate_outcome,
     truncate_needs_attribution, truncate_report_test_sync,
 };
+use checkpoint_core::{
+    log_tx_registry_oldest_debug, log_tx_registry_oldest_warn, log_tx_registry_snapshot_warn,
+    log_wal_high_water_warn,
+};
 
 pub use checkpoint_core::checkpoint_once;
 pub use lifecycle::{run_session_sweep_task, CheckpointLifecycleOwner, SweepBackend};
 pub use task_loop::run_checkpoint_task;
+
+#[cfg(test)]
+pub(crate) fn truncate_requests_attribution_for_test(
+    pool: &crate::pool::ConnectionPool,
+    conn: &rusqlite::Connection,
+    config: &CheckpointConfig,
+    wal_pages_before: u64,
+    state: &mut TruncateState,
+) -> bool {
+    checkpoint_core::maybe_truncate(pool, conn, config, wal_pages_before, state).is_some()
+}
 
 use lifecycle::{CheckpointConnection, CheckpointLifecycleEmitter, CheckpointPressureEpisode};
 #[cfg(test)]

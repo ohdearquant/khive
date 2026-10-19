@@ -29,10 +29,11 @@ use super::register_namespace_trigram;
 use super::{
     claimed_file_identity, close_connection_quietly, configure_reader_connection,
     current_journal_mode, open_reader_connection, read_database_id, reader_connection_is_healthy,
-    register_read_functions, register_writer_clock, reset_reader_connection, ConnectionPool,
-    PoolConfig, PoolIdentityRegistration, PooledReader, ReaderAcquisitionSnapshot, ReaderGuard,
-    RuntimeWriteOperation, SearchMechanismSnapshot, StandaloneReaderPurpose, WriteAdmission,
-    WriterAcquisitionCounters, WriterAcquisitionSnapshot, NEXT_MAIN_POOL_GENERATION,
+    register_read_functions, register_writer_clock, reset_reader_connection, CheckpointFile,
+    ConnectionPool, PoolConfig, PoolIdentityRegistration, PooledReader, ReaderAcquisitionSnapshot,
+    ReaderGuard, RuntimeWriteOperation, SearchMechanismSnapshot, StandaloneCheckpoint,
+    StandaloneReaderPurpose, StandaloneWriteUnit, WriteAdmission, WriterAcquisitionCounters,
+    WriterAcquisitionSnapshot, NEXT_MAIN_POOL_GENERATION,
 };
 #[cfg(test)]
 use super::{run_identity_open_hook, IdentityOpenStage};
@@ -673,44 +674,110 @@ impl ConnectionPool {
             })
     }
 
-    /// Open a standalone read-write connection to the same file-backed database.
-    ///
-    /// Stores whose trait methods take `Send + 'static` closures (executed via
-    /// `spawn_blocking`) cannot hold the pooled `WriterGuard`'s `MutexGuard`
-    /// across the call — it opens an independent connection instead. This
-    /// must still honor `PoolConfig::read_only`: opening
-    /// `SQLITE_OPEN_READ_WRITE` unconditionally here would let a read-only
-    /// backend's graph/event/text stores bypass the flag that the pooled
-    /// writer enforces via `query_only`. A fully configured successful open
-    /// increments the standalone acquisition class exactly once.
-    pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
-        self.write_admission.check()?;
-        self.open_standalone_writer_for_admitted_operation()
-    }
-
-    /// Open for a caller that owns §4 admission at its transaction or
-    /// autocommit execution boundary. Connection open alone cannot authorize
-    /// the later write, especially when a handle is cached across requests.
-    pub(crate) fn open_standalone_writer_for_admitted_operation(
-        &self,
-    ) -> Result<Connection, SqliteError> {
-        let conn = self.open_standalone_writer_untracked()?;
+    /// Construct the complete admitted owner before the connection can leave
+    /// this module. The native opener below is private to these factories.
+    #[track_caller]
+    pub(super) fn standalone_write_unit(&self) -> Result<StandaloneWriteUnit, SqliteError> {
+        if self.config.read_only {
+            return Err(SqliteError::InvalidData(
+                "database is read-only: standalone write transactions are not permitted".into(),
+            ));
+        }
+        let volume_lease = self.write_admission.acquire()?;
+        let conn = self.open_standalone_connection()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
             .fetch_add(1, Ordering::Relaxed);
-        Ok(conn)
+        let unit = StandaloneWriteUnit::new(conn, Arc::clone(&self.write_admission), volume_lease);
+        if !unit.conn().is_autocommit() {
+            return Err(SqliteError::WriterSettlementUnknown);
+        }
+        Ok(unit)
     }
 
-    /// Open an infrastructure-owned standalone writer connection without
-    /// counting it as one write-operation acquisition.
-    ///
-    /// Restricted to the diagnostics PASSIVE probe, the writer task's
-    /// one-time lifetime connection, and the checkpoint task's dedicated
-    /// long-lived connection (opened once at startup and reused across
-    /// ticks — see `CheckpointConnection::ensure_open`). Actual file-backed
-    /// write paths must call [`Self::open_standalone_writer`] so their
-    /// acquisitions are observable.
-    pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
+    /// Retain a dedicated recovery connection without granting ordinary SQL.
+    /// This bypasses logical-write admission so a checkpoint can reclaim space.
+    pub fn open_standalone_checkpoint(&self) -> Result<StandaloneCheckpoint<'_>, SqliteError> {
+        Ok(StandaloneCheckpoint::new(
+            self,
+            self.open_checkpoint_file()?,
+        ))
+    }
+
+    pub(crate) fn open_checkpoint_file(&self) -> Result<CheckpointFile, SqliteError> {
+        self.open_standalone_connection().map(CheckpointFile::new)
+    }
+
+    pub(crate) fn spawn_writer_task(
+        &self,
+        capacity: usize,
+    ) -> Result<WriterTaskHandle, SqliteError> {
+        let conn = self.open_standalone_connection()?;
+        crate::writer_task::spawn_with_connection(self, conn, capacity)
+    }
+
+    pub(crate) fn open_sql_bridge_writer(
+        self: Arc<Self>,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Box<dyn khive_storage::SqlWriter>, StorageError> {
+        let conn = self
+            .open_standalone_connection()
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+        self.writer_acquisition_counters
+            .standalone_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        crate::sql_bridge::build_standalone_writer(self, conn, slot)
+    }
+
+    pub(crate) fn inspect_diagnostic_connection(
+        &self,
+        collect_size_composition: bool,
+    ) -> crate::diagnostics::PoolInspection {
+        crate::diagnostics::inspect_open_connection(
+            self,
+            self.open_standalone_connection(),
+            collect_size_composition,
+        )
+    }
+
+    pub(crate) fn inspect_diagnostic_connection_interruptibly(
+        &self,
+        scope: &crate::read_cancellation::InterruptibleReadScope,
+        collect_size_composition: bool,
+    ) -> Result<crate::diagnostics::PoolInspection, StorageError> {
+        scope.ensure_active()?;
+        crate::diagnostics::inspect_open_connection_interruptibly(
+            self,
+            self.open_standalone_connection(),
+            scope,
+            collect_size_composition,
+        )
+    }
+
+    /// FTS merge INSERTs are logical writes, even when scheduled by the
+    /// checkpoint task. They use an admitted owner, never its recovery file.
+    pub(crate) fn run_fts_maintenance(
+        &self,
+        config: &crate::fts_maintenance::FtsMaintenanceConfig,
+        state: &mut crate::fts_maintenance::FtsMaintenanceState,
+        now: Instant,
+    ) -> Result<Option<crate::fts_maintenance::FtsMaintenanceStep>, String> {
+        if !state.is_due(config, now) {
+            return Ok(None);
+        }
+        let unit = self
+            .standalone_write_unit()
+            .map_err(|error| format!("FTS maintenance admission: {error}"))?;
+        crate::fts_maintenance::run_if_due_with_admission(unit.conn(), config, state, now, || {
+            self.write_admission
+                .check()
+                .map_err(|error| format!("FTS maintenance admission: {error}"))
+        })
+    }
+
+    /// The sole raw standalone opener. Only the complete-consumer factories
+    /// above can call it; no raw connection is returned across that boundary.
+    fn open_standalone_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.identity_path.as_deref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
@@ -745,23 +812,33 @@ impl ConnectionPool {
         #[cfg(any(unix, windows))]
         self.verify_connection_file_identity(&conn, path)?;
         self.verify_opened_database_id(&conn)?;
+        self.configure_standalone_connection(&conn)?;
+        Ok(conn)
+    }
+
+    /// Configure a caller-owned native connection. This does not open or
+    /// return a pool connection, and does not grant write admission.
+    pub(super) fn configure_standalone_connection(
+        &self,
+        conn: &Connection,
+    ) -> Result<(), SqliteError> {
         #[cfg(feature = "namespace-trigram-proto")]
-        register_namespace_trigram(&conn)?;
-        register_writer_clock(&conn)?;
+        register_namespace_trigram(conn)?;
+        register_writer_clock(conn)?;
         // Expression indexes over these keys are maintained by every writer
         // (the write-queue task and per-store standalone writers included), so
         // each of them needs the same functions the pooled writer registers.
-        register_read_functions(&conn)?;
+        register_read_functions(conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         if self.config.code_map_vfs.is_none() {
             self.checkpoint_ownership
-                .configure_wal_autocheckpoint(&conn)?;
+                .configure_wal_autocheckpoint(conn)?;
         }
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         let wal_enabled =
-            self.config.wal_mode && current_journal_mode(&conn)?.eq_ignore_ascii_case("wal");
+            self.config.wal_mode && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
         if wal_enabled {
             conn.pragma_update(
                 None,
@@ -771,8 +848,8 @@ impl ConnectionPool {
         }
 
         #[cfg(any(test, feature = "test-support"))]
-        crate::statement_observer::install(&conn, &self.statement_observer)?;
-        Ok(conn)
+        crate::statement_observer::install(conn, &self.statement_observer)?;
+        Ok(())
     }
 
     #[cfg(any(unix, windows))]

@@ -397,7 +397,24 @@ pub(crate) fn execute_wrapped_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    let profiled = execute_wrapped_transaction_profiled(conn, commit_operation, None, operation);
+    let profiled =
+        execute_wrapped_transaction_profiled(conn, commit_operation, None, false, operation);
+    (profiled.result, profiled.terminal_state)
+}
+
+/// The standalone SQL bridge shares settlement rules while retaining its
+/// native commit error source and timeout/full observation site.
+pub(crate) fn execute_wrapped_sql_bridge_transaction<R, F>(
+    conn: &Connection,
+    commit_operation: &'static str,
+    db: &str,
+    operation: F,
+) -> (Result<R, StorageError>, Option<WriterTaskRequestState>)
+where
+    F: FnOnce(&Connection) -> Result<R, StorageError>,
+{
+    let profiled =
+        execute_wrapped_transaction_profiled(conn, commit_operation, Some(db), true, operation);
     (profiled.result, profiled.terminal_state)
 }
 
@@ -412,6 +429,7 @@ fn execute_wrapped_transaction_profiled<R, F>(
     conn: &Connection,
     commit_operation: &'static str,
     db: Option<&str>,
+    direct_sql_bridge: bool,
     operation: F,
 ) -> ProfiledWrappedTransaction<R>
 where
@@ -450,7 +468,15 @@ where
                 }
                 Err(commit_error) => {
                     if let Some(db) = db {
-                        crate::timeout_sink::maybe_emit_sqlite_full(db, &commit_error);
+                        if direct_sql_bridge {
+                            crate::timeout_sink::maybe_emit_busy(
+                                db,
+                                crate::timeout_sink::Site::StandaloneSqlBridge,
+                                &commit_error,
+                            );
+                        } else {
+                            crate::timeout_sink::maybe_emit_sqlite_full(db, &commit_error);
+                        }
                     }
                     match rollback_after_failure(conn, "commit failure") {
                         RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
@@ -461,9 +487,17 @@ where
                                         &commit_error,
                                         khive_storage::error::SqliteWriteStage::Commit,
                                     );
-                                    let error = StorageError::Pool {
-                                        operation: commit_operation.into(),
-                                        message: commit_error.to_string(),
+                                    let error = if direct_sql_bridge {
+                                        StorageError::driver(
+                                            khive_storage::StorageCapability::Sql,
+                                            commit_operation,
+                                            commit_error,
+                                        )
+                                    } else {
+                                        StorageError::Pool {
+                                            operation: commit_operation.into(),
+                                            message: commit_error.to_string(),
+                                        }
                                     };
                                     match failure {
                                         Some(failure) => error.with_sqlite_write_failure(failure),
@@ -580,6 +614,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             conn,
             "writer_task_commit",
             Some(&telemetry.db),
+            false,
             op,
         );
         if let Err(error) = &profiled.result {
@@ -1147,10 +1182,19 @@ impl WriterTaskHandle {
 /// support). See `crates/khive-db/docs/api/writer-task.md` for the
 /// migration-slice scope this commits per `BEGIN IMMEDIATE`.
 pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
+    pool.spawn_writer_task(capacity)
+}
+
+/// Consume a verified lifetime connection inside its admission-owning task.
+/// Only the pool's private connection factory opens that connection.
+pub(crate) fn spawn_with_connection(
+    pool: &ConnectionPool,
+    conn: Connection,
+    capacity: usize,
+) -> Result<WriterTaskHandle, SqliteError> {
     // The lifetime connection is infrastructure, not one acquisition per
     // write. Each dequeued request is counted below at the task's actual
     // ownership boundary instead.
-    let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
     let write_admission = pool.write_admission();
     let busy_timeout = pool.config().busy_timeout;

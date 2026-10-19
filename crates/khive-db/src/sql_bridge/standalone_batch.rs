@@ -188,14 +188,13 @@ impl std::error::Error for PoisonedBatchError {
 pub(super) fn run_standalone_statement(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     statement: SqlStatement,
     event_rows: Option<Arc<AtomicEventRows>>,
 ) -> (
     StandaloneHandle,
     Result<usize, StandaloneWriteError<rusqlite::Error>>,
 ) {
-    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute", false) {
+    let lease = match admit_standalone_operation(&pool, "execute", false) {
         Ok(lease) => lease,
         Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
     };
@@ -215,7 +214,6 @@ pub(super) fn run_standalone_statement(
 pub(super) fn run_standalone_batch(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     statements: Vec<SqlStatement>,
     origin: khive_storage::tx_registry::TxOrigin,
     event_rows: Option<Arc<AtomicEventRows>>,
@@ -223,7 +221,7 @@ pub(super) fn run_standalone_batch(
     Option<StandaloneHandle>,
     Result<u64, StandaloneWriteError<BatchFailure>>,
 ) {
-    let lease = match acquire_standalone_lease(&pool, unit_holds_lease, "execute_batch") {
+    let lease = match acquire_standalone_lease(&pool, "execute_batch") {
         Ok(lease) => lease,
         Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
     };
@@ -254,43 +252,22 @@ pub(super) fn run_standalone_batch(
 pub(super) fn run_standalone_script(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     script: String,
 ) -> (
     Option<StandaloneHandle>,
     Result<(), StandaloneWriteError<rusqlite::Error>>,
 ) {
-    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute_script", false) {
-        Ok(lease) => lease,
-        Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+    let mut owner = StandaloneCallOwner::new(handle, pool);
+    let res = match owner.admit("execute_script") {
+        Ok(()) => owner
+            .conn()
+            .execute_batch(&script)
+            .map_err(StandaloneWriteError::Sql),
+        Err(error) => Err(StandaloneWriteError::Refused(error)),
     };
-    let res = handle
-        .conn
-        .execute_batch(&script)
-        .map_err(StandaloneWriteError::Sql);
-    // ADR-154: without a unit lease the volume lease covers this call
-    // only, so a transaction the script left open is settled here,
-    // while the lease is still held, instead of continuing outside it.
-    if unit_holds_lease || handle.conn.is_autocommit() {
-        drop(lease);
-        return (Some(handle), res);
-    }
-    let (handle, settled) =
-        if handle.conn.execute_batch("ROLLBACK").is_ok() && handle.conn.is_autocommit() {
-            (Some(handle), Ok(()))
-        } else {
-            // The connection closes while the lease is still held; the
-            // handle's slots are released after it.
-            let StandaloneHandle {
-                conn,
-                _retained_slot,
-                read_transaction_slot,
-            } = handle;
-            let settled = pool.write_admission().close_retired_connection(conn);
-            drop((_retained_slot, read_transaction_slot));
-            (None, settled)
-        };
-    drop(lease);
+    // The volume lease covers this call only, so a transaction the script
+    // left open is settled here while the lease is still held.
+    let settled = owner.settle();
     let result = match (res, settled) {
         (res, Err(settlement)) => {
             if let Err(StandaloneWriteError::Sql(error)) = &res {
@@ -305,8 +282,9 @@ pub(super) fn run_standalone_script(
                 settlement.into_storage_error(StorageCapability::Sql, "execute_script"),
             ))
         }
-        (Err(failure), Ok(())) => Err(failure),
-        (Ok(()), Ok(())) => Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
+        (res, Ok(false)) => res,
+        (Err(failure), Ok(true)) => Err(failure),
+        (Ok(()), Ok(true)) => Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
             capability: StorageCapability::Sql,
             operation: "execute_script".into(),
             message: "the script left a transaction open; a standalone script holds \
@@ -316,21 +294,19 @@ pub(super) fn run_standalone_script(
                 .into(),
         })),
     };
-    (handle, result)
+    (owner.into_handle(), result)
 }
 
 pub(super) fn run_standalone_top_level(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     maintenance: TopLevelMaintenance,
 ) -> (
     StandaloneHandle,
     Result<(), StandaloneWriteError<rusqlite::Error>>,
 ) {
     let lease = if maintenance == TopLevelMaintenance::Vacuum {
-        match admit_standalone_operation(&pool, unit_holds_lease, "execute_script_top_level", true)
-        {
+        match admit_standalone_operation(&pool, "execute_script_top_level", true) {
             Ok(lease) => lease,
             Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
         }

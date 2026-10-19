@@ -15,11 +15,11 @@ use super::{
 /// transaction is rolled back; a call that succeeded fails with
 /// `InvalidInput`.
 pub(super) fn settle_pooled_call<T>(
-    guard: &crate::pool::WriterGuard<'_>,
+    guard: &crate::pool::PooledAutocommitWriteUnit<'_>,
     operation: &'static str,
     result: khive_storage::types::StorageResult<T>,
 ) -> khive_storage::types::StorageResult<T> {
-    if guard.is_autocommit() {
+    if guard.conn().is_autocommit() {
         return result;
     }
     if let Err(settlement) = guard.rollback_or_retire("pooled call left its transaction open") {

@@ -207,6 +207,7 @@ mod tests {
         .unwrap();
         pool.writer()
             .unwrap()
+            .conn()
             .execute_batch("CREATE TABLE witness(value INTEGER)")
             .unwrap();
         let handle = pool.writer_task_handle().unwrap().unwrap();

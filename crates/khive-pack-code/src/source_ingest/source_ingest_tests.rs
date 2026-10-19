@@ -79,17 +79,19 @@ pub(super) fn runtime_on_with_mode_in(
     )
     .expect("target runtime opens");
     let writer = runtime.backend().pool().writer().expect("writer");
-    let actual_mode: String = writer
-        .conn()
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("journal mode");
-    let busy_timeout_ms: i64 = writer
-        .conn()
-        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-        .expect("busy timeout");
+    let (actual_mode, busy_timeout_ms): (String, i64) = writer
+        .autocommit(|conn| {
+            let actual_mode = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("journal mode");
+            let busy_timeout_ms = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("busy timeout");
+            Ok((actual_mode, busy_timeout_ms))
+        })
+        .expect("inspect writer settings");
     assert_eq!(actual_mode.to_ascii_lowercase(), mode.label());
     assert_eq!(busy_timeout_ms, 5_000);
-    drop(writer);
     let token = runtime.authorize(Namespace::local()).expect("token");
     (runtime, token)
 }
@@ -836,7 +838,7 @@ async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock()
     // The runtimes take different lock directories, so the second one stands
     // in for a writer outside this process's lease and meets the first
     // one's reserved lock at BEGIN, as SQLITE_BUSY.
-    let (runtime_a, _) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+    let (_runtime_a, _) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
     let (runtime_b, token_b) = runtime_on_with_mode_in(
         &db_path,
         TestJournalMode::Delete,
@@ -855,9 +857,8 @@ async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock()
         .await
         .expect("disable SQLite wait on first BEGIN");
 
-    let lock_holder = runtime_a.backend().pool().writer().expect("lock holder");
+    let lock_holder = rusqlite::Connection::open(&db_path).expect("external lock holder");
     lock_holder
-        .conn()
         .execute_batch("BEGIN IMMEDIATE")
         .expect("reserve rollback-journal writer lock");
     let id = project_uuid("busy-retry");
@@ -875,7 +876,6 @@ async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock()
         })
         .await;
         lock_holder
-            .conn()
             .execute_batch("ROLLBACK")
             .expect("release rollback-journal writer lock");
         observed.expect("the other runtime must observe a real SQLITE_BUSY refusal");

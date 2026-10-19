@@ -34,13 +34,14 @@ fn setup(queued: bool) -> (tempfile::TempDir, Arc<ConnectionPool>, SqlAttachment
     );
     pool.writer()
         .unwrap()
-        .conn()
-        .execute_batch(
-            "CREATE TABLE attachments (
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TABLE attachments (
            record_uuid TEXT NOT NULL, substrate TEXT NOT NULL, role TEXT NOT NULL,
            content_ref TEXT NOT NULL, media_type TEXT, size_bytes INTEGER,
            created_at INTEGER NOT NULL, PRIMARY KEY(record_uuid, role));",
-        )
+            )?)
+        })
         .unwrap();
     let store = SqlAttachmentStore::new(pool.clone(), true);
     (dir, pool, store)

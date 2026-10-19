@@ -478,16 +478,16 @@ impl Drop for QuarantinePooledReaderOnDrop<'_, '_> {
     }
 }
 
-struct QuarantinePooledWriterOnDrop<'guard, 'pool_ref, 'guard_pool> {
+struct QuarantinePooledWriterOnDrop<'conn, 'pool_ref> {
     pool: &'pool_ref crate::pool::ConnectionPool,
-    guard: &'guard crate::pool::WriterGuard<'guard_pool>,
+    conn: &'conn rusqlite::Connection,
     control: Arc<ReadControl>,
 }
 
-impl Drop for QuarantinePooledWriterOnDrop<'_, '_, '_> {
+impl Drop for QuarantinePooledWriterOnDrop<'_, '_> {
     fn drop(&mut self) {
         if self.control.cleanup_failed.load(Ordering::Acquire) {
-            self.pool.retire_pooled_writer(self.guard.conn());
+            self.pool.retire_pooled_writer(self.conn);
         }
     }
 }
@@ -648,10 +648,29 @@ impl InterruptibleReadScope {
     {
         let quarantine = QuarantinePooledWriterOnDrop {
             pool,
-            guard,
+            conn: guard.conn(),
             control: Arc::clone(&self.control),
         };
-        read(quarantine.guard.conn())
+        read(quarantine.conn)
+    }
+
+    /// Keep callback-cleanup quarantine inside the owner of an admitted
+    /// pooled query. The write unit outlives both this guard and settlement.
+    pub(crate) fn with_pooled_write_unit<R, F>(
+        &self,
+        pool: &crate::pool::ConnectionPool,
+        unit: &crate::pool::PooledAutocommitWriteUnit<'_>,
+        query: F,
+    ) -> R
+    where
+        F: FnOnce(&rusqlite::Connection) -> R,
+    {
+        let quarantine = QuarantinePooledWriterOnDrop {
+            pool,
+            conn: unit.conn(),
+            control: Arc::clone(&self.control),
+        };
+        query(quarantine.conn)
     }
 }
 

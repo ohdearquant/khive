@@ -13,10 +13,7 @@ fn secondary_backend_runtime() -> KhiveRuntime {
 
     let make_backend = || {
         let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
-        {
-            let mut writer = backend.pool().try_writer().expect("writer");
-            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-        }
+        backend.pool().run_migrations().expect("migrations");
         Arc::new(backend)
     };
     let main_backend = make_backend();
