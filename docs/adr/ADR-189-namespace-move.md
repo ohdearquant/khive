@@ -492,7 +492,9 @@ and the watermark actually live.
 
 ## Amendment 2 (2026-10-04): logical domain routes and partitioned vector destinations
 
-**Status: Proposed.** Refs #3696.
+**Status: accepted (2026-10-19).** Refs #3696. Accepted on its own acceptance arm: the seven
+`namespace_move::partition_tests` fixtures named under Acceptance below pass on main as of
+2026-10-19.
 
 This amendment refines the route-key and derived-parent descriptions above for a
 domain's mirror atom and adds the partitioned vector destination rule. Amendment 1's
