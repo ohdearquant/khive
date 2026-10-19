@@ -3145,6 +3145,8 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         output = temp / "output"
         output.write_text("")
         env = {**self.env, "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output), "DOCS_ONLY": docs_only}
+        # The CI job exports its own TEST_SCOPE, so the unset arm removes it rather than inheriting it.
+        env.pop("TEST_SCOPE", None)
         if test_scope is not None:
             env["TEST_SCOPE"] = test_scope
         subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, timeout=30)
