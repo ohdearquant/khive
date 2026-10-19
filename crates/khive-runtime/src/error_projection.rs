@@ -81,6 +81,21 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::CanonicalUnsupportedOperation {
+            op_index,
+            operation,
+        } => {
+            return json!({
+                "kind": "runtime_error",
+                "code": "invalid_input",
+                "reason": "KnownUnimplemented",
+                "operation": operation,
+                "op_index": op_index,
+                "message": format!("canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"),
+                "domain_disposition": "not_committed",
+                "retryable": false,
+            });
+        }
         RuntimeError::CanonicalAdmission { op_index, source } => {
             // Preparation precedes all domain DML. Keep the original typed
             // refusal (including secret detector/permission receipt) and add

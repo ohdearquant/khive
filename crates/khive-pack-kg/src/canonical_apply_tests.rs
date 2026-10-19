@@ -37,16 +37,26 @@ fn setup() -> (KhiveRuntime, VerbRegistry) {
 #[test]
 fn canonical_delta_requires_exact_envelope_and_supported_outer_version() {
     let text = delta(&[create(1, "one"), create(2, "two")]);
-    let decoded = decode_delta(&text, Some(1)).unwrap();
+    let decoded = decode_delta(&text, Some(khive_changeset::CURRENT_SCHEMA_VERSION)).unwrap();
     assert_eq!(decoded.ops.len(), 2);
     // The fixture is hand-built JSON. The byte layout belongs to the codec, so
     // the codec's own output is the fixed point a decode and re-encode keeps.
     let encoded = khive_changeset::to_ndjson(&decoded).unwrap();
-    let reencoded = khive_changeset::to_ndjson(&decode_delta(&encoded, Some(1)).unwrap()).unwrap();
+    let reencoded = khive_changeset::to_ndjson(
+        &decode_delta(&encoded, Some(khive_changeset::CURRENT_SCHEMA_VERSION)).unwrap(),
+    )
+    .unwrap();
     assert_eq!(reencoded, encoded);
-    assert!(decode_delta(&text, Some(2)).is_err());
+    assert!(decode_delta(&text, Some(khive_changeset::CURRENT_SCHEMA_VERSION + 1)).is_err());
     assert!(decode_delta(
-        &text.replacen("\"schema_version\":1", "\"schema_version\":2", 1),
+        &text.replacen(
+            &format!(
+                "\"schema_version\":{}",
+                khive_changeset::CURRENT_SCHEMA_VERSION
+            ),
+            "\"schema_version\":1",
+            1
+        ),
         None
     )
     .is_err());
@@ -62,7 +72,7 @@ fn canonical_bound_and_budget_count_the_whole_change_set() {
     ops.push(create(max as u128 + 1, "over bound"));
     assert!(decode_delta(&delta(&ops), None).is_err());
     let canonical = ProposalChangeset::Canonical {
-        schema_version: 1,
+        schema_version: khive_changeset::CURRENT_SCHEMA_VERSION,
         delta: delta(&ops[..3]),
     };
     assert_eq!(crate::apply_worker::count_new_entries(&canonical), 3);
@@ -213,7 +223,7 @@ async fn canonical_proposal_and_direct_apply_share_captured_update_execution() {
         "preimage":{"target":"entity","name":"before"}});
     let proposal = registry.dispatch("propose", json!({
         "title":"Canonical captured update", "description":"Apply the staged complete delta",
-        "changeset":{"kind":"canonical","schema_version":1,"delta":delta(&[update])},
+        "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"delta":delta(&[update])},
     })).await.unwrap();
     let response = registry
         .dispatch(
@@ -243,7 +253,7 @@ async fn canonical_proposal_counts_all_creates_before_apply_budget() {
     let (runtime, registry) = setup();
     let proposal = registry.dispatch("propose", json!({
         "title":"Bounded canonical creates", "description":"Both create rows count against the budget",
-        "changeset":{"kind":"canonical","schema_version":1,
+        "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,
             "delta":delta(&[create(401,"one"),create(402,"two")])},
     })).await.unwrap();
     registry
@@ -297,7 +307,7 @@ async fn canonical_proposal_scans_decoded_delta_values_for_secrets() {
             "propose",
             json!({
                 "title":"Escaped credential", "description":"Refuse on the decoded value",
-                "changeset":{"kind":"canonical","schema_version":1,"delta":escaped},
+                "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"delta":escaped},
             }),
         )
         .await
@@ -345,7 +355,7 @@ async fn canonical_proposal_scans_values_under_reserved_property_keys() {
             "propose",
             json!({
                 "title":"Reserved credential", "description":"Refuse on the decoded value",
-                "changeset":{"kind":"canonical","schema_version":1,"delta":escaped},
+                "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"delta":escaped},
             }),
         )
         .await
@@ -387,7 +397,7 @@ async fn propose_canonical(
             "propose",
             json!({
                 "title":"Canonical proposal", "description":"Decoded once, scanned whole",
-                "changeset":{"kind":"canonical","schema_version":1,"delta":delta},
+                "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"delta":delta},
             }),
         )
         .await;
@@ -531,7 +541,7 @@ async fn canonical_proposal_admits_the_runtime_secret_gate_stamp() {
             "propose",
             json!({
                 "title":"Stamp echo", "description":"Apply decides reserved values",
-                "changeset":{"kind":"canonical","schema_version":1,"delta":delta(&[update])},
+                "changeset":{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"delta":delta(&[update])},
             }),
         )
         .await
@@ -551,8 +561,8 @@ async fn invalid_canonical_proposal_leaves_no_created_history() {
     };
     let before = events.count_events(filter.clone()).await.unwrap();
     for changeset in [
-        json!({"kind":"canonical","schema_version":2,"delta":delta(&[create(501,"invalid")])}),
-        json!({"kind":"compound","steps":[{"kind":"canonical","schema_version":1,
+        json!({"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION + 1,"delta":delta(&[create(501,"invalid")])}),
+        json!({"kind":"compound","steps":[{"kind":"canonical","schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,
             "delta":delta(&[create(502,"nested")])}]}),
     ] {
         assert!(registry
@@ -634,4 +644,50 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
             .unwrap()
             .is_none());
     }
+}
+
+#[tokio::test]
+async fn canonical_restore_dispatch_refuses_before_creates_or_events() {
+    let (runtime, registry) = setup();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let events = runtime.events(&token).unwrap();
+    let before = events.count_events(Default::default()).await.unwrap();
+    let restore = json!({"op":"restore","target_id":Uuid::from_u128(802),
+        "record":{"substrate":"entity","id":Uuid::from_u128(802),"namespace":"local",
+            "created_at":1_000_000,"updated_at":1_000_000,"kind":"concept",
+            "entity_type":null,"name":"restored","description":null,
+            "properties":{},"tags":[],"deleted_at":null}});
+    let text = delta(&[create(801, "before"), restore, create(803, "after")]);
+    assert_eq!(decode_delta(&text, None).unwrap().ops.len(), 3);
+    let error = registry
+        .dispatch("apply_changeset", json!({"delta":text}))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.refusal_source(),
+        RuntimeError::CanonicalUnsupportedOperation {
+            op_index: 1,
+            operation: "restore",
+        }
+    ));
+    let wire = khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+    assert_eq!(wire["op_index"], 1);
+    assert_eq!(wire["operation"], "restore");
+    assert_eq!(wire["reason"], "KnownUnimplemented");
+    assert_eq!(wire["domain_disposition"], "not_committed");
+    for id in [801, 802, 803] {
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(Uuid::from_u128(id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        events.count_events(Default::default()).await.unwrap(),
+        before
+    );
 }

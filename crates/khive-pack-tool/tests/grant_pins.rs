@@ -1021,3 +1021,6 @@ async fn equal_request_times_keep_the_existing_grant_selection() {
         "a check cites the grant tool.requests lists first when request times tie"
     );
 }
+
+#[path = "grant_pins/strict_decode.rs"]
+mod strict_decode;

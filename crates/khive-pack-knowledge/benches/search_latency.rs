@@ -1,203 +1,122 @@
-//! knowledge.search latency benchmark (harness = false).
-//!
-//! Run with:
-//!   cd crates && cargo bench -p khive-pack-knowledge --bench search_latency
-//!
-//! Measures warm p50/p95 for three dispatch variants:
-//!   - `rerank=false` baseline (pure TF-IDF, no embedding)
-//!   - `rerank=true`  explicit (embedding blend)
-//!   - default (omitted rerank = true when embedder configured)
-//!
-//! Cold first-query cost is measured separately and printed but excluded from
-//! the warm percentiles, because cold-start is dominated by model weight load
-//! (one-time per daemon lifecycle).
+//! Criterion timings for three knowledge.search reranking choices on 100 generated atoms.
+//! Synthetic by default; KHIVE_BENCH_REAL_MODEL=1 selects a separate inference cohort.
 
-use std::time::Instant;
+#[path = "support/synthetic_embedding.rs"]
+mod synthetic_embedding;
 
+use criterion::{black_box, Criterion};
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
-};
-use khive_types::Namespace;
-use lattice_embed::EmbeddingModel;
+use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::time::Duration;
+use synthetic_embedding::{SyntheticProvider, MODEL};
 
-fn rt_with_embedder() -> KhiveRuntime {
-    KhiveRuntime::new(RuntimeConfig {
-        wal_ceiling_bytes: 0,
-        wal_ceiling_configured_bytes: 0,
-        wal_ceiling_source: Default::default(),
-        wal_ceiling_env_raw: None,
-        web: Default::default(),
-        telemetry: Default::default(),
-        mounts: Vec::new(),
-        brain: Default::default(),
-        git_write: Default::default(),
-        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
-        events_split: None,
-        db_path: None,
-        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
-        default_namespace: Namespace::local(),
-        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
-        additional_embedding_models: vec![],
-        gate: Arc::new(AllowAllGate),
-        packs: vec!["kg".to_string(), "knowledge".to_string()],
-        backend_id: BackendId::main(),
-        brain_profile: None,
-        visible_namespaces: vec![],
-        allowed_outbound_namespaces: vec![],
-        actor_id: None,
-        exec: Default::default(),
-        ..khive_runtime::RuntimeConfig::no_embeddings()
-    })
-    .expect("runtime with embedder")
+const CASES: [(&str, Option<bool>); 3] = [
+    ("rerank_false", Some(false)),
+    ("rerank_true", Some(true)),
+    ("default", None),
+];
+fn case_id(variant: &str, real_model: bool) -> String {
+    let cohort = if real_model {
+        "real_model_100"
+    } else {
+        "synthetic_100"
+    };
+    format!("knowledge_search_latency/{cohort}/{variant}")
 }
+const QUERY: &str = "subject7 visiblemarker0 knowledge retrieval embedding reranking benchmark";
 
-fn build_registry(rt: KhiveRuntime) -> VerbRegistry {
+async fn fixture(real_model: bool) -> VerbRegistry {
+    // In-memory store: the default config points at HOME/.khive/khive.db, which a benchmark must never open.
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(MODEL),
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("synthetic runtime");
+    if !real_model {
+        runtime.register_embedder(SyntheticProvider);
+    }
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(KnowledgePack::new(rt.clone()));
+    builder.register(KgPack::new(runtime.clone()));
+    builder.register(KnowledgePack::new(runtime.clone()));
     let registry = builder.build().expect("registry");
-    rt.install_edge_rules(registry.all_edge_rules());
+    registry.apply_schema_plans(runtime.backend());
+    runtime.install_edge_rules(registry.all_edge_rules());
+    let atoms: Vec<Value> = (0..100).map(|i| json!({
+        "slug": format!("bench-atom-{i}"), "name": format!("Bench Atom {i}"), "finalized": true,
+        "content": format!("subject{i} visiblemarker0 knowledge retrieval embedding reranking benchmark atom tensor neural dense sparse retrieval corpus benchmark search latency gradient transformer semantic index query score rank precision recall vector")
+    })).collect();
+    let seeded = registry
+        .dispatch("knowledge.upsert_atoms", json!({"atoms":atoms}))
+        .await
+        .expect("seed atoms");
+    assert_eq!(seeded["created"], 100);
+    // Search returns finalized atoms only, and the rerank cases read the indexed vectors.
+    let indexed = registry
+        .dispatch("knowledge.index", json!({"rebuild_ann": false}))
+        .await
+        .expect("index atoms");
+    assert_eq!(indexed["indexed"], 100);
     registry
 }
 
-fn percentile(sorted: &[u128], pct: f64) -> u128 {
-    if sorted.is_empty() {
-        return 0;
+async fn search(registry: &VerbRegistry, rerank: Option<bool>) -> Value {
+    let mut params = json!({"query": QUERY, "limit": 10});
+    if let Some(value) = rerank {
+        params["rerank"] = json!(value);
     }
-    let idx = ((sorted.len() as f64 * pct / 100.0).ceil() as usize).min(sorted.len()) - 1;
-    sorted[idx]
+    let response = registry
+        .dispatch("knowledge.search", params)
+        .await
+        .expect("search");
+    let rows = response["results"].as_array().expect("results array");
+    assert_eq!(rows.len(), 10, "a shortened/empty result is not a timing");
+    let expected = rerank.unwrap_or(true);
+    assert_eq!(
+        response.get("rerank_provenance").is_some(),
+        expected,
+        "rerank route must match the case"
+    );
+    assert!(rows
+        .iter()
+        .all(|row| row["score_provenance"]["embedding_rerank"]
+            .as_bool()
+            .unwrap_or(false)
+            == expected));
+    response
 }
 
 fn main() {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-
-    rt.block_on(async {
-        let runtime = rt_with_embedder();
-        let registry = build_registry(runtime.clone());
-
-        let atoms: Vec<Value> = (0..100)
-            .map(|i| {
-                json!({
-                    "slug": format!("bench-atom-{i}"),
-                    "name": format!("Bench Atom {i}"),
-                    // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by
-                    // the knowledge pack. The first clause was a `description`
-                    // field until this was fixed: an atom write has no such field
-                    // and the params struct denies unknown ones, so every run of
-                    // this bench died in its seed. Its words are kept here rather
-                    // than dropped, because `knowledge` and `reranking` appear in
-                    // the query below and nowhere else in the corpus -- deleting
-                    // the key would have left the bench running and measuring a
-                    // search for terms the corpus no longer contains.
-                    "content": format!(
-                        "knowledge retrieval embedding reranking benchmark atom {i} tensor neural \
-                         dense sparse retrieval corpus benchmark search latency atom {i} gradient neural transformer embedding semantic index query score rank precision recall vector"
-                    ),
-                })
-            })
-            .collect();
-
-        registry
-            .dispatch("knowledge.upsert_atoms", json!({ "atoms": atoms }))
-            .await
-            .expect("seed atoms");
-
-        let query = "knowledge retrieval embedding reranking benchmark";
-
-        let t_cold = Instant::now();
-        let cold_resp = registry
-            .dispatch("knowledge.search", json!({ "query": query }))
-            .await
-            .expect("cold rerank dispatch");
-        let cold_us = t_cold.elapsed().as_micros();
-        assert!(cold_resp["results"].is_array());
-        println!("[#595] cold_rerank_first_query_us: {cold_us}");
-
-        const N: usize = 20;
-
-        let mut rerank_false_us: Vec<u128> = Vec::with_capacity(N);
-        for _ in 0..N {
-            let t = Instant::now();
-            let resp = registry
-                .dispatch(
-                    "knowledge.search",
-                    json!({ "query": query, "rerank": false }),
-                )
-                .await
-                .expect("rerank=false dispatch");
-            rerank_false_us.push(t.elapsed().as_micros());
-            assert!(resp["results"].is_array());
+    let args: Vec<_> = std::env::args().collect();
+    let real_model = std::env::var("KHIVE_BENCH_REAL_MODEL").as_deref() == Ok("1");
+    if args.iter().any(|arg| arg == "--list") {
+        for (variant, _) in CASES {
+            println!("{}: benchmark", case_id(variant, real_model));
         }
-        rerank_false_us.sort_unstable();
-
-        let mut rerank_true_us: Vec<u128> = Vec::with_capacity(N);
-        for _ in 0..N {
-            let t = Instant::now();
-            let resp = registry
-                .dispatch(
-                    "knowledge.search",
-                    json!({ "query": query, "rerank": true }),
-                )
-                .await
-                .expect("rerank=true dispatch");
-            rerank_true_us.push(t.elapsed().as_micros());
-            assert!(resp["results"].is_array());
-        }
-        rerank_true_us.sort_unstable();
-
-        let mut default_us: Vec<u128> = Vec::with_capacity(N);
-        for _ in 0..N {
-            let t = Instant::now();
-            let resp = registry
-                .dispatch("knowledge.search", json!({ "query": query }))
-                .await
-                .expect("default dispatch");
-            default_us.push(t.elapsed().as_micros());
-            assert!(resp["results"].is_array());
-        }
-        default_us.sort_unstable();
-
-        let rf_p50 = percentile(&rerank_false_us, 50.0);
-        let rf_p95 = percentile(&rerank_false_us, 95.0);
-        let rt_p50 = percentile(&rerank_true_us, 50.0);
-        let rt_p95 = percentile(&rerank_true_us, 95.0);
-        let df_p50 = percentile(&default_us, 50.0);
-        let df_p95 = percentile(&default_us, 95.0);
-
-        println!("[#595] corpus=100 atoms, N={N} warm queries each");
-        println!("[#595] cold_first_query_us:         {cold_us}");
-        println!("[#595] rerank=false  p50_us={rf_p50}  p95_us={rf_p95}");
-        println!("[#595] rerank=true   p50_us={rt_p50}  p95_us={rt_p95}");
-        println!("[#595] default       p50_us={df_p50}  p95_us={df_p95}");
-
-        let json_report = json!({
-            "issue": 595,
-            "corpus_atoms": 100,
-            "warm_queries_per_case": N,
-            "cold_first_query_us": cold_us,
-            "rerank_false": { "p50_us": rf_p50, "p95_us": rf_p95 },
-            "rerank_true":  { "p50_us": rt_p50, "p95_us": rt_p95 },
-            "default":      { "p50_us": df_p50, "p95_us": df_p95 },
-            "note": "warm = after first reranked query preloads embedding model"
+        return;
+    }
+    // A model-free control proves that listing returns before any runtime or seed work.
+    assert!(
+        !args.iter().any(|arg| arg == "--regression-case=list-only"),
+        "listing entered workload setup"
+    );
+    let mut criterion = Criterion::default()
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2))
+        .configure_from_args();
+    let executor = tokio::runtime::Runtime::new().expect("measurement runtime");
+    let registry = executor.block_on(fixture(real_model));
+    for (variant, rerank) in CASES {
+        let id = case_id(variant, real_model);
+        // Warm the selected route outside the measured iterations; each timed call
+        // retains the same cardinality/provenance checks, whose cost is included.
+        black_box(executor.block_on(search(&registry, rerank)));
+        criterion.bench_function(&id, |b| {
+            b.iter(|| black_box(executor.block_on(search(&registry, rerank))))
         });
-        println!(
-            "[#595] json_report: {}",
-            serde_json::to_string_pretty(&json_report).unwrap()
-        );
-
-        let rerank_overhead = rt_p50.checked_div(rf_p50).unwrap_or(0);
-        println!("[#595] warm_rerank_overhead_factor: {rerank_overhead}x");
-
-        let out_path = std::env::temp_dir().join("issue_595_latencies.json");
-        if let Ok(()) = std::fs::write(
-            &out_path,
-            serde_json::to_string_pretty(&json_report).unwrap(),
-        ) {
-            println!("[#595] wrote latency report to {}", out_path.display());
-        }
-    });
+    }
+    criterion.final_summary();
 }
