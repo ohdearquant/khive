@@ -1607,6 +1607,16 @@ jobs:
         run: |
           cargo test -p khive-db --lib windows_code_map_pool_reports_retained_main_identity 2>&1 | tee "$RUNNER_TEMP/windows-code-map-handle-identity.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-code-map-handle-identity.log" 1
+      - name: khive-db Windows handle lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe windows::windows_handle_interaction_does_not_release_another_handles_lock -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-windows-handle.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-windows-handle.log" 1
+      - name: khive-db Windows stale-path lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe stale_path::stale_path_truncate_after_rename_changes_the_replacement_while_original_lock_survives -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-stale-path.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-stale-path.log" 1
       # #2149: exercise real Windows sharing/reparse semantics and Git's
       # consumption of the pinned path; a compile check cannot prove either.
       - name: khive-pack-git Windows cache slot pins
