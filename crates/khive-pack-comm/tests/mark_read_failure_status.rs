@@ -104,11 +104,13 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
             .busy_timeout(Duration::ZERO)
             .expect("zero busy timeout");
     }
-    let holder = runtime
-        .backend()
-        .pool()
-        .open_standalone_writer()
-        .expect("lock-holder connection");
+    // Deliberately uncooperative external SQLite writer: this fixture must
+    // observe native SQLITE_BUSY rather than application lease contention.
+    let holder = rusqlite::Connection::open_with_flags(
+        runtime.backend().pool().canonical_path().unwrap(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("external lock-holder connection");
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("lock holder synchronously owns the SQLite writer lock");

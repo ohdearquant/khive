@@ -215,13 +215,12 @@ fn exercise_descriptor_swap(later: Option<LaterConnection>) {
         Some(kind) => {
             let pool = pool.as_ref().unwrap();
             match kind {
-                LaterConnection::PooledReader => pool.open_reader_connection(),
-                LaterConnection::StandaloneWriter => pool.open_standalone_writer_untracked(),
-                LaterConnection::StandaloneReader => pool.open_standalone_reader(
-                    StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
-                ),
+                LaterConnection::PooledReader => pool.open_reader_connection().map(|_| ()),
+                LaterConnection::StandaloneWriter => pool.standalone_autocommit(|_| Ok(())),
+                LaterConnection::StandaloneReader => pool
+                    .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+                    .map(|_| ()),
             }
-            .map(|_| ())
         }
     };
     claimed_file_observer::set_test_hook(None);

@@ -6,8 +6,7 @@ crate::writer_busy_fixture::direct_busy_case!(
     |pool: std::sync::Arc<ConnectionPool>, standalone| async move {
         tokio::task::spawn_blocking(move || {
             if standalone {
-                let conn = pool.open_standalone_writer().unwrap();
-                run_graph_mutation_transaction(&pool, &conn, false, |conn| {
+                run_standalone_graph_mutation_transaction(&pool, |conn| {
                     crate::writer_busy_fixture::insert(conn)
                         .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))
                 })

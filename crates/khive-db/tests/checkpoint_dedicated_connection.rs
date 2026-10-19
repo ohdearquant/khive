@@ -31,7 +31,7 @@
 //! the fixed design no longer imposes that admission-path constraint, not
 //! that TRUNCATE stopped blocking writes at the SQLite level.
 
-use khive_db::checkpoint::{checkpoint_once, TruncateState};
+use khive_db::checkpoint::TruncateState;
 use khive_db::{CheckpointConfig, ConnectionPool, PoolConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -149,11 +149,13 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
     // A live read snapshot pinning the WAL: TRUNCATE must wait for readers
     // whose snapshot predates the WAL's end, so with this transaction open
     // the armed TRUNCATE below busy-waits for the full TRUNCATE_BUSY bound.
-    // (Any standalone connection works; BEGIN + a SELECT materializes the
-    // snapshot.)
-    let pinning_reader = pool
-        .open_standalone_writer()
-        .expect("open the pinning-reader connection");
+    // A fixture-owned read-only connection pins this snapshot independently
+    // of application admission; BEGIN + SELECT materializes it.
+    let pinning_reader = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open the pinning-reader connection");
     pinning_reader
         .execute_batch("BEGIN")
         .expect("open the pinning read transaction");
@@ -172,23 +174,18 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
     };
 
     // The checkpoint task's dedicated connection, opened exactly the way
-    // `run_checkpoint_task` opens its own (`CheckpointConnection::ensure_open`
-    // -> `ConnectionPool::open_standalone_writer`).
+    // `run_checkpoint_task` opens its own, with a fixed checkpoint capability
+    // rather than an arbitrary SQL connection.
     let checkpoint_pool = Arc::clone(&pool);
-    let dedicated_conn = checkpoint_pool
-        .open_standalone_writer()
-        .expect("open dedicated checkpoint connection");
 
     // Thread A: run the real `checkpoint_once` once — PASSIVE over the fat
     // WAL, then the armed TRUNCATE busy-waiting ~TRUNCATE_BUSY on the
     // pinning reader.
     let thread_a = std::thread::spawn(move || {
-        checkpoint_once(
-            &checkpoint_pool,
-            &dedicated_conn,
-            &config,
-            &mut TruncateState::default(),
-        )
+        let dedicated_conn = checkpoint_pool
+            .open_standalone_checkpoint()
+            .expect("open dedicated checkpoint connection");
+        dedicated_conn.run(&config, &mut TruncateState::default())
     });
 
     // Observe, rather than time-guess, the moment thread A's TRUNCATE actually
@@ -201,9 +198,13 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
     // inference from elapsed wall-clock time. Bounded by a 5s deadline so a
     // TRUNCATE that never arms (a fixture regression) fails loudly instead of
     // this test passing vacuously.
-    let probe = pool
-        .open_standalone_writer()
-        .expect("open the TRUNCATE-arming probe connection");
+    // The external native probe must observe SQLite's writer lock directly,
+    // without being serialized through the application's volume lease.
+    let probe = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open the TRUNCATE-arming probe connection");
     probe
         .busy_timeout(Duration::ZERO)
         .expect("set zero busy_timeout on the probe connection");

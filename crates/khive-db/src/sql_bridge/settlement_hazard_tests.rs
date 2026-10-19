@@ -7,7 +7,7 @@ use std::sync::Arc;
 use khive_storage::types::SqlStatement;
 use khive_storage::SqlReader;
 
-use super::{open_standalone_writer, SqlBridge, SqliteWriter, StandaloneHandle};
+use super::{open_external_writer_fixture, SqlBridge, SqliteWriter, StandaloneHandle};
 use crate::disk_guard_config::EffectiveDiskGuardConfig;
 use crate::pool::{ConnectionPool, PoolConfig};
 
@@ -83,32 +83,29 @@ async fn standalone_begin_keeps_the_volume_lease_until_autocommit() {
         })
         .unwrap(),
     );
-    let writer_slot = pool
-        .sql_bridge_writer_slots()
-        .acquire_owned()
+    let bridge = SqlBridge::new(Arc::clone(&pool), true);
+    let mut writer = khive_storage::SqlAccess::writer(&bridge).await.unwrap();
+
+    writer
+        .execute(statement("CREATE TABLE lease_probe (x INTEGER)"))
         .await
         .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
-    let mut writer = SqliteWriter {
-        observe_direct_errors: true,
-        event_rows: None,
-        handle: Some(StandaloneHandle {
-            conn,
-            _retained_slot: Some(writer_slot),
-            read_transaction_slot: None,
-        }),
-        writer_task: None,
-        origin: pool.origin(),
-        db: crate::timeout_sink::db_label(&pool),
-        pool: Arc::clone(&pool),
-        held_lease: None,
-    };
-
-    let begin = khive_storage::SqlWriter::execute(&mut writer, statement("BEGIN IMMEDIATE")).await;
+    let begin = khive_storage::SqlWriter::execute(&mut *writer, statement("BEGIN IMMEDIATE")).await;
     if begin.is_err() {
         return;
     }
-    let in_transaction = !writer.handle.as_ref().unwrap().conn.is_autocommit();
+    writer
+        .execute(statement("INSERT INTO lease_probe VALUES (1)"))
+        .await
+        .unwrap();
+    let visible_rows: i64 = pool
+        .open_standalone_reader(
+            crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
+        )
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM lease_probe", [], |row| row.get(0))
+        .unwrap();
+    let in_transaction = visible_rows == 0;
     assert!(
         in_transaction,
         "fixture: BEGIN must leave the connection in a transaction"
@@ -124,7 +121,7 @@ async fn standalone_begin_keeps_the_volume_lease_until_autocommit() {
     .await
     .unwrap();
 
-    khive_storage::SqlWriter::execute(&mut writer, statement("ROLLBACK"))
+    khive_storage::SqlWriter::execute(&mut *writer, statement("ROLLBACK"))
         .await
         .unwrap();
     assert!(
@@ -360,47 +357,32 @@ async fn standalone_execute_without_a_unit_lease_refuses_transaction_control() {
         })
         .unwrap(),
     );
-    let writer_slot = pool
-        .sql_bridge_writer_slots()
-        .acquire_owned()
-        .await
-        .unwrap();
-    let conn = open_standalone_writer(&pool).unwrap();
-    let mut writer = SqliteWriter {
-        observe_direct_errors: true,
-        event_rows: None,
-        handle: Some(StandaloneHandle {
-            conn,
-            _retained_slot: Some(writer_slot),
-            read_transaction_slot: None,
-        }),
-        writer_task: None,
-        origin: pool.origin(),
-        db: crate::timeout_sink::db_label(&pool),
-        pool: Arc::clone(&pool),
-        held_lease: None,
-    };
+    let bridge = SqlBridge::new(Arc::clone(&pool), true);
+    let mut writer = khive_storage::SqlAccess::writer(&bridge).await.unwrap();
     for sql in ["BEGIN IMMEDIATE", "SAVEPOINT s", "COMMIT"] {
-        let refused = khive_storage::SqlWriter::execute(&mut writer, statement(sql)).await;
+        let refused = khive_storage::SqlWriter::execute(&mut *writer, statement(sql)).await;
         assert!(
             matches!(&refused, Err(khive_storage::StorageError::InvalidInput { message, .. })
                 if message.contains("transaction control")),
             "{sql}: {refused:?}"
         );
     }
-    assert!(writer.handle.as_ref().unwrap().conn.is_autocommit());
-    khive_storage::SqlWriter::execute(&mut writer, statement("CREATE TABLE ok_rows (x INTEGER)"))
+    khive_storage::SqlWriter::execute(&mut *writer, statement("CREATE TABLE ok_rows (x INTEGER)"))
         .await
         .expect("an ordinary statement still runs after the refusals");
+    writer
+        .execute_batch(vec![statement("INSERT INTO ok_rows VALUES (1)")])
+        .await
+        .expect("a fresh owned transaction proves the refused controls left autocommit");
 }
 
-async fn standalone_writer(pool: &Arc<ConnectionPool>) -> SqliteWriter {
+async fn standalone_fault_writer(pool: &Arc<ConnectionPool>) -> SqliteWriter {
     let writer_slot = pool
         .sql_bridge_writer_slots()
         .acquire_owned()
         .await
         .unwrap();
-    let conn = open_standalone_writer(pool).unwrap();
+    let conn = open_external_writer_fixture(pool).unwrap();
     SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
@@ -413,7 +395,6 @@ async fn standalone_writer(pool: &Arc<ConnectionPool>) -> SqliteWriter {
         origin: pool.origin(),
         db: crate::timeout_sink::db_label(pool),
         pool: Arc::clone(pool),
-        held_lease: None,
     }
 }
 
@@ -440,16 +421,17 @@ fn standalone_pool(dir: &tempfile::TempDir, name: &str) -> Arc<ConnectionPool> {
 async fn standalone_script_left_in_a_transaction_is_rolled_back_before_the_lease_is_released() {
     let dir = tempfile::tempdir().unwrap();
     let pool = standalone_pool(&dir, "standalone_script.db");
-    let mut writer = standalone_writer(&pool).await;
+    let bridge = SqlBridge::new(Arc::clone(&pool), true);
+    let mut writer = khive_storage::SqlAccess::writer(&bridge).await.unwrap();
     khive_storage::SqlWriter::execute(
-        &mut writer,
+        &mut *writer,
         statement("CREATE TABLE script_rows (x INTEGER)"),
     )
     .await
     .unwrap();
 
     let script = khive_storage::SqlWriter::execute_script(
-        &mut writer,
+        &mut *writer,
         "BEGIN IMMEDIATE; INSERT INTO script_rows (x) VALUES (1);".to_string(),
     )
     .await;
@@ -458,21 +440,17 @@ async fn standalone_script_left_in_a_transaction_is_rolled_back_before_the_lease
             if message.contains("left a transaction open")),
         "{script:?}"
     );
-    let conn = &writer
-        .handle
-        .as_ref()
-        .expect("a rolled-back handle is kept")
-        .conn;
-    assert!(
-        conn.is_autocommit(),
-        "the script's transaction must be rolled back"
-    );
-    let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM script_rows", [], |row| row.get(0))
+    writer
+        .execute_batch(vec![])
+        .await
+        .expect("the retained handle must admit a fresh transaction after rollback");
+    let rows = writer
+        .query_scalar(statement("SELECT COUNT(*) FROM script_rows"))
+        .await
         .unwrap();
-    assert_eq!(
-        rows, 0,
-        "the row written inside the open transaction was kept"
+    assert!(
+        matches!(rows, Some(khive_storage::types::SqlValue::Integer(0))),
+        "the row written inside the open transaction was kept: {rows:?}"
     );
 
     let other = Arc::clone(&pool);
@@ -490,7 +468,7 @@ async fn standalone_script_left_in_a_transaction_is_rolled_back_before_the_lease
     );
 
     khive_storage::SqlWriter::execute_script(
-        &mut writer,
+        &mut *writer,
         "BEGIN IMMEDIATE; INSERT INTO script_rows (x) VALUES (2); COMMIT;".to_string(),
     )
     .await
@@ -506,7 +484,7 @@ async fn standalone_script_whose_rollback_is_refused_closes_the_connection_under
 
     let dir = tempfile::tempdir().unwrap();
     let pool = standalone_pool(&dir, "standalone_script_retire.db");
-    let mut writer = standalone_writer(&pool).await;
+    let mut writer = standalone_fault_writer(&pool).await;
     khive_storage::SqlWriter::execute(
         &mut writer,
         statement("CREATE TABLE retire_rows (x INTEGER)"),
@@ -540,7 +518,11 @@ async fn standalone_script_whose_rollback_is_refused_closes_the_connection_under
         writer.handle.is_none(),
         "a connection whose rollback was refused must be closed, not kept"
     );
-    let reader = open_standalone_writer(&pool).unwrap();
+    let reader = pool
+        .open_standalone_reader(
+            crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
+        )
+        .unwrap();
     let rows: i64 = reader
         .query_row("SELECT COUNT(*) FROM retire_rows", [], |row| row.get(0))
         .unwrap();

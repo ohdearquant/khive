@@ -187,7 +187,7 @@ impl FtsMaintenanceState {
     }
 
     /// Whether the next `run_if_due` call would do any work. The checkpoint
-    /// loop asks this before moving its connection onto a blocking thread, so
+    /// loop asks this before constructing an admitted writer off-thread, so
     /// an ordinary tick between maintenance intervals costs one clock read.
     pub(crate) fn is_due(&self, config: &FtsMaintenanceConfig, now: Instant) -> bool {
         config.enabled && now.saturating_duration_since(self.last_check) >= config.interval
@@ -472,11 +472,22 @@ fn run_merge_statement(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_if_due(
     conn: &Connection,
     config: &FtsMaintenanceConfig,
     state: &mut FtsMaintenanceState,
     now: Instant,
+) -> Result<Option<FtsMaintenanceStep>, String> {
+    run_if_due_with_admission(conn, config, state, now, || Ok(()))
+}
+
+pub(crate) fn run_if_due_with_admission(
+    conn: &Connection,
+    config: &FtsMaintenanceConfig,
+    state: &mut FtsMaintenanceState,
+    now: Instant,
+    admit: impl FnOnce() -> Result<(), String>,
 ) -> Result<Option<FtsMaintenanceStep>, String> {
     if !state.is_due(config, now) {
         return Ok(None);
@@ -510,6 +521,7 @@ pub(crate) fn run_if_due(
     }
 
     let requested_pages = merge_page_budget(config, merge_in_progress);
+    admit()?;
     let outcome = run_merge_statement(conn, table, requested_pages)?;
     if outcome == FtsMaintenanceOutcome::Busy {
         return Ok(Some(FtsMaintenanceStep {
