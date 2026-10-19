@@ -28,8 +28,8 @@ fn sqlite_vec_store_capabilities_are_correct() {
         "sqlite-vec does not support filter pushdown"
     );
     assert!(
-        !caps.supports_batch_search,
-        "sqlite-vec does not support native batch search"
+        caps.supports_batch_search,
+        "sqlite-vec shares one reader and snapshot across native batch search"
     );
     assert!(
         !caps.supports_quantization,

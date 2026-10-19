@@ -130,6 +130,51 @@ where
     F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
+    run_pooled_store_read_with_state(pool, capability, operation, false, read).await
+}
+
+/// A typed read that changes connection-local state must pay the pristine
+/// return check, including when its callback unwinds with an open transaction.
+pub(crate) async fn run_stateful_pooled_store_read<F, R>(
+    pool: Arc<ConnectionPool>,
+    capability: StorageCapability,
+    operation: &'static str,
+    read: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    R: Send + 'static,
+{
+    run_pooled_store_read_with_state(pool, capability, operation, true, read).await
+}
+
+struct PooledReadStateOwner<'pool> {
+    guard: crate::pool::ReaderGuard<'pool>,
+    stateful: bool,
+}
+
+impl Drop for PooledReadStateOwner<'_> {
+    fn drop(&mut self) {
+        // The scope has already removed its progress handler on return or
+        // unwind. Never release an unfinished transaction as a reusable reader,
+        // including the degraded reader that shares the pool's writer.
+        if self.stateful && !self.guard.conn().is_autocommit() {
+            self.guard.discard();
+        }
+    }
+}
+
+async fn run_pooled_store_read_with_state<F, R>(
+    pool: Arc<ConnectionPool>,
+    capability: StorageCapability,
+    operation: &'static str,
+    stateful: bool,
+    read: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    R: Send + 'static,
+{
     let trace = khive_storage::request_context::capture_search_phase_trace();
     let _admission_phase = trace.as_ref().and_then(|trace| {
         reader_phase(capability, ReaderPhaseKind::Admission).map(|phase| trace.enter(phase))
@@ -144,13 +189,17 @@ where
         let _checkout_phase = worker_trace.as_ref().and_then(|trace| {
             reader_phase(capability, ReaderPhaseKind::Checkout).map(|phase| trace.enter(phase))
         });
-        let mut guard = pool.resolve_reader_checkout(
+        let guard = pool.resolve_reader_checkout(
             capability,
             operation,
             pool.reader_with_admission(admission, || scope.should_stop()),
         )?;
         drop(_checkout_phase);
-        let result = scope.run_pooled_reader(&mut guard, read);
+        let mut owner = PooledReadStateOwner { guard, stateful };
+        if stateful {
+            owner.guard.mark_dirty();
+        }
+        let result = scope.run_pooled_reader(&mut owner.guard, read);
         if let Err(error) = &result {
             pool.record_reader_query_error(error);
         }
