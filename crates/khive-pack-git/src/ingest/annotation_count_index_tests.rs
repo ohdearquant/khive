@@ -4,13 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CANONICAL: &str = "idx_git_notes_history_canonical_sha";
 const NONCANONICAL: &str = "idx_git_notes_history_noncanonical";
 const OLD_COUNT: &str = "SELECT COUNT(*) AS holders FROM notes WHERE namespace=?1 AND kind='commit' AND json_type(properties,'$.sha')='text' AND json_extract(properties,'$.sha')=?2 COLLATE BINARY";
-const INSERT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../khive-db/sql/commit-annotation-insert.sql"
-));
 const SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../khive-db/sql/commit-annotation-source-live-select.sql"
+    "/sql/commit_annotation_source_guard.sql"
 ));
 const OLD_SOURCE: &str = "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND namespace=?2 AND kind='commit' AND deleted_at IS NULL AND json_type(properties,'$.sha')='text' AND json_extract(properties,'$.sha')=?3 COLLATE BINARY AND (SELECT COUNT(*) FROM notes WHERE namespace=?2 AND kind='commit' AND json_type(properties,'$.sha')='text' AND json_extract(properties,'$.sha')=?3 COLLATE BINARY)=1)";
 
@@ -166,46 +162,6 @@ async fn observed_source_scalar(
         SqlValue::Integer(value) => Ok(*value),
         other => panic!("source predicate must return an SQL integer: {other:?}"),
     }
-}
-
-fn old_insert() -> String {
-    let (before, rest) = INSERT.split_once("AND 1 = (\n").unwrap();
-    let (_, after) = rest.split_once("\n)\nAND EXISTS").unwrap();
-    format!(
-        "{before}AND 1 = (\n{}\n)\nAND EXISTS{after}",
-        OLD_COUNT.replace(" AS holders", "").replace("?2", "?9")
-    )
-}
-
-fn insert_edge(
-    runtime: &KhiveRuntime,
-    sql: &str,
-    source: &str,
-    target: &str,
-    cursor: bool,
-) -> Result<usize, String> {
-    let writer = runtime.backend().pool().try_writer().unwrap();
-    writer
-        .autocommit(|conn| {
-            Ok(conn.execute(
-                sql,
-                (
-                    "local",
-                    "candidate-edge",
-                    source,
-                    target,
-                    1.0,
-                    1_i64,
-                    1_i64,
-                    "{}",
-                    "match",
-                    "owner/repo",
-                    cursor,
-                ),
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
 }
 
 fn seed_history(runtime: &KhiveRuntime, from: usize, to: usize) {
@@ -465,7 +421,7 @@ async fn partition_preserves_types_namespaces_tombstones_json5_jsonb_and_binding
 }
 
 #[tokio::test]
-async fn whole_insert_and_failure_classification_preserve_holder_and_guard_outcomes() {
+async fn source_guard_preserves_holder_population_and_scope() {
     for schema in SCHEMAS {
         for history in [
             "unique",
@@ -477,116 +433,101 @@ async fn whole_insert_and_failure_classification_preserve_holder_and_guard_outco
             "existing-live",
             "existing-deleted",
         ] {
-            for cursor in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let runtime = file_runtime(&dir.path().join("insert.db"), false);
-                raw_note(
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = file_runtime(&dir.path().join("source.db"), false);
+            raw_note(
+                &runtime,
+                "source",
+                "local",
+                "commit",
+                SqlValue::Text(
+                    if history == "wrong-type" {
+                        r#"{"sha":123}"#
+                    } else {
+                        r#"{"sha":"match"}"#
+                    }
+                    .into(),
+                ),
+                history == "deleted-source",
+            );
+            if matches!(history, "duplicate" | "json5" | "jsonb") {
+                let value = match history {
+                    "json5" => SqlValue::Text("{sha:'match'}".into()),
+                    "jsonb" => jsonb(&runtime, r#"{"sha":"match"}"#),
+                    _ => SqlValue::Text(r#"{"sha":"match"}"#.into()),
+                };
+                raw_note(&runtime, "duplicate", "local", "commit", value, true);
+            }
+            runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", [])?)).unwrap();
+            if matches!(history, "existing-live" | "existing-deleted") {
+                runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO graph_edges(id,namespace,source_id,target_id,relation,weight,created_at,updated_at,deleted_at,metadata) VALUES('curated','local','source','project','annotates',0.42,7,8,?1,'{\"curated\":true}')", [if history == "existing-deleted" { Some(9_i64) } else { None }])?)).unwrap();
+            }
+            let curated = snapshot(
+                &query(
                     &runtime,
-                    "source",
-                    "local",
-                    "commit",
-                    SqlValue::Text(
-                        if history == "wrong-type" {
-                            r#"{"sha":123}"#
-                        } else {
-                            r#"{"sha":"match"}"#
-                        }
-                        .into(),
-                    ),
-                    history == "deleted-source",
-                );
-                if matches!(history, "duplicate" | "json5" | "jsonb") {
-                    let value = match history {
-                        "json5" => SqlValue::Text("{sha:'match'}".into()),
-                        "jsonb" => jsonb(&runtime, r#"{"sha":"match"}"#),
-                        _ => SqlValue::Text(r#"{"sha":"match"}"#.into()),
-                    };
-                    raw_note(&runtime, "duplicate", "local", "commit", value, true);
-                }
-                runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", [])?)).unwrap();
-                if matches!(history, "existing-live" | "existing-deleted") {
-                    runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO graph_edges(id,namespace,source_id,target_id,relation,weight,created_at,updated_at,deleted_at,metadata) VALUES('curated','local','source','project','annotates',0.42,7,8,?1,'{\"curated\":true}')", [if history == "existing-deleted" { Some(9_i64) } else { None }])?)).unwrap();
-                }
-                let curated = snapshot(
-                    &query(
-                        &runtime,
-                        "SELECT * FROM graph_edges WHERE id='curated'",
-                        vec![],
-                    )
-                    .await,
-                );
-                configure(&runtime, schema);
-                let expected = usize::from(history == "unique" && cursor);
-                let old =
-                    insert_edge(&runtime, &old_insert(), "source", "project", cursor).unwrap();
-                assert_eq!(old, expected, "old {schema:?} {history} {cursor}");
-                runtime
-                    .backend()
-                    .pool()
-                    .try_writer()
-                    .unwrap()
-                    .autocommit(|conn| {
-                        Ok(conn.execute("DELETE FROM graph_edges WHERE id='candidate-edge'", [])?)
-                    })
-                    .unwrap();
-                let new = insert_edge(&runtime, INSERT, "source", "project", cursor).unwrap();
-                assert_eq!(new, old, "whole INSERT {schema:?} {history} {cursor}");
-                assert_eq!(
-                    snapshot(
-                        &query(
-                            &runtime,
-                            "SELECT * FROM graph_edges WHERE id='curated'",
-                            vec![]
-                        )
-                        .await
-                    ),
-                    curated
-                );
+                    "SELECT * FROM graph_edges WHERE id='curated'",
+                    vec![],
+                )
+                .await,
+            );
+            configure(&runtime, schema);
+            let params = vec![
+                SqlValue::Text("source".into()),
+                SqlValue::Text("local".into()),
+                SqlValue::Text("match".into()),
+            ];
+            let actual = observed_source_scalar(&runtime, SOURCE, params.clone()).await;
+            assert_eq!(
+                actual,
+                observed_source_scalar(&runtime, OLD_SOURCE, params.clone()).await,
+                "source refusal {schema:?} {history}"
+            );
+            let rows = query(&runtime, SOURCE, params).await;
+            assert!(
+                matches!(&rows[0].columns[0].value, SqlValue::Integer(value) if *value == i64::from(matches!(history, "unique" | "existing-live" | "existing-deleted"))),
+                "source count must reject deleted duplicates: {rows:?}"
+            );
+            for (source, namespace) in [("missing", "local"), ("source", "other")] {
                 let params = vec![
-                    SqlValue::Text("source".into()),
-                    SqlValue::Text("local".into()),
+                    SqlValue::Text(source.into()),
+                    SqlValue::Text(namespace.into()),
                     SqlValue::Text("match".into()),
                 ];
                 let actual = observed_source_scalar(&runtime, SOURCE, params.clone()).await;
+                assert_eq!(actual, Ok(0), "{schema:?} {history} {source} {namespace}");
                 assert_eq!(
                     actual,
-                    observed_source_scalar(&runtime, OLD_SOURCE, params.clone()).await,
-                    "source refusal {schema:?} {history}"
-                );
-                let rows = query(&runtime, SOURCE, params).await;
-                assert!(
-                    matches!(&rows[0].columns[0].value, SqlValue::Integer(value) if *value == i64::from(matches!(history, "unique" | "existing-live" | "existing-deleted"))),
-                    "source count must reject deleted duplicates: {rows:?}"
-                );
-                for (source, target) in [("missing", "project"), ("source", "missing")] {
-                    assert_eq!(
-                        insert_edge(&runtime, INSERT, source, target, true).unwrap(),
-                        0
-                    );
-                }
-                let params = vec![
-                    SqlValue::Text("source".into()),
-                    SqlValue::Text("other".into()),
-                    SqlValue::Text("match".into()),
-                ];
-                assert_eq!(
-                    observed_source_scalar(&runtime, SOURCE, params.clone()).await,
                     observed_source_scalar(&runtime, OLD_SOURCE, params).await
                 );
-                let events = query(
-                    &runtime,
-                    "SELECT COUNT(*) AS n FROM events WHERE kind='link_created'",
-                    vec![],
-                )
-                .await;
-                assert_eq!(events[0].i64("n").unwrap(), 0, "raw SQL must not fabricate audit events; retained runtime fixtures check Created emits once");
             }
+            assert_eq!(
+                snapshot(
+                    &query(
+                        &runtime,
+                        "SELECT * FROM graph_edges WHERE id='curated'",
+                        vec![]
+                    )
+                    .await
+                ),
+                curated
+            );
+            let events = query(
+                &runtime,
+                "SELECT COUNT(*) AS n FROM events WHERE kind='link_created'",
+                vec![],
+            )
+            .await;
+            assert_eq!(
+                events[0].i64("n").unwrap(),
+                0,
+                "a source predicate must not emit link_created"
+            );
         }
     }
 }
 
 #[tokio::test]
-async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_write_errors() {
+async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_source_errors() {
     for schema in SCHEMAS {
         let dir = tempfile::tempdir().unwrap();
         let runtime = file_runtime(&dir.path().join("malformed.db"), false);
@@ -623,7 +564,6 @@ async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_wri
         ] {
             raw_note(&runtime, id, ns, kind, SqlValue::Text("{".into()), true);
         }
-        runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES('project','local','project','p','{\"repo_slug\":\"owner/repo\"}',1,1)", [])?)).unwrap();
         let before = snapshot(
             &query(
                 &runtime,
@@ -654,12 +594,6 @@ async fn malformed_deleted_history_installs_safely_and_keeps_exact_count_and_wri
         assert!(old.as_ref().unwrap_err().contains("malformed JSON"));
         assert_eq!(
             observed_source_scalar(&runtime, SOURCE, source_params).await,
-            old
-        );
-        let old = insert_edge(&runtime, &old_insert(), "source", "project", true).unwrap_err();
-        assert!(old.contains("malformed JSON"));
-        assert_eq!(
-            insert_edge(&runtime, INSERT, "source", "project", true).unwrap_err(),
             old
         );
         assert_eq!(

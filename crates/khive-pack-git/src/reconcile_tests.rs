@@ -1,6 +1,9 @@
 use super::*;
 use std::io::Write;
 
+#[path = "reconcile_tests/annotation_guards_tests.rs"]
+mod annotation_guards;
+
 use khive_runtime::{Namespace, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
@@ -322,16 +325,15 @@ async fn conditional_annotation_link_uses_normal_endpoint_rules() {
         &fixture.source_identity,
     )
     .unwrap();
-    let error = fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.project_a,
-            fixture.project_b,
-            guard,
-        )
-        .await
-        .expect_err("an entity cannot be an annotates source");
+    let error = link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.project_a,
+        fixture.project_b,
+        guard,
+    )
+    .await
+    .expect_err("an entity cannot be an annotates source");
     assert!(error.to_string().contains("annotates source"), "{error}");
     let written = fixture
         .runtime
@@ -375,20 +377,16 @@ async fn conditional_annotation_link_refuses_a_stale_cursor_before_inserting() {
         )
         .await;
 
-    let outcome = fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.first_note,
-            fixture.project_b,
-            guard,
-        )
-        .await
-        .expect("stale cursor is a classified refusal");
-    assert!(matches!(
-        outcome,
-        CommitAnnotationInsertOutcome::CursorChanged
-    ));
+    let outcome = link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.first_note,
+        fixture.project_b,
+        guard,
+    )
+    .await
+    .expect("stale cursor is a classified refusal");
+    assert!(matches!(outcome, AnnotationOutcome::CursorChanged));
     assert_eq!(fixture.edge_bytes(fixture.first_note).await, None);
     assert_eq!(fixture.link_created_events(fixture.first_note).await, 0);
 }
@@ -407,35 +405,30 @@ async fn conditional_annotation_link_emits_only_for_created_outcome() {
     .unwrap();
     assert_eq!(fixture.link_created_events(fixture.first_note).await, 0);
 
-    let created = fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.first_note,
-            fixture.project_b,
-            guard.clone(),
-        )
-        .await
-        .expect("new annotation");
-    assert!(matches!(created, CommitAnnotationInsertOutcome::Created(_)));
+    let created = link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.first_note,
+        fixture.project_b,
+        guard.clone(),
+    )
+    .await
+    .expect("new annotation");
+    assert!(matches!(created, AnnotationOutcome::Created));
     assert_eq!(fixture.link_created_events(fixture.first_note).await, 1);
     let live_bytes = fixture.edge_bytes(fixture.first_note).await;
     let before_existing_events = fixture.link_created_events(fixture.first_note).await;
 
-    let existing = fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.first_note,
-            fixture.project_b,
-            guard.clone(),
-        )
-        .await
-        .expect("existing live annotation");
-    assert!(matches!(
-        existing,
-        CommitAnnotationInsertOutcome::ExistingLive
-    ));
+    let existing = link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.first_note,
+        fixture.project_b,
+        guard.clone(),
+    )
+    .await
+    .expect("existing live annotation");
+    assert!(matches!(existing, AnnotationOutcome::ExistingLive));
     assert_eq!(
         fixture.link_created_events(fixture.first_note).await - before_existing_events,
         0,
@@ -455,20 +448,16 @@ async fn conditional_annotation_link_emits_only_for_created_outcome() {
         .await;
     let tombstone_bytes = fixture.edge_bytes(fixture.first_note).await;
     let before_tombstone_events = fixture.link_created_events(fixture.first_note).await;
-    let tombstoned = fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.first_note,
-            fixture.project_b,
-            guard,
-        )
-        .await
-        .expect("tombstoned annotation");
-    assert!(matches!(
-        tombstoned,
-        CommitAnnotationInsertOutcome::Tombstoned
-    ));
+    let tombstoned = link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.first_note,
+        fixture.project_b,
+        guard,
+    )
+    .await
+    .expect("tombstoned annotation");
+    assert!(matches!(tombstoned, AnnotationOutcome::Tombstoned));
     assert_eq!(
         fixture.link_created_events(fixture.first_note).await - before_tombstone_events,
         0,
@@ -484,23 +473,22 @@ async fn conditional_annotation_link_emits_only_for_created_outcome() {
 #[serial_test::serial(config_ledger)]
 async fn tombstone_is_an_exclusion_and_remains_byte_exact() {
     let fixture = Fixture::new().await;
-    fixture
-        .runtime
-        .link_commit_annotation_if_absent(
-            &fixture.token,
-            fixture.first_note,
-            fixture.project_b,
-            annotation_guard(
-                &cursor_snapshot(&fixture.runtime, fixture.project_b)
-                    .await
-                    .unwrap(),
-                &fixture.first_sha,
-                &fixture.source_identity,
-            )
-            .unwrap(),
+    link_annotation_if_absent(
+        &fixture.runtime,
+        &fixture.token,
+        fixture.first_note,
+        fixture.project_b,
+        annotation_guard(
+            &cursor_snapshot(&fixture.runtime, fixture.project_b)
+                .await
+                .unwrap(),
+            &fixture.first_sha,
+            &fixture.source_identity,
         )
-        .await
-        .expect("fixture link");
+        .unwrap(),
+    )
+    .await
+    .expect("fixture link");
     fixture
         .execute(
             "UPDATE graph_edges SET deleted_at=77 WHERE source_id=?1 AND target_id=?2 \

@@ -6,9 +6,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use khive_runtime::{KhiveRuntime, NamespaceToken};
-use khive_storage::graph::{
-    CommitAnnotationCursorValue, CommitAnnotationGuard, CommitAnnotationInsertOutcome,
-};
+mod annotation;
+use annotation::{link_annotation_if_absent, AnnotationGuard, AnnotationOutcome, CursorValue};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -158,8 +157,8 @@ fn annotation_guard(
     rows: &[CursorRow],
     expected_sha: &str,
     source_identity: &str,
-) -> Result<CommitAnnotationGuard> {
-    let value = |kind: &str| -> Result<CommitAnnotationCursorValue> {
+) -> Result<AnnotationGuard> {
+    let value = |kind: &str| -> Result<CursorValue> {
         let row = rows
             .iter()
             .find(|row| row.kind == kind)
@@ -167,7 +166,7 @@ fn annotation_guard(
         if row.value_type != "text" {
             bail!("{kind} cursor is not text");
         }
-        Ok(CommitAnnotationCursorValue {
+        Ok(CursorValue {
             value: row
                 .value
                 .clone()
@@ -175,7 +174,7 @@ fn annotation_guard(
             updated_at: row.updated_at,
         })
     };
-    Ok(CommitAnnotationGuard {
+    Ok(AnnotationGuard {
         expected_sha: expected_sha.into(),
         source_identity: source_identity.into(),
         commits: value("commits")?,
@@ -590,29 +589,29 @@ pub async fn run_reconciliation(
                     test_hooks::before_first_link(runtime, token, *note_id, options.project_id)
                         .await?;
                 }
-                match runtime
-                    .link_commit_annotation_if_absent(
-                        token,
-                        *note_id,
-                        options.project_id,
-                        annotation_guard(&first.cursor, sha, &source_identity)?,
-                    )
-                    .await
+                match link_annotation_if_absent(
+                    runtime,
+                    token,
+                    *note_id,
+                    options.project_id,
+                    annotation_guard(&first.cursor, sha, &source_identity)?,
+                )
+                .await
                 {
-                    Ok(CommitAnnotationInsertOutcome::Created(_)) => apply.created += 1,
-                    Ok(CommitAnnotationInsertOutcome::ExistingLive) => apply.raced_live += 1,
-                    Ok(CommitAnnotationInsertOutcome::Tombstoned) => apply.raced_tombstone += 1,
-                    Ok(CommitAnnotationInsertOutcome::SourceChanged) => {
+                    Ok(AnnotationOutcome::Created) => apply.created += 1,
+                    Ok(AnnotationOutcome::ExistingLive) => apply.raced_live += 1,
+                    Ok(AnnotationOutcome::Tombstoned) => apply.raced_tombstone += 1,
+                    Ok(AnnotationOutcome::SourceChanged) => {
                         apply.failures += 1;
                         apply.error = Some(format!("commit note changed before link: {sha}"));
                         break;
                     }
-                    Ok(CommitAnnotationInsertOutcome::TargetChanged) => {
+                    Ok(AnnotationOutcome::TargetChanged) => {
                         apply.failures += 1;
                         apply.error = Some("project changed before link".into());
                         break;
                     }
-                    Ok(CommitAnnotationInsertOutcome::CursorChanged) => {
+                    Ok(AnnotationOutcome::CursorChanged) => {
                         apply.failures += 1;
                         apply.error = Some("commit cursor changed before link".into());
                         break;
