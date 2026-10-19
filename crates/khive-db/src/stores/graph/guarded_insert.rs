@@ -2,13 +2,13 @@ use khive_storage::graph::{
     EdgeInsertIfAbsentOutcome, GraphGuardValueKind, GraphStatementGuard,
     GraphStatementGuardFailure, GraphStatementGuardFailureReason,
 };
-use khive_storage::{StorageCapability, StorageResult};
+use khive_storage::{Edge, StorageCapability, StorageError, StorageResult};
 use rusqlite::types::ValueRef;
 
-use super::{
-    canonical_edge_endpoints, edge_by_natural_key_including_deleted,
-    edge_insert_if_absent_statement, map_err, Edge, StorageError, GRAPH_MUTATION_EVENTS_OP,
-};
+use super::edge_statements::{canonical_edge_endpoints, edge_insert_if_absent_statement};
+use super::edge_upserts::edge_by_natural_key_including_deleted;
+use super::map_err;
+use super::mutation_plans::GRAPH_MUTATION_EVENTS_OP;
 use crate::sql_bridge::{bind_params, statement_guard_select_admits};
 
 pub(super) fn check_statement_guards(

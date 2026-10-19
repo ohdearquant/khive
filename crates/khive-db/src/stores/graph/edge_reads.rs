@@ -223,7 +223,8 @@ pub(super) fn edge_order_clause(sort: &[SortOrder<EdgeSortField>]) -> String {
 /// this expression has live endpoints or none at all.
 ///
 /// The probe reads the same local tables as [`LIVE_ENDPOINTS_CONDITION`] and
-/// [`endpoint_exists_clause`], which is what makes the three agree on what an
+/// [`crate::stores::graph::edge_statements::endpoint_exists_clause`], which is
+/// what makes the three agree on what an
 /// endpoint is. Two consequences are deliberate. An `annotates` endpoint that
 /// is an event or another edge is a live endpoint that is not in either base,
 /// so it classifies as `none` and lands in `unresolved`; that is the bucket's
@@ -328,7 +329,7 @@ pub(super) fn build_edge_filter_sql_for_namespaces(
 /// filter's own parameters are even added. Binding one JSON string instead
 /// keeps this at O(1) parameters regardless of namespace count, so paged
 /// enumeration (which needs one exact-order SQL statement per page — see
-/// [`super::SqlGraphStore::query_edges_in_namespaces`]) never has to chunk the
+/// [`khive_storage::GraphStore::query_edges_in_namespaces`]) never has to chunk the
 /// namespace set and cannot silently corrupt paging by doing so (#2088).
 pub(super) fn build_edge_filter_sql_for_namespaces_json(
     namespaces_json: &str,
