@@ -206,8 +206,15 @@ not `full`.
    walk the repository at the pinned revision are the content sweeps, which the documentation lane runs
    (`scripts/ci.sh:536–545`). The list is under `scripts/`, so a change to it runs the full suite, and a
    workflow test fails when a listed file is outside `docs/`, has another extension, or when any non-Markdown file
-   outside `docs/` names the listed file, any directory that contains it (for example `docs/testing`), or a pattern over
-   its extension (for example `*.tsv`). Any other naming file still counts.
+   outside `docs/` names the listed file, a directory below `docs/` that contains it (for example `docs/testing`), or a
+   pattern over its extension (for example `*.tsv`). A file names a directory when a whole path token, after any leading
+   `./`, `../` or `/`, is that directory's path followed by `/`, `/*` or `/**`, or, for a path of two or more segments,
+   the path alone; a longer path that starts with it does not count. A pattern over the extension is a glob token whose
+   last segment ends in it, such as `*.tsv` or `docs/**/*.tsv`. Outside `docs/`, `docs/` itself is named only by the
+   formatter, which reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file (`deno fmt docs/`
+   and `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), and by two lines of
+   `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix; the test admits exactly those lines and fails on
+   any other naming of `docs/`. Any other naming file still counts.
 
 Every new rule prints the crates it added and why, and every failure in it chooses the full suite.
 
@@ -237,8 +244,10 @@ fixture case below is an arm of its check, and each named mutation must turn the
    entries by name alone (the two-version arm fails).
 4. Inert data: `CHANGELOG.md` named only by a listed `.tsv` takes the documentation lane; the same file unlisted runs
    the full suite; the workflow test fails when a script outside `docs/` names the listed file, its directory
-   (`docs/testing`), or `*.tsv`. Mutations: ignore the list (the unlisted arm fails); check only the file's own name
-   (the directory and pattern arms fail).
+   (`docs/testing`), `docs/`, or `*.tsv`, and passes on the repository's own tree, where `docs/testing` occurs only
+   inside longer paths. Mutations: ignore the list (the unlisted arm fails); check only the file's own name (the
+   directory and pattern arms fail); admit every naming of `docs/` (the `docs/` arm fails); match a directory as the
+   start of a longer path (the repository-tree arm fails).
 5. A change to `crates/Cargo.toml`, or a crate manifest change outside the admitted tables, runs the full suite.
    Mutation: admit `[package]` changes (the arm editing `[package]` fails).
 6. D8 join: on a recorded pair, an integration run and a failing run on `main` whose head commits have the same tree,
