@@ -207,16 +207,19 @@ not `full`.
    (`scripts/ci.sh:536–545`). The list is under `scripts/`, so a change to it runs the full suite, and a
    workflow test fails when a listed file is outside `docs/`, has another extension, or when any non-Markdown file
    outside `docs/` names the listed file, a directory below `docs/` that contains it (for example `docs/testing`), or a
-   pattern over its extension (for example `*.tsv`). A file names a directory when a whole path token, after any leading
-   `./`, `../` or `/`, is that directory's path followed by `/`, `/*` or `/**`, or, for a path of two or more segments,
-   the path alone; a longer path that starts with it does not count. A token ends at whitespace, a quote, a comma, a
-   brace or a final period, and a bracket at its edge. A pattern over the extension is a glob token whose last segment
-   ends in it, such as `*.tsv` or `docs/**/*.tsv`. Outside `docs/`, `docs/` itself is named only by the formatter, which
-   reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file (`deno fmt docs/` and
-   `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), by two lines of
-   `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix, and by the comment in `scripts/ci.sh` on the
-   shipping pack-set copy check, a content sweep the documentation lane runs that reads Markdown only; the test admits
-   exactly those lines and fails on any other naming of `docs/`. Any other naming file still counts.
+   pattern over its extension (for example `*.tsv`). A line names the listed file when it holds the file's name. A path
+   token is a run of letters, digits and the characters `_ . - / * ? [ ] { } ,`; its pieces are its parts between braces
+   and commas, and the parts between commas of each expansion of its brace lists, each without any leading `[`, `./`,
+   `../` or `/` or any trailing `]`, period or comma. A line names a directory when a piece is that directory's path
+   followed by `/`, `/*` or `/**`, or, for a path of two or more segments, the path alone; a longer path that starts with
+   it does not count. A line names a pattern over the extension when a piece's last segment holds `*`, `?` or `[` and
+   ends in the extension, such as `*.tsv`, `docs/**/*.tsv` or `*.{tsv,csv}`. Outside `docs/`, `docs/` itself is named
+   only by the formatter, which reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file
+   (`deno fmt docs/` and `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), by two
+   lines of `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix, and by the comment in `scripts/ci.sh` on
+   the shipping pack-set copy check, a content sweep the documentation lane runs that reads only `.rs`, `.py`, `.md`,
+   `.json` and `.toml` files; the test admits exactly those lines and fails on any other naming of `docs/`. Any other
+   naming file still counts.
 
 Every new rule prints the crates it added and why, and every failure in it chooses the full suite.
 
@@ -246,10 +249,11 @@ fixture case below is an arm of its check, and each named mutation must turn the
    entries by name alone (the two-version arm fails).
 4. Inert data: `CHANGELOG.md` named only by a listed `.tsv` takes the documentation lane; the same file unlisted runs
    the full suite; the workflow test fails when a script outside `docs/` names the listed file, its directory
-   (`docs/testing`), `docs/`, or `*.tsv`, and passes on the repository's own tree, where `docs/testing` occurs only
-   inside longer paths. Mutations: ignore the list (the unlisted arm fails); check only the file's own name (the
-   directory and pattern arms fail); admit every naming of `docs/` (the `docs/` arm fails); match a directory as the
-   start of a longer path (the repository-tree arm fails).
+   (`docs/testing`), `docs/`, or `*.tsv`, including inside a brace, bracket or comma list and after a variable, and
+   passes on the repository's own tree, where `docs/testing` occurs only inside longer paths. Mutations: ignore the list
+   (the listed arm fails); check only the file's own name (the directory and pattern arms fail); admit every naming of
+   `docs/` (the `docs/` arm fails); match a directory as the start of a longer path (the repository-tree arm fails);
+   take each path token whole (the list and variable arms fail).
 5. A change to `crates/Cargo.toml`, or a crate manifest change outside the admitted tables, runs the full suite.
    Mutation: admit `[package]` changes (the arm editing `[package]` fails).
 6. D8 join: on a recorded pair, an integration run and a failing run on `main` whose head commits have the same tree,
