@@ -494,7 +494,8 @@ and the watermark actually live.
 
 **Status: accepted (2026-10-19).** Refs #3696. Accepted on its own acceptance arm: the seven
 `namespace_move::partition_tests` fixtures named under Acceptance below pass on main as of
-2026-10-19.
+2026-10-19. The fixtures compile only with the `khive-db` `vectors` feature enabled
+(`cargo test -p khive-db --features vectors`); without it the module is absent and nothing runs.
 
 This amendment refines the route-key and derived-parent descriptions above for a
 domain's mirror atom and adds the partitioned vector destination rule. Amendment 1's
