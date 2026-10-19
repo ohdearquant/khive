@@ -13,6 +13,9 @@ description = "khive MCP server library — served via the kkernel binary"
 # The shared parser corpus is available only in a workspace checkout.
 exclude = ["tests/plan_conformance.rs"]
 
+[lib]
+bench = false
+
 [dependencies]
 khive-mounts = { version = "0.14.0", path = "../khive-mounts" }
 khive-pack-agent = { version = "0.14.0", path = "../khive-pack-agent", optional = true }
@@ -100,6 +103,7 @@ test-forward-seam = []
 test-channel-timing = ["channel-telegram", "khive-channel-telegram/test-support"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
 khive-score = { version = "0.14.0", path = "../khive-score" }
 toml = { workspace = true }
@@ -131,3 +135,7 @@ required-features = ["pack-telemetry"]
 [[test]]
 name = "web_backend_routing"
 required-features = ["pack-web"]
+
+[[bench]]
+name = "serve_startup"
+harness = false
