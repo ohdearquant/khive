@@ -699,7 +699,10 @@ excluded list. Its failure message names the tables without a rule.
 
 ## Amendment 4 (2026-10-04): edge relation routes
 
-**Status: Proposed.** Refs #4038.
+**Status: accepted (2026-10-19).** Refs #4038. Accepted on its own acceptance arm: the
+`namespace_move::edge_tests` fixtures for every bullet below pass on main as of 2026-10-19, and
+each of the five mutation controls in the seventh and ninth bullets made its unchanged fixture
+fail on main as of 2026-10-19 and pass again after exact restoration.
 
 This route grammar serves relation-specific namespace moves in #4038, whose acceptance requires
 exact relation routes with an order-independent bare-edge fallback, refusal of unrouted relations
