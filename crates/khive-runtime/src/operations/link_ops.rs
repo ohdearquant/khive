@@ -586,7 +586,12 @@ impl KhiveRuntime {
                 self.resolve_edge_endpoint(token, target_id).await?,
             ) {
                 (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
-                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
+                    Self::prepare_link_metadata(
+                        relation,
+                        Some(&src_e.kind),
+                        Some(&tgt_e.kind),
+                        metadata,
+                    )
                 }
                 _ => metadata,
             }
@@ -702,6 +707,28 @@ impl KhiveRuntime {
         .map(|result| result.edge)
     }
 
+    /// Apply dependency defaults using entity kinds resolved by the caller.
+    ///
+    /// Only `depends_on` uses the shared inference table. Explicit metadata is
+    /// preserved, including invalid values for the write boundary to reject.
+    /// Missing kinds and pairs without a default leave metadata unchanged.
+    /// This does not validate endpoints or make their kinds a write precondition.
+    /// Both the local link route and the coordinator route use this preparation
+    /// before writing; each retains its existing validation responsibilities.
+    pub fn prepare_link_metadata(
+        relation: EdgeRelation,
+        source_entity_kind: Option<&str>,
+        target_entity_kind: Option<&str>,
+        metadata: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        match (relation, source_entity_kind, target_entity_kind) {
+            (EdgeRelation::DependsOn, Some(source), Some(target)) => {
+                merge_dependency_kind(source, target, metadata)
+            }
+            _ => metadata,
+        }
+    }
+
     /// Policy-aware cross-backend form of [`Self::link_observed`]. Endpoint
     /// validation remains the coordinator's responsibility; mutation
     /// classification and tombstone handling stay inside the source store.
@@ -726,6 +753,27 @@ impl KhiveRuntime {
             canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
         let (source_id, target_id) = (canonical_source, canonical_target);
         validate_edge_metadata(relation, metadata.as_ref())?;
+        let metadata = if relation == EdgeRelation::DependsOn && target_backend.is_none() {
+            // Same-backend coordinator calls have both records here. Cross-backend
+            // callers prepare metadata from records on their respective runtimes.
+            // As on the local route, resolution is by-ID and namespace-unfiltered.
+            match (
+                self.resolve_edge_endpoint(token, source_id).await?,
+                self.resolve_edge_endpoint(token, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(source)), Some(Resolved::Entity(target))) => {
+                    Self::prepare_link_metadata(
+                        relation,
+                        Some(&source.kind),
+                        Some(&target.kind),
+                        metadata,
+                    )
+                }
+                _ => metadata,
+            }
+        } else {
+            metadata
+        };
         let now = chrono::Utc::now();
         let ns = token.namespace().as_str();
         let edge = Edge {
