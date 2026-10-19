@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the tables in the developer guide that restate facts the tree holds.
+"""Validate documentation tables that restate facts the tree holds.
 
 The guide (``CLAUDE.md``) keeps two kinds of table that can be derived from
 the repository, so drift in either is a failing check rather than a reading:
@@ -35,8 +35,11 @@ import tomllib
 
 
 GUIDE = "CLAUDE.md"
+AGENT_GUIDE = "AGENTS.md"
 DIRECTORY_MAP_HEADING = "## Directory map"
 VERB_TABLE_HEADING_RE = re.compile(r"^### (?P<name>[A-Za-z]+) pack verbs \(")
+AGENT_TABLE_HEADING_RE = re.compile(r"^### (?P<name>[A-Za-z]+) pack — \d+ verbs\b")
+VERB_TABLE_CANDIDATE_RE = re.compile(r"^### .*\bverbs\b")
 ROW_RE = re.compile(r"^\|")
 SEPARATOR_RE = re.compile(r"^\|\s*:?-{3,}")
 CODE_RE = re.compile(r"`([^`]*)`")
@@ -91,7 +94,15 @@ def _section(lines: list[str], start: int) -> list[tuple[int, str]]:
     return section
 
 
-def _table_rows(section: list[tuple[int, str]]) -> tuple[Row, ...]:
+def _parse_error(message: str, errors: list[str] | None) -> None:
+    if errors is None:
+        raise ValueError(message)
+    errors.append(message)
+
+
+def _table_rows(
+    section: list[tuple[int, str]], *, source: str = GUIDE, errors: list[str] | None = None
+) -> tuple[Row, ...]:
     """The body rows of the first table in a section: header and separator are skipped."""
     rows: list[Row] = []
     seen_separator = False
@@ -104,18 +115,29 @@ def _table_rows(section: list[tuple[int, str]]) -> tuple[Row, ...]:
             seen_separator = True
             continue
         if seen_separator:
-            rows.append(Row(number, split_row(line)))
+            try:
+                rows.append(Row(number, split_row(line)))
+            except ValueError as exc:
+                _parse_error(f"{source}:{number}: {exc}", errors)
     return tuple(rows)
 
 
-def parse_verb_tables(text: str) -> list[VerbTable]:
+def parse_verb_tables(
+    text: str,
+    *,
+    source: str = GUIDE,
+    heading_re: re.Pattern[str] = VERB_TABLE_HEADING_RE,
+    errors: list[str] | None = None,
+) -> list[VerbTable]:
     lines = text.split("\n")
     tables = []
     for index, line in enumerate(lines):
-        match = VERB_TABLE_HEADING_RE.match(line)
+        match = heading_re.match(line)
         if match:
-            rows = _table_rows(_section(lines, index))
+            rows = _table_rows(_section(lines, index), source=source, errors=errors)
             tables.append(VerbTable(index + 1, match.group("name").lower(), rows))
+        elif VERB_TABLE_CANDIDATE_RE.match(line):
+            _parse_error(f"{source}:{index + 1}: unsupported verb-table heading: {line!r}", errors)
     return tables
 
 
@@ -146,16 +168,45 @@ def documented_params(cell: str) -> list[tuple[str, bool]]:
     params = []
     depth = 0
     position = 0
+
+    def scan_prose(start: int, end: int) -> None:
+        nonlocal depth
+        for index in range(start, end):
+            char = cell[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    raise ValueError(f"unmatched ')' at column {index + 1}")
+                depth -= 1
+            elif char == "`":
+                raise ValueError(f"unclosed code span at column {index + 1}")
+
     for match in CODE_RE.finditer(cell):
-        outside = cell[position : match.start()]
-        depth += outside.count("(") - outside.count(")")
+        scan_prose(position, match.start())
         position = match.end()
         if depth > 0:
             continue
         param = PARAM_RE.match(match.group(1))
-        if param:
-            params.append((param.group("name"), param.group("optional") is not None))
+        if not param:
+            raise ValueError(
+                f"invalid parameter code span {match.group(1)!r} at column {match.start() + 1}"
+            )
+        params.append((param.group("name"), param.group("optional") is not None))
+    scan_prose(position, len(cell))
+    if depth:
+        raise ValueError("unclosed annotation '('")
     return params
+
+
+def _row_params(row: Row, verb: str, source: str = GUIDE) -> list[tuple[str, bool]]:
+    where = f"{source}:{row.line}: {verb} Args"
+    if len(row.cells) < 2:
+        raise ValueError(f"{where}: missing Args column")
+    try:
+        return documented_params(row.cells[1])
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
 
 
 def registry_verbs(verbs_result: object) -> dict[str, dict[str, str]]:
@@ -190,15 +241,20 @@ def signature_params(verb: str, signature: str) -> dict[str, bool]:
     return params
 
 
-def validate_guide_verb_tables(repo_root: Path, verbs_result: object) -> list[str]:
+def validate_guide_verb_tables(
+    repo_root: Path, verbs_result: object, *, source: str = GUIDE
+) -> list[str]:
     registry = registry_verbs(verbs_result)
-    text = (repo_root / GUIDE).read_text(encoding="utf-8")
-    tables = parse_verb_tables(text)
+    text = (repo_root / source).read_text(encoding="utf-8")
     errors: list[str] = []
+    agent_inventory = source == AGENT_GUIDE
+    heading_re = AGENT_TABLE_HEADING_RE if agent_inventory else VERB_TABLE_HEADING_RE
+    tables = parse_verb_tables(text, source=source, heading_re=heading_re, errors=errors)
     if not tables:
-        return [f"{GUIDE} has no '### <Name> pack verbs' table"]
+        form = "### <Name> pack — <count> verbs" if agent_inventory else "### <Name> pack verbs"
+        return errors or [f"{source} has no {form!r} table"]
     for table in tables:
-        where = f"{GUIDE}:{table.line}"
+        where = f"{source}:{table.line}"
         if table.pack not in registry:
             errors.append(f"{where}: no loaded pack {table.pack!r} reports verbs")
             continue
@@ -210,32 +266,40 @@ def validate_guide_verb_tables(repo_root: Path, verbs_result: object) -> list[st
         for row in table.rows:
             verb = _only_code(row.cells[0])
             if verb is None:
-                errors.append(f"{GUIDE}:{row.line}: verb cell is not one code span: {row.cells[0]!r}")
+                errors.append(f"{source}:{row.line}: verb cell is not one code span: {row.cells[0]!r}")
                 continue
             if verb in documented:
-                errors.append(f"{GUIDE}:{row.line}: {verb} is listed twice")
+                errors.append(f"{source}:{row.line}: {verb} is listed twice")
                 continue
             documented[verb] = row
         for verb in sorted(set(pack_verbs) - set(documented)):
             errors.append(f"{where}: the {table.pack} table has no row for {verb}")
         for verb in sorted(set(documented) - set(pack_verbs)):
             errors.append(
-                f"{GUIDE}:{documented[verb].line}: {verb} is not a {table.pack} verb in the registry"
+                f"{source}:{documented[verb].line}: {verb} is not a {table.pack} verb in the registry"
             )
+        # The agent inventory has descriptions and usage guidance, not an Args column.
+        if agent_inventory:
+            continue
         for verb, row in documented.items():
-            if verb not in pack_verbs or len(row.cells) < 2:
+            try:
+                params = _row_params(row, verb, source)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            if verb not in pack_verbs:
                 continue
             try:
                 signature = signature_params(verb, pack_verbs[verb])
             except ValueError as exc:
-                errors.append(f"{GUIDE}:{row.line}: {exc}")
+                errors.append(f"{source}:{row.line}: {exc}")
                 continue
-            for name, written_optional in documented_params(row.cells[1]):
+            for name, written_optional in params:
                 if name not in signature:
-                    errors.append(f"{GUIDE}:{row.line}: {verb} has no parameter {name!r}")
+                    errors.append(f"{source}:{row.line}: {verb} has no parameter {name!r}")
                 elif written_optional and signature[name]:
                     errors.append(
-                        f"{GUIDE}:{row.line}: {verb} requires {name!r} but the guide writes {name}?"
+                        f"{source}:{row.line}: {verb} requires {name!r} but the guide writes {name}?"
                     )
     return errors
 
@@ -287,6 +351,11 @@ def missing_rows(repo_root: Path, verbs_result: object) -> list[str]:
         out.append(f"| `crates/{name}` | {description} |")
     registry = registry_verbs(verbs_result)
     for table in parse_verb_tables(text):
+        for row in table.rows:
+            verb = _only_code(row.cells[0])
+            if verb is None:
+                raise ValueError(f"{GUIDE}:{row.line}: verb cell is not one code span: {row.cells[0]!r}")
+            _row_params(row, verb)
         documented = {_only_code(row.cells[0]) for row in table.rows}
         for verb, signature in sorted(registry.get(table.pack, {}).items()):
             if verb in documented:
