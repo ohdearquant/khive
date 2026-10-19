@@ -237,7 +237,7 @@ def main():
 
         # verbs: verb discovery introspection.
         # Result shape: {"verbs": list, "total": int, "pack_counts": object}.
-        # Each entry has verb, pack, description, category (handler_defs.rs:735-742).
+        # handler_defs::handle_verbs reports verb, pack, description, category and signature.
         verbs_result = call_verb(proc, "verbs", {})
         assert "verbs" in verbs_result, f"verbs must return 'verbs' key: {verbs_result}"
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
@@ -271,12 +271,15 @@ def main():
             "published verb/pack counts drifted from the live registry:\n"
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
-        guide_table_errors = validate_guide_verb_tables(
-            Path(__file__).resolve().parent.parent,
-            verbs_result,
-        )
+        guide_table_errors = [
+            error
+            for source in ("CLAUDE.md", "AGENTS.md")
+            for error in validate_guide_verb_tables(
+                Path(__file__).resolve().parent.parent, verbs_result, source=source
+            )
+        ]
         assert not guide_table_errors, (
-            "CLAUDE.md pack verb tables drifted from the live registry:\n"
+            "published pack verb tables drifted from the live registry:\n"
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
@@ -382,12 +385,12 @@ def main():
         assert "comm.mark_read" in verb_names, (
             f"'comm.mark_read' (#1387) must appear in verbs listing: {verb_names}"
         )
-        # each entry carries verb, pack, description, category per handler_defs.rs:735-742
+        # Keep the handler_defs::handle_verbs entry shape, including its compact signature.
         first = verbs_result["verbs"][0]
-        for key in ("verb", "pack", "description", "category"):
+        for key in ("verb", "pack", "description", "category", "signature"):
             assert key in first, f"verb entry missing key {key!r}: {first}"
-        # pack= filter: handler_defs.rs:729 applies pack_name.eq_ignore_ascii_case(pk);
-        # each returned entry carries its "pack" field (handler_defs.rs:736).
+        # handle_verbs applies pack_name.eq_ignore_ascii_case to the pack filter;
+        # each returned entry carries its "pack" field.
         # Assertions must be non-vacuous: a pack=kg filter that was ignored would
         # return the full 74-verb list, so we verify the filter returns only kg verbs.
         kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})
