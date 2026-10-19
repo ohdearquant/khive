@@ -222,6 +222,7 @@ async fn scheduled_checkpoint_and_sidecar_recovery_bypass_an_active_floor() {
     pool.set_test_write_admission(0, |_| Ok(0));
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE payload (id INTEGER); INSERT INTO payload VALUES (1)")
         .unwrap();
     let wal = path.with_extension("db-wal");
@@ -239,7 +240,9 @@ async fn scheduled_checkpoint_and_sidecar_recovery_bypass_an_active_floor() {
         Ok(0)
     });
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(crate::SqliteError::CapacityFloor {
             available_bytes: 0,
             floor_bytes: 100,
@@ -369,6 +372,7 @@ async fn checkpoint_once_bypasses_an_active_floor_on_its_real_dedicated_connecti
     pool.set_test_write_admission(0, |_| Ok(0));
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE payload (id INTEGER); INSERT INTO payload VALUES (1)")
         .unwrap();
     let wal = path.with_extension("db-wal");
@@ -386,7 +390,9 @@ async fn checkpoint_once_bypasses_an_active_floor_on_its_real_dedicated_connecti
         Ok(0)
     });
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(crate::SqliteError::CapacityFloor {
             available_bytes: 0,
             floor_bytes: 100,

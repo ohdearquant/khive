@@ -29,8 +29,7 @@ fn setup() -> (Arc<ConnectionPool>, SqlAttachmentStore) {
     );
     pool.writer()
         .expect("writer")
-        .conn()
-        .execute_batch(ATTACHMENTS_DDL)
+        .autocommit(|conn| Ok(conn.execute_batch(ATTACHMENTS_DDL)?))
         .expect("attachment schema");
     let store = SqlAttachmentStore::new(pool.clone(), false);
     (pool, store)
@@ -126,13 +125,14 @@ async fn attachment_store_rejects_corrupt_negative_size_rows() {
     let record_uuid = Uuid::new_v4();
     pool.writer()
         .expect("writer")
-        .conn()
-        .execute(
-            "INSERT INTO attachments \
+        .autocommit(|conn| {
+            Ok(conn.execute(
+                "INSERT INTO attachments \
              (record_uuid, substrate, role, content_ref, size_bytes, created_at) \
              VALUES (?1, 'entity', 'content', ?2, -1, 123)",
-            rusqlite::params![record_uuid.to_string(), "e".repeat(64)],
-        )
+                rusqlite::params![record_uuid.to_string(), "e".repeat(64)],
+            )?)
+        })
         .expect("corrupt fixture");
 
     store

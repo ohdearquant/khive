@@ -47,7 +47,7 @@ writer-task acquisition class once per dequeued top-level request or successful
 [ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) defines
 the accepted contract. The drain-loop behavior below is implemented; the
 [SQLite disk admission](disk-admission.md) inventory records the remaining
-raw-connection boundaries, so this is not a claim of complete ADR conformance.
+admission boundaries, so this is not a claim of complete ADR conformance.
 
 The writer task does not sample free space when a caller enters the bounded
 channel. At execution time it acquires the shared volume lease, successfully

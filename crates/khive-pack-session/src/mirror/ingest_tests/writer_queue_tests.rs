@@ -10,12 +10,14 @@ fn write_queue_pool(db_path: std::path::PathBuf) -> Arc<khive_db::ConnectionPool
     let pool = Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
     {
         let w_conn = pool.writer().expect("writer");
-        for stmt in &SESSION_SCHEMA_PLAN_STMTS {
-            w_conn
-                .conn()
-                .execute_batch(stmt)
-                .expect("session schema stmt");
-        }
+        w_conn
+            .autocommit(|conn| {
+                for stmt in &SESSION_SCHEMA_PLAN_STMTS {
+                    conn.execute_batch(stmt).expect("session schema stmt");
+                }
+                Ok(())
+            })
+            .expect("session schema scope");
     }
     pool
 }

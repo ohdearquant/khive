@@ -42,8 +42,7 @@ impl Fixture {
         );
         pool.writer()
             .unwrap()
-            .conn()
-            .execute_batch(include_str!("../sql/notes-ddl.sql"))
+            .autocommit(|conn| Ok(conn.execute_batch(include_str!("../sql/notes-ddl.sql"))?))
             .unwrap();
         let store = SqlNoteStore::new(Arc::clone(&pool), dir.is_some());
         Self {
@@ -58,45 +57,46 @@ impl Fixture {
         self.pool
             .writer()
             .unwrap()
-            .conn()
-            .execute(
-                "INSERT INTO notes \
+            .autocommit(|conn| {
+                Ok(conn.execute(
+                    "INSERT INTO notes \
              (id, namespace, kind, status, name, content, salience, decay_factor, \
               expires_at, properties, created_at, updated_at, deleted_at, key, \
               strict_due_key, due_source) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                rusqlite::params![
-                    note.id.to_string(),
-                    note.namespace,
-                    note.kind,
-                    note.status,
-                    note.name,
-                    note.content,
-                    note.salience,
-                    note.decay_factor,
-                    note.expires_at,
-                    note.properties.as_ref().map(Value::to_string),
-                    note.created_at,
-                    note.updated_at,
-                    note.deleted_at,
-                    note.key,
-                    due_key,
-                    due_source,
-                ],
-            )
+                    rusqlite::params![
+                        note.id.to_string(),
+                        note.namespace,
+                        note.kind,
+                        note.status,
+                        note.name,
+                        note.content,
+                        note.salience,
+                        note.decay_factor,
+                        note.expires_at,
+                        note.properties.as_ref().map(Value::to_string),
+                        note.created_at,
+                        note.updated_at,
+                        note.deleted_at,
+                        note.key,
+                        due_key,
+                        due_source,
+                    ],
+                )?)
+            })
             .unwrap();
     }
 
     fn snapshot(&self, id: Uuid) -> Vec<rusqlite::types::Value> {
-        let reader = self.pool.writer().unwrap();
-        let mut statement = reader
-            .conn()
-            .prepare("SELECT rowid, * FROM notes WHERE id = ?1")
-            .unwrap();
-        let columns = statement.column_count();
-        statement
-            .query_row([id.to_string()], |row| {
-                (0..columns).map(|index| row.get(index)).collect()
+        self.pool
+            .writer()
+            .unwrap()
+            .autocommit(|conn| {
+                let mut statement = conn.prepare("SELECT rowid, * FROM notes WHERE id = ?1")?;
+                let columns = statement.column_count();
+                Ok(statement.query_row([id.to_string()], |row| {
+                    (0..columns).map(|index| row.get(index)).collect()
+                })?)
             })
             .unwrap()
     }
@@ -486,17 +486,16 @@ async fn retry_deadline_projections_follow_only_writes_to_next_attempt_at() {
     assert!(original_due.0.is_some());
     assert!(fixture.patch(note.id, &patch()).await.unwrap());
     assert_eq!(fixture.due_values(note.id), original_due);
-    fixture.pool.writer().unwrap().conn().execute_batch(
+    fixture.pool.writer().unwrap().autocommit(|conn| Ok(conn.execute_batch(
         "CREATE TRIGGER reject_unrelated_due_set BEFORE UPDATE OF strict_due_key, due_source ON notes \
          BEGIN SELECT RAISE(ABORT, 'unrelated patch set due columns'); END;"
-    ).unwrap();
+    )?)).unwrap();
     assert!(fixture.patch(note.id, &patch()).await.unwrap());
     fixture
         .pool
         .writer()
         .unwrap()
-        .conn()
-        .execute_batch("DROP TRIGGER reject_unrelated_due_set")
+        .autocommit(|conn| Ok(conn.execute_batch("DROP TRIGGER reject_unrelated_due_set")?))
         .unwrap();
     for value in [
         json!("2026-10-10T09:30:00.123+02:00"),
@@ -615,11 +614,12 @@ async fn each_writer_route_preserves_statement_error_context_and_recovers() {
             .pool
             .writer()
             .unwrap()
-            .conn()
-            .execute_batch(
-                "CREATE TRIGGER reject_patch BEFORE UPDATE OF properties ON notes \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "CREATE TRIGGER reject_patch BEFORE UPDATE OF properties ON notes \
              BEGIN SELECT RAISE(ABORT, 'patch refused by fixture'); END;",
-            )
+                )?)
+            })
             .unwrap();
         let before = fixture.snapshot(note.id);
         let error = fixture.patch(note.id, &patch()).await.unwrap_err();
@@ -665,8 +665,7 @@ async fn each_writer_route_preserves_statement_error_context_and_recovers() {
             .pool
             .writer()
             .unwrap()
-            .conn()
-            .execute_batch("DROP TRIGGER reject_patch")
+            .autocommit(|conn| Ok(conn.execute_batch("DROP TRIGGER reject_patch")?))
             .unwrap();
         assert!(
             fixture.patch(note.id, &patch()).await.unwrap(),

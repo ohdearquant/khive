@@ -143,30 +143,34 @@ async fn query_plans(rt: &KhiveRuntime, project: Uuid) {
     // connection for its write plan. EXPLAIN never executes the cursor write.
     let query = stmt("git_ingest_write_page_checkpoint", "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) VALUES(?1, ?2, ?3, ?4), (?1, ?5, ?6, ?4) ON CONFLICT(project_id, kind) DO UPDATE SET cursor_value=excluded.cursor_value, updated_at=excluded.updated_at", vec![SqlValue::Text(project.to_string()),SqlValue::Text("issues_checkpoint".into()),SqlValue::Text("{}".into()),SqlValue::Integer(0),SqlValue::Text("issues".into()),SqlValue::Text(timestamp(ISSUES-1))]);
     let writer = rt.backend().pool().try_writer().unwrap();
-    let mut prepared = writer
-        .conn()
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))
-        .unwrap();
-    let plan: Vec<Value> = prepared
-        .query_map(
-            (
-                project.to_string(),
-                "issues_checkpoint",
-                "{}",
-                0_i64,
-                "issues",
-                timestamp(ISSUES - 1),
-            ),
-            |row| {
-                Ok(
-                    json!({"id": row.get::<_, i64>(0)?, "parent": row.get::<_, i64>(1)?,
+    let plan: Vec<Value> = writer
+        .autocommit(|conn| {
+            let mut prepared = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))
+                .unwrap();
+            let plan = prepared
+                .query_map(
+                    (
+                        project.to_string(),
+                        "issues_checkpoint",
+                        "{}",
+                        0_i64,
+                        "issues",
+                        timestamp(ISSUES - 1),
+                    ),
+                    |row| {
+                        Ok(
+                            json!({"id": row.get::<_, i64>(0)?, "parent": row.get::<_, i64>(1)?,
             "aux": row.get::<_, i64>(2)?, "detail": row.get::<_, String>(3)?}),
+                        )
+                    },
                 )
-            },
-        )
-        .unwrap()
-        .map(|row| row.unwrap())
-        .collect();
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            Ok(plan)
+        })
+        .unwrap();
     println!(
         "DIGEST_SCALE_PLAN {}",
         json!({"label":query.label,"sql":query.sql,
@@ -218,7 +222,8 @@ async fn digest_scale_existing_tracker() {
         project = create(&registry, json!({"kind":"project","name":"fixture/repository",
             "properties":{"repo_slug":"github.com/fixture/repository","repo_url":"https://github.com/fixture/repository"}})).await;
         let writer = rt.backend().pool().try_writer().unwrap();
-        writer.conn().execute_batch(&format!(
+        writer.autocommit(|conn| {
+        conn.execute_batch(&format!(
             "BEGIN; \
              WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{UNRELATED}) \
              INSERT INTO notes(id,namespace,kind,name,content,properties,created_at,updated_at) \
@@ -229,13 +234,13 @@ async fn digest_scale_existing_tracker() {
              INSERT INTO graph_edges(namespace,id,source_id,target_id,relation,weight,created_at,updated_at) \
              SELECT namespace,replace(id,'10000000-','30000000-'),id,'{project}','annotates',1,created_at,updated_at FROM notes WHERE kind='issue'; COMMIT;"
         )).expect("seed exact fixture population");
-        let count: i64 = writer
-            .conn()
+        let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
             .unwrap();
         // Project creation is an entity; its audit records are in events, not notes.
         assert_eq!(count, (ISSUES + UNRELATED) as i64);
-        drop(writer);
+        Ok(())
+        }).unwrap();
         query_plans(&rt, project).await;
     }
 
@@ -249,8 +254,7 @@ async fn digest_scale_existing_tracker() {
                     .pool()
                     .try_writer()
                     .unwrap()
-                    .conn()
-                    .execute("DELETE FROM git_mirror_cursor", [])
+                    .autocommit(|conn| Ok(conn.execute("DELETE FROM git_mirror_cursor", [])?))
                     .unwrap();
             }
             std::fs::write(logs.join("pages.log"), "").unwrap();

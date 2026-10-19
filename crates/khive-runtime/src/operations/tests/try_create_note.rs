@@ -158,11 +158,12 @@ fn install_fts_insert_refusal(runtime: &KhiveRuntime, token: &NamespaceToken) {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .execute_batch(
-            "CREATE TRIGGER refuse_ingest_fts BEFORE INSERT ON fts_notes_rowids \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TRIGGER refuse_ingest_fts BEFORE INSERT ON fts_notes_rowids \
          BEGIN SELECT RAISE(ABORT, 'ingest FTS refusal'); END;",
-        )
+            )?)
+        })
         .expect("install actual FTS map refusal");
 }
 
@@ -366,22 +367,23 @@ async fn assert_model_failure(fault: ModelFault, expected_stage: &str) {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| {
-                let deny = match fault {
-                    ModelFault::Store => matches!(context.action,
+            .autocommit(|conn| {
+                Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+                    let deny = match fault {
+                        ModelFault::Store => matches!(context.action,
                         AuthAction::CreateVtable { table_name, .. } if table_name == table),
-                    ModelFault::Publication => matches!(context.action,
+                        ModelFault::Publication => matches!(context.action,
                         AuthAction::Insert { table_name } if table_name == table),
-                    ModelFault::Provider => false,
-                };
-                if deny {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    Authorization::Deny
-                } else {
-                    Authorization::Allow
-                }
-            }))
+                        ModelFault::Provider => false,
+                    };
+                    if deny {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }))?)
+            })
             .unwrap();
     }
     let result = runtime
@@ -399,8 +401,7 @@ async fn assert_model_failure(fault: ModelFault, expected_stage: &str) {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
             .unwrap();
         assert!(
             sql_faults.load(Ordering::SeqCst) > 0,
@@ -491,8 +492,7 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .execute_batch("DROP TABLE fts_notes")
+        .autocommit(|conn| Ok(conn.execute_batch("DROP TABLE fts_notes")?))
         .unwrap();
     let faults = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&faults);
@@ -501,21 +501,22 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .authorizer(Some(move |context: AuthContext<'_>| {
-            if matches!(
-                context.action,
-                AuthAction::CreateVtable {
-                    table_name: "fts_notes",
-                    ..
+        .autocommit(|conn| {
+            Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::CreateVtable {
+                        table_name: "fts_notes",
+                        ..
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
                 }
-            ) {
-                observed.fetch_add(1, Ordering::SeqCst);
-                Authorization::Deny
-            } else {
-                Authorization::Allow
-            }
-        }))
+            }))?)
+        })
         .unwrap();
     let result = runtime
         .try_create_note(
@@ -531,8 +532,7 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
     assert!(faults.load(Ordering::SeqCst) > 0);
     let (id, failures) = committed_failure(result.expect_err("FTS acquisition failure is visible"));

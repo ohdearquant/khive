@@ -65,16 +65,19 @@ async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
         let attempts = Arc::clone(&denied);
         let writer = runtime.backend().pool().writer().unwrap();
         writer
-            .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| match context.action {
-                AuthAction::Function { function_name }
-                    if function_name.eq_ignore_ascii_case("count") =>
-                {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Authorization::Deny
-                }
-                _ => Authorization::Allow,
-            }))
+            .autocommit(|conn| {
+                Ok(
+                    conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+                        AuthAction::Function { function_name }
+                            if function_name.eq_ignore_ascii_case("count") =>
+                        {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Authorization::Deny
+                        }
+                        _ => Authorization::Allow,
+                    }))?,
+                )
+            })
             .unwrap();
     }
     assert!(store
@@ -137,8 +140,7 @@ async fn entity_list_wrappers_skip_count_but_exact_consumers_retain_it() {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
     assert_eq!(
         store

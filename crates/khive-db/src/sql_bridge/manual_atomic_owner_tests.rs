@@ -172,6 +172,7 @@ fn pool(path: PathBuf, locks: &Path) -> ConnectionPool {
 fn create_probe(pool: &ConnectionPool) {
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch("CREATE TABLE manual_atomic_owner_probe (id INTEGER PRIMARY KEY)")
         .unwrap();
 }
@@ -291,6 +292,7 @@ async fn manual_atomic_owner_abort_retains_lease_permit_and_registry_until_settl
         let after_settlement = ownership(&primary, &lock);
         peer.writer()
             .unwrap()
+            .conn()
             .execute_batch("INSERT INTO manual_atomic_owner_probe VALUES (1)")
             .expect("same-volume peer must proceed after native settlement");
 

@@ -2,10 +2,7 @@
 #[serial_test::serial(config_ledger)]
 async fn idempotency_actor_namespace_and_delimiter_tuples_are_distinct() {
     let backend = khive_db::StorageBackend::memory().unwrap();
-    {
-        let mut writer = backend.pool().try_writer().unwrap();
-        khive_db::run_migrations(writer.conn_mut()).unwrap();
-    }
+    backend.pool().run_migrations().unwrap();
     let backend = Arc::new(backend);
     let (a, runtime) = actor_registry(Arc::clone(&backend), "actor:a", "local");
     let (b, _) = actor_registry(Arc::clone(&backend), "actor:a:b", "local");

@@ -512,25 +512,31 @@ async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only
     let f = fixture();
     let backend = khive_db::StorageBackend::sqlite_for_test(f._dir.path().join("gc.db")).unwrap();
     {
-        let mut writer = backend.pool().writer().unwrap();
-        let conn = writer.conn_mut();
-        conn.execute_batch(include_str!(
-            "../../../khive-db/sql/schema-migrations-table.sql"
-        ))
-        .unwrap();
-        for migration in khive_db::MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version <= 20)
-        {
-            let tx = conn.transaction().unwrap();
-            tx.execute_batch(migration.up).unwrap();
-            tx.execute(
+        backend
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit(|conn| {
+                conn.execute_batch(include_str!(
+                    "../../../khive-db/sql/schema-migrations-table.sql"
+                ))
+                .unwrap();
+                for migration in khive_db::MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version <= 20)
+                {
+                    let tx = conn.unchecked_transaction().unwrap();
+                    tx.execute_batch(migration.up).unwrap();
+                    tx.execute(
                 "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
                 (migration.version, migration.name),
             )
             .unwrap();
-            tx.commit().unwrap();
-        }
+                    tx.commit().unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
     }
     let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
         .await
@@ -544,25 +550,28 @@ async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only
     drop(owner);
     let reference = f.store.put(b"committed control".to_vec()).await.unwrap();
     {
-        let writer = backend.pool().writer().unwrap();
-        writer
-            .conn()
-            .execute_batch(
-                "INSERT INTO entities \
+        backend
+            .pool()
+            .writer()
+            .unwrap()
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO entities \
                  (id, namespace, kind, name, tags, created_at, updated_at, deleted_at) \
                  VALUES ('11111111-1111-4111-8111-111111111111', 'local', 'document', \
                          'live blob control', '[]', 1, 1, NULL);",
-            )
-            .unwrap();
-        writer
-            .conn()
-            .execute(
-                "INSERT INTO attachments \
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO attachments \
                  (record_uuid, substrate, role, content_ref, created_at) \
                  VALUES ('11111111-1111-4111-8111-111111111111', \
                          'entity', 'content', ?1, 1)",
-                [reference.as_str()],
-            )
+                    [reference.as_str()],
+                )
+                .unwrap();
+                Ok(())
+            })
             .unwrap();
     }
     let committed_path = f

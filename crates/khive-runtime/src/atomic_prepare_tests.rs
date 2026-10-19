@@ -1149,7 +1149,7 @@ async fn note_vectors_embed_false_purge_clears_provenance_across_models() {
             .pool()
             .try_writer()
             .expect("fixture writer");
-        let conn = writer.conn();
+        writer.autocommit(|conn| {
         let model_key = crate::config::sanitize_key(FOREIGN_MODEL);
         let sidecar: i64 = conn
             .query_row(
@@ -1165,7 +1165,8 @@ async fn note_vectors_embed_false_purge_clears_provenance_across_models() {
                 |row| row.get(0),
             )
             .unwrap();
-        (sidecar, vector)
+        Ok((sidecar, vector))
+        }).expect("inspect foreign vectors")
     };
     assert_eq!(foreign_count(&runtime), (1, 1));
     for model in [STUB_MODEL, SECOND_STUB_MODEL] {
@@ -1249,42 +1250,45 @@ async fn note_vectors_second_model_sidecar_failure_rolls_back_all_models() {
     fn persisted(runtime: &KhiveRuntime, model: &str, subject_id: Uuid) -> PersistedVector {
         let key = crate::config::sanitize_key(model);
         let writer = runtime.backend().pool().try_writer().expect("pool writer");
-        let conn = writer.conn();
-        let embedding_hex = conn
-            .query_row(
-                &format!(
-                    "SELECT hex(embedding) FROM vec_{key} \
+        writer
+            .autocommit(|conn| {
+                let embedding_hex = conn
+                    .query_row(
+                        &format!(
+                            "SELECT hex(embedding) FROM vec_{key} \
                          WHERE namespace=?1 AND subject_id=?2"
-                ),
-                rusqlite::params!["local", subject_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("read persisted vec0 embedding");
-        let (digest, fingerprint, updated_at) = conn
-            .query_row(
-                "SELECT embedding_digest, text_fingerprint, updated_at \
+                        ),
+                        rusqlite::params!["local", subject_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("read persisted vec0 embedding");
+                let (digest, fingerprint, updated_at) = conn
+                    .query_row(
+                        "SELECT embedding_digest, text_fingerprint, updated_at \
                      FROM vector_provenance \
                      WHERE model_key=?1 AND namespace=?2 AND subject_id=?3",
-                rusqlite::params![key, "local", subject_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read persisted model sidecar");
-        let ann_delete_count = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ann_write_log \
+                        rusqlite::params![key, "local", subject_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .expect("read persisted model sidecar");
+                let ann_delete_count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ann_write_log \
                      WHERE namespace=?1 AND embedding_model=?2 \
                      AND subject_id=?3 AND op='delete'",
-                rusqlite::params!["local", model, subject_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("read persisted ANN delete count");
-        PersistedVector {
-            embedding_hex,
-            digest,
-            fingerprint,
-            updated_at,
-            ann_delete_count,
-        }
+                        rusqlite::params!["local", model, subject_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("read persisted ANN delete count");
+                Ok(PersistedVector {
+                    embedding_hex,
+                    digest,
+                    fingerprint,
+                    updated_at,
+                    ann_delete_count,
+                })
+            })
+            .expect("inspect persisted vector")
     }
 
     let runtime = scratch_runtime();
@@ -1337,15 +1341,14 @@ async fn note_vectors_second_model_sidecar_failure_rolls_back_all_models() {
     {
         let writer = runtime.backend().pool().try_writer().expect("pool writer");
         writer
-            .conn()
-            .execute_batch(&format!(
+            .autocommit(|conn| Ok(conn.execute_batch(&format!(
                 "CREATE TRIGGER fail_second_note_vector_sidecar_delete \
                      BEFORE DELETE ON vector_provenance \
                      WHEN OLD.model_key='{}' AND OLD.namespace='local' \
                       AND OLD.subject_id='{}' \
                      BEGIN SELECT RAISE(ABORT, 'injected second-model sidecar delete failure'); END;",
                 keys[1], note.id
-            ))
+            ))?))
             .expect("install second-model sidecar fault");
     }
 

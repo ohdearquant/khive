@@ -144,7 +144,14 @@ async fn khive_db_counts_match_the_tool_packs_own_liveness_and_expiry_reads() {
     )
     .at(now);
     let writer = runtime.backend().pool().writer().expect("writer");
-    let counts = move_namespace(writer.conn(), &request).expect("the registered tool moves");
+    let counts = writer
+        .transaction(|conn| {
+            move_namespace(conn, &request).map_err(|error| match error {
+                khive_db::namespace_move::MoveError::Sqlite(error) => error.into(),
+                error => khive_db::SqliteError::InvalidData(error.to_string()),
+            })
+        })
+        .expect("the registered tool moves");
 
     assert_eq!(counts.left_behind.get("tool_policy"), Some(&3));
     assert_eq!(counts.left_behind.get("tool_grants"), Some(&8));

@@ -512,7 +512,9 @@ async fn active_reader_cancellation_bypasses_an_active_floor_and_reuses_the_conn
         Ok(0)
     });
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(crate::SqliteError::CapacityFloor {
             available_bytes: 0,
             floor_bytes: 100,

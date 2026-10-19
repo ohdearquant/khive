@@ -21,7 +21,9 @@ fn set_merge_event_refusal(rt: &KhiveRuntime, kind: &str, refuse: bool) {
     } else {
         "DROP TRIGGER reject_merge_event".to_string()
     };
-    guard.conn().execute_batch(&sql).expect("set event fault");
+    guard
+        .autocommit(|conn| Ok(conn.execute_batch(&sql)?))
+        .expect("set event fault");
 }
 
 async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
@@ -2457,10 +2459,12 @@ async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
     tokio::task::spawn_blocking(move || {
         let guard = pool.writer().expect("writer connection");
         guard
-            .execute(
-                "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![future_micros, id_str],
-            )
+            .autocommit(|conn| {
+                Ok(conn.execute(
+                    "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![future_micros, id_str],
+                )?)
+            })
             .expect("force future revision")
     })
     .await
@@ -5383,12 +5387,13 @@ async fn merge_entity_tombstones_source_with_provenance() {
         tokio::task::spawn_blocking(move || {
             let guard = pool.writer().unwrap();
             guard
-                .conn()
-                .query_row(
-                    "SELECT deleted_at, merged_into FROM entities WHERE id = ?1",
-                    [from_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
+                .autocommit(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT deleted_at, merged_into FROM entities WHERE id = ?1",
+                        [from_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?)
+                })
                 .unwrap()
         })
         .await

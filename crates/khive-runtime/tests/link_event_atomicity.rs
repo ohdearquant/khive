@@ -854,8 +854,7 @@ async fn unknown_link_usage() {
         // file-backed route opens an independent standalone writer instead.
         pool.writer()
             .unwrap()
-            .conn()
-            .authorizer(Some(deny))
+            .autocommit(|conn| Ok(conn.authorizer(Some(deny))?))
             .unwrap();
     }
     let error = scope(

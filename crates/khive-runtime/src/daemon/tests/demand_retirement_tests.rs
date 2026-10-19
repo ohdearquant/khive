@@ -168,7 +168,6 @@ fn pool_transaction_probe_detects_own_and_ignores_foreign_database() {
             Ok(())
         })
         .unwrap();
-    drop(own_writer);
     assert!(!pool_has_open_transaction(&own));
 
     let foreign_writer = foreign.writer().unwrap();
@@ -182,7 +181,6 @@ fn pool_transaction_probe_detects_own_and_ignores_foreign_database() {
             Ok(())
         })
         .unwrap();
-    drop(foreign_writer);
     assert!(!pool_has_open_transaction(&foreign));
 }
 

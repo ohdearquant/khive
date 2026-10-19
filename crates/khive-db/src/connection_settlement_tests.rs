@@ -92,6 +92,7 @@ fn exercise_owner(root: &Path, owner: &str, terminal: bool) {
     .unwrap();
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
         .unwrap();
     match owner {
@@ -107,7 +108,6 @@ fn exercise_owner(root: &Path, owner: &str, terminal: bool) {
                 matches!(result, Err(SqliteError::WriterSettlementUnknown)),
                 "the failed rollback is a typed unknown outcome"
             );
-            drop(writer);
             assert!(pool.try_writer().is_err());
         }
         "standalone" => {
