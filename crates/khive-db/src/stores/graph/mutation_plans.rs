@@ -12,6 +12,7 @@ use khive_types::EdgeRelation;
 use uuid::Uuid;
 
 use crate::sql_bridge::bind_params;
+use crate::stores::event;
 
 use super::edge_statements::edge_soft_delete_statement;
 use super::edge_upserts::{
@@ -608,7 +609,7 @@ where
         ));
     }
     for event in &events {
-        crate::stores::event::append_event_in_transaction(conn, event).map_err(|error| {
+        event::append_event_in_transaction(conn, event).map_err(|error| {
             StorageError::driver(StorageCapability::Events, GRAPH_MUTATION_EVENTS_OP, error)
         })?;
     }
