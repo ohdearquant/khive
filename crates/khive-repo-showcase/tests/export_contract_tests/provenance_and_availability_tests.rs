@@ -28,6 +28,46 @@ fn edge_provenance_invariant_is_enforced_by_rust_and_schema() {
 }
 
 #[test]
+fn graph_edge_weight_boundaries_preserve_bits_and_error_precedence() {
+    let edge = serde_json::json!({
+        "id": "edge",
+        "source": "source",
+        "target": "target",
+        "relation": "contains",
+        "weight": 0.5,
+        "origin": "ingested",
+        "derivation": null
+    });
+    for weight in [-0.0_f64, 0.0, f64::from_bits(1), 0.5, 1.0] {
+        let mut value = edge.clone();
+        value["weight"] = serde_json::json!(weight);
+        let decoded = serde_json::from_value::<GraphEdge>(value).unwrap();
+        assert_eq!(decoded.weight.to_bits(), weight.to_bits());
+    }
+    for weight in [-f64::from_bits(1), 1.5] {
+        let mut value = edge.clone();
+        value["weight"] = serde_json::json!(weight);
+        let error = serde_json::from_value::<GraphEdge>(value).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("graph edge weight must be a finite value in [0,1]"),
+            "{error}"
+        );
+    }
+    let mut both_invalid = edge;
+    both_invalid["weight"] = serde_json::json!(1.5);
+    both_invalid["origin"] = serde_json::json!("derived");
+    let error = serde_json::from_value::<GraphEdge>(both_invalid).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("graph edge weight must be a finite value in [0,1]"),
+        "{error}"
+    );
+}
+
+#[test]
 fn completed_empty_is_distinct_from_skipped() {
     let (_dir, mut request) = fixture();
     if let Availability::Available { value } = &mut request.provenance.git_digest {
