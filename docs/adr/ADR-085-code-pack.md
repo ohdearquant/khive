@@ -2098,6 +2098,24 @@ Every Unix host gate includes **both directions** for close, whole-file unlock a
 
 Unix and Windows gates keep Amendment 12's native identity and alias refusal, protected-file presence, bytes, size and modification time, prior-WAL transition, hot-journal recovery, DELETE rebase concurrency and zero-`xShm*` controls. Unix also keeps the retained-handle pin controls of the 2026-10-05 ledger correction. Windows also runs the Channel access arm against the named pipe. Non-adversarial quarantine occupancy stays zero. Record the exact source revision, commands and selected tests, OS and filesystem, the actual open, unlock and close events and independent before-and-after lock observations.
 
+### Probe record (2026-10-19)
+
+Sequencing step 1. The routing-free probe of the Executable acceptance section ran at source commit `abf9b9e236b191130736e430c19a2997fb21713e` (#5756) on main `a48cf947db04dfe108ab4aa611e93713feb6112d`, with the bundled SQLite 3.53.2, the stock `unix` VFS on the Unix hosts and rollback journal mode. The probe lives in `crates/khive-db/tests/lock_mechanism_probe.rs` and its `unix`, `windows` and `stale_path` modules. Each case runs once with the second client and once without it as the survival control. Every observation comes from a child process, the test binary re-executed, whose process id differs from the holder's: `F_GETLK` for a write lock on Unix, which reports the conflicting type, range and process id, and a nonblocking exclusive `LockFileEx` on Windows, which reports a conflict but not its owner.
+
+Commands: on Linux and macOS, `cargo test --locked -p khive-db -- <names>` selecting the three Unix cases and the stale-path case by name, with each test's assertions as the observation check; on Windows, the CI steps run `cargo test -p khive-db --test lock_mechanism_probe <case> -- --exact --nocapture`, which prints every observation.
+
+Hosts: Linux x86_64, Ubuntu 24.04, kernel 6.8, fixtures on ext4; macOS 27.0.1 arm64, fixtures on APFS; Windows on the hosted runner, fixtures on NTFS (GitHub Actions run 39192177229).
+
+- `unix::unix_second_raw_descriptor_close_releases_process_lock`, Linux and macOS: lost. Byte 0's write lock reads unlocked after the second descriptor closes; the control keeps it.
+- `unix::unix_default_vfs_last_shared_unlock_releases_unrelated_byte`, Linux and macOS: lost. Byte 0 is held during the default reader's transaction and reads unlocked after its COMMIT, before its close; the control keeps it.
+- `unix::unix_default_reader_downgrades_process_write_lock`, Linux and macOS: replaced. The write lock at `SHARED_FIRST` reads as a read lock over the reader's 510-byte shared range, then unlocked after COMMIT; the control keeps the write lock.
+- `windows::windows_handle_interaction_does_not_release_another_handles_lock`, Windows: survives. The second handle's shared lock request and its unlock are both refused (`ERROR_LOCK_VIOLATION`, `ERROR_NOT_LOCKED`); the owner's lock reads as a conflict before, during and after the second handle's close, and unlocked only after the owner's own unlock; the control matches.
+- `stale_path::stale_path_truncate_after_rename_changes_the_replacement_while_original_lock_survives`, Linux and macOS: the replacement is emptied, and the renamed original keeps its lock and its row; the control keeps both. Windows: the replacement is emptied (8192 bytes to 0); the renamed original reads as a conflict before and after the stale client, unlocked only after its owner releases it, and keeps its row; the control keeps the replacement's 8192 bytes.
+
+Each Unix and stale-path case also ran with a deliberate defect, and each failed at the phase its defect predicts (Linux and macOS alike): the second descriptor leaked instead of closed (the lock still reads write where the loss arm expects unlocked); the observer asking for a read lock (the downgraded range no longer conflicts, so it reads unlocked where read is expected); the reader's transaction touching no table (no shared lock is taken, so byte 0 stays write-locked after COMMIT); and the stale-path client opening without truncation (the replacement keeps its bytes). These four controls show the observations depend on the second client's operation and on the observer's request, and are not fixed outcomes of the fixture.
+
+The three Unix losses are reproduced on both Unix hosts. On Windows a second handle cannot take, unlock or release the owner's byte-range lock, which is the survival this section expects there.
+
 ### Sequencing
 
 1. **Probe.** The routing-free probe under Acceptance runs, and its results are recorded beside this text.
