@@ -126,6 +126,20 @@ pub(super) async fn embed_cosine_scores(
     ))
 }
 
+fn blend_and_rank(hits: &mut [ScoredHit], cosines: impl IntoIterator<Item = f32>, alpha: f32) {
+    let max_score = hits
+        .iter()
+        .map(|hit| hit.score)
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    for (hit, cosine) in hits.iter_mut().zip(cosines) {
+        let normalized_score = hit.score / max_score;
+        hit.score = alpha * normalized_score + (1.0 - alpha) * cosine.max(0.0);
+        hit.provenance.embedding_rerank = true;
+    }
+    hits.sort_by(compare_scored_hits);
+}
+
 pub(super) async fn rerank_with_embeddings(
     runtime: &KhiveRuntime,
     query: &str,
@@ -141,17 +155,7 @@ pub(super) async fn rerank_with_embeddings(
         .map(|h| format!("{} {}", h.name, h.content.as_deref().unwrap_or("")))
         .collect();
     if let Some(cosines) = embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
-        let max_tfidf = hits
-            .iter()
-            .map(|h| h.score)
-            .fold(0.0f32, f32::max)
-            .max(1e-6);
-        for (hit, cos) in hits.iter_mut().zip(cosines.iter()) {
-            let norm_tfidf = hit.score / max_tfidf;
-            hit.score = alpha * norm_tfidf + (1.0 - alpha) * cos.max(0.0);
-            hit.provenance.embedding_rerank = true;
-        }
-        hits.sort_by(compare_scored_hits);
+        blend_and_rank(hits, cosines, alpha);
         return Ok(true);
     }
     Ok(false)
@@ -288,18 +292,11 @@ pub(super) async fn rerank_search_from_store(
     }
 
     let from_stored = hits.len() - fallback_indices.len();
-    let max_score = hits
-        .iter()
-        .map(|hit| hit.score)
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
-    for (hit, vector) in hits.iter_mut().zip(candidate_vectors) {
+    let cosines = candidate_vectors.into_iter().map(|vector| {
         let vector = vector.expect("every rerank candidate has a stored or fallback vector");
-        let cosine = cosine_similarity(query_vector, &vector, false);
-        hit.score = alpha * (hit.score / max_score) + (1.0 - alpha) * cosine.max(0.0);
-        hit.provenance.embedding_rerank = true;
-    }
-    hits.sort_by(compare_scored_hits);
+        cosine_similarity(query_vector, &vector, false)
+    });
+    blend_and_rank(hits, cosines, alpha);
     Ok(Some(json!({
         "stored_vector_lookup": stored_vector_lookup,
         "candidates": hits.len(),
