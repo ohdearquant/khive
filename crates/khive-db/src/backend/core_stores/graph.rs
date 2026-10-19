@@ -2,10 +2,7 @@ use super::super::StorageBackend;
 use super::map_open_error;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, GraphStore, SymmetricEdgeUpdateOutcome,
-    SymmetricEdgeUpdateRequest,
-};
+use khive_storage::graph::{GraphStore, SymmetricEdgeUpdateOutcome, SymmetricEdgeUpdateRequest};
 use khive_storage::types::EdgeEndpointBaseCounts;
 use khive_storage::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Edge, EdgeFilter, EdgeSeekPage,
@@ -62,17 +59,6 @@ impl GraphStore for StorageBackend {
         self.graph()
             .map_err(|error| map_open_error(error, StorageCapability::Graph, "graph"))?
             .insert_edge_if_absent(_edge)
-            .await
-    }
-
-    async fn insert_commit_annotation_if_absent(
-        &self,
-        _edge: Edge,
-        _guard: CommitAnnotationGuard,
-    ) -> StorageResult<CommitAnnotationInsertOutcome> {
-        self.graph()
-            .map_err(|error| map_open_error(error, StorageCapability::Graph, "graph"))?
-            .insert_commit_annotation_if_absent(_edge, _guard)
             .await
     }
 

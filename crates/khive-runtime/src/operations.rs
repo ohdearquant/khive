@@ -13,7 +13,6 @@ use uuid::Uuid;
 #[cfg(test)]
 use khive_score::DeterministicScore;
 use khive_storage::entity::EntityTypeCounts;
-use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 #[cfg(test)]
 use khive_storage::graph::{SymmetricEdgeUpdateOutcome, SymmetricEdgeUpdateRequest};
 use khive_storage::note::Note;
