@@ -866,7 +866,7 @@ class Kkernel:
         self.config = workdir / "config.toml"
         self.config.write_text("")
 
-    def exec(self, ops):
+    def exec(self, ops, *, expected_count=1):
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.home),
@@ -893,6 +893,10 @@ class Kkernel:
             outcomes = payload["results"]
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             raise Full(f"kkernel exec printed no result payload: {error}") from error
+        if not isinstance(outcomes, list):
+            raise Full("kkernel exec returned results that are not a list")
+        if len(outcomes) != expected_count:
+            raise Full(f"kkernel exec returned {len(outcomes)} outcomes for {expected_count} ops")
         values = []
         for outcome in outcomes:
             if not isinstance(outcome, dict) or outcome.get("ok") is not True:
@@ -992,11 +996,32 @@ def closure(kernel, changed, by_name):
                 f"max_depth=1, limit={DEPS_LIMIT})"
                 for ident in chunk
             )
-            for ident, graph in zip(chunk, kernel.exec(f"[{ops}]")):
+            graphs = kernel.exec(f"[{ops}]", expected_count=len(chunk))
+            for ident, graph in zip(chunk, graphs):
                 if not isinstance(graph, dict) or graph.get("truncated") is not False:
                     raise Full(f"code.deps from {name_of.get(ident, ident)} was truncated or malformed")
-                kinds = {node.get("id"): node.get("kind") for node in graph.get("nodes", [])}
-                for edge in graph.get("edges", []):
+                origin = name_of.get(ident, ident)
+                if graph.get("map") != MAP_NAME:
+                    raise Full(f"code.deps from {origin} returned wrong map: {graph.get('map')!r}")
+                if graph.get("root") != ident:
+                    raise Full(f"code.deps from {origin} returned wrong root: {graph.get('root')!r}")
+                nodes, edges = graph.get("nodes"), graph.get("edges")
+                if not isinstance(nodes, list):
+                    raise Full(f"code.deps from {origin}: nodes is not a list")
+                if not isinstance(edges, list):
+                    raise Full(f"code.deps from {origin}: edges is not a list")
+                kinds = {}
+                for node in nodes:
+                    if (not isinstance(node, dict) or not isinstance(node.get("id"), str)
+                            or not isinstance(node.get("kind"), str)):
+                        raise Full(f"code.deps from {origin} returned a node without string id and kind")
+                    if node["id"] in kinds:
+                        raise Full(f"code.deps from {origin} returned duplicate node id: {node['id']}")
+                    kinds[node["id"]] = node["kind"]
+                for edge in edges:
+                    if (not isinstance(edge, dict) or not isinstance(edge.get("source"), str)
+                            or not isinstance(edge.get("target"), str)):
+                        raise Full(f"code.deps from {origin} returned an edge without string source and target")
                     if edge.get("target") != ident:
                         continue
                     source = edge.get("source")
