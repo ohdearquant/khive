@@ -1397,7 +1397,7 @@ serialized archive data. Registry validation, kind hooks, store construction, cl
 JSON bindings precede admission. The owner revalidates captured destination observations
 before any DML and uses the existing prepared runner's rollback/commit acknowledgement.
 Embedding/index effects run only after confirmed commit. This caller was inspected through
-that edge; its new native race and failure controls have been authored but not executed.
+that edge.
 
 **Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
 writer transaction. The protocol first holds a process-local lock keyed by the canonical database

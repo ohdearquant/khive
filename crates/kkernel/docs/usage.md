@@ -653,8 +653,7 @@ Index maintenance follows the existing deferred entity update path after commit,
 so a later indexing failure can be reported after row changes have committed.
 Library `import_kg` and its policy/JSON wrappers retain their existing upsert and
 edge-skipping behavior. These CLI rules implement the
-[ADR-020 import amendment](../../../docs/adr/ADR-020-git-native-kg-implementation.md)
-proposed in PR #5758; merging this implementation depends on that specification landing.
+[ADR-020 import amendment](../../../docs/adr/ADR-020-git-native-kg-implementation.md).
 
 ---
 
