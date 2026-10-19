@@ -263,3 +263,93 @@ fixture case below is an arm of its check, and each named mutation must turn the
    both run ids. Mutations: join by commit instead of tree (the fixture's integration and main commits are distinct
    commits with equal trees, so the pair is then missed); take only the newest matching run (the two-run arm fails when
    the newest one's scope includes the crate).
+
+## Amendment 2: A dependency that appears or disappears, and a symbolic link under `crates/`, run the full suite (2026-10-19)
+
+**Status**: Proposed (2026-10-19)
+
+### Context
+
+Amendment 1 Decision 2 scopes a crate manifest change that adds, removes or edits a dependency entry by counting as
+changed every workspace member whose resolved dependencies reach the package the entry names, and Decision 3 scopes a
+lockfile change by the members that reach a changed entry. Both read reach from the lockfile, and the lockfile does not
+record which features a package requests of its own dependencies. A feature that a newly reached package enables on a
+third package changes that third package for every member in a whole-workspace build, and no lockfile entry shows it.
+
+A probe workspace (Cargo 1.98.0, resolver 2) shows the gap. Its members are `m`, `k` and `j`, where `j` depends on `k`.
+Two path crates sit outside the workspace: `shared`, with features `default` and `std`, and `foo`, which depends on
+`shared` with `features = ["std"]`. `m` depends on `shared`. Adding `foo` to `k`'s `[dependencies]` with no features adds
+a `foo` entry to the lockfile and adds `foo` to `k`'s dependency list; `cargo tree --workspace -e features -i shared`
+printed the `default` feature alone before the change, and `std` as well after it, enabled through `foo`. The reach walk
+counts `k` and `j`, the members that reach `foo`. It does not count `m`, whose tests in a whole-workspace build now
+compile `shared` with `std`. In a second probe `foo` moved from version 0.1.0, which requests no feature of `shared`, to
+0.2.0, which requests `std`. The only lockfile difference was the `version` line of `foo`'s entry, and `std` was enabled
+on `shared` again. Removing an entry is the same change in reverse: the features it enabled leave the unified build.
+
+A symbolic link has a related gap. A changed path resolves to a crate by the location of the path itself, while the
+compiler reads the file the link names, which can lie in another crate. A link that did not change also reads the new
+contents of a changed file in another crate, and the crate holding the link is then not among the changed crates.
+Amendment 1's classifier (#5754) sends a manifest or lockfile that is a symbolic link on either side to the full suite;
+crate source has no such rule.
+
+Measured on the 60 newest first-parent commits on `main` up to `850a88b5`: 9 add a dependency entry to a crate manifest
+and none removes one. All 9 are benchmark pull requests, and all 9 already ran the full suite because a non-Markdown
+file names a Markdown file in the crate. One commit changes the set of lockfile entries, the 0.14.0 release, which bumps
+the version of every workspace member and of nothing else; no commit adds or removes an entry for a package outside the
+workspace. Amendment 1's classifier (#5754), run with `--paths-only` on each commit, admitted 5 of the 60
+past the path rules, and none of the 5 adds or removes an entry, so this amendment changes no admission on that sample;
+the 9 benchmark pull requests are the shape it sends to the full suite. The tree at `850a88b5` holds no symbolic link
+(`git ls-tree -r`, 0 of 3,970 entries under `crates/`).
+
+### Decision
+
+1. **A dependency entry that appears or disappears.** Amendment 1 Decision 2 no longer admits a crate manifest change
+   that adds or removes a dependency entry; such a change runs the full suite. An entry is identified by its table
+   (`[dependencies]`, `[dev-dependencies]` or `[build-dependencies]`, at top level or under one `[target.*]` key), the
+   package it names (its `package` value when present, otherwise its key) and where that package comes from (its
+   `path`, its `git` with any `branch`, `tag` or `rev`, its `registry`, or `workspace = true`). An entry whose identity
+   has no match in the other copy of the manifest was added or removed. Moving an entry to another table, another
+   target, another path or another source therefore runs the full suite. A change to any other key of an entry whose
+   identity matches, such as its version requirement, is an edit, and Amendment 1's lockfile reach still decides which
+   members it adds. Amendment 1's rule for `features`, `default-features` and `optional` is unchanged.
+2. **A lockfile entry outside the workspace that appears, disappears or changes.** Amendment 1 Decision 3 keeps keying
+   lockfile entries by name, version and source. A difference in an entry for a package that is not a workspace member
+   runs the full suite: an entry on one side only, which includes a version bump (it removes one key and adds another),
+   and an entry whose checksum or dependency list differs. Entries for workspace members keep Amendment 1's reach: a
+   member whose own entry differs counts as changed, together with the members that reach it.
+3. **Symbolic links under `crates/` (D3).** D3's list gains: a symbolic link (Git mode `120000`) anywhere under
+   `crates/` in the base tree or in the head tree, whether or not the link itself changed. The classifier reads modes
+   with `git ls-tree` at both commits, as #5754 already does for manifests and the lockfile. Reading the whole tree, and
+   not only the changed paths, is what catches an unchanged link whose target changed.
+
+Every new rule prints its reason, and every failure in it chooses the full suite. Amendment 1's Verify by 2 and 3 change
+with Decisions 1 and 2: in Verify by 2, the arm that adds a development dependency on an existing external package now
+expects the full suite, and the base-tree assertion moves to an arm that edits the version requirement of an existing
+entry; in Verify by 3, the bump, checksum, dependency-list and two-version arms concern packages outside the workspace
+and now expect the full suite, the header and unparseable arms are unchanged, the name-keying mutation moves to Verify
+by 2 below, and the reverse-walk mutation moves to the version-requirement arm of Verify by 1 below.
+
+### Verify by
+
+Each check runs the classifier on fixture ranges and fails if the printed scope or reason differs. Each fixture case is
+an arm of its check, and each named mutation must turn the arm it names red.
+
+1. Manifest entries: adding a path package outside the workspace to a crate's `[dependencies]` with no features, adding
+   a development dependency on an external package already in the lockfile, removing an entry, changing an entry's
+   `path`, and changing an entry's `package` each run the full suite and print the entry; changing only the version
+   requirement of an existing entry runs Amendment 1's reach, and the binary is handed the base tree. Mutations:
+   identify an entry by its key alone (the `package` arm fails); compare only entries new at head (the removal arm
+   fails); leave the source out of the identity (the `path` arm fails); hand the binary the head tree (the
+   version-requirement arm's base-tree assertion fails); drop the lockfile reverse walk (the version-requirement arm
+   then omits the members that reach the package).
+2. Lockfile: a version bump of an external package whose only lockfile difference is its `version` line runs the full
+   suite; a new external entry, a removed one, and an external entry whose checksum or dependency list changes under an
+   unchanged key each run the full suite; a workspace member's entry whose dependency list changes, with no external
+   entry changed, runs the reach of that member. Mutations: key entries by name alone (the bump arm fails, because the
+   name is on both sides); apply the rule to workspace members too (the member arm runs the full suite and fails);
+   compare only key sets (the checksum and dependency-list arms fail).
+3. Symbolic links: a new link in one crate that names a file in another crate runs the full suite; a link that is
+   unchanged, in crate `a`, naming a file in crate `b`, with only that file changed, runs the full suite (the closure of
+   `b` alone omits `a`); a link present at the base and removed at the head runs the full suite; a range with no link
+   in either tree is unaffected. Mutations: read modes of the changed paths only (the unchanged-link arm fails); read
+   the head tree only (the removed-link arm fails).
