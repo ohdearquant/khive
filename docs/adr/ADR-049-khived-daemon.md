@@ -1767,6 +1767,11 @@ that would fall back is rejected with its reason code, as Amendment 2 already sp
 `KHIVE_DAEMON_STRICT=1`. With no rendezvous on disk, the quiet `no_socket` fallback of
 Amendment 2 is unchanged. The sanctioned way to run without a daemon stays `KHIVE_NO_DAEMON=1`.
 
+[Amendment 15](#amendment-15-2026-10-19-conditional-client-boot-without-writer-admission)
+proposes retaining the earlier rendezvous observation when its new boot recovery can consume that
+evidence before request entry. This limited observation-lifetime amendment is Proposed; the
+accepted tri-state and refusal outcomes above remain in force.
+
 **3. A named slow-daemon reason.** Both "alive but not in time" outcomes carry
 `reason: "daemon_slow"` in the error data, with a `phase` field and the elapsed wait in
 milliseconds:
@@ -1828,9 +1833,11 @@ are unchanged.
 ## Amendment 15 (2026-10-19): conditional client boot without writer admission
 
 **Status**: Proposed. **Disposition**: partial amendment of Amendment 14, Decision 1's deferred
-no-create and migration-free boot property, for #5223. The base ADR remains Accepted. The lazy
-registry design stays withdrawn; Amendment 14, Decisions 2 and 3, and the other amendments remain
-in force. Dependent implementation does not merge before this amendment's acceptance gate.
+no-create and migration-free boot property, and Decision 2's rendezvous-observation lifetime when
+the new boot recovery precedes request entry, for #5223. The base ADR remains Accepted. The lazy
+registry design stays withdrawn. Decision 2's tri-state settings and refusal outcomes, Decision 3
+and the other amendments remain in force. Dependent implementation does not merge before this
+amendment's acceptance gate.
 
 ### Context and boundary
 
@@ -1858,10 +1865,24 @@ keeps today's eager boot. Explicit strict true without a rendezvous still has it
 request semantics; it does not, by itself, select this boot policy. Boot selection must not use
 the broader `is_forwarding_client()` predicate, which does not establish these conditions.
 
-The boot decision is not permission to dispatch a request locally. Request entry and fallback
-retain Amendment 14's rendezvous readings and entry latch, including recovery removing a stale
-socket or PID file. Ordinary **boot** fallback below does not add any local **request** fallback.
-`daemon_slow`, unknown post-write outcomes, and all existing no-retry rules are unchanged.
+Conditional validation reads the socket and PID paths without removing either. Stale-rendezvous
+cleanup remains request-entry recovery, except when Decision 2's daemon-first startup itself
+needs that recovery. Before such startup can consume the evidence, retain the selected boot's
+positive rendezvous observation in the MCP host's state. It survives provisional-runtime teardown,
+ordinary eager rebuild and every spawned forwarding task for that host; a task-local reading
+taken only after boot is insufficient. End this observation's lifetime with that host, and do not
+leak it into a separately booted host in the same process.
+
+An explicit strict setting keeps priority. Otherwise the strict default is true if **any** of
+the host's retained boot observation, Amendment 14's request-entry observation or the rendezvous
+at the fallback decision is true. This is the limited Decision 2 observation-lifetime extension:
+boot recovery cannot make an unset-strict client forget a daemon it already observed. Explicit
+false remains non-strict; `KHIVE_NO_DAEMON=1` and requests local by design retain their routes.
+The observation is host state, not a new setting or part of `config_id`.
+
+Ordinary **boot** fallback below does not add any local **request** fallback, even after a failed
+daemon-first launch clears both paths before the first request. `daemon_slow`, unknown post-write
+outcomes, and all existing no-retry rules are unchanged.
 
 ### Decision 2: no-create validation, with explicit ordinary-boot exits
 
@@ -1951,9 +1972,19 @@ existing host validation queue; this Proposed text claims no native result.
    witness.
 4. Exercise socket-only and PID-only rendezvous, unset/truthy/explicit-false strict values,
    absent rendezvous, `KHIVE_NO_DAEMON=1`, daemon role and in-memory main. Check Decision 1's
-   selection and the unchanged strict request fallback contract, including stale rendezvous
+   selection and the strict request refusal contract, including the retained boot observation and
+   stale rendezvous
    removal. A failed forward in strict mode must not execute the local mutation, including
    after an ordinary-boot exit.
+   Specifically, begin with a stale rendezvous and a missing configured store, force daemon-first
+   startup to remove the stale paths and launch a daemon that never binds, then take ordinary
+   eager boot with strict unset. Both paths must be absent **before the first request**. That
+   first normal write must refuse with the strict-forward error, without local mutation or its
+   dispatch audit. Dropping the retained boot observation must make this witness fail. Check
+   stale socket and stale PID separately; a store-present control that removes paths only after
+   request entry does not exercise this earlier lifetime. Pair it with the existing no-boot-
+   rendezvous and explicit-false behavior, and a second independent host that cannot inherit the
+   first host's observation.
 5. Independently remove a configured store, identity nonce, declared pack column, vector table
    or direct sidecar, and provide behind-schema/incomplete-cutover fixtures. Check the specified
    daemon-first or ordinary-boot exit, without serving the provisional runtime. Identity swap,
@@ -1978,5 +2009,5 @@ claim. No historical timings are extrapolated. Store ownership, daemon protocol,
 semantics, timeouts, configured modes, full discovery and mount visibility are unchanged.
 
 The docs-only proposal carries no implementation or executed acceptance. Independent spec review
-and Leo's acceptance are required before dependent implementation merges; a merged Proposed text
-does not itself grant that acceptance.
+and approval through the designated specification gate are required before dependent
+implementation merges; a merged Proposed text does not itself grant that acceptance.
