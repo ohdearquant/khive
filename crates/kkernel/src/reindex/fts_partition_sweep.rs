@@ -13,7 +13,7 @@ use super::*;
 /// emitted so operators know a manual or multi-namespace reindex is needed.
 pub(super) async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
     use khive_db::stores::text::{rowid_map_state_table, rowid_map_table};
-    use khive_storage::types::{SqlStatement, SqlValue};
+    use khive_storage::types::SqlStatement;
 
     // Guard: only sweep when every distinct namespace present in base
     // entities/notes was covered by this reindex pass. A single-namespace
@@ -74,9 +74,8 @@ pub(super) async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &s
 
     let mut to_drop: Vec<String> = Vec::new();
     for row in &rows {
-        let name = match row.get("name") {
-            Some(SqlValue::Text(s)) => s.clone(),
-            _ => continue,
+        let Some(name) = row.text_or_none("name").map(str::to_owned) else {
+            continue;
         };
         // The prefix discovery also finds the live rowid maps and their state.
         if canonical.contains(&name.as_str()) || canonical_companions.contains(&name) {
