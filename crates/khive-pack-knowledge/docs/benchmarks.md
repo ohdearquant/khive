@@ -104,7 +104,6 @@ cargo test --manifest-path crates/Cargo.toml -p khive-pack-knowledge --lib \
 
 #### `knowledge_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
 
-
 | Scenario                          | Low      | Median   | High     | Outliers   |
 | --------------------------------- | -------- | -------- | -------- | ---------- |
 | knowledge_learn/concept_create    | 1.030 ms | 1.368 ms | 1.774 ms | 4/50 (8%)  |
@@ -131,10 +130,10 @@ Numbers not yet recorded in this ledger entry; will be added on next full bench 
 
 ## Accepted Regressions
 
-A p50 regression gate of +20% applies to the Criterion `knowledge_bench` scenarios.
+The historical +20% comparison for Criterion `knowledge_bench` scenarios is advisory;
+no automatic percentage gate is enforced.
 
 Last reviewed: v0.2.8 (2026-06-08)
-
 
 ## Generated workload coverage
 
@@ -143,14 +142,14 @@ and historical observations above are retained. The historical +20% statement is
 not an enforced gate: timing rows below are advisory trends, with qualified-host
 baselines still pending. No native measurement is claimed by this addition.
 
-| Target/group                                    | Scenarios                                                 | Timed work                                                                                                                                                | Baseline |
-| ----------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
-| `knowledge_workloads / knowledge_compose`       | 100 atoms / 10 domains; 1000 / 20; `max_tokens=2000`      | Pinned-atom retrieval, scoring and bounded Markdown assembly; actual-call p50/p95 and estimated rendered tokens/sec                                       | pending  |
-| `knowledge_workloads / knowledge_suggest`       | The same two atom/domain corpora                          | Domain retrieval and actual member-cost aggregation; actual-call p50/p95                                                                                  | pending  |
-| `knowledge_workloads / knowledge_fold`          | 100/1000/10000 candidates × budget 256/2048               | Parse and select scored candidates of size 32; actual-call p50/p95 versus N                                                                               | pending  |
-| `knowledge_workloads / knowledge_search_scale`  | 100/1000/10000 indexed atoms, limit 20                    | Hybrid lexical/ANN retrieval and stored-vector reranking; actual-call p50/p95                                                                             | pending  |
-| `knowledge_workloads / knowledge_search_matrix` | 1000 atoms, half draft; alpha 0/0.5/1 × drafts false/true | Actual status filtering and embedding-score blending; actual-call p50/p95                                                                                 | pending  |
-| `knowledge_index_build`                         | 1000/10000 atoms; 100000 explicitly opt-in                | One cold full index dispatch per size, including synthetic embedding, vector writes, corpus scan, ANN build and publication; elapsed time and vectors/sec | pending  |
+| Target/group                                    | Scenarios                                                 | Timed work                                                                                                                                                                     | Baseline |
+| ----------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- |
+| `knowledge_workloads / knowledge_compose`       | 100 atoms / 10 domains; 1000 / 20; `max_tokens=2000`      | Pinned-atom retrieval, scoring and bounded Markdown assembly; actual-call p50/p95 and estimated rendered tokens/sec                                                            | pending  |
+| `knowledge_workloads / knowledge_suggest`       | The same two atom/domain corpora                          | Domain retrieval and actual member-cost aggregation; actual-call p50/p95                                                                                                       | pending  |
+| `knowledge_workloads / knowledge_fold`          | 100/1000/10000 candidates × budget 256/2048               | Parse and select scored candidates of size 32; actual-call p50/p95 versus N                                                                                                    | pending  |
+| `knowledge_workloads / knowledge_search_scale`  | 100/1000/10000 indexed atoms, limit 20                    | Hybrid lexical/ANN retrieval and stored-vector reranking; actual-call p50/p95                                                                                                  | pending  |
+| `knowledge_workloads / knowledge_search_matrix` | 1000 atoms, half draft; alpha 0/0.5/1 × drafts false/true | Actual status filtering and embedding-score blending; actual-call p50/p95                                                                                                      | pending  |
+| `knowledge_index_build`                         | 1000/10000 atoms; 100000 explicitly opt-in                | One cold full index dispatch per size, including synthetic embedding, vector writes, corpus scan, ANN build and publication; reducible elapsed time and diagnostic vectors/sec | pending  |
 
 The Criterion target contains 19 scenarios. Each reports 21 actual individual
 dispatch durations, with nearest-rank p50/p95 (ranks 11 and 20), then separately
@@ -195,18 +194,35 @@ required; a zero-vector or failed build cannot produce a successful report.
 cd crates
 cargo bench -p khive-pack-knowledge --bench knowledge_workloads -- --quick --noplot
 cargo bench -p khive-pack-knowledge --bench knowledge_index_build -- --quick --noplot
-# Bounded custom-harness smoke: exactly one 1000-atom build, then Success.
+# Bounded custom-harness smoke: one 1000-atom build, then Success.
 cargo test -p khive-pack-knowledge --bench knowledge_index_build
 # Explicit reference measurement only; exclude this setting from scheduled CI.
 KHIVE_BENCH_KNOWLEDGE_100K=1 cargo bench -p khive-pack-knowledge --bench knowledge_index_build
 ```
 
-Cargo supplies `--bench` to custom harnesses for `cargo bench`. Without it, or
-with `--test`, this target runs 1000 atoms once and prints a standalone `Success`
-line only after validation and teardown. Normal benchmark mode runs 1000 and
-10000 once each. Criterion-style flags such as `--quick` and `--noplot` are accepted
-without changing those fixed sizes. The 100000 corpus is additional only when
-`KHIVE_BENCH_KNOWLEDGE_100K=1` and benchmark mode are both selected.
+The target lists `knowledge_index_build/atoms1000` and
+`knowledge_index_build/atoms10000` with `--list`, including Cargo
+`--bench --list`, before executor, database or corpus setup. Each full run
+performs one fresh build per size and emits one stdout row per case:
+
+```text
+BENCH-JSON {"id":"knowledge_index_build/atoms1000","statistic":"median_ns","value":123,"n":1}
+```
+
+The value above is illustrative. Each measured value is the original complete
+index dispatch duration in nanoseconds. With `n=1`, the median is that one
+observation, not a percentile estimate. Setup, post-build search validation and
+joined writer teardown stay outside the timer; diagnostic elapsed milliseconds,
+vectors/sec and corpus details go to stderr. Compare two full runs at the same
+commit and environment before admitting a reference. This custom target does
+not write Criterion estimates or baseline files.
+
+Without `--bench`, or with `--test`, the target runs the 1000-atom case once and
+prints `Success` after validation and teardown. Accepted flags such as `--quick`
+and `--noplot` do not change the fixed corpus sizes. `KHIVE_BENCH_KNOWLEDGE_100K=1`
+adds `knowledge_index_build/atoms100000` only outside test mode; it is excluded
+from the default reference cohort. `--regression-case=report-contract` emits
+known protocol values without runtime work; those values are not measurements.
 
 The existing inline tick-gap measurement remains an ignored internal test.
 Its measurement module is `cfg(test)` and its full-build helper is `pub(crate)`;
@@ -225,8 +241,8 @@ load alongside each qualified-host baseline. Workflow selection is separate work
 | `knowledge_list/corpus/100`         | 100 atoms                     | median latency | Advisory trend; last recorded value 213.2 µs (`docs/benchmarks.md` v0.2.8) |
 | `knowledge_upsert_atoms/atoms/50`   | 50 atoms                      | median latency | Advisory trend; last recorded value 11.89 ms (`docs/benchmarks.md` v0.2.8) |
 | `knowledge_get/by_slug`             | 1 atom                        | median latency | Advisory trend; last recorded value 29.35 µs (`docs/benchmarks.md` v0.2.8) |
-| `bench_search_scale` (new)          | 10 000 atoms, limit 20        | median latency | Advisory trend against the recorded baseline                               |
-| `bench_index_build` (new)           | 10 000 atoms cold build       | build time     | Advisory trend against the recorded baseline                               |
+| `knowledge_search_scale/atoms10000` | 10 000 atoms, limit 20        | median latency | Advisory trend against the recorded baseline                               |
+| `knowledge_index_build/atoms10000`  | 10 000 atoms cold build       | build time     | Advisory trend against the recorded baseline                               |
 
 These rows add no deterministic performance bound or automatic percentage gate.
 Historical values are observations. New rolling and fixed-reference comparisons
