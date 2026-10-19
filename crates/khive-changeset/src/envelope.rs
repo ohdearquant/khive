@@ -4,7 +4,7 @@ use khive_types::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// The NDJSON-delta schema version this crate currently emits and accepts.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Change-set-wide producer identity and stage-time provenance.
 ///

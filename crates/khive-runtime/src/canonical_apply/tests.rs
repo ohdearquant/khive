@@ -645,3 +645,61 @@ fn shared_entity_fields_keep_legacy_merge_and_canonical_replace_distinct() {
     assert_eq!(legacy.properties, Some(json!({"old":1,"keep":2,"new":3})));
     assert_eq!(canonical.properties, Some(json!({"new":3})));
 }
+
+#[tokio::test]
+async fn restore_refuses_the_whole_changeset_before_preparation() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let record = projection::entity(&Entity::new("local", "concept", "restored")).unwrap();
+    let restored_id = uuid(record.header.id);
+    let restore = Op::Restore(
+        khive_changeset::RestoreOp::new(
+            record.header.id,
+            khive_changeset::DeletePreimage::Entity(Box::new(record)),
+        )
+        .unwrap(),
+    );
+    let first = Uuid::new_v4();
+    let last = Uuid::new_v4();
+    let events = rt.events(&token).unwrap();
+    let before = events.count_events(Default::default()).await.unwrap();
+    let error = prepare_canonical_changeset(
+        rt,
+        &registry(),
+        &token,
+        &changeset(vec![
+            entity_create(first, "before"),
+            restore,
+            entity_create(last, "after"),
+        ]),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        &error,
+        RuntimeError::CanonicalUnsupportedOperation {
+            op_index: 1,
+            operation: "restore",
+        }
+    ));
+    let wire = crate::runtime_error_value(error, crate::DomainDisposition::Unknown);
+    assert_eq!(wire["op_index"], 1);
+    assert_eq!(wire["operation"], "restore");
+    assert_eq!(wire["reason"], "KnownUnimplemented");
+    assert_eq!(wire["domain_disposition"], "not_committed");
+    assert_eq!(wire["retryable"], false);
+    for id in [first, restored_id, last] {
+        assert!(rt
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        events.count_events(Default::default()).await.unwrap(),
+        before
+    );
+}
