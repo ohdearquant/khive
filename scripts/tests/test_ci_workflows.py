@@ -3240,6 +3240,7 @@ if spec.get("exit"):
     print(json.dumps({"results": [{"ok": False, "error": {"message": "refused"}}]}))
     sys.exit(spec["exit"])
 results = []
+deps_batch = False
 for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
     if verb == "ingest":
         report = spec.get("ingest", {"projects_created": len(spec["projects"]), "edges_created": len(spec["edges"])})
@@ -3253,15 +3254,44 @@ for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
         following = str(index + 1) if index + 1 < len(pages) else None
         results.append({"ok": True, "result": {"items": items, "next_cursor": following}})
     elif verb == "deps":
+        deps_batch = True
         ident = re.search(r'id="([^"]*)"', args).group(1)
         edges = [{"source": source, "target": target} for source, target in spec["edges"] if target == ident]
         kinds = spec.get("kinds", {})
         nodes = [{"id": node, "kind": kinds.get(node, "project")}
                  for node in sorted({ident} | {edge["source"] for edge in edges})]
-        results.append({"ok": True, "result": {"map": "workspace", "root": ident, "nodes": nodes,
-                                               "edges": edges, "truncated": spec.get("truncated", False)}})
+        graph = {"map": "workspace", "root": ident, "nodes": nodes,
+                 "edges": edges, "truncated": spec.get("truncated", False)}
+        if spec.get("deps_missing_nodes"):
+            del graph["nodes"]
+        if spec.get("deps_missing_edges"):
+            del graph["edges"]
+        if spec.get("deps_nodes_not_list"):
+            graph["nodes"] = {}
+        if spec.get("deps_wrong_root"):
+            graph["root"] = "p-unrequested"
+        if spec.get("deps_wrong_map"):
+            graph["map"] = "another-map"
+        if spec.get("deps_node_missing_kind"):
+            nodes[0].pop("kind")
+        if spec.get("deps_edge_missing_target"):
+            edges[0].pop("target")
+        if spec.get("deps_duplicate_node"):
+            nodes.append(dict(nodes[0]))
+        # an edge kept while the node it names is dropped from the reply
+        if spec.get("deps_omit_source_node") and edges:
+            nodes[:] = [node for node in nodes if node["id"] != edges[0]["source"]]
+        if spec.get("deps_omit_root_node"):
+            nodes[:] = [node for node in nodes if node["id"] != ident]
+        if spec.get("deps_unknown_kind"):
+            nodes[0]["kind"] = "Project"
+        results.append({"ok": True, "result": graph})
     else:
         results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
+if spec.get("short_batch") and deps_batch:
+    results = results[:-1]
+if spec.get("results_not_list") and deps_batch:
+    results = {str(index): outcome for index, outcome in enumerate(results)}
 print(json.dumps({"results": results}))
 '''
 
@@ -3480,6 +3510,24 @@ class TestScopeClassifierTests(ScopeFixture):
                 ("refused manifest", {**self.GRAPH, "ingest": {"manifest_files_refused": 1}},
                  "manifest_files_refused=1"),
                 ("truncated", {**self.GRAPH, "truncated": True}, "was truncated"),
+                ("short batch", {**self.GRAPH, "short_batch": True}, "0 outcomes for 1 ops"),
+                ("results not a list", {**self.GRAPH, "results_not_list": True}, "results that are not a list"),
+                ("missing nodes", {**self.GRAPH, "deps_missing_nodes": True}, "nodes is not a list"),
+                ("missing edges", {**self.GRAPH, "deps_missing_edges": True}, "edges is not a list"),
+                ("non-list nodes", {**self.GRAPH, "deps_nodes_not_list": True}, "nodes is not a list"),
+                ("wrong root", {**self.GRAPH, "deps_wrong_root": True}, "wrong root"),
+                ("wrong map", {**self.GRAPH, "deps_wrong_map": True}, "wrong map"),
+                ("node without kind", {**self.GRAPH, "deps_node_missing_kind": True},
+                 "node without string id and kind"),
+                ("edge without target", {**self.GRAPH, "deps_edge_missing_target": True},
+                 "edge without string source and target"),
+                ("duplicate node id", {**self.GRAPH, "deps_duplicate_node": True}, "duplicate node id"),
+                ("edge source not a node", {**self.GRAPH, "deps_omit_source_node": True},
+                 "edge source missing from nodes: p-j"),
+                ("edge target not a node", {**self.GRAPH, "deps_omit_root_node": True},
+                 "edge target missing from nodes: p-k"),
+                ("node of unknown kind", {**self.GRAPH, "deps_unknown_kind": True},
+                 "node of unknown kind: 'Project'"),
                 ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
                  "changed crate k is not a project"),
                 ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
@@ -3496,6 +3544,16 @@ class TestScopeClassifierTests(ScopeFixture):
         self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
         self.assertEqual(self.scope(self.base, head)[0], "k")
         self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_nonempty_partial_reply_to_a_two_root_batch_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs", "crates/m/src/lib.rs")
+        self.set_graph({**self.GRAPH, "short_batch": True})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("1 outcomes for 2 ops", reasons)
+        deps_calls = [call for call in self.calls() if call.startswith("[code.deps(")]
+        self.assertEqual(len(deps_calls), 1)
+        self.assertEqual(deps_calls[0].count("code.deps("), 2)
 
     def test_a_file_another_crate_includes_runs_the_full_suite(self):
         # The closure of k (or m) never reaches m (or j): only the include names the file.
