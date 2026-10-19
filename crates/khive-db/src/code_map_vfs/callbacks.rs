@@ -444,6 +444,20 @@ unsafe extern "C" fn file_control(
             }
         }
     }
+    #[cfg(windows)]
+    if op == ffi::SQLITE_FCNTL_WIN32_GET_HANDLE && opened.handle.role == Role::Main {
+        use std::os::windows::io::{AsRawHandle, RawHandle};
+
+        if arg.is_null() {
+            return ffi::SQLITE_IOERR;
+        }
+        // Return the handle whose identity the VFS attested, without opening
+        // the pathname again or transferring ownership away from GuardedFile.
+        // SAFETY: SQLITE_FCNTL_WIN32_GET_HANDLE carries a writable native
+        // handle pointer. The installed file retains the borrowed handle.
+        unsafe { *arg.cast::<RawHandle>() = opened.handle.file().as_raw_handle() };
+        return ffi::SQLITE_OK;
+    }
     #[cfg(unix)]
     {
         if op == ffi::SQLITE_FCNTL_HAS_MOVED && opened.handle.role == Role::Main {

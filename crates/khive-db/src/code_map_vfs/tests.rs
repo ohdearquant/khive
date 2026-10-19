@@ -440,6 +440,105 @@ fn byte_copy_of_production_is_not_an_identity_alias() {
     assert_eq!(super::quarantine_occupancy(), 0);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_code_map_pool_reports_retained_main_identity() {
+    use crate::file_identity::{database_file_identity, sqlite_opened_file_identity};
+    use rusqlite::ffi;
+
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    let backend = open_code_map(&target, &[], &[]).expect("Windows code-map pool opens");
+    let expected = database_file_identity(&target).unwrap();
+    {
+        let writer = backend.pool().writer().expect("guarded writer");
+        assert_eq!(
+            sqlite_opened_file_identity(writer.conn()).unwrap(),
+            expected
+        );
+        // SAFETY: the connection stays live; a null output is deliberately
+        // passed to exercise the custom VFS's refusal before dereferencing it.
+        let result = unsafe {
+            ffi::sqlite3_file_control(
+                writer.conn().handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, ffi::SQLITE_IOERR);
+        writer
+            .transaction(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE witness(value INTEGER NOT NULL); INSERT INTO witness VALUES(7)",
+                )?;
+                Ok(())
+            })
+            .expect("handle queries leave the writer usable");
+    }
+    {
+        let reader = backend.pool().reader().expect("guarded reader");
+        assert_eq!(
+            sqlite_opened_file_identity(reader.conn()).unwrap(),
+            expected
+        );
+        let value: i64 = reader
+            .conn()
+            .query_row("SELECT value FROM witness", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+    drop(backend);
+
+    let reopened = open_code_map(&target, &[], &[]).expect("reopen retained identity");
+    let writer = reopened.pool().writer().expect("reopened writer");
+    assert_eq!(
+        sqlite_opened_file_identity(writer.conn()).unwrap(),
+        expected
+    );
+    let value: i64 = writer
+        .conn()
+        .query_row("SELECT value FROM witness", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, 7);
+
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: SQLite owns the main file for this live connection; the output
+    // points to storage of the sqlite3_file pointer type the control expects.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            writer.conn().handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&raw mut file).cast(),
+        )
+    };
+    assert_eq!(result, ffi::SQLITE_OK);
+    assert!(!file.is_null());
+    // SAFETY: the VFS methods remain installed while writer owns the live
+    // connection. Calling the forbidden SHM method poisons this file object.
+    unsafe { ((*(*file).pMethods).xShmBarrier.unwrap())(file) };
+    let mut handle: std::os::windows::io::RawHandle = std::ptr::null_mut();
+    // SAFETY: the connection and native-handle output remain live for the call.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            writer.conn().handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            (&raw mut handle).cast(),
+        )
+    };
+    assert_eq!(
+        result,
+        ffi::SQLITE_IOERR,
+        "poison precedes handle disclosure"
+    );
+    assert!(handle.is_null(), "refusal must not write the output");
+}
+
 #[cfg(unix)]
 fn has_moved(conn: &Connection) -> (std::ffi::c_int, std::ffi::c_int) {
     let mut moved: std::ffi::c_int = -1;
