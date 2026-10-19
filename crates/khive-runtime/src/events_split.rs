@@ -72,19 +72,26 @@ use uuid::Uuid;
 use crate::daemon::{read_frame, write_frame};
 
 mod daemon;
+#[cfg(unix)]
 mod forwarder;
 mod paths;
 mod protocol;
 mod registry;
+#[cfg(unix)]
 mod server;
 mod stores;
 
 pub use stores::*;
 
+#[cfg(unix)]
 pub use forwarder::*;
 
+#[cfg(unix)]
 use server::*;
 
+#[cfg(not(unix))]
+use daemon::refuse_events_db_symlinks;
+#[cfg(unix)]
 pub use daemon::*;
 
 pub use protocol::*;
