@@ -28,8 +28,8 @@ fn lock_request(kind: libc::c_short, offset: i64, length: i64) -> libc::flock {
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
     lock.l_type = kind;
     lock.l_whence = libc::SEEK_SET as _;
-    lock.l_start = offset.try_into().expect("offset fits off_t");
-    lock.l_len = length.try_into().expect("length fits off_t");
+    lock.l_start = offset;
+    lock.l_len = length;
     lock
 }
 
@@ -104,8 +104,8 @@ pub(super) fn observe(request: &ProbeRequest) -> Observation {
         holder_pid: (lock_type != "unlocked")
             .then(|| u32::try_from(lock.l_pid).expect("conflicting lock has a valid owner pid")),
         lock_type: lock_type.into(),
-        offset: lock.l_start as i64,
-        length: lock.l_len as i64,
+        offset: lock.l_start,
+        length: lock.l_len,
         native_error: None,
     }
 }
@@ -291,7 +291,7 @@ fn unix_default_vfs_last_shared_unlock_releases_unrelated_byte() {
         let fixture = Fixture::new("default-last-shared-unlock", second_client);
         let reader =
             second_client.then(|| open_warmed_default_reader(&fixture.path, &fixture.case));
-        assert!(OUTSIDE_SQLITE_LOCK_RANGE < PENDING_BYTE);
+        const { assert!(OUTSIDE_SQLITE_LOCK_RANGE < PENDING_BYTE) };
         let holder = hold_lock(&fixture.path, OUTSIDE_SQLITE_LOCK_RANGE, 1);
         fixture.expect(OUTSIDE_SQLITE_LOCK_RANGE, "before-default-reader", "write");
         if let Some(reader) = reader {
