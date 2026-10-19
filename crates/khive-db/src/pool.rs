@@ -2,10 +2,15 @@
 mod acquisition;
 mod connection_setup;
 mod construction;
+#[cfg(test)]
+mod external_writer_fixture;
 mod guards;
 mod identity;
 mod pool_impl;
 mod reader_counters;
+mod standalone_checkpoint;
+#[cfg(test)]
+pub(crate) use external_writer_fixture::open_external_writer_fixture;
 
 pub(crate) use connection_setup::open_read_only_snapshot_connection;
 #[cfg(feature = "namespace-trigram-proto")]
@@ -33,6 +38,8 @@ pub use guards::{ReaderGuard, ReaderRow};
 use reader_counters::ReaderAcquisitionCounters;
 pub use reader_counters::ReaderAcquisitionSnapshot;
 pub(crate) use reader_counters::StandaloneReaderPurpose;
+pub(crate) use standalone_checkpoint::CheckpointFile;
+pub use standalone_checkpoint::StandaloneCheckpoint;
 
 mod code_map;
 mod sql_functions;
@@ -58,8 +65,8 @@ use test_volume_lock_dir::test_volume_lock_dir;
 use write_units::STARTUP_SPACE_PROBE;
 pub use write_units::{CheckpointGuard, CheckpointResult, WriterAcquisitionSnapshot, WriterGuard};
 pub(crate) use write_units::{
-    PooledAutocommitWriteUnit, PooledTransactionWriteUnit, StandaloneTransactionWriteUnit,
-    WriteAdmission, WriterAcquisitionCounters,
+    PooledAutocommitWriteUnit, PooledTransactionWriteUnit, StandaloneWriteUnit, WriteAdmission,
+    WriterAcquisitionCounters,
 };
 
 use crossbeam_queue::ArrayQueue;

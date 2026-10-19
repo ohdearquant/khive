@@ -229,7 +229,7 @@ impl VolumeIdentity {
             match fs4::FileExt::try_lock(&file) {
                 Ok(()) => {
                     return Ok(VolumeLease {
-                        held: HeldLease {
+                        _held: HeldLease {
                             file: Some(file),
                             process: Some(process),
                         },
@@ -438,6 +438,7 @@ fn process_registry() -> &'static ProcessRegistry {
 
 struct ProcessSlot(ProcessSlotKey);
 
+#[cfg(test)]
 impl ProcessSlot {
     fn detach_from_thread(&self) {
         if let Some(holder) = process_registry()
@@ -543,35 +544,34 @@ mod fifo_tests;
 /// A volume lease bound to the thread that took it. Re-entry detection keys
 /// on that thread, so the lease must not move: it is `!Send`, which makes
 /// holding it across an `.await` in a `Send` future, or handing it to another
-/// thread, a compile error. A lease that has to travel goes through
-/// [`VolumeLease::detach_from_thread`].
+/// thread, a compile error. Manual atomic operations keep it on their one
+/// blocking owner thread through native settlement.
 pub(crate) struct VolumeLease {
-    held: HeldLease,
+    _held: HeldLease,
     _thread_bound: PhantomData<*const ()>,
 }
 
-/// A volume lease released from the thread that took it, for an operation
-/// whose steps run on more than one thread, such as a manual atomic unit held
-/// across awaits. A later request from the original thread is ordinary
-/// contention, not re-entry.
+/// Test fixture for releasing thread attribution while retaining the lease.
+/// Production write owners keep their lease on the thread that acquired it.
+#[cfg(test)]
 pub(crate) struct DetachedVolumeLease {
     _held: HeldLease,
 }
 
+#[cfg(test)]
 impl VolumeLease {
     pub(crate) fn detach_from_thread(self) -> DetachedVolumeLease {
-        if let Some(process) = &self.held.process {
+        if let Some(process) = &self._held.process {
             process.detach_from_thread();
         }
-        DetachedVolumeLease { _held: self.held }
+        DetachedVolumeLease { _held: self._held }
     }
 
     /// A lease that holds neither the advisory file lock nor the in-process
     /// slot: the no-lease arm of the lease-latency measurement.
-    #[cfg(test)]
     pub(crate) fn unheld_for_measurement() -> Self {
         Self {
-            held: HeldLease {
+            _held: HeldLease {
                 file: None,
                 process: None,
             },

@@ -262,11 +262,10 @@ async fn request_cancellation_after_passive_stops_before_graph_and_census() {
 fn checkpoint_probe_returns_a_well_formed_triple_on_a_file_backed_db() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (pool, _path) = seeded_pool(&dir);
-    let conn = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone probe connection");
-
-    let probe = checkpoint_probe(&conn).expect("probe must succeed on a WAL database");
+    let probe = pool
+        .inspect_diagnostic_connection(false)
+        .checkpoint_probe
+        .expect("probe must succeed on a WAL database");
 
     assert!(
         probe.busy == 0 || probe.busy == 1,
@@ -542,13 +541,11 @@ fn checkpoint_probe_does_not_perturb_the_adr091_counters() {
     crate::checkpoint::reset_checkpoint_metrics_for_tests();
     let dir = tempfile::tempdir().expect("tempdir");
     let (pool, _path) = seeded_pool(&dir);
-    let conn = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone probe connection");
-
     let before = checkpoint_counters();
     for _ in 0..3 {
-        checkpoint_probe(&conn).expect("probe must succeed");
+        pool.inspect_diagnostic_connection(false)
+            .checkpoint_probe
+            .expect("probe must succeed");
     }
     let after = checkpoint_counters();
 
@@ -725,10 +722,8 @@ fn diagnostics_composes_file_backed_standalone_acquisitions_without_counting_its
     let dir = tempfile::tempdir().expect("tempdir");
     let (pool, _path) = seeded_pool(&dir);
 
-    drop(
-        pool.open_standalone_writer()
-            .expect("write-traffic standalone connection"),
-    );
+    pool.standalone_autocommit(|_| Ok(()))
+        .expect("write-traffic standalone operation");
 
     let report = collect_with_audit_append_failures(
         &pool,

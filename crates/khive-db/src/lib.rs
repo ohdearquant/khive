@@ -119,7 +119,7 @@ pub use migrations::{
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
-    WalCeilingPolicy, WalCeilingSource, WriterGuard,
+    StandaloneCheckpoint, WalCeilingPolicy, WalCeilingSource, WriterGuard,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;

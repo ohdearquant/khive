@@ -3389,7 +3389,7 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
 /// actually enqueued on the pool's shared `WriterTaskHandle` channel when
 /// `KHIVE_WRITE_QUEUE=1`.
 ///
-/// `graph.rs`'s own flag-off/no-writer-task fallback (`open_standalone_writer`)
+/// `graph.rs`'s own flag-off/no-writer-task fallback (`standalone_transaction_write_unit`)
 /// differs from entity.rs/note.rs's (`pool.try_writer()`), so a wall-clock
 /// occupier-timing test is even less trustworthy here — a real file-backed
 /// fallback connection opened per call would ALSO contend with the occupier

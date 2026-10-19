@@ -18,7 +18,7 @@ use manual_atomic::run_manual_atomic_unit;
 #[path = "sql_bridge/standalone_admission.rs"]
 mod standalone_admission;
 use standalone_admission::{
-    acquire_standalone_lease, acquire_unit_lease, admit_standalone_operation, StandaloneWriteError,
+    acquire_standalone_lease, admit_standalone_operation, StandaloneWriteError,
 };
 mod standalone_batch;
 #[cfg(test)]
@@ -129,12 +129,13 @@ pub(crate) use reader_capability::{reader_capability_admits, statement_guard_sel
 
 mod handles;
 pub(crate) use handles::acquire_in_memory_write_unit;
+pub(crate) use handles::build_standalone_writer;
 use handles::{
     acquire_handle_slot, acquire_reader_handle_slot, open_standalone_reader_on_blocking,
     open_standalone_writer_on_blocking, SlotTimeoutClass,
 };
 #[cfg(test)]
-use handles::{open_standalone_on_blocking, open_standalone_reader, open_standalone_writer};
+use handles::{open_external_writer_fixture, open_standalone_on_blocking, open_standalone_reader};
 
 mod sqlite_reader;
 #[cfg(test)]
@@ -161,6 +162,9 @@ mod tests;
 #[cfg(test)]
 #[path = "sql_bridge/direct_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+mod manual_atomic_owner_tests;
 
 #[cfg(test)]
 #[path = "sql_bridge/settlement_hazard_tests.rs"]
