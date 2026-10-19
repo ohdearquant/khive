@@ -563,6 +563,9 @@ mod unmanaged_write_escalation_tests;
 #[cfg(all(test, feature = "vectors"))]
 mod batch_exists_tests;
 
+#[cfg(all(test, feature = "vectors"))]
+mod search_batch_tests;
+
 /// Tests for `first_error` surfacing in `insert_batch`.
 ///
 /// These tests use only the pre-SAVEPOINT validation path (wrong vector count
