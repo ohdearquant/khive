@@ -3239,6 +3239,13 @@ for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
             edges[0].pop("target")
         if spec.get("deps_duplicate_node"):
             nodes.append(dict(nodes[0]))
+        # an edge kept while the node it names is dropped from the reply
+        if spec.get("deps_omit_source_node") and edges:
+            nodes[:] = [node for node in nodes if node["id"] != edges[0]["source"]]
+        if spec.get("deps_omit_root_node"):
+            nodes[:] = [node for node in nodes if node["id"] != ident]
+        if spec.get("deps_unknown_kind"):
+            nodes[0]["kind"] = "Project"
         results.append({"ok": True, "result": graph})
     else:
         results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
@@ -3476,6 +3483,12 @@ class TestScopeClassifierTests(ScopeFixture):
                 ("edge without target", {**self.GRAPH, "deps_edge_missing_target": True},
                  "edge without string source and target"),
                 ("duplicate node id", {**self.GRAPH, "deps_duplicate_node": True}, "duplicate node id"),
+                ("edge source not a node", {**self.GRAPH, "deps_omit_source_node": True},
+                 "edge source missing from nodes: p-j"),
+                ("edge target not a node", {**self.GRAPH, "deps_omit_root_node": True},
+                 "edge target missing from nodes: p-k"),
+                ("node of unknown kind", {**self.GRAPH, "deps_unknown_kind": True},
+                 "node of unknown kind: 'Project'"),
                 ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
                  "changed crate k is not a project"),
                 ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
