@@ -2942,9 +2942,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
 
     def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
-                     head_repository=None):
+                     head_repository=None, classifier=None):
         """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
-        unset unless given, as on a push."""
+        unset unless given, as on a push. classifier, when given, is the text of the checked-out
+        scripts/ci-docs-only.sh in place of this repository's own."""
         workflow = workflow_text("ci.yml")
         job = indented_block(workflow, "changed-paths", 2)
         step = job.split("- name: Classify\n", 1)[1]
@@ -2952,7 +2953,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertIsNotNone(match)
         script = textwrap.dedent(match.group(1))
         (self.repo / "scripts").mkdir(exist_ok=True)
-        shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        if classifier is None:
+            shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        else:
+            self.write("scripts/ci-docs-only.sh", classifier)
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -2997,6 +3001,39 @@ class DocsOnlyClassifierTests(unittest.TestCase):
     def test_job_pull_request_with_code_runs_the_full_suite(self):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    # A classifier that answers "documentation only" for every change, as a change could carry.
+    LENIENT_CLASSIFIER = "#!/bin/bash\necho true\n"
+    CLASSIFIER_CHANGED = "full suite: the change edits a path classifier"
+
+    def test_job_pull_request_that_edits_the_docs_classifier_runs_the_full_suite(self):
+        head = self.merge_ref("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        verdict, log = self.classify_job("pull_request", head, classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
+
+    def test_job_pull_request_that_edits_the_scope_script_reports_a_classifier_change(self):
+        head = self.merge_ref("scripts/ci-test-scope.py", "print('map')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-test-scope.py\n", log)
+
+    def test_job_pull_request_with_only_documentation_does_not_report_a_classifier_change(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertNotIn(self.CLASSIFIER_CHANGED, log)
+
+    def test_job_integration_push_that_edits_a_classifier_runs_the_full_suite(self):
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a lenient classifier beside documentation")
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(self.base, "success"),
+                                         classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
 
     def test_job_own_codex_pull_request_with_crate_source_is_not_a_lane(self):
         # The integration-only lane is retired (ADR-205 D7): the branch name changes nothing.
@@ -3945,6 +3982,38 @@ esac
                 scope, log = self.run_step("push", head, extra_env=extra)
                 self.assertEqual(scope, "full", log)
                 self.assertIn("no fully tested main commit is an ancestor of this push", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    # A scope script that scopes every change to crate k and leaves a mark when it runs.
+    LENIENT_SCOPE = ("import pathlib, sys\n"
+                     "pathlib.Path(__file__).with_name('lenient-ran').write_text(' '.join(sys.argv[1:]))\n"
+                     "print('map' if '--paths-only' in sys.argv else 'k')\n")
+
+    def lenient_scope_change(self):
+        """Crate k's source and m's, with a scope script that would scope both to k."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        self.write("scripts/ci-test-scope.py", self.LENIENT_SCOPE)
+        return self.commit("a lenient scope script beside crate source")
+
+    def test_a_change_that_edits_a_classifier_runs_the_full_suite_without_running_it(self):
+        head = self.lenient_scope_change()
+        for event_name, extra in (("pull_request", None),
+                                  ("push", {"REF": "refs/heads/integration/train-1", "TESTED_BASE": self.base})):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py\n", log)
+                self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_range_that_cannot_be_compared_counts_as_a_classifier_change(self):
+        head = self.train()
+        missing = "0" * 40
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": missing})
+        self.assertEqual(scope, "full", log)
+        self.assertIn(f"full suite: the path classifiers could not be compared with {missing}\n", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_a_main_push_is_never_scoped_even_with_a_tested_base(self):
