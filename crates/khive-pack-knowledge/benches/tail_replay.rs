@@ -20,7 +20,12 @@ struct Cases {
 }
 impl Cases {
     fn from_args(args: &[String]) -> Self {
-        let quick = args.iter().any(|arg| arg == "--quick");
+        // `cargo bench` passes `--bench`; `cargo test --benches` runs this binary without it. Like Criterion's test
+        // mode, that run is a smoke check, so it takes the quick cohort. Listing and protocol controls keep the default.
+        let test_mode = !args.iter().any(|arg| {
+            arg == "--bench" || arg == "--list" || arg.starts_with("--regression-case=")
+        });
+        let quick = test_mode || args.iter().any(|arg| arg == "--quick");
         let mut sizes = if quick { vec![64] } else { vec![10_000] };
         if !quick && std::env::var("KHIVE_BENCH_TAIL_100K").as_deref() == Ok("1") {
             sizes.push(100_000);

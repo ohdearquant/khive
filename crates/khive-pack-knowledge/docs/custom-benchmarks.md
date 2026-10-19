@@ -46,7 +46,8 @@ cargo bench --manifest-path crates/Cargo.toml -p khive-pack-knowledge --bench ta
 The default is 10,000 generated atoms, `M=16` and offered rate 10 writes/second.
 `KHIVE_BENCH_TAIL_100K=1` and `KHIVE_BENCH_TAIL_500K=1` opt into the larger corpora;
 neither is enabled by default. `--quick` selects 64 atoms and default `M=4` for
-smoke checks. Existing `KHIVE_BENCH_TAIL_M` and `KHIVE_BENCH_TAIL_WRITE_HZ`
+smoke checks. `cargo test --benches` runs the target without `--bench`, and that run takes the
+same quick cohort. Existing `KHIVE_BENCH_TAIL_M` and `KHIVE_BENCH_TAIL_WRITE_HZ`
 overrides remain. Large corpora and custom write schedules need their own runtime
 budget; the five-minute default target does not apply to them.
 

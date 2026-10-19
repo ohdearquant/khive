@@ -28,7 +28,9 @@ fn case_id(variant: &str, real_model: bool) -> String {
 const QUERY: &str = "subject7 visiblemarker0 knowledge retrieval embedding reranking benchmark";
 
 async fn fixture(real_model: bool) -> VerbRegistry {
+    // In-memory store: the default config points at HOME/.khive/khive.db, which a benchmark must never open.
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
         embedding_model: Some(MODEL),
         ..RuntimeConfig::no_embeddings()
     })
