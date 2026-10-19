@@ -257,36 +257,17 @@ pub(super) fn run_standalone_script(
     Option<StandaloneHandle>,
     Result<(), StandaloneWriteError<rusqlite::Error>>,
 ) {
-    let lease = match admit_standalone_operation(&pool, "execute_script", false) {
-        Ok(lease) => lease,
-        Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+    let mut owner = StandaloneCallOwner::new(handle, pool);
+    let res = match owner.admit("execute_script") {
+        Ok(()) => owner
+            .conn()
+            .execute_batch(&script)
+            .map_err(StandaloneWriteError::Sql),
+        Err(error) => Err(StandaloneWriteError::Refused(error)),
     };
-    let res = handle
-        .conn
-        .execute_batch(&script)
-        .map_err(StandaloneWriteError::Sql);
-    // This call holds the volume lease until a script-opened transaction
-    // has rolled back or its connection has been retired.
-    if handle.conn.is_autocommit() {
-        drop(lease);
-        return (Some(handle), res);
-    }
-    let (handle, settled) =
-        if handle.conn.execute_batch("ROLLBACK").is_ok() && handle.conn.is_autocommit() {
-            (Some(handle), Ok(()))
-        } else {
-            // The connection closes while the lease is still held; the
-            // handle's slots are released after it.
-            let StandaloneHandle {
-                conn,
-                _retained_slot,
-                read_transaction_slot,
-            } = handle;
-            let settled = pool.write_admission().close_retired_connection(conn);
-            drop((_retained_slot, read_transaction_slot));
-            (None, settled)
-        };
-    drop(lease);
+    // The volume lease covers this call only, so a transaction the script
+    // left open is settled here while the lease is still held.
+    let settled = owner.settle();
     let result = match (res, settled) {
         (res, Err(settlement)) => {
             if let Err(StandaloneWriteError::Sql(error)) = &res {
@@ -301,8 +282,9 @@ pub(super) fn run_standalone_script(
                 settlement.into_storage_error(StorageCapability::Sql, "execute_script"),
             ))
         }
-        (Err(failure), Ok(())) => Err(failure),
-        (Ok(()), Ok(())) => Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
+        (res, Ok(false)) => res,
+        (Err(failure), Ok(true)) => Err(failure),
+        (Ok(()), Ok(true)) => Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
             capability: StorageCapability::Sql,
             operation: "execute_script".into(),
             message: "the script left a transaction open; a standalone script holds \
@@ -312,7 +294,7 @@ pub(super) fn run_standalone_script(
                 .into(),
         })),
     };
-    (handle, result)
+    (owner.into_handle(), result)
 }
 
 pub(super) fn run_standalone_top_level(

@@ -8,8 +8,9 @@ owned connection close. When rollback and close both fail, the owner retires the
 connection, returns an unknown-outcome error, and releases the lease. Checkpoints
 and read-only work remain available for recovery.
 
-The implementation below is the foundation for #3551. The raw and cached APIs in
-the remaining-work table are not covered by a complete execution-time guarantee.
+The implementation below is the foundation for #3551. The queued cached writer
+queries and the pre-pool code-map transition in the remaining-work table are not
+covered by this inventory.
 
 ## Configuration
 
@@ -121,6 +122,18 @@ checkout as proof that a later write was admitted. Symbols are under
   for typed write units, the lifetime writer task and cached SQL bridge handles.
   Diagnostics return collected data; checkpoints return only fixed checkpoint
   operations. No factory returns a raw pool-opened writer to another module.
+- **Cached SQL writer queries:** with the write queue off, `query_row`,
+  `query_all` and `query_page` admit writable SQL at execution, including DML
+  with `RETURNING`. Their call owner
+  retains the connection and lease through settlement, even if the observer is
+  aborted. Pure reader-shaped SQL keeps its read-only admission path. An
+  unowned transaction cannot survive a query call; successful rollback refuses
+  an otherwise successful call with `InvalidInput`, and preserves an original
+  error. Failed settlement retires the connection and reports an unknown
+  outcome. Scripts may complete their own transactions under the same rule.
+- **Manual atomic SQL:** file-backed manual atomic SQL runs in one blocking owner
+  with its permit, lease, connection and transaction evidence retained through
+  settlement, including when the async observer is aborted.
 - **Autocommit writes:** admit backend constructor DDL and entity, note,
   attachment, and sparse helpers before the first SQLite write. Retain the guard
   through the script and retire an unfinished transaction.
@@ -158,10 +171,10 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 
 ## Remaining work
 
-- **#3597:** Cached `SqlWriter` handles still need their remaining per-write
-  classification work. File-backed manual atomic SQL now runs in one blocking
-  owner with its permit, lease, connection and transaction evidence retained
-  through settlement, including when the async observer is aborted.
+- **#3597:** With the write queue on, the default for a file-backed pool, a
+  cached `SqlWriter`'s `query_row`, `query_all` and `query_page` still accept
+  only reader-shaped SQL and refuse writable statements with `InvalidInput`.
+  Admitting writable SQL on that path remains open.
 - **#3551:** The code-map WAL-to-DELETE transition, including checkpoint and
   sidecar work before pool construction, remains outside this slice. A later
   ADR-154 slice must decide its admission classification.
