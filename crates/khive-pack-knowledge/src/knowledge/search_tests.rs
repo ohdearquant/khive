@@ -2,6 +2,9 @@ use super::*;
 use khive_storage::types::{SqlRow, StorageResult};
 use std::sync::{Arc, Mutex};
 
+#[path = "rerank_blend_tests.rs"]
+mod rerank_blend_tests;
+
 #[cfg(feature = "namespace-trigram-proto")]
 pub(super) type PrototypePhaseTimes = Arc<Mutex<HashMap<&'static str, (u128, u64)>>>;
 
