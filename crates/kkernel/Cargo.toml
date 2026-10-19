@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-rule-evaluator = { version = "0.14.0", path = "../khive-rule-evaluator" }
 khive-mounts = { version = "0.14.0", path = "../khive-mounts" }
@@ -69,6 +72,7 @@ lattice-embed = { workspace = true }
 khive-fs = { version = "0.14.0", path = "../khive-fs" }
 
 [dev-dependencies]
+criterion = { workspace = true }
 inventory = { workspace = true }
 khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-template = { version = "0.14.0", path = "../khive-pack-template" }
@@ -122,6 +126,7 @@ pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
 [[bin]]
 name = "kkernel"
 path = "src/main.rs"
+bench = false
 
 [[test]]
 name = "mount_fixture"
@@ -132,3 +137,11 @@ harness = false
 [[test]]
 name = "mounts"
 required-features = ["pack-agent"]
+
+[[bench]]
+name = "locator"
+harness = false
+
+[[bench]]
+name = "coord_locate"
+harness = false

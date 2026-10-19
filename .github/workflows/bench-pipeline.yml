@@ -35,7 +35,7 @@ on:
       - "scripts/perf/test_bench_load_harness.py"
       - ".github/workflows/bench-pipeline.yml"
   push:
-    branches: ["integration/**"]
+    branches: ["main", "integration/**"]
     paths:
       - "crates/khive-pack-memory/**"
       - "crates/khive-pack-kg/**"
@@ -70,7 +70,8 @@ jobs:
     # run that merges them runs it on the merged tree.
     if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A build without a restored cache takes 11-16 minutes; this limit leaves margin for one.
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: crates
@@ -85,10 +86,13 @@ jobs:
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
 
+      # Only main saves: a cache saved by a pull request or an integration branch can be restored by
+      # no other ref, while every pull request can restore the one main saves.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Lock the embedder clustering invariant the vector-leg gate depends on:
       # if same-cluster vectors stop being more similar than cross-cluster ones,

@@ -129,6 +129,9 @@ checkout as proof that a later write was admitted. Symbols are under
   an otherwise successful call with `InvalidInput`, and preserves an original
   error. Failed settlement retires the connection and reports an unknown
   outcome. Scripts may complete their own transactions under the same rule.
+- **Manual atomic SQL:** file-backed manual atomic SQL runs in one blocking owner
+  with its permit, lease, connection and transaction evidence retained through
+  settlement, including when the async observer is aborted.
 - **Autocommit writes:** admit backend constructor DDL and entity, note,
   attachment, and sparse helpers before the first SQLite write. Retain the guard
   through the script and retire an unfinished transaction.
