@@ -2183,6 +2183,7 @@ dependencies = [
 name = "khive-graph-diff"
 version = "0.14.0"
 dependencies = [
+ "criterion",
  "khive-types",
  "serde",
  "serde_json",
@@ -2230,6 +2231,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "criterion",
  "futures",
  "inventory",
  "khive-channel",
@@ -2914,6 +2916,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
+ "criterion",
  "iana-time-zone",
  "inventory",
  "khive-changeset",
@@ -3074,6 +3077,7 @@ dependencies = [
 name = "khive-wire-protocol"
 version = "0.14.0"
 dependencies = [
+ "criterion",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

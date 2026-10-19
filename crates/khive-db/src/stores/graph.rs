@@ -7,23 +7,43 @@ mod mutation_plans;
 mod store_impl;
 mod traversal;
 
-use traversal::*;
+#[cfg(test)]
+use traversal::{run_bounded_traversal, traversal_neighbor_sql};
 
-use edge_upserts::*;
+use edge_upserts::{
+    edge_by_natural_key_including_deleted, observed_edge_batch_upsert, observed_edge_upsert,
+};
 
-use edge_reads::*;
+use edge_reads::{count_neighbor_select, neighbor_extra_clause, parse_uuid};
+#[cfg(test)]
+use edge_reads::{neighbor_select_count, reset_neighbor_select_count};
+use edge_statements::canonical_edge_endpoints;
+pub(crate) use edge_statements::EDGE_NAMESPACES_CTE;
+use mutation_plans::GRAPH_MUTATION_EVENTS_OP;
 
-pub use mutation_plans::*;
+pub use mutation_plans::{
+    compose_graph_mutation_events, edge_symmetric_absorb_or_update_inplace_statement,
+    edge_symmetric_delete_if_conflict_statement, GraphDocumentGuard, GraphEdgeSnapshotGuard,
+    GraphMutationEventOutcome, GraphMutationOutcome, GraphMutationPreconditions,
+    GraphMutationRequest,
+};
 
-pub use edge_statements::*;
+pub use edge_statements::{
+    edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
+    edge_insert_guarded_by_endpoints_with_resurrection_statement, edge_insert_if_absent_statement,
+    edge_insert_new_guarded_by_endpoints_statement,
+    edge_insert_only_guarded_by_endpoints_statement,
+    edge_link_replace_if_unchanged_and_endpoints_exist_statement, edge_merge_rewire_statement,
+    edge_replace_if_unchanged_statement, edge_snapshot_assertion_statement,
+    edge_soft_delete_statement, edge_upsert_statement, edge_upsert_statement_with_resurrection,
+    purge_incident_edges_statement,
+};
 
 #[path = "graph/write_transaction.rs"]
 mod write_transaction;
-use write_transaction::run_graph_mutation_transaction;
 
 #[path = "graph/guarded_insert.rs"]
 mod guarded_insert;
-use guarded_insert::{check_statement_guards, insert_edge_if_absent};
 
 #[path = "graph/symmetric_update.rs"]
 mod symmetric_update;
@@ -34,42 +54,30 @@ pub use symmetric_update::{
     EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
 };
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use async_trait::async_trait;
+#[cfg(test)]
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::OptionalExtension;
-use uuid::Uuid;
-
 use khive_storage::error::StorageError;
-use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, EdgeInsertIfAbsentOutcome,
-    GraphStatementGuard, GraphStatementGuardFailure, SymmetricEdgeUpdateOutcome,
-    SymmetricEdgeUpdateRequest,
+#[cfg(test)]
+use khive_storage::types::{
+    DeleteMode, EdgeEndpointBaseCounts, EdgeFilter, EdgeSortField, EdgeUpsertRefusal,
+    EdgeUpsertResult, GraphPath, PageRequest, SortDirection, SortOrder, SqlStatement, SqlValue,
+    TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
-    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRefusal, EdgeUpsertRequest,
-    EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
-    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, NeighborCursor,
-    NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection,
-    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
-    TraversalRequest,
+    Direction, Edge, EdgeUpsertRequest, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
+    NeighborCursor, NeighborHit, NeighborQuery,
 };
-use khive_storage::LinkId;
 use khive_storage::StorageCapability;
-use khive_storage::{Event, GraphStore, StorageResult};
+#[cfg(test)]
+use khive_storage::{Event, GraphStore, LinkId, StorageResult};
 use khive_types::EdgeRelation;
+use uuid::Uuid;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
-use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
-
-// The child modules name sibling store modules as `super::event` and
-// `super::index_repair`; this import keeps those paths resolving one level down.
-use super::{event, index_repair};
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -173,108 +181,6 @@ WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
             AND e.relation = 'annotates' AND e.deleted_at IS NULL)
     ORDER BY n.created_at DESC, n.id ASC LIMIT 1
 ) END"#;
-
-// ---------------------------------------------------------------------------
-// Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
-// sibling block for the full rationale. `upsert_edge`/`delete_edge` below and
-// `purge_incident_edges` (plus ADR-099's atomic prepare path in
-// `khive-runtime`, and `khive-runtime::operations::update_edge`'s
-// non-symmetric branch) all call these.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Symmetric-relation update DML — atomic-only, commit-time self-guarding
-// variant (ADR-099 §B3).
-//
-// Canonical `update_edge_symmetric_dml` binds the shared SQL constants in
-// `graph/symmetric_update.rs` directly, not the plan-shape builders — the
-// builders are used by the atomic prepare path. Canonical probes and branches
-// synchronously INSIDE its own writer-task transaction, with no other op
-// interleaved between its probe and its write, so the interleaving exposure the
-// atomic path has does not arise there. Canonical's absorption delete is
-// nonetheless bound to the GUARDED constant, because its snapshot is read
-// before the transaction and can be stale by the time the delete runs.
-//
-// The atomic path is structurally different: its conflict probe runs in the
-// async PREPARE phase, which for a multi-op `--atomic` unit completes for
-// EVERY op before the synchronous COMMIT phase begins for ANY of them. An
-// earlier op in the SAME atomic unit (e.g. a `delete` or another symmetric
-// `update` touching the same natural key) can change the conflict landscape
-// between this op's prepare-time probe and its own statements finally
-// executing at commit time — this is a real staleness
-// window, not just an SQL-text duplication concern.
-//
-// The two builders below close it: instead of a Rust-level `if let
-// Some(conflict) { ... } else { ... }` that hand-picks ONE of three
-// statements at prepare time (the second hand-assembled branch this
-// closes), the atomic plan ALWAYS carries both statements, in order, and
-// each is a self-guarding, commit-time predicate that re-evaluates conflict
-// state fresh against whatever the transaction's state actually is when it
-// runs — not what prepare's probe said:
-//
-// 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
-//    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
-//    exists at the target natural key at THIS moment AND the row's own
-//    `updated_at`/`deleted_at` still match the snapshot this plan was built
-//    from (guard: 0 or 1 rows) — a plan built from a since-changed snapshot
-//    must not delete the row just because some other, unrelated conflict
-//    happens to exist; the second statement's own commit-time predicate
-//    (below) then sees `changes() = 0` and fails its `exactly(1)` guard,
-//    aborting the whole atomic unit rather than silently absorbing a
-//    concurrent writer's change.
-// 2. [`edge_symmetric_absorb_or_update_inplace_statement`]: a single
-//    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
-//    (ADR-099 §B3 — that predicate could
-//    match the WRONG row: if a different op earlier in the SAME atomic unit
-//    had already deleted the requested edge, statement 1 above no-ops (its
-//    "0 rows" result is indistinguishable at the Rust level from "no
-//    conflict existed"), yet the natural-key arm could still hit a
-//    pre-existing canonical row that this update never causally touched).
-//    The fix ties the natural-key arm to `changes()` — SQLite's per-
-//    connection scalar reporting the row count of the most recently
-//    COMPLETED statement, i.e. statement 1's own result, evaluated fresh at
-//    THIS statement's execution, not at prepare time:
-//    - `id = ?2 AND changes() = 0`: statement 1 deleted nothing, so the
-//      requested row is still live under its own id — update it in place.
-//    - `source_id = ?3 AND target_id = ?4 AND relation = ?5 AND id != ?2
-//      AND changes() = 1`: statement 1 just deleted the requested row
-//      BECAUSE a conflict existed — match the surviving canonical row and
-//      leave its attributes unchanged (ADR-039 DO NOTHING; see below).
-//    These two arms are mutually exclusive and, together with statement 1's
-//    own guard, jointly exhaustive: if the requested row no longer existed
-//    when statement 1 ran (the same-unit race above), statement 1 affects 0
-//    rows for a reason unrelated to conflict absorption, `id = ?2` no
-//    longer matches anything (the row is gone), and the natural-key arm's
-//    `changes() = 1` guard is false — so this statement affects ZERO rows
-//    and the plan's `AffectedRowGuard::exactly(1)` on it fails the op,
-//    aborting the whole atomic unit rather than silently mutating an
-//    unrelated row.
-//
-//    ADR-039's edge-conflict contract is ON CONFLICT DO NOTHING: the
-//    natural-key (absorbed-conflict) arm must leave the surviving canonical
-//    row's attributes exactly as they were — refreshing them from the
-//    discarded edge (and forcing `deleted_at = NULL`, resurrecting a
-//    tombstone) is the same defect already fixed on the merge-rewire path
-//    (khive#1213). Every SET expression is therefore keyed on `id = ?2`:
-//    that condition is true only for the WHERE clause's first (in-place)
-//    arm — the second (absorbed) arm only ever matches a row whose id is
-//    NOT ?2 — so each column either takes its new value (in-place arm) or
-//    self-assigns its current value (absorbed arm, a true no-op). This
-//    still affects exactly one row either way (SQLite's `changes()` counts
-//    matched rows, not changed bytes), so `AffectedRowGuard::exactly(1)`
-//    and the race-abort behavior above are unaffected by this being a
-//    no-op write in the absorbed case.
-//
-// No probe, no branch, no read at all is needed to APPLY this pair. Which
-// row this plan actually touched is derived post-commit by the caller via a
-// fresh natural-key lookup (`khive-runtime::KhiveRuntime::get_edge_by_natural_key_including_deleted`,
-// filtered on the canonicalized endpoints/relation and including soft-deleted rows — unlike
-// `list_edges`, which unconditionally filters `deleted_at IS NULL` and would report "not
-// found" for a surviving row this absorption arm left tombstoned) — ADR-099 §B3
-// removed the prior prepare-time advisory `target_id` probe entirely:
-// a value computed before the
-// SAME atomic unit's other ops have run is not a fact this plan can stand
-// behind, so result rendering no longer trusts it.
 
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {

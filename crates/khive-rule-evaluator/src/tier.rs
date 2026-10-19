@@ -99,6 +99,7 @@ fn operation_subjects(op: &Op) -> Vec<String> {
         ],
         Op::Update(update) => vec![update.target_id().to_string()],
         Op::Delete(delete) => vec![delete.target_id.to_string()],
+        Op::Restore(restore) => vec![restore.target_id().to_string()],
         Op::Merge(merge) => vec![merge.into_id.to_string(), merge.from_id.to_string()],
     }
 }
@@ -177,6 +178,11 @@ fn seed_decision(op: &Op) -> TierDecision {
             "adr102.delete",
             "Every delete requires Tier 2 review under the ADR-102 floor.",
         ),
+        Op::Restore(_) => TierDecision::seed(
+            Tier::Tier2,
+            "adr102.restore",
+            "Restoration requires independently reviewed compensation under ADR-102 D4.",
+        ),
         Op::Merge(_) => TierDecision::seed(
             Tier::Tier2,
             "adr102.merge",
@@ -194,6 +200,7 @@ fn configure_decision(decision: &mut TierDecision, op: &Op, config: &TierConfig)
         Op::Link(_) => "link",
         Op::Update(_) => "update",
         Op::Delete(_) => "delete",
+        Op::Restore(_) => "restore",
         Op::Merge(_) => "merge",
     };
     if !config
@@ -251,7 +258,7 @@ fn configure_decision(decision: &mut TierDecision, op: &Op, config: &TierConfig)
                 }
             }
         }
-        Op::Create(_) | Op::Delete(_) | Op::Merge(_) => {}
+        Op::Create(_) | Op::Delete(_) | Op::Restore(_) | Op::Merge(_) => {}
     }
 }
 

@@ -13,25 +13,15 @@ use uuid::Uuid;
 use crate::sql_bridge::bind_params;
 
 use super::edge_reads::read_edge;
-use super::edge_statements::{edge_upsert_statement_with_resurrection, endpoint_exists_clause};
+use super::edge_statements::{
+    canonical_edge_endpoints, edge_upsert_statement_with_resurrection, endpoint_exists_clause,
+};
 #[cfg(test)]
 use super::tests;
 
-/// Canonical endpoint order for symmetric relations (F012).
-///
-/// For `competes_with` and `composed_with`, ensures `source_uuid < target_uuid`
-/// so A→B and B→A collapse to a single canonical row in storage.
-pub(super) fn canonical_edge_endpoints(
-    relation: EdgeRelation,
-    source_id: Uuid,
-    target_id: Uuid,
-) -> (Uuid, Uuid) {
-    relation.canonical_endpoints(source_id, target_id)
-}
-
 /// Standalone existence probe for both endpoints of a would-be edge (#769),
 /// matching the `WHERE EXISTS(...)` shape
-/// [`edge_insert_guarded_by_endpoints_statement`] embeds in its own guarded
+/// [`super::edge_statements::edge_insert_guarded_by_endpoints_statement`] embeds in its own guarded
 /// `INSERT`. Returns per-endpoint existence (not a single AND'd bool) so
 /// callers can report exactly which side was missing. See
 /// `crates/khive-db/docs/api/graph.md` for its two call sites and why both

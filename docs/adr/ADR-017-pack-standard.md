@@ -943,6 +943,7 @@ dedicated ADR. v1 is compile-time.
   migration design under ADR-015.
 - A pack invariant that must be race-safe across processes may use ADR-015's narrowly
   governed core-row trigger exception; it does not widen `SchemaPlan` beyond auxiliary DDL.
+  The named tool grant-invalidation exception below is separate from that migration exception.
 
 ### 2026-09-12 amendment: nullable pack-owned column additions
 
@@ -964,9 +965,28 @@ preserves existing values and does not rely on swallowing duplicate-column error
 Column-addition targets participate in pack table-ownership collision checks. The
 registry carries declarations to the pack's assigned backend and preserves read-only
 startup's writer-free behavior. A pack that is not loaded supplies neither DDL nor
-additions. Tool grant pins use this mechanism; the core migration chain does not create
-or upgrade `tool_grants`. The tool pack installs its invalidation trigger and marker-only
-backfill in the same transaction as its auxiliary schema.
+additions. Tool grant pins use this mechanism.
+
+**Named tool grant-invalidation exception (#4137).** The tool pack retains ownership
+of `tool_grants`; the core migration chain does not create or upgrade it. Its schema
+plan may install the single trigger `tool_grants_invalidate_on_registry_insert` on
+`entities` and run the associated marker-only backfill, in the same writer transaction
+as its auxiliary schema. This is a specific exception to the auxiliary-only
+`SchemaPlan` rule. The trigger observes insertion of live tool-registry rows; the
+backfill reads existing live registry rows. Both may update only invalidation markers
+of matching grants in the same namespace, preserving the grant's approval status and
+pins. This exception grants no general permission for a pack to create objects on,
+mutate, or read core tables from a schema plan. The all-pack schema guard binds the
+exception to the tool pack and the reviewed trigger/backfill SQL; a semantic change
+requires explicit review of the exception and its guard. Core-only installation must
+not install this trigger or create `tool_grants`.
+
+An uninstall or purge path that removes `tool_grants` must drop
+`tool_grants_invalidate_on_registry_insert` in the same transaction: leaving the
+trigger on `entities` would make entity inserts fail against the missing table.
+Until such a path exists, the tool pack's tables are not removable. This constraint
+also applies to any future lifecycle path under ADR-203 (Proposed); it does not
+authorize an uninstall or purge implementation.
 
 `SchemaPlan` and `PackSchemaPlan` retain their SQL-only shape. Hosts that apply plans
 manually and need the full upgrade declaration must use

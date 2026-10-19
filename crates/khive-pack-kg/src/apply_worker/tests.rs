@@ -39,7 +39,7 @@ async fn canonical_committed_reindex_failure_preserves_applying_and_cannot_repla
         &tok,
         proposal_id,
         ProposalChangeset::Canonical {
-            schema_version: 1,
+            schema_version: khive_changeset::CURRENT_SCHEMA_VERSION,
             delta: format!("{}\n{op}\n", serde_json::to_string(&envelope).unwrap()),
         },
     )

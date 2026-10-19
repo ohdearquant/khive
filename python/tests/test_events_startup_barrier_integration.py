@@ -175,8 +175,15 @@ def test_write_is_refused_uncommitted_when_the_events_daemon_misses_the_startup_
     assert detail.code == "events_daemon_unavailable", detail
     assert detail.domain_disposition == "not_committed", detail
     assert detail.retryable is True, detail
-    assert detail.model_extra["socket"] == str(daemon.events_socket), detail
-    assert str(daemon.events_socket) in detail.message, detail
+    # The daemon may report the socket through a resolved directory (macOS
+    # reaches /tmp as /private/tmp), so compare resolved paths and accept the
+    # message naming either spelling.
+    expected_socket = daemon.events_socket.resolve()
+    assert Path(detail.model_extra["socket"]).resolve() == expected_socket, detail
+    assert (
+        str(expected_socket) in detail.message
+        or str(daemon.events_socket) in detail.message
+    ), detail
 
     # Once the late child answers, the gate reopens and requests dispatch again.
     deadline = time.monotonic() + 30

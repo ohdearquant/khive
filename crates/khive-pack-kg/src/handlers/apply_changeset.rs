@@ -42,6 +42,7 @@ impl KgPack {
                 khive_changeset::Op::Link(op) => ("link", op.id, false),
                 khive_changeset::Op::Update(op) => ("update", op.target_id(), true),
                 khive_changeset::Op::Delete(op) => ("delete", op.target_id, true),
+                khive_changeset::Op::Restore(op) => ("restore", op.target_id(), false),
                 khive_changeset::Op::Merge(_) => unreachable!("decode rejects merge"),
             };
             serde_json::json!({"op_index":index,"verb":verb,"id":id,"preimage":if checked {"captured"} else {"none"}})

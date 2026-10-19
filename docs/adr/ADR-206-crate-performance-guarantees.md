@@ -579,6 +579,13 @@ every crate in them had its benchmark: 9 of the 80 pull requests then select not
 new components are selected by all 16 trains and 11 trains select all six. Its 6.9
 runner-minutes per job is a floor for the `runtime-mcp` component, whose release build of
 `khive-runtime`, `khive-mcp` and `kkernel` is heavier than any component measured here.
+Timed on 2026-10-19 under decision 6, on the CI build host (16 CPUs, 8 build jobs) at main
+`fb10dc43` with the bench targets of #5674, #5689 and #5698 applied: the `runtime-mcp`
+quick Criterion pass (`cargo bench -p khive-runtime -p khive-mcp -p kkernel --benches --
+--quick --noplot`) ran 5 targets and 46 benchmarks in 44 seconds, against the 600-second
+bound. Building those bench targets first (`--no-run`) took 383 seconds, so the two together
+took 427 seconds, about 7.1 minutes, beside the 6.9-minute floor above (a floor counted in
+pull request runner-minutes; this is the build host).
 
 Per-pull-request closure costs about five to eight times the existing spend and fails D6's
 ceiling. Per-train closure costs two to three times the existing spend and benchmarks every

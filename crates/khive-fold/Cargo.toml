@@ -49,3 +49,11 @@ criterion = { workspace = true }
 [[bench]]
 name = "fold_bench"
 harness = false
+
+[[bench]]
+name = "fold_workloads"
+harness = false
+
+[[bench]]
+name = "fold_selector_scale"
+harness = false

@@ -199,4 +199,19 @@ R=$(fresh_repo c22)
 mkdir -p "$R/-dir"; printf '{"a":1}\n' >"$R/-dir/x.NDJSON"; big_json "$R" -big.json 300
 [ "$(run_guard "$R" --all)" = 1 ] && grep -qF -- '-dir/x.NDJSON' "$ERR" && grep -qF -- '-big.json — 300KB JSON exceeds' "$ERR" && pass || fail "--all did not refuse both '-' names"
 
+echo "--- case 23: a JSONL path with 'result' before 'bench' is not a benchmark-results path ---"
+R=$(fresh_repo c23)
+mkdir -p "$R/results"; printf '{"a":1}\n' >"$R/results/bench-corpus.jsonl"; git -C "$R" add results/bench-corpus.jsonl
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'results/bench-corpus.jsonl — JSONL/NDJSON staged outside a benchmark-results path' "$ERR" && pass || fail "results/bench-corpus.jsonl was admitted"
+
+echo "--- case 24: a *bench*result* JSONL outside a bench directory is admitted (control) ---"
+R=$(fresh_repo c24)
+mkdir -p "$R/perf"; printf '{"t":1}\n' >"$R/perf/bench_results.jsonl"; git -C "$R" add perf/bench_results.jsonl
+[ "$(run_guard "$R")" = 0 ] && pass || fail "perf/bench_results.jsonl was refused"
+
+echo "--- case 25: a nested package's lockfile over the ceiling is admitted by file name ---"
+R=$(fresh_repo c25)
+big_json "$R" apps/web/package-lock.json 300; git -C "$R" add apps/web/package-lock.json
+[ "$(run_guard "$R")" = 0 ] && pass || fail "apps/web/package-lock.json was refused"
+
 echo "all cases passed"

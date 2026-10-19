@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{SqlColumnError, SqlRow, SqlStatement, SqlValue};
 use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
@@ -166,6 +166,32 @@ pub(crate) struct GrantRow {
 }
 
 impl GrantRow {
+    fn from_active_row(row: &SqlRow) -> Result<Self, RuntimeError> {
+        let invalid = |error: SqlColumnError| {
+            let id = row.text("id").unwrap_or("<unreadable id>");
+            RuntimeError::Internal(format!("invalid tool_grants row {id}: {error}"))
+        };
+        // A selected malformed grant must not become a perpetual grant or fall
+        // through to a policy/default decision. Other readers retain their contract.
+        Ok(Self {
+            id: row.text("id").map_err(invalid)?.to_owned(),
+            actor: row.text("actor").map_err(invalid)?.to_owned(),
+            tool: row.text("tool").map_err(invalid)?.to_owned(),
+            scope: text(row, "scope"),
+            reason: text(row, "reason"),
+            status: row.text("status").map_err(invalid)?.to_owned(),
+            requested_at: row.i64("requested_at").map_err(invalid)?,
+            decided_at: int(row, "decided_at"),
+            decided_by: text(row, "decided_by"),
+            expires_at: row.opt_i64("expires_at").map_err(invalid)?,
+            decision_note: text(row, "decision_note"),
+            registry_id: text(row, "registry_id"),
+            definition_digest: text(row, "definition_digest"),
+            invalidated_by_registry_id: text(row, "invalidated_by_registry_id"),
+            invalidated_at: int(row, "invalidated_at"),
+        })
+    }
+
     fn from_row(row: &SqlRow) -> Option<Self> {
         Some(Self {
             id: text(row, "id")?,
@@ -383,7 +409,7 @@ pub(crate) async fn select_active_grant(
             label: Some("tool_grant_decide".into()),
         })
         .await?;
-    Ok(rows.first().and_then(GrantRow::from_row))
+    rows.first().map(GrantRow::from_active_row).transpose()
 }
 
 pub(crate) struct PolicyWrite<'a> {
@@ -890,7 +916,60 @@ pub async fn decide(
 
 #[cfg(test)]
 mod tests {
-    use super::pattern_matches;
+    use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
+
+    use super::{pattern_matches, GrantRow};
+
+    fn active_row() -> SqlRow {
+        SqlRow {
+            columns: [
+                ("id", SqlValue::Text("grant-id".into())),
+                ("actor", SqlValue::Text("actor".into())),
+                ("tool", SqlValue::Text("tool".into())),
+                ("status", SqlValue::Text("granted".into())),
+                ("requested_at", SqlValue::Integer(1)),
+                ("expires_at", SqlValue::Null),
+            ]
+            .into_iter()
+            .map(|(name, value)| SqlColumn {
+                name: name.into(),
+                value,
+            })
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn active_grant_decode_refuses_missing_or_mistyped_columns() {
+        assert!(GrantRow::from_active_row(&active_row()).is_ok());
+        for column in [
+            "id",
+            "actor",
+            "tool",
+            "status",
+            "requested_at",
+            "expires_at",
+        ] {
+            for replacement in [None, Some(SqlValue::Blob(vec![0]))] {
+                let mut row = active_row();
+                row.columns.retain(|field| field.name != column);
+                if let Some(value) = replacement {
+                    row.columns.push(SqlColumn {
+                        name: column.into(),
+                        value,
+                    });
+                }
+                let error = GrantRow::from_active_row(&row).unwrap_err().to_string();
+                assert!(error.contains("tool_grants"), "{error}");
+                assert!(error.contains(&format!("SQL column {column}")), "{error}");
+                if column == "id" {
+                    assert!(error.contains("<unreadable id>"), "{error}");
+                } else {
+                    assert!(error.contains("grant-id"), "{error}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn patterns() {

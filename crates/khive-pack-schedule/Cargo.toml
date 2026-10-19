@@ -41,3 +41,7 @@ lattice-embed = { workspace = true }
 [[bench]]
 name = "schedule_bench"
 harness = false
+
+[[bench]]
+name = "schedule_scale"
+harness = false
