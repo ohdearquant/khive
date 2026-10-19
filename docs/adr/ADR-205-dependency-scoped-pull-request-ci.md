@@ -132,3 +132,134 @@ Phase 1 has landed: the map registry loaded from configuration (#5612) and `code
 Phase 2 has landed in part (#5638): the classifier script and the Classify job's `test_scope` output (D1 to D4), the scoped `ci` job (D5), the gate reading the scope (D6), the debug `kkernel` artifact published by `main` push runs, and the retirement of the integration-only lane (D7). #5717 adds a full-suite rule for a changed file that another crate includes. The escape audit issue is #5637 (D8).
 
 Not implemented: the D3a mechanical range check for `main` pushes, and the D8 parity test against `cargo metadata`. D9's acceptance has not been read. The status stays Proposed until it is.
+
+## Amendment 1: Scope integration-branch pushes, and narrow three full-suite triggers (2026-10-18)
+
+**Status**: Proposed (2026-10-18)
+
+### Context
+
+On the 40 newest pull-request runs that had ended by 2026-10-18 21:00 UTC (32 succeeded, 7 were cancelled, 1 failed),
+the classifier chose a crate scope for 2, sent 1 to the documentation lane, and ran the full suite for 37. The reasons it
+printed for those 37 (six runs printed two): a change to `crates/Cargo.lock` (15 runs; most added one development
+dependency to one crate, one bumped workspace versions), `CHANGELOG.md` named by a non-Markdown file (9; the only such
+file is a `.tsv` census list under `docs/testing/`), other Markdown named by code (8, correctly full), a crate's own
+`Cargo.toml` (6), CI scripts (3), a Rust source file (1) and a verb-count document (1).
+Every push to `integration/**` runs the full suite under D3, including a push whose merged pull requests change only
+Markdown. Run over the 60 newest commits on `main` up to `fb10dc43`, the classifier with Decisions 2 and 3 below scoped
+2 and ran the full suite for 58; both scoped commits changed a dependency entry, and the lockfile reach widened them to
+52 and 37 of the 53 workspace members, so in practice Decision 2 scopes manifest edits that change no dependency entry,
+such as a new target or bench.
+
+In this amendment the _tested base_ of a push is the newest commit on `main` whose push or scheduled CI run concluded
+successfully as a whole, ran the full suite (its recorded scope is `full`, as D3a requires of its range start), passed
+Linux test shard 1, and is an ancestor of the pushed head. The documentation lane already looks up this base for pushes
+to `main` (`ci.yml`, Classify step). Until D3a's range check is implemented every run on `main` runs the full suite, so
+the newest successful run qualifies; once runs on `main` can be scoped, the lookup skips a run whose recorded scope is
+not `full`.
+
+### Decision
+
+1. **Integration-branch pushes.** D3's first sentence no longer lists pushes to `integration/**`. Such a push is
+   classified like a pull request over the range from its tested base to its head: if every changed path is Markdown the
+   documentation lane admits, the push takes that lane; otherwise D2-D4 run on that range and the push runs the closure
+   or the full suite. No tested base, a failed lookup, or a head whose ancestry cannot be read puts the push on the full
+   suite. Pushes to `main` keep D3 and D3a. D8 counts as an escape a run on `main` that fails in a crate outside the
+   scope printed by an integration push whose head has the same tree as the failing commit. The join is by tree, read
+   from the head commit of each run, because an integration branch is tested and then its pull requests land one by
+   one, so the commit that reaches `main` is usually a different commit with the same tree; a join by tree also covers
+   the case where the integration head itself reaches `main`. When more
+   than one integration run has that tree, the failure counts as an escape if the crate lies outside the scope any of
+   them printed, and the count lists every matching run id with its printed scope. A failing commit whose tree no
+   integration head has is counted under D8's existing categories, which remain.
+2. **A crate's own manifest.** D3's path list and D4's ordering rule change for one path class: a `Cargo.toml` under a
+   crate's manifest directory (the workspace manifest `crates/Cargo.toml` stays a D3 path). Such a change no longer puts
+   the run on the full suite by itself, but only when every difference between the base and head copy of that manifest
+   is inside a dependency table (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and their
+   `[target.*]` forms) or a target table (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`); no dependency entry gains, loses or changes `features`, `default-features` or `optional`; and
+   in every target table that differs, each `path`, resolved with every `..` segment and symbolic link
+   followed, lies inside the crate's manifest directory and `required-features` is unchanged. A target whose file lies outside the crate, or whose required features change, can
+   compile code or enable features the dependency map does not show, so it goes to the full suite.
+   `[package.metadata]` is not admitted: tools other than the compiler read it, and this rule audits none of them.
+   The classifier reads both copies as data (a TOML parse in the classifier, never the binary). Any other difference,
+   including any change to `[features]`, puts the run on the full suite, because a feature a crate enables on another
+   package can change that package's build for every crate in a whole-workspace build, which the dependency closure
+   does not follow. For the same reason, when the change adds, removes or edits a dependency entry, every workspace member
+   whose resolved dependencies in the base or head `Cargo.lock` reach the package that entry names (inside or outside
+   the workspace) also counts as changed: a new entry with default features can change that package's unified build.
+   When a crate manifest changed, the crate counts as changed, and the binary ingests the base commit's
+   tree instead of the head's, so it still parses no manifest the change wrote (D4); the closure is taken over the
+   dependency map ingested from that base tree. It contains the head's closure: every dependency edge the change adds starts at a crate whose manifest
+   changed, which is itself in the changed set.
+3. **The lockfile.** A change to `crates/Cargo.lock` no longer puts the run on the full suite by itself. The classifier
+   parses the base and head lockfiles as data and keys each package entry by name, version and source. Every entry that
+   exists on one side only, or whose checksum or dependency list differs, is changed. Every workspace member whose
+   resolved dependencies in either lockfile reach a changed entry, and every member whose own entry differs, counts as
+   changed. A lockfile that does not parse, a change to its `version` header, or a change touching every workspace
+   member puts the run on the full suite. Any other `Cargo.lock`, such as a nested crate's own lockfile
+   (`crates/khive-merge/Cargo.lock`), stays a D3 path.
+4. **Markdown named only by an inert documentation data file.** The documentation-lane check that no non-Markdown file
+   names a Markdown file ignores a naming file listed in `scripts/ci-inert-docs-data.txt`. A file may be listed only if
+   it is under `docs/`, has a `.tsv`, `.csv` or `.txt` extension, and no test, script or build reads it by name or by a
+   directory pattern, other than a test the documentation lane itself runs; the line states why. The workflow test sees
+   naming only, so a reader that reaches the file by walking the repository is outside what it checks; the readers that
+   walk the repository at the pinned revision are the content sweeps, which the documentation lane runs
+   (`scripts/ci.sh:536–545`). The list is under `scripts/`, so a change to it runs the full suite, and a
+   workflow test fails when a listed file is outside `docs/`, has another extension, or when any non-Markdown file
+   outside `docs/` names the listed file, a directory below `docs/` that contains it (for example `docs/testing`), or a
+   pattern over its extension (for example `*.tsv`). A line names the listed file when it holds the file's name. A path
+   token is a run of letters, digits and the characters `_ . - / * ? [ ] { } ,`; its pieces are its parts between braces
+   and commas, and the parts between commas of each expansion of its brace lists, each without any leading `[`, `./`,
+   `../` or `/` or any trailing `]`, period or comma. A line names a directory when a piece is that directory's path
+   followed by `/`, `/*` or `/**`, or, for a path of two or more segments, the path alone; a longer path that starts with
+   it does not count. A line names a pattern over the extension when a piece's last segment holds `*`, `?` or `[` and
+   ends in the extension, such as `*.tsv`, `docs/**/*.tsv` or `*.{tsv,csv}`. Outside `docs/`, `docs/` itself is named
+   only by the formatter, which reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file
+   (`deno fmt docs/` and `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), by two
+   lines of `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix, and by the comment in `scripts/ci.sh` on
+   the shipping pack-set copy check, a content sweep the documentation lane runs that reads only `.rs`, `.py`, `.md`,
+   `.json` and `.toml` files; the test admits exactly those lines and fails on any other naming of `docs/`. Any other
+   naming file still counts.
+
+Every new rule prints the crates it added and why, and every failure in it chooses the full suite.
+
+### Verify by
+
+Each check runs the classifier, or the workflow step, on fixture ranges and fails if the printed scope differs. Each
+fixture case below is an arm of its check, and each named mutation must turn the arm it names red.
+
+1. Integration push: Markdown-only commits after the tested base take the documentation lane; the same range with one
+   crate source commit runs that crate's closure, and a range of two commits (a source change in one crate, then in
+   another) runs both closures. A candidate base whose run concluded with a failure, whose shard 1 failed, or whose
+   recorded scope is not `full` is not used. Mutations: compare against the pushed head's parent (the range of two
+   commits then runs only the second crate's closure); accept a run by its shard alone (the candidate whose run failed
+   is then used); ignore the recorded scope (the scoped candidate is then used).
+2. Crate manifest: adding a development dependency on an existing external package runs that crate's closure plus the
+   crates whose lockfile dependencies reach the package, and the binary is handed the base tree; editing `[features]`,
+   or a dependency's `features`, runs the full suite; a `[[test]]` whose `path` moves outside the crate, or whose
+   `required-features` changes, runs the full suite, while a new `[[bench]]` with a path inside the crate runs the
+   crate's closure; a `[[test]]` whose `path` is a symbolic link inside the crate to a file outside it, and any change
+   under `[package.metadata]`, run the full suite. Mutations: hand the binary the head tree (the fixture's base-tree assertion fails); drop the
+   `[features]` rule (the feature arm fails); drop the target-path rule (the outside-path arm fails); drop the `required-features` comparison (the
+   changed-required-features arm fails); resolve `path` lexically (the symbolic-link arm fails); admit
+   `[package.metadata]` changes (the metadata arm fails).
+3. Lockfile: bumping one external package runs the closure of the members that reach it; a changed checksum or
+   dependency list alone does the same; two versions of one package where only one changes select only that one's
+   reachers; a header change or an unparseable lockfile runs the full suite. Mutations: drop the reverse walk; key
+   entries by name alone (the two-version arm fails).
+4. Inert data: `CHANGELOG.md` named only by a listed `.tsv` takes the documentation lane; the same file unlisted runs
+   the full suite; the workflow test fails when a script outside `docs/` names the listed file, its directory
+   (`docs/testing`), `docs/`, or `*.tsv`, including inside a brace, bracket or comma list and after a variable, and
+   passes on the repository's own tree, where `docs/testing` occurs only inside longer paths. Mutations: ignore the list
+   (the listed arm fails); check only the file's own name (the directory and pattern arms fail); admit every naming of
+   `docs/` (the `docs/` arm fails); match a directory as the start of a longer path (the repository-tree arm fails);
+   take each path token whole (the list and variable arms fail).
+5. A change to `crates/Cargo.toml`, or a crate manifest change outside the admitted tables, runs the full suite.
+   Mutation: admit `[package]` changes (the arm editing `[package]` fails).
+6. D8 join: on a recorded pair, an integration run and a failing run on `main` whose head commits have the same tree,
+   with the failing crate outside the integration run's printed scope, the audit reports one escape; with one file of
+   the main commit's tree changed, it reports none in this category; with two integration runs at distinct commits of
+   that tree, one whose scope includes the failing crate and one whose scope omits it, it reports one escape naming
+   both run ids. Mutations: join by commit instead of tree (the fixture's integration and main commits are distinct
+   commits with equal trees, so the pair is then missed); take only the newest matching run (the two-run arm fails when
+   the newest one's scope includes the crate).

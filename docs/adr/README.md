@@ -327,6 +327,7 @@ Amendments to accepted records:
 
 Amendments inside records whose own status is Proposed:
 
+- [ADR-205 Amendment 1](ADR-205-dependency-scoped-pull-request-ci.md#amendment-1-scope-integration-branch-pushes-and-narrow-three-full-suite-triggers-2026-10-18) (2026-10-18): proposed scoping of `integration/**` pushes from a fully tested base, and crate manifests, the workspace lockfile and Markdown named only by an inert documentation data file taken off the full-suite triggers, each failing toward the full suite.
 - [ADR-133 Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
 - [ADR-189 Amendment 2](ADR-189-namespace-move.md#amendment-2-2026-10-04-logical-domain-routes-and-partitioned-vector-destinations) (2026-10-04): canonical Domain mirror ownership and unique source-vector destinations per backend (#3696).
