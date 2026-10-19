@@ -625,7 +625,9 @@ fn bench_backend_creation(c: &mut Criterion) {
                 .expect("sqlite backend");
                 black_box((backend, dir))
             },
-            BatchSize::SmallInput,
+            // Each output is an open backend; a batch keeps every output alive until it ends, so a batch size
+            // above one holds that many databases open at once and can run out of file descriptors.
+            BatchSize::PerIteration,
         );
     });
 
