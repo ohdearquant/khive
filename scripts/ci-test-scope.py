@@ -583,6 +583,14 @@ def changed_keys(key, before, after):
     return [key]
 
 
+def symbolic_links(revision, paths):
+    """The paths among paths that are symbolic links (mode 120000) at revision."""
+    if not paths:
+        return set()
+    raw = git("--literal-pathspecs", "ls-tree", "-r", "-z", "--format=%(objectmode) %(path)", revision, "--", *paths)
+    return {row.split(" ", 1)[1] for row in raw.split("\0") if row.startswith("120000 ")}
+
+
 def symlink_map(head):
     """{path: target} for every symbolic link in the head tree."""
     raw = git("ls-tree", "-r", "-z", "--format=%(objectmode) %(path)", head)
@@ -1017,6 +1025,11 @@ def classify(base, head, binary, paths_only=False):
             check_markdown(path, head, targets)
     if not crate_paths and not manifest_paths and not lockfile:
         raise Full("no crate source changed")
+    # git show returns a link's target text while cargo reads the file the link names, so a manifest or lockfile
+    # that is a link on either side is never read as data.
+    for revision in (base, head):
+        for path in sorted(symbolic_links(revision, manifest_paths + sorted_paths["lockfile"])):
+            raise Full(f"{path} is a symbolic link at {revision}")
     manifests = load_manifests(head)
     changed = set()
     for path in crate_paths:

@@ -3227,9 +3227,17 @@ class ScopeFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
     def change(self, *paths):
+        # Each edit stays valid TOML where the file is TOML, so a manifest or lockfile reaches the rule a test names
+        # instead of failing to parse: a crate manifest gains a [features] table, which the manifest rules refuse.
         self.git("checkout", "-q", "--detach", self.base)
         for path in paths:
-            self.write(path, (self.TREE.get(path) or "") + "// changed\n")
+            if path.endswith("/Cargo.toml") and path != "crates/Cargo.toml":
+                edit = "\n[features]\nchanged = []\n"
+            elif path.endswith((".toml", ".lock")):
+                edit = "# changed\n"
+            else:
+                edit = "// changed\n"
+            self.write(path, (self.TREE.get(path) or "") + edit)
         return self.commit("change " + " ".join(paths))
 
 
@@ -3256,13 +3264,14 @@ class TestScopeClassifierTests(ScopeFixture):
                 verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
                 admitted = path in self.CRATE_SOURCE and path not in self.NAMED_ELSEWHERE
                 self.assertEqual(verdict, "map" if admitted else "full", reasons)
+                self.assertNotIn("does not parse", reasons)
         self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
 
     def test_a_full_suite_path_never_reaches_the_binary(self):
         # ADR-205 D4 ordering arm: a manifest beside crate source prints its reason and no ingest line.
         verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(verdict, "full")
-        self.assertIn("full suite: manifest: crates/k/Cargo.toml", reasons)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", reasons)
         self.assertNotIn("ingest:", reasons)
         self.assertEqual(self.calls(), [])
 
@@ -3506,9 +3515,12 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
         """A commit on base (the fixture base by default) writing files and adding (link, target) symlinks."""
         self.git("checkout", "-q", "--detach", base or self.base)
         for path, text in files.items():
+            if (self.repo / path).is_symlink():
+                (self.repo / path).unlink()
             self.write(path, text)
         for path, target in links:
             (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).unlink(missing_ok=True)
             os.symlink(target, self.repo / path)
         return self.commit("edit " + " ".join(sorted(files)))
 
@@ -3678,6 +3690,38 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
         self.assertEqual(verdict, "full", reasons)
         self.assertIn("crates/Cargo.lock is read by a crate: j (crates/j/tests/lock.rs:1)", reasons)
 
+    # --- symbolic links: git stores a link's target text, cargo reads the file the link names ---
+    # Each link's target text is itself an admissible change, so only the file mode separates these from "map".
+
+    def test_a_manifest_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/Cargo.lock": lock}, links=[("crates/m/Cargo.toml", self.M + 'serde = "1"\n')])
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
+    def test_a_manifest_that_was_a_symbolic_link_runs_the_full_suite(self):
+        linked = self.edit({}, links=[("crates/m/Cargo.toml", self.M)])
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": lock}, base=linked)
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "100644")
+        verdict, reasons = self.scope(linked, head, "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {linked}", reasons)
+
+    def test_a_lockfile_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])})
+        head = self.edit({}, links=[("crates/Cargo.lock", lock)])
+        self.assertEqual(self.git("ls-tree", head, "crates/Cargo.lock").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/Cargo.lock is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
 
 class ScopeStepTests(ScopeFixture):
     """The Classify job's Scope step: the path rules first, then the binary from main, never a failure."""
@@ -3744,7 +3788,7 @@ esac
     def test_the_path_rules_run_before_any_fetch(self):
         scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
-        self.assertIn("full suite: manifest: crates/k/Cargo.toml", log)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_other_events_are_never_scoped(self):
@@ -3835,6 +3879,7 @@ class BenchTrainScopeTests(ScopeFixture):
     def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
         scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
+        self.assertIn("manifest: crates/k/Cargo.toml changes features", log)
         self.assertEqual(self.gh_calls(), [])
         self.assertEqual(self.components(scope), set(self.COMPONENTS))
 
