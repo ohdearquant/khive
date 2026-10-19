@@ -209,12 +209,14 @@ not `full`.
    outside `docs/` names the listed file, a directory below `docs/` that contains it (for example `docs/testing`), or a
    pattern over its extension (for example `*.tsv`). A file names a directory when a whole path token, after any leading
    `./`, `../` or `/`, is that directory's path followed by `/`, `/*` or `/**`, or, for a path of two or more segments,
-   the path alone; a longer path that starts with it does not count. A pattern over the extension is a glob token whose
-   last segment ends in it, such as `*.tsv` or `docs/**/*.tsv`. Outside `docs/`, `docs/` itself is named only by the
-   formatter, which reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file (`deno fmt docs/`
-   and `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), and by two lines of
-   `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix; the test admits exactly those lines and fails on
-   any other naming of `docs/`. Any other naming file still counts.
+   the path alone; a longer path that starts with it does not count. A token ends at whitespace, a quote, a comma, a
+   brace or a final period, and a bracket at its edge. A pattern over the extension is a glob token whose last segment
+   ends in it, such as `*.tsv` or `docs/**/*.tsv`. Outside `docs/`, `docs/` itself is named only by the formatter, which
+   reads only the file types it supports and never a `.tsv`, `.csv` or `.txt` file (`deno fmt docs/` and
+   `deno fmt --check docs/` in the `Makefile`, and the `include` list in `deno.json`), by two lines of
+   `.github/workflows/ci.yml` that use `docs/` as a branch-name prefix, and by the comment in `scripts/ci.sh` on the
+   shipping pack-set copy check, a content sweep the documentation lane runs that reads Markdown only; the test admits
+   exactly those lines and fails on any other naming of `docs/`. Any other naming file still counts.
 
 Every new rule prints the crates it added and why, and every failure in it chooses the full suite.
 
