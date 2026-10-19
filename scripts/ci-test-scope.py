@@ -19,16 +19,25 @@ crate source goes to the full suite. Two path classes are read as data before th
   loses or changes `features`, `default-features` or `optional` (a `workspace = true` entry is read
   together with the workspace manifest's entry it inherits); and every target table that differs keeps
   its `required-features` and has a `path` that, with `..` segments and symbolic links followed in the
-  head tree, lies inside the crate. The crate counts as changed, and so does every workspace member
-  whose resolved dependencies in the base or head lockfile reach a package a changed dependency entry
-  names. The binary then ingests the base commit's tree, never the head's.
+  head tree, lies inside the crate. A dependency entry that appears or disappears goes to the full suite
+  (ADR-205 Amendment 2, D1): an entry is its table, its target, the package it names and where that
+  package comes from (`path`, `git` with `branch`, `tag` or `rev`, `registry`, or `workspace = true`), so
+  an entry moved to another table, target, path or source counts as one removed and one added. For an
+  edit to an entry that stays, the crate counts as changed, and so does every workspace member whose
+  resolved dependencies in the base or head lockfile reach the package it names. The binary then ingests
+  the base commit's tree, never the head's.
 - `crates/Cargo.lock` is parsed on both sides with each package entry keyed by name, version and
-  source. An entry on one side only, or one that differs, is changed; every workspace member whose own
-  entry changed, or whose resolved dependencies in either lockfile reach a changed entry, counts as
-  changed. A changed `version` header, any other changed top-level key, or a change reaching every
-  workspace member goes to the full suite.
+  source. An entry on one side only, or one that differs, is changed. A changed entry for a package that
+  is not a workspace member goes to the full suite, a version bump included (ADR-205 Amendment 2, D2):
+  the lockfile does not record the features a package requests of its own dependencies, so the reach of
+  such a change is not readable from it. Every workspace member whose own entry changed, or whose
+  resolved dependencies in either lockfile reach a changed member entry, counts as changed. A changed
+  `version` header, any other changed top-level key, or a change reaching every workspace member goes to
+  the full suite.
 
-Any other difference, and every failure to read either side, goes to the full suite. Only then does
+Any other difference, and every failure to read either side, goes to the full suite. So does a symbolic
+link anywhere under crates/ in the base or head tree, changed or not (ADR-205 Amendment 2, D3): a changed
+path resolves to a crate by its own location while the compiler reads the file a link names. Only then does
 the classifier run `code.ingest` with the
 given `kkernel` binary (the one the newest successful push run on main built), register the map it
 writes, resolve each changed crate to its project with `code.list(kind="project")`, and take the
@@ -90,6 +99,8 @@ TARGET_TABLES = ("lib", "bin", "test", "bench", "example")
 # Cargo also reads the underscore spellings, so each counts as a flag of its own.
 DEPENDENCY_FLAGS = ("features", "default-features", "default_features", "optional")
 REQUIRED_FEATURES = ("required-features", "required_features")
+# Where a dependency entry's package comes from: with the package it names, an entry's identity (Amendment 2, D1).
+DEPENDENCY_SOURCES = ("path", "git", "branch", "tag", "rev", "registry", "registry-index", "workspace")
 SYMLINK_HOPS = 40
 FULL_SUITE_NAMES = {
     "Cargo.toml": "manifest",
@@ -653,8 +664,20 @@ def dependency_package(name, entry, inherited):
     return name
 
 
+def dependency_identities(table, inherited):
+    """{(package, source): [keys]} for one dependency table: the package each entry names and where it comes from.
+    Two entries can share an identity (two keys renaming one package), so each identity keeps every key."""
+    identities = {}
+    for name, entry in sorted(table.items()):
+        source = tuple((field, json.dumps(entry[field], sort_keys=True)) for field in DEPENDENCY_SOURCES
+                       if isinstance(entry, dict) and field in entry)
+        identities.setdefault((dependency_package(name, entry, inherited), source), []).append(name)
+    return identities
+
+
 def dependency_change(path, label, before, after, inherited):
-    """The packages named by the entries a dependency table's change adds, removes or edits."""
+    """The packages named by the entries a dependency table's change edits. An entry that appears or
+    disappears raises Full (ADR-205 Amendment 2, D1)."""
     before, after = before or {}, after or {}
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise Full(f"manifest: {path} has a [{label}] that is not a table")
@@ -668,6 +691,13 @@ def dependency_change(path, label, before, after, inherited):
         if old_flags != new_flags:
             raise Full(f"manifest: {path} changes features, default-features or optional of {label}.{name}")
         named.update(dependency_package(name, entry, inherited) for entry in (old, new) if entry is not None)
+    old_ids, new_ids = dependency_identities(before, inherited), dependency_identities(after, inherited)
+    for verb, side, other in (("adds", new_ids, old_ids), ("removes", old_ids, new_ids)):
+        moved = sorted(f"{label}.{side[identity][-1]}" for identity in side
+                       if len(side[identity]) > len(other.get(identity, [])))
+        if moved:
+            raise Full(f"manifest: {path} {verb} the dependency entry {', '.join(moved)} (a dependency that appears "
+                       f"or disappears can change features the lockfile does not record)")
     return named
 
 
@@ -828,6 +858,10 @@ def lockfile_change(sides, crates):
     if other:
         raise Full(f"lockfile: {LOCKFILE} changes {', '.join(other)}")
     changed = {key for key in set(old) | set(new) if old.get(key) != new.get(key)}
+    outside = sorted(key for key in changed if key[2] or key[0] not in crates)
+    if outside:
+        raise Full(f"lockfile: {LOCKFILE} changes {len(outside)} entries outside the workspace, first "
+                   f"{outside[0][0]} {outside[0][1]} (the lockfile does not record the features they request)")
     everyone = {member[0] for entries in (old, new) for member in members(entries, crates)}
     if not everyone:
         raise Full(f"lockfile: {LOCKFILE} lists no workspace member")
@@ -1030,6 +1064,12 @@ def classify(base, head, binary, paths_only=False):
     for revision in (base, head):
         for path in sorted(symbolic_links(revision, manifest_paths + sorted_paths["lockfile"])):
             raise Full(f"{path} is a symbolic link at {revision}")
+    # A changed path resolves to a crate by its own location while the compiler reads the file a link names, and an
+    # unchanged link reads the new contents of whatever it names; so any link under crates/, on either side.
+    for revision in (base, head):
+        links = sorted(symbolic_links(revision, [CRATES]))
+        if links:
+            raise Full(f"{len(links)} symbolic link(s) under {CRATES} at {revision}, first {links[0]}")
     manifests = load_manifests(head)
     changed = set()
     for path in crate_paths:

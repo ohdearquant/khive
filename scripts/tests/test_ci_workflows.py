@@ -3653,28 +3653,65 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
         packages = [changes.pop(f"{p[0]}@{p[1]}", p) for p in self.PACKAGES]
         return lockfile(*[p for p in packages if p is not None], *changes.values())
 
-    # --- crate manifests (verify-by 2 and 5) ---
+    # --- crate manifests (Amendment 1 verify-by 2 and 5; Amendment 2 verify-by 1) ---
 
-    def test_a_new_development_dependency_runs_the_crate_and_every_member_reaching_the_package(self):
-        head = self.edit({"crates/m/Cargo.toml": self.M + 'serde = "1"\n',
-                          "crates/Cargo.lock": self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None,
-                                                                             ["rand 0.7.0", "serde"])})})
+    def test_an_edit_to_an_existing_entry_runs_the_crate_and_every_member_reaching_the_package(self):
+        # A version requirement added to a path dependency: the entry stays and the lockfile does not change.
+        head = self.edit({"crates/j/Cargo.toml": self.J.replace('k = { path = "../k" }',
+                                                                'k = { path = "../k", version = "0.1" }')})
         verdict, reasons = self.scope(self.base, head)
-        self.assertEqual(verdict, "j k m", reasons)
-        self.assertIn("changed: crates/m/Cargo.toml -> m (manifest; changed dependency entries name: serde)", reasons)
-        self.assertIn("members reaching serde in either lockfile: j k m", reasons)
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/j/Cargo.toml -> j (manifest; changed dependency entries name: k)", reasons)
+        self.assertIn("members reaching k in either lockfile: j k", reasons)
         self.assertIn("ingest: the base tree", reasons)
         # the binary was handed the base commit's manifests, never one the change wrote
         seen = self.ingested()
         self.assertNotEqual(seen["path"], str(self.repo / "crates"))
-        self.assertEqual(seen["manifests"]["m/Cargo.toml"], self.M)
+        self.assertEqual(seen["manifests"]["j/Cargo.toml"], self.J)
         self.assertEqual(seen["manifests"]["k/Cargo.toml"], self.K)
         self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "map")
 
-    def test_a_dependency_named_by_neither_lockfile_runs_the_full_suite(self):
-        verdict, reasons = self.scope(self.base, self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1"\n'}))
+    def test_an_edited_entry_named_by_neither_lockfile_runs_the_full_suite(self):
+        stale = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1"\n'})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1.0"\n'}, base=stale)
+        verdict, reasons = self.scope(stale, head)
         self.assertEqual(verdict, "full", reasons)
         self.assertIn("lockfile: neither side lists itoa", reasons)
+
+    def test_a_dependency_entry_that_appears_or_disappears_runs_the_full_suite(self):
+        twice = self.edit({"crates/j/Cargo.toml": self.J + 'rand2 = { package = "rand", version = "0.8" }\n'})
+        with_serde = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        for label, base, files, reason in (
+                ("a path package outside the workspace", None,
+                 {"crates/m/Cargo.toml": self.M + '\n[dependencies]\nfoo = { path = "../../outside/foo" }\n'},
+                 "adds the dependency entry dependencies.foo"),
+                ("a development dependency on a package the lockfile lists", None,
+                 {"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": with_serde},
+                 "adds the dependency entry dev-dependencies.serde"),
+                ("a removed entry", None, {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"\n', "")},
+                 "removes the dependency entry dependencies.rand"),
+                ("another path", None,
+                 {"crates/k/Cargo.toml": self.K.replace('ksub = { path = "sub" }', 'ksub = { path = "sub2" }')},
+                 "adds the dependency entry dependencies.ksub"),
+                ("another package under the same key", None,
+                 {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"', 'rand = { package = "fastrand", version = "0.8" }')},
+                 "adds the dependency entry dependencies.rand"),
+                ("another table", None, {"crates/m/Cargo.toml": self.M.replace("[dev-dependencies]", "[dependencies]")},
+                 "adds the dependency entry dependencies.rand"),
+                ("another target", None,
+                 {"crates/m/Cargo.toml": self.M + "\n[target.'cfg(unix)'.dependencies]\nrand = \"0.7\"\n"},
+                 "adds the dependency entry target.cfg(unix).dependencies.rand"),
+                ("one of two entries naming one package", twice, {"crates/j/Cargo.toml": self.J},
+                 "removes the dependency entry dependencies.rand2")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                start = base or self.base
+                verdict, reasons = self.scope(start, self.edit(files, base=start))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"full suite: manifest: crates/", reasons)
+                self.assertIn(reason, reasons)
+                self.assertNotIn("ingest:", reasons)
+                self.assertEqual(self.calls(), [])
 
     def test_features_runs_the_full_suite(self):
         for label, path, text, reason in (
@@ -3721,18 +3758,31 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
                 self.assertEqual(verdict, "full", reasons)
                 self.assertIn(reason, reasons)
 
-    def test_a_target_path_through_a_symbolic_link_out_of_the_crate_runs_the_full_suite(self):
-        linked = self.edit({}, links=[("crates/k/tests/link.rs", "../../j/src/lib.rs"),
-                                      ("crates/k/inside.rs", "src/lib.rs")])
-        outside = self.edit({"crates/k/Cargo.toml": self.K + '\n[[test]]\nname = "l"\npath = "tests/link.rs"\n'},
-                            base=linked)
-        verdict, reasons = self.scope(linked, outside)
-        self.assertEqual(verdict, "full", reasons)
-        self.assertIn("gives [[test]] l the path tests/link.rs, which resolves to crates/j/src/lib.rs", reasons)
-        # control: a link that stays inside the crate is admitted
-        inside = self.edit({"crates/k/Cargo.toml": self.K + '\n[[test]]\nname = "i"\npath = "inside.rs"\n'},
-                           base=linked)
-        self.assertEqual(self.scope(linked, inside)[0], "j k")
+    def test_a_symbolic_link_under_crates_runs_the_full_suite(self):
+        # Amendment 2, D3: a link in k naming a file of j. The path rules would admit each change below.
+        linked = self.edit({}, links=[("crates/k/tests/link.rs", "../../j/src/lib.rs")])
+        self.git("checkout", "-q", "--detach", linked)
+        (self.repo / "crates/k/tests/link.rs").unlink()
+        removed = self.commit("remove the link")
+        for label, base, head in (
+                ("a new link", self.base, linked),
+                # the closure of j alone would omit k, whose test reads the changed file through the link
+                ("an unchanged link whose target changed", linked,
+                 self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}, base=linked)),
+                ("a link removed at the head", linked, removed),
+                ("a target path through a link inside the crate", linked,
+                 self.edit({"crates/k/Cargo.toml": self.K + '\n[[test]]\nname = "l"\npath = "tests/link.rs"\n'},
+                           base=linked))):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                verdict, reasons = self.scope(base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertRegex(reasons, r"full suite: 1 symbolic link\(s\) under crates/ at [0-9a-f]{40}, "
+                                          r"first crates/k/tests/link\.rs")
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.scope(base, head, "--paths-only")[0], "full")
+        # control: the same source change with no link in either tree runs its closure
+        self.assertEqual(self.scope(self.base, self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}))[0], "j")
 
     def test_a_new_bench_inside_the_crate_runs_the_crate_closure(self):
         head = self.edit({"crates/k/Cargo.toml": self.K + '\n[[bench]]\nname = "kb"\npath = "benches/kb.rs"\n',
@@ -3772,14 +3822,11 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
 
     # --- the lockfile (verify-by 3) ---
 
-    def test_a_lockfile_change_runs_the_members_that_reach_it(self):
+    def test_a_lockfile_change_to_member_entries_runs_the_members_that_reach_them(self):
         for label, changes, expected in (
-                ("bump one external package", {"rand@0.7.0": ("rand", "0.7.1", REGISTRY, "a71", []),
-                                               "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.1"])}, "m"),
-                ("checksum alone", {"serde@1.0.0": ("serde", "1.0.0", REGISTRY, "c2", [])}, "j k"),
-                ("dependency list alone", {"rand@0.8.0": ("rand", "0.8.0", REGISTRY, "a8", ["serde"])}, "j"),
-                # two versions of rand: only the changed one's reachers run
-                ("one of two versions", {"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])}, "m")):
+                ("a member's dependency list", {"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])}, "m"),
+                ("a nested member's dependency list", {"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"])},
+                 "j k ksub")):
             with self.subTest(label=label):
                 head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
                 verdict, reasons = self.scope(self.base, head)
@@ -3787,9 +3834,33 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
                 self.assertIn("lockfile: ", reasons)
                 self.assertNotIn("ingest: the base tree", reasons)
 
+    def test_a_lockfile_change_outside_the_workspace_runs_the_full_suite(self):
+        for label, changes, reason in (
+                # the lockfile records a version, never the features the new version requests of its dependencies
+                ("bump one external package", {"rand@0.7.0": ("rand", "0.7.1", REGISTRY, "a71", []),
+                                               "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.1"])},
+                 "first rand 0.7.0"),
+                ("checksum alone", {"serde@1.0.0": ("serde", "1.0.0", REGISTRY, "c2", [])}, "first serde 1.0.0"),
+                ("dependency list alone", {"rand@0.8.0": ("rand", "0.8.0", REGISTRY, "a8", ["serde"])},
+                 "first rand 0.8.0"),
+                ("one of two versions", {"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])}, "first rand 0.7.0"),
+                ("a new external entry", {"itoa@1.0.0": ("itoa", "1.0.0", REGISTRY, "i1", []),
+                                          "m@0.1.0": ("m", "0.1.0", None, None, ["itoa", "rand 0.7.0"])},
+                 "first itoa 1.0.0"),
+                ("a removed external entry", {"rand@0.7.0": None, "m@0.1.0": ("m", "0.1.0", None, None, [])},
+                 "first rand 0.7.0")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn("full suite: lockfile: crates/Cargo.lock changes ", reasons)
+                self.assertIn(f"entries outside the workspace, {reason} ", reasons)
+                self.assertEqual(self.calls(), [])
+
     def test_a_lockfile_header_change_a_parse_failure_or_a_change_reaching_every_member_runs_the_full_suite(self):
         everyone = self.lock_with(**{"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"]),
-                                     "rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])})
+                                     "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
         for label, text, reason in (
                 ("header", lockfile(*self.PACKAGES, version=3), "lockfile: crates/Cargo.lock changes its version header"),
                 ("unparseable", self.TREE["crates/Cargo.lock"] + "// changed\n",
@@ -3805,8 +3876,8 @@ class ManifestAndLockfileScopeTests(ScopeFixture):
 
     def test_a_lockfile_a_crate_reads_runs_the_full_suite(self):
         reader = self.edit({"crates/j/tests/lock.rs": 'const L: &str = include_str!("../../Cargo.lock");\n'})
-        head = self.edit({"crates/Cargo.lock": self.lock_with(**{"serde@1.0.0": ("serde", "1.0.0", REGISTRY, "c2",
-                                                                                 [])})}, base=reader)
+        head = self.edit({"crates/Cargo.lock": self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None,
+                                                                             ["rand 0.7.0", "serde"])})}, base=reader)
         verdict, reasons = self.scope(reader, head)
         self.assertEqual(verdict, "full", reasons)
         self.assertIn("crates/Cargo.lock is read by a crate: j (crates/j/tests/lock.rs:1)", reasons)
