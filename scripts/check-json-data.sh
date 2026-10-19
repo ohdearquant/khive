@@ -13,9 +13,13 @@
 #
 # Rules:
 #   .jsonl / .ndjson     — ALWAYS blocked unless path looks like benchmark
-#                          results (bench/, benchmark/, criterion/, *bench*result*)
+#                          results: a bench/, benches/, benchmark/, benchmarks/ or
+#                          criterion/ directory, or a path matching *bench*result*
+#                          ("bench" before "result"; results/bench-x.jsonl is blocked)
 #   .json                — blocked if larger than MAX_JSON_KB (default 256 KB),
-#                          unless a known lockfile or benchmark-results path
+#                          unless a known lockfile (matched by file name at any
+#                          depth, so a nested package's lockfile is admitted) or a
+#                          benchmark-results path
 #   Extensions match case-insensitively (DATA.JSONL is JSONL), and file lists are
 #   read NUL-delimited so a non-ASCII name reaches the rules as named instead of
 #   in git's C-quoted form, which ends in a quote and matched no extension. A name
@@ -58,7 +62,7 @@ set -uo pipefail
 
 MAX_JSON_KB="${KHIVE_MAX_JSON_KB:-256}"
 LOCKFILES='package-lock.json|deno.lock|flake.lock|composer.lock|bun.lock|.package.resolved'
-BENCH_RE='(^|/)(bench|benches|benchmark|benchmarks|criterion)(/|$)|bench.*result|result.*bench'
+BENCH_RE='(^|/)(bench|benches|benchmark|benchmarks|criterion)(/|$)|bench.*result'
 SHOWCASE_GOLDEN_RE='^(docs/schemas/examples/khive-repo-v1-khive\.json|apps/kg-editor/public/showcase/khive-repo-v1-khive\.json)$'
 SHOWCASE_MAX_JSON_KB=8192
 
