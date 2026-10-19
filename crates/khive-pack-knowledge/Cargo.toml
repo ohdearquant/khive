@@ -73,6 +73,14 @@ harness = false
 name = "tail_replay"
 harness = false
 
+[[bench]]
+name = "knowledge_workloads"
+harness = false
+
+[[bench]]
+name = "knowledge_index_build"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
