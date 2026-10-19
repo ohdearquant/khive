@@ -1600,6 +1600,13 @@ jobs:
         run: |
           cargo test -p khive-db --lib windows_read_only_legacy_reader_rejects_different_opened_file_identity 2>&1 | tee "$RUNNER_TEMP/windows-legacy-reader-identity.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-legacy-reader-identity.log" 1
+      # #5722: a code-map pool's post-open identity check asks the custom VFS for the native
+      # handle; only a Windows run exercises that file control.
+      - name: khive-db Windows code-map handle identity
+        shell: bash
+        run: |
+          cargo test -p khive-db --lib windows_code_map_pool_reports_retained_main_identity 2>&1 | tee "$RUNNER_TEMP/windows-code-map-handle-identity.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-code-map-handle-identity.log" 1
       - name: khive-db Windows handle lock mechanism
         shell: bash
         run: |

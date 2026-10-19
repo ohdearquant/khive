@@ -627,8 +627,7 @@ impl KhiveRuntime {
         // entities, ?(n+1)..?(2n) for notes) — numbered SQLite params bind by
         // index, so reusing the same numbers across halves would silently
         // collapse to a single shared block instead of binding the full list
-        // twice (see khive-db/src/stores/graph.rs batch_neighbors: "each half
-        // is a fully independent positional-parameter block").
+        // twice.
         let entities_placeholders = (0..n)
             .map(|i| format!("?{}", i + 1))
             .collect::<Vec<_>>()
