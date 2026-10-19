@@ -1,4 +1,27 @@
-use super::*;
+use chrono::{DateTime, Utc};
+use khive_storage::types::{Edge, SqlStatement, SqlValue};
+use khive_types::EdgeRelation;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
+// sibling block for the full rationale. `upsert_edge`/`delete_edge` in `store_impl.rs` and
+// `purge_incident_edges` (plus ADR-099's atomic prepare path in
+// `khive-runtime`, and `khive-runtime::operations::update_edge`'s
+// non-symmetric branch) all call these.
+// ---------------------------------------------------------------------------
+
+/// Canonical endpoint order for symmetric relations (F012).
+///
+/// For `competes_with` and `composed_with`, ensures `source_uuid < target_uuid`
+/// so A→B and B→A collapse to a single canonical row in storage.
+pub(super) fn canonical_edge_endpoints(
+    relation: EdgeRelation,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> (Uuid, Uuid) {
+    relation.canonical_endpoints(source_id, target_id)
+}
 
 /// Replacement clause shared by canonical and guarded upserts. Live rows use
 /// replace semantics. Tombstones are excluded unless resurrection was
@@ -29,7 +52,7 @@ pub(super) fn edge_conflict_clause(resurrect: bool) -> String {
 /// undeleted edge (the `annotates` relation's target may be any substrate,
 /// including another edge; ADR-002/ADR-055). Shared by
 /// [`edge_insert_guarded_by_endpoints_statement`] and
-/// [`edge_endpoints_exist`] (#769) so the two "does this endpoint still
+/// [`super::edge_upserts::edge_endpoints_exist`] (#769) so the two "does this endpoint still
 /// exist" probes — the guarded single-row insert and the guarded batch
 /// pre-check — can never drift on which substrates count as valid
 /// endpoints.

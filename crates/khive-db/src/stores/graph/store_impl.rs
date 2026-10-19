@@ -1,4 +1,45 @@
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use khive_storage::graph::{
+    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
+    SymmetricEdgeUpdateRequest,
+};
+use khive_storage::types::{
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
+    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRefusal, EdgeUpsertRequest,
+    EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, NeighborCursor,
+    NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder,
+    TraversalRequest,
+};
+use khive_storage::{GraphStore, LinkId, StorageCapability, StorageError, StorageResult};
+use khive_types::EdgeRelation;
+use rusqlite::OptionalExtension;
+use uuid::Uuid;
+
+use crate::sql_bridge::bind_params;
+
+use super::edge_reads::{
+    build_edge_filter_sql, build_edge_filter_sql_for_namespaces,
+    build_edge_filter_sql_for_namespaces_json, count_neighbor_select, edge_order_clause,
+    endpoint_base_case, fold_endpoint_base_row, neighbor_extra_clause, parse_uuid, read_edge,
+    with_live_endpoints, LIVE_ENDPOINTS_CONDITION,
+};
+use super::edge_statements::{
+    canonical_edge_endpoints, edge_hard_delete_statement, edge_insert_if_absent_statement,
+    edge_replace_if_unchanged_statement, edge_soft_delete_statement,
+    purge_incident_edges_statement,
+};
+use super::edge_upserts::conditional_commit_annotation_insert;
+use super::traversal::{run_bounded_traversal, traversal_neighbor_sql, traversal_timeout_error};
+use super::{
+    map_err, report_graph_usage, resurrection_required_error, SqlGraphStore,
+    LATEST_ANNOTATING_NOTE_SQL, LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL,
+    NAMESPACE_COUNT_CHUNK_SIZE,
+};
 
 #[async_trait]
 impl GraphStore for SqlGraphStore {
@@ -1399,7 +1440,7 @@ impl GraphStore for SqlGraphStore {
             if self
                 .index_repair
                 .as_ref()
-                .is_some_and(super::index_repair::IndexRepairContext::is_writable)
+                .is_some_and(crate::stores::index_repair::IndexRepairContext::is_writable)
             {
                 // Prepare and step the actual indexed adjacency statements with
                 // LIMIT 0 before BFS takes its long-lived reader. This checks the
