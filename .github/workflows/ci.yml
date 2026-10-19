@@ -112,7 +112,9 @@ jobs:
   # commit whose CI run concluded successfully, passed the Linux test shard and recorded a full-suite scope
   # (the Record step), so a documentation commit that replaces a waiting run cannot carry an untested code
   # commit past main CI, and a train whose members change only Markdown skips the suites main already
-  # passed. Every other event, and any failed lookup, runs the full suite.
+  # passed. Every other event, and any failed lookup, runs the full suite. So does a change to either
+  # classifier script (scripts/ci-docs-only.sh, scripts/ci-test-scope.py): neither decides whether its own
+  # change is tested.
   #
   # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
   # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
@@ -120,7 +122,9 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
     needs: resolve-revision
     runs-on: ubuntu-latest
-    # The scope step fetches a binary and ingests the workspace map; its own steps are bounded below it.
+    # The Scope step fetches a binary and ingests the workspace map. Its own bounds (60 s of path rules, up to
+    # ten 120 s downloads, a 300 s ingest) can add up to more than this job's limit; a job that reaches the limit
+    # fails, and the gate reads a failed changed-paths job as a red run, never as a pass.
     timeout-minutes: 10
     permissions:
       contents: read
@@ -147,10 +151,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A change to either path classifier runs the full suite: the classifier a commit carries never decides
+          # whether that commit is tested. A range that cannot be compared counts as such a change.
+          classifiers_changed() {
+            local changed
+            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+              echo "full suite: the path classifiers could not be compared with $1"
+              return 0
+            fi
+            if [[ -n "$changed" ]]; then
+              echo "full suite: the change edits a path classifier: ${changed//$'\n'/, }"
+              return 0
+            fi
+            return 1
+          }
           docs_only=false
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base=$(git rev-parse --verify "${HEAD_SHA}^1")
-            docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+            if ! classifiers_changed "$base"; then
+              docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+            fi
           elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
             base=""
             runs=""
@@ -193,7 +213,9 @@ jobs:
             if [[ -n "$base" ]]; then
               echo "Compared with $base, the newest main commit with a completed full run"
               echo "base=$base" >> "$GITHUB_OUTPUT"
-              docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+              if ! classifiers_changed "$base"; then
+                docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+              fi
             else
               echo "full suite: no main commit with a completed full run was found"
             fi
@@ -223,6 +245,20 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # A change to either path classifier runs the full suite: the classifier a commit carries never decides
+          # whether that commit is tested. A range that cannot be compared counts as such a change.
+          classifiers_changed() {
+            local changed
+            if ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py); then
+              echo "full suite: the path classifiers could not be compared with $1"
+              return 0
+            fi
+            if [[ -n "$changed" ]]; then
+              echo "full suite: the change edits a path classifier: ${changed//$'\n'/, }"
+              return 0
+            fi
+            return 1
+          }
           test_scope=full
           base=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -234,6 +270,9 @@ jobs:
             [[ -n "$base" ]] || echo "full suite: no fully tested main commit is an ancestor of this push"
           else
             echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
+          fi
+          if [[ -n "$base" ]] && classifiers_changed "$base"; then
+            base=""
           fi
           if [[ -n "$base" ]]; then
             mode=$(timeout 60 python3 scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
