@@ -188,14 +188,13 @@ impl std::error::Error for PoisonedBatchError {
 pub(super) fn run_standalone_statement(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     statement: SqlStatement,
     event_rows: Option<Arc<AtomicEventRows>>,
 ) -> (
     StandaloneHandle,
     Result<usize, StandaloneWriteError<rusqlite::Error>>,
 ) {
-    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute", false) {
+    let lease = match admit_standalone_operation(&pool, "execute", false) {
         Ok(lease) => lease,
         Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
     };
@@ -215,7 +214,6 @@ pub(super) fn run_standalone_statement(
 pub(super) fn run_standalone_batch(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     statements: Vec<SqlStatement>,
     origin: khive_storage::tx_registry::TxOrigin,
     event_rows: Option<Arc<AtomicEventRows>>,
@@ -223,7 +221,7 @@ pub(super) fn run_standalone_batch(
     Option<StandaloneHandle>,
     Result<u64, StandaloneWriteError<BatchFailure>>,
 ) {
-    let lease = match acquire_standalone_lease(&pool, unit_holds_lease, "execute_batch") {
+    let lease = match acquire_standalone_lease(&pool, "execute_batch") {
         Ok(lease) => lease,
         Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
     };
@@ -254,13 +252,12 @@ pub(super) fn run_standalone_batch(
 pub(super) fn run_standalone_script(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     script: String,
 ) -> (
     Option<StandaloneHandle>,
     Result<(), StandaloneWriteError<rusqlite::Error>>,
 ) {
-    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute_script", false) {
+    let lease = match admit_standalone_operation(&pool, "execute_script", false) {
         Ok(lease) => lease,
         Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
     };
@@ -268,10 +265,9 @@ pub(super) fn run_standalone_script(
         .conn
         .execute_batch(&script)
         .map_err(StandaloneWriteError::Sql);
-    // ADR-154: without a unit lease the volume lease covers this call
-    // only, so a transaction the script left open is settled here,
-    // while the lease is still held, instead of continuing outside it.
-    if unit_holds_lease || handle.conn.is_autocommit() {
+    // This call holds the volume lease until a script-opened transaction
+    // has rolled back or its connection has been retired.
+    if handle.conn.is_autocommit() {
         drop(lease);
         return (Some(handle), res);
     }
@@ -322,15 +318,13 @@ pub(super) fn run_standalone_script(
 pub(super) fn run_standalone_top_level(
     handle: StandaloneHandle,
     pool: Arc<ConnectionPool>,
-    unit_holds_lease: bool,
     maintenance: TopLevelMaintenance,
 ) -> (
     StandaloneHandle,
     Result<(), StandaloneWriteError<rusqlite::Error>>,
 ) {
     let lease = if maintenance == TopLevelMaintenance::Vacuum {
-        match admit_standalone_operation(&pool, unit_holds_lease, "execute_script_top_level", true)
-        {
+        match admit_standalone_operation(&pool, "execute_script_top_level", true) {
             Ok(lease) => lease,
             Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
         }

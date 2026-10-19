@@ -5,6 +5,37 @@ use crate::pool::ConnectionPool;
 use super::mutation_plans::GRAPH_MUTATION_EVENTS_OP;
 use super::{map_err, map_sqlite_err};
 
+pub(super) fn run_standalone_graph_mutation_transaction<R, F>(
+    pool: &ConnectionPool,
+    operation: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+{
+    let mut tx_handle = None;
+    let unit = pool.standalone_transaction_write_unit().map_err(|error| {
+        let error = map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP);
+        crate::timeout_sink::maybe_emit_busy_storage_error(
+            &crate::timeout_sink::db_label(pool),
+            crate::timeout_sink::Site::StandaloneGraph,
+            &error,
+        );
+        pool.record_direct_writer_error(&error);
+        error
+    })?;
+    let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
+        Some(GRAPH_MUTATION_EVENTS_OP.to_string()),
+        pool.origin(),
+    ));
+    crate::writer_task::execute_wrapped_transaction(
+        unit.conn(),
+        "compose_graph_mutation_events.commit",
+        operation,
+    )
+    .0
+    .inspect_err(|error| pool.record_direct_writer_error(error))
+}
+
 pub(super) fn run_graph_mutation_transaction<R, F>(
     pool: &ConnectionPool,
     conn: &rusqlite::Connection,

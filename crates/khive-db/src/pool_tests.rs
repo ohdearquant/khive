@@ -1333,12 +1333,11 @@ fn standalone_and_new_reader_keep_the_first_opened_target_after_symlink_retarget
     fs::remove_file(&alias).unwrap();
     symlink(&second, &alias).unwrap();
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone probe stays on the opened database");
-    let value: i64 = standalone
-        .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
-        .unwrap();
+    let value: i64 = pool
+        .standalone_autocommit(|conn| {
+            Ok(conn.query_row("SELECT value FROM identity_marker", [], |row| row.get(0))?)
+        })
+        .expect("standalone operation stays on the opened database");
     assert_eq!(value, 11);
 
     let reader = pool
@@ -1370,7 +1369,7 @@ fn standalone_writer_refuses_replaced_pinned_database_file() {
     fs::rename(&replacement, &path).unwrap();
 
     let error = pool
-        .open_standalone_writer_untracked()
+        .standalone_autocommit(|_| Ok(()))
         .expect_err("a replaced file must not receive a standalone probe");
     assert!(
         error.to_string().contains("file identity changed"),
@@ -1580,7 +1579,7 @@ fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
         }
     });
     let error = pool
-        .open_standalone_writer_untracked()
+        .standalone_autocommit(|_| Ok(()))
         .expect_err("both pathname stats see the original, but SQLite opened replacement");
     assert!(swap_ran.get(), "the swap hook must execute");
     assert!(restore_ran.get(), "the restore hook must execute");
@@ -1604,11 +1603,13 @@ fn standalone_wal_writer_uses_configured_journal_size_limit() {
     })
     .expect("WAL pool open");
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone WAL writer open");
-    assert_eq!(current_journal_mode(&standalone).unwrap(), "wal");
-    assert_eq!(journal_size_limit_bytes(&standalone), configured_limit);
+    let (mode, limit) = pool
+        .standalone_autocommit(|conn| {
+            Ok((current_journal_mode(conn)?, journal_size_limit_bytes(conn)))
+        })
+        .expect("standalone WAL operation");
+    assert_eq!(mode, "wal");
+    assert_eq!(limit, configured_limit);
 }
 
 #[test]
@@ -1634,11 +1635,13 @@ fn standalone_rollback_writer_keeps_sqlite_journal_size_limit() {
     })
     .expect("rollback-journal pool open");
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone rollback-journal writer open");
-    assert_eq!(current_journal_mode(&standalone).unwrap(), "delete");
-    assert_eq!(journal_size_limit_bytes(&standalone), sqlite_default);
+    let (mode, limit) = pool
+        .standalone_autocommit(|conn| {
+            Ok((current_journal_mode(conn)?, journal_size_limit_bytes(conn)))
+        })
+        .expect("standalone rollback-journal operation");
+    assert_eq!(mode, "delete");
+    assert_eq!(limit, sqlite_default);
 }
 
 #[test]
@@ -1679,14 +1682,16 @@ fn every_writer_capable_connection_maintains_rfc3339_expression_indexes() {
     );
     drop(bare);
 
-    let tracked = pool.open_standalone_writer().expect("tracked standalone");
-    let untracked = pool
-        .open_standalone_writer_untracked()
-        .expect("untracked standalone");
-    for (id, conn) in [(2, &tracked), (3, &untracked)] {
-        conn.execute(INSERT, rusqlite::params![id, "2026-01-01T00:00:00Z"])
-            .unwrap_or_else(|error| panic!("standalone writer {id}: {error}"));
-    }
+    pool.standalone_autocommit(|conn| {
+        conn.execute(INSERT, rusqlite::params![2, "2026-01-01T00:00:00Z"])?;
+        Ok(())
+    })
+    .expect("standalone autocommit registers both key functions");
+    pool.standalone_transaction(|conn| {
+        conn.execute(INSERT, rusqlite::params![3, "2026-01-01T00:00:00Z"])?;
+        Ok(())
+    })
+    .expect("standalone transaction registers both key functions");
     {
         let writer = pool.writer().expect("pooled writer");
         writer
@@ -1729,14 +1734,10 @@ fn writer_connections_follow_checkpoint_ownership_claim() {
             FALLBACK_WAL_AUTOCHECKPOINT_PAGES
         );
     }
-    let standalone = pool
-        .open_standalone_writer()
+    let standalone_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer opened before any claim");
-    assert_eq!(
-        wal_autocheckpoint_pages(&standalone),
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES
-    );
-    drop(standalone);
+    assert_eq!(standalone_pages, FALLBACK_WAL_AUTOCHECKPOINT_PAGES);
 
     // Claimed: the already-open pooled writer is re-configured under the
     // writer mutex, and every later writer-capable open disables the
@@ -1746,16 +1747,20 @@ fn writer_connections_follow_checkpoint_ownership_claim() {
         let writer = pool.writer().expect("pooled writer after claim");
         assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
     }
-    let claimed_standalone = pool
-        .open_standalone_writer()
+    let claimed_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer opened after the claim");
-    assert_eq!(wal_autocheckpoint_pages(&claimed_standalone), 0);
-    drop(claimed_standalone);
+    assert_eq!(claimed_pages, 0);
 
     let later_infrastructure = pool
-        .open_standalone_writer_untracked()
+        .open_checkpoint_file()
         .expect("later infrastructure writer");
-    assert_eq!(wal_autocheckpoint_pages(&later_infrastructure), 0);
+    assert_eq!(
+        later_infrastructure
+            .wal_autocheckpoint_pages_for_test()
+            .unwrap(),
+        0
+    );
 
     let memory_pool = ConnectionPool::new(PoolConfig {
         write_queue_enabled: Some(false),
@@ -1806,10 +1811,9 @@ fn standalone_writer_waits_for_checkpoint_claim_resolution() {
     let open_thread_start = Arc::clone(&open_start);
     let open_thread = thread::spawn(move || {
         open_thread_start.wait();
-        let conn = open_pool
-            .open_standalone_writer()
-            .expect("standalone writer after claim resolution");
-        wal_autocheckpoint_pages(&conn)
+        open_pool
+            .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
+            .expect("standalone writer after claim resolution")
     });
     open_start.wait();
 
@@ -1851,10 +1855,9 @@ fn standalone_fallback_application_linearizes_before_claim_publication() {
 
     let open_pool = Arc::clone(&pool);
     let open_thread = thread::spawn(move || {
-        let conn = open_pool
-            .open_standalone_writer()
-            .expect("standalone writer opens");
-        wal_autocheckpoint_pages(&conn)
+        open_pool
+            .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
+            .expect("standalone writer opens")
     });
     pause.selected.wait();
     assert!(
@@ -1912,14 +1915,10 @@ fn failed_checkpoint_ownership_claim_keeps_fallback_and_can_be_retried() {
         "a failed claim must leave later writer connections fallback-safe"
     );
 
-    let fallback_writer = pool
-        .open_standalone_writer()
+    let fallback_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer after failed claim");
-    assert_eq!(
-        wal_autocheckpoint_pages(&fallback_writer),
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES
-    );
-    drop(fallback_writer);
+    assert_eq!(fallback_pages, FALLBACK_WAL_AUTOCHECKPOINT_PAGES);
 
     drop(held_writer);
     pool.claim_checkpoint_ownership()
@@ -2031,9 +2030,8 @@ fn standalone_writer_open_counts_its_connection_class_once() {
     })
     .expect("file-backed pool");
 
-    let _standalone = pool
-        .open_standalone_writer()
-        .expect("standalone writer opens");
+    pool.standalone_autocommit(|_| Ok(()))
+        .expect("standalone write operation opens once");
 
     assert_eq!(
         pool.writer_acquisition_snapshot(),
@@ -2394,7 +2392,7 @@ fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
         pool.writer(),
         Err(SqliteError::CapacityFloor { .. })
     ));
-    pool.open_standalone_writer_untracked()
+    pool.open_checkpoint_file()
         .expect("checkpoint infrastructure must still open");
 }
 

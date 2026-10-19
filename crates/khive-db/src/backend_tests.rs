@@ -2221,10 +2221,8 @@ async fn issue_1029_starvation_warn_reports_registered_transactions() {
     // Hold a genuine SQLite write lock on a separate standalone writer
     // connection, with a registered fixture transaction the diagnostic
     // must surface.
-    let holder = backend
-        .pool
-        .open_standalone_writer()
-        .expect("holder connection");
+    let holder =
+        crate::pool::open_external_writer_fixture(&backend.pool).expect("holder connection");
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("holder BEGIN IMMEDIATE");

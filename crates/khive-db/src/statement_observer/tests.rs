@@ -270,9 +270,12 @@ fn replacement_and_standalone_connections_share_pool_observation() {
         matching(&observation, "SELECT 456 AS standalone_reader").len(),
         1
     );
-    let writer = pool.open_standalone_writer_untracked().unwrap();
     let sql = "UPDATE statement_fixture SET value = value + 1";
-    assert_eq!(writer.execute(sql, []).unwrap(), 3);
+    assert_eq!(
+        pool.standalone_autocommit(|conn| Ok(conn.execute(sql, [])?))
+            .unwrap(),
+        3
+    );
     assert_eq!(matching(&observation, sql).len(), 1);
 }
 
@@ -387,12 +390,12 @@ fn fresh_standalone_writer_excludes_setup_statements() {
     for wal in [true, false] {
         let (_dir, pool) = fixture(wal, true, false);
         let observation = pool.observe_test_statement_starts(256).unwrap();
-        let writer = pool.open_standalone_writer_untracked().unwrap();
         let sql = "SELECT 284 AS fresh_standalone_writer_statement";
         assert_eq!(
-            writer
-                .query_row(sql, [], |row| row.get::<_, i64>(0))
-                .unwrap(),
+            pool.standalone_autocommit(|conn| Ok(
+                conn.query_row(sql, [], |row| row.get::<_, i64>(0))?
+            ))
+            .unwrap(),
             284
         );
         assert_eq!(
@@ -456,15 +459,16 @@ fn record_budget_and_nested_observations_fail_explicitly() {
 fn connection_can_outlive_pool_and_observation_without_a_dangling_context() {
     let (_dir, pool) = fixture(true, true, false);
     let observation = pool.observe_test_statement_starts(128).unwrap();
-    let writer = pool.open_standalone_writer_untracked().unwrap();
+    let writer = pool.standalone_transaction_write_unit().unwrap();
     drop(pool);
     let sql = "UPDATE statement_fixture SET value = value + 20";
-    assert_eq!(writer.execute(sql, []).unwrap(), 3);
+    assert_eq!(writer.conn().execute(sql, []).unwrap(), 3);
     assert_eq!(matching(&observation, sql).len(), 1);
     drop(observation);
     // Its hub is gone, but the connection's monotonic opaque token is safe.
     assert_eq!(
         writer
+            .conn()
             .query_row("SELECT 89", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         89

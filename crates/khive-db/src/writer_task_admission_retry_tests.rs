@@ -133,7 +133,7 @@ fn count_begin_attempts(conn: &Connection, attempts: Arc<AtomicUsize>) -> rusqli
 fn failed_busy_timeout_reduction_stops_before_a_second_begin() {
     let dir = tempfile::tempdir().unwrap();
     let pool = file_pool(&dir.path().join("writer_task_timeout_update_failure.db"));
-    let conn = pool.open_standalone_writer_untracked().unwrap();
+    let conn = crate::pool::open_external_writer_fixture(&pool).unwrap();
     let busy_timeout = Duration::from_secs(5);
     // Return BUSY before the budget expires, without manufacturing the
     // BEGIN result. Only the timeout setter below injects a failure.

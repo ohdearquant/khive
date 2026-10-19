@@ -107,13 +107,13 @@ fn pooled_standalone_readonly_and_shared_readers_register_tag_matching() {
             pool.writer().unwrap().conn(),
             r#"["type\u003adomain"]"#
         ));
-        for conn in [
-            pool.open_standalone_writer().unwrap(),
-            pool.open_standalone_writer_untracked().unwrap(),
-        ] {
-            assert!(matches(&conn, r#"["type\u003adomain"]"#));
-            assert!(!matches(&conn, r#"["type:domain-extra"]"#));
-        }
+        let check = |conn: &Connection| {
+            assert!(matches(conn, r#"["type\u003adomain"]"#));
+            assert!(!matches(conn, r#"["type:domain-extra"]"#));
+            Ok(())
+        };
+        pool.standalone_autocommit(check).unwrap();
+        pool.standalone_transaction(check).unwrap();
         let reader = pool.reader().unwrap();
         let matched: bool = reader
             .query_row(

@@ -149,7 +149,7 @@ pub(super) fn log_wal_high_water_warn(
 /// lifetime instead of leaving it in mutable cross-tick state.
 #[derive(Debug)]
 #[must_use]
-pub(super) struct CheckpointCoreOutcome {
+pub(crate) struct CheckpointCoreOutcome {
     pub(super) wal_pages: Option<u64>,
     pub(super) unavailable_reason: Option<CheckpointUnavailableReason>,
     pub(super) sidecar_attribution: Option<WalpinAttributionRequest>,
@@ -202,7 +202,7 @@ pub fn checkpoint_once(
 /// Synchronous PASSIVE/TRUNCATE core used by the async task. Unlike the
 /// compatibility wrapper [`checkpoint_once`], this preserves the explicit
 /// no-progress attribution request for the caller to complete off-runtime.
-pub(super) fn checkpoint_once_core(
+pub(crate) fn checkpoint_once_core(
     pool: &ConnectionPool,
     conn: &rusqlite::Connection,
     config: &CheckpointConfig,
