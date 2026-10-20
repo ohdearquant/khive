@@ -6,25 +6,33 @@ use serde_json::{json, Value};
 
 #[test]
 fn allocate_sequence_exhaustion_preserves_head_at_checked_add_boundary() {
-    // Overflow is logically possible, but no bounded real-store fixture
-    // reaches it: stream_gap requires consecutive inserts from 1, and
-    // ledger UPDATE/DELETE are forbidden. Supply the head at this unit
-    // boundary instead of fabricating an exhausted persisted stream.
-    let mut head = i64::MAX - 1;
+    // ADR-174 A12.1 reserves i64::MAX for the whole-prefix floor.
+    // Check conflict before exhaustion, without advancing the cached head.
+    let mut head = i64::MAX - 2;
     assert!(matches!(
         allocate_sequence(&mut head, None),
-        Ok(seq) if seq == i64::MAX
+        Ok(seq) if seq == i64::MAX - 1
     ));
-    assert_eq!(head, i64::MAX);
+    assert_eq!(head, i64::MAX - 1);
+    assert!(matches!(
+        allocate_sequence(&mut head, Some(i64::MAX - 1)),
+        Err(SequenceRefusal::Conflict { expected, next })
+            if expected == i64::MAX - 1 && next == i64::MAX
+    ));
+    for expected in [None, Some(i64::MAX)] {
+        assert!(matches!(
+            allocate_sequence(&mut head, expected),
+            Err(SequenceRefusal::Exhausted)
+        ));
+        assert_eq!(head, i64::MAX - 1, "refusal must not advance the head");
+    }
+    // Keep the defensive checked-add guard for an unrepresentable successor.
+    head = i64::MAX;
     assert!(matches!(
         allocate_sequence(&mut head, None),
         Err(SequenceRefusal::Exhausted)
     ));
-    assert_eq!(
-        head,
-        i64::MAX,
-        "refused allocation must not advance the head"
-    );
+    assert_eq!(head, i64::MAX);
 }
 
 #[tokio::test]

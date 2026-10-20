@@ -283,7 +283,7 @@ def main():
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 158 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 159 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -315,7 +315,7 @@ def main():
         # by [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1; storage
         # operations require an installed backend.
         # The kg pack also carries its one documented sub-namespace,
-        # stream.append / stream.batch / stream.read / stream.stat (ADR-174
+        # stream.append / stream.batch / stream.read / stream.stat / stream.truncate (ADR-174
         # §2); git grew from four verbs to seventeen with the dev-loop surface
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
         # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
@@ -329,8 +329,8 @@ def main():
         # NDJSON change-set.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 158, (
-            f"expected 158 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 159, (
+            f"expected 159 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -350,7 +350,7 @@ def main():
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
             f"the internal inbound sibling after an ambiguous atomic write), "
-            f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
+            f"kg also carries stream.append/stream.batch/stream.read/stream.stat/stream.truncate "
             f"(ADR-174); "
             f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "

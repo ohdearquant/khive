@@ -82,7 +82,7 @@ async fn truncate(registry: &VerbRegistry, stream: &str, before: i64) -> Value {
 fn exhausted(error: RuntimeError) -> Value {
     let value =
         khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
-    assert_eq!(value["message"], "stream sequence exhausted");
+    assert_eq!(value["message"], "invalid input: stream sequence exhausted");
     assert_eq!(value["domain_disposition"], "not_committed");
     value
 }
@@ -344,14 +344,14 @@ async fn stream_truncate_requires_strict_arguments_and_namespace_write_authority
         json!({"stream":"s","before_seq":"2"}),
         json!({"stream":"s","before_seq":u64::MAX}),
         json!({"stream":"s","before_seq":2,"unknown":true}),
-        json!({"stream":"","before_seq":2}),
         json!({"stream":"x\0y","before_seq":2}),
         json!({"stream":"x".repeat(513),"before_seq":2}),
     ] {
-        assert!(matches!(
-            registry.dispatch("stream.truncate", args).await,
-            Err(RuntimeError::InvalidInput(_))
-        ));
+        let result = registry.dispatch("stream.truncate", args.clone()).await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "strict truncate arguments {args}: {result:?}"
+        );
         assert_eq!(snapshot(&rt).await, before);
         no_permit(&rt).await;
     }
@@ -387,6 +387,16 @@ async fn stream_truncate_requires_strict_arguments_and_namespace_write_authority
         "{error}"
     );
     assert_eq!(snapshot(&rt).await, before);
+    no_permit(&rt).await;
+
+    // ADR-174 §1 bounds byte length and excludes U+0000, but has no minimum
+    // length. Truncate uses the same name domain as append/read/stat.
+    append(&registry, "", "local", json!("empty-name entry"), None).await;
+    assert_eq!(
+        truncate(&registry, "", 2).await,
+        json!({"removed":1,"floor_seq":2,"head_seq":1})
+    );
+    assert_eq!(stat(&registry, "s").await["count"], 1);
     no_permit(&rt).await;
 }
 
@@ -506,7 +516,10 @@ async fn stream_exhaustion_in_atomic_and_per_member_batches_keeps_its_boundary()
         .unwrap();
     assert_eq!(result["results"].as_array().unwrap().len(), 3);
     assert_eq!(result["results"][0]["seq"], 2);
-    assert_eq!(result["results"][1]["message"], "stream sequence exhausted");
+    assert_eq!(
+        result["results"][1]["message"],
+        "invalid input: stream sequence exhausted"
+    );
     assert_eq!(result["results"][1]["domain_disposition"], "not_committed");
     assert_eq!(result["results"][2]["seq"], 2);
     assert_eq!(
@@ -544,7 +557,10 @@ async fn stream_batch_checks_exhaustion_for_each_transaction_local_sequence() {
             let result = result.unwrap();
             assert_eq!(result["results"].as_array().unwrap().len(), 3);
             assert_eq!(result["results"][0]["seq"], i64::MAX - 1);
-            assert_eq!(result["results"][1]["message"], "stream sequence exhausted");
+            assert_eq!(
+                result["results"][1]["message"],
+                "invalid input: stream sequence exhausted"
+            );
             assert_eq!(result["results"][1]["domain_disposition"], "not_committed");
             assert_eq!(result["results"][2]["seq"], 2);
             assert_eq!(scalar(&rt, "SELECT COUNT(*) FROM notes").await, 3);
