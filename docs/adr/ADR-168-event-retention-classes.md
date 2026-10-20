@@ -112,7 +112,8 @@ the field that already serves it in practice.
 **The table key is exactly `(kind, verb)`, and it is not always one row per emitter.** Some
 `(kind, verb)` pairs are constructed at more than one production call site — for example,
 every git write verb (`git.commit`, `git.branch`, `git.update_ref`, `git.push`) is audited both by the generic
-dispatch-audit path (`crates/khive-runtime/src/pack.rs`, fired for every dispatched verb) and
+dispatch-audit path (`crates/khive-runtime/src/pack.rs`, fired for every dispatched verb, apart
+from the success rows of six non-git verbs that ADR-103 Amendment 7 omits or samples) and
 by a supplementary, verb-specific audit (`crates/khive-pack-git/src/write_handlers.rs`'s
 `emit_write_audit`, ADR-108 rule 2), and `git.digest` is audited both by its own pinned
 receipt (`crates/khive-runtime/src/pack.rs`'s `persist_git_digest_receipt`) and, on the
