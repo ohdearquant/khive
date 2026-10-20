@@ -288,18 +288,78 @@ fn take_bytes<'a>(data: &'a [u8], offset: &mut usize, len: usize, field: &str) -
     Ok(bytes)
 }
 
+fn read_fixed<const N: usize>(data: &[u8], offset: &mut usize, field: &str) -> Result<[u8; N]> {
+    let mut bytes = [0; N];
+    bytes.copy_from_slice(take_bytes(data, offset, N, field)?);
+    Ok(bytes)
+}
+
 fn read_u32(data: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        take_bytes(data, offset, 4, field)?
-            .try_into()
-            .expect("four-byte field"),
-    ))
+    Ok(u32::from_le_bytes(read_fixed(data, offset, field)?))
 }
 
 fn read_u64(data: &[u8], offset: &mut usize, field: &str) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        take_bytes(data, offset, 8, field)?
-            .try_into()
-            .expect("eight-byte field"),
-    ))
+    Ok(u64::from_le_bytes(read_fixed(data, offset, field)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_u32, read_u64, VamanaError};
+
+    #[test]
+    fn fixed_width_reads_decode_little_endian_at_nonzero_offsets() {
+        let data = [
+            0xa5, 0x5a, 0x12, 0x34, 0x56, 0x78, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0xff,
+        ];
+        let mut offset = 2;
+
+        assert_eq!(read_u32(&data, &mut offset, "u32").unwrap(), 0x7856_3412u32);
+        assert_eq!(offset, 6);
+        assert_eq!(
+            read_u64(&data, &mut offset, "u64").unwrap(),
+            0xefcd_ab89_6745_2301u64
+        );
+        assert_eq!(offset, 14);
+        assert_eq!(&data[offset..], &[0xff]);
+    }
+
+    #[test]
+    fn fixed_width_reads_leave_offset_unchanged_on_truncation() {
+        let u32_data = [0xa5, 0x12, 0x34, 0x56];
+        let mut offset = 1;
+        assert!(matches!(
+            read_u32(&u32_data, &mut offset, "short u32"),
+            Err(VamanaError::InvalidFormat { reason })
+                if reason == "portable container truncated at short u32"
+        ));
+        assert_eq!(offset, 1);
+
+        let u64_data = [0xa5, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd];
+        offset = 1;
+        assert!(matches!(
+            read_u64(&u64_data, &mut offset, "short u64"),
+            Err(VamanaError::InvalidFormat { reason })
+                if reason == "portable container truncated at short u64"
+        ));
+        assert_eq!(offset, 1);
+    }
+
+    #[test]
+    fn fixed_width_reads_leave_offset_unchanged_on_overflow() {
+        let mut offset = usize::MAX;
+        assert!(matches!(
+            read_u32(&[], &mut offset, "overflow u32"),
+            Err(VamanaError::InvalidFormat { reason })
+                if reason == "overflow u32 offset overflows"
+        ));
+        assert_eq!(offset, usize::MAX);
+
+        assert!(matches!(
+            read_u64(&[], &mut offset, "overflow u64"),
+            Err(VamanaError::InvalidFormat { reason })
+                if reason == "overflow u64 offset overflows"
+        ));
+        assert_eq!(offset, usize::MAX);
+    }
 }

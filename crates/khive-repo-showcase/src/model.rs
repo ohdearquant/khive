@@ -559,7 +559,7 @@ impl<'de> Deserialize<'de> for GraphEdge {
         D: Deserializer<'de>,
     {
         let wire = GraphEdgeWire::deserialize(deserializer)?;
-        if !is_unit_interval(wire.weight) {
+        if !khive_types::validate_edge_weight(wire.weight) {
             return Err(serde::de::Error::custom(
                 "graph edge weight must be a finite value in [0,1]",
             ));
