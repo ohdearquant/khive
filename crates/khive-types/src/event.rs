@@ -785,7 +785,7 @@ impl ProposalChangeset {
                             "ProposalChangeset AddEdge weight must be finite, got {w}"
                         ));
                     }
-                    if !(*w >= 0.0 && *w <= 1.0) {
+                    if !crate::validate_edge_weight(f64::from(*w)) {
                         return Err(alloc::format!(
                             "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
                         ));
