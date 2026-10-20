@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import pathlib
@@ -1184,21 +1185,8 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         # `cargo bench --benches` also runs every target whose `bench` flag is on, and a library's defaults to on.
         # Its libtest harness rejects the Criterion flags the quick profile passes (`--quick`, `--noplot`), so a
         # benchmarked crate whose library is not `bench = false` fails the whole component run.
-        import tomllib
-
-        benchmarked, offenders = [], []
-        for manifest in sorted((REPO_ROOT / "crates").glob("*/Cargo.toml")):
-            data = tomllib.loads(manifest.read_text())
-            if "package" not in data:
-                continue
-            auto = data["package"].get("autobenches", True) and list((manifest.parent / "benches").glob("*.rs"))
-            if not (data.get("bench") or auto):
-                continue
-            benchmarked.append(manifest.parent.name)
-            has_lib = "lib" in data or (manifest.parent / "src" / "lib.rs").exists()
-            if has_lib and data.get("lib", {}).get("bench", True) is not False:
-                offenders.append(manifest.parent.name)
-        self.assertTrue(benchmarked, "no benchmarked crate found: the manifest scan read nothing")
+        _, benchmarked, offenders = BenchmarkInventoryTests.inventory(REPO_ROOT / "crates")
+        self.assertIn("khive-channel", benchmarked, "the inventory missed a known benchmarked workspace crate")
         self.assertEqual(offenders, [], "set `[lib] bench = false` in these crates' Cargo.toml")
 
     SELECT_NAME = "Select the component's crates that have a bench target"
@@ -4270,8 +4258,6 @@ class BenchTrainScopeTests(ScopeFixture):
     def test_every_benchmarked_crate_is_in_exactly_one_component(self):
         # A component may name a crate whose first benchmark has not landed yet (the component job leaves it out),
         # so the components cover the benchmarked crates rather than equal them. Every name is a workspace package.
-        import tomllib
-
         text = workflow_text("bench-track.yml")
         inputs = dict(re.findall(r"(?m)^      component: (\S+)\n      crates: (.+)$", text))
         inputs = {name.replace("-", "_"): sorted(crates.split()) for name, crates in inputs.items()}
@@ -4280,22 +4266,15 @@ class BenchTrainScopeTests(ScopeFixture):
                            text)
         table = {flag: sorted(path.split("/")[1] for path in paths.split("|")) for paths, flag in table}
         self.assertEqual(table, inputs, "the path table and the component jobs name different crates")
-        benchmarked, packages = set(), {}
-        for manifest in sorted((REPO_ROOT / "crates").glob("*/Cargo.toml")):
-            data = tomllib.loads(manifest.read_text())
-            if "package" not in data:
-                continue
-            packages[manifest.parent.name] = data["package"]["name"]
-            auto = data["package"].get("autobenches", True) and list((manifest.parent / "benches").glob("*.rs"))
-            if data.get("bench") or auto:
-                benchmarked.add(manifest.parent.name)
-                self.assertEqual(data["package"]["name"], manifest.parent.name, manifest)
+        packages, benchmarked, _ = BenchmarkInventoryTests.inventory(REPO_ROOT / "crates")
+        for name in benchmarked:
+            self.assertEqual(packages[name].parent.name, name, packages[name])
         members = [crate for crates in inputs.values() for crate in crates]
         self.assertEqual(len(members), len(set(members)), "a crate is in two components")
-        self.assertTrue(benchmarked, "no benchmarked crate found: the manifest scan read nothing")
+        self.assertIn("khive-channel", benchmarked, "the inventory missed a known benchmarked workspace crate")
         self.assertEqual(benchmarked - set(members), set(), "a benchmarked crate is in no component")
         # The train maps a crate to crates/<name>/Cargo.toml, so every member's directory is its package name.
-        self.assertEqual({m for m in members if packages.get(m) != m}, set(),
+        self.assertEqual({m for m in members if m not in packages or packages[m].parent.name != m}, set(),
                          "a component names a crate that is not a package of that directory name")
 
 
@@ -4670,6 +4649,79 @@ class PipelineGateCacheTests(unittest.TestCase):
         self.assertEqual(re.findall(r"(?m)^          save-if: (.+)$", caches[0]),
                          ["${{ github.ref == 'refs/heads/main' }}"])
         self.assertEqual(re.findall(r"(?m)^    timeout-minutes: (.+)$", job), ["25"])
+
+
+class BenchmarkInventoryTests(unittest.TestCase):
+    @staticmethod
+    @functools.cache
+    def inventory(workspace: pathlib.Path) -> tuple[dict[str, pathlib.Path], set[str], list[str]]:
+        """Discover the workflow's Cargo targets once, without resolving or building dependencies."""
+        import tomllib
+
+        result = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+            cwd=workspace, capture_output=True, text=True, timeout=60, check=True,
+        )
+        packages, benchmarked, offenders = {}, set(), []
+        library_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+        for package in json.loads(result.stdout)["packages"]:
+            name = package["name"]
+            manifest = pathlib.Path(package["manifest_path"])
+            packages[name] = manifest
+            kinds = {kind for target in package["targets"] for kind in target["kind"]}
+            if "bench" not in kinds:
+                continue
+            benchmarked.add(name)
+            # Metadata decides whether a library exists, including autolib=false and custom paths.
+            # It does not expose the library's `bench` flag, so read only that setting from TOML.
+            if kinds & library_kinds:
+                data = tomllib.loads(manifest.read_text())
+                if data.get("lib", {}).get("bench", True) is not False:
+                    offenders.append(name)
+        return packages, benchmarked, sorted(offenders)
+
+    def test_benchmark_inventory_uses_cargo_target_discovery(self):
+        # Real manifests exercise Cargo's discovery rather than hard-coding metadata-shaped answers.
+        cases = {
+            "nested-default": ("", "", ["src/lib.rs", "benches/nested/main.rs"]),
+            "disabled-lib": ('autolib = false\n', "",
+                             ["src/lib.rs", "src/main.rs", "benches/flat.rs"]),
+            "explicit-lib": ('autolib = false\n', '[lib]\npath = "library/entry.rs"\nbench = false\n',
+                             ["library/entry.rs", "benches/nested/main.rs"]),
+            "plain-lib": ("", "", ["src/lib.rs"]),
+            "disabled-benches": ('autobenches = false\n', "",
+                                 ["src/lib.rs", "benches/decoy.rs", "benches/nested/main.rs"]),
+            "explicit-bench": ('autobenches = false\n',
+                               '[lib]\nbench = false\n[[bench]]\nname = "manual"\n'
+                               'path = "perf/main.rs"\nharness = false\n',
+                               ["src/lib.rs", "perf/main.rs"]),
+            "rlib-default": ("", '[lib]\ncrate-type = ["rlib"]\n',
+                             ["src/lib.rs", "benches/flat.rs"]),
+            "library-example": ('autolib = false\n',
+                                '[[example]]\nname = "demo"\ncrate-type = ["lib"]\n',
+                                ["src/main.rs", "examples/demo.rs", "benches/flat.rs"]),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "2"\nmembers = ' + json.dumps(list(cases)) + '\n')
+            for name, (settings, targets, files) in cases.items():
+                package = root / name
+                package.mkdir()
+                (package / "Cargo.toml").write_text(
+                    f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+                    + settings + targets)
+                for file in files:
+                    path = package / file
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fn main() {}\n")
+            packages, benchmarked, offenders = self.inventory(root)
+            self.assertEqual(set(packages), set(cases))
+            self.assertEqual(benchmarked, {
+                "nested-default", "disabled-lib", "explicit-lib", "explicit-bench",
+                "rlib-default", "library-example",
+            })
+            self.assertEqual(offenders, ["nested-default", "rlib-default"])
 
 
 if __name__ == "__main__":
