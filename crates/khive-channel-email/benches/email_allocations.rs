@@ -56,7 +56,7 @@ fn main() {
         true
     };
     for scene in ROUTES {
-        let name = format!("route_inbound/{scene}");
+        let name = format!("allocations/route_inbound/{scene}");
         if !selected(&name) {
             continue;
         }
@@ -72,7 +72,7 @@ fn main() {
         report(&name, EMAILS, measured);
     }
     for scene in MARKINGS {
-        let name = format!("external_delivery_marking/{scene}");
+        let name = format!("allocations/external_delivery_marking/{scene}");
         if !selected(&name) {
             continue;
         }
@@ -88,7 +88,7 @@ fn main() {
         report(&name, EMAILS, measured);
     }
     for (scene, prior) in [("first", 0), ("escalating", 3), ("saturated", 10)] {
-        let name = format!("backoff_record_failure/{scene}");
+        let name = format!("allocations/backoff_record_failure/{scene}");
         if !selected(&name) {
             continue;
         }
@@ -100,7 +100,7 @@ fn main() {
         fixture.validate(result);
         report(&name, 1, measured);
     }
-    let name = "single_flight/uncontended";
+    let name = "allocations/single_flight/uncontended";
     if selected(name) {
         let rt = backoff::executor();
         let guard = khive_channel_email::ImapSingleFlight::new();
@@ -112,7 +112,7 @@ fn main() {
         report(name, 1, measured);
     }
     for count in [1, 100] {
-        let name = format!("single_flight/queued/{count}");
+        let name = format!("allocations/single_flight/queued/{count}");
         if !selected(&name) {
             continue;
         }
@@ -126,7 +126,7 @@ fn main() {
         report(&name, count, measured);
     }
     for count in [1_000, 10_000] {
-        let name = format!("fetch_remote_suppression_set/{count}");
+        let name = format!("allocations/fetch_remote_suppression_set/{count}");
         if !selected(&name) {
             continue;
         }
