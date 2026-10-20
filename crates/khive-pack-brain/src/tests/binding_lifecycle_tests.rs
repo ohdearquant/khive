@@ -118,7 +118,7 @@ async fn w4_c3_resolve_skips_archived_binding() {
     }
 
     // Resolve must NOT return the archived profile.
-    let err = pack
+    let resolved = pack
         .dispatch(
             "brain.resolve",
             json!({"consumer_kind": "recall"}),
@@ -126,9 +126,15 @@ async fn w4_c3_resolve_skips_archived_binding() {
             &token,
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(err, RuntimeError::NotFound(_)),
-        "C3: resolve with only archived binding must return NotFound, got {err:?}"
+        .expect("a registered consumer without a non-archived profile uses tier 3");
+    assert_eq!(
+        resolved,
+        json!({
+            "resolved_profile_id": null,
+            "lifecycle": null,
+            "requested_consumer_kind": "recall",
+            "matched_consumer_kind": null,
+            "matched_binding": false,
+        })
     );
 }
