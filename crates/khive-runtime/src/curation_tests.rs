@@ -10995,3 +10995,104 @@ async fn merge_map_upsert_failure_rolls_back_domain_fts_and_event() {
         fixture.assert_merged().await;
     }
 }
+
+#[tokio::test]
+async fn merge_fts_insert_matches_canonical_document() {
+    use rusqlite::types::Value::{Integer, Null, Text};
+
+    for (notes, named) in [(false, false), (true, true), (true, false)] {
+        let runtime = rt(); // No embedding provider can repair the raw INSERT after commit.
+        let token = NamespaceToken::local();
+        let mut ids = Vec::new();
+        for label in ["retained", "absorbed", "unrelated"] {
+            let title = format!("{label} title");
+            let body = format!("{label} canonical body with distinct content");
+            let properties = Some(serde_json::json!({
+                "label": label, "nested": {"count": 7, "enabled": true}
+            }));
+            let tags = vec!["fts-parity".to_string(), label.to_string()];
+            ids.push(if notes {
+                runtime
+                    .create_note(
+                        &token,
+                        "observation",
+                        named.then_some(title.as_str()),
+                        &body,
+                        None,
+                        properties,
+                        tags,
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            } else {
+                runtime
+                    .create_entity(
+                        &token,
+                        "concept",
+                        None,
+                        &title,
+                        Some(&body),
+                        properties,
+                        tags,
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            });
+        }
+        let fixture = MergeFtsFixture {
+            runtime,
+            notes,
+            ids: ids.try_into().unwrap(),
+        };
+        fixture.merge().await.unwrap();
+        let document = if notes {
+            let retained = fixture
+                .runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(fixture.ids[0])
+                .await
+                .unwrap()
+                .unwrap();
+            note_fts_document(&retained)
+        } else {
+            let retained = fixture
+                .runtime
+                .get_entity(&token, fixture.ids[0])
+                .await
+                .unwrap();
+            entity_fts_document(&retained)
+        };
+        let expected = [
+            Text(document.subject_id.to_string()),
+            Text(document.kind.to_string()),
+            Text(document.title.unwrap_or_default()),
+            Text(document.body),
+            Text(serde_json::to_string(&document.tags).unwrap()),
+            Text(document.namespace),
+            document
+                .metadata
+                .map(|metadata| Text(metadata.to_string()))
+                .unwrap_or(Null),
+            Integer(document.updated_at.timestamp_micros()),
+            document.record_kind.map(Text).unwrap_or(Null),
+        ];
+        let columns = "subject_id,kind,title,body,tags,namespace,metadata,updated_at,record_kind";
+        let actual = fixture.rows(&format!(
+            "SELECT {columns} FROM {} WHERE namespace='local' AND subject_id='{}'",
+            fixture.table(),
+            fixture.ids[0]
+        ));
+        assert_eq!(
+            actual.len(),
+            1,
+            "one retained FTS row; notes={notes}, named={named}"
+        );
+        assert_eq!(actual[0].len(), expected.len());
+        for ((column, value), expected) in columns.split(',').zip(&actual[0]).zip(expected) {
+            assert_eq!(value, &expected, "{column}; notes={notes}, named={named}");
+        }
+    }
+}

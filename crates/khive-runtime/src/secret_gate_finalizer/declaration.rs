@@ -132,16 +132,6 @@ pub(crate) const RUNTIME_TABLE_WRITE_INVENTORY: &[RuntimeTableWriteInventoryEntr
         expected_writes: 1,
         properties_route: None,
     },
-    RuntimeTableWriteInventoryEntry {
-        site: "khive-runtime/src/curation/merge_sql.rs::merge_entity_sql",
-        expected_writes: 1,
-        properties_route: None,
-    },
-    RuntimeTableWriteInventoryEntry {
-        site: "khive-runtime/src/curation/merge_sql.rs::merge_note_sql",
-        expected_writes: 1,
-        properties_route: None,
-    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

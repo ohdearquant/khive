@@ -520,14 +520,16 @@ pub(super) fn merge_entity_sql(
             ],
         )?;
 
-        // Body formula mirrors entity_fts_document (the canonical constructor):
-        // this path is sync/spawn_blocking so it can't call it directly, but
-        // must stay field-identical.
-        let fts_body = match &merged_description {
-            Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
-            _ => merged_name.clone(),
-        };
-        let kind_str = SubstrateKind::Entity.to_string();
+        // Derive the FTS row from the prepared merged fields without moving
+        // the returned entity's version-overflow check ahead of these writes.
+        let fts_merged = entity_fts_document(&Entity {
+            name: merged_name.clone(),
+            description: merged_description.clone(),
+            properties: merged_props.clone(),
+            tags: merged_tags.clone(),
+            updated_at: now,
+            ..into_entity.clone()
+        });
 
         // `into`'s old FTS row (via the map, not a namespace/subject_id
         // scan), then the new merged row, then the map upsert to the new
@@ -540,30 +542,9 @@ pub(super) fn merge_entity_sql(
                 &fts_table, &namespace, into_id,
             )],
         )?;
-        conn.execute(
-            &format!(
-                "INSERT INTO {} \
-                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                fts_table
-            ),
-            rusqlite::params![
-                &into_str,
-                &kind_str,
-                &merged_name,
-                &fts_body,
-                &tags_json,
-                &namespace,
-                &props_str,
-                now,
-                &into_entity.kind,
-            ],
-        )?;
         khive_db::sql_bridge::execute_statements(
             conn,
-            &[khive_db::stores::text::insert_document_map_statement(
-                &fts_table, &namespace, into_id,
-            )],
+            &khive_db::stores::text::insert_document_statements(&fts_table, &fts_merged),
         )?;
 
         // `from`'s FTS row is gone for good (merged away, not reinserted) —
@@ -1203,42 +1184,19 @@ pub(super) fn merge_note_sql(
                 &fts_table, &namespace, into_id,
             )],
         )?;
-        // Derive FTS scalars through the shared constructor so this raw SQL path
-        // is field-identical to TextSearch::upsert_document: critically, `title`
-        // is an empty string (not SQL NULL) for nameless notes, so get_document
-        // round-trips None <-> "" correctly.
+        // The canonical document and shared INSERT builder preserve all nine
+        // stored fields, including the empty-string title for nameless notes.
         let fts_merged = {
             let mut merged_note = Note::new(&namespace, &*into_note.kind, &*merged_content);
             merged_note.id = into_id;
             merged_note.name = merged_name.clone();
             merged_note.properties = merged_props.clone();
             merged_note.updated_at = now;
-            note_fts_scalars(&merged_note)
+            note_fts_document(&merged_note)
         };
-        conn.execute(
-            &format!(
-                "INSERT INTO {} \
-                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                fts_table
-            ),
-            rusqlite::params![
-                &into_str,
-                SubstrateKind::Note.to_string(),
-                &fts_merged.title,
-                &fts_merged.body,
-                &fts_merged.tags,
-                &namespace,
-                &fts_merged.metadata,
-                fts_merged.updated_at_micros,
-                &fts_merged.record_kind,
-            ],
-        )?;
         khive_db::sql_bridge::execute_statements(
             conn,
-            &[khive_db::stores::text::insert_document_map_statement(
-                &fts_table, &namespace, into_id,
-            )],
+            &khive_db::stores::text::insert_document_statements(&fts_table, &fts_merged),
         )?;
 
         // `from`'s FTS row is gone for good — remove its map row too.
