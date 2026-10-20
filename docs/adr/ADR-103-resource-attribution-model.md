@@ -128,7 +128,9 @@ A fifth value requires an ADR amendment, matching how the existing closed taxono
 
 Every dispatch already produces one `EventKind::Audit` row. (Amendment 3 narrows this for one
 bounded case — transient audit-lane admission pressure on a fixed, named set of read verbs — where
-the row may be dropped best-effort instead of committing; see that amendment for the exact scope.)
+the row may be dropped best-effort instead of committing; see that amendment for the exact scope.
+Amendment 7 narrows it again for the successful dispatches of six named polling and
+channel-maintenance verbs, which write no row or a sampled one.)
 This design adds a `resource` object to that row's existing JSON `payload`, with no new row and no
 migration:
 
@@ -604,7 +606,8 @@ Adding fields is non-breaking" (`crates/khive-gate/src/audit.rs:10-11`). `resour
 `cost_unit` within it, is exactly this kind of additive field: no schema migration, no
 change to any existing field's meaning.
 
-**Absence has exactly three meanings** (the third added by Amendment 3). An audit row with no
+**Absence has exactly four meanings** (the third added by Amendment 3, the fourth by Amendment 7).
+An audit row with no
 `resource.cost_unit` field is one of:
 
 1. A pre-amendment event, written before a producer emitted this field.
@@ -616,13 +619,17 @@ change to any existing field's meaning.
    best-effort under transient audit-lane admission pressure. Unlike (1) and (2), the caller
    received a successful result — see Amendment 3 for the exact scope and the counters that make
    this case distinguishable from the other two.
+4. A successful dispatch of one of Amendment 7's six named verbs whose row that amendment omits or
+   does not select. As in (3) the caller received a successful result; Amendment 7's per-verb
+   counters count these dispatches.
 
 Because this amendment keeps Decision (b)'s every-dispatch scope, there is no third
 "verb not yet covered" case: every dispatch that resolves `Ok` gets a `resource.cost_unit`
 value, embedding-bearing or not — except the bounded admission-pressure case Amendment 3 adds for
 a fixed, named set of read verbs, where the row (and the `resource.cost_unit` value it would have
-carried) may be absent because it was dropped best-effort, not because the verb is uncovered. A
-missing value outside that named case is never inferred, defaulted to zero, or
+carried) may be absent because it was dropped best-effort, not because the verb is uncovered.
+Amendment 7 adds a second exception: the success rows it omits or does not select. A
+missing value outside those named cases is never inferred, defaulted to zero, or
 backfilled after the fact. This mirrors the absence-is-exclusion convention
 `counts_by_work_class` already applies to `work_class`: a row with no `work_class` is
 skipped, not counted into a default bucket.
@@ -1011,7 +1018,8 @@ Writes and every Assertive handler NOT on the allowlist keep hard-fail semantics
 admission-pressure commit failure on their audit row still fails the dispatch. This amendment does
 not touch `DispatchFailed`, `DispatchObligation` rows for write verbs, gate-denial rows,
 unknown-verb rows, or `git.digest` receipts — all of those remain obligation-bearing with no
-degradation path.
+degradation path. Amendment 7 later adds a separate exception for the success rows of six named
+verbs, two of them writes; it is not a degrade path and does not widen this amendment's allowlist.
 
 ### Why this is accepted rather than fixed by splitting the row
 
@@ -1072,7 +1080,8 @@ handlers' own code), not by this table.
 - **`comm.heartbeat` — excluded by design.** It is `VerbCategory::Declaration` and its primary
   effect is a persist ("Persist a per-channel-credential heartbeat row"). Its audit row is
   obligation-bearing exactly as Amendment 3's "What does not change" requires for writes. Its
-  failures during the incident were the mechanism working as specified.
+  failures during the incident were the mechanism working as specified. (Amendment 7 samples its
+  success rows; every row it keeps stays obligation-bearing.)
 - **`comm.cursor_get` — excluded as-is, with a named precondition.** Although declared Assertive,
   its dispatch path checks out the writer connection and runs a schema-ensure
   `execute_script` (`crates/khive-pack-comm/src/handlers.rs:3009-3011`) before its SELECT. Two
@@ -1080,6 +1089,8 @@ handlers' own code), not by this table.
   body stalls on the writer checkout — so degrading its audit row would not have made it
   incident-safe anyway. Precondition for a future amendment: move the schema-ensure to
   pack initialization and read through a reader connection; only then does it meet the criterion.
+  (Amendment 7 omits its success rows on a different criterion; this precondition still governs
+  the admission-degrade list.)
 - **`memory.recall` and `db_diagnostics`** remain excluded for the reasons Amendment 3's
   implementation records (background accounting write; physical checkpoint I/O).
 
@@ -1426,3 +1437,313 @@ existing cap; the unfiltered audit/non-audit split does not apply to a
 single-kind query. `all_actors=true` still requires the exact caller id in the
 serving runtime's fleet-reader configuration. No new grouping pair or budget is
 approved by this amendment.
+
+## Amendment 7 (2026-10-20): Success Rows of High-Frequency Polling Verbs
+
+**Status**: Proposed
+
+Decision (b) gives every dispatch one `EventKind::Audit` row, and Amendment 3 narrowed that only
+for transient admission pressure. This amendment narrows it for a second, deliberate case: the
+**successful** dispatches of six named verbs. Four polling reads write no row on success. Two
+channel-maintenance subhandlers write the row of a hash-selected one in ten successful calls, plus
+the row of every call whose result reports a state change or a failed poll. Every other outcome of
+those six verbs, and every dispatch of every other verb, keeps its row exactly as today. ADR-133
+Amendment 10 records the matching exception to that record's audit-row obligations.
+
+### Context
+
+On one single-user development deployment, the UTC day 2026-10-19 wrote 164,793 audit rows
+(`brain.event_counts(kind="audit", all_actors=true, exhaustive=true)` over that day). Six verbs
+produced 135,765 of them, 82.4%:
+
+| Verb                              | Rows on 2026-10-19 | Category, visibility    | What one call does                                                                      |
+| --------------------------------- | -----------------: | ----------------------- | --------------------------------------------------------------------------------------- |
+| `comm.inbox`                      |             35,460 | Assertive, verb         | lists unread messages                                                                   |
+| `comm.cleanup_expired_quarantine` |             25,310 | Declaration, subhandler | deletes expired quarantined messages and reports `deleted` and `routed_owners_detached` |
+| `whoami`                          |             25,029 | Assertive, verb         | returns the caller's identity                                                           |
+| `comm.probe`                      |             24,656 | Assertive, verb         | write-free unread check (Amendment 4)                                                   |
+| `comm.cursor_get`                 |             12,655 | Assertive, subhandler   | reads one channel's ingest cursor                                                       |
+| `comm.heartbeat`                  |             12,655 | Declaration, subhandler | records one channel poll on that channel's health row                                   |
+
+They come from two groups of callers. Clients that poll for mail and identity call `comm.inbox`,
+`whoami` and `comm.probe`. The server's channel poll loop calls the other three: per cycle it
+dispatches `comm.cursor_get` once (`crates/khive-mcp/src/serve/channel_poll.rs:692`),
+`comm.heartbeat` once (`channel_poll.rs:658`) and `comm.cleanup_expired_quarantine` up to twice,
+once for the channel's slug and, when that succeeds, once for the slugless legacy form
+(`crates/khive-mcp/src/serve/channel_ingest.rs:734`, `:741` and `:746`). A cursor failure skips the
+rest of the cycle (`channel_poll.rs:139-143`). The measured 25,310 = 2 × 12,655 is consistent with
+that normal path; the counts alone do not identify every caller.
+
+The poll loop's three verbs are `Visibility::Subhandler` verbs
+(`crates/khive-pack-comm/src/vocab.rs:650-652`, `:686-688` and `:906-911`). The agent-facing wire
+rejects them (`crates/khive-mcp/src/server/request_dispatch.rs:18-22` and `:201-206`) and the MCP
+catalog omits them (`crates/khive-runtime/src/pack/catalog.rs:305`). Only in-process callers and the
+operator path (`kkernel exec`, `request_dispatch.rs:56-61`) reach them, so their rows record server
+housekeeping and operator calls, never an agent's request.
+
+These rows carry little. An audit row of these six verbs holds the actor, namespace, verb,
+outcome, duration, gate decision and `resource` object, and none of the request's arguments, so a
+poll's row cannot say which channel or which question it was about. Per-channel poll state lives
+on the channel's health row, which `comm.heartbeat` writes: `last_poll_attempt_at`
+(`crates/khive-pack-comm/src/handlers/quarantine_heartbeat.rs:541`), `consecutive_failures` (`:549`
+and `:621`) and `last_error` (`:622`). That row holds current state, not a history: each failure
+overwrites the previous `last_error`.
+
+Their cost is real. The event store's file (`khive.db.events.db`, the store this record's rows live
+in) grew from 3,582,369,792 bytes at about 23:11Z on 2026-10-12 to 4,533,735,424 bytes at about
+11:05Z on 2026-10-20: 951,365,632 bytes in 7.50 days, about 121 MiB a day. Dividing that rate by
+one day's audit rows gives about 770 bytes per row. That ratio is an upper bound on a row's share
+of file growth, not a measured marginal size: the file also holds the lane's other records, its
+indexes and free pages.
+
+### Decision
+
+**1. Omitted success rows.** A constant `VerbRegistry::AUDIT_SUCCESS_ROW_OMITTED_VERBS` lists
+`(pack, verb)` pairs. At this revision it holds four:
+
+- comm: `comm.inbox`, `comm.probe`, `comm.cursor_get`;
+- kg: `whoami`.
+
+In `reduced` mode (item 6), a dispatch of a listed verb whose outcome is `Success` writes no audit
+row: no row is built and nothing is submitted to the audit lane.
+
+Eligibility is bound to registration, as Amendment 3 binds its allowlist. The `(pack, verb)` pair
+must match, and the pack must have been registered through the composition root's trusted path
+(`PackRegistry::register_packs` and `register_packs_with_runtimes`,
+`crates/khive-runtime/src/pack/loading.rs:282` and `:380`, and the factory variant at `:412`). A
+pack registered through the untrusted `VerbRegistryBuilder::register` is never eligible, whatever
+it reports about itself. Membership is precomputed when `VerbRegistryBuilder::build` runs, into a
+set of its own. Amendment 3's set cannot be reused: its builder keeps only `Visibility::Verb`
+handlers of category Assertive (`crates/khive-runtime/src/pack/builder.rs:545-550`), which leaves
+out all three poll-loop verbs.
+
+`comm.cursor_get` is not write-free in Amendment 4's sense: it checks out the writer and runs the
+cursor table's `CREATE TABLE IF NOT EXISTS` statement on every call
+(`crates/khive-pack-comm/src/handlers/probe_cursor.rs:202-204`). Once the table exists that
+statement changes nothing, and on a store without the table it creates it. Omitting its success
+row is a different criterion from Amendment 4's admission-degrade criterion, which `comm.cursor_get`
+still does not meet: it stays off `ADMISSION_DEGRADE_SAFE_VERBS`, and Amendment 4's precondition
+for that list is unchanged.
+
+**2. Sampled success rows.** A constant `VerbRegistry::AUDIT_SUCCESS_ROW_SAMPLED_VERBS` lists
+entries of `(pack, verb, every, forcing rule)`, bound to registration the same way. At this
+revision:
+
+- comm: `comm.heartbeat`, every 10; forced when the result's `outcome` is not the string
+  `"success"`.
+- comm: `comm.cleanup_expired_quarantine`, every 10; forced when the result's `deleted` or
+  `routed_owners_detached` is greater than zero.
+
+Selection works as follows:
+
+- Each entry owns one process-lifetime counter. Every `Success` dispatch of the entry's verb takes
+  exactly one sequence number `n` from it by a single atomic fetch-add, at the deferred append
+  described under "Stage 1 clarification", where the outcome and the handler's result are both
+  known. Numbers are unique per process and per verb, start at 0, and are taken by no other
+  outcome.
+- The dispatch is **selected** when `mix64(n) % every == 0`, where `mix64` is the splitmix64
+  finalizer: `z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9; z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+  z ^ (z >> 31)`, in wrapping 64-bit arithmetic. `mix64(0) = 0`, so the first success after a
+  process start is always selected. Over `n` from 0 to 99 the selected numbers are 0, 2, 8, 12,
+  34, 47, 77 and 90.
+- The dispatch is **forced** when the entry's forcing rule holds for the trusted canonical
+  handler's result. A named field that is missing or has the wrong type also forces, so a result
+  the rule cannot read fails toward writing. The rule is evaluated only at that seam and only for
+  an eligible registration; no other pack's result is parsed.
+- A selected or forced dispatch writes its row; any other `Success` dispatch of the verb writes
+  none. A written row carries `resource.sampling = {"every": 10, "seq": n, "selected_by": s}`, where
+  `s` is `"sample"` when the hash selected it and `"forced"` when only the forcing rule did.
+- A row describes only its own dispatch: its request id, duration, `resource.units` and
+  `cost_unit` are that dispatch's, never a sum over skipped ones.
+
+Why a hash and not `n % every == 0`: the cleanup verb's dispatches alternate between the slug pass
+and the slugless pass. Over the measured day's 25,310 cleanup sequence numbers, the periodic rule
+selects 2,531 even numbers and no odd ones, so it would never write a row for the slugless pass;
+the hash selects 1,297 even and 1,281 odd. A fixed function of `n` also keeps the selected set
+exact and testable, which a random draw would not.
+
+Why one counter per verb and no per-key state: a row stands only for itself, so nothing has to
+track which dispatches a row covers. The fetch-add is the only shared step, there is no map to cap
+or evict, and concurrent dispatches cannot lose or share a number.
+
+Why heartbeat failures are forced: the health row keeps only the latest `last_error`, so without a
+row per failed poll the history of failures would be lost. Failed polls are rare, so forcing them
+costs little.
+
+**3. Every other outcome is unchanged.** Gate denials, `Error` outcomes, unknown-verb rows,
+admission failures and Amendment 3's degraded rows are written exactly as today for these six
+verbs, carry no `sampling` object and take no sequence number. Denial receipts keep surfacing
+`audit_event_id` (`crates/khive-runtime/src/pack/dispatch.rs:223`) on the same conditions as today.
+A heartbeat whose parameters report a failed poll still resolves `Ok` (`channel_poll.rs:648`), so it
+is a `Success` dispatch here, and the forcing rule keeps its row.
+
+Every row this amendment still writes is produced, admitted and committed exactly as today. The
+heartbeat and cleanup rows keep their obligation: if a selected or forced row's append fails, the
+dispatch fails as it does today, and Amendment 3's degrade path still applies only to its own
+allowlist. An omitted or skipped success never reaches the audit lane, so it is never admitted,
+refused or degraded and moves none of Amendment 3's admission counters. The operational-read
+admission tests that drive `comm.inbox` and `comm.probe` through a real trusted pack
+(`crates/khive-mcp/tests/operational_read_admission.rs:283-300`) therefore run in `all` mode.
+
+**4. Counters.** Per verb and per process, exported through `VerbRegistry::audit_batch_metrics()`
+beside Amendment 3's counters and visible on `db_diagnostics`:
+
+- `audit_success_rows_omitted`: item 1 dispatches that wrote no row;
+- `audit_success_rows_sampled_out`: item 2 dispatches that were neither selected nor forced;
+- `audit_success_rows_forced`: item 2 dispatches written only because of the forcing rule;
+
+and, once per process, `audit_success_rows_mode`: `reduced` or `all`. Each dispatch increments at
+most one of the three counts, once. They reset when the process
+restarts, and they are the only record of omitted and skipped dispatches.
+
+**5. Readers.** Every reader of audit rows keeps reading stored rows, with its current meaning.
+For these six verbs, after this amendment:
+
+- `brain.event_counts` counts each stored row once
+  (`crates/khive-pack-brain/src/event_counts_grouping.rs:105`) and adds its `cost_unit` to
+  `total_cost_unit` and `cost_unit_by_verb` (`event_counts_grouping.rs:151`). Every existing field
+  keeps that meaning and those values. The omitted verbs appear only through their non-success
+  rows. The sampled verbs appear through their written rows, so their counts and `cost_unit` sums
+  are sampled totals, not dispatch totals.
+- `brain.event_counts` gains one field, `sampled_success_rows`, keyed by verb, with `rows` (stored
+  rows carrying `resource.sampling`), `sample_rows` (those with `selected_by = "sample"`),
+  `forced_rows` (those with `selected_by = "forced"`) and `every`. It is computed over the same
+  authorized, filtered and fetched rows as the other fields (Amendment 6). When the fetch is
+  truncated it is named `sampled_success_rows_page_scoped`, as the verb-by-actor cross is. A reader
+  can estimate a window's successful dispatches of a sampled verb as `every × sample_rows`. That is
+  an estimate with sampling error, never an exact count; forced rows are outside the sample and are
+  not multiplied.
+- `count(kind="event", group_by=...)` (`crates/khive-pack-kg/src/handlers/stats.rs:83-87`),
+  `brain.event_page` (`crates/khive-pack-brain/src/handlers/event_page.rs:178-182`),
+  `list(kind="event")` (`crates/khive-pack-kg/src/handlers/list.rs:935`) and the `query` event
+  source (`crates/khive-query/src/compilers/sql.rs:434`) return and count only stored rows. They
+  see fewer rows for these verbs, page and truncate accordingly, show `resource.sampling` as part of
+  the row's payload, and scale nothing.
+- `get` (`crates/khive-pack-kg/src/handlers/get.rs:371`) and `resolve`
+  (`crates/khive-runtime/src/operations/identity_reads.rs:283`) keep reading every row already
+  stored. An omitted or skipped success never had an event id, so there is nothing for them to
+  find.
+- The performance bench joins each client sample to its audit row by `resource.request_id`
+  (`scripts/perf/mcp_bench_client.py:493`) and reports a sample with no row as `no_audit_row` with
+  a null server duration (`mcp_bench_client.py:502-504`). A bench therefore runs its daemon in
+  `all` mode (item 6), and the bench client reads `audit_success_rows_mode` from `db_diagnostics`
+  before its first sample and refuses to run against a daemon in any other mode.
+
+**6. Mode.** One runtime setting, `KHIVE_AUDIT_SUCCESS_ROWS`, read once when the registry is
+built. `reduced` (the default) applies items 1 and 2; `all` writes every success row as before this
+amendment, takes no sequence numbers and adds no `sampling` object. A builder option overrides the
+environment variable, so an embedder or a test fixes the mode without touching the process
+environment. An unrecognized value resolves to `all` and logs a warning naming the value. The
+setting can only restore rows: no value removes a row this amendment keeps.
+
+The daemon a performance bench launches runs with `all`. A deployment that needs a complete
+per-dispatch record, or that bills from `cost_unit`, runs with `all`. ADR-168's
+`aggregate_then_archivable` rule, that any class serving quota or admission accounting declares a
+verified durable aggregate (`docs/adr/ADR-168-event-retention-classes.md:64-68`), stands: the
+reduced population is not complete accounting input, and no sampled count substitutes for that
+aggregate.
+
+### Growth
+
+Applied to the 2026-10-19 counts with one process for the day: item 1 removes 97,800 rows. Item 2
+takes sequence numbers 0 to 12,654 for `comm.heartbeat` and 0 to 25,309 for
+`comm.cleanup_expired_quarantine`; the hash selects 1,268 and 2,578 of them, 3,846 rows against the
+3,796.5 of an exact one in ten. The day falls from 164,793 rows to 32,874 before forced rows, an
+80.05% cut. Forced rows add to that, and each restart starts the sequence again at 0, whose
+first success is always selected. If file growth
+tracks audit rows, it falls from about 121 MiB a day to about 24 MiB a day. That projection is
+conditional, and acceptance arm 12 measures it. Rows already written stay; removing old rows is
+retention's question (ADR-168), not this amendment's.
+
+### Alternatives considered
+
+1. **Sample the four polling reads at 1 in 100 instead of omitting them.** About 978 rows a day.
+   Unlike the process-lifetime counters, those rows would keep poll volume by actor, namespace and
+   time across restarts, so omission loses information that sampling would keep. Not chosen: the
+   constraint this amendment implements is that a pure poll's success writes no row. The sets are
+   constants, so moving a verb between them is a one-line amendment.
+2. **Exact block weights per key** (the first draft of this amendment): one counter per
+   `(pack, verb, actor, namespace)` and a `represents` count on each written row. Rejected: a
+   weight cannot be split across a reader's time window, the tail after the last written row is
+   lost at exit or eviction, concurrent dispatches need a reservation protocol, and the capped map
+   needs eviction rules. A row that stands only for itself needs none of that.
+3. **Select by a hash of the event id.** Stateless, but the selected set changes from run to run,
+   so a test cannot assert it exactly.
+4. **Retention alone.** Deleting old rows bounds the store but leaves the write volume, the
+   audit-lane admission load and the WAL churn. It is needed as well (ADR-168), not instead.
+5. **A periodic summary row per poller.** One row per interval with a count. Needs a new row shape,
+   a timer and a flush at shutdown; the counters of item 4 give in-process totals and the sampled
+   rows give a durable estimate without one.
+6. **Poll less.** Client poll intervals and the server's double cleanup pass are worth revisiting,
+   but they are client and channel behavior, not the audit contract.
+
+### Acceptance
+
+Each arm names the control that must turn it red.
+
+1. In `reduced` mode, a `Success` dispatch of each of `comm.inbox`, `comm.probe`,
+   `comm.cursor_get` and `whoami` through the trusted registry writes no audit row and increments
+   that verb's `audit_success_rows_omitted` by one. Control: removing any one entry from the
+   omitted constant turns that verb's case red.
+2. The omitted and sampled constants are disjoint, every entry resolves to a handler of the named
+   pack, and the precomputed sets equal the constants. A pack registered through
+   `VerbRegistryBuilder::register` that serves `comm.inbox` and `comm.heartbeat` writes every
+   success row of both. Control: dropping the trusted-registration condition makes its success
+   rows omit or sample.
+3. One hundred serial `Success` dispatches of `comm.heartbeat` with a passing result write rows
+   whose `seq` values are exactly 0, 2, 8, 12, 34, 47, 77 and 90, each with `every = 10` and
+   `selected_by = "sample"`, and `audit_success_rows_sampled_out` reads 92. Control: replacing the
+   hash with `n % 10 == 0` turns the set red.
+4. Eight tasks dispatch `comm.cleanup_expired_quarantine` 1,000 times each, concurrently: the
+   sequence numbers taken are exactly 0 to 7,999 with no repeat, the written rows are exactly the
+   hash-selected numbers in that range, and written rows plus `sampled_out` equal 8,000. Control: a
+   counter read and written in two steps instead of one fetch-add turns it red.
+5. Forcing: a cleanup result with `deleted = 1` and `routed_owners_detached = 0`, one with
+   `deleted = 0` and `routed_owners_detached = 1`, one missing `deleted`, and a heartbeat whose
+   result has `outcome = "failure"`, each at a sequence number the hash skips, write their rows with
+   `selected_by = "forced"` and increment `audit_success_rows_forced`. A cleanup returning zeros at a
+   skipped number writes none. Control: removing either field from the cleanup rule, or the
+   heartbeat rule, turns its case red. A census test pins each handler's result key set, so a new
+   result field fails it until the forcing rule is reviewed.
+6. Error and denial rows: a `comm.heartbeat` with an empty `channel_kind`, a cleanup that returns
+   an error, an unknown verb and a gate-denied `whoami` write their rows as today, with no
+   `sampling` object, take no sequence number, and the denial returns `audit_event_id`. Control:
+   applying the cut before the outcome is known drops them.
+7. Obligation: with an injected append failure, a selected `comm.heartbeat` dispatch fails as it
+   does today, and a skipped one succeeds. The operational-read admission tests pass in `all`
+   mode. Control: routing a selected row through a best-effort path makes the first case succeed.
+8. `db_diagnostics` reports the three counts and the mode per verb, equal to the dispatches of
+   arms 1, 3 and 5, and all zero in `all` mode.
+9. Readers, over one stored fixture holding pre-amendment rows, `all`-mode rows and sampled rows
+   (both `selected_by` values) for two actors and two namespaces: every existing
+   `brain.event_counts` field equals the value a build without this amendment returns over the same
+   rows; `sampled_success_rows` equals stated expected values under actor, namespace, kind and time
+   filters; and with a row cap below the fixture size it is named
+   `sampled_success_rows_page_scoped`. `count(kind="event")`, `brain.event_page` and
+   `list(kind="event")` return the stored rows unchanged. Control: scaling an existing field by
+   `every` breaks the equality.
+10. The bench client refuses to run against a daemon whose `db_diagnostics` reports `reduced`.
+    Against a daemon it launched in `all` mode it reports zero `no_audit_row` for successful
+    `comm.inbox`, `comm.probe` and `whoami` samples. Control: with the refusal removed, a `reduced`
+    daemon makes every successful sample of those three verbs `no_audit_row`.
+11. An unrecognized `KHIVE_AUDIT_SUCCESS_ROWS` value resolves to `all` with one warning, and the
+    builder option overrides the environment variable in both directions.
+12. A replay of the 2026-10-19 verb mix at 1/100 scale through a test registry (each of the six
+    verbs called its measured count divided by 100, rounded, with passing results, and 290 calls of
+    unaffected verbs) writes exactly 330 rows in `reduced` mode, against 1,649 in `all` mode, a
+    79.99% cut. Control: emptying either constant changes the count. Separately, 24 hours of a deployment with this change record the six verbs'
+    per-verb audit counts and the event store's daily file growth beside the 2026-10-19 figures
+    above; that record is an observation, not a gate.
+
+### Consequences
+
+- About 80% fewer audit rows on a deployment shaped like the measured one, and the same share less
+  audit-lane admission traffic.
+- Poll volume for the omitted verbs is visible only on process-lifetime counters; across a restart
+  it is gone.
+- `brain.event_counts` counts and `cost_unit` sums undercount the six verbs' successes. For the two
+  sampled verbs, `sampled_success_rows` supports an estimate; nothing recovers the omitted ones.
+- Every dispatch whose row is omitted or skipped returns its result without a committed audit row;
+  ADR-133 Amendment 10 names this as an exception to that record's obligations.
+- A verb joins either set only by amendment, with the same evidence: its row count, what its row
+  records that nothing else does, and which readers depend on it.
