@@ -115,6 +115,61 @@ fn read_merge_entity(
     })
 }
 
+fn collect_merge_incident_edges(
+    conn: &rusqlite::Connection,
+    from_str: &str,
+    budget: &mut MergeTxBudget,
+) -> Result<Vec<EdgeRow>, SqliteError> {
+    let parse_id =
+        |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
+
+    // Namespace-agnostic (khive#1236): edge endpoints resolve by-ID regardless of
+    // namespace (ADR-007 Rev 6), and `link` stamps an edge with its *creator's*
+    // namespace, not either endpoint's — so an edge incident to `from_id` can live
+    // in any namespace. Scoping this collection to the merge's own namespace missed
+    // those edges entirely. Each row's own `namespace` column is carried through
+    // (`EdgeRow::namespace`) and used for every subsequent SQL op against that row.
+    let mut outbound: Vec<EdgeRow> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, \
+                    updated_at, deleted_at, target_backend, metadata \
+             FROM graph_edges WHERE source_id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![&from_str])?;
+        while let Some(row) = rows.next()? {
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            outbound.push(edge);
+        }
+    }
+
+    let mut inbound: Vec<EdgeRow> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, \
+                    updated_at, deleted_at, target_backend, metadata \
+             FROM graph_edges WHERE target_id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![&from_str])?;
+        while let Some(row) = rows.next()? {
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            inbound.push(edge);
+        }
+    }
+
+    // A self-edge from_id→from_id is charged in both lists before deduplication.
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut all_edges: Vec<EdgeRow> = Vec::new();
+    for edge in outbound.into_iter().chain(inbound) {
+        if seen.insert(edge.id) {
+            all_edges.push(edge);
+        }
+    }
+    Ok(all_edges)
+}
+
 /// All merge SQL on one connection inside an already-open `BEGIN IMMEDIATE` transaction.
 ///
 /// Reads both entities, rewires/drops incident edges, merges entity fields, updates FTS,
@@ -194,55 +249,8 @@ pub(super) fn merge_entity_sql(
     }
 
     // --- Collect edges incident to from_id ---
-    let parse_id =
-        |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
-
     let from_str = from_id.to_string();
-
-    // Namespace-agnostic (khive#1236): edge endpoints resolve by-ID regardless of
-    // namespace (ADR-007 Rev 6), and `link` stamps an edge with its *creator's*
-    // namespace, not either endpoint's — so an edge incident to `from_id` can live
-    // in any namespace. Scoping this collection to the merge's own namespace missed
-    // those edges entirely. Each row's own `namespace` column is carried through
-    // (`EdgeRow::namespace`) and used for every subsequent SQL op against that row.
-    let mut outbound: Vec<EdgeRow> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, \
-                    updated_at, deleted_at, target_backend, metadata \
-             FROM graph_edges WHERE source_id = ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![&from_str])?;
-        while let Some(row) = rows.next()? {
-            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
-            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
-            outbound.push(edge);
-        }
-    }
-
-    let mut inbound: Vec<EdgeRow> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, \
-                    updated_at, deleted_at, target_backend, metadata \
-             FROM graph_edges WHERE target_id = ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![&from_str])?;
-        while let Some(row) = rows.next()? {
-            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
-            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
-            inbound.push(edge);
-        }
-    }
-
-    // Deduplicate by edge ID (a self-edge from_id→from_id appears in both lists).
-    let mut seen: HashSet<Uuid> = HashSet::new();
-    let mut all_edges: Vec<EdgeRow> = Vec::new();
-    for edge in outbound.into_iter().chain(inbound) {
-        if seen.insert(edge.id) {
-            all_edges.push(edge);
-        }
-    }
+    let all_edges = collect_merge_incident_edges(conn, &from_str, &mut budget)?;
     let original_edges: HashMap<Uuid, EdgeRow> = all_edges
         .iter()
         .map(|edge| (edge.id, edge.clone()))
@@ -830,44 +838,7 @@ pub(super) fn merge_note_sql(
     let from_str = from_id.to_string();
 
     // Collect edges incident to from_id.
-    let parse_id =
-        |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
-
-    // Namespace-agnostic (khive#1236): see the equivalent comment in
-    // `merge_entity_sql` — edge endpoints resolve by-ID regardless of namespace.
-    let mut outbound: Vec<EdgeRow> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
-             FROM graph_edges WHERE source_id = ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![&from_str])?;
-        while let Some(row) = rows.next()? {
-            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
-            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
-            outbound.push(edge);
-        }
-    }
-    let mut inbound: Vec<EdgeRow> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
-             FROM graph_edges WHERE target_id = ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![&from_str])?;
-        while let Some(row) = rows.next()? {
-            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
-            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
-            inbound.push(edge);
-        }
-    }
-    let mut seen: HashSet<Uuid> = HashSet::new();
-    let mut all_edges: Vec<EdgeRow> = Vec::new();
-    for edge in outbound.into_iter().chain(inbound) {
-        if seen.insert(edge.id) {
-            all_edges.push(edge);
-        }
-    }
+    let all_edges = collect_merge_incident_edges(conn, &from_str, &mut budget)?;
     let original_edges: HashMap<Uuid, EdgeRow> = all_edges
         .iter()
         .map(|edge| (edge.id, edge.clone()))
