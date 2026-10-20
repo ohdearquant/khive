@@ -3983,3 +3983,6 @@ async fn body_line_counts_degrade_to_none_under_expired_read_deadline() {
         "control: without a deadline the lookup returns real counts"
     );
 }
+
+#[path = "namespace_fallback_tests.rs"]
+mod namespace_fallback_tests;
