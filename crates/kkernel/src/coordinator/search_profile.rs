@@ -15,6 +15,10 @@
 //!   fan-out it runs from fan-out start to that backend's completion (or to the
 //!   coordinator giving up on it). When one backend serves the searched
 //!   substrate there is no fan-out, and its line carries the `fanout` time.
+//! - `backend_deadline`: the selected phase snapshot for a timed-out or late
+//!   backend, with the same call/backend identity. `snapshot_origin` distinguishes
+//!   a deadline capture from a fallback observation. Its `phase_elapsed_ms` is
+//!   an inclusive phase duration, not backend `us` or native execution time.
 //! - `merge`: rank fusion across backends (multi-backend only).
 //! - `fanout`: candidate collection as a whole, with the backend count.
 //! - `finalize`: score floor and ordering of the merged hits.
@@ -133,21 +137,69 @@ pub(super) fn backend(result: &BackendSearchResult, elapsed: Duration) {
     );
 }
 
+/// Export the snapshot already selected by the coordinator, on its parent task
+/// so the existing call scope is retained. No field construction occurs when off.
+pub(super) fn backend_deadline(
+    backend: &str,
+    observation: &str,
+    snapshot_origin: &str,
+    snapshot: &khive_storage::request_context::SearchPhaseSnapshot,
+) {
+    emit_if_on(|| {
+        let call = CALL.try_with(|call| *call).unwrap_or(0);
+        record(
+            call,
+            "backend_deadline",
+            None,
+            &[
+                ("b", backend.into()),
+                ("o", "timeout".into()),
+                ("observation", observation.into()),
+                ("snapshot_origin", snapshot_origin.into()),
+                ("in_flight_phase", snapshot.in_flight_phase.as_str().into()),
+                ("phase_elapsed_ms", snapshot.phase_elapsed_ms.into()),
+                ("active_phases", snapshot.active_phases.as_str().into()),
+                (
+                    "completed_phases",
+                    snapshot.completed_phases.as_str().into(),
+                ),
+            ],
+        )
+    });
+}
+
+fn emit_if_on(build: impl FnOnce() -> String) {
+    if on() {
+        emit(&build());
+    }
+}
+
 fn write(stage: &str, elapsed: Duration, fields: &[(&str, serde_json::Value)]) {
     let call = CALL.try_with(|call| *call).unwrap_or(0);
     emit(&line(call, stage, elapsed, fields));
 }
 
 fn line(call: u64, stage: &str, elapsed: Duration, fields: &[(&str, serde_json::Value)]) -> String {
+    record(call, stage, Some(elapsed), fields)
+}
+
+fn record(
+    call: u64,
+    stage: &str,
+    elapsed: Option<Duration>,
+    fields: &[(&str, serde_json::Value)],
+) -> String {
     let mut line = serde_json::Map::new();
     line.insert("c".into(), call.into());
     line.insert("s".into(), stage.into());
-    line.insert(
-        "us".into(),
-        u64::try_from(elapsed.as_micros())
-            .unwrap_or(u64::MAX)
-            .into(),
-    );
+    if let Some(elapsed) = elapsed {
+        line.insert(
+            "us".into(),
+            u64::try_from(elapsed.as_micros())
+                .unwrap_or(u64::MAX)
+                .into(),
+        );
+    }
     for (key, value) in fields {
         line.insert((*key).to_string(), value.clone());
     }
@@ -248,5 +300,65 @@ mod tests {
         assert_eq!(current(), None);
         // switched off, a search runs outside any call
         assert_eq!(scoped(false, async { current() }).await, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn deadline_profile_off_does_not_construct_a_record() {
+        assert!(
+            !enabled(),
+            "KHIVE_SEARCH_PROFILE is set in the test environment"
+        );
+        emit_if_on(|| panic!("disabled profiling constructed a deadline record"));
+    }
+
+    #[tokio::test]
+    async fn deadline_profile_keeps_call_identity_and_snapshot_fields() {
+        let snapshot = khive_storage::request_context::SearchPhaseSnapshot {
+            in_flight_phase: "vector_embedding".into(),
+            phase_elapsed_ms: 17,
+            active_phases: "vector_search=21ms,vector_embedding=17ms".into(),
+            completed_phases: "text_reader_admission=0ms".into(),
+        };
+        let name = "main\"x\\y\n";
+        let ((), lines) = capture(profiled(async {
+            backend_deadline(name, "timed_out", "deadline_capture", &snapshot);
+            profiled(async {
+                backend_deadline(
+                    name,
+                    "completed_after_deadline",
+                    "fallback_observation",
+                    &snapshot,
+                );
+            })
+            .await;
+        }))
+        .await;
+        let records: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| {
+                assert!(!line.contains('\n'), "{line}");
+                serde_json::from_str(line).expect("profile JSON")
+            })
+            .collect();
+        assert_eq!(records.len(), 3, "{records:?}");
+        let call = records[2]["c"].as_u64().expect("search call id");
+        assert!(call > 0);
+        assert_eq!(records[2]["s"], "search");
+        for record in &records[..2] {
+            assert_eq!(record["c"], call);
+            assert_eq!(record["s"], "backend_deadline");
+            assert_eq!(record["b"], name);
+            assert_eq!(record["o"], "timeout");
+            assert_eq!(record["in_flight_phase"], snapshot.in_flight_phase);
+            assert_eq!(record["phase_elapsed_ms"], 17);
+            assert_eq!(record["active_phases"], snapshot.active_phases);
+            assert_eq!(record["completed_phases"], snapshot.completed_phases);
+            assert!(record.get("us").is_none());
+        }
+        assert_eq!(records[0]["observation"], "timed_out");
+        assert_eq!(records[0]["snapshot_origin"], "deadline_capture");
+        assert_eq!(records[1]["observation"], "completed_after_deadline");
+        assert_eq!(records[1]["snapshot_origin"], "fallback_observation");
     }
 }
