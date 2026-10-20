@@ -39,51 +39,57 @@ fn history_ddl(name: &str) -> &str {
 
 fn configure(runtime: &KhiveRuntime, schema: Schema) {
     let writer = runtime.backend().pool().try_writer().unwrap();
-    writer.autocommit(|conn| {
-    conn
-        .execute_batch(&format!(
-            "DROP INDEX IF EXISTS {CANONICAL}; DROP INDEX IF EXISTS {NONCANONICAL}"
-        ))
-        .unwrap();
-    if matches!(schema, Schema::Absent) {
-        return Ok(());
-    }
-    conn.execute_batch(GIT_CORE_INDEXES).unwrap();
-    match schema {
-        Schema::CanonicalOnly => conn
-            .execute_batch(&format!("DROP INDEX {NONCANONICAL}"))
-            .unwrap(),
-        Schema::NoncanonicalOnly => conn
-            .execute_batch(&format!("DROP INDEX {CANONICAL}"))
-            .unwrap(),
-        Schema::Aliases | Schema::WrongTable | Schema::WrongDefinitions => {
-            conn
-                .execute_batch(&format!(
-                    "DROP INDEX {CANONICAL}; DROP INDEX {NONCANONICAL}"
-                ))
-                .unwrap();
+    writer
+        .autocommit(|conn| {
+            conn.execute_batch(&format!(
+                "DROP INDEX IF EXISTS {CANONICAL}; DROP INDEX IF EXISTS {NONCANONICAL}"
+            ))
+            .unwrap();
+            if matches!(schema, Schema::Absent) {
+                return Ok(());
+            }
+            conn.execute_batch(GIT_CORE_INDEXES).unwrap();
             match schema {
-                Schema::Aliases => {
-                    for ddl in [
-                        history_ddl(CANONICAL),
-                        history_ddl(NONCANONICAL),
-                    ] {
-                        conn.execute_batch(&ddl.replace("idx_git_notes_history_", "idx_fixture_alias_")).unwrap();
+                Schema::CanonicalOnly => conn
+                    .execute_batch(&format!("DROP INDEX {NONCANONICAL}"))
+                    .unwrap(),
+                Schema::NoncanonicalOnly => conn
+                    .execute_batch(&format!("DROP INDEX {CANONICAL}"))
+                    .unwrap(),
+                Schema::Aliases | Schema::WrongTable | Schema::WrongDefinitions => {
+                    conn.execute_batch(&format!(
+                        "DROP INDEX {CANONICAL}; DROP INDEX {NONCANONICAL}"
+                    ))
+                    .unwrap();
+                    match schema {
+                        Schema::Aliases => {
+                            for ddl in [history_ddl(CANONICAL), history_ddl(NONCANONICAL)] {
+                                conn.execute_batch(
+                                    &ddl.replace("idx_git_notes_history_", "idx_fixture_alias_"),
+                                )
+                                .unwrap();
+                            }
+                        }
+                        Schema::WrongTable => conn
+                            .execute_batch(&format!(
+                                "CREATE INDEX {CANONICAL} ON entities(namespace); \
+                                 CREATE INDEX {NONCANONICAL} ON entities(kind)"
+                            ))
+                            .unwrap(),
+                        Schema::WrongDefinitions => conn
+                            .execute_batch(&format!(
+                                "CREATE INDEX {CANONICAL} ON notes(namespace); \
+                                 CREATE INDEX {NONCANONICAL} ON notes(kind)"
+                            ))
+                            .unwrap(),
+                        _ => unreachable!(),
                     }
                 }
-                Schema::WrongTable => conn.execute_batch(&format!(
-                    "CREATE INDEX {CANONICAL} ON entities(namespace); CREATE INDEX {NONCANONICAL} ON entities(kind)"
-                )).unwrap(),
-                Schema::WrongDefinitions => conn.execute_batch(&format!(
-                    "CREATE INDEX {CANONICAL} ON notes(namespace); CREATE INDEX {NONCANONICAL} ON notes(kind)"
-                )).unwrap(),
-                _ => unreachable!(),
+                Schema::Absent | Schema::Both => {}
             }
-        }
-        Schema::Absent | Schema::Both => {}
-    }
-    Ok(())
-    }).unwrap();
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn raw_note(

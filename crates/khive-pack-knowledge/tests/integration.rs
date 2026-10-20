@@ -2245,8 +2245,7 @@ async fn cursor_indexes_cover_order_and_walk_terminates() {
                 .pool()
                 .writer()
                 .unwrap()
-                .autocommit(|conn| {
-                    let tx = conn.unchecked_transaction().unwrap();
+                .transaction(|conn| {
                     for (kind, table) in [(0, "knowledge_atoms"), (1, "knowledge_domains")] {
                         for (ns_number, namespace) in [(0, "local"), (1, "foreign")] {
                             for n in (1..=1020).rev() {
@@ -2256,7 +2255,7 @@ async fn cursor_indexes_cover_order_and_walk_terminates() {
                                 }
                                 let id = format!("{kind:08x}-{ns_number:04x}-4000-8000-{n:012x}");
                                 let tags = if n > 1010 { "[\"type:domain\"]" } else { "[]" };
-                                tx.execute(
+                                conn.execute(
                                     &format!(
                                         "INSERT INTO {table} \
                                 (id, namespace, slug, name, tags, created_at, \
@@ -2280,7 +2279,6 @@ async fn cursor_indexes_cover_order_and_walk_terminates() {
                             }
                         }
                     }
-                    tx.commit().unwrap();
                     Ok(())
                 })
                 .unwrap();

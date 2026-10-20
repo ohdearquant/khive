@@ -639,6 +639,17 @@ impl<'pool> WriterGuard<'pool> {
         )))
     }
 
+    /// Run a native SQLite fixture operation through the usual autocommit owner.
+    ///
+    /// Available only to test builds and dependents enabling `test-support`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn autocommit_sqlite<R>(
+        self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, SqliteError> {
+        self.autocommit(|conn| operation(conn).map_err(Into::into))
+    }
+
     /// Execute a write transaction.
     /// Consumes this guard through BEGIN IMMEDIATE, post-BEGIN admission and
     /// COMMIT/ROLLBACK. The callback must not settle the outer transaction itself.
