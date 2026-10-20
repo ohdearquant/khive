@@ -20,6 +20,7 @@ bench = false
 khive-mounts = { version = "0.14.0", path = "../khive-mounts" }
 khive-pack-agent = { version = "0.14.0", path = "../khive-pack-agent", optional = true }
 khive-db = { version = "0.14.0", path = "../khive-db" }
+khive-fs = { version = "0.14.0", path = "../khive-fs" }
 khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
 khive-storage = { version = "0.14.0", path = "../khive-storage" }
 khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
