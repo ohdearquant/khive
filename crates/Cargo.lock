@@ -2962,6 +2962,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-runtime-production-tests"
+version = "0.14.0"
+dependencies = [
+ "async-trait",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "khive-score"
 version = "0.14.0"
 dependencies = [

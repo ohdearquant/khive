@@ -644,6 +644,9 @@ jobs:
       - name: Workspace doctests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh tests-doc
+      - name: Audit batch with production features
+        if: runner.os == 'Linux' && matrix.shard == 2
+        run: sh ../scripts/ci-audit-production.sh
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 2
         run: ../scripts/ci.sh channel-email
