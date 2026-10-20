@@ -1172,15 +1172,7 @@ async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
         .await
         .unwrap_or_default();
     rows.into_iter()
-        .filter_map(|row| {
-            row.get("namespace").and_then(|v| {
-                if let khive_storage::types::SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-        })
+        .filter_map(|row| row.text_or_none("namespace").map(str::to_owned))
         .collect()
 }
 
