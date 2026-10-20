@@ -33,7 +33,7 @@ import re
 import sys
 import tomllib
 
-from markdown_table_rows import split_row
+from documented_verb_counts import split_row
 
 
 GUIDE = "CLAUDE.md"
