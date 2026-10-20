@@ -163,7 +163,7 @@ them. So the key names a subject class, qualified by kind for the two classes th
 note:<kind>   entity:<kind>   edge   atom   domain
 ```
 
-The proposed [Amendment 4](#amendment-4-2026-10-04-edge-relation-routes) extends this grammar with
+[Amendment 4](#amendment-4-2026-10-04-edge-relation-routes) extends this grammar with
 `edge:<relation>` and defines its precedence over the bare `edge` fallback.
 
 The qualification is not decoration. Nothing in the schema stops a note kind and an entity kind
@@ -708,7 +708,20 @@ excluded list. Its failure message names the tables without a rule.
 
 ## Amendment 4 (2026-10-04): edge relation routes
 
-**Status: Proposed.** Refs #4038.
+**Status: accepted (2026-10-20).** Refs #4038. Accepted on its own acceptance arm: the
+`namespace_move::edge_tests` fixtures named under Acceptance below pass at main commit `972d8861`,
+run with the `khive-db` `vectors` feature (`cargo test -p khive-db --features vectors`); without
+that feature the vector fixture `edge_vectors_follow_the_resolved_relation_not_both_matching_routes`
+is not compiled. Each of the five mutation controls that the seventh and ninth Acceptance bullets
+require was applied alone to that commit and turned its unchanged fixture red after valid setup, at
+the move under test or an assertion on its result, and the fixture passed again once the mutation
+was removed: removing the edge route predicate, skipping collision preflight, removing relation
+filtering from the edge update, removing per-relation preflight, and removing fallback exclusion
+from the vector selector. #5761, merged after that run, gives the vector fixture two vector kinds
+and two fields and records its own two mutation checks (a kind filter and a field filter on the edge
+vector selector). The fallback-exclusion control was run again against that fixture at main commit
+`e8b59a3a`: the fixture passed, the mutation turned it red at the move under test, and it passed
+again once the mutation was removed.
 
 This route grammar serves relation-specific namespace moves in #4038, whose acceptance requires
 exact relation routes with an order-independent bare-edge fallback, refusal of unrouted relations
@@ -756,7 +769,7 @@ as "routed to the namespace it is already in", checked in `namespace_move.rs` be
 inventory is read). This amendment states the rule and extends it to the new keys; it does not add
 a new refusal.
 
-**Proposed collision exception (#4121, 2026-10-05).** This replaces the earlier requirement to
+**Collision exception (#4121, 2026-10-05).** This replaces the earlier requirement to
 check every source edge against every routed target. Collision enumeration still visits each
 reachable constraint once per distinct target. For `graph_edges`'s named
 `idx_graph_edges_unique_triple` constraint only, it considers source edges whose resolved relation
@@ -819,6 +832,7 @@ the status of the document.
   exclusion from the vector selector must fail the unchanged vector success test. Each control
   requires a semantic failure after valid setup and the same test passing after exact restoration.
 
-These storage routing fixtures do not establish warmed ANN consumer behavior. Amendment 1's
-consumer acceptance and Amendment 2's orphan and competing-subject refusals remain separate
-requirements. This proposal records acceptance obligations, not a claim that they have run.
+These storage routing fixtures do not establish warmed ANN consumer behavior, which stays with
+Amendment 1's consumer acceptance. Amendment 2's orphan and competing-subject refusals are proven by
+its own `partitioned_orphan_and_competing_subject_routes_refuse_before_any_write` fixture, not by
+these.
