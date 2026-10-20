@@ -2238,6 +2238,7 @@ dependencies = [
  "khive-channel-email",
  "khive-channel-telegram",
  "khive-db",
+ "khive-fs",
  "khive-mounts",
  "khive-pack-agent",
  "khive-pack-blob",

@@ -380,22 +380,21 @@ pub(super) fn read_supervisor_marker() -> Option<SupervisorMarker> {
         .ok()
         .and_then(|metadata| metadata.modified().ok());
     let read_regular_marker = || -> std::io::Result<String> {
+        use khive_fs::opened_file::ContainedOpenError;
         use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
 
         // Inspect the opened file, not only a pathname that can be replaced.
         // Nonblocking open prevents a FIFO from stalling before that check;
         // no-follow treats a symlink as an unreadable declaration.
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(&path)?;
-        if !file.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "supervisor marker is not a regular file",
-            ));
-        }
+        let mut file = khive_fs::opened_file::open_regular_file_nofollow(&path).map_err(
+            |error| match error {
+                ContainedOpenError::Open(error) | ContainedOpenError::Metadata(error) => error,
+                _ => std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "supervisor marker is not a regular file",
+                ),
+            },
+        )?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
         Ok(contents)
