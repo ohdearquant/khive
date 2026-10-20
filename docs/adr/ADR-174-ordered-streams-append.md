@@ -1358,3 +1358,103 @@ it does not imply an exemption from this new aggregate bound.
    preparation error. No member commits in either case. The at-cap control
    establishes that the preparation error is reachable and the fixture is not
    refused by an earlier admission check.
+
+## Amendment 11 (2026-10-19): a lost reply to an atomic `stream.batch` reconciles through one witness member
+
+**Status**: Proposed.
+
+### The gap
+
+§4 reconciles a lost reply to one `stream.append(expected_seq=N)`: retry, read the record at `N`,
+compare. Amendment 1 added the atomic batch and said nothing about its lost reply. A client that
+sent an atomic batch over several streams and heads, and did not get the answer, has no stated way
+to learn whether it committed. The obvious reading of §4 applied member by member re-reads every
+stream and every head the batch touched, and a head that another writer moved since cannot be
+compared at all. A request to close this with a server-side idempotency key and a stored receipt per
+batch (issue #2958) is answered here without one.
+
+### A11.1 One member witnesses the batch
+
+An atomic batch commits in one writer transaction or writes nothing (A1.1, Amendment 1 acceptance
+2). So any one of its members, found committed, proves every member committed. The client:
+
+1. Sends the batch with `atomic=true`. Without a fence the default is per-member (A1.1), and the
+   rule below holds only for a batch that commits as one unit. Before the first attempt the client
+   fixes the batch's member list and gives it an operation token: at least 122 random bits from a
+   cryptographically secure generator (a version 4 UUID qualifies), drawn once per operation and never
+   derived from the batch's content. A digest of the member list would let a reader who may read the
+   stream, but not the documents the batch writes, confirm a guessed document from the record at `N`.
+   The client writes the token nowhere else until the reply is settled, so another client cannot
+   produce it or plant it at `N` ahead of the batch. The token is the client's operation identity. It
+   does not replace any event id the records already carry.
+2. Puts the token inside the record of one `append` member that carries `expected_seq=N` on stream
+   `S`. A batch with no append member adds one witness append for the token; that costs one record.
+3. On a lost reply, reads `stream.read(stream=S, after=N-1, limit=1)`. Only an entry whose `seq` is
+   `N` is the record at `N`; after truncation the read can return the first retained entry above `N`
+   instead. The client compares the record at `N` with the token:
+   - the token is there: the whole batch committed;
+   - a different record is at `N`: this batch cannot commit at `N`; its own writes did not happen;
+   - nothing is at `N` (no entry, or the entry returned has a `seq` above `N`): not established.
+     The first attempt may still be in flight, so the read is a snapshot, not a proof of rollback.
+     The client retries the identical batch with the same `expected_seq` values, or waits, and
+     never assigns new numbers because a read came back empty.
+
+This is §4's read path applied to an atomic unit: one read, whatever the number of streams and heads
+in the batch.
+
+### A11.2 What the store guarantees, and what it does not
+
+- **Guaranteed, and now stated as contract:** a committed atomic batch is visible to every later read
+  as a whole until truncation removes any of its members: no snapshot of the store shows some of its
+  members committed and others not. A read of one stream sees only that stream's members, which is not
+  a partial view of the batch. A refused atomic batch is visible to no read.
+- **Removal exception:** truncation (A3.2) removes entries per stream, below that stream's
+  `before_seq`, with no knowledge of batches. After it, a read can show a batch's members on one stream
+  and not its members on another, and on one stream it can show the members above the floor and not
+  those below (same-stream members take consecutive numbers, Amendment 1). The `floor_seq` each read
+  returns is the signal that a prefix is gone; a missing member below the floor is not evidence that
+  the batch was partial.
+- **Not provided:** the original per-member results. The witness proves that the batch happened; it
+  does not return the `version` and `updated_at` the batch's head writes produced (Amendment 5 A5.2).
+  After another writer changes such a head, those values cannot be read back from the store. A client
+  that needs them keeps them from the reply. Only the version can be derived from what it sent: a
+  `write` member sent once in the batch with `expected_version=V` is at `V+1` after commit. `updated_at`
+  is stamped by the server inside the batch's transaction and cannot be derived.
+- **Retention:** under the truncation contract (A3.2), a witness below `floor_seq` is gone, which is
+  not evidence that the batch did not commit. A client that relies on the witness keeps it above the
+  floor until its reply is settled.
+- **Side effects:** a commit verdict is a domain verdict. Post-commit effects run after the
+  transaction and are reported by the reply's disposition, which a lost reply also loses.
+
+### A11.3 Consequence for a client that also writes heads
+
+A client that wrote a head in the batch and lost the reply learns from the witness that the batch
+landed even when another writer has moved that head since. Its next write at `V+1` then refuses with
+`version_conflict`, which is the correct stop. Re-reading the head instead would find neither the
+client's value nor its version and leave the outcome unresolved.
+
+### Alternatives considered
+
+| Alternative                                                                                    | Why not                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A caller-chosen idempotency key with a stored receipt and an expiry                            | Once an expired receipt is removed, a key never used and a key whose batch committed and was pruned are the same state, so "an unknown or expired key refuses" cannot be enforced without keeping a marker for every key forever.                                                                                                                                                           |
+| Server-issued, never-reissued reservation keys with a receipt written in the batch transaction | Coherent: a reservation is positive evidence for every keyed submission, and one issuer high-water mark replaces the per-key markers. It costs a reservation call per batch, a new table and a client-side journal of outstanding batches. It returns the original per-member results, which the first consumer does not use after a lost reply. Revisit if a consumer needs those results. |
+| A batch-level read verb ("did this batch land")                                                | Adds a server surface to answer what one `stream.read` already answers once the client carries a token.                                                                                                                                                                                                                                                                                     |
+| Re-read every member                                                                           | Costs one read per stream and head, and a moved head cannot be compared.                                                                                                                                                                                                                                                                                                                    |
+
+### Acceptance
+
+1. **Witness after commit.** An atomic batch (`atomic=true`) of two appends on two streams and one
+   head write, the first append carrying a token at `expected_seq=N`, commits;
+   `stream.read(stream=S, after=N-1, limit=1)` returns the token record at `N`.
+2. **Witness after refusal.** The same batch with a stale `expected_seq` on its second member is
+   refused (Amendment 1 arm 2); the read at `N` on `S` returns no record, and a control append by
+   another writer at `N` makes the read return that writer's record, not the token.
+3. **No partial visibility.** While one process commits atomic batches of K appends across K
+   streams, a second process reads the K streams' last entries inside one store read transaction,
+   repeatedly (a store-level test, so that the K reads share one snapshot); every reading
+   shows either all K members of a batch or none of them. A control that commits the same members as
+   a per-member batch (`atomic=false`) must produce at least one partial reading in the same harness,
+   so the arm is known to be able to see one.
+4. **Mutation.** With the atomic batch committed in two transactions split after its first member,
+   arm 3 goes red; its per-member control is unaffected.
