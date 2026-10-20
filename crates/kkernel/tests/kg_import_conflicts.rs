@@ -732,6 +732,15 @@ fn dry_run_matches_real_outcomes_preserves_all_row_images_and_creates_no_missing
 impl Fixture {
     fn seed_collision_note(&self) -> Uuid {
         self.seed(&archive(vec![], vec![]));
+        let seed_config = self.directory.path().join("seed.toml");
+        std::fs::write(
+            &seed_config,
+            format!(
+                "engines = []\n{}",
+                std::fs::read_to_string(&self.config).unwrap()
+            ),
+        )
+        .unwrap();
         let output = self
             .command()
             .args(["exec", "--strict", "--output-format", "json"])
@@ -745,7 +754,7 @@ impl Fixture {
             .arg("--db")
             .arg(&self.db)
             .arg("--config")
-            .arg(&self.config)
+            .arg(&seed_config)
             .output()
             .unwrap();
         assert_success(&output);

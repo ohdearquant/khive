@@ -128,6 +128,15 @@ impl Fixture {
 
     fn register_tool(&self) -> String {
         std::fs::create_dir_all(self.db.parent().unwrap()).unwrap();
+        let seed_config = self.directory.path().join("seed.toml");
+        std::fs::write(
+            &seed_config,
+            format!(
+                "engines = []\n{}",
+                std::fs::read_to_string(&self.config).unwrap()
+            ),
+        )
+        .unwrap();
         let operations = json!([{
             "tool": "tool.register",
             "args": {
@@ -143,7 +152,7 @@ impl Fixture {
             .arg("--db")
             .arg(&self.db)
             .arg("--config")
-            .arg(&self.config)
+            .arg(&seed_config)
             .args(["--namespace", "local"])
             .output()
             .unwrap();
