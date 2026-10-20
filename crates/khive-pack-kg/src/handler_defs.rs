@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (30 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (31 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 31] = [
     HandlerDef {
         name: "kg.proposal_cleanup",
         description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
@@ -86,7 +86,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
     },
     HandlerDef {
         name: "stream.read",
-        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        description: "Read retained entries after an exclusive sequence in ascending order, with floor_seq, head_seq and next_after from the same snapshot. A cursor below the persisted floor resumes at the retained prefix. Unknown streams return an empty page with floor_seq 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -98,12 +98,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 30] = [
     },
     HandlerDef {
         name: "stream.stat",
-        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        description: "Read retained count, persisted floor_seq and head_seq in one snapshot. Head survives whole-prefix truncation; retained density is count = head_seq - floor_seq + 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.truncate",
+        description: "Hard-delete a stream prefix below before_seq in one writer transaction, removing each ledger row and note together. Returns {removed, floor_seq, head_seq}; head and future numbering do not move. Values at or below the floor are no-ops, values above head_seq + 1 are clipped, and unknown streams return {removed:0, floor_seq:1, head_seq:0}. Requires namespace write authority. Retention policy is caller-owned.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "before_seq", param_type: "integer", required: true, description: "Exclusive prefix boundary as a signed 64-bit integer. Values at or below floor_seq remove nothing; values above head_seq + 1 are clipped.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Write namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },
     HandlerDef {

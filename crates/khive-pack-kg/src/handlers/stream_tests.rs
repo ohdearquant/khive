@@ -561,7 +561,7 @@ async fn stream_pagination_unknown_and_after_head() {
                 .dispatch("stream.read", json!({"stream": stream, "after": after}))
                 .await
                 .unwrap(),
-            json!({"entries": [], "head_seq": head, "next_after": null})
+            json!({"entries": [], "head_seq": head, "floor_seq": 1, "next_after": null})
         );
     }
     assert_eq!(
@@ -569,7 +569,7 @@ async fn stream_pagination_unknown_and_after_head() {
             .dispatch("stream.stat", json!({"stream": "pages"}))
             .await
             .unwrap(),
-        json!({"count": 25, "head_seq": 25})
+        json!({"count": 25, "head_seq": 25, "floor_seq": 1})
     );
 }
 
@@ -1704,3 +1704,6 @@ mod batch_cap_tests;
 
 #[path = "stream_batch_fence_budget_tests.rs"]
 mod batch_fence_budget_tests;
+
+#[path = "stream_truncate_tests.rs"]
+mod stream_truncate_tests;

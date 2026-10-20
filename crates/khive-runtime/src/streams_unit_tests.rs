@@ -133,10 +133,10 @@ async fn stream_namespace_isolation_and_real_stat_count() {
     rt.sql().writer().await.unwrap().execute_script("DROP TRIGGER refuse_stream_ledger_update; UPDATE note_streams SET seq=5 WHERE namespace='a';".into()).await.unwrap();
     assert_eq!(
         rt.stream_stat(&a, "same-name").await.unwrap(),
-        json!({"count": 1, "head_seq": 5})
+        json!({"count": 1, "head_seq": 5, "floor_seq": 1})
     );
     assert_eq!(
         rt.stream_stat(&b, "same-name").await.unwrap(),
-        json!({"count": 1, "head_seq": 1})
+        json!({"count": 1, "head_seq": 1, "floor_seq": 1})
     );
 }
