@@ -516,27 +516,31 @@ async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only
             .pool()
             .writer()
             .unwrap()
-            .autocommit(|conn| {
+            .autocommit_sqlite(|conn| {
                 conn.execute_batch(include_str!(
                     "../../../khive-db/sql/schema-migrations-table.sql"
                 ))
-                .unwrap();
-                for migration in khive_db::MIGRATIONS
-                    .iter()
-                    .filter(|migration| migration.version <= 20)
-                {
-                    let tx = conn.unchecked_transaction().unwrap();
-                    tx.execute_batch(migration.up).unwrap();
-                    tx.execute(
-                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
-                (migration.version, migration.name),
-            )
-            .unwrap();
-                    tx.commit().unwrap();
-                }
-                Ok(())
             })
             .unwrap();
+        for migration in khive_db::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 20)
+        {
+            backend
+                .pool()
+                .writer()
+                .unwrap()
+                .transaction(|conn| {
+                    conn.execute_batch(migration.up).unwrap();
+                    conn.execute(
+                        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+                        (migration.version, migration.name),
+                    )
+                    .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
     let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
         .await
