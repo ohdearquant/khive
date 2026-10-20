@@ -110,8 +110,10 @@ mode, and unit ranges. Chain checks preserve `$prev.id` as an unresolved referen
 
 ### Timing boundaries
 
-Each scenario runs one preflight, then prints a `request_call_report` from 1,001
-actual single calls. The median is sorted rank 501. A separate Criterion trend
+Each selected benchmark scenario runs one preflight, then prints one
+`request_call_report` from 1,001 actual single calls. The median is sorted rank
+501. Sampling begins inside Criterion's selected callback, before its timed
+iterations. A separate Criterion trend
 uses 10 samples, a one-second warmup and a three-second measurement target;
 `--quick` selects Criterion quick mode. Only 1,001 durations are retained at once,
 and setup is sequential rather than an accumulating batch of owned fixtures.
@@ -123,6 +125,28 @@ work still consumes wall time. These short-call medians should be compared using
 the same harness and host, and are not interchangeable with historical Criterion
 estimates. Every valid parsing scene must succeed, and expected rejected atomic
 operations must return the full rejection list.
+
+### Listing and correctness-only runs
+
+```bash
+cargo bench -p khive-request --bench request_pipeline -- --list
+cargo bench -p khive-request --bench request_pipeline -- --test
+```
+
+Criterion owns scenario filtering and listing. Listing registers the same 22
+scenario IDs without invoking their measured operations or result checks;
+filtered-out scenes likewise do no operation or report sampling. Small,
+deterministic input fixtures are still constructed during registration.
+
+Correctness-only mode runs one checked call per selected scenario and emits no
+`request_call_report`. This includes `--test` with `--bench`, and direct
+execution without `--bench`, matching Criterion's mode precedence. Arguments
+after `--` are filter text, not mode flags. Planning's parsed expected fixture is
+initialized lazily during its first result check, outside the timed operation.
+Ordinary benchmark runs retain the 1,001-sample report once per selected scene
+and the Criterion timing boundaries above. Explicit `--profile-time` runs skip
+the supplemental report samples, so those samples do not enter the profile.
+No new baseline is claimed.
 
 ## Performance guarantees
 

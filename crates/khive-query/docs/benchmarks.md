@@ -155,10 +155,23 @@ The 15 GQL fixture suffixes exactly reuse the existing inputs:
   `variable_length_with_where`, `three_node_mixed_direction`,
   `node_multi_property_map`, `undirected_edge`.
 
-There are 48 new scenarios. Each prints a `query_call_report` from 1,001 actual
-single calls, with median defined as sorted rank 501. This report follows one
-untimed preflight and precedes a separate Criterion run (10 samples, one-second
-warmup, three-second measurement target; `--quick` selects Criterion quick mode).
+There are 48 new scenarios. In measurement mode (`--bench`, as supplied by
+`cargo bench`), each selected scenario prints one `query_call_report` from
+1,001 actual single calls, with median defined as sorted rank 501. This report
+follows one preflight and runs inside Criterion's first selected callback,
+before `iter_custom` begins recording its iteration timing (10 samples,
+one-second warmup, three-second measurement target; `--quick` selects
+Criterion quick mode).
+
+`--list` and filtered-out scenarios execute no operation, preflight or report
+samples. Test mode (`--test`, or no `--bench`) executes one checked operation
+per selected scenario and emits no supplemental timing report. Profiling
+(`--profile-time`) also omits the supplemental report and preflight, so they do
+not enter Criterion's profiler. Small deterministic strings are still constructed
+while registering the scenarios; GQL fixture parsing is lazy and occurs during
+untimed preparation only when a scenario executes. Listing is not an allocation
+measurement. Benchmark IDs, fixture contents and per-call timing boundaries are
+unchanged.
 Only 1,001 durations are retained at once. Per-call `Instant` overhead is included;
 these short-call observations are advisory and should be compared using the same
 harness and host, rather than treated as interchangeable with the historical
