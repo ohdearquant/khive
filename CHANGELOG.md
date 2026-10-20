@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared
+  dependency-kind defaults to caller-resolved entity kinds without I/O.
 - Writer contention diagnostics now report per-pool FIFO admission depth, its
   high-water mark, capacity rejections and bounded lifetime duration histograms.
   Snapshots identify the FIFO stage and report unavailable call/rotation metrics
