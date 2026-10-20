@@ -1710,7 +1710,7 @@ takes sequence numbers 0 to 12,654 for `comm.heartbeat` and 0 to 25,309 for
 3,796.5 of an exact one in ten. The day falls from 164,793 rows to 32,874 before forced rows, an
 80.05% cut. Forced rows add to that, and each restart starts the sequence again at 0, whose
 first success is always selected. If file growth tracks audit rows, it falls from about 121 MiB a
-day to about 24 MiB a day, less what each kept row's `sampling` object adds. That projection is
+day to about 24 MiB a day, plus what each kept row's `sampling` object adds. That projection is
 conditional, and acceptance arm 12 measures it. Rows already written stay; removing old rows is
 retention's question (ADR-168), not this amendment's.
 
@@ -1748,11 +1748,16 @@ Each arm names the control that must turn it red.
 2. The omitted constant equals exactly the four pairs of item 1 and the sampled constant exactly
    the two entries of item 2, each written out in the test as literals; the two are disjoint, every
    entry resolves to a handler of the named pack, and the precomputed sets equal the constants. A
-   pack registered through `VerbRegistryBuilder::register` that serves `comm.inbox` and
-   `comm.heartbeat` is called 20 times for each and writes 20 success rows of each, and a trusted
-   dispatch of a verb on neither list (`stats`) writes its row with no `sampling` object. Control:
-   adding an entry to either constant fails the literal comparison, and dropping the
-   trusted-registration condition from either set makes the untrusted pack's rows omit or sample.
+   pack named `comm`, registered through `VerbRegistryBuilder::register`, serves `comm.inbox` and
+   `comm.heartbeat`, and its heartbeat returns exactly `{"outcome": "success"}`, the value that
+   does not force. After a test-only reset it is called 20 times for each: it writes 20 success
+   rows of each, none with a `sampling` object; the three counters of item 4 are unchanged for
+   both verbs; and the next trusted `comm.heartbeat` dispatch writes its row with `seq` 0. A
+   trusted dispatch of a verb on neither list (`stats`) writes its row with no `sampling` object.
+   Control: adding an entry to either constant fails the literal comparison, and dropping the
+   trusted-registration condition from either set makes the untrusted pack's rows omit or sample:
+   for `comm.heartbeat`, 4 of the 20 rows are written (numbers 0, 2, 8 and 12) and the next
+   trusted dispatch takes 20.
 3. From a fresh counter (a test-only reset), one hundred serial `Success` dispatches of
    `comm.heartbeat` with a passing result write rows whose `seq` values are exactly 0, 2, 8, 12,
    34, 47, 77 and 90, each with `every = 10` and `selected_by = "sample"`, and
@@ -1762,8 +1767,9 @@ Each arm names the control that must turn it red.
 4. From a fresh counter, eight tasks on a multi-threaded runtime start together at a barrier and
    dispatch `comm.cleanup_expired_quarantine` 1,000 times each with zero results: the numbers taken
    are exactly 0 to 7,999 with no repeat, the written rows are exactly the 775 hash-selected numbers
-   in that range, and `sampled_out` rises by 7,225. Control: a counter that loads, yields to the
-   scheduler and then stores, in place of the fetch-add, turns it red.
+   in that range, and `sampled_out` rises by 7,225. Control: in place of the fetch-add, a counter
+   that loads, waits at a two-task rendezvous so that two tasks hold the same loaded value, and then
+   stores takes a number twice and turns it red.
 5. Forcing, at sequence numbers the hash skips, through an injected trusted result: cleanup results
    with `deleted` = 1, `routed_owners_detached` = 1, either field missing, either field null, either
    field the string `"1"`, -1 or 0.5 each write their row with `selected_by = "forced"` and
@@ -1814,7 +1820,8 @@ Each arm names the control that must turn it red.
     successful samples of each of `comm.inbox`, `comm.probe` and `whoami` each join exactly one
     audit row and report a server duration. Control: with the refusal removed, a `reduced` daemon
     makes every successful sample of those three verbs `no_audit_row`, and a preflight that reads a
-    missing mode as `all` passes the missing-mode case.
+    missing mode as `all` runs against a daemon that reports no mode, so the missing-mode case turns
+    red.
 11. With `KHIVE_AUDIT_SUCCESS_ROWS` unset the mode is `reduced`; an unrecognized value resolves to
     `all` with one warning; the builder option overrides the environment variable in both
     directions; and changing the variable after a registry is built leaves that registry's mode
