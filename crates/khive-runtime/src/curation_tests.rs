@@ -11020,7 +11020,7 @@ async fn merge_fts_insert_matches_canonical_document() {
                         &body,
                         None,
                         properties,
-                        tags,
+                        vec![],
                     )
                     .await
                     .unwrap()
