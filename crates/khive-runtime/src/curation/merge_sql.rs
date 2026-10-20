@@ -528,20 +528,17 @@ pub(super) fn merge_entity_sql(
             _ => merged_name.clone(),
         };
         let kind_str = SubstrateKind::Entity.to_string();
-        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
 
         // `into`'s old FTS row (via the map, not a namespace/subject_id
         // scan), then the new merged row, then the map upsert to the new
         // rowid. No separate map-row delete first: `INSERT OR REPLACE`
         // overwrites it in place (see `delete_document_statement`'s doc
         // comment in khive-db).
-        conn.execute(
-            &format!(
-                "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
-                 AND namespace = ?1 AND subject_id = ?2"
-            ),
-            rusqlite::params![&namespace, &into_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &[khive_db::stores::text::delete_document_statement(
+                &fts_table, &namespace, into_id,
+            )],
         )?;
         conn.execute(
             &format!(
@@ -562,28 +559,19 @@ pub(super) fn merge_entity_sql(
                 &into_entity.kind,
             ],
         )?;
-        conn.execute(
-            &format!(
-                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
-                 VALUES (?1, ?2, last_insert_rowid())"
-            ),
-            rusqlite::params![&namespace, &into_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &[khive_db::stores::text::insert_document_map_statement(
+                &fts_table, &namespace, into_id,
+            )],
         )?;
 
         // `from`'s FTS row is gone for good (merged away, not reinserted) —
         // its map row must be removed too, or it would keep pointing at a
         // rowid the DELETE above already reclaimed.
-        conn.execute(
-            &format!(
-                "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
-                 AND namespace = ?1 AND subject_id = ?2"
-            ),
-            rusqlite::params![&namespace, &from_str],
-        )?;
-        conn.execute(
-            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
-            rusqlite::params![&namespace, &from_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &khive_db::stores::text::delete_document_statements(&fts_table, &namespace, from_id),
         )?;
 
         khive_db::stores::vectors::delete_subject_from_vector_tables(
@@ -1206,18 +1194,14 @@ pub(super) fn merge_note_sql(
                 &due_source,
             ])?;
 
-        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
-
         // `into`'s old FTS row (via the map), then the new merged row, then
         // the map upsert to the new rowid — see `merge_entity_sql`'s matching
         // comment for why no separate map-row delete is needed here.
-        conn.execute(
-            &format!(
-                "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
-                 AND namespace = ?1 AND subject_id = ?2"
-            ),
-            rusqlite::params![&namespace, &into_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &[khive_db::stores::text::delete_document_statement(
+                &fts_table, &namespace, into_id,
+            )],
         )?;
         // Derive FTS scalars through the shared constructor so this raw SQL path
         // is field-identical to TextSearch::upsert_document: critically, `title`
@@ -1250,26 +1234,17 @@ pub(super) fn merge_note_sql(
                 &fts_merged.record_kind,
             ],
         )?;
-        conn.execute(
-            &format!(
-                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
-                 VALUES (?1, ?2, last_insert_rowid())"
-            ),
-            rusqlite::params![&namespace, &into_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &[khive_db::stores::text::insert_document_map_statement(
+                &fts_table, &namespace, into_id,
+            )],
         )?;
 
         // `from`'s FTS row is gone for good — remove its map row too.
-        conn.execute(
-            &format!(
-                "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
-                 AND namespace = ?1 AND subject_id = ?2"
-            ),
-            rusqlite::params![&namespace, &from_str],
-        )?;
-        conn.execute(
-            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
-            rusqlite::params![&namespace, &from_str],
+        khive_db::sql_bridge::execute_statements(
+            conn,
+            &khive_db::stores::text::delete_document_statements(&fts_table, &namespace, from_id),
         )?;
 
         khive_db::stores::vectors::delete_subject_from_vector_tables(
