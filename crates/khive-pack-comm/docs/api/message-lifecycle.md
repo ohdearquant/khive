@@ -866,17 +866,24 @@ Only failure to write that terminal quarantine continues to hold progress.
 When a quarantined inbound message carries `quarantine_content_ref`, ingest
 commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
-alone does not own stored bytes. A duplicate transport id repairs a missing
-attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. The one-release legacy IMAP lookup applies
-those same ownership checks before acknowledging a quarantined replay; the
-old-key note keeps its stored `external_id`; the lookup already matched its
+alone does not own stored bytes. An attachment-free duplicate is acknowledged
+only after matching the namespaced, channel-scoped message identity, including
+the scoped legacy IMAP lookup. It attaches nothing and leaves the stored duplicate
+note unchanged; that receipt does not prove possession of the original or that
+changed replay content, sender, or metadata was stored. Delivered withheld retries
+retain their stricter original-custody requirements described above.
+
+When a replay supplies an original attachment, a duplicate transport id repairs a
+missing attachment only when its stored reference matches the replayed bytes and
+the exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging an attachment-bearing quarantined
+replay; the old-key note keeps its stored `external_id`; the lookup already matched its
 `channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
 restores a missing matching attachment. When that old-key row has no `expires_at`, the
 repair also installs one from replay time plus configured retention, so the row
 that now owns the original bytes is selected by channel cleanup; an existing
-deadline on an old-key row is left as it is. A matching channel-scoped replay also
-installs a missing expiry deadline from replay time plus configured retention
+deadline on an old-key row is left as it is. A matching attachment-bearing
+channel-scoped replay also installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
 or repaired by a replay from a named channel. At boot, the configured backends

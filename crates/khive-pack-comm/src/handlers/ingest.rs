@@ -128,8 +128,12 @@ async fn verify_duplicate_replay(
     .await
 }
 
-/// A duplicate quarantine must prove replay ownership before acknowledgement.
-/// This applies equally to the account key and its one-release legacy IMAP key.
+/// Callers have resolved this duplicate by its namespaced, channel-scoped message
+/// identity, including the scoped legacy IMAP lookup. An attachment-free replay
+/// is acknowledged on that identity alone: this helper attaches nothing and
+/// rewrites nothing. The receipt does not prove changed replay bytes were stored.
+/// Attachment-bearing replays must verify or repair original custody first;
+/// delivered withheld retries use the stricter path in `verify_duplicate_replay`.
 #[allow(clippy::too_many_arguments)]
 async fn repair_duplicate_quarantine(
     runtime: &KhiveRuntime,
