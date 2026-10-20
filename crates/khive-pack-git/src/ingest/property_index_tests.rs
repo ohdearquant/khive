@@ -158,13 +158,15 @@ fn snapshot(rows: &[SqlRow]) -> Value {
 }
 
 fn annotation_count_sql() -> String {
-    let insert = include_str!(concat!(
+    let source = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../khive-db/sql/commit-annotation-insert.sql"
+        "/sql/commit_annotation_source_guard.sql"
     ));
-    let (_, rest) = insert.split_once("AND 1 = (\n").unwrap();
-    let (count, _) = rest.split_once("\n)\nAND EXISTS").unwrap();
-    format!("SELECT ({count}) AS holders").replace("?9", "?2")
+    let (_, rest) = source.split_once("AND 1 = (\n").unwrap();
+    let (count, _) = rest.rsplit_once("\n      )").unwrap();
+    format!("SELECT ({count}) AS holders")
+        .replace("?2", "?1")
+        .replace("?3", "?2")
 }
 
 async fn annotation_count(runtime: &KhiveRuntime, sha: &str) -> i64 {

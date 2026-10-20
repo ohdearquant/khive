@@ -1,7 +1,6 @@
 use chrono::Utc;
 use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, EdgeInsertIfAbsentOutcome,
-    GraphStatementGuard, GraphStatementGuardFailure,
+    EdgeInsertIfAbsentOutcome, GraphStatementGuard, GraphStatementGuardFailure,
 };
 use khive_storage::types::{
     Edge, EdgeUpsertRequest, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, SqlStatement,
@@ -16,8 +15,8 @@ use crate::stores::event;
 
 use super::edge_statements::edge_soft_delete_statement;
 use super::edge_upserts::{
-    conditional_commit_annotation_insert, edge_by_natural_key_including_deleted,
-    edge_by_natural_key_parts_including_deleted, observed_edge_batch_upsert, observed_edge_upsert,
+    edge_by_natural_key_including_deleted, edge_by_natural_key_parts_including_deleted,
+    observed_edge_batch_upsert, observed_edge_upsert,
 };
 use super::guarded_insert::{check_statement_guards, insert_edge_if_absent};
 #[cfg(test)]
@@ -278,10 +277,6 @@ pub enum GraphMutationRequest {
     InsertIfAbsent {
         edge: Edge,
     },
-    CommitAnnotation {
-        edge: Edge,
-        guard: CommitAnnotationGuard,
-    },
 }
 
 /// Internal seam for khive-runtime; no compatibility promise.
@@ -295,7 +290,6 @@ pub enum GraphMutationOutcome {
     /// guard refusals use the top-level arm for every mutation request kind.
     InsertIfAbsent(EdgeInsertIfAbsentOutcome),
     GuardFailed(GraphStatementGuardFailure),
-    CommitAnnotation(CommitAnnotationInsertOutcome),
 }
 
 /// Internal seam for khive-runtime; no compatibility promise.
@@ -314,7 +308,6 @@ pub(super) fn count_graph_mutation_events(outcome: &GraphMutationEventOutcome) {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
         GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
-        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => 0,
     };
     khive_storage::usage::count(
@@ -546,25 +539,11 @@ where
                     .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
             )
         }
-        GraphMutationRequest::CommitAnnotation { edge, guard } => {
-            if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
-                return Err(StorageError::InvalidInput {
-                    capability: StorageCapability::Graph,
-                    operation: GRAPH_MUTATION_EVENTS_OP.into(),
-                    message: "expected a live annotates edge".into(),
-                });
-            }
-            GraphMutationOutcome::CommitAnnotation(
-                conditional_commit_annotation_insert(conn, edge, &guard)
-                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
-            )
-        }
     };
     let written = match &mutation {
         GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
         GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
         GraphMutationOutcome::InsertIfAbsent(EdgeInsertIfAbsentOutcome::Created(_)) => 1,
-        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
         _ => {
             return Ok(GraphMutationEventOutcome {
                 mutation,

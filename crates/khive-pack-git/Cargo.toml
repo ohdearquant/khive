@@ -52,6 +52,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["functions"] }
 khive-db = { version = "0.14.0", path = "../khive-db" }
 khive-pack-blob = { version = "0.14.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full"] }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `khive_storage::graph::CommitAnnotationCursorValue`,
+  `khive_storage::graph::CommitAnnotationGuard`, and
+  `khive_storage::graph::CommitAnnotationInsertOutcome`.
+- `khive_storage::GraphStore::insert_commit_annotation_if_absent` and
+  `khive_runtime::KhiveRuntime::link_commit_annotation_if_absent`.
+  Git reconciliation uses pack-owned predicates and the existing generic
+  create-only graph insertion instead.
+- `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
+  `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
+
 ### Added
 
 - `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared

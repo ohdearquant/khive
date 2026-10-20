@@ -2502,6 +2502,7 @@ dependencies = [
  "khive-types",
  "lattice-embed",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",

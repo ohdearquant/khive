@@ -3,12 +3,11 @@ use khive_storage::{EdgeInsertIfAbsentOutcome, GraphStatementGuard};
 use super::{
     accepted_entity_relations_description, base_entity_rule_allows, canonical_edge_endpoint_kinds,
     canonical_edge_endpoints, compose_graph_mutation_events, merge_dependency_kind,
-    pack_rule_allows, validate_edge_metadata, validate_edge_weight, CommitAnnotationGuard,
-    CommitAnnotationInsertOutcome, Edge, EdgeEndpointKind, EdgeRelation, EdgeUpsertDisposition,
-    EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, Event, EventKind, GraphMutationOutcome,
-    GraphMutationPreconditions, GraphMutationRequest, GuardedEdgeUpsertOutcome,
-    GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken, Resolved, RuntimeError,
-    RuntimeResult, SubstrateKind, Uuid,
+    pack_rule_allows, validate_edge_metadata, validate_edge_weight, Edge, EdgeEndpointKind,
+    EdgeRelation, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    Event, EventKind, GraphMutationOutcome, GraphMutationPreconditions, GraphMutationRequest,
+    GuardedEdgeUpsertOutcome, GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken,
+    Resolved, RuntimeError, RuntimeResult, SubstrateKind, Uuid,
 };
 
 pub(super) fn guarded_link_batch_failure(
@@ -1219,73 +1218,5 @@ impl KhiveRuntime {
                 "create-only link: unexpected composition outcome".into(),
             )),
         }
-    }
-
-    /// Create a historical commit-to-project annotation without replacing a
-    /// curated edge or reviving a tombstone. The store rechecks the exact live
-    /// commit SHA and project under its writer transaction; only a newly
-    /// inserted edge produces the ordinary LinkCreated lifecycle event.
-    pub async fn link_commit_annotation_if_absent(
-        &self,
-        token: &NamespaceToken,
-        commit_id: Uuid,
-        project_id: Uuid,
-        guard: CommitAnnotationGuard,
-    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
-        if !matches!(guard.expected_sha.len(), 40 | 64)
-            || !guard
-                .expected_sha
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(RuntimeError::InvalidInput(
-                "expected full commit SHA".into(),
-            ));
-        }
-        let edge = self
-            .build_edge(
-                token,
-                &LinkSpec {
-                    namespace: None,
-                    source_id: commit_id,
-                    target_id: project_id,
-                    relation: EdgeRelation::Annotates,
-                    weight: 1.0,
-                    metadata: None,
-                    resurrect: false,
-                },
-            )
-            .await?;
-        let attribution = crate::EventAttribution::from_token(token);
-        let outcome = compose_graph_mutation_events(
-            self.backend(),
-            GraphMutationRequest::CommitAnnotation { edge, guard },
-            GraphMutationPreconditions::default(),
-            Vec::new(),
-            move |outcome| match &outcome.mutation {
-                GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(
-                    edge,
-                )) => Ok(vec![Self::link_mutation_event(
-                    &attribution,
-                    &EdgeUpsertResult {
-                        edge: edge.clone(),
-                        disposition: EdgeUpsertDisposition::Created,
-                        previous: None,
-                    },
-                    EdgeEndpointKind::Note,
-                    EdgeEndpointKind::Entity,
-                )]),
-                _ => Err(Self::link_composition_shape_error(
-                    "expected a created annotation",
-                )),
-            },
-        )
-        .await?;
-        let GraphMutationOutcome::CommitAnnotation(result) = outcome.mutation else {
-            return Err(RuntimeError::Internal(
-                "link annotation: unexpected composition outcome".into(),
-            ));
-        };
-        Ok(result)
     }
 }
