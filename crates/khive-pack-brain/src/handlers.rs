@@ -239,7 +239,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.resolve",
-        description: "Show which profile would serve the caller; a named foreign actor must be visible to the caller.",
+        description: "Show which profile would serve the caller; a registered consumer kind without a profile returns matched_binding=false and null profile fields. A named foreign actor must be visible to the caller.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -887,7 +887,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.event_counts" => self.handle_event_counts(token, params).await,
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,
-            "brain.resolve" => self.handle_resolve(token, params).await,
+            "brain.resolve" => self.handle_resolve(token, params, registry).await,
             "brain.bindings" => self.handle_bindings(token, params).await,
             // Commissive
             "brain.activate" => self.handle_activate(token, params).await,

@@ -48,6 +48,14 @@ system-default fallback for `consumer_kind="recall"` when no explicit binding ma
 `brain.bind` consumer kinds must appear in the loaded registry's composed
 `BRAIN_CONSUMER_KINDS`; `"*"` remains the explicit wildcard.
 
+When a consumer kind is declared by the loaded registry but has no eligible profile,
+`brain.resolve` succeeds with `matched_binding=false`, echoes `requested_consumer_kind`,
+and returns `null` for `resolved_profile_id`, `matched_consumer_kind`, and `lifecycle`.
+This is normal absence: recall and composition can use their pack-local tuning prior
+without recording a failed nested resolution. Existing binding and fallback matches
+retain their profile fields. An unmatched consumer kind absent from the registry still
+returns `NotFound`; caller authorization and malformed-parameter refusals are unchanged.
+
 **Event interpretation** (`event::interpret`): The `brain.feedback` verb is the
 `FeedbackExplicit` event emitter. Legacy rows whose canonical event verb is `brain.emit` predate
 this design and are treated as `Irrelevant` to avoid spurious updates during event replay.
