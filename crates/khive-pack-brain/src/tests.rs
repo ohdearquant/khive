@@ -3,6 +3,7 @@
 mod receipt_credentials;
 
 mod auto_feedback_unjudged;
+mod resolve_absence_tests;
 
 use super::*;
 use khive_runtime::{

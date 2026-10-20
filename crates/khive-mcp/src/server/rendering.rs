@@ -842,7 +842,7 @@ pub(super) fn build_instructions(loaded: &str, unloaded: &str) -> String {
     } else {
         format!(
             " Also linked into this binary but not loaded here, so their verbs are \
-             absent from the catalog below until selected: {unloaded}."
+             absent from the `request` tool's verb list until selected: {unloaded}."
         )
     };
     format!(

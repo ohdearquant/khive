@@ -527,6 +527,7 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -561,6 +562,18 @@ impl BrainPack {
                 "matched_consumer_kind": matched_kind,
                 "matched_binding": matched_binding,
             })),
+            None if registry
+                .all_brain_consumer_kinds()
+                .contains(&p.consumer_kind.as_str()) =>
+            {
+                Ok(json!({
+                    "resolved_profile_id": null,
+                    "lifecycle": null,
+                    "requested_consumer_kind": p.consumer_kind,
+                    "matched_consumer_kind": null,
+                    "matched_binding": false,
+                }))
+            }
             None => Err(RuntimeError::NotFound(format!(
                 "no profile resolved for consumer_kind={:?}",
                 p.consumer_kind
