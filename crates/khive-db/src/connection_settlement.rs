@@ -2,6 +2,12 @@ use crate::error::SqliteError;
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::Connection;
 
+/// Execute ROLLBACK and require autocommit before the caller reports settlement.
+/// A native rollback error is failed proof even if SQLite already auto-rolled back.
+pub(crate) fn rollback_proves_autocommit(conn: &Connection) -> bool {
+    conn.execute_batch("ROLLBACK").is_ok() && conn.is_autocommit()
+}
+
 /// The caller owns this connection and retains its physical-volume lease.
 /// Clearing an authorizer is permitted only after the connection is retired.
 ///

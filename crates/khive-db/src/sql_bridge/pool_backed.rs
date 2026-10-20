@@ -579,8 +579,10 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                 match result {
                     Ok(total) => {
                         if let Err(e) = guard.conn().execute_batch("COMMIT") {
-                            let unsettled = guard.conn().execute_batch("ROLLBACK").is_err()
-                                || !guard.conn().is_autocommit();
+                            let unsettled =
+                                !crate::connection_settlement::rollback_proves_autocommit(
+                                    guard.conn(),
+                                );
                             let error = map_write_boundary_err(
                                 e,
                                 "pool_writer.execute_batch",
@@ -596,8 +598,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                         }
                     }
                     Err(e) => {
-                        let unsettled = guard.conn().execute_batch("ROLLBACK").is_err()
-                            || !guard.conn().is_autocommit();
+                        let unsettled =
+                            !crate::connection_settlement::rollback_proves_autocommit(guard.conn());
                         Err(if unsettled {
                             crate::error::unknown_write_settlement(e)
                         } else {
