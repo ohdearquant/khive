@@ -709,9 +709,18 @@ excluded list. Its failure message names the tables without a rule.
 ## Amendment 4 (2026-10-04): edge relation routes
 
 **Status: accepted (2026-10-19).** Refs #4038. Accepted on its own acceptance arm: the
-`namespace_move::edge_tests` fixtures for every bullet below pass on main as of 2026-10-19, and
-each of the five mutation controls in the seventh and ninth bullets made its unchanged fixture
-fail on main as of 2026-10-19 and pass again after exact restoration.
+`namespace_move::edge_tests` fixtures named under Acceptance below pass at main commit `972d8861`,
+run with the `khive-db` `vectors` feature (`cargo test -p khive-db --features vectors`); without
+that feature the vector fixture `edge_vectors_follow_the_resolved_relation_not_both_matching_routes`
+is not compiled. Each of the five mutation controls that the seventh and ninth Acceptance bullets
+require was applied alone to that commit and turned its unchanged fixture red after valid setup, at
+the move under test or an assertion on its result, and the fixture passed again once the mutation
+was removed: removing the edge route predicate, skipping collision preflight, removing relation
+filtering from the edge update, removing per-relation preflight, and removing fallback exclusion
+from the vector selector. #5761, merged after that run, gives the vector fixture two vector kinds
+and two fields and records its own two mutation checks (a kind filter and a field filter on the edge
+vector selector); the fallback-exclusion control above was run against the fixture as it stood at
+`972d8861`.
 
 This route grammar serves relation-specific namespace moves in #4038, whose acceptance requires
 exact relation routes with an order-independent bare-edge fallback, refusal of unrouted relations
