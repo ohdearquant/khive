@@ -37,12 +37,7 @@ use super::common::{
 };
 
 fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (true, true) => std::cmp::Ordering::Equal,
-        (false, false) => right.total_cmp(&left),
-    }
+    khive_score::cmp_desc_then_id_f32(left, &(), right, &())
 }
 
 fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, RuntimeError> {

@@ -20,15 +20,19 @@ pub enum Scene {
     Ingest,
     Cleanup,
     Cursor,
+    CursorGet,
+    CursorCommit,
     MarkRead,
     Suppression,
 }
 
 impl Scene {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Ingest,
         Self::Cleanup,
         Self::Cursor,
+        Self::CursorGet,
+        Self::CursorCommit,
         Self::MarkRead,
         Self::Suppression,
     ];
@@ -38,6 +42,8 @@ impl Scene {
             Self::Ingest => "ingest",
             Self::Cleanup => "cleanup_expired_quarantine/100",
             Self::Cursor => "cursor_get_commit",
+            Self::CursorGet => "cursor_get",
+            Self::CursorCommit => "cursor_commit",
             Self::MarkRead => "mark_read/200",
             Self::Suppression => "suppression_list/100",
         }
@@ -48,6 +54,8 @@ impl Scene {
             Self::Ingest => "one fresh inbound ingest dispatch",
             Self::Cleanup => "one cleanup dispatch deleting 100 expired quarantines",
             Self::Cursor => "one get plus one commit dispatch",
+            Self::CursorGet => "one get dispatch",
+            Self::CursorCommit => "one commit dispatch",
             Self::MarkRead => "one default non-atomic dispatch marking 200 messages",
             Self::Suppression => "one list dispatch returning 100 entries",
         }
@@ -96,6 +104,19 @@ impl Prepared {
                 check_cursor(&initial, 100);
                 second = Some(("comm.cursor_commit", cursor_commit(101)));
                 ("comm.cursor_get", cursor_key())
+            }
+            Scene::CursorGet | Scene::CursorCommit => {
+                let initial = fixture
+                    .registry
+                    .dispatch("comm.cursor_commit", cursor_commit(100))
+                    .await
+                    .expect("seed one cursor row");
+                check_cursor(&initial, 100);
+                if matches!(scene, Scene::CursorGet) {
+                    ("comm.cursor_get", cursor_key())
+                } else {
+                    ("comm.cursor_commit", cursor_commit(101))
+                }
             }
             Scene::MarkRead => {
                 ids = fixture.seed(200, false).await.0;
@@ -181,6 +202,21 @@ impl Prepared {
                     .await
                     .expect("read committed cursor");
                 assert_eq!(&stored, second.as_ref().unwrap());
+            }
+            Scene::CursorGet | Scene::CursorCommit => {
+                let high_water = if matches!(self.scene, Scene::CursorGet) {
+                    100
+                } else {
+                    101
+                };
+                check_cursor(first, high_water);
+                let stored = self
+                    .fixture
+                    .registry
+                    .dispatch("comm.cursor_get", cursor_key())
+                    .await
+                    .expect("read persisted cursor");
+                assert_eq!(&stored, first);
             }
             Scene::MarkRead => {
                 assert_eq!(first["status"], "success", "{first}");
