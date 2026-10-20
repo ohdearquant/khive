@@ -1172,3 +1172,481 @@ Backfill version 1 makes that window explicit:
 - Changing which append classes the sidecar receives.
 - Archival in daemonless embedded mode.
 - Coordinating archival with edges stored in other backends.
+
+## Amendment (proposed): expendable polling dispatch audits and a capacity bound for the events sidecar (2026-10-20)
+
+**Status**: proposed. Acceptance is required before dependent implementation merges.
+
+### Context and scope
+
+The idempotent audit-batch lane introduced by ADR-170 accumulates high-volume dispatch receipts for
+recurrent mailbox, channel-maintenance and identity checks. A seven-day recent receipt window is
+useful for debugging and accounting; retaining every such payload permanently is not required for
+reconstruction of mailbox, channel or training state.
+
+This amendment adds an `expendable` retention class for the six exact `(kind="audit", verb)` keys
+below. It permits removal of eligible payloads without sealed copies. It does not permit sampling,
+change the audit obligation at dispatch time, or remove any feedback, phase, channel-lifecycle,
+schedule-provenance or moodboard record. It applies to both halves of the split event plane,
+including historical generic dispatch audits in the main file.
+
+ADR-103 Amendment 7 (proposed) is the write-time half of the same problem and is a separate
+decision. In its `reduced` mode four of the six verbs write no row for a successful dispatch, and
+the other two write the row of a hash-selected one in ten successful calls plus every call whose
+result reports a change or a failed poll. Every non-success outcome of all six keeps its row. That
+amendment reduces growth and deletes nothing. This amendment governs the rows that remain under the
+six keys: rows written before that amendment's reduced mode, rows written in its `all` mode, the
+sampled and forced rows it keeps, and every non-success row. The two are independent: either may
+land first, and neither changes the other's predicate.
+
+The capacity metric is `size(events database file) + size(events WAL)`. It excludes the domain
+database, shared-memory file, archives and temporary maintenance files, but maintenance must still
+have sufficient physical disk space for all of them. The bound on that metric is operator
+configuration (§6). Seven-day pruning alone does not hold the metric under any fixed value: other
+classes keep growing, and so does the compact identity state this amendment adds. The bound is a
+disk-pressure signal with a defined response, not a correctness line, and reaching it does not stop
+the deployment.
+
+**What this amendment decides against the base ADR, stated once.** This amendment is the separate,
+independently reviewed decision that §2 requires for moving a row to a weaker class. For the six
+keys only, it moves them from `age_archivable` (Table A row 1) to `expendable`, which is weaker
+because it keeps no sealed copy, and it carries its own contract for rows already written under the
+stronger class (§4 below). For the same six keys it also makes the following departures, and no
+others:
+
+- it adds a fourth value to §1's closed vocabulary;
+- it is the narrow exception to §3's sealed-copy rule and to the base's rejection of delete-only
+  retention;
+- it fixes the horizon at seven days for this policy instead of taking it from §4's configuration;
+- it fixes the expendable pass's cadence (at least hourly), departing from the non-goal "no
+  automatic scheduling policy" for this pass only;
+- it makes one availability decision, the response to the configured capacity bound (§6), departing
+  from the non-goal "no durability or availability decision" for that response only;
+- it is the narrow exception to §9 for the historical cohort named in §4 below.
+
+§3, §4, §9 and the non-goals stand unchanged for every other class, for sealed archival, and for the
+remainder of Table A row 1.
+
+### 1. Closed class assignment
+
+| Exact verb, with kind `audit`     | Reported rows on 2026-10-19 UTC | Reason for this assignment                                                                                                                                  |
+| --------------------------------- | ------------------------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.inbox`                      |                          35,460 | Repeated mailbox listing/wait checks; message state is stored independently of the generic dispatch receipt.                                                |
+| `comm.cleanup_expired_quarantine` |                          25,310 | Recurrent bounded channel cleanup. The receipt is expendable; the cleanup's domain mutations and any independent events are not.                            |
+| `whoami`                          |                          25,029 | Repeated principal/build/namespace checks. This also covers interactive calls to the same verb; classification is by exact key, not inferred caller intent. |
+| `comm.probe`                      |                          24,656 | Explicit read-only mailbox polling interface.                                                                                                               |
+| `comm.cursor_get`                 |                          12,655 | Channel poll checkpoint reads. The persisted checkpoint is separate state.                                                                                  |
+| `comm.heartbeat`                  |                          12,655 | Receipt of the per-poll health update; the health record remains domain state.                                                                              |
+
+The total is 135,765 of 164,793 reported Audit rows, 82.3852%, measured before ADR-103 Amendment 7.
+These operational measurements motivate the assignment but are not classifier inputs or guaranteed
+byte savings.
+
+No other key is included. In particular `knowledge.get`, `gtd.tasks`, `channel.poll_lifecycle`,
+every phase kind and `feedback_explicit` are excluded. Case folding, alias expansion after storage,
+prefixes, regular expressions, caller-supplied lists and configurable verb additions are prohibited.
+The predicate compares the persisted canonical verb exactly and always also requires `kind="audit"`.
+
+This extends §1's vocabulary to four values and carves Table A row 1 into this closed subset and its
+unchanged `age_archivable` remainder. The most protective class still wins for a shared
+`(kind, verb)` key: pinned, aggregate-required, age-archivable, then expendable. This amendment does
+not relax protection for any shared or provisional key. A new emitter of an allowlisted key must
+fail the emitter-census acceptance test until independently reviewed; it may not inherit
+expendability merely because its verb matches.
+
+At construction, the generic dispatch producer records an additive payload object:
+
+`retention = {"class":"expendable", "policy":"poll-dispatch-v1", "horizon_seconds":604800}`.
+
+This object is immutable with the event and does not redefine existing payload fields or
+schema-version meanings. The runtime computes it; user parameters cannot supply or override it.
+Assignment happens before batch admission and the same stamped event is reused on every retry. It is
+not synthesized at query time. A stamped row still must match the exact kind/key and
+generic-producer contract before pruning; a stamp alone never authorizes deletion. Unrecognized
+policy versions, malformed stamps, aggregate-bearing records, and conflicting classification retain
+the row and report the reason.
+
+This policy covers success, denied and error outcomes of the selected generic dispatch keys,
+including the sampled and forced rows that ADR-103 Amendment 7 keeps. That choice expires old
+failure diagnostics too; retaining a subset of outcomes would require another version and a revised
+capacity model. A row's `resource.sampling` object is neither a classifier input nor a reason to
+retain the row, and pruning a sampled row removes its sampling evidence with it.
+
+### 2. Horizon, execution and preservation
+
+The horizon is **fixed at 604,800 seconds (seven 24-hour days)** for this policy. It is not
+inherited from §4's unset/off archival configuration. The operator explicitly activates the policy
+at rollout; activation and its timestamp are durable. Once active, maintenance evaluates eligibility
+at least hourly, with bounded batches. The fixed cutoff for a run is
+`run_started_at_utc - 604800 seconds`; only `created_at < cutoff` qualifies. Equality is retained.
+No shorter horizon or broader list is a supported tuning knob. Failure to execute on schedule raises
+an alarm; it does not authorize early deletion.
+
+Remove only the selected event and that event's persisted observation rows in its own half,
+transactionally. A row with a live or soft-deleted graph edge naming it in the same backend is
+retained. An unresolved classification or reference check retains the row. This is a protection
+exception to age eligibility, so protected backlog is reported separately. Neither a future
+timestamp nor missing metadata is interpreted as permission to delete.
+
+The generic Audit decoder currently creates no observations, but that does not authorize an
+assumption that historical persisted observations are empty. The selection record includes the
+actual persisted observations. Unknown observation content or a classification inconsistency refuses
+that row pending review. Every other event and observation remains byte-for-byte unchanged.
+
+There is **no sealed copy of expended payloads**, no restore path for them, and no claim that the
+whole plane remains information-preserving for this class. The reason is a product decision to limit
+detailed polling receipts to the recent window. The readers of these rows are `brain.event_counts`,
+grouped event counts, `brain.event_page`, event list/get, benchmark request-to-duration joins, audit
+retry comparison, and event-ID references. `brain.events` was inspected and is not one of them: its
+fixed verb filter names none of the six verbs. Each reader's post-expiration behavior is specified
+below; absence of readers is not the justification.
+
+### 3. Event identity, references and disclosed expiration
+
+The payload is expendable; the fact that an event ID was used is not silently erased. Pruning
+retains compact permanent **expended-ID records** with event ID, policy/classifier version,
+namespace/verb needed for scoped disclosure, removal time and run identity. They are not ordinary
+events, are not fed to observation decoding or counted as dispatches, and never claim that an
+archive exists. Their physical cost and continuing growth are included in capacity accounting.
+
+Use the October 17 amendment's two-half reservation ordering for these IDs, adapted to an expended
+disposition rather than an archive segment. Before deletion in half A, half B durably reserves each
+selected ID and refuses if it has a live copy. The source-half transaction records the expended
+disposition and removes exactly its verified selected rows together. Every event insertion path in
+each half checks its local reservation record in the same statement/transaction; a separate
+preflight lookup is insufficient. This includes embedded writes and caller-owned SQL transactions,
+not just the events socket.
+
+The main writer orders reference validation and reservations against every graph-edge
+insert/upsert/resurrection/endpoint change, as in the October 17 amendment. Selection and final
+main-side reservation recheck both reject selected IDs used by a live or soft-deleted edge. A later
+same-backend edge write cannot bypass the reservation. Edges held by another backend are not
+discoverable by these checks; as in the October 17 amendment, their eventual target may resolve to a
+typed non-live result. Here that result is Expended and has no recoverable payload. This limitation
+must be documented for reference holders.
+
+Live rows resolve before reservation/expended records. A completed deletion returns a typed
+**Expended** result to trait and public by-ID resolution, carrying the event ID, policy and removal
+evidence; it is distinct from unknown ID and Archived. Query/count/list/page surfaces report
+retention coverage when the requested kind/time scope can include expended polling receipts. A broad
+query must not call its retained-row total a full historical dispatch count. Counts over retained
+rows stay integer/exact; no extrapolation or zero-fill is added. Queries scoped exclusively to
+non-expendable kinds gain no retention fields from this policy, preserving their existing serialized
+response shape.
+
+The idempotent batch gains an **Expended** per-item disposition: the ID is reserved and no row is
+inserted, but column equality is not asserted. The split probe, both leaf stores, daemon wire and
+audit flusher carry it. It is terminal, not retried and not reported as AlreadyPresentIdentical.
+Ordinary appends to a reserved ID refuse with a typed error. Old peers that do not understand the
+disposition are refused by protocol negotiation before writing. Delayed retries must never resurrect
+pruned rows in either half.
+
+A run interrupted after reservation but before deletion leaves the live row readable and the
+reservation protective. Recovery may complete the guarded delete or release the reservation only
+after source-half durable evidence proves no deletion committed and fences delayed prune requests.
+Use the October 17 release/retirement ordering, keyed by immutable prune-batch identity instead of
+segment identity. A timeout, process death or lost reply is not proof of non-execution. No
+permanently expended ID is released for reuse.
+
+### 4. Historical population and one-time migration
+
+The historical classifier is **`poll-dispatch-legacy-v1`**, distinct from `backfill-v1`. It reaches
+only this amendment's six keys. A candidate must have kind Audit; exact allowlisted verb; generic
+dispatch envelope with `gate_impl` string, `decision` in `allow`, `deny`, `gate_unavailable`, and
+payload `verb` equal to row `verb`; no aggregate identity; and no contrary dedicated-emitter
+evidence. A row carrying ADR-103 Amendment 7's `resource.sampling` object is a generic dispatch
+envelope and is classified by the same predicate. It inherits the conservative shared-key exclusions
+of October 17, which do not overlap this list. Ambiguous or malformed rows remain grandfathered.
+
+At an explicit, writer-quiesced rollout boundary, capture the pre-policy population in each half and
+classify it once. Record immutable per-ID historical assignments outside the Event payload; do not
+rewrite old events as if they carried a write-time stamp. Assignments include the classifier version
+and rollout/run identity. Old eligible rows can be pruned immediately; correctly classified rows
+younger than seven days acquire age eligibility later under the same assignment. Rows excluded from
+that captured population are never retrospectively swept by a loose timestamp predicate. Late
+unstamped writes from an old producer fail rollout admission rather than silently entering a new
+historical cohort.
+
+An operator first reviews counts by half, verb, age bucket and exclusion reason under a fixed
+candidate-set digest. Mutation is a separate explicitly authorized phase using that same versioned
+cohort, with final predicate/reference rechecks. Before deletion, aborting leaves event and
+observation bytes intact and can discard unused assignment state through a recorded rollback. After
+deletion there is no payload rollback; expended-ID and run records are permanent evidence. The lack
+of a sealed copy is authorized here, not by reinterpreting `backfill-v1`.
+
+This is the narrow exception to §9 for the named historical cohort. Every other pre-existing row
+stays under §9. In particular, this does not make phase events eligible merely because Table A calls
+them age-archivable.
+
+### 5. Run evidence and composition with sealed archival
+
+Each run has an immutable ID, caller or maintenance principal, policy/classifier revision and
+literal allowlist digest, activation/cohort identity, fixed cutoff, selected counts by half/verb,
+excluded counts/reasons, and candidate-set digest. A run's authorization and attempt record are
+durable in the main event plane before any reservation or delete. If that append fails, the run has
+no destructive effect.
+
+Use a distinct typed Audit payload under exact maintenance verb `events.prune_poll_audits`, schema
+version 1, outside the expendable list. Its dimensions:
+
+- **Attribution.** The caller or maintenance principal that started the run.
+- **Additivity.** Additive under ADR-162 §3: fields are added, never removed or redefined.
+- **Sink.** `caller_event_store`, in the main half.
+- **Write posture.** Attempt rows are preconditions, appended before any reservation or delete;
+  completion rows are outcome records, appended after it.
+- **Retention.** Class `pinned_while_referenced`. The referent of every row of a run, attempt or
+  completion, is the run's expended set: the expended-ID records and source-half batch receipts that
+  name the run's ID. That set is permanent, because no expended ID is released (§3), so the class
+  has no terminal condition and these rows are retained indefinitely by the referent's own
+  permanence. A run that expended nothing, a refused run and a run with unresolved evidence are
+  retained the same way. The class covers every row written under the key
+  `(Audit, events.prune_poll_audits)`, including a generic dispatch receipt for the same verb if one
+  is produced, by the base's most-protective rule for a shared key. A run writes an attempt row and
+  a completion row, so the required hourly cadence adds about 48 rows a day; they count toward the
+  capacity metric like any other rows.
+
+A completion records per-half committed batch IDs/counts, actual observed bytes/page/freelist/mode
+before and after, verification result, failures and excluded backlog. It must not equate
+payload-byte estimates with file bytes reclaimed.
+
+Each source-half delete transaction also stores a durable batch receipt with selected-ID digest,
+count, policy and cutoff, atomically with expended records and removal. This resolves a crash after
+commit but before main completion. Missing completion means outcome unrecorded, never success.
+Recovery reads those receipts and reservations, appends its recovery outcome, and refuses ambiguous
+evidence. It does not re-run an unbounded age delete. A completion append failure is reported to the
+caller and host error log; committed destruction is not concealed.
+
+Sealed archival remains the route for the remainder of Table A row 1 and all other classes governed
+by the base ADR. This amendment does not activate or require copy/seal/segment lifecycle for
+expendable payloads. Both halves remain in population, and each is mutated by its existing writer;
+no second resident SQLite writer is added.
+
+If the October 17 machinery is implemented too, its eligibility excludes this policy's
+marked/assigned rows and reserved IDs. A shared reservation check prevents concurrent archival and
+expenditure of the same ID; encountering the other operation's reservation refuses the run. An
+already archived event stays Archived and is not converted to Expended. Pending reservations are
+resolved before switching mechanisms. The two classifiers keep their distinct meanings and
+histories.
+
+### 6. Physical reclaim and the capacity bound
+
+The release must measure the actual sidecar mode; it must not infer INCREMENTAL from an ADR or a
+newly created test database. Existing sidecars may be NONE. The current implementation provides no
+incremental drain.
+
+For an existing NONE sidecar, conversion is an explicit exclusive maintenance operation, after
+paired main/sidecar backup and verified writer quiescence, using SQLite's `auto_vacuum=INCREMENTAL`
+plus the required full VACUUM. It is not a startup migration. The initial implementation must
+support a stopped conversion that first checkpoints through SQLite, verifies no competing
+connections, uses rollback-journal mode for the rebuild where required to avoid duplicating live
+data into the counted WAL, restores WAL, and verifies mode 2 and database integrity before serving.
+This is a proposed maintenance path, and its exact peak/disk behavior must pass the scratch
+acceptance arm before rollout. Temporary-file and rollback-journal disk capacity is checked
+separately.
+
+After conversion, the events owner runs bounded incremental-vacuum slices, using ADR-204's specified
+mechanics: a typed positive page bound of at most 1,024 pages per slice, step to SQLITE_DONE, zero
+busy timeout for a slice with restoration afterward, at most one slice per 500 ms tick, and only
+after a fully backfilled WAL observation. Checkpoint between slices. Arm the drain after a committed
+prune. Run it off the async worker. Provision this owner explicitly in the events daemon; main-only
+checkpoint/FTS wiring does not satisfy it. New sidecars set INCREMENTAL before their first WAL
+transition. Existing main files processed by the migration receive their own measured-mode reclaim
+procedure through their owner.
+
+Use ADR-204's 5%/4,096-page start and 1%/1,024-page floor as routine defaults. Capacity recovery may
+request bounded drain slices below the routine start threshold, but never bypass WAL/backfill/space
+guards or the positive bound. Completion reports measured combined bytes, not just freelist
+improvement. Pinned readers, a busy writer or a mode mismatch cause a visible failure or skip, not
+an unbounded vacuum or a falsely reported shrink.
+
+**The capacity bound.** The bound `B` is operator configuration, in bytes, over the capacity metric.
+Unset means no bound is applied; measurement and reporting still run. `B` covers **all** sidecar
+writes, including non-allowlisted audits, config-lock records, identity metadata, migration and
+maintenance traffic, embedded writers and concurrent admitted batches.
+
+Reaching `B` does not refuse ordinary writes and does not stop the deployment. Refusing writes at
+the bound would stop every caller whose dispatch carries an audit obligation, which costs more than
+the growth it prevents. Instead, the events owner:
+
+1. raises a durable capacity alarm, recorded on the next run's completion and in the host error log,
+   with the measured metric, `B`, the protected backlog and the eligible backlog;
+2. starts capacity recovery: prune runs continue on schedule, and the drain may run bounded slices
+   below its routine start threshold;
+3. refuses to start any maintenance operation whose demonstrated worst-case peak does not fit under
+   `B` together with the free disk that operation needs.
+
+What follows is the operator's decision, made on the reported numbers. Nothing in this amendment
+shortens the horizon, widens the list, deletes another event class, reroutes audits into the main
+file, truncates a database file with filesystem tools or silently drops an obligation-bearing row to
+get back under `B`. The original dispatch/audit failure contract still applies.
+
+**Maintenance admission.** Every maintenance operation that can grow the counted files (conversion,
+drain, historical migration and each prune run) reserves a conservative worst-case growth budget
+before it starts, including index/page overhead, journal or WAL growth and checkpoint growth. The
+budget must be a demonstrated upper bound from the operation's storage and write limits, not a
+per-row byte estimate times a row count. An operation whose bound cannot be established is refused.
+Reservations serialize across all processes that can write the file. A stat-after-write check,
+`max_page_count` alone, or a WAL-only ceiling does not establish the bound. A WAL-mode conversion is
+refused unless its worst-case combined-file peak fits.
+
+The release reports measured daily combined-file growth and growth of protected backlog and
+expended-ID state. The planning proxy, which assumes file bytes track audit rows, is 118–121 MiB/day
+before either amendment. About 21 MiB/day of that comes from rows outside the six keys and is
+unaffected by both. With ADR-103 Amendment 7 in `reduced` mode, the six keys write about 3,846
+rows/day on the 2026-10-19 counts plus forced rows, about 2.8 MiB/day by the same proxy; this
+amendment then holds them to a seven-day live window. Expended-ID records grow by one per expended
+row and are permanent; the release measures their size. No plateau of the whole sidecar is promised.
+A later residual-class policy may extend service time.
+
+### 7. Before implementation
+
+Until this amendment is implemented and its acceptance passes, nothing is deleted from either half
+under it. No interim hard delete is authorized, no ad hoc SQL purge, no deletion or truncation of a
+store file, and no stop of the events-producing deployment because of file size. Before then, growth
+is controlled at write time by ADR-103 Amendment 7. A deployment that reaches its configured bound
+first is an operator decision made on measured numbers, and this amendment authorizes no deletion
+for that case.
+
+The historical migration in §4 runs only after acceptance of this text and verification of the
+maintenance procedure above, with the reviewed cohort, reference and identity reservations,
+mandatory run evidence, training-count checks and physical reclaim procedure. Urgency does not waive
+any of them.
+
+### 8. Acceptance arms
+
+1. **Exact training invariance.** On a frozen, quiescent paired scratch store, capture the complete
+   serialized `brain.event_counts` result with explicit RFC3339 `since` and `until`, identical
+   namespace/actor scope, separately for `feedback_explicit`, `phase_started`, `phase_completed` and
+   `phase_cancelled`. Include old and recent rows, mixed actors/namespaces and same-timestamp ties.
+   Before anything runs, check the baseline against an independent oracle: the expected count for
+   each training kind is computed from the seed fixture itself, is nonzero, and must equal the
+   captured response, so that an empty or zero baseline cannot make the identity check pass
+   vacuously. Run migration, prune and reclaim. Repeat the identical calls: response bytes must be
+   identical, without removing fields from the comparison. Exercise exhaustive and bounded modes
+   with nontruncated populations; separately verify that existing limit refusals remain refusals.
+   Also compare the persisted training rows/observations byte-for-byte. An unfiltered whole-plane
+   result is not the invariant, because its Audit total must change.
+2. **Independent closed-list oracle.** Seed every allowed key, `knowledge.get`, `gtd.tasks`, another
+   generic non-allowlisted Audit verb, schedule/moodboard dedicated Audit keys, all training kinds
+   carrying even allowlisted verb strings, and malformed/stamped impostors. Only fully eligible
+   allowed generic Audit rows disappear. The expected six literals are owned by the test oracle, not
+   imported from the production classifier. A must-fail mutation that widens the production
+   allowlist and corresponding stamp assignment makes the non-allowlisted-survival arm red. Removing
+   the kind guard makes the training arm red.
+3. **Exact matching, time boundary and schedule.** `comm.inbox.extra`, `comm.inbox_preview`, a
+   differently cased spelling, and other same-prefix verbs survive. Test one microsecond before
+   cutoff, equality, one microsecond after, missing/future timestamps and bad metadata. Only the
+   strictly older valid rows qualify. Default/unset archival config does not disable an explicitly
+   active policy; an inactive rollout changes no rows. With a controlled clock, an active policy
+   starts a run within every hour; a run withheld past its hour raises the alarm at the next
+   evaluation and deletes nothing that is not yet eligible; each run's cutoff is computed from that
+   run's own start time. A mutation that drops the scheduler makes the alarm arm red.
+4. **Reader honesty.** Recent retained counts and costs equal an independently enumerated row
+   oracle. Mixed/old polling queries disclose retention incompleteness across count/list/page/brain
+   reads. By-ID results distinguish live, unknown, Archived and Expended. A per-request latency join
+   returns the retained duration before expiration and unavailable afterward; it never invents a
+   duration.
+5. **Both halves, identity races and settlement.** Seed identical-ID conflict cases, retries of
+   main-resident historical rows, sidecar rows, and observations. Race late appends, reservations,
+   same-backend edge writes, pruning and release; inject crashes before/after every durable boundary
+   and lose replies. No pruned ID is reinserted in either half; no falsely identical acknowledgement
+   is returned. Existing referenced candidates survive. Unknown peers refuse before writes. Exercise
+   embedded insertion paths too. Through the production paths (audit flusher, daemon wire, split
+   probe and both leaf stores), a retried batch item whose ID is reserved settles Expended exactly
+   once, inserts nothing, is not retried, and is not reported as AlreadyPresentIdentical. No
+   moodboard implementation change is necessary for its rows to survive.
+6. **Historical migration safety.** Review a dry-run cohort/digest, then mutate a candidate
+   reference or payload before prune. The final guard retains/refuses it; it does not delete an
+   unchecked substitution. Young classified legacy rows remain until seven days;
+   malformed/unclassified rows stay. A row carrying a `resource.sampling` object is classified like
+   any other generic dispatch row. An old producer cannot add new unstamped rows after activation.
+   Rollback before delete preserves row/observation bytes; recovery after delete uses committed
+   receipts and cannot recreate payloads.
+7. **Physical, peak and drain evidence.** On representative scratch copies in both NONE and
+   INCREMENTAL modes, report file bytes, WAL bytes, their sum, mode, page size/count and freelist
+   before delete, after delete, during conversion/drain and after final checkpoint. Delete-alone is
+   a negative control and must not be credited as shrink. Verify actual shrink when reclaimable
+   pages exist, including WAL allocation, identity-index bytes and conversion temporary-space
+   demand. Inspect database integrity and surviving row hashes after reopen. ADR-204's acceptance
+   arms 2 to 4 apply unchanged to the events sidecar's drain. In addition: each slice releases at
+   most 1,024 pages and exactly its page count, measured as the change in freelist count; the slice
+   statement is stepped to SQLITE_DONE; at most one slice runs per 500 ms tick; the slice runs with
+   zero busy timeout and the connection's previous busy timeout is restored after it; no slice runs
+   while the WAL is above its backfill point; the drain runs off the async worker. Must-fail
+   mutations: an unbounded `incremental_vacuum` call and a helper that steps the statement once each
+   fail this arm. Do not run these destructive arms against the live store.
+8. **Capacity bound and failure controls.** Drive a scratch store past a configured `B` with large
+   valid audit payloads, concurrent batches, an embedded writer, non-allowlisted traffic, pinned
+   readers and maintenance. Ordinary writes keep succeeding and keep their audit obligations; the
+   capacity alarm is durable and carries the measured metric, `B` and both backlogs; recovery prunes
+   only eligible rows and never shortens the horizon, widens the list or deletes another class. A
+   maintenance operation whose demonstrated peak does not fit is refused before it starts, and the
+   measured peak of every admitted maintenance operation stays within its reserved budget. Unknown
+   bounds and insufficient conversion headroom refuse the operation. A deliberately removed
+   maintenance-admission guard fails this arm, and so does a mutation that refuses ordinary writes
+   at `B`.
+9. **Evidence/recovery.** Fail the attempt append and prove zero destructive effects. Crash after a
+   source-half delete commit but before completion and prove its receipt resolves exactly the
+   committed batch. Corrupt/miss evidence and prove no further deletion. Enumerate every production
+   Audit constructor, every events insertion path and every graph-edge write path covered by the
+   guards; an added unclassified emitter or unguarded path fails the census. The census asserts that
+   every emitter of `(Audit, events.prune_poll_audits)`, a generic dispatch receipt for that verb
+   included, is classified `pinned_while_referenced`; a mutation that classifies the key as
+   `expendable` or leaves it unclassified fails the census.
+
+### 9. Implementation fences
+
+**MAY:** implement only this closed polling class, its versioned historical migration, compact
+identity/coverage evidence, typed protocol/read changes, source-owned bounded prune/reclaim, the
+capacity alarm and maintenance admission. Reuse the October 17 reservation ordering and ADR-204
+drain mechanics with explicit tests of the actually shipped paths. Begin with a stopped maintenance
+release for the conversion and the historical migration.
+
+**MAY NOT:** infer expendability from `Audit` alone, `comm.*`, frequency, absence of a known
+consumer, or metadata alone; add `knowledge.get` or channel kinds; rewrite training rows; prune
+unstamped rows outside the captured migration; suppress initial audit obligations; change ephemeral
+dispatch-hook delivery; represent deletion as archival; recreate expired IDs; substitute manual file
+deletion/truncation for SQLite reclaim; refuse ordinary writes or stop the deployment at the
+capacity bound; or advertise a permanent size plateau from a seven-day age rule.
+
+**Verify by:** all acceptance arms above, paired-store before/after artifacts, peak byte traces and
+a measured daily-growth report. No destructive rollout or dependent merge proceeds on this draft
+alone.
+
+### Alternatives considered
+
+**Write-time sampling of the polling receipts.** Taken separately, as ADR-103 Amendment 7. It
+removes about 80% of new rows at the source and keeps the plane append-only. It does not reclaim
+rows already written, does not bound the file, and leaves the sampled and non-success rows growing
+without an end, so it complements this amendment and does not replace it. Counts over sampled rows
+are estimates, and per-request durations of omitted rows cannot be recovered; that amendment states
+both effects for its readers.
+
+**Aggregate rows per verb, actor, namespace and window.** Rejected for this decision. Per-cell
+counts are not the original records: ID lookup and per-request latency joins do not survive
+aggregation, and an arbitrary sub-window cannot be answered exactly from a coarse window. Distinct
+actors, namespaces and windows are unbounded, so one permanent cell per window is still unbounded
+storage, and deleting the original rows would still need either this class or sealed archival. Kept
+as separate accounting work if exact long-term polling totals become a product requirement.
+
+**Sealed archival of the six keys under the October 17 backfill.** Kept as the fallback, rejected as
+the route for these keys. It preserves more forensic value: by-ID resolution returns Archived and
+the payload stays recoverable from sealed media. It needs the same identity reservations, reference
+races, historical classification and physical reclaim as this amendment, plus segment copy, seal,
+verify and destruction, and it keeps polling payloads that nothing reads on sealed media
+indefinitely. If long-term diagnostics of these receipts turn out to be needed, or the expended-ID
+state proves too costly, this is the route.
+
+**Sampling now and archival later.** Rejected as a shortcut. It pays for two transitions, keeps
+today's rows until the second ships, and cannot reconstruct events that were never written. It mixes
+exact historical counts with sampled estimates, so every reader has to disclose which it is
+returning. The adopted combination is write-time reduction plus this class, with a seven-day window
+of the remaining rows.
+
+**Refusing writes at the capacity bound.** Rejected. A write-refusing cap stops every caller whose
+dispatch carries an audit obligation, which costs more than the file growth it prevents. The bound
+instead drives an alarm, capacity recovery and maintenance admission (§6).
+
+**Plain age deletion without identity records.** Rejected. A retried append of a deleted ID would be
+inserted again, by-ID reads could not tell an expired event from one that never existed, and
+references to the deleted ID would resolve as unknown.
