@@ -1,12 +1,13 @@
 //! `kkernel kg export` and `kkernel kg import` — archive round-trip operations.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
-use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
+use khive_runtime::portability::{
+    ExportedEdge, ExportedEntity, ImportConflictMode, ImportOptions, KgArchive,
+};
 use khive_runtime::{
     runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig,
 };
@@ -18,7 +19,7 @@ use khive_vcs_adapters::{
 };
 use uuid::Uuid;
 
-use super::types::{ExportArgs, ImportArgs, ImportFormat};
+use super::types::{ExportArgs, ImportArgs, ImportConflict, ImportFormat};
 
 pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
     let ns = Namespace::parse(&args.namespace)?;
@@ -235,12 +236,17 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     // source failures must not create or migrate `--db` as a side effect.
     let validation_runtime = KhiveRuntime::new(destination_config.clone().for_metadata_registry())
         .context("create import validation runtime")?;
-    validation_runtime
+    let validation_token = validation_runtime
         .authorize(ns.clone())
         .context("authorize kg import before destination setup")?;
     let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
     if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
         bail!("--default-kind is only supported for CSV/TSV input");
+    }
+    if args.continue_on_error && format == ImportFormat::Archive {
+        bail!(
+            "--continue is only supported for adapter input; use --on-conflict skip for archives"
+        );
     }
     let mut bibtex_stats = None;
     let archive = match format {
@@ -282,27 +288,77 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             archive_from_adapter(&args.namespace, adapter, args.verbose)?
         }
     };
-    validation_runtime.validate_kg_import(&archive, policy)?;
-    drop(validation_runtime);
+    validation_runtime.validate_kg_import_options(&archive, &validation_token, policy)?;
 
     if let Some(target) = &validated {
         destination_config.db_path = Some(target.path.clone());
         khive_mcp::serve::reverify_reindex_target_identity(target)
             .context("kg import destination changed before open")?;
     }
-    let boot_guard = crate::exec::acquire_local_construction_guard(&destination_config)?;
-    let runtime =
-        khive_mcp::serve::build_single_backend_runtime(destination_config, &khive_cfg).await?;
-    drop(boot_guard);
+    let options = ImportOptions {
+        on_conflict: if args.continue_on_error {
+            ImportConflictMode::Skip
+        } else {
+            match args.on_conflict {
+                ImportConflict::Error => ImportConflictMode::Error,
+                ImportConflict::Skip => ImportConflictMode::Skip,
+                ImportConflict::Update => ImportConflictMode::Update,
+            }
+        },
+        force: args.force,
+        dry_run: args.dry_run,
+    };
+    let destination_exists = destination_config
+        .db_path
+        .as_ref()
+        .context("import target path")?
+        .try_exists()
+        .context("inspect import destination")?;
+    let runtime = if args.dry_run {
+        if destination_exists {
+            // Live read-only construction accepts daemon-held WAL state and validates
+            // the current schema without migrations, model registration or boot repairs.
+            KhiveRuntime::new_readonly_live(destination_config)
+                .context("open dry-run destination")?
+        } else {
+            // No destination exists: use the already-isolated metadata runtime to
+            // plan an empty target, without creating the requested database.
+            validation_runtime
+        }
+    } else {
+        if !destination_exists {
+            // Resolve all empty-target policy/endpoint outcomes before the host can
+            // create directories, migrate the target or start boot/cutover work.
+            validation_runtime
+                .import_kg_with_options(
+                    &archive,
+                    &validation_token,
+                    policy,
+                    ImportOptions {
+                        dry_run: true,
+                        ..options
+                    },
+                )
+                .await
+                .with_context(|| format!("preflight {}", args.source.display()))?;
+        }
+        drop(validation_runtime);
+        let boot_guard = crate::exec::acquire_local_construction_guard(&destination_config)?;
+        let runtime =
+            khive_mcp::serve::build_single_backend_runtime(destination_config, &khive_cfg).await?;
+        drop(boot_guard);
+        runtime
+    };
     install_import_kind_registry(&runtime)?;
     let token = runtime.authorize(ns)?;
     let summary = runtime
-        .import_kg_with_policy(&archive, &token, policy)
+        .import_kg_with_options(&archive, &token, policy, options)
         .await
         .with_context(|| format!("import {}", args.source.display()))?;
 
     let json = if let Some(stats) = bibtex_stats {
-        let mut value = serde_json::to_value(&summary).context("serialize ImportSummary")?;
+        let mut value =
+            serde_json::to_value(&summary).context("serialize import conflict summary")?;
         value["adapter"] = serde_json::json!({
             "format": "bibtex",
             "entries": stats.entries,
@@ -311,7 +367,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         });
         serde_json::to_string(&value).context("serialize BibTeX import summary")?
     } else {
-        serde_json::to_string(&summary).expect("serialize ImportSummary")
+        serde_json::to_string(&summary).expect("serialize import conflict summary")
     };
     println!("{json}");
     Ok(())
@@ -435,8 +491,6 @@ fn adapter_records_to_archive(
     edges: Vec<EdgeRecord>,
 ) -> Result<KgArchive> {
     let now = Utc::now();
-    let entity_ids: HashSet<Uuid> = entities.iter().map(|e| e.id).collect();
-
     let exported_entities: Vec<ExportedEntity> = entities
         .into_iter()
         .map(|e| {
@@ -467,7 +521,7 @@ fn adapter_records_to_archive(
 
     let exported_edges = edges
         .into_iter()
-        .map(|edge| adapter_edge_to_exported(edge, &entity_ids))
+        .map(adapter_edge_to_exported)
         .collect::<Result<Vec<_>>>()?;
 
     Ok(KgArchive {
@@ -497,10 +551,9 @@ pub(super) fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display)
     Ok(())
 }
 
-/// Install the merged pack/runtime entity- and note-kind registry on `runtime`
-/// so that `runtime.import_kg` (and any other runtime-layer kind validation)
-/// accepts pack-registered kinds such as `resource`, not just the eight base
-/// `khive_types::EntityKind` variants.
+/// Install merged pack kind and edge-endpoint metadata on both import runtimes.
+/// This admits pack-registered kinds such as `resource` and additive endpoint
+/// rules during validation as well as destination import.
 ///
 /// Returns the merged entity-kind list so callers can also thread it into
 /// adapter-layer validation (see `JsonFormatAdapter::new_with_valid_kinds`,
@@ -527,10 +580,11 @@ fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<Vec<String>> {
         .map(str::to_string)
         .collect();
     runtime.install_kind_registry(entity_kinds.clone(), note_kinds);
+    runtime.install_edge_rules(registry.all_edge_rules());
     Ok(entity_kinds)
 }
 
-fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Result<ExportedEdge> {
+fn adapter_edge_to_exported(edge: EdgeRecord) -> Result<ExportedEdge> {
     let source = edge
         .source
         .parse::<Uuid>()
@@ -539,20 +593,6 @@ fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Res
         .target
         .parse::<Uuid>()
         .with_context(|| format!("edge {} target must be a UUID", edge.edge_id))?;
-    if !entity_ids.contains(&source) {
-        bail!(
-            "edge {} source {} is not present in adapter entities",
-            edge.edge_id,
-            source
-        );
-    }
-    if !entity_ids.contains(&target) {
-        bail!(
-            "edge {} target {} is not present in adapter entities",
-            edge.edge_id,
-            target
-        );
-    }
     let relation: EdgeRelation = edge
         .relation
         .parse()
@@ -899,6 +939,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Archive),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -940,6 +984,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Archive),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args)
@@ -993,6 +1041,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args)
@@ -1036,6 +1088,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Ndjson),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args)
@@ -1079,6 +1135,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         assert!(
@@ -1111,6 +1171,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1151,6 +1215,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Ndjson),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1306,6 +1374,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         cmd_import(args).await.unwrap();
@@ -1359,6 +1431,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         })
         .await
@@ -1382,6 +1458,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         })
         .await
@@ -1441,6 +1521,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Json),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         })
         .await
@@ -1501,6 +1585,10 @@ mod tests {
             namespace: "test-ns".to_string(),
             format: Some(ImportFormat::Archive),
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         })
         .await
@@ -1551,6 +1639,10 @@ mod import_destination_tests {
             namespace: "local".into(),
             format: None,
             default_kind: None,
+            on_conflict: ImportConflict::Error,
+            force: false,
+            dry_run: false,
+            continue_on_error: false,
             verbose: false,
         };
         let (selected, runtime, policy, target) =

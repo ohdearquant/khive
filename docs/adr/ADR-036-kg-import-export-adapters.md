@@ -546,6 +546,16 @@ record invariants before the first target write:
 These rules supersede any earlier implementation text that allowed alias-based edge detection or
 warning/default behavior for a present malformed timestamp, or discarded edge metadata/provenance.
 
+## Amendment 2 (2026-10-19): tool-registry rows do not travel through an archive
+
+Import never creates or rewrites a tool-registry row. In every conflict mode, it
+skips registry-tagged archive entities and edges incident to them, reporting
+`entities_registry_skipped` and `edges_registry_skipped` as subsets of the total
+`entities_skipped` and `edges_skipped` counts, omitting zero subset counts. Export
+is unchanged: an archive may contain registry rows, which are skipped on import.
+
+Tool registrations must pass through the owning tool pack rather than an archive.
+
 ## Format-v2 migration UX (deferred to ADR-048)
 
 The current export format (NDJSON, ADR-020 §canonical) is format-v1. A future

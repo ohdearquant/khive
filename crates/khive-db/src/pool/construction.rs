@@ -30,6 +30,11 @@ use super::{
 #[cfg(test)]
 use super::{run_identity_open_hook, IdentityOpenStage};
 
+enum ReadOnlyOpenMode {
+    FrozenSnapshot,
+    Live,
+}
+
 impl ConnectionPool {
     /// Create a new connection pool.
     ///
@@ -39,6 +44,19 @@ impl ConnectionPool {
     /// writable non-WAL files fall back to single-connection mode. Read-only
     /// files retain a dedicated reader regardless of journal mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
+        Self::new_with_read_only_open_mode(config, ReadOnlyOpenMode::FrozenSnapshot)
+    }
+
+    pub(crate) fn new_read_only_live(mut config: PoolConfig) -> Result<Self, SqliteError> {
+        config.read_only = true;
+        config.write_queue_enabled = Some(false);
+        Self::new_with_read_only_open_mode(config, ReadOnlyOpenMode::Live)
+    }
+
+    fn new_with_read_only_open_mode(
+        config: PoolConfig,
+        read_only_mode: ReadOnlyOpenMode,
+    ) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
         if let Some(policy) = config.disk_guard_config {
@@ -138,7 +156,14 @@ impl ConnectionPool {
                 None,
             )
         };
-        let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
+        let read_only_open_target = match read_only_mode {
+            ReadOnlyOpenMode::FrozenSnapshot => {
+                read_only_open_target(&config, identity_path.as_deref())?
+            }
+            // Keep ordinary SQLite locking and change detection for a live WAL.
+            // Read-only flags and connection configuration still apply to every slot.
+            ReadOnlyOpenMode::Live => identity_path.clone(),
+        };
         #[cfg(any(unix, windows))]
         let identity_before_open = identity_path
             .as_deref()

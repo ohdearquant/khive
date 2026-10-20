@@ -574,6 +574,29 @@ impl KhiveRuntime {
         })
     }
 
+    /// Open an existing live database for read-only planning.
+    ///
+    /// Committed WAL frames remain visible while a writer holds the database
+    /// open. Schema compatibility is checked without migrations, configured-model
+    /// registration or application-assisted cutover writes. A file-backed path
+    /// is required.
+    pub fn new_readonly_live(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        if config.db_path.is_none() {
+            return Err(khive_db::SqliteError::InvalidConfig(
+                "live read-only planning requires a file-backed database path".into(),
+            )
+            .into());
+        }
+        let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
+        Self::new_readonly_with_file_backend(config, |path| {
+            StorageBackend::sqlite_read_only_live_with_max_readers_and_wal_ceiling(
+                path,
+                None,
+                wal_ceiling,
+            )
+        })
+    }
+
     /// Construct a read-only fixture runtime with a small reader pool.
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_readonly_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
