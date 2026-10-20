@@ -18,6 +18,167 @@ use khive_storage::{
 /// sqlite-vec's ceiling on `k` in a vec0 KNN query (`SQLITE_VEC_VEC0_K_MAX`).
 const VEC0_K_MAX: usize = 4096;
 
+impl SqliteVecStore {
+    /// Prepare the existing single-query kernel without acquiring a reader.
+    fn prepare_search(
+        &self,
+        request: VectorSearchRequest,
+    ) -> StorageResult<
+        impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<Vec<VectorSearchHit>> + Send + 'static,
+    > {
+        if request.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "use search_with_filter for filtered queries".into(),
+            });
+        }
+        if request.query_vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "sqlite-vec supports exactly one query vector per search".into(),
+            });
+        }
+        let query_embedding = request.query_vectors[0].clone();
+
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        // Use request.namespace if present; fall back to self.namespace.
+        let namespace = request
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.namespace.clone());
+        let kind_filter = request.kind.map(|k| k.to_string());
+        // Use the request's embedding_model filter, or fall back to this store's model.
+        let effective_model = request
+            .embedding_model
+            .clone()
+            .unwrap_or_else(|| self.embedding_model.clone());
+
+        if query_embedding.len() == dims {
+            if let Some(idx) = non_finite_index(&query_embedding) {
+                return Err(non_finite_vector_error(
+                    "vec_search",
+                    idx,
+                    query_embedding[idx],
+                ));
+            }
+        }
+
+        Ok(move |conn: &rusqlite::Connection| {
+            if query_embedding.len() != dims {
+                return Err(rusqlite::Error::InvalidParameterCount(
+                    query_embedding.len(),
+                    dims,
+                ));
+            }
+
+            // MATCH applies namespace, model and kind inside sqlite-vec before its
+            // top-k, but orders by distance alone, so rows tied at the top_k
+            // boundary would be cut in table order. The query widens k until the
+            // last row returned is strictly farther than the boundary row, or the
+            // eligible rows run out, and the cut below orders ties by subject ID.
+            // A k past sqlite-vec's limit uses the scalar distance over every
+            // eligible row instead.
+            let kind_clause = if kind_filter.is_some() {
+                "AND kind = ?5"
+            } else {
+                ""
+            };
+            let match_sql = format!(
+                "SELECT subject_id, distance \
+                 FROM {t} \
+                 WHERE embedding MATCH ?1 \
+                   AND namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
+                 ORDER BY distance \
+                 LIMIT ?2",
+                t = table,
+                kind_clause = kind_clause
+            );
+            let exact_sql = format!(
+                "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
+                 FROM {t} \
+                 WHERE namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
+                 ORDER BY exact_distance, subject_id \
+                 LIMIT ?2",
+                t = table,
+                kind_clause = kind_clause
+            );
+
+            let query_blob = encode_f32_native(&query_embedding);
+            let query_rows = |sql: &str, limit: usize| -> rusqlite::Result<Vec<(String, f64)>> {
+                let mut stmt = conn.prepare(sql)?;
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, f64)> {
+                    Ok((row.get(0)?, row.get(1)?))
+                };
+                if let Some(ref kind_str) = kind_filter {
+                    stmt.query_map(
+                        rusqlite::params![
+                            query_blob,
+                            limit,
+                            &namespace,
+                            &effective_model,
+                            kind_str
+                        ],
+                        read_row,
+                    )?
+                    .collect()
+                } else {
+                    stmt.query_map(
+                        rusqlite::params![query_blob, limit, &namespace, &effective_model],
+                        read_row,
+                    )?
+                    .collect()
+                }
+            };
+
+            let top_k = request.top_k as usize;
+            let mut k = top_k.saturating_add(1);
+            let mut rows = loop {
+                if k > VEC0_K_MAX {
+                    break query_rows(&exact_sql, top_k)?;
+                }
+                let rows = query_rows(&match_sql, k)?;
+                if top_k == 0 || rows.len() < k || rows[k - 1].1 > rows[top_k - 1].1 {
+                    break rows;
+                }
+                k = if k == VEC0_K_MAX {
+                    VEC0_K_MAX + 1
+                } else {
+                    k.saturating_mul(2).min(VEC0_K_MAX)
+                };
+            };
+            rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            rows.truncate(top_k);
+
+            let mut hits = Vec::new();
+            for (rank_idx, (id_str, distance)) in rows.into_iter().enumerate() {
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                hits.push(VectorSearchHit {
+                    subject_id,
+                    score: sqlite_cosine_score(distance)?,
+                    rank: (rank_idx + 1) as u32,
+                });
+            }
+
+            Ok(hits)
+        })
+    }
+}
+
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn score_candidates(
@@ -352,157 +513,56 @@ impl VectorStore for SqliteVecStore {
         &self,
         request: VectorSearchRequest,
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
-        if request.filter.as_ref().is_some_and(|f| !f.is_empty()) {
-            return Err(StorageError::Unsupported {
-                capability: StorageCapability::Vectors,
-                operation: "vec_search".into(),
-                message: "use search_with_filter for filtered queries".into(),
-            });
+        self.with_reader("vec_search", self.prepare_search(request)?)
+            .await
+    }
+
+    async fn search_batch(
+        &self,
+        requests: &[VectorSearchRequest],
+    ) -> StorageResult<Vec<StorageResult<Vec<VectorSearchHit>>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
         }
-        if request.query_vectors.len() != 1 {
-            return Err(StorageError::Unsupported {
-                capability: StorageCapability::Vectors,
-                operation: "vec_search".into(),
-                message: "sqlite-vec supports exactly one query vector per search".into(),
-            });
-        }
-        let query_embedding = request.query_vectors[0].clone();
+        let queries = requests
+            .iter()
+            .cloned()
+            .map(|request| self.prepare_search(request))
+            .collect::<Vec<_>>();
+        #[cfg(all(test, feature = "vectors"))]
+        let after_slot = super::search_batch_tests::current_after_slot_gate();
 
-        let table = self.table_name.clone();
-        let dims = self.dimensions;
-        // Use request.namespace if present; fall back to self.namespace.
-        let namespace = request
-            .namespace
-            .clone()
-            .unwrap_or_else(|| self.namespace.clone());
-        let kind_filter = request.kind.map(|k| k.to_string());
-        // Use the request's embedding_model filter, or fall back to this store's model.
-        let effective_model = request
-            .embedding_model
-            .clone()
-            .unwrap_or_else(|| self.embedding_model.clone());
-
-        if query_embedding.len() == dims {
-            if let Some(idx) = non_finite_index(&query_embedding) {
-                return Err(non_finite_vector_error(
-                    "vec_search",
-                    idx,
-                    query_embedding[idx],
-                ));
-            }
-        }
-
-        self.with_reader("vec_search", move |conn| {
-            if query_embedding.len() != dims {
-                return Err(rusqlite::Error::InvalidParameterCount(
-                    query_embedding.len(),
-                    dims,
-                ));
-            }
-
-            // MATCH applies namespace, model and kind inside sqlite-vec before its
-            // top-k, but orders by distance alone, so rows tied at the top_k
-            // boundary would be cut in table order. The query widens k until the
-            // last row returned is strictly farther than the boundary row, or the
-            // eligible rows run out, and the cut below orders ties by subject ID.
-            // A k past sqlite-vec's limit uses the scalar distance over every
-            // eligible row instead.
-            let kind_clause = if kind_filter.is_some() {
-                "AND kind = ?5"
-            } else {
-                ""
-            };
-            let match_sql = format!(
-                "SELECT subject_id, distance \
-                 FROM {t} \
-                 WHERE embedding MATCH ?1 \
-                   AND namespace = ?3 \
-                   AND embedding_model = ?4 \
-                   {kind_clause} \
-                 ORDER BY distance \
-                 LIMIT ?2",
-                t = table,
-                kind_clause = kind_clause
-            );
-            let exact_sql = format!(
-                "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
-                 FROM {t} \
-                 WHERE namespace = ?3 \
-                   AND embedding_model = ?4 \
-                   {kind_clause} \
-                 ORDER BY exact_distance, subject_id \
-                 LIMIT ?2",
-                t = table,
-                kind_clause = kind_clause
-            );
-
-            let query_blob = encode_f32_native(&query_embedding);
-            let query_rows = |sql: &str, limit: usize| -> rusqlite::Result<Vec<(String, f64)>> {
-                let mut stmt = conn.prepare(sql)?;
-                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-                let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, f64)> {
-                    Ok((row.get(0)?, row.get(1)?))
-                };
-                if let Some(ref kind_str) = kind_filter {
-                    stmt.query_map(
-                        rusqlite::params![
-                            query_blob,
-                            limit,
-                            &namespace,
-                            &effective_model,
-                            kind_str
-                        ],
-                        read_row,
-                    )?
-                    .collect()
-                } else {
-                    stmt.query_map(
-                        rusqlite::params![query_blob, limit, &namespace, &effective_model],
-                        read_row,
-                    )?
-                    .collect()
+        let results = super::super::run_stateful_pooled_store_read(
+            std::sync::Arc::clone(&self.pool),
+            StorageCapability::Vectors,
+            "vec_search_batch",
+            move |conn| {
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Deferred,
+                )
+                .map_err(|error| map_err(error, "vec_search_batch"))?;
+                let mut results = Vec::with_capacity(queries.len());
+                for query in queries {
+                    results.push(match query {
+                        Ok(query) => {
+                            query(&transaction).map_err(|error| map_err(error, "vec_search"))
+                        }
+                        Err(error) => Err(error),
+                    });
+                    #[cfg(all(test, feature = "vectors"))]
+                    if let Some(gate) = &after_slot {
+                        gate.after_slot(&transaction);
+                    }
                 }
-            };
-
-            let top_k = request.top_k as usize;
-            let mut k = top_k.saturating_add(1);
-            let mut rows = loop {
-                if k > VEC0_K_MAX {
-                    break query_rows(&exact_sql, top_k)?;
-                }
-                let rows = query_rows(&match_sql, k)?;
-                if top_k == 0 || rows.len() < k || rows[k - 1].1 > rows[top_k - 1].1 {
-                    break rows;
-                }
-                k = if k == VEC0_K_MAX {
-                    VEC0_K_MAX + 1
-                } else {
-                    k.saturating_mul(2).min(VEC0_K_MAX)
-                };
-            };
-            rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            rows.truncate(top_k);
-
-            let mut hits = Vec::new();
-            for (rank_idx, (id_str, distance)) in rows.into_iter().enumerate() {
-                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-
-                hits.push(VectorSearchHit {
-                    subject_id,
-                    score: sqlite_cosine_score(distance)?,
-                    rank: (rank_idx + 1) as u32,
-                });
-            }
-
-            Ok(hits)
-        })
-        .await
+                transaction
+                    .commit()
+                    .map_err(|error| map_err(error, "vec_search_batch"))?;
+                Ok(results)
+            },
+        )
+        .await?;
+        Ok(results)
     }
 
     async fn info(&self) -> Result<VectorStoreInfo, StorageError> {
@@ -847,7 +907,7 @@ impl VectorStore for SqliteVecStore {
         static SQLITE_VEC_CAPABILITIES: OnceLock<VectorStoreCapabilities> = OnceLock::new();
         SQLITE_VEC_CAPABILITIES.get_or_init(|| VectorStoreCapabilities {
             supports_filter: false,
-            supports_batch_search: false,
+            supports_batch_search: true,
             supports_quantization: false,
             supports_update: false,
             supports_orphan_sweep: true,

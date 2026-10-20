@@ -149,7 +149,7 @@ fn sqlite_vec_capabilities(engine_name: String) -> CapabilitiesReport {
     CapabilitiesReport {
         engine_name,
         supports_filter: false,
-        supports_batch_search: false,
+        supports_batch_search: true,
         supports_quantization: false,
         supports_update: false,
         supports_orphan_sweep: true,
