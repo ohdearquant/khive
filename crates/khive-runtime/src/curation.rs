@@ -24,10 +24,10 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 mod embedding_text;
 mod properties;
 
+pub(crate) use embedding_text::note_embedding_text_ref;
 pub use embedding_text::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
 };
-pub(crate) use embedding_text::{note_embedding_text_ref, note_fts_scalars};
 #[cfg(test)]
 use properties::merge_json;
 pub(crate) use properties::{
@@ -103,26 +103,6 @@ use merge_edges::{
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
-
-/// SQL-bind–ready scalars derived from [`note_fts_document`].
-///
-/// Used by `merge_note_sql` to guarantee that the raw SQL FTS INSERT stores
-/// exactly what [`Fts5TextSearch::upsert_document`] would write, preventing
-/// null/empty-string divergence on the `title` column for nameless notes.
-pub(crate) struct NoteFtsScalars {
-    /// Granular note kind used by the indexed corpus classifier.
-    pub record_kind: String,
-    /// Empty string when `note.name` is `None` — matches the `unwrap_or("")` in
-    /// `Fts5TextSearch::upsert_document`.
-    pub title: String,
-    pub body: String,
-    /// Always the JSON array `"[]"`.
-    pub tags: String,
-    /// Serialised `note.properties`, or `None` when properties are absent.
-    pub metadata: Option<String>,
-    /// `note.updated_at` converted to `DateTime<Utc>` timestamp_micros.
-    pub updated_at_micros: i64,
-}
 
 // ---------------------------------------------------------------------------
 // INLINE TEST JUSTIFICATION: tests here exercise patch/merge helpers and the
