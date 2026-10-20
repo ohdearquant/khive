@@ -347,6 +347,13 @@ impl EmailChannel {
             env.metadata
                 .insert("quarantine_claimed_from".to_string(), claimed_from.clone());
         }
+        if !email.to.is_empty() {
+            // Informational parsed To claims only; quarantine routing stays with the maintainer.
+            env.metadata.insert(
+                "quarantine_claimed_to".into(),
+                serde_json::json!(&email.to).to_string(),
+            );
+        }
 
         env
     }
@@ -358,6 +365,8 @@ impl EmailChannel {
     /// must always leave a queryable record, never a silent drop, since
     /// dropping it here is the only way this UID's disposition could be lost
     /// before the cursor advances past it.
+    /// No parsed `RawEmail` is available, so claimed recipients are omitted even
+    /// when replay bytes exist; malformed or oversized input is not parsed again.
     pub(super) fn malformed_quarantine_envelope(
         &self,
         uid: u32,
