@@ -370,7 +370,8 @@ the Context section promises:
 
 Both legacy `[gate]` keys become inputs to a single import epoch and are inert
 afterward. Amendment 1 explicitly permits a temporary `actor.mailbox_readers`
-carrier for two read views; it does not change this section's durable grant destination.
+carrier for three read views; it does not change this section's durable grant
+destination.
 
 > **Implementation status (2026-08-30):** The current runtime enforces these
 > two keys as a live static caller-enrollment policy on every boot. That closes
@@ -529,9 +530,10 @@ All conditions are executed tests, not review assertions:
 
 Status: Accepted. This is the named **trusted-local mailbox view exception** to
 §2's ban on authoritative configuration text and §5's one-import transition.
-It permits only `comm.inbox(mailbox_actor=...)` and
-`comm.thread(mailbox_actor=...)` while the store-held grants above remain
-unshipped. It introduces no authenticated principal or durable grant record.
+It permits only `comm.inbox(mailbox_actor=...)`,
+`comm.thread(mailbox_actor=...)` and `comm.probe(actor=...)` while the store-held
+grants above remain unshipped. It introduces no authenticated principal or durable
+grant record.
 
 ### Authority and scope
 
@@ -564,9 +566,9 @@ The mailbox policy composes with the configured gate, including enrollment and
 write restrictions. `AllowAllGate` does not imply mailbox delegation. Missing
 pairs, including an embedding host without an installed mailbox policy, refuse
 with `PermissionDenied` reason `mailbox_read_not_granted` before thread-root
-lookup, inbox counts, or an empty page. Policy errors remain errors. The real
-caller remains the gate, token and audit actor; selecting a mailbox never mints
-an owner token.
+lookup, inbox counts, probe metadata or stale-unread counts, or an empty page.
+Policy errors remain errors. The real caller remains the gate, token and audit
+actor; selecting a mailbox never mints an owner token.
 
 Delegated inboxes require exactly `to_actor = owner`, including unread counts,
 `limit=0`, projection and every long-poll query. Delegated thread views include
@@ -577,6 +579,13 @@ explicitly addressing the owner remains eligible. Explicit `mailbox_actor=local`
 and delegated `box=sent` refuse. Omitted selectors and explicit non-local self
 selectors preserve existing own-view behavior.
 
+`comm.probe` uses its required `actor` field as the mailbox selector and applies
+the same exact-pair grant before reading message metadata or stale-unread counts.
+That selector does not replace the real caller identity. Probing the caller's own
+actor needs no mailbox grant, while probing another actor requires one. The
+anonymous caller may probe `actor=local` as its own view; a named caller may not
+use it to read the anonymous pool. These own views still obey the composed gate.
+
 The base-store `idx_notes_unread_probe_recipient_type_direction` index includes the
 recipient JSON type as a seek key: the existing recipient index leaves type
 checking as a residual filter, so malformed object/array recipients that alias
@@ -586,10 +595,10 @@ with matching fresh-store DDL. Following
 [ADR-187](ADR-187-comm-seek-plan-pinning.md), the typed query shape pins this
 index; existing untyped query shapes retain their existing pins.
 
-These two views do not change message read flags. `comm.read`, `comm.mark_read`
+These three views do not change message read flags. `comm.read`, `comm.mark_read`
 and `comm.reply` retain the real caller's existing ownership checks; none accepts
-`mailbox_actor`. This exception does not change `comm.probe`, generic record
-privacy, namespace authorization or mutation rights.
+`mailbox_actor`. This exception does not change generic record privacy, namespace
+authorization or mutation rights.
 
 ### Revocation and sunset
 
@@ -614,14 +623,16 @@ permanent design.
 
 - Granted views succeed; an ungranted cross-actor selector refuses under
   `AllowAllGate`, direct pack invocation, empty data, `limit=0`, and existing or
-  missing thread roots. A failing composed policy never becomes an allow.
+  missing thread roots. Probe controls cover both its metadata page and
+  stale-unread count, with own-actor and anonymous-local compatibility witnesses.
+  A failing composed policy never becomes an allow.
 - An explicit namespace cannot grant an absent pair. Configured, per-request and
   embedding caller identities remain exact and attributable; request arguments
   cannot impersonate the owner.
 - Strict delegated inbox/count/thread filtering excludes the unattributed pool
   before paging, projection and deduplication, including long-poll re-queries.
   Own-view compatibility controls remain unchanged.
-- Snapshot owner unread counts and original row flags before and after both
+- Snapshot owner unread counts and original row flags before and after all three
   delegated views, projection, long poll and helper read-mark/reply attempts;
   the owner snapshots remain equal.
 - Invalid owners/readers refuse configuration load. Reordering or duplicating
