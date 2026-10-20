@@ -188,10 +188,14 @@ fn proposal_archive_replay_preserves_existing_column_rows_and_event_bytes() {
         ),
         vec![vec![Value::Integer(123)], vec![Value::Null]]
     );
+    // Replay a contiguous tail even after later migrations are registered.
     assert_eq!(
-        conn.execute("DELETE FROM _schema_migrations WHERE version=58", [])
+        conn.execute("DELETE FROM _schema_migrations WHERE version>=58", [])
             .unwrap(),
-        1
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 58)
+            .count()
     );
     assert_eq!(read_schema_version(&conn).unwrap(), 57);
     assert!(rows(
