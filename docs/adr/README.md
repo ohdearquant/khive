@@ -234,6 +234,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-204](ADR-204-automatic-freelist-reclamation.md)                    | Automatic freelist reclamation with incremental auto-vacuum                                                |
 | [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)                 | Dependency-Scoped Pull-Request CI from the Code Map                                                        |
 | [ADR-206](ADR-206-crate-performance-guarantees.md)                      | Crate Performance Guarantees                                                                               |
+| [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
 
 <!-- END GENERATED ADR CATALOG -->
 
