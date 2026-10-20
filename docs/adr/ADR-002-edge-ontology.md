@@ -49,6 +49,11 @@ This also amends ADR-196 D1, which kept `located_in` to one base row.
 the tenth category (Ownership), and the base pairs `Person owns Org` and
 `Org owns Org`, expanding the closed set from 19 → 20. ADR-197 keeps its
 own status.
+**Amendment 2026-10-19 (Proposed)**: a `depends_on` edge whose endpoint pair has no inference
+default is accepted without a `dependency_kind` and stored without one; an explicit value is
+validated on every pair. See "Amendment 2026-10-19: an omitted qualifier on a pair with no
+default" under "`depends_on` governed metadata" below and "Why the 2026-10-19 qualifier
+amendment?" in Rationale.
 
 ## Context
 
@@ -680,6 +685,18 @@ endpoint kinds:
 Unknown `dependency_kind` values are rejected. `dependency_kind` is only valid on
 `depends_on` edges.
 
+#### Amendment 2026-10-19: an omitted qualifier on a pair with no default (#5709)
+
+**Status**: Proposed
+
+"Requires" above governs what a stored qualifier may say, and inference supplies one where the
+endpoint pair has a default. When `dependency_kind` is omitted and the pair has no default (the
+base pair `Service → Project`, and pairs a pack declares, such as the KG pack's `Org → Org` and
+the GTD pack's task-to-task pair), the edge is accepted and stored without a `dependency_kind`. A reader treats an absent qualifier as
+unspecified, never as any one kind. An explicit value is validated on every `depends_on` pair,
+with or without a default. The reasoning is under "Why the 2026-10-19 qualifier amendment?" in
+Rationale.
+
 ## Edge Density Rules
 
 A sparse graph is a useless graph. Per-kind minimums (polish guidance, not write-time gates):
@@ -923,6 +940,24 @@ The change removes the endpoint-signature collision between `located_in` and `ex
 had shared the single pair `Concept -> Concept`. The `located_in` certificate's Er fixture still
 stands on that shared pair. The collision exemption in the signature tripwire is withdrawn
 rather than left stale.
+
+### Why the 2026-10-19 qualifier amendment?
+
+The sentence "`depends_on` requires a `dependency_kind` qualifier" admitted two readings: a write
+refused whenever the edge would end up without a qualifier, or a rule about the stored value that
+inference fills where it can. The runtime implements the second. It validates an explicit value
+on every `depends_on` edge, adds the default for the seven pairs in the inference table, and leaves
+the metadata unchanged for every other pair. This amendment writes that behaviour down.
+
+Refusing an omitted qualifier on the pairs without a default was considered and not adopted. The
+GTD pack writes each task dependency as `depends_on` between two task notes with no metadata, so
+the stricter reading would refuse every task dependency in the default pack set. An absent
+qualifier also makes no false claim about the dependency.
+
+Adding defaults for `Service → Project` and `Org → Org` was considered and not adopted. A service
+can depend on a project to build it or to run it, and one organization can depend on another in
+ways no single kind names, so a default for either pair would store a guess. A caller that knows
+the kind states it.
 
 ### Why 10 categories?
 

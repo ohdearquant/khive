@@ -31,8 +31,7 @@ fn execute(rt: &KhiveRuntime, sql: &str) {
         .pool()
         .writer()
         .expect("writer")
-        .conn()
-        .execute_batch(sql)
+        .autocommit(|conn| Ok(conn.execute_batch(sql)?))
         .expect("fixture sql");
 }
 

@@ -106,6 +106,7 @@ fn pooled_checkout_refuses_directory_replacement_on_the_same_volume() {
     let pool = fixture_pool(&path, &dir.path().join("volume-locks"));
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE retained_row (id INTEGER); INSERT INTO retained_row VALUES (1)",
         )
@@ -147,6 +148,7 @@ fn pooled_checkout_refuses_directory_replacement_on_the_same_volume() {
     assert_eq!(
         pool.writer()
             .unwrap()
+            .conn()
             .query_row("SELECT id FROM retained_row", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
@@ -184,6 +186,7 @@ fn pooled_checkout_refuses_directory_redirect_to_another_physical_volume() {
     );
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE retained_row (id INTEGER); INSERT INTO retained_row VALUES (1)",
         )
@@ -202,6 +205,7 @@ fn pooled_checkout_refuses_directory_redirect_to_another_physical_volume() {
     assert_eq!(
         pool.writer()
             .unwrap()
+            .conn()
             .query_row("SELECT id FROM retained_row", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),

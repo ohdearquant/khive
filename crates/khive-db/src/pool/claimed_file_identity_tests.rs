@@ -49,8 +49,9 @@ fn changed_claim_is_refused_before_database_identity_or_wal_writes() {
     assert_ne!(unclaimed.opened_file_identity_record(), Some(expected));
     let conn = unclaimed.writer().unwrap();
     assert_eq!(
-        conn.query_row("SELECT value FROM unclaimed_marker", [], |row| row
-            .get::<_, i64>(0))
+        conn.conn()
+            .query_row("SELECT value FROM unclaimed_marker", [], |row| row
+                .get::<_, i64>(0))
             .unwrap(),
         7
     );
@@ -75,11 +76,12 @@ fn matching_claim_allows_normal_identity_initialization_and_wal() {
     assert_eq!(pool.opened_file_identity_record(), Some(expected));
     let conn = pool.writer().unwrap();
     assert_eq!(
-        conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        conn.conn()
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
             .unwrap(),
         "wal"
     );
-    assert!(read_database_id(&conn).unwrap().is_some());
+    assert!(read_database_id(conn.conn()).unwrap().is_some());
 }
 
 #[test]
@@ -215,13 +217,12 @@ fn exercise_descriptor_swap(later: Option<LaterConnection>) {
         Some(kind) => {
             let pool = pool.as_ref().unwrap();
             match kind {
-                LaterConnection::PooledReader => pool.open_reader_connection(),
-                LaterConnection::StandaloneWriter => pool.open_standalone_writer_untracked(),
-                LaterConnection::StandaloneReader => pool.open_standalone_reader(
-                    StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
-                ),
+                LaterConnection::PooledReader => pool.open_reader_connection().map(|_| ()),
+                LaterConnection::StandaloneWriter => pool.standalone_autocommit(|_| Ok(())),
+                LaterConnection::StandaloneReader => pool
+                    .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+                    .map(|_| ()),
             }
-            .map(|_| ())
         }
     };
     claimed_file_observer::set_test_hook(None);

@@ -10,11 +10,12 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
     };
     let runtime = KhiveRuntime::new(config).unwrap();
     let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
-    let info = server.get_info();
-    let instructions = info.instructions.unwrap_or_default();
-    assert!(instructions.contains("create"), "kg verb missing");
+    let catalog = request_tool_description(server)
+        .await
+        .expect("tools/list answers");
+    assert!(catalog.contains("\n  create — "), "kg verb missing");
     assert!(
-        !instructions.contains("gtd.assign"),
+        !catalog.contains("gtd.assign"),
         "gtd verb should not be in catalog when only kg is loaded"
     );
 }
@@ -121,10 +122,14 @@ async fn pack_gtd_with_kg_explicit_works() {
     };
     let runtime = KhiveRuntime::new(config).unwrap();
     let server = KhiveMcpServer::new(runtime).expect("kg+gtd builds");
-    let info = server.get_info();
-    let instructions = info.instructions.unwrap_or_default();
-    assert!(instructions.contains("assign"), "gtd verb must be present");
-    assert!(instructions.contains("create"), "kg verb must be present");
+    let catalog = request_tool_description(server)
+        .await
+        .expect("tools/list answers");
+    assert!(
+        catalog.contains("\n  gtd.assign — "),
+        "gtd verb must be present"
+    );
+    assert!(catalog.contains("\n  create — "), "kg verb must be present");
 }
 
 #[tokio::test]

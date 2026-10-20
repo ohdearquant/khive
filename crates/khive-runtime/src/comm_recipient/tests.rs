@@ -340,26 +340,28 @@ async fn delivered_replay_is_acked_before_gate_or_timestamp_revalidation() {
     assert_eq!(stored.content, "hello");
     let backend = runtime.backend();
     let writer = backend.pool().writer().unwrap();
-    let ack_count: i64 = writer
-        .conn()
-        .query_row("SELECT count(*) FROM comm_ack_work", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(ack_count, 3, "every new attempt receives its own ack");
-    let replay_count: i64 = writer
-        .conn()
-        .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
-            row.get(0)
+    writer
+        .autocommit(|conn| {
+            let ack_count: i64 = conn
+                .query_row("SELECT count(*) FROM comm_ack_work", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(ack_count, 3, "every new attempt receives its own ack");
+            let replay_count: i64 = conn
+                .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let quarantine_count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM comm_recipient_quarantine",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((replay_count, quarantine_count), (1, 0));
+            Ok(())
         })
         .unwrap();
-    let quarantine_count: i64 = writer
-        .conn()
-        .query_row(
-            "SELECT count(*) FROM comm_recipient_quarantine",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!((replay_count, quarantine_count), (1, 0));
 }
 
 #[tokio::test]
@@ -402,8 +404,9 @@ fn table_count(runtime: &KhiveRuntime, table: &str) -> i64 {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .autocommit(|conn| {
+            Ok(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
+        })
         .unwrap()
 }
 
@@ -726,12 +729,13 @@ async fn policy_quarantine_plaintext_is_secret_gated_before_any_write() {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .query_row(
-                "SELECT reason,parsed_plaintext FROM comm_recipient_quarantine",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .autocommit(|conn| {
+                Ok(conn.query_row(
+                    "SELECT reason,parsed_plaintext FROM comm_recipient_quarantine",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
             .unwrap();
         assert_eq!(reason, "policy_rejected");
         assert_eq!(
@@ -774,12 +778,13 @@ async fn quarantine_writes_no_message_note_and_keeps_the_item_verbatim() {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .query_row(
-                "SELECT delivery_item,parsed_plaintext FROM comm_recipient_quarantine",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .autocommit(|conn| {
+                Ok(conn.query_row(
+                    "SELECT delivery_item,parsed_plaintext FROM comm_recipient_quarantine",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
             .unwrap();
         assert_eq!(stored, bytes);
         assert_eq!(
@@ -841,8 +846,9 @@ async fn empty_body_is_stored_and_receipted() {
             .pool()
             .writer()
             .unwrap()
-            .conn()
-            .query_row("SELECT disposition FROM comm_ack_work", [], |r| r.get(0))
+            .autocommit(|conn| {
+                Ok(conn.query_row("SELECT disposition FROM comm_ack_work", [], |r| r.get(0))?)
+            })
             .unwrap();
         assert_eq!(ack, "stored");
     }

@@ -2942,9 +2942,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertEqual(verdict, "false", reasons)
 
     def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
-                     head_repository=None):
+                     head_repository=None, classifier=None):
         """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
-        unset unless given, as on a push."""
+        unset unless given, as on a push. classifier, when given, is the text of the checked-out
+        scripts/ci-docs-only.sh in place of this repository's own."""
         workflow = workflow_text("ci.yml")
         job = indented_block(workflow, "changed-paths", 2)
         step = job.split("- name: Classify\n", 1)[1]
@@ -2952,7 +2953,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.assertIsNotNone(match)
         script = textwrap.dedent(match.group(1))
         (self.repo / "scripts").mkdir(exist_ok=True)
-        shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        if classifier is None:
+            shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        else:
+            self.write("scripts/ci-docs-only.sh", classifier)
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -2975,8 +2979,10 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         lines = output.read_text().splitlines()
-        self.assertEqual([line.split("=", 1)[0] for line in lines], ["docs_only"], lines)
-        return lines[0], completed.stdout + completed.stderr
+        # A push that found a fully tested base also records it, for the Scope step, before docs_only.
+        self.assertIn([line.split("=", 1)[0] for line in lines], (["docs_only"], ["base", "docs_only"]), lines)
+        self.outputs = dict(line.split("=", 1) for line in lines)
+        return lines[-1], completed.stdout + completed.stderr
 
     def merge_ref(self, path, text):
         self.git("checkout", "-q", "-b", "topic")
@@ -2996,20 +3002,57 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
         self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
 
+    # A classifier that answers "documentation only" for every change, as a change could carry.
+    LENIENT_CLASSIFIER = "#!/bin/bash\necho true\n"
+    CLASSIFIER_CHANGED = "full suite: the change edits a path classifier"
+
+    def test_job_pull_request_that_edits_the_docs_classifier_runs_the_full_suite(self):
+        head = self.merge_ref("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        verdict, log = self.classify_job("pull_request", head, classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
+
+    def test_job_pull_request_that_edits_the_scope_script_reports_a_classifier_change(self):
+        head = self.merge_ref("scripts/ci-test-scope.py", "print('map')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-test-scope.py\n", log)
+
+    def test_job_pull_request_with_only_documentation_does_not_report_a_classifier_change(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertNotIn(self.CLASSIFIER_CHANGED, log)
+
+    def test_job_integration_push_that_edits_a_classifier_runs_the_full_suite(self):
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a lenient classifier beside documentation")
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(self.base, "success"),
+                                         classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
+
     def test_job_own_codex_pull_request_with_crate_source_is_not_a_lane(self):
         # The integration-only lane is retired (ADR-205 D7): the branch name changes nothing.
         head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
         verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
         self.assertEqual(verdict, "docs_only=false", log)
 
-    def gh_listing(self, run_sha, shard_conclusion):
-        return (
-            'case "$2" in\n'
-            '  */workflows/ci.yml/runs*) echo "101 ' + run_sha + '" ;;\n'
-            '  */runs/101/jobs*) [ "' + shard_conclusion + '" = success ] && echo 1 || echo 0 ;;\n'
-            '  *) exit 1 ;;\n'
-            'esac\n'
-        )
+    def gh_listing(self, run_sha, shard_conclusion, conclusion="success", record="test-scope-full"):
+        return self.gh_runs((101, run_sha, conclusion, shard_conclusion, record))
+
+    def gh_runs(self, *runs):
+        """A fake gh answering the tested-base lookup: each run is (id, head sha, run conclusion, Linux shard 1
+        conclusion, recorded scope artifact name or None), newest first, after the step's own jq."""
+        listing = "\\n".join(f"{run_id} {sha} {conclusion}" for run_id, sha, conclusion, _, _ in runs)
+        cases = [f'  */workflows/ci.yml/runs*) printf "{listing}\\n" ;;\n']
+        for run_id, _, _, shard, record in runs:
+            cases.append(f'  */runs/{run_id}/jobs*) echo {1 if shard == "success" else 0} ;;\n')
+            cases.append(f'  */runs/{run_id}/artifacts*) echo {1 if record == "test-scope-full" else 0} ;;\n')
+        return 'case "$2" in\n' + "".join(cases) + '  *) exit 1 ;;\nesac\n'
 
     def test_job_main_push_compares_with_the_newest_fully_tested_main_commit(self):
         self.write("src/lib.rs", "pub fn untested() {}\n")
@@ -3056,9 +3099,126 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("notes/guide.md", "# Guide\n\nMore.\n")
         head = self.commit("documentation")
         for event_name, ref in (("schedule", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main"),
-                                ("push", "refs/heads/integration/train-1")):
+                                ("push", "refs/heads/release/v1")):
             with self.subTest(event_name=event_name, ref=ref):
                 self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
+                self.assertNotIn("base", self.outputs)
+
+    def test_job_integration_push_compares_with_the_newest_fully_tested_main_commit(self):
+        train = "refs/heads/integration/train-1"
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation in the same train")
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(self.base, "success"))
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+        self.assertIn(f"Compared with {untested}", log)
+
+    def test_job_integration_push_fetches_main_and_its_own_branch_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn tested() {}\n")
+        tested = self.commit("main's newest fully tested commit")
+        self.git("checkout", "-q", "-b", "integration/train-1")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a documentation-only train")
+        self.git("checkout", "-q", "main")
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", "-b", "integration/train-1", remote.as_uri(),
+                 str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(tested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), tested, log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
+    def test_job_checks_out_integration_pushes(self):
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        checkout = job.split("- uses: actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+        condition = re.search(r"(?m)^        if: (.+)$", checkout).group(1)
+        self.assertIn("startsWith(github.ref, 'refs/heads/integration/')", condition)
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+
+    def test_job_tested_base_skips_a_failed_run_an_unrecorded_run_and_a_scoped_run(self):
+        # ADR-205 Amendment 1, verify-by 1: the newest candidate is unusable, an older one is the base. If the
+        # newest were used, only Markdown would follow it and the push would take the documentation lane.
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for label, newest in (("run concluded with a failure", (102, untested, "failure", "success", "test-scope-full")),
+                              ("scope recorded as scoped", (102, untested, "success", "success", "test-scope-scoped")),
+                              ("no scope record", (102, untested, "success", "success", None)),
+                              ("shard 1 failed", (102, untested, "success", "failure", "test-scope-full"))):
+            for ref in ("refs/heads/integration/train-1", "refs/heads/main"):
+                with self.subTest(label=label, ref=ref):
+                    gh = self.gh_runs(newest, (101, self.base, "success", "success", "test-scope-full"))
+                    verdict, log = self.classify_job("push", head, ref=ref, gh_script=gh)
+                    self.assertEqual(verdict, "docs_only=false", log)
+                    self.assertEqual(self.outputs.get("base"), self.base, log)
+        # control: the same newest candidate, usable, is the base
+        gh = self.gh_runs((102, untested, "success", "success", "test-scope-full"),
+                          (101, self.base, "success", "success", "test-scope-full"))
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1", gh_script=gh)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+
+    def record_step(self, event_name, docs_only, test_scope):
+        """Runs the Record step and returns (recorded, the record file's text)."""
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        step = job.split("- name: Record the test scope\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("if: github.event_name != 'pull_request'", step)
+        script = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n").group(1))
+        temp = pathlib.Path(self.temp.name) / f"record-{docs_only}-{test_scope}"
+        temp.mkdir()
+        output = temp / "output"
+        output.write_text("")
+        env = {**self.env, "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output), "DOCS_ONLY": docs_only}
+        # The CI job exports its own TEST_SCOPE, so the unset arm removes it rather than inheriting it.
+        env.pop("TEST_SCOPE", None)
+        if test_scope is not None:
+            env["TEST_SCOPE"] = test_scope
+        subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, timeout=30)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0].split("=", 1)[1], (temp / "test-scope" / "test_scope").read_text()
+
+    def test_record_step_names_the_scope_the_suites_ran(self):
+        for docs_only, test_scope, recorded, text in (("false", "full", "full", "full\n"),
+                                                      ("false", "", "full", "full\n"),
+                                                      ("false", None, "full", "full\n"),
+                                                      ("false", "j k", "scoped", "j k\n"),
+                                                      ("true", None, "docs", "docs\n"),
+                                                      ("true", "", "docs", "docs\n")):
+            with self.subTest(docs_only=docs_only, test_scope=test_scope):
+                self.assertEqual(self.record_step("push", docs_only, test_scope), (recorded, text))
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        upload = job.split("- name: Upload the test scope record\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("name: test-scope-${{ steps.record.outputs.recorded }}", upload)
+        self.assertIn("if: github.event_name != 'pull_request'", upload)
+        self.assertIn("continue-on-error: true", upload)
+        # the lookup reads exactly the name a full run records
+        classify = job.split("- name: Classify\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn('select(.name == "test-scope-full")', classify)
+
+    def test_job_integration_push_without_a_full_run_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for gh_script in (self.gh_listing(self.base, "skipped"), "exit 1\n"):
+            with self.subTest(gh_script=gh_script):
+                verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                                 gh_script=gh_script)
+                self.assertEqual(verdict, "docs_only=false", log)
+                self.assertNotIn("base", self.outputs)
+                self.assertIn("no main commit with a completed full run", log)
 
 
 FAKE_KKERNEL = r'''#!{python}
@@ -3070,10 +3230,17 @@ spec = json.loads((here / "graph.json").read_text())
 ops = sys.argv[-1]
 with open(here / "calls.log", "a") as log:
     log.write(ops + "\n")
+ingested = re.search(r'code\.ingest\(path="([^"]*)"', ops)
+if ingested:
+    # what the binary was handed: every manifest under the ingested directory, as it read them
+    root = pathlib.Path(ingested.group(1))
+    (here / "ingested.json").write_text(json.dumps({"path": str(root), "manifests": {
+        str(p.relative_to(root)): p.read_text() for p in sorted(root.rglob("Cargo.toml"))}}))
 if spec.get("exit"):
     print(json.dumps({"results": [{"ok": False, "error": {"message": "refused"}}]}))
     sys.exit(spec["exit"])
 results = []
+deps_batch = False
 for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
     if verb == "ingest":
         report = spec.get("ingest", {"projects_created": len(spec["projects"]), "edges_created": len(spec["edges"])})
@@ -3087,15 +3254,44 @@ for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
         following = str(index + 1) if index + 1 < len(pages) else None
         results.append({"ok": True, "result": {"items": items, "next_cursor": following}})
     elif verb == "deps":
+        deps_batch = True
         ident = re.search(r'id="([^"]*)"', args).group(1)
         edges = [{"source": source, "target": target} for source, target in spec["edges"] if target == ident]
         kinds = spec.get("kinds", {})
         nodes = [{"id": node, "kind": kinds.get(node, "project")}
                  for node in sorted({ident} | {edge["source"] for edge in edges})]
-        results.append({"ok": True, "result": {"map": "workspace", "root": ident, "nodes": nodes,
-                                               "edges": edges, "truncated": spec.get("truncated", False)}})
+        graph = {"map": "workspace", "root": ident, "nodes": nodes,
+                 "edges": edges, "truncated": spec.get("truncated", False)}
+        if spec.get("deps_missing_nodes"):
+            del graph["nodes"]
+        if spec.get("deps_missing_edges"):
+            del graph["edges"]
+        if spec.get("deps_nodes_not_list"):
+            graph["nodes"] = {}
+        if spec.get("deps_wrong_root"):
+            graph["root"] = "p-unrequested"
+        if spec.get("deps_wrong_map"):
+            graph["map"] = "another-map"
+        if spec.get("deps_node_missing_kind"):
+            nodes[0].pop("kind")
+        if spec.get("deps_edge_missing_target"):
+            edges[0].pop("target")
+        if spec.get("deps_duplicate_node"):
+            nodes.append(dict(nodes[0]))
+        # an edge kept while the node it names is dropped from the reply
+        if spec.get("deps_omit_source_node") and edges:
+            nodes[:] = [node for node in nodes if node["id"] != edges[0]["source"]]
+        if spec.get("deps_omit_root_node"):
+            nodes[:] = [node for node in nodes if node["id"] != ident]
+        if spec.get("deps_unknown_kind"):
+            nodes[0]["kind"] = "Project"
+        results.append({"ok": True, "result": graph})
     else:
         results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
+if spec.get("short_batch") and deps_batch:
+    results = results[:-1]
+if spec.get("results_not_list") and deps_batch:
+    results = {str(index): outcome for index, outcome in enumerate(results)}
 print(json.dumps({"results": results}))
 '''
 
@@ -3221,9 +3417,17 @@ class ScopeFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
     def change(self, *paths):
+        # Each edit stays valid TOML where the file is TOML, so a manifest or lockfile reaches the rule a test names
+        # instead of failing to parse: a crate manifest gains a [features] table, which the manifest rules refuse.
         self.git("checkout", "-q", "--detach", self.base)
         for path in paths:
-            self.write(path, (self.TREE.get(path) or "") + "// changed\n")
+            if path.endswith("/Cargo.toml") and path != "crates/Cargo.toml":
+                edit = "\n[features]\nchanged = []\n"
+            elif path.endswith((".toml", ".lock")):
+                edit = "# changed\n"
+            else:
+                edit = "// changed\n"
+            self.write(path, (self.TREE.get(path) or "") + edit)
         return self.commit("change " + " ".join(paths))
 
 
@@ -3250,13 +3454,14 @@ class TestScopeClassifierTests(ScopeFixture):
                 verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
                 admitted = path in self.CRATE_SOURCE and path not in self.NAMED_ELSEWHERE
                 self.assertEqual(verdict, "map" if admitted else "full", reasons)
+                self.assertNotIn("does not parse", reasons)
         self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
 
     def test_a_full_suite_path_never_reaches_the_binary(self):
         # ADR-205 D4 ordering arm: a manifest beside crate source prints its reason and no ingest line.
         verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(verdict, "full")
-        self.assertIn("full suite: manifest: crates/k/Cargo.toml", reasons)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", reasons)
         self.assertNotIn("ingest:", reasons)
         self.assertEqual(self.calls(), [])
 
@@ -3305,6 +3510,24 @@ class TestScopeClassifierTests(ScopeFixture):
                 ("refused manifest", {**self.GRAPH, "ingest": {"manifest_files_refused": 1}},
                  "manifest_files_refused=1"),
                 ("truncated", {**self.GRAPH, "truncated": True}, "was truncated"),
+                ("short batch", {**self.GRAPH, "short_batch": True}, "0 outcomes for 1 ops"),
+                ("results not a list", {**self.GRAPH, "results_not_list": True}, "results that are not a list"),
+                ("missing nodes", {**self.GRAPH, "deps_missing_nodes": True}, "nodes is not a list"),
+                ("missing edges", {**self.GRAPH, "deps_missing_edges": True}, "edges is not a list"),
+                ("non-list nodes", {**self.GRAPH, "deps_nodes_not_list": True}, "nodes is not a list"),
+                ("wrong root", {**self.GRAPH, "deps_wrong_root": True}, "wrong root"),
+                ("wrong map", {**self.GRAPH, "deps_wrong_map": True}, "wrong map"),
+                ("node without kind", {**self.GRAPH, "deps_node_missing_kind": True},
+                 "node without string id and kind"),
+                ("edge without target", {**self.GRAPH, "deps_edge_missing_target": True},
+                 "edge without string source and target"),
+                ("duplicate node id", {**self.GRAPH, "deps_duplicate_node": True}, "duplicate node id"),
+                ("edge source not a node", {**self.GRAPH, "deps_omit_source_node": True},
+                 "edge source missing from nodes: p-j"),
+                ("edge target not a node", {**self.GRAPH, "deps_omit_root_node": True},
+                 "edge target missing from nodes: p-k"),
+                ("node of unknown kind", {**self.GRAPH, "deps_unknown_kind": True},
+                 "node of unknown kind: 'Project'"),
                 ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
                  "changed crate k is not a project"),
                 ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
@@ -3321,6 +3544,16 @@ class TestScopeClassifierTests(ScopeFixture):
         self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
         self.assertEqual(self.scope(self.base, head)[0], "k")
         self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_nonempty_partial_reply_to_a_two_root_batch_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs", "crates/m/src/lib.rs")
+        self.set_graph({**self.GRAPH, "short_batch": True})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("1 outcomes for 2 ops", reasons)
+        deps_calls = [call for call in self.calls() if call.startswith("[code.deps(")]
+        self.assertEqual(len(deps_calls), 1)
+        self.assertEqual(deps_calls[0].count("code.deps("), 2)
 
     def test_a_file_another_crate_includes_runs_the_full_suite(self):
         # The closure of k (or m) never reaches m (or j): only the include names the file.
@@ -3451,6 +3684,334 @@ class TestScopeClassifierTests(ScopeFixture):
                 self.assertIn("usage:", completed.stderr)
 
 
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+
+
+def lockfile(*packages, version=4):
+    """A Cargo.lock: each package is (name, version, source or None, checksum or None, [dependency strings])."""
+    blocks = [f"version = {version}\n"]
+    for name, number, source, checksum, dependencies in packages:
+        lines = [f'[[package]]\nname = "{name}"\nversion = "{number}"\n']
+        if source:
+            lines.append(f'source = "{source}"\n')
+        if checksum:
+            lines.append(f'checksum = "{checksum}"\n')
+        if dependencies:
+            lines.append("dependencies = [\n" + "".join(f' "{d}",\n' for d in dependencies) + "]\n")
+        blocks.append("".join(lines))
+    return "\n".join(blocks)
+
+
+class ManifestAndLockfileScopeTests(ScopeFixture):
+    """ADR-205 Amendment 1, D2 and D3: a crate's own manifest and crates/Cargo.lock are read as data."""
+
+    # j depends on k and rand 0.8, k on ksub and serde (inherited from the workspace with a feature), m has a
+    # development dependency on rand 0.7: two versions of one package, each reached by a different crate.
+    PACKAGES = (("j", "0.1.0", None, None, ["k", "rand 0.8.0"]),
+                ("k", "0.1.0", None, None, ["ksub", "serde"]),
+                ("ksub", "0.1.0", None, None, []),
+                ("m", "0.1.0", None, None, ["rand 0.7.0"]),
+                ("rand", "0.7.0", REGISTRY, "a7", []),
+                ("rand", "0.8.0", REGISTRY, "a8", []),
+                ("serde", "1.0.0", REGISTRY, "c1", []))
+    K = ('[package]\nname = "k"\nversion = "0.1.0"\n\n[dependencies]\nksub = { path = "sub" }\n'
+         'serde = { workspace = true }\n\n[[test]]\nname = "t"\npath = "tests/t.rs"\n')
+    J = '[package]\nname = "j"\nversion = "0.1.0"\n\n[dependencies]\nk = { path = "../k" }\nrand = "0.8"\n'
+    M = '[package]\nname = "m"\nversion = "0.1.0"\n\n[dev-dependencies]\nrand = "0.7"\n'
+    TREE = {**ScopeFixture.TREE,
+            "crates/Cargo.toml": ('[workspace]\nmembers = ["k", "k/sub", "j", "m"]\n\n[workspace.dependencies]\n'
+                                  'serde = { version = "1", features = ["derive"] }\n'),
+            "crates/Cargo.lock": lockfile(*PACKAGES),
+            "crates/k/Cargo.toml": K,
+            "crates/k/sub/Cargo.toml": '[package]\nname = "ksub"\nversion = "0.1.0"\n',
+            "crates/j/Cargo.toml": J,
+            "crates/m/Cargo.toml": M}
+
+    scope = TestScopeClassifierTests.scope
+
+    def edit(self, files, base=None, links=()):
+        """A commit on base (the fixture base by default) writing files and adding (link, target) symlinks."""
+        self.git("checkout", "-q", "--detach", base or self.base)
+        for path, text in files.items():
+            if (self.repo / path).is_symlink():
+                (self.repo / path).unlink()
+            self.write(path, text)
+        for path, target in links:
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).unlink(missing_ok=True)
+            os.symlink(target, self.repo / path)
+        return self.commit("edit " + " ".join(sorted(files)))
+
+    def ingested(self):
+        return json.loads((self.fake / "ingested.json").read_text())
+
+    def lock_with(self, **changes):
+        """The fixture lockfile with packages replaced by name@version: {"rand@0.8.0": (name, version, ...)}."""
+        packages = [changes.pop(f"{p[0]}@{p[1]}", p) for p in self.PACKAGES]
+        return lockfile(*[p for p in packages if p is not None], *changes.values())
+
+    # --- crate manifests (Amendment 1 verify-by 2 and 5; Amendment 2 verify-by 1) ---
+
+    def test_an_edit_to_an_existing_entry_runs_the_crate_and_every_member_reaching_the_package(self):
+        # A version requirement added to a path dependency: the entry stays and the lockfile does not change.
+        head = self.edit({"crates/j/Cargo.toml": self.J.replace('k = { path = "../k" }',
+                                                                'k = { path = "../k", version = "0.1" }')})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/j/Cargo.toml -> j (manifest; changed dependency entries name: k)", reasons)
+        self.assertIn("members reaching k in either lockfile: j k", reasons)
+        self.assertIn("ingest: the base tree", reasons)
+        # the binary was handed the base commit's manifests, never one the change wrote
+        seen = self.ingested()
+        self.assertNotEqual(seen["path"], str(self.repo / "crates"))
+        self.assertEqual(seen["manifests"]["j/Cargo.toml"], self.J)
+        self.assertEqual(seen["manifests"]["k/Cargo.toml"], self.K)
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "map")
+
+    def test_an_edited_entry_named_by_neither_lockfile_runs_the_full_suite(self):
+        stale = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1"\n'})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1.0"\n'}, base=stale)
+        verdict, reasons = self.scope(stale, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("lockfile: neither side lists itoa", reasons)
+
+    def test_a_dependency_entry_that_appears_or_disappears_runs_the_full_suite(self):
+        twice = self.edit({"crates/j/Cargo.toml": self.J + 'rand2 = { package = "rand", version = "0.8" }\n'})
+        with_serde = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        for label, base, files, reason in (
+                ("a path package outside the workspace", None,
+                 {"crates/m/Cargo.toml": self.M + '\n[dependencies]\nfoo = { path = "../../outside/foo" }\n'},
+                 "adds the dependency entry dependencies.foo"),
+                ("a development dependency on a package the lockfile lists", None,
+                 {"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": with_serde},
+                 "adds the dependency entry dev-dependencies.serde"),
+                ("a removed entry", None, {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"\n', "")},
+                 "removes the dependency entry dependencies.rand"),
+                ("another path", None,
+                 {"crates/k/Cargo.toml": self.K.replace('ksub = { path = "sub" }', 'ksub = { path = "sub2" }')},
+                 "adds the dependency entry dependencies.ksub"),
+                ("another package under the same key", None,
+                 {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"', 'rand = { package = "fastrand", version = "0.8" }')},
+                 "adds the dependency entry dependencies.rand"),
+                ("another table", None, {"crates/m/Cargo.toml": self.M.replace("[dev-dependencies]", "[dependencies]")},
+                 "adds the dependency entry dependencies.rand"),
+                ("another target", None,
+                 {"crates/m/Cargo.toml": self.M + "\n[target.'cfg(unix)'.dependencies]\nrand = \"0.7\"\n"},
+                 "adds the dependency entry target.cfg(unix).dependencies.rand"),
+                ("one of two entries naming one package", twice, {"crates/j/Cargo.toml": self.J},
+                 "removes the dependency entry dependencies.rand2")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                start = base or self.base
+                verdict, reasons = self.scope(start, self.edit(files, base=start))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"full suite: manifest: crates/", reasons)
+                self.assertIn(reason, reasons)
+                self.assertNotIn("ingest:", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_features_runs_the_full_suite(self):
+        for label, path, text, reason in (
+                ("[features]", "crates/m/Cargo.toml", self.M + "\n[features]\nx = []\n", "changes features"),
+                ("dependency features", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", features = ["small_rng"] }'),
+                 "changes features, default-features or optional of dependencies.rand"),
+                ("default-features", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", default-features = false }'),
+                 "of dependencies.rand"),
+                ("optional", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", optional = true }'),
+                 "of dependencies.rand"),
+                ("inherited entry gains a local feature", "crates/k/Cargo.toml",
+                 self.K.replace("serde = { workspace = true }", 'serde = { workspace = true, features = ["std"] }'),
+                 "of dependencies.serde"),
+                # a new entry inheriting the workspace's feature list gains features it did not have
+                ("new inherited entry", "crates/m/Cargo.toml", self.M + "serde = { workspace = true }\n",
+                 "of dev-dependencies.serde"),
+                ("target-specific features", "crates/m/Cargo.toml",
+                 self.M + '\n[target.\'cfg(unix)\'.dependencies]\nrand = { version = "0.7", features = ["x"] }\n',
+                 "of target.cfg(unix).dependencies.rand")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({path: text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"full suite: manifest: {path} ", reasons)
+                self.assertIn(reason, reasons)
+                self.assertNotIn("ingest:", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_target_outside_the_crate_or_with_changed_required_features_runs_the_full_suite(self):
+        test_table = '[[test]]\nname = "t"\npath = "tests/t.rs"\n'
+        for label, text, reason in (
+                ("outside path", self.K.replace(test_table, '[[test]]\nname = "t"\npath = "../j/src/lib.rs"\n'),
+                 "gives [[test]] t the path ../j/src/lib.rs, which resolves to crates/j/src/lib.rs, outside the crate"),
+                ("nested crate's file", self.K + '\n[[test]]\nname = "s"\npath = "sub/src/lib.rs"\n',
+                 "gives [[test]] s the path sub/src/lib.rs, which resolves to crates/k/sub/src/lib.rs"),
+                ("required features", self.K.replace(test_table, test_table + 'required-features = ["x"]\n'),
+                 "changes the required features of [[test]] t"),
+                ("absolute path", self.K + '\n[[bench]]\nname = "b"\npath = "/etc/b.rs"\n',
+                 "gives [[bench]] b a path that is not relative")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({"crates/k/Cargo.toml": text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+
+    def test_a_symbolic_link_under_crates_runs_the_full_suite(self):
+        # Amendment 2, D3: a link in k naming a file of j. The path rules would admit each change below.
+        linked = self.edit({}, links=[("crates/k/tests/link.rs", "../../j/src/lib.rs")])
+        self.git("checkout", "-q", "--detach", linked)
+        (self.repo / "crates/k/tests/link.rs").unlink()
+        removed = self.commit("remove the link")
+        for label, base, head in (
+                ("a new link", self.base, linked),
+                # the closure of j alone would omit k, whose test reads the changed file through the link
+                ("an unchanged link whose target changed", linked,
+                 self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}, base=linked)),
+                ("a link removed at the head", linked, removed),
+                ("a target path through a link inside the crate", linked,
+                 self.edit({"crates/k/Cargo.toml": self.K + '\n[[test]]\nname = "l"\npath = "tests/link.rs"\n'},
+                           base=linked))):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                verdict, reasons = self.scope(base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertRegex(reasons, r"full suite: 1 symbolic link\(s\) under crates/ at [0-9a-f]{40}, "
+                                          r"first crates/k/tests/link\.rs")
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.scope(base, head, "--paths-only")[0], "full")
+        # control: the same source change with no link in either tree runs its closure
+        self.assertEqual(self.scope(self.base, self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}))[0], "j")
+
+    def test_a_new_bench_inside_the_crate_runs_the_crate_closure(self):
+        head = self.edit({"crates/k/Cargo.toml": self.K + '\n[[bench]]\nname = "kb"\npath = "benches/kb.rs"\n',
+                          "crates/k/benches/kb.rs": "fn main() {}\n"})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/k/Cargo.toml -> k (manifest; changed dependency entries name: none)", reasons)
+        self.assertEqual(self.ingested()["manifests"]["k/Cargo.toml"], self.K)
+
+    def test_any_other_manifest_difference_runs_the_full_suite(self):
+        for label, path, text, reason in (
+                ("[package]", "crates/m/Cargo.toml", self.M.replace('version = "0.1.0"', 'version = "0.2.0"'),
+                 "manifest: crates/m/Cargo.toml changes package.version, outside the dependency and target tables"),
+                ("[package.metadata]", "crates/m/Cargo.toml", self.M + "\n[package.metadata.docs]\nall = true\n",
+                 "changes package.metadata"),
+                ("[lints]", "crates/m/Cargo.toml", self.M + "\n[lints.rust]\nunsafe_code = \"forbid\"\n",
+                 "changes lints"),
+                ("workspace manifest", "crates/Cargo.toml", self.TREE["crates/Cargo.toml"] + "resolver = \"2\"\n",
+                 "manifest: crates/Cargo.toml"),
+                ("a manifest that is not a crate's", "crates/k/tests/fixture/Cargo.toml", "[workspace]\n",
+                 "manifest: crates/k/tests/fixture/Cargo.toml is not the manifest of a crate at"),
+                ("a new crate", "crates/n/Cargo.toml", '[package]\nname = "n"\n',
+                 "manifest: crates/n/Cargo.toml cannot be read at")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({path: text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_manifest_another_crate_reads_runs_the_full_suite(self):
+        reader = self.edit({"crates/j/tests/manifest.rs": 'const M: &str = include_str!("../../m/Cargo.toml");\n'})
+        head = self.edit({"crates/m/Cargo.toml": self.M + '\n[[example]]\nname = "e"\n'}, base=reader)
+        verdict, reasons = self.scope(reader, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/m/Cargo.toml is compiled or read by another crate: j (crates/j/tests/manifest.rs:1)",
+                      reasons)
+
+    # --- the lockfile (verify-by 3) ---
+
+    def test_a_lockfile_change_to_member_entries_runs_the_members_that_reach_them(self):
+        for label, changes, expected in (
+                ("a member's dependency list", {"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])}, "m"),
+                ("a nested member's dependency list", {"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"])},
+                 "j k ksub")):
+            with self.subTest(label=label):
+                head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, expected, reasons)
+                self.assertIn("lockfile: ", reasons)
+                self.assertNotIn("ingest: the base tree", reasons)
+
+    def test_a_lockfile_change_outside_the_workspace_runs_the_full_suite(self):
+        for label, changes, reason in (
+                # the lockfile records a version, never the features the new version requests of its dependencies
+                ("bump one external package", {"rand@0.7.0": ("rand", "0.7.1", REGISTRY, "a71", []),
+                                               "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.1"])},
+                 "first rand 0.7.0"),
+                ("checksum alone", {"serde@1.0.0": ("serde", "1.0.0", REGISTRY, "c2", [])}, "first serde 1.0.0"),
+                ("dependency list alone", {"rand@0.8.0": ("rand", "0.8.0", REGISTRY, "a8", ["serde"])},
+                 "first rand 0.8.0"),
+                ("one of two versions", {"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])}, "first rand 0.7.0"),
+                ("a new external entry", {"itoa@1.0.0": ("itoa", "1.0.0", REGISTRY, "i1", []),
+                                          "m@0.1.0": ("m", "0.1.0", None, None, ["itoa", "rand 0.7.0"])},
+                 "first itoa 1.0.0"),
+                ("a removed external entry", {"rand@0.7.0": None, "m@0.1.0": ("m", "0.1.0", None, None, [])},
+                 "first rand 0.7.0")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn("full suite: lockfile: crates/Cargo.lock changes ", reasons)
+                self.assertIn(f"entries outside the workspace, {reason} ", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_lockfile_header_change_a_parse_failure_or_a_change_reaching_every_member_runs_the_full_suite(self):
+        everyone = self.lock_with(**{"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"]),
+                                     "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        for label, text, reason in (
+                ("header", lockfile(*self.PACKAGES, version=3), "lockfile: crates/Cargo.lock changes its version header"),
+                ("unparseable", self.TREE["crates/Cargo.lock"] + "// changed\n",
+                 "lockfile: crates/Cargo.lock does not parse at"),
+                ("ambiguous dependency", self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand"])}),
+                 "depends on 'rand', which matches 2 entries"),
+                ("every member", everyone, "lockfile: the change reaches every workspace member (4)")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({"crates/Cargo.lock": text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_lockfile_a_crate_reads_runs_the_full_suite(self):
+        reader = self.edit({"crates/j/tests/lock.rs": 'const L: &str = include_str!("../../Cargo.lock");\n'})
+        head = self.edit({"crates/Cargo.lock": self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None,
+                                                                             ["rand 0.7.0", "serde"])})}, base=reader)
+        verdict, reasons = self.scope(reader, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/Cargo.lock is read by a crate: j (crates/j/tests/lock.rs:1)", reasons)
+
+    # --- symbolic links: git stores a link's target text, cargo reads the file the link names ---
+    # Each link's target text is itself an admissible change, so only the file mode separates these from "map".
+
+    def test_a_manifest_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/Cargo.lock": lock}, links=[("crates/m/Cargo.toml", self.M + 'serde = "1"\n')])
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
+    def test_a_manifest_that_was_a_symbolic_link_runs_the_full_suite(self):
+        linked = self.edit({}, links=[("crates/m/Cargo.toml", self.M)])
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": lock}, base=linked)
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "100644")
+        verdict, reasons = self.scope(linked, head, "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {linked}", reasons)
+
+    def test_a_lockfile_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])})
+        head = self.edit({}, links=[("crates/Cargo.lock", lock)])
+        self.assertEqual(self.git("ls-tree", head, "crates/Cargo.lock").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/Cargo.lock is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
+
 class ScopeStepTests(ScopeFixture):
     """The Classify job's Scope step: the path rules first, then the binary from main, never a failure."""
 
@@ -3482,7 +4043,7 @@ esac
         self.runner_temp.mkdir()
         self.gh_log = self.root / "gh.log"
 
-    def run_step(self, event_name, head, runs="201 202", artifact_runs="202"):
+    def run_step(self, event_name, head, runs="201 202", artifact_runs="202", extra_env=None):
         step = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
         match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
         self.assertIsNotNone(match)
@@ -3494,7 +4055,7 @@ esac
             env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
                  "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
                  "REPOSITORY": "o/r", "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
-                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake)},
+                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake), **(extra_env or {})},
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         lines = output.read_text().splitlines()
@@ -3516,7 +4077,7 @@ esac
     def test_the_path_rules_run_before_any_fetch(self):
         scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
-        self.assertIn("full suite: manifest: crates/k/Cargo.toml", log)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_other_events_are_never_scoped(self):
@@ -3525,6 +4086,70 @@ esac
             with self.subTest(event_name=event_name):
                 scope, log = self.run_step(event_name, head)
                 self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def train(self):
+        """Two commits after the tested base: k's source, then m's. The pushed head's parent holds only k's change."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        return self.commit("change crates/m/src/lib.rs")
+
+    def test_an_integration_push_is_scoped_from_the_tested_main_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": self.base})
+        self.assertEqual(scope, "j k m", log)
+        self.assertIn("kkernel from main push run 202", log)
+
+    def test_an_integration_push_without_a_tested_base_runs_the_full_suite(self):
+        head = self.train()
+        for tested_base in ("", None):
+            with self.subTest(tested_base=tested_base):
+                extra = {"REF": "refs/heads/integration/train-1"}
+                if tested_base is not None:
+                    extra["TESTED_BASE"] = tested_base
+                scope, log = self.run_step("push", head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no fully tested main commit is an ancestor of this push", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    # A scope script that scopes every change to crate k and leaves a mark when it runs.
+    LENIENT_SCOPE = ("import pathlib, sys\n"
+                     "pathlib.Path(__file__).with_name('lenient-ran').write_text(' '.join(sys.argv[1:]))\n"
+                     "print('map' if '--paths-only' in sys.argv else 'k')\n")
+
+    def lenient_scope_change(self):
+        """Crate k's source and m's, with a scope script that would scope both to k."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        self.write("scripts/ci-test-scope.py", self.LENIENT_SCOPE)
+        return self.commit("a lenient scope script beside crate source")
+
+    def test_a_change_that_edits_a_classifier_runs_the_full_suite_without_running_it(self):
+        head = self.lenient_scope_change()
+        for event_name, extra in (("pull_request", None),
+                                  ("push", {"REF": "refs/heads/integration/train-1", "TESTED_BASE": self.base})):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py\n", log)
+                self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_range_that_cannot_be_compared_counts_as_a_classifier_change(self):
+        head = self.train()
+        missing = "0" * 40
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": missing})
+        self.assertEqual(scope, "full", log)
+        self.assertIn(f"full suite: the path classifiers could not be compared with {missing}\n", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_main_push_is_never_scoped_even_with_a_tested_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/main", "TESTED_BASE": self.base})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: push runs on refs/heads/main are never scoped", log)
         self.assertEqual(self.gh_calls(), [])
 
     def test_an_unavailable_binary_runs_the_full_suite(self):
@@ -3607,6 +4232,7 @@ class BenchTrainScopeTests(ScopeFixture):
     def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
         scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
         self.assertEqual(scope, "full", log)
+        self.assertIn("manifest: crates/k/Cargo.toml changes features", log)
         self.assertEqual(self.gh_calls(), [])
         self.assertEqual(self.components(scope), set(self.COMPONENTS))
 
@@ -3761,6 +4387,24 @@ class OptionalWorkflowCodexSkipTests(unittest.TestCase):
                 self.assertIn(guard, condition.group(1))
         e2e = indented_block(indented_block(text, "jobs", 0), "e2e", 2)
         self.assertIn("!(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/'))", e2e)
+
+
+class PipelineGateCacheTests(unittest.TestCase):
+    """A pull request run can restore only a cache saved by its own ref or by main, so the pipeline gate saves
+    from main alone and main pushes run it; without that every run builds from cold against the time limit."""
+
+    def test_main_pushes_run_the_gate_and_only_main_saves_its_cache(self):
+        text = workflow_text("bench-pipeline.yml")
+        push = indented_block(indented_block(text, "on", 0), "push", 2)
+        branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+        self.assertIsNotNone(branches)
+        self.assertIn('"main"', branches.group(1))
+        job = indented_block(indented_block(text, "jobs", 0), "pipeline-gate", 2)
+        caches = [step for step in re.split(r"(?m)^      - ", job)[1:] if step.startswith("uses: Swatinem/rust-cache@")]
+        self.assertEqual(len(caches), 1)
+        self.assertEqual(re.findall(r"(?m)^          save-if: (.+)$", caches[0]),
+                         ["${{ github.ref == 'refs/heads/main' }}"])
+        self.assertEqual(re.findall(r"(?m)^    timeout-minutes: (.+)$", job), ["25"])
 
 
 if __name__ == "__main__":

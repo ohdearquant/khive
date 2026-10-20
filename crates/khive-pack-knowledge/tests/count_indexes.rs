@@ -65,12 +65,13 @@ async fn seed(runtime: &KhiveRuntime, events: i64, atoms: i64) {
 fn set_indexes(runtime: &KhiveRuntime, indexed: bool) {
     let writer = runtime.backend().pool().writer().unwrap();
     writer
-        .conn()
-        .execute_batch(if indexed {
-            include_str!("../../khive-db/sql/032-knowledge-count-indexes.sql")
-        } else {
-            "DROP INDEX IF EXISTS idx_events_ns_verb; \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(if indexed {
+                include_str!("../../khive-db/sql/032-knowledge-count-indexes.sql")
+            } else {
+                "DROP INDEX IF EXISTS idx_events_ns_verb; \
              DROP INDEX IF EXISTS idx_knowledge_atoms_ns_live_counts;"
+            })?)
         })
         .unwrap();
 }

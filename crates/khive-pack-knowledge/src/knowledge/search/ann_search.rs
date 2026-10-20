@@ -183,7 +183,14 @@ pub(super) fn normalize_rrf_score(raw: f32, source_count: usize, k: usize) -> f3
     if source_count == 0 {
         return 0.0;
     }
-    let theoretical_max = source_count as f32 / (k as f32 + 1.0);
+    let rank_one = khive_score::rrf_score_one_based(std::num::NonZeroUsize::MIN, k);
+    // Checked-add overflow or a reciprocal below fixed-point resolution
+    // leaves no normalization scale.
+    if rank_one == DeterministicScore::ZERO {
+        return 0.0;
+    }
+    let rank_one = rank_one.to_f64() as f32;
+    let theoretical_max = source_count as f32 * rank_one;
     (raw / theoretical_max).clamp(0.0, 1.0)
 }
 
@@ -329,4 +336,161 @@ pub(super) fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprec
 /// returning fewer than `limit` hits when the floor removes some is correct.
 pub(super) fn enforce_min_score_floor(hits: &mut Vec<ScoredHit>, min_score: f32) {
     hits.retain(|hit| hit.score >= min_score);
+}
+
+#[cfg(test)]
+mod rrf_normalization_tests {
+    use super::*;
+
+    fn legacy_normalization(raw: f32, source_count: usize, k: usize) -> f32 {
+        if source_count == 0 {
+            return 0.0;
+        }
+        let theoretical_max = source_count as f32 / (k as f32 + 1.0);
+        (raw / theoretical_max).clamp(0.0, 1.0)
+    }
+
+    fn assert_legacy_bits(raw: f32, source_count: usize, k: usize) {
+        let actual = normalize_rrf_score(raw, source_count, k);
+        let expected = legacy_normalization(raw, source_count, k);
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "raw={raw}, sources={source_count}, k={k}");
+        } else {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "raw={raw}, sources={source_count}, k={k}"
+            );
+        }
+    }
+
+    fn quantized_rank(rank: usize) -> DeterministicScore {
+        DeterministicScore::from_f64(1.0 / (60 + rank) as f64)
+    }
+
+    #[test]
+    fn rrf_normalization_keeps_legacy_bits_for_production_arms() {
+        assert_eq!(RRF_K, 60, "a new production k needs a new rounding proof");
+        let mut raw_scores = vec![
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -0.25,
+            0.001,
+            0.015,
+            0.025,
+            0.05,
+            1.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for rank in [1, 2, 7, 17, 4096] {
+            let score = quantized_rank(rank);
+            raw_scores.push(score.to_f64() as f32);
+            raw_scores.push((score + quantized_rank(3)).to_f64() as f32);
+        }
+        for source_count in 0..=2 {
+            for &raw in &raw_scores {
+                assert_legacy_bits(raw, source_count, RRF_K);
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_normalization_returns_zero_without_representable_rank_one() {
+        for source_count in [1, 2, 3] {
+            for raw in [0.001, 0.5, 1.0, f32::INFINITY, f32::NAN] {
+                assert_eq!(
+                    normalize_rrf_score(raw, source_count, usize::MAX).to_bits(),
+                    0.0f32.to_bits(),
+                    "checked-add overflow must not divide by a zero rank-one score"
+                );
+            }
+        }
+    }
+
+    fn hit(id: &str, provenance: ScoreProvenance) -> ScoredHit {
+        ScoredHit {
+            id: id.to_owned(),
+            slug: id.to_owned(),
+            name: id.to_owned(),
+            content: None,
+            tags: None,
+            atom_embed_text: None,
+            finalized: true,
+            is_domain: false,
+            status: None,
+            score: 0.5,
+            provenance,
+        }
+    }
+
+    #[test]
+    fn rrf_fusion_keeps_single_and_dual_arm_scores_and_floor() {
+        for lexical in [true, false] {
+            let provenance = if lexical {
+                ScoreProvenance::lexical()
+            } else {
+                ScoreProvenance::ann()
+            };
+            let source = vec![hit("first", provenance), hit("second", provenance)];
+            let (mut hits, ann) = if lexical {
+                (source, Vec::new())
+            } else {
+                (Vec::new(), source)
+            };
+            fuse_ann_hits(&mut hits, &ann, 0.0);
+            assert_eq!(
+                hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+            for (hit, rank) in hits.iter().zip([1, 2]) {
+                let expected = legacy_normalization(quantized_rank(rank).to_f64() as f32, 1, 60);
+                assert_eq!(hit.score.to_bits(), expected.to_bits());
+                assert_eq!(hit.provenance.lexical, lexical);
+                assert_eq!(hit.provenance.ann, !lexical);
+            }
+        }
+
+        let lexical = vec![
+            hit("lexical", ScoreProvenance::lexical()),
+            hit("shared", ScoreProvenance::lexical()),
+        ];
+        let ann = vec![
+            hit("ann", ScoreProvenance::ann()),
+            hit("shared", ScoreProvenance::ann()),
+        ];
+        let mut hits = lexical.clone();
+        fuse_ann_hits(&mut hits, &ann, 0.0);
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            ["shared", "ann", "lexical"]
+        );
+        let expected = [
+            legacy_normalization(
+                (quantized_rank(2) + quantized_rank(2)).to_f64() as f32,
+                2,
+                60,
+            ),
+            legacy_normalization(quantized_rank(1).to_f64() as f32, 2, 60),
+            legacy_normalization(quantized_rank(1).to_f64() as f32, 2, 60),
+        ];
+        for (hit, expected) in hits.iter().zip(expected) {
+            assert_eq!(hit.score.to_bits(), expected.to_bits());
+        }
+        assert!(hits[0].provenance.lexical && hits[0].provenance.ann);
+
+        let mut filtered = lexical;
+        fuse_ann_hits(&mut filtered, &ann, 0.75);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"],
+            "one-arm-only hits must not clear the two-arm normalized floor"
+        );
+    }
 }

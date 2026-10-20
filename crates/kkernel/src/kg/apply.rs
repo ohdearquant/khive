@@ -23,6 +23,17 @@ pub(super) async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     {
         bail!("operation {index}: merge is KnownUnimplemented for canonical apply");
     }
+    if let Some(op_index) = changeset
+        .ops
+        .iter()
+        .position(|op| matches!(op, Op::Restore(_)))
+    {
+        return Err(khive_runtime::RuntimeError::CanonicalUnsupportedOperation {
+            op_index,
+            operation: "restore",
+        }
+        .into());
+    }
     let rules = validate::load_rules(&args.rules).context("loading apply rules")?;
     let rule_results = commit::run_commit_time_rules_with_rules(&changeset, &rules)
         .context("running commit-time rule pass")?;
@@ -196,7 +207,7 @@ mod tests {
     use serde_json::{json, Value};
 
     fn changeset(ops: &[Value]) -> khive_changeset::ChangeSet {
-        let envelope = json!({"schema_version":1,"producer":"fixture",
+        let envelope = json!({"schema_version":khive_changeset::CURRENT_SCHEMA_VERSION,"producer":"fixture",
             "producer_model_family":"fixture-family","staged_at":1_000_000});
         let mut delta = format!("{envelope}\n");
         for op in ops {

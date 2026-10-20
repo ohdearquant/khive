@@ -299,6 +299,30 @@ impl WriteAdmission {
 /// A writer connection checked out from the pool.
 /// The Mutex ensures only one writer at a time.
 ///
+/// Checkout retains exclusion; each consuming operation samples capacity at
+/// its execution boundary. Raw connection access is not a public capability:
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw(pool: &ConnectionPool) {
+///     let writer = pool.writer().unwrap();
+///     let _connection = writer.conn();
+/// }
+/// ```
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw_mut(pool: &ConnectionPool) {
+///     let mut writer = pool.writer().unwrap();
+///     let _connection = writer.conn_mut();
+/// }
+/// ```
+/// ```compile_fail
+/// use khive_db::ConnectionPool;
+/// fn raw_mut(pool: &ConnectionPool) {
+///     let mut writer = pool.writer().unwrap();
+///     let _connection: &mut rusqlite::Connection = &mut *writer;
+/// }
+/// ```
+///
 /// # Terminal settlement
 /// Dropping a retired writer settles its connection before the volume lease is
 /// released. If cleanup cannot restore autocommit and owned SQLite close also
@@ -331,6 +355,10 @@ impl PooledAutocommitWriteUnit<'_> {
     pub(crate) fn conn(&self) -> &Connection {
         self.writer.conn()
     }
+
+    pub(crate) fn rollback_or_retire(&self, context: &str) -> Result<(), SqliteError> {
+        self.writer.rollback_or_retire(context)
+    }
 }
 
 /// One pooled transaction after lease, BEGIN, and capacity admission. The
@@ -345,16 +373,28 @@ impl PooledTransactionWriteUnit<'_> {
     }
 }
 
-/// One standalone transaction on an owned connection. Settlement (autocommit
+/// One standalone write unit on an owned connection. Settlement (autocommit
 /// or successful owned close) precedes release of the volume lease, including
 /// when the operation unwinds or its initial rollback fails.
-pub(crate) struct StandaloneTransactionWriteUnit {
+pub(crate) struct StandaloneWriteUnit {
     conn: Option<Connection>,
     admission: Arc<WriteAdmission>,
     _volume_lease: Option<VolumeLease>,
 }
 
-impl StandaloneTransactionWriteUnit {
+impl StandaloneWriteUnit {
+    pub(super) fn new(
+        conn: Connection,
+        admission: Arc<WriteAdmission>,
+        volume_lease: Option<VolumeLease>,
+    ) -> Self {
+        Self {
+            conn: Some(conn),
+            admission,
+            _volume_lease: volume_lease,
+        }
+    }
+
     pub(crate) fn conn(&self) -> &Connection {
         self.conn
             .as_ref()
@@ -362,7 +402,7 @@ impl StandaloneTransactionWriteUnit {
     }
 }
 
-impl Drop for StandaloneTransactionWriteUnit {
+impl Drop for StandaloneWriteUnit {
     fn drop(&mut self) {
         let conn = self
             .conn
@@ -527,7 +567,10 @@ impl<'pool> WriterGuard<'pool> {
                 "pooled autocommit write began on a connection in a transaction".to_string(),
             ));
         }
-        if self._volume_lease.is_none() && self.pool.canonical_path().is_some() {
+        if self._volume_lease.is_none()
+            && self.pool.canonical_path().is_some()
+            && !self.pool.config.read_only
+        {
             return Err(SqliteError::InvalidData(
                 "checkpoint writer checkout cannot admit a logical write".to_string(),
             ));
@@ -536,45 +579,110 @@ impl<'pool> WriterGuard<'pool> {
         Ok(PooledAutocommitWriteUnit { writer: self })
     }
 
-    /// Returns a shared reference to the underlying connection.
-    pub fn conn(&self) -> &Connection {
+    /// Borrow inside an already owned internal write boundary.
+    pub(crate) fn conn(&self) -> &Connection {
         &self.guard
     }
 
-    /// Returns a mutable reference to the underlying connection.
-    pub fn conn_mut(&mut self) -> &mut Connection {
+    /// Borrow for the internal migration owner that retains this guard.
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.guard
     }
 
+    /// Own one autocommit operation or complete SQL script.
+    ///
+    /// Capacity is checked immediately before the callback. A script must
+    /// finish every transaction it starts; an unfinished one is rolled back
+    /// and refused. The consumed guard retains its lease through settlement,
+    /// including if the callback unwinds.
+    ///
+    /// ```no_run
+    /// use khive_db::{ConnectionPool, SqliteError};
+    /// fn seed(pool: &ConnectionPool) -> Result<(), SqliteError> {
+    ///     pool.writer()?.autocommit(|conn| {
+    ///         conn.execute_batch("CREATE TABLE example(value INTEGER)")?;
+    ///         Ok(())
+    ///     })
+    /// }
+    /// ```
+    /// The callback cannot return a connection borrow:
+    /// ```compile_fail
+    /// use khive_db::ConnectionPool;
+    /// fn escape(pool: &ConnectionPool) {
+    ///     let _connection = pool.writer().unwrap().autocommit(|conn| Ok(conn));
+    /// }
+    /// ```
+    pub fn autocommit<R>(
+        self,
+        operation: impl FnOnce(&Connection) -> Result<R, SqliteError>,
+    ) -> Result<R, SqliteError> {
+        let unit = self.admit_autocommit()?;
+        let result = operation(unit.conn()).map_err(statement_error);
+        if unit.conn().is_autocommit() {
+            return result;
+        }
+        if unit
+            .writer
+            .rollback_or_retire("autocommit script left its transaction open")
+            .is_err()
+        {
+            return Err(match result {
+                Err(error) => SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Statement,
+                ),
+                Ok(_) => SqliteError::WriterSettlementUnknown,
+            });
+        }
+        result.and(Err(SqliteError::InvalidData(
+            "pooled script left a transaction open; rolled back".into(),
+        )))
+    }
+
+    /// Run a native SQLite fixture operation through the usual autocommit owner.
+    ///
+    /// Available only to test builds and dependents enabling `test-support`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn autocommit_sqlite<R>(
+        self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, SqliteError> {
+        self.autocommit(|conn| operation(conn).map_err(Into::into))
+    }
+
     /// Execute a write transaction.
-    /// Wraps the closure in BEGIN IMMEDIATE ... COMMIT.
-    pub fn transaction<F, R>(&self, f: F) -> Result<R, SqliteError>
+    /// Consumes this guard through BEGIN IMMEDIATE, post-BEGIN admission and
+    /// COMMIT/ROLLBACK. The callback must not settle the outer transaction itself.
+    ///
+    /// # Panics
+    ///
+    /// A callback panic propagates to the caller. During unwinding, this guard
+    /// attempts rollback or retirement before releasing its volume lease and
+    /// registered transaction evidence.
+    pub fn transaction<F, R>(self, f: F) -> Result<R, SqliteError>
     where
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
-        if self._volume_lease.is_none() && self.pool.canonical_path().is_some() {
+        let mut tx_handle = None;
+        let writer = self;
+        if writer._volume_lease.is_none()
+            && writer.pool.canonical_path().is_some()
+            && !writer.pool.config.read_only
+        {
             return Err(SqliteError::InvalidData(
                 "checkpoint writer checkout cannot start a logical transaction".to_string(),
             ));
         }
-        self.guard
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|error| {
-                SqliteError::write(error, khive_storage::error::SqliteWriteStage::Begin)
-            })?;
-        if let Err(error) = self.admission.check() {
-            self.rollback_or_retire("capacity admission")?;
-            return Err(error);
-        }
-        let _tx_handle = khive_storage::tx_registry::register_scoped(
+        writer.begin_admitted_transaction()?;
+        let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
             Some("writer_guard_tx".to_string()),
-            self.origin.clone(),
-        );
+            writer.origin.clone(),
+        ));
 
-        match f(&self.guard) {
+        match f(&writer.guard) {
             Ok(result) => {
-                if let Err(err) = self.guard.execute_batch("COMMIT") {
-                    if self.rollback_or_retire("commit failure").is_err() {
+                if let Err(err) = writer.guard.execute_batch("COMMIT") {
+                    if writer.rollback_or_retire("commit failure").is_err() {
                         return Err(SqliteError::settlement_with_cause(
                             &err,
                             khive_storage::error::SqliteWriteStage::Commit,
@@ -585,10 +693,17 @@ impl<'pool> WriterGuard<'pool> {
                         khive_storage::error::SqliteWriteStage::Commit,
                     ));
                 }
+                if !writer.guard.is_autocommit() {
+                    writer.pool.retire_pooled_writer(&writer.guard);
+                    return Err(SqliteError::WriterSettlementUnknown);
+                }
                 Ok(result)
             }
             Err(err) => {
-                if self.rollback_or_retire("transaction body failure").is_err() {
+                if writer
+                    .rollback_or_retire("transaction body failure")
+                    .is_err()
+                {
                     return Err(SqliteError::settlement_with_cause(
                         &err,
                         khive_storage::error::SqliteWriteStage::Statement,
@@ -604,9 +719,34 @@ impl<'pool> WriterGuard<'pool> {
         }
     }
 
+    /// Acquire SQLite's writer slot before sampling logical-write capacity.
+    fn begin_admitted_transaction(&self) -> Result<(), SqliteError> {
+        if !self.guard.is_autocommit() {
+            self.pool.retire_pooled_writer(&self.guard);
+            return Err(SqliteError::InheritedWriterTransaction);
+        }
+        if let Err(error) = self.guard.execute_batch("BEGIN IMMEDIATE") {
+            if !self.guard.is_autocommit() {
+                self.pool.retire_pooled_writer(&self.guard);
+                return Err(SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Begin,
+                ));
+            }
+            return Err(SqliteError::write(
+                error,
+                khive_storage::error::SqliteWriteStage::Begin,
+            ));
+        }
+        if let Err(error) = self.admission.check() {
+            self.rollback_or_retire("capacity admission")?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn rollback_or_retire(&self, context: &str) -> Result<(), SqliteError> {
-        let rollback = self.guard.execute_batch("ROLLBACK");
-        if rollback.is_err() || !self.guard.is_autocommit() {
+        if !crate::connection_settlement::rollback_proves_autocommit(&self.guard) {
             self.pool.retire_pooled_writer(&self.guard);
             tracing::error!(context, "pooled writer rollback did not prove autocommit");
             return Err(SqliteError::WriterSettlementUnknown);
@@ -625,7 +765,7 @@ impl crate::migrations::MigrationTransactions for PooledMigrationTransactions<'_
         &mut self,
         operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
     ) -> Result<T, SqliteError> {
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let result = operation(writer.conn_mut());
         if writer.guard.is_autocommit() {
             return result;
@@ -655,54 +795,108 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-impl<'pool> Deref for WriterGuard<'pool> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn()
-    }
-}
-
-impl<'pool> DerefMut for WriterGuard<'pool> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn_mut()
-    }
-}
-
 impl ConnectionPool {
+    /// Run one standalone autocommit operation or complete SQL script.
+    ///
+    /// The connection and volume lease remain owned by this call. Capacity
+    /// is checked immediately before the callback. A script may contain
+    /// complete transactions, but returning with a transaction still open
+    /// rolls it back and reports an error. Use [`Self::standalone_transaction`]
+    /// when this API should own BEGIN IMMEDIATE and COMMIT instead.
+    ///
+    /// The callback cannot return a connection borrow:
+    /// ```compile_fail
+    /// use khive_db::ConnectionPool;
+    /// fn escape(pool: &ConnectionPool) {
+    ///     let _connection = pool.standalone_autocommit(|conn| Ok(conn));
+    /// }
+    /// ```
+    #[track_caller]
+    pub fn standalone_autocommit<R>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<R, SqliteError>,
+    ) -> Result<R, SqliteError> {
+        let unit = self.standalone_write_unit()?;
+        self.write_admission.check()?;
+        let result = operation(unit.conn()).map_err(statement_error);
+        if unit.conn().is_autocommit() {
+            return result;
+        }
+        if !crate::connection_settlement::rollback_proves_autocommit(unit.conn()) {
+            return Err(match result {
+                Err(error) => SqliteError::settlement_with_cause(
+                    &error,
+                    khive_storage::error::SqliteWriteStage::Statement,
+                ),
+                Ok(_) => SqliteError::WriterSettlementUnknown,
+            });
+        }
+        result.and(Err(SqliteError::InvalidData(
+            "standalone script left a transaction open; rolled back".into(),
+        )))
+    }
+
+    /// Run a standalone BEGIN IMMEDIATE transaction under the volume lease.
+    ///
+    /// Capacity is sampled after BEGIN succeeds and before the callback.
+    /// This call owns COMMIT/ROLLBACK; the callback must not settle the outer
+    /// transaction itself. A panic drops the owned connection before the
+    /// lease can be released.
+    #[track_caller]
+    pub fn standalone_transaction<R>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<R, SqliteError>,
+    ) -> Result<R, SqliteError> {
+        let mut tx_handle = None;
+        let unit = self.standalone_transaction_write_unit()?;
+        let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
+            Some("standalone_transaction".into()),
+            self.origin(),
+        ));
+        match operation(unit.conn()).map_err(statement_error) {
+            Ok(value) => match unit.conn().execute_batch("COMMIT") {
+                Ok(()) if unit.conn().is_autocommit() => Ok(value),
+                Ok(()) => Err(SqliteError::WriterSettlementUnknown),
+                Err(error) => {
+                    if unit.conn().execute_batch("ROLLBACK").is_err()
+                        || !unit.conn().is_autocommit()
+                    {
+                        return Err(SqliteError::settlement_with_cause(
+                            &error,
+                            khive_storage::error::SqliteWriteStage::Commit,
+                        ));
+                    }
+                    Err(SqliteError::write(
+                        error,
+                        khive_storage::error::SqliteWriteStage::Commit,
+                    ))
+                }
+            },
+            Err(error) => {
+                if unit.conn().execute_batch("ROLLBACK").is_err() || !unit.conn().is_autocommit() {
+                    return Err(SqliteError::settlement_with_cause(
+                        &error,
+                        khive_storage::error::SqliteWriteStage::Statement,
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
     #[track_caller]
     pub(crate) fn autocommit_write_unit(
         &self,
     ) -> Result<PooledAutocommitWriteUnit<'_>, SqliteError> {
-        self.writer_for_admitted_operation()?.admit_autocommit()
+        self.writer()?.admit_autocommit()
     }
 
     #[track_caller]
     pub(crate) fn transaction_write_unit(
         &self,
     ) -> Result<super::PooledTransactionWriteUnit<'_>, SqliteError> {
-        let writer = self.writer_for_admitted_operation()?;
-        if !writer.guard.is_autocommit() {
-            writer.pool.retire_pooled_writer(&writer.guard);
-            return Err(SqliteError::InheritedWriterTransaction);
-        }
-        if let Err(error) = writer.guard.execute_batch("BEGIN IMMEDIATE") {
-            if !writer.guard.is_autocommit() {
-                writer.pool.retire_pooled_writer(&writer.guard);
-                return Err(SqliteError::settlement_with_cause(
-                    &error,
-                    khive_storage::error::SqliteWriteStage::Begin,
-                ));
-            }
-            return Err(SqliteError::write(
-                error,
-                khive_storage::error::SqliteWriteStage::Begin,
-            ));
-        }
-        if let Err(error) = writer.admission.check() {
-            writer.rollback_or_retire("capacity admission")?;
-            return Err(error);
-        }
+        let writer = self.writer()?;
+        writer.begin_admitted_transaction()?;
         Ok(PooledTransactionWriteUnit { writer })
     }
 
@@ -787,22 +981,59 @@ impl ConnectionPool {
     #[track_caller]
     pub(crate) fn standalone_transaction_write_unit(
         &self,
-    ) -> Result<super::StandaloneTransactionWriteUnit, SqliteError> {
-        if self.config.read_only {
-            return Err(SqliteError::InvalidData(
-                "database is read-only: standalone write transactions are not permitted".into(),
-            ));
+    ) -> Result<super::StandaloneWriteUnit, SqliteError> {
+        let unit = self.standalone_write_unit()?;
+        self.begin_standalone_transaction(unit)
+    }
+
+    /// The SQL bridge's complete standalone transaction owner. Configure the
+    /// connection before BEGIN, then retain its lease through settlement.
+    #[track_caller]
+    pub(crate) fn standalone_sql_bridge_transaction_write_unit(
+        &self,
+    ) -> Result<super::StandaloneWriteUnit, StorageError> {
+        let unit = self
+            .standalone_write_unit()
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+        for (name, value) in [
+            ("cache_size", sqlite_cache_size_pragma()),
+            ("mmap_size", sqlite_mmap_size_pragma()),
+        ] {
+            unit.conn()
+                .pragma_update(None, name, value)
+                .map_err(|error| {
+                    StorageError::driver(StorageCapability::Sql, "open_writer", error)
+                })?;
         }
-        let volume_lease = self.write_admission.acquire()?;
-        let conn = self.open_standalone_writer_for_admitted_operation()?;
-        let unit = StandaloneTransactionWriteUnit {
-            conn: Some(conn),
-            admission: Arc::clone(&self.write_admission),
-            _volume_lease: volume_lease,
-        };
-        if !unit.conn().is_autocommit() {
-            return Err(SqliteError::WriterSettlementUnknown);
-        }
+        self.begin_standalone_transaction(unit)
+            .map_err(|error| match error {
+                SqliteError::Write { stage, source } => {
+                    crate::timeout_sink::maybe_emit_busy(
+                        &crate::timeout_sink::db_label(self),
+                        crate::timeout_sink::Site::StandaloneSqlBridge,
+                        &source,
+                    );
+                    crate::error::with_write_stage(
+                        StorageError::driver(StorageCapability::Sql, "execute", source),
+                        stage,
+                    )
+                }
+                SqliteError::Rusqlite(source) => {
+                    crate::timeout_sink::maybe_emit_busy(
+                        &crate::timeout_sink::db_label(self),
+                        crate::timeout_sink::Site::StandaloneSqlBridge,
+                        &source,
+                    );
+                    StorageError::driver(StorageCapability::Sql, "execute", source)
+                }
+                error => error.into_storage_error(StorageCapability::Sql, "execute"),
+            })
+    }
+
+    fn begin_standalone_transaction(
+        &self,
+        unit: StandaloneWriteUnit,
+    ) -> Result<StandaloneWriteUnit, SqliteError> {
         if let Err(error) = unit.conn().execute_batch("BEGIN IMMEDIATE") {
             if !unit.conn().is_autocommit() {
                 return Err(SqliteError::settlement_with_cause(
@@ -824,3 +1055,20 @@ impl ConnectionPool {
         Ok(unit)
     }
 }
+
+fn statement_error(error: SqliteError) -> SqliteError {
+    match error {
+        SqliteError::Rusqlite(error) => {
+            SqliteError::write(error, khive_storage::error::SqliteWriteStage::Statement)
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+#[path = "standalone_write_tests.rs"]
+mod standalone_write_tests;
+
+#[cfg(test)]
+#[path = "pooled_write_tests.rs"]
+mod pooled_write_tests;

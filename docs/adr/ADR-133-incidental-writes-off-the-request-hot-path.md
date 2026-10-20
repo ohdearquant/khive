@@ -1051,3 +1051,41 @@ Acceptance requires direct/socket/mixed-plane parity, a controlled old-peer deco
 refusal proving no fallback, protocol-version rejection, namespace/row/frame guards,
 and read-only missing-lane behavior. Existing audit obligation, event count/debug
 and split-store tests remain applicable.
+
+## Amendment 9 (2026-10-19): What an operator reads for an abandoned or shed generation
+
+**Status**: Accepted (2026-10-19).
+
+The INV-1 "Named exceptions" paragraph and Amendment 6 tell an operator to read an abandoned or
+shed generation from its generation snapshot: `terminal_reason = DriverAppendAbandoned` or
+`StoreWedged`, `committed_rows = 0`, and the snapshot's row count as the upper bound on what was
+lost. That snapshot is retained only in builds compiled with `test` or the `test-internals`
+feature. In an ordinary build the per-generation record is discarded, so no operator surface
+carries a per-generation terminal reason or row count. This amendment replaces that operator
+instruction. The abandonment, shedding and non-retry behavior those sections define is unchanged.
+
+An operator reads, instead:
+
+1. **The submitting call's result.** Every waiter on an abandoned generation receives
+   `Err(AuditTerminalReason::DriverAppendAbandoned)`, and every waiter on a shed generation
+   receives `Err(AuditTerminalReason::StoreWedged)`. How a producer surfaces that reason follows its
+   class under D2 and Amendments 3 to 5.
+2. **`db_diagnostics` writer-contention fields.** `audit_batch_flush_failures` increments once per
+   abandoned or shed generation. It also counts the other terminal non-commit outcomes, so it counts
+   failed generations of every kind, not this path alone. `audit_degraded_rows` counts the
+   pure-observability rows released on these paths. On the abandon and shed paths `audit_degraded`
+   is set only through such a row: a generation holding only obligation-bearing rows increments
+   `audit_batch_flush_failures` and leaves `audit_degraded` as it was.
+3. **The process log.** The driver writes one warning per abandoned generation ("audit generation
+   append exceeded the driver's own bound; abandoning this generation ...") and one per shed
+   generation ("audit store treated as wedged ..."). Neither line carries a row count.
+4. **In-process health metrics.** An embedder holding the batch (`audit_batch_handle()`) reads
+   `AuditBatch::health_metrics()`: `flush_failures`, `degraded_rows` and `degraded` as above, plus
+   `late_append_commits` and `late_append_failures`, which count detached abandoned appends that
+   later committed or failed. These two counters are not carried into `db_diagnostics`.
+
+**Loss bound.** A generation drains at most `max_rows_per_generation` rows (default 256), so each
+abandoned or shed generation loses at most that many. The number of such generations is the count
+of the two warning lines above. An abandoned generation whose detached append later commits (one
+`late_append_commits` increment) lost nothing. A shed generation is lost with certainty. The
+generation snapshot is not the instrument for this bound in an ordinary build.

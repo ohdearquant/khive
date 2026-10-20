@@ -34,6 +34,7 @@ impl Fixture {
         );
         pool.try_writer()
             .unwrap()
+            .conn()
             .execute_batch("CREATE TABLE direct_busy_fixture (id INTEGER PRIMARY KEY)")
             .unwrap();
         Self {
@@ -60,6 +61,7 @@ impl Fixture {
         self.pool
             .try_writer()
             .unwrap()
+            .conn()
             .query_row(COUNT, [], |r| r.get(0))
             .unwrap()
     }
@@ -274,7 +276,7 @@ where
         0
     );
     assert!(
-        primary.pool.try_writer().unwrap().is_autocommit(),
+        primary.pool.try_writer().unwrap().conn().is_autocommit(),
         "rollback must retain a reusable writer"
     );
     assert!(!holder.is_autocommit());
@@ -334,7 +336,12 @@ where
         0,
         "COMMIT metadata does not add a native SQLite cause to the source chain"
     );
-    assert!(commit_primary.pool.try_writer().unwrap().is_autocommit());
+    assert!(commit_primary
+        .pool
+        .try_writer()
+        .unwrap()
+        .conn()
+        .is_autocommit());
     assert!(
         !reader.is_autocommit(),
         "read lock spans COMMIT and rollback"

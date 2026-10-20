@@ -47,7 +47,12 @@ fn assert_summary(output: &Output, entities: usize, edges: usize, entries: usize
         summary,
         json!({
             "entities_imported": entities,
+            "entities_inserted": entities,
+            "entities_updated": 0,
+            "entities_skipped": 0,
             "edges_imported": edges,
+            "edges_inserted": edges,
+            "edges_updated": 0,
             "edges_skipped": 0,
             "embedding_truncation": {"truncated": 0, "discarded_bytes": 0},
             "adapter": {

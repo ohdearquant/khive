@@ -71,24 +71,27 @@ impl Fixture {
         .expect("migrate private vector fixture");
         {
             let writer = runtime.backend().pool().writer().expect("substrate writer");
-            for (index, deleted_at) in [(1, None), (3, Some(2_i64))] {
-                writer
-                    .execute(
-                        "INSERT INTO entities \
+            writer
+                .autocommit(|conn| {
+                    for (index, deleted_at) in [(1, None), (3, Some(2_i64))] {
+                        conn.execute(
+                            "INSERT INTO entities \
                          (id, namespace, kind, name, created_at, updated_at, deleted_at) \
                          VALUES (?1, 'a', 'concept', 'Vector fixture entity', 1, 1, ?2)",
-                        (id(index).to_string(), deleted_at),
-                    )
-                    .expect("seed live and soft-deleted entities");
-            }
-            writer
-                .execute(
-                    "INSERT INTO notes \
+                            (id(index).to_string(), deleted_at),
+                        )
+                        .expect("seed live and soft-deleted entities");
+                    }
+                    conn.execute(
+                        "INSERT INTO notes \
                      (id, namespace, kind, content, created_at, updated_at) \
                      VALUES (?1, 'a', 'observation', 'Live vector fixture note', 1, 1)",
-                    [id(2).to_string()],
-                )
-                .expect("seed live note");
+                        [id(2).to_string()],
+                    )
+                    .expect("seed live note");
+                    Ok(())
+                })
+                .expect("seed substrate scope");
         }
 
         let models: BTreeSet<&str> = engines.iter().copied().collect();
@@ -124,19 +127,23 @@ impl Fixture {
     async fn seed_atom_vectors(&self, model_name: &str) {
         {
             let writer = self.runtime.backend().pool().writer().expect("atom writer");
-            for (index, slug, deleted_at) in [
-                (6, "live-vector-atom", None),
-                (7, "deleted-vector-atom", Some(2_i64)),
-            ] {
-                writer
-                    .execute(
-                        "INSERT INTO knowledge_atoms \
+            writer
+                .autocommit(|conn| {
+                    for (index, slug, deleted_at) in [
+                        (6, "live-vector-atom", None),
+                        (7, "deleted-vector-atom", Some(2_i64)),
+                    ] {
+                        conn.execute(
+                            "INSERT INTO knowledge_atoms \
                          (id, namespace, slug, name, created_at, updated_at, deleted_at) \
                          VALUES (?1, 'a', ?2, ?2, 1, 1, ?3)",
-                        (id(index).to_string(), slug, deleted_at),
-                    )
-                    .expect("seed live and soft-deleted knowledge atoms");
-            }
+                            (id(index).to_string(), slug, deleted_at),
+                        )
+                        .expect("seed live and soft-deleted knowledge atoms");
+                    }
+                    Ok(())
+                })
+                .expect("seed atom scope");
         }
 
         let model: EmbeddingModel = model_name.parse().expect("supported fixture model");
@@ -180,20 +187,24 @@ impl Fixture {
             .pool()
             .writer()
             .expect("vector snapshot connection");
-        let mut statement = writer
-            .conn()
-            .prepare(&format!(
-                "SELECT subject_id, namespace FROM vec_{} ORDER BY subject_id",
-                model_key(model)
-            ))
-            .expect("prepare vector row snapshot");
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        writer
+            .autocommit(|conn| {
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT subject_id, namespace FROM vec_{} ORDER BY subject_id",
+                        model_key(model)
+                    ))
+                    .expect("prepare vector row snapshot");
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .expect("read vector rows")
+                    .collect::<Result<_, _>>()
+                    .expect("collect vector row snapshot");
+                Ok(rows)
             })
-            .expect("read vector rows")
-            .collect::<Result<_, _>>()
-            .expect("collect vector row snapshot")
+            .expect("vector snapshot scope")
     }
 
     fn row_count(&self, model: &str) -> u64 {

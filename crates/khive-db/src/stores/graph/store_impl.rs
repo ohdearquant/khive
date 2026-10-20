@@ -3,10 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use khive_storage::graph::{
-    CommitAnnotationGuard, CommitAnnotationInsertOutcome, SymmetricEdgeUpdateOutcome,
-    SymmetricEdgeUpdateRequest,
-};
+use khive_storage::graph::{SymmetricEdgeUpdateOutcome, SymmetricEdgeUpdateRequest};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRefusal, EdgeUpsertRequest,
@@ -33,7 +30,6 @@ use super::edge_statements::{
     edge_replace_if_unchanged_statement, edge_soft_delete_statement,
     purge_incident_edges_statement,
 };
-use super::edge_upserts::conditional_commit_annotation_insert;
 use super::traversal::{run_bounded_traversal, traversal_neighbor_sql, traversal_timeout_error};
 use super::{
     map_err, report_graph_usage, resurrection_required_error, SqlGraphStore,
@@ -139,51 +135,6 @@ impl GraphStore for SqlGraphStore {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
-        })
-        .await
-    }
-
-    async fn insert_commit_annotation_if_absent(
-        &self,
-        edge: Edge,
-        guard: CommitAnnotationGuard,
-    ) -> Result<CommitAnnotationInsertOutcome, StorageError> {
-        const OP: &str = "insert_commit_annotation_if_absent";
-        if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
-            return Err(StorageError::InvalidInput {
-                capability: StorageCapability::Graph,
-                operation: OP.into(),
-                message: "expected a live annotates edge".into(),
-            });
-        }
-        if let Some(writer_task) = self.current_writer_task(OP)? {
-            return writer_task
-                .send_bounded_at(
-                    move |conn| {
-                        conditional_commit_annotation_insert(conn, edge, &guard)
-                            .map_err(|error| map_err(error, OP))
-                    },
-                    OP,
-                )
-                .await;
-        }
-        let origin = self.pool.origin();
-        self.with_writer(OP, move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register_scoped(Some(OP.to_string()), origin);
-            let outcome = match conditional_commit_annotation_insert(conn, edge, &guard) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(error);
-                }
-            };
-            if let Err(error) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-            Ok(outcome)
         })
         .await
     }

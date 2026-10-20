@@ -23,6 +23,9 @@ use super::{
     SubstrateCoordinator, SubstrateCoordinatorService,
 };
 
+#[path = "link_inference_tests.rs"]
+mod link_inference_tests;
+
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
 }

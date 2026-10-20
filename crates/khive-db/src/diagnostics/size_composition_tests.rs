@@ -173,7 +173,11 @@ async fn size_composition_metadata_failure_is_explicit_and_fail_closed() {
 #[test]
 fn size_composition_keeps_admission_and_walk_in_one_snapshot() {
     let (_directory, pool, path) = fixture();
-    let conn = pool.open_standalone_writer_untracked().expect("reader");
+    let conn = pool
+        .open_standalone_reader(
+            crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
+        )
+        .expect("reader");
     let before = collect(&conn, true);
     let pages = before.page_accounting.expect("initial accounting");
     let exact_before = before.size_composition.expect("initial exact composition");
@@ -238,7 +242,11 @@ fn size_composition_keeps_admission_and_walk_in_one_snapshot() {
 #[test]
 fn size_composition_releases_snapshot_on_every_outcome() {
     let (_directory, pool, _path) = fixture();
-    let conn = pool.open_standalone_writer_untracked().expect("reader");
+    let conn = pool
+        .open_standalone_reader(
+            crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
+        )
+        .expect("reader");
     for outcome in ["success", "skip", "metadata", "dbstat", "not_requested"] {
         let _hooks = test_support::install(Hooks {
             budget: (outcome == "skip").then_some(Budget { pages: 0, bytes: 0 }),
@@ -282,7 +290,11 @@ fn size_composition_releases_snapshot_on_every_outcome() {
 #[test]
 fn size_composition_cleanup_failure_cannot_report_success() {
     let (_directory, pool, _path) = fixture();
-    let conn = pool.open_standalone_writer_untracked().expect("reader");
+    let conn = pool
+        .open_standalone_reader(
+            crate::pool::StandaloneReaderPurpose::DiagnosticsIndependentSnapshot,
+        )
+        .expect("reader");
     conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
         AuthAction::Transaction {
             operation: TransactionOperation::Rollback,

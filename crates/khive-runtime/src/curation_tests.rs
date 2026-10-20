@@ -21,7 +21,9 @@ fn set_merge_event_refusal(rt: &KhiveRuntime, kind: &str, refuse: bool) {
     } else {
         "DROP TRIGGER reject_merge_event".to_string()
     };
-    guard.conn().execute_batch(&sql).expect("set event fault");
+    guard
+        .autocommit(|conn| Ok(conn.execute_batch(&sql)?))
+        .expect("set event fault");
 }
 
 async fn seed_health_identity_note(runtime: &KhiveRuntime, slug: &str) -> Note {
@@ -2457,10 +2459,12 @@ async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
     tokio::task::spawn_blocking(move || {
         let guard = pool.writer().expect("writer connection");
         guard
-            .execute(
-                "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![future_micros, id_str],
-            )
+            .autocommit(|conn| {
+                Ok(conn.execute(
+                    "UPDATE entities SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![future_micros, id_str],
+                )?)
+            })
             .expect("force future revision")
     })
     .await
@@ -5383,12 +5387,13 @@ async fn merge_entity_tombstones_source_with_provenance() {
         tokio::task::spawn_blocking(move || {
             let guard = pool.writer().unwrap();
             guard
-                .conn()
-                .query_row(
-                    "SELECT deleted_at, merged_into FROM entities WHERE id = ?1",
-                    [from_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
+                .autocommit(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT deleted_at, merged_into FROM entities WHERE id = ?1",
+                        [from_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?)
+                })
                 .unwrap()
         })
         .await
@@ -10721,4 +10726,373 @@ async fn note_merge_dry_run_does_not_recapture_an_earlier_planned_cascade() {
         ],
     )
     .await;
+}
+
+struct MergeFtsFixture {
+    runtime: KhiveRuntime,
+    notes: bool,
+    ids: [Uuid; 3],
+}
+
+impl MergeFtsFixture {
+    async fn new(notes: bool) -> Self {
+        let runtime = rt(); // No embedding provider: postcommit reindex cannot repair a bad map.
+        let token = NamespaceToken::local();
+        let mut ids = Vec::new();
+        for name in ["retained", "absorbed", "unrelated"] {
+            ids.push(if notes {
+                runtime
+                    .create_note(&token, "observation", None, name, None, None, vec![])
+                    .await
+                    .unwrap()
+                    .id
+            } else {
+                runtime
+                    .create_entity(&token, "concept", None, name, Some(name), None, vec![])
+                    .await
+                    .unwrap()
+                    .id
+            });
+        }
+        let relation = if notes {
+            EdgeRelation::Refutes
+        } else {
+            EdgeRelation::Extends
+        };
+        runtime
+            .link(&token, ids[0], ids[1], relation, 1.0, None)
+            .await
+            .unwrap();
+        runtime
+            .link(&token, ids[1], ids[2], relation, 0.5, None)
+            .await
+            .unwrap();
+        Self {
+            runtime,
+            notes,
+            ids: ids.try_into().unwrap(),
+        }
+    }
+
+    fn table(&self) -> &'static str {
+        if self.notes {
+            "fts_notes"
+        } else {
+            "fts_entities"
+        }
+    }
+
+    fn execute(&self, sql: &str) {
+        self.runtime
+            .backend()
+            .pool_arc()
+            .writer()
+            .unwrap()
+            .autocommit(|conn| Ok(conn.execute_batch(sql)?))
+            .unwrap();
+    }
+
+    fn rows(&self, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        self.runtime
+            .backend()
+            .pool_arc()
+            .writer()
+            .unwrap()
+            .autocommit(|conn| {
+                let mut statement = conn.prepare(sql)?;
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    fn snapshot(&self) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let mut rows: Vec<_> = ["entities", "notes", "graph_edges", "events"]
+            .into_iter()
+            .map(|table| self.rows(&format!("SELECT * FROM {table} ORDER BY id")))
+            .collect();
+        rows.push(self.rows(&format!(
+            "SELECT rowid, * FROM {} ORDER BY rowid",
+            self.table()
+        )));
+        rows.push(self.rows(&format!(
+            "SELECT * FROM {} ORDER BY namespace, subject_id",
+            khive_db::stores::text::rowid_map_table(self.table())
+        )));
+        rows
+    }
+
+    async fn merge(&self) -> Result<(), RuntimeError> {
+        let token = NamespaceToken::local();
+        if self.notes {
+            self.runtime
+                .merge_note(
+                    &token,
+                    self.ids[0],
+                    self.ids[1],
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    false,
+                )
+                .await?;
+        } else {
+            self.runtime
+                .merge_entity(
+                    &token,
+                    self.ids[0],
+                    self.ids[1],
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    false,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_merged(&self) {
+        use rusqlite::types::Value::Integer;
+        let table = self.table();
+        let map = khive_db::stores::text::rowid_map_table(table);
+        let [into, from, other] = self.ids;
+        let event = if self.notes {
+            "note_merged"
+        } else {
+            "entity_merged"
+        };
+        let counts = self.rows(&format!(
+            "SELECT (SELECT count(*) FROM {table} WHERE namespace='local' AND subject_id='{into}'),
+             (SELECT count(*) FROM {table} WHERE namespace='local' AND subject_id='{from}'),
+             (SELECT count(*) FROM {map} WHERE namespace='local' AND subject_id='{from}'),
+             (SELECT count(*) FROM {map} m JOIN {table} f ON f.rowid=m.rowid
+              AND f.namespace=m.namespace AND f.subject_id=m.subject_id
+              WHERE m.namespace='local' AND m.subject_id='{into}'),
+             (SELECT count(*) FROM events WHERE kind='{event}')"
+        ));
+        assert_eq!(counts[0][0], Integer(1), "exactly one retained raw FTS row");
+        assert_eq!(counts[0][1], Integer(0), "absorbed raw FTS removed");
+        assert_eq!(counts[0][2], Integer(0), "absorbed map removed");
+        assert_eq!(counts[0][3], Integer(1), "retained map joins new FTS");
+        assert_eq!(counts[0][4], Integer(1), "one committed merge event");
+        for id in [into, other] {
+            let token = NamespaceToken::local();
+            let document = if self.notes {
+                self.runtime
+                    .text_for_notes(&token)
+                    .unwrap()
+                    .get_document("local", id)
+                    .await
+                    .unwrap()
+            } else {
+                self.runtime
+                    .text(&token)
+                    .unwrap()
+                    .get_document("local", id)
+                    .await
+                    .unwrap()
+            }
+            .expect("retained and unrelated documents remain readable");
+            assert_eq!(document.subject_id, id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn merge_fts_maps_preserve_unrelated_documents_and_remove_absorbed_rows() {
+    for notes in [false, true] {
+        for stale in [false, true] {
+            let fixture = MergeFtsFixture::new(notes).await;
+            let table = fixture.table();
+            let map = khive_db::stores::text::rowid_map_table(table);
+            let [into, _, other] = fixture.ids;
+            let columns =
+                "subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind";
+            fixture.execute(&format!(
+                "INSERT INTO {table} (rowid, {columns}) SELECT 1000000, {columns} FROM {table}
+                 WHERE namespace='local' AND subject_id='{other}';
+                 DELETE FROM {table} WHERE namespace='local' AND subject_id='{other}' AND rowid!=1000000;
+                 UPDATE {map} SET rowid=1000000 WHERE namespace='local' AND subject_id='{other}';"
+            ));
+            assert_eq!(
+                fixture.rows(&format!(
+                    "SELECT rowid FROM {map} WHERE namespace='local' AND subject_id='{other}'"
+                )),
+                vec![vec![rusqlite::types::Value::Integer(1000000)]]
+            );
+            if stale {
+                fixture.execute(&format!(
+                    "DELETE FROM {table} WHERE namespace='local' AND subject_id='{into}';
+                     UPDATE {map} SET rowid=1000000 WHERE namespace='local' AND subject_id='{into}';"
+                ));
+            }
+            let unrelated_sql = format!(
+                "SELECT rowid, * FROM {table} WHERE namespace='local' AND subject_id='{other}'"
+            );
+            let unrelated_map_sql =
+                format!("SELECT * FROM {map} WHERE namespace='local' AND subject_id='{other}'");
+            let unrelated = fixture.rows(&unrelated_sql);
+            let unrelated_map = fixture.rows(&unrelated_map_sql);
+            fixture.merge().await.unwrap();
+            assert_eq!(
+                fixture.rows(&unrelated_sql),
+                unrelated,
+                "unrelated raw document survives"
+            );
+            assert_eq!(
+                fixture.rows(&unrelated_map_sql),
+                unrelated_map,
+                "unrelated map survives"
+            );
+            fixture.assert_merged().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn merge_map_upsert_failure_rolls_back_domain_fts_and_event() {
+    for notes in [false, true] {
+        let fixture = MergeFtsFixture::new(notes).await;
+        let map = khive_db::stores::text::rowid_map_table(fixture.table());
+        fixture.execute(&format!(
+            "CREATE TRIGGER reject_merge_map BEFORE INSERT ON {map}
+             WHEN NEW.namespace='local' AND NEW.subject_id='{}'
+             BEGIN SELECT RAISE(ABORT, 'merge FTS map refusal'); END",
+            fixture.ids[0]
+        ));
+        let before = fixture.snapshot();
+        let error = fixture
+            .merge()
+            .await
+            .expect_err("map upsert must abort the public merge");
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        let native = loop {
+            if let Some(native) = source.downcast_ref::<rusqlite::Error>() {
+                break native;
+            }
+            source = source
+                .source()
+                .expect("the original native map error must remain in the source chain");
+        };
+        let rusqlite::Error::SqliteFailure(code, message) = native else {
+            panic!("expected the native map trigger error, got {native:?}");
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+        assert_eq!(message.as_deref(), Some("merge FTS map refusal"));
+        assert_eq!(
+            fixture.snapshot(),
+            before,
+            "domain records, FTS/maps, both incident edges and all events roll back together"
+        );
+        fixture.execute("DROP TRIGGER reject_merge_map");
+        fixture.merge().await.unwrap();
+        fixture.assert_merged().await;
+    }
+}
+
+#[tokio::test]
+async fn merge_fts_insert_matches_canonical_document() {
+    use rusqlite::types::Value::{Integer, Null, Text};
+
+    for (notes, named) in [(false, false), (true, true), (true, false)] {
+        let runtime = rt(); // No embedding provider can repair the raw INSERT after commit.
+        let token = NamespaceToken::local();
+        let mut ids = Vec::new();
+        for label in ["retained", "absorbed", "unrelated"] {
+            let title = format!("{label} title");
+            let body = format!("{label} canonical body with distinct content");
+            let properties = Some(serde_json::json!({
+                "label": label, "nested": {"count": 7, "enabled": true}
+            }));
+            let tags = vec!["fts-parity".to_string(), label.to_string()];
+            ids.push(if notes {
+                runtime
+                    .create_note(
+                        &token,
+                        "observation",
+                        named.then_some(title.as_str()),
+                        &body,
+                        None,
+                        properties,
+                        vec![],
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            } else {
+                runtime
+                    .create_entity(
+                        &token,
+                        "concept",
+                        None,
+                        &title,
+                        Some(&body),
+                        properties,
+                        tags,
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            });
+        }
+        let fixture = MergeFtsFixture {
+            runtime,
+            notes,
+            ids: ids.try_into().unwrap(),
+        };
+        fixture.merge().await.unwrap();
+        let document = if notes {
+            let retained = fixture
+                .runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(fixture.ids[0])
+                .await
+                .unwrap()
+                .unwrap();
+            note_fts_document(&retained)
+        } else {
+            let retained = fixture
+                .runtime
+                .get_entity(&token, fixture.ids[0])
+                .await
+                .unwrap();
+            entity_fts_document(&retained)
+        };
+        let expected = [
+            Text(document.subject_id.to_string()),
+            Text(document.kind.to_string()),
+            Text(document.title.unwrap_or_default()),
+            Text(document.body),
+            Text(serde_json::to_string(&document.tags).unwrap()),
+            Text(document.namespace),
+            document
+                .metadata
+                .map(|metadata| Text(metadata.to_string()))
+                .unwrap_or(Null),
+            Integer(document.updated_at.timestamp_micros()),
+            document.record_kind.map(Text).unwrap_or(Null),
+        ];
+        let columns = "subject_id,kind,title,body,tags,namespace,metadata,updated_at,record_kind";
+        let actual = fixture.rows(&format!(
+            "SELECT {columns} FROM {} WHERE namespace='local' AND subject_id='{}'",
+            fixture.table(),
+            fixture.ids[0]
+        ));
+        assert_eq!(
+            actual.len(),
+            1,
+            "one retained FTS row; notes={notes}, named={named}"
+        );
+        assert_eq!(actual[0].len(), expected.len());
+        for ((column, value), expected) in columns.split(',').zip(&actual[0]).zip(expected) {
+            assert_eq!(value, &expected, "{column}; notes={notes}, named={named}");
+        }
+    }
 }

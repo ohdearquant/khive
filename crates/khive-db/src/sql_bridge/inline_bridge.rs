@@ -1,11 +1,11 @@
 use super::{
-    acquire_handle_slot, acquire_unit_lease, async_trait, bind_params, execute_prepared_batch,
-    execute_query, execute_query_page, execute_query_row, map_rusqlite_err, map_write_boundary_err,
-    map_write_err, open_standalone_writer_on_blocking, prepare_batch_statements,
-    prepare_cached_sql_statement, reject_transaction_control_statements, run_manual_atomic_unit,
-    Any, Arc, AtomicEventRows, AtomicUnitOp, ConnectionPool, PageRequest, PoolBackedReader,
-    PoolBackedWriter, SlotTimeoutClass, SqlRow, SqlStatement, SqlValue, SqliteError, SqliteReader,
-    SqliteWriter, StandaloneHandle, StorageCapability, StorageError,
+    acquire_handle_slot, async_trait, bind_params, execute_prepared_batch, execute_query,
+    execute_query_page, execute_query_row, map_rusqlite_err, map_write_boundary_err, map_write_err,
+    open_standalone_writer_on_blocking, prepare_batch_statements, prepare_cached_sql_statement,
+    reject_transaction_control_statements, run_manual_atomic_unit, Any, Arc, AtomicEventRows,
+    AtomicUnitOp, ConnectionPool, PageRequest, PoolBackedReader, PoolBackedWriter,
+    SlotTimeoutClass, SqlRow, SqlStatement, SqlValue, SqliteError, SqliteReader, SqliteWriter,
+    StorageCapability, StorageError,
 };
 
 // =============================================================================
@@ -29,13 +29,14 @@ use super::{
 /// (`Connection` is `!Sync`), which the `#[async_trait]`-generated futures
 /// require. A raw pointer sidesteps both: `*const Connection` is `Send` and
 /// `'static` on its face, and the safety burden (the pointee outliving
-/// every dereference) is upheld by construction — see `atomic_unit`, the
-/// only call site: it builds an `InlineWriter` from `conn: &Connection`,
-/// drives `op` to completion via `block_on_sync` synchronously, and drops
-/// the `InlineWriter` before that borrow ends, all within one stack frame.
+/// every dereference) is upheld by each atomic-unit owner: it builds an
+/// `InlineWriter` from `conn: &Connection`, drives `op` to completion via
+/// `block_on_sync` synchronously, and drops the `InlineWriter` before that
+/// borrow ends, all within one stack frame.
 pub(super) struct InlineWriter {
     pub(super) event_rows: Option<Arc<AtomicEventRows>>,
     pub(super) conn: *const rusqlite::Connection,
+    pub(super) standalone_db: Option<String>,
 }
 
 // SAFETY: `InlineWriter` is never actually shared across a real thread
@@ -53,6 +54,25 @@ impl InlineWriter {
     fn conn(&self) -> &rusqlite::Connection {
         unsafe { &*self.conn }
     }
+
+    fn operation(&self, standalone: &'static str, inline: &'static str) -> &'static str {
+        if self.standalone_db.is_some() {
+            standalone
+        } else {
+            inline
+        }
+    }
+
+    fn map_write_error(&self, error: rusqlite::Error, operation: &'static str) -> StorageError {
+        if let Some(db) = &self.standalone_db {
+            crate::timeout_sink::maybe_emit_busy(
+                db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &error,
+            );
+        }
+        map_write_err(error, operation)
+    }
 }
 
 #[async_trait]
@@ -61,15 +81,24 @@ impl khive_storage::SqlReader for InlineWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        execute_query_row(self.conn(), &statement)
-            .map_err(|e| map_rusqlite_err(e, "inline.query_row"))
+        execute_query_row(self.conn(), &statement).map_err(|error| {
+            map_rusqlite_err(
+                error,
+                self.operation("writer.query_row", "inline.query_row"),
+            )
+        })
     }
 
     async fn query_all(
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        execute_query(self.conn(), &statement).map_err(|e| map_rusqlite_err(e, "inline.query_all"))
+        execute_query(self.conn(), &statement).map_err(|error| {
+            map_rusqlite_err(
+                error,
+                self.operation("writer.query_all", "inline.query_all"),
+            )
+        })
     }
 
     async fn query_page(
@@ -77,8 +106,12 @@ impl khive_storage::SqlReader for InlineWriter {
         statement: SqlStatement,
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        execute_query_page(self.conn(), &statement, &page)
-            .map_err(|e| map_rusqlite_err(e, "inline.query_page"))
+        execute_query_page(self.conn(), &statement, &page).map_err(|error| {
+            map_rusqlite_err(
+                error,
+                self.operation("writer.query_page", "inline.query_page"),
+            )
+        })
     }
 
     async fn query_scalar(
@@ -110,13 +143,14 @@ impl khive_storage::SqlWriter for InlineWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         // Boundary: `execute_batch` owns transaction-control rejection;
         // `atomic_unit` uses this one-statement primitive for its own boundary.
+        let operation = self.operation("execute", "inline.execute");
         let mut stmt = prepare_cached_sql_statement(self.conn(), &statement.sql)
-            .map_err(|e| map_write_err(e, "inline.execute"))?;
+            .map_err(|error| self.map_write_error(error, operation))?;
         bind_params(&mut stmt, &statement.params)
-            .map_err(|e| map_write_err(e, "inline.execute"))?;
+            .map_err(|error| self.map_write_error(error, operation))?;
         let affected = stmt
             .raw_execute()
-            .map_err(|e| map_write_err(e, "inline.execute"))?;
+            .map_err(|error| self.map_write_error(error, operation))?;
         if let Some(event_rows) = self.event_rows.as_deref() {
             event_rows.observe(&statement, affected as u64);
         }
@@ -131,24 +165,28 @@ impl khive_storage::SqlWriter for InlineWriter {
         // (atomic_unit flag-on path), so a caller `COMMIT` would close the
         // task's transaction — reject transaction-control statements up
         // front, same contract as every other `execute_batch`.
-        reject_transaction_control_statements(&statements, "inline.execute_batch")?;
+        let operation = self.operation("execute_batch", "inline.execute_batch");
+        reject_transaction_control_statements(&statements, operation)?;
         let prepared = prepare_batch_statements(self.conn(), &statements)
-            .map_err(|e| map_write_err(e, "inline.execute_batch"))?;
+            .map_err(|error| self.map_write_error(error, operation))?;
         execute_prepared_batch(
             self.conn(),
             prepared,
             &statements,
             self.event_rows.as_deref(),
         )
-        .map_err(|e| map_write_err(e, "inline.execute_batch"))
+        .map_err(|error| self.map_write_error(error, operation))
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
         // Boundary: this raw script path is internal maintenance only and is
         // outside the `execute_batch` transaction-control contract.
-        self.conn()
-            .execute_batch(&script)
-            .map_err(|e| map_write_err(e, "inline.execute_script"))
+        self.conn().execute_batch(&script).map_err(|error| {
+            self.map_write_error(
+                error,
+                self.operation("execute_script", "inline.execute_script"),
+            )
+        })
     }
 }
 
@@ -322,7 +360,7 @@ impl khive_storage::SqlAccess for SqlBridge {
             // writer permit (its writes route through the writer task), so
             // this budget caps exactly the standalone read-write
             // connections.
-            let handle = if writer_task.is_none() {
+            if writer_task.is_none() {
                 let handle_slot = acquire_handle_slot(
                     self.pool.sql_bridge_writer_slots(),
                     self.pool.config().checkout_timeout,
@@ -330,25 +368,17 @@ impl khive_storage::SqlAccess for SqlBridge {
                     SlotTimeoutClass::Admission,
                 )
                 .await?;
-                let (conn, handle_slot) =
-                    open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
-                Some(StandaloneHandle {
-                    conn,
-                    _retained_slot: Some(handle_slot),
-                    read_transaction_slot: None,
-                })
-            } else {
-                None
-            };
+                return open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot)
+                    .await;
+            }
             Ok(Box::new(SqliteWriter {
                 observe_direct_errors: true,
                 event_rows: None,
-                handle,
+                handle: None,
                 writer_task,
                 origin: self.pool.origin(),
                 db,
                 pool: Arc::clone(&self.pool),
-                held_lease: None,
             }))
         } else {
             Ok(Box::new(PoolBackedWriter {
@@ -413,6 +443,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                                 let mut inline = InlineWriter {
                                     event_rows: Some(Arc::clone(&pending_event_rows)),
                                     conn: conn as *const rusqlite::Connection,
+                                    standalone_db: None,
                                 };
                                 // Flatten: `block_on_sync` now returns `Result<F::Output,
                                 // StorageError>` (outer = "did the future actually
@@ -432,10 +463,6 @@ impl khive_storage::SqlAccess for SqlBridge {
                         )
                         .await;
                 }
-                // Flag-off (or no writer task available): manual
-                // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
-                // byte-for-byte the pre-ADR-067 shape.
-                //
                 // Contract: this acquire waits on the pool-wide one-permit
                 // writer-handle budget — the same permit a live `writer()` handle
                 // holds for its lifetime — so it times out with
@@ -452,28 +479,14 @@ impl khive_storage::SqlAccess for SqlBridge {
                     SlotTimeoutClass::Admission,
                 )
                 .await?;
-                // The unit's lease spans its BEGIN, statements and COMMIT or
-                // ROLLBACK, as one queued request does on the write-queue path.
-                let unit_lease = acquire_unit_lease(Arc::clone(&self.pool)).await?;
-                let (conn, handle_slot) =
-                    open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
-                let mut writer = SqliteWriter {
-                    observe_direct_errors: false,
-                    event_rows: Some(Arc::clone(&event_rows)),
-                    handle: Some(StandaloneHandle {
-                        conn,
-                        _retained_slot: Some(handle_slot),
-                        read_transaction_slot: None,
-                    }),
-                    writer_task: None,
-                    origin: self.pool.origin(),
-                    db: crate::timeout_sink::db_label(&self.pool),
-                    pool: Arc::clone(&self.pool),
-                    held_lease: unit_lease,
-                };
-                run_manual_atomic_unit(&mut writer, op, self.pool.origin())
-                    .await
-                    .inspect_err(|error| self.pool.record_direct_writer_error(error))
+                run_manual_atomic_unit(
+                    Arc::clone(&self.pool),
+                    handle_slot,
+                    op,
+                    Arc::clone(&event_rows),
+                )
+                .await
+                .inspect_err(|error| self.pool.record_direct_writer_error(error))
             } else {
                 // Every statement shares one connection. Keep its guard through
                 // commit/rollback so other units and ordinary writes cannot join it.
@@ -517,6 +530,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                             let mut inline = InlineWriter {
                                 event_rows: Some(Arc::clone(&pending_event_rows)),
                                 conn: conn as *const rusqlite::Connection,
+                                standalone_db: None,
                             };
                             block_on_sync(op(&mut inline)).and_then(|result| result)
                         },

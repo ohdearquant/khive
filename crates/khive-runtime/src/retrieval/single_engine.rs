@@ -78,6 +78,7 @@ impl KhiveRuntime {
     /// A supplied vector avoids embedding. Otherwise the named query embedder is
     /// invoked with the caller's token. Unknown/excluded engines, wrong dimensions
     /// and nonfinite coordinates refuse even when `top_k` is zero.
+    /// Entity queries exclude knowledge-atom vectors before their candidate window.
     // REASON: preserve vector_search's arguments while adding an explicit engine identity.
     #[allow(clippy::too_many_arguments)]
     pub async fn vector_search_in(
@@ -109,7 +110,7 @@ impl KhiveRuntime {
                 kind,
                 embedding_model: None,
                 filter: None,
-                backend_hints: None,
+                backend_hints: entity_vector_backend_hints(kind),
             })
             .await;
         crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
@@ -131,6 +132,7 @@ impl KhiveRuntime {
     /// Exact entity KNN in the named engine's space and token namespace.
     /// Unknown/excluded names and invalid vectors refuse before search, including
     /// zero-result requests. No embedding service is instantiated for this API.
+    /// Knowledge-atom vectors do not consume the entity candidate window.
     pub async fn knn_in(
         &self,
         token: &NamespaceToken,
@@ -149,7 +151,7 @@ impl KhiveRuntime {
                 kind: Some(SubstrateKind::Entity),
                 embedding_model: None,
                 filter: None,
-                backend_hints: None,
+                backend_hints: entity_vector_backend_hints(Some(SubstrateKind::Entity)),
             })
             .await?)
     }
@@ -192,6 +194,13 @@ impl KhiveRuntime {
         hits.truncate(top_k as usize);
         Ok(hits)
     }
+}
+
+// Atom vectors share the entity substrate tag but belong to knowledge retrieval.
+// The fixed private SQLite hint excludes them before KNN cuts its candidate window.
+fn entity_vector_backend_hints(kind: Option<SubstrateKind>) -> Option<serde_json::Value> {
+    (kind == Some(SubstrateKind::Entity))
+        .then(|| serde_json::json!({ "exclude_knowledge_atoms": true }))
 }
 
 fn missing_query() -> RuntimeError {

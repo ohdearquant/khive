@@ -125,11 +125,12 @@ fn install_fts_refusal(runtime: &KhiveRuntime, token: &NamespaceToken) {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .execute_batch(
-            "CREATE TRIGGER refuse_ingest_fts BEFORE INSERT ON fts_notes_rowids \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TRIGGER refuse_ingest_fts BEFORE INSERT ON fts_notes_rowids \
          BEGIN SELECT RAISE(ABORT, 'comm ingest FTS refusal'); END;",
-        )
+            )?)
+        })
         .unwrap();
 }
 
@@ -494,11 +495,12 @@ async fn ingest_precommit_storage_failure_stays_an_error_without_a_wake() {
         .pool()
         .writer()
         .unwrap()
-        .conn()
-        .execute_batch(
-            "CREATE TRIGGER refuse_ingest_note BEFORE INSERT ON notes \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TRIGGER refuse_ingest_note BEFORE INSERT ON notes \
          BEGIN SELECT RAISE(ABORT, 'precommit note refusal'); END;",
-        )
+            )?)
+        })
         .unwrap();
     let error = ingest(&runtime, &token, &signal, &capability, message())
         .await

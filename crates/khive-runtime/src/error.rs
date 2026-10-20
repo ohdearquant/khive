@@ -617,6 +617,14 @@ impl std::error::Error for ResolutionFailureContext {
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A decoded canonical operation has no live apply implementation.
+    #[error(
+        "canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"
+    )]
+    CanonicalUnsupportedOperation {
+        op_index: usize,
+        operation: &'static str,
+    },
     /// A constituent was refused before canonical writer admission. Retain
     /// its typed source without rendering submitted or captured contents.
     #[error("canonical operation {op_index} refused")]
@@ -1043,6 +1051,7 @@ impl RuntimeError {
             Self::WithResolution { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
             Self::CanonicalAdmission { source, .. } => source.variant_name(),
+            Self::CanonicalUnsupportedOperation { .. } => "CanonicalUnsupportedOperation",
         }
     }
 

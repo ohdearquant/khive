@@ -1,9 +1,10 @@
 # Inferred dependency kinds in link responses
 
-On the local runtime path, for `depends_on`, khive infers a `metadata.dependency_kind` when the caller does
-not supply one. A successful link response adds a top-level `hint` naming that
-inferred value. The hint is response information; it is never stored in the edge
-or its event payload.
+For `depends_on`, both local and coordinator routes infer a
+`metadata.dependency_kind` when the caller does not supply one and the endpoint
+pair has a default. A successful local link response also adds a top-level `hint`
+naming that inferred value. The hint is response information; it is never stored
+in the edge or its event payload.
 
 All existing defaults receive the hint:
 
@@ -41,10 +42,10 @@ each returned edge whose dependency kind was inferred. Its stored edge metadata
 and events remain unchanged.
 
 On multi-backend servers, a single link by UUID can use the coordinator route.
-That route validates and stores caller-supplied metadata without inferring a
-dependency kind, even when both endpoints resolve to the same backend. It
-therefore returns no inference hint. Supply `dependency_kind` explicitly on
-that route when the qualifier is needed.
+Its stored metadata follows the same inference and explicit-value validation
+rules, whether the endpoints share a backend or live on different backends.
+A pair without a default, such as service to project, is accepted without adding
+a qualifier. An explicit qualifier is validated on every pair.
 
 CLI `--atomic` link results carry the same optional `hint`. Its provenance is
 captured during preparation; a later response read cannot change which value

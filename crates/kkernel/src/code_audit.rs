@@ -485,7 +485,7 @@ async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
         .map_err(map_storage_busy)?;
     let tables: BTreeSet<String> = table_rows
         .iter()
-        .filter_map(|r| text_col(r, "name"))
+        .filter_map(|r| r.text_or_none("name").map(str::to_owned))
         .collect();
 
     let mut schema_errors = Vec::new();
@@ -541,7 +541,7 @@ async fn table_columns(reader: &mut dyn SqlReader, table: &str) -> Result<BTreeS
         .map_err(map_storage_busy)?;
     Ok(col_rows
         .iter()
-        .filter_map(|r| text_col(r, "name"))
+        .filter_map(|r| r.text_or_none("name").map(str::to_owned))
         .collect())
 }
 
@@ -588,15 +588,9 @@ async fn check_table_capability(
     Ok(missing_columns_error(table, &cols, required_cols))
 }
 
-fn text_col(row: &khive_storage::SqlRow, name: &str) -> Option<String> {
-    match row.get(name) {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 fn json_col(row: &khive_storage::SqlRow, name: &str) -> Option<Value> {
-    text_col(row, name).and_then(|s| serde_json::from_str(&s).ok())
+    row.text_or_none(name)
+        .and_then(|s| serde_json::from_str(s).ok())
 }
 
 fn unresolved_count(properties: &Value) -> usize {
@@ -625,8 +619,8 @@ async fn ingest_coverage_signals(
     let mut coverage_by_project: BTreeMap<String, f64> = BTreeMap::new();
 
     for row in &rows {
-        let project_id = text_col(row, "id").unwrap_or_default();
-        let project_name = text_col(row, "name").unwrap_or_default();
+        let project_id = row.text_or_none("id").unwrap_or_default().to_owned();
+        let project_name = row.text_or_none("name").unwrap_or_default().to_owned();
         let properties = json_col(row, "properties").unwrap_or(Value::Null);
         all_projects.insert(project_name.clone());
 
@@ -663,7 +657,7 @@ async fn ingest_coverage_signals(
             .map_err(map_storage_busy)?;
         let module_count = module_rows.len();
         for module_row in &module_rows {
-            let module_id = text_col(module_row, "id").unwrap_or_default();
+            let module_id = module_row.text_or_none("id").unwrap_or_default().to_owned();
             let module_properties = json_col(module_row, "properties").unwrap_or(Value::Null);
             let n = unresolved_count(&module_properties);
             if n > 0 {
@@ -717,8 +711,8 @@ async fn fan_in_signals(reader: &mut dyn SqlReader, signals: &mut Vec<Signal>) -
 
     let mut importers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for row in &rows {
-        let source = text_col(row, "source_id").unwrap_or_default();
-        let target = text_col(row, "target_id").unwrap_or_default();
+        let source = row.text_or_none("source_id").unwrap_or_default().to_owned();
+        let target = row.text_or_none("target_id").unwrap_or_default().to_owned();
         importers.entry(target).or_default().insert(source);
     }
 
@@ -732,7 +726,12 @@ async fn fan_in_signals(reader: &mut dyn SqlReader, signals: &mut Vec<Signal>) -
         .map_err(map_storage_busy)?;
     let names: BTreeMap<String, String> = module_rows
         .iter()
-        .filter_map(|r| Some((text_col(r, "id")?, text_col(r, "name")?)))
+        .filter_map(|r| {
+            Some((
+                r.text_or_none("id")?.to_owned(),
+                r.text_or_none("name")?.to_owned(),
+            ))
+        })
         .collect();
 
     for (target, sources) in &importers {
@@ -778,9 +777,15 @@ async fn layering_signals(
         .collect();
 
     for row in &rows {
-        let edge_id = text_col(row, "id").unwrap_or_default();
-        let source_name = text_col(row, "source_name").unwrap_or_default();
-        let target_name = text_col(row, "target_name").unwrap_or_default();
+        let edge_id = row.text_or_none("id").unwrap_or_default().to_owned();
+        let source_name = row
+            .text_or_none("source_name")
+            .unwrap_or_default()
+            .to_owned();
+        let target_name = row
+            .text_or_none("target_name")
+            .unwrap_or_default()
+            .to_owned();
         let metadata = json_col(row, "metadata").unwrap_or(Value::Null);
         let scopes = dependency_scopes(&metadata);
         let is_dev_only = scopes.len() == 1 && scopes.contains("dev");
@@ -853,9 +858,15 @@ async fn manifest_import_mismatch_signals(
         .await
         .map_err(map_storage_busy)?;
     for row in &rows {
-        let edge_id = text_col(row, "id").unwrap_or_default();
-        let source_name = text_col(row, "source_name").unwrap_or_default();
-        let target_name = text_col(row, "target_name").unwrap_or_default();
+        let edge_id = row.text_or_none("id").unwrap_or_default().to_owned();
+        let source_name = row
+            .text_or_none("source_name")
+            .unwrap_or_default()
+            .to_owned();
+        let target_name = row
+            .text_or_none("target_name")
+            .unwrap_or_default()
+            .to_owned();
         signals.push(Signal {
             id: "manifest_import_mismatch",
             subject_id: format!("{source_name}->{target_name}"),
@@ -939,11 +950,17 @@ async fn dependency_cycle_signals(
     let mut prod_edges = Vec::new();
     let mut dev_edges = Vec::new();
     for row in &project_rows {
-        let edge_id = text_col(row, "id").unwrap_or_default();
-        let source_id = text_col(row, "source_id").unwrap_or_default();
-        let target_id = text_col(row, "target_id").unwrap_or_default();
-        let source_name = text_col(row, "source_name").unwrap_or_default();
-        let target_name = text_col(row, "target_name").unwrap_or_default();
+        let edge_id = row.text_or_none("id").unwrap_or_default().to_owned();
+        let source_id = row.text_or_none("source_id").unwrap_or_default().to_owned();
+        let target_id = row.text_or_none("target_id").unwrap_or_default().to_owned();
+        let source_name = row
+            .text_or_none("source_name")
+            .unwrap_or_default()
+            .to_owned();
+        let target_name = row
+            .text_or_none("target_name")
+            .unwrap_or_default()
+            .to_owned();
         node_names.insert(source_id.clone(), source_name);
         node_names.insert(target_id.clone(), target_name);
         let metadata = json_col(row, "metadata").unwrap_or(Value::Null);
@@ -972,18 +989,22 @@ async fn dependency_cycle_signals(
     let module_edges: Vec<DepEdge> = module_rows
         .iter()
         .map(|row| {
-            let source_id = text_col(row, "source_id").unwrap_or_default();
-            let target_id = text_col(row, "target_id").unwrap_or_default();
+            let source_id = row.text_or_none("source_id").unwrap_or_default().to_owned();
+            let target_id = row.text_or_none("target_id").unwrap_or_default().to_owned();
             node_names.insert(
                 source_id.clone(),
-                text_col(row, "source_name").unwrap_or_default(),
+                row.text_or_none("source_name")
+                    .unwrap_or_default()
+                    .to_owned(),
             );
             node_names.insert(
                 target_id.clone(),
-                text_col(row, "target_name").unwrap_or_default(),
+                row.text_or_none("target_name")
+                    .unwrap_or_default()
+                    .to_owned(),
             );
             DepEdge {
-                id: text_col(row, "id").unwrap_or_default(),
+                id: row.text_or_none("id").unwrap_or_default().to_owned(),
                 source_id,
                 target_id,
             }
@@ -1141,9 +1162,9 @@ async fn zero_in_edge_signals(
         .map_err(map_storage_busy)?;
     let mut coverage_gated: BTreeSet<String> = BTreeSet::new();
     for row in &rows {
-        let module_id = text_col(row, "id").unwrap_or_default();
-        let module_name = text_col(row, "name").unwrap_or_default();
-        let source_project = text_col(row, "source_project");
+        let module_id = row.text_or_none("id").unwrap_or_default().to_owned();
+        let module_name = row.text_or_none("name").unwrap_or_default().to_owned();
+        let source_project = row.text_or_none("source_project").map(str::to_owned);
         let coverage = source_project
             .as_deref()
             .and_then(|p| coverage_by_project.get(p))
@@ -1215,8 +1236,11 @@ async fn duplicate_content_hash_signals(
         .await
         .map_err(map_storage_busy)?;
     for row in &rows {
-        let hash = text_col(row, "content_hash").unwrap_or_default();
-        let ids_csv = text_col(row, "ids").unwrap_or_default();
+        let hash = row
+            .text_or_none("content_hash")
+            .unwrap_or_default()
+            .to_owned();
+        let ids_csv = row.text_or_none("ids").unwrap_or_default().to_owned();
         let mut module_ids: Vec<String> = ids_csv.split(',').map(str::to_string).collect();
         module_ids.sort();
         signals.push(Signal {

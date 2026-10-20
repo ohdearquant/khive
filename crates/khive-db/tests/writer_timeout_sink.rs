@@ -443,8 +443,7 @@ async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
     {
         let writer = pool.writer().unwrap();
         writer
-            .conn()
-            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .autocommit(|conn| Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?))
             .unwrap();
     }
 
@@ -514,7 +513,9 @@ async fn graph_busy_standalone_writer_emits_ndjson_row() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        writer
+            .autocommit(|conn| Ok(conn.execute_batch(GRAPH_DDL)?))
+            .unwrap();
     }
 
     let holder = rusqlite::Connection::open(&db_path).unwrap();
@@ -587,7 +588,9 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(EVENTS_DDL).unwrap();
+        writer
+            .autocommit(|conn| Ok(conn.execute_batch(EVENTS_DDL)?))
+            .unwrap();
     }
 
     let holder = rusqlite::Connection::open(&db_path).unwrap();

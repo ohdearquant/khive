@@ -36,7 +36,7 @@ connection with a shortened busy timeout (Plank 2, below).
 **Non-contending design (2026-08-02 amendment — supersedes the original
 `try_writer_nowait` design below).** The task opens its own dedicated,
 long-lived standalone connection (`CheckpointConnection`, opened once at
-task startup via `ConnectionPool::open_standalone_writer`) and runs PASSIVE
+task startup via the pool's fixed `open_checkpoint_file` factory) and runs PASSIVE
 (and, when armed, TRUNCATE) on it every tick — `checkpoint_once` never
 checks out the pool's writer mutex at all. `PRAGMA wal_checkpoint` takes
 SQLite's CKPT lock, not the WRITE lock, so a concurrent pool writer can
@@ -554,9 +554,9 @@ genuinely fat (≥32MiB) WAL, run concurrently with a `pool.writer()`
 admission attempt, proving the converse direction — the writer is never
 blocked behind the checkpoint either.
 
-### `open_standalone_writer_fails_on_in_memory_pool`
+### `open_checkpoint_file_fails_on_in_memory_pool`
 
-An in-memory pool has no on-disk file for `ConnectionPool::open_standalone_writer`
+An in-memory pool has no on-disk file for `ConnectionPool::open_checkpoint_file`
 to open a second connection against. This is exactly the precondition that
 makes `CheckpointConnection::ensure_open` return `None` and
 `run_checkpoint_task` report `Skipped` — `checkpoint_once` itself is never
@@ -575,7 +575,7 @@ longer produces a Skipped tick at all, so the original mechanism (hold
 `pool.try_writer()` for the task's whole run) can no longer drive the
 Skipped path this regression exists to cover. Drives Skipped the way it
 actually happens now instead: a read-only pool, on which
-`ConnectionPool::open_standalone_writer` always fails, so
+`ConnectionPool::open_checkpoint_file` always fails, so
 `CheckpointConnection::ensure_open` can never open a dedicated connection.
 The underlying regression this test guards — the Plank 1 age sweep must
 still run and escalate on a Skipped tick, not just an Observed one — is

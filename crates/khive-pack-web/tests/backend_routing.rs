@@ -605,7 +605,9 @@ async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments()
         // or standalone SqlAccess writer. Release the pooled writer before dispatch.
         {
             let writer = fault_backend.pool().try_writer().unwrap();
-            writer.conn().execute_batch(&trigger).unwrap();
+            writer
+                .autocommit(|conn| Ok(conn.execute_batch(&trigger)?))
+                .unwrap();
         }
         let error = fixture
             .registry
@@ -644,8 +646,7 @@ async fn routed_hard_delete_interrupted_cleanup_leaves_only_orphan_attachments()
         {
             let writer = fault_backend.pool().try_writer().unwrap();
             writer
-                .conn()
-                .execute_batch("DROP TRIGGER i3135_delete_fault")
+                .autocommit(|conn| Ok(conn.execute_batch("DROP TRIGGER i3135_delete_fault")?))
                 .unwrap();
         }
         let retry = fixture
@@ -708,13 +709,14 @@ async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
     {
         let writer = fixture.main_backend.pool().try_writer().unwrap();
         writer
-            .conn()
-            .execute_batch(&format!(
-                "CREATE TRIGGER fail_attachment_cleanup BEFORE DELETE ON attachments \
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_attachment_cleanup BEFORE DELETE ON attachments \
                  WHEN OLD.record_uuid = '{}' AND OLD.substrate = 'entity' \
                  BEGIN SELECT RAISE(ABORT, 'injected attachment cleanup failure'); END;",
-                entity.id
-            ))
+                    entity.id
+                ))?)
+            })
             .unwrap();
     }
     let first = fixture
@@ -728,8 +730,7 @@ async fn routed_delete_cleanup_retry_keeps_indexes_and_event_consistent() {
     {
         let writer = fixture.main_backend.pool().try_writer().unwrap();
         writer
-            .conn()
-            .execute_batch("DROP TRIGGER fail_attachment_cleanup")
+            .autocommit(|conn| Ok(conn.execute_batch("DROP TRIGGER fail_attachment_cleanup")?))
             .unwrap();
     }
 
@@ -850,13 +851,14 @@ async fn routed_delete_reports_failed_event_append_without_repeating_committed_d
         {
             let writer = fixture.routed_backend.pool().try_writer().unwrap();
             writer
-                .conn()
-                .execute_batch(&format!(
-                    "CREATE TRIGGER fail_entity_deleted_event BEFORE INSERT ON events \
+                .autocommit(|conn| {
+                    Ok(conn.execute_batch(&format!(
+                        "CREATE TRIGGER fail_entity_deleted_event BEFORE INSERT ON events \
                      WHEN NEW.kind = 'entity_deleted' AND NEW.target_id = '{}' \
                      BEGIN SELECT RAISE(ABORT, 'entity deletion event write failed'); END;",
-                    entity.id
-                ))
+                        entity.id
+                    ))?)
+                })
                 .unwrap();
         }
 
@@ -902,8 +904,9 @@ async fn routed_delete_reports_failed_event_append_without_repeating_committed_d
         {
             let writer = fixture.routed_backend.pool().try_writer().unwrap();
             writer
-                .conn()
-                .execute_batch("DROP TRIGGER fail_entity_deleted_event")
+                .autocommit(
+                    |conn| Ok(conn.execute_batch("DROP TRIGGER fail_entity_deleted_event")?),
+                )
                 .unwrap();
         }
 

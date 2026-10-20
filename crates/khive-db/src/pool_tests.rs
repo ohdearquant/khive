@@ -82,7 +82,7 @@ fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
     let before = pool.writer_acquisition_snapshot();
     let checks = Cell::new(0);
     let stopped = pool
-        .writer_until(|| {
+        .writer_until_for_admitted_operation(|| {
             checks.set(checks.get() + 1);
             checks.get() == 2
         })
@@ -112,7 +112,7 @@ async fn constructor_writer_observes_absolute_blocking_deadline() {
     let before = pool.writer_acquisition_snapshot();
     let started = Instant::now();
     let stopped = pool
-        .writer_until(|| context.blocking_stop_reason().is_some())
+        .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())
         .unwrap();
     assert!(stopped.is_none());
     if let Some(bound) = timing::duration_bound(Duration::from_secs(1), None) {
@@ -135,7 +135,7 @@ fn constructor_writer_preserves_uncancelled_checkout_timeout() {
     .unwrap();
     let held = pool.writer().unwrap();
     let before = pool.writer_acquisition_snapshot();
-    let result = pool.writer_until(|| false);
+    let result = pool.writer_until_for_admitted_operation(|| false);
     assert!(
         matches!(result, Err(SqliteError::WriterPoolCheckoutTimeout { timeout }) if timeout == Duration::from_millis(5))
     );
@@ -1171,6 +1171,7 @@ fn pool_drop_never_leaves_a_reader_as_the_last_connection_closed() {
 
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE close_order_row(id INTEGER PRIMARY KEY);\
              INSERT INTO close_order_row DEFAULT VALUES;",
@@ -1333,12 +1334,11 @@ fn standalone_and_new_reader_keep_the_first_opened_target_after_symlink_retarget
     fs::remove_file(&alias).unwrap();
     symlink(&second, &alias).unwrap();
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone probe stays on the opened database");
-    let value: i64 = standalone
-        .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
-        .unwrap();
+    let value: i64 = pool
+        .standalone_autocommit(|conn| {
+            Ok(conn.query_row("SELECT value FROM identity_marker", [], |row| row.get(0))?)
+        })
+        .expect("standalone operation stays on the opened database");
     assert_eq!(value, 11);
 
     let reader = pool
@@ -1370,7 +1370,7 @@ fn standalone_writer_refuses_replaced_pinned_database_file() {
     fs::rename(&replacement, &path).unwrap();
 
     let error = pool
-        .open_standalone_writer_untracked()
+        .standalone_autocommit(|_| Ok(()))
         .expect_err("a replaced file must not receive a standalone probe");
     assert!(
         error.to_string().contains("file identity changed"),
@@ -1534,6 +1534,7 @@ fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
     .unwrap();
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE identity_marker (value INTEGER); \
                         INSERT INTO identity_marker (value) VALUES (11)",
@@ -1580,7 +1581,7 @@ fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
         }
     });
     let error = pool
-        .open_standalone_writer_untracked()
+        .standalone_autocommit(|_| Ok(()))
         .expect_err("both pathname stats see the original, but SQLite opened replacement");
     assert!(swap_ran.get(), "the swap hook must execute");
     assert!(restore_ran.get(), "the restore hook must execute");
@@ -1604,11 +1605,13 @@ fn standalone_wal_writer_uses_configured_journal_size_limit() {
     })
     .expect("WAL pool open");
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone WAL writer open");
-    assert_eq!(current_journal_mode(&standalone).unwrap(), "wal");
-    assert_eq!(journal_size_limit_bytes(&standalone), configured_limit);
+    let (mode, limit) = pool
+        .standalone_autocommit(|conn| {
+            Ok((current_journal_mode(conn)?, journal_size_limit_bytes(conn)))
+        })
+        .expect("standalone WAL operation");
+    assert_eq!(mode, "wal");
+    assert_eq!(limit, configured_limit);
 }
 
 #[test]
@@ -1634,11 +1637,13 @@ fn standalone_rollback_writer_keeps_sqlite_journal_size_limit() {
     })
     .expect("rollback-journal pool open");
 
-    let standalone = pool
-        .open_standalone_writer_untracked()
-        .expect("standalone rollback-journal writer open");
-    assert_eq!(current_journal_mode(&standalone).unwrap(), "delete");
-    assert_eq!(journal_size_limit_bytes(&standalone), sqlite_default);
+    let (mode, limit) = pool
+        .standalone_autocommit(|conn| {
+            Ok((current_journal_mode(conn)?, journal_size_limit_bytes(conn)))
+        })
+        .expect("standalone rollback-journal operation");
+    assert_eq!(mode, "delete");
+    assert_eq!(limit, sqlite_default);
 }
 
 #[test]
@@ -1679,14 +1684,16 @@ fn every_writer_capable_connection_maintains_rfc3339_expression_indexes() {
     );
     drop(bare);
 
-    let tracked = pool.open_standalone_writer().expect("tracked standalone");
-    let untracked = pool
-        .open_standalone_writer_untracked()
-        .expect("untracked standalone");
-    for (id, conn) in [(2, &tracked), (3, &untracked)] {
-        conn.execute(INSERT, rusqlite::params![id, "2026-01-01T00:00:00Z"])
-            .unwrap_or_else(|error| panic!("standalone writer {id}: {error}"));
-    }
+    pool.standalone_autocommit(|conn| {
+        conn.execute(INSERT, rusqlite::params![2, "2026-01-01T00:00:00Z"])?;
+        Ok(())
+    })
+    .expect("standalone autocommit registers both key functions");
+    pool.standalone_transaction(|conn| {
+        conn.execute(INSERT, rusqlite::params![3, "2026-01-01T00:00:00Z"])?;
+        Ok(())
+    })
+    .expect("standalone transaction registers both key functions");
     {
         let writer = pool.writer().expect("pooled writer");
         writer
@@ -1729,14 +1736,10 @@ fn writer_connections_follow_checkpoint_ownership_claim() {
             FALLBACK_WAL_AUTOCHECKPOINT_PAGES
         );
     }
-    let standalone = pool
-        .open_standalone_writer()
+    let standalone_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer opened before any claim");
-    assert_eq!(
-        wal_autocheckpoint_pages(&standalone),
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES
-    );
-    drop(standalone);
+    assert_eq!(standalone_pages, FALLBACK_WAL_AUTOCHECKPOINT_PAGES);
 
     // Claimed: the already-open pooled writer is re-configured under the
     // writer mutex, and every later writer-capable open disables the
@@ -1746,16 +1749,20 @@ fn writer_connections_follow_checkpoint_ownership_claim() {
         let writer = pool.writer().expect("pooled writer after claim");
         assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
     }
-    let claimed_standalone = pool
-        .open_standalone_writer()
+    let claimed_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer opened after the claim");
-    assert_eq!(wal_autocheckpoint_pages(&claimed_standalone), 0);
-    drop(claimed_standalone);
+    assert_eq!(claimed_pages, 0);
 
     let later_infrastructure = pool
-        .open_standalone_writer_untracked()
+        .open_checkpoint_file()
         .expect("later infrastructure writer");
-    assert_eq!(wal_autocheckpoint_pages(&later_infrastructure), 0);
+    assert_eq!(
+        later_infrastructure
+            .wal_autocheckpoint_pages_for_test()
+            .unwrap(),
+        0
+    );
 
     let memory_pool = ConnectionPool::new(PoolConfig {
         write_queue_enabled: Some(false),
@@ -1806,10 +1813,9 @@ fn standalone_writer_waits_for_checkpoint_claim_resolution() {
     let open_thread_start = Arc::clone(&open_start);
     let open_thread = thread::spawn(move || {
         open_thread_start.wait();
-        let conn = open_pool
-            .open_standalone_writer()
-            .expect("standalone writer after claim resolution");
-        wal_autocheckpoint_pages(&conn)
+        open_pool
+            .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
+            .expect("standalone writer after claim resolution")
     });
     open_start.wait();
 
@@ -1851,10 +1857,9 @@ fn standalone_fallback_application_linearizes_before_claim_publication() {
 
     let open_pool = Arc::clone(&pool);
     let open_thread = thread::spawn(move || {
-        let conn = open_pool
-            .open_standalone_writer()
-            .expect("standalone writer opens");
-        wal_autocheckpoint_pages(&conn)
+        open_pool
+            .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
+            .expect("standalone writer opens")
     });
     pause.selected.wait();
     assert!(
@@ -1912,14 +1917,10 @@ fn failed_checkpoint_ownership_claim_keeps_fallback_and_can_be_retried() {
         "a failed claim must leave later writer connections fallback-safe"
     );
 
-    let fallback_writer = pool
-        .open_standalone_writer()
+    let fallback_pages = pool
+        .standalone_autocommit(|conn| Ok(wal_autocheckpoint_pages(conn)))
         .expect("standalone writer after failed claim");
-    assert_eq!(
-        wal_autocheckpoint_pages(&fallback_writer),
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES
-    );
-    drop(fallback_writer);
+    assert_eq!(fallback_pages, FALLBACK_WAL_AUTOCHECKPOINT_PAGES);
 
     drop(held_writer);
     pool.claim_checkpoint_ownership()
@@ -1945,15 +1946,18 @@ fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint_once_claimed() {
         .expect("claim ownership for the dedicated-owner posture");
     let writer = pool.writer().expect("pooled writer");
     writer
+        .conn()
         .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
         .expect("create fixture table");
 
     let page_size: i64 = writer
+        .conn()
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .expect("read page size");
     let payload_bytes = page_size * 32;
     for _ in 0..160 {
         writer
+            .conn()
             .execute(
                 "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
                 [payload_bytes],
@@ -1962,6 +1966,7 @@ fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint_once_claimed() {
     }
 
     let log_frames: i64 = writer
+        .conn()
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
         .expect("observe WAL frame count");
     assert!(
@@ -1990,15 +1995,18 @@ fn unclaimed_pool_retains_bounded_autocheckpoint_reclamation() {
     .expect("pool open");
     let writer = pool.writer().expect("pooled writer");
     writer
+        .conn()
         .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
         .expect("create fixture table");
 
     let page_size: i64 = writer
+        .conn()
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .expect("read page size");
     let payload_bytes = page_size * 32;
     for _ in 0..160 {
         writer
+            .conn()
             .execute(
                 "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
                 [payload_bytes],
@@ -2012,6 +2020,7 @@ fn unclaimed_pool_retains_bounded_autocheckpoint_reclamation() {
     // fired on a threshold-crossing commit already drained the WAL, so
     // far fewer than the threshold's frames remain.
     let log_frames: i64 = writer
+        .conn()
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
         .expect("observe WAL frame count");
     assert!(
@@ -2031,9 +2040,8 @@ fn standalone_writer_open_counts_its_connection_class_once() {
     })
     .expect("file-backed pool");
 
-    let _standalone = pool
-        .open_standalone_writer()
-        .expect("standalone writer opens");
+    pool.standalone_autocommit(|_| Ok(()))
+        .expect("standalone write operation opens once");
 
     assert_eq!(
         pool.writer_acquisition_snapshot(),
@@ -2391,10 +2399,12 @@ fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
     assert_eq!(exists, 0, "low-space startup must not write a nonce");
     drop(reader);
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(SqliteError::CapacityFloor { .. })
     ));
-    pool.open_standalone_writer_untracked()
+    pool.open_checkpoint_file()
         .expect("checkpoint infrastructure must still open");
 }
 
@@ -2544,6 +2554,7 @@ fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
     pool.set_test_write_admission(0, |_| Ok(0));
     pool.writer()
         .unwrap()
+        .conn()
         .execute_batch(
             "CREATE TABLE checkpoint_floor (id INTEGER); \
              INSERT INTO checkpoint_floor VALUES (1)",
@@ -2554,7 +2565,9 @@ fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
     assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
     pool.set_test_write_admission(100, |_| Ok(99));
     assert!(matches!(
-        pool.writer(),
+        pool.writer()
+            .unwrap()
+            .autocommit::<()>(|_| panic!("refused body must not run")),
         Err(SqliteError::CapacityFloor { .. })
     ));
     let before = pool.writer_acquisition_snapshot();

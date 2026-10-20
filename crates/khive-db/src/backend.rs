@@ -496,10 +496,44 @@ impl StorageBackend {
         )
     }
 
+    /// Open an existing live database with read-only SQLite connections.
+    ///
+    /// Ordinary WAL locking and change detection remain enabled, so a writable
+    /// shared-memory sidecar is accepted. No schema preparation is performed.
+    pub fn sqlite_read_only_live_with_max_readers_and_wal_ceiling(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+        wal_ceiling: WalCeilingPolicy,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_constructor(
+            path,
+            PoolConfig {
+                wal_ceiling,
+                ..PoolConfig::default()
+            },
+            max_readers,
+            ConnectionPool::new_read_only_live,
+        )
+    }
+
     fn sqlite_read_only_with_pool_config(
         path: impl AsRef<Path>,
         pool_config: PoolConfig,
         max_readers: Option<usize>,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_constructor(
+            path,
+            pool_config,
+            max_readers,
+            ConnectionPool::new,
+        )
+    }
+
+    fn sqlite_read_only_with_pool_constructor(
+        path: impl AsRef<Path>,
+        pool_config: PoolConfig,
+        max_readers: Option<usize>,
+        open_pool: fn(PoolConfig) -> Result<ConnectionPool, SqliteError>,
     ) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
@@ -512,12 +546,12 @@ impl StorageBackend {
         if let Some(max_readers) = max_readers {
             config.max_readers = max_readers;
         }
-        // `ConnectionPool::new` opens the writer slot with `SQLITE_OPEN_READ_ONLY`
-        // (no `SQLITE_OPEN_CREATE`) and sets `PRAGMA query_only = ON` on it, so a
+        // Both pool constructors open the writer slot with `SQLITE_OPEN_READ_ONLY`
+        // (no `SQLITE_OPEN_CREATE`) and set `PRAGMA query_only = ON` on it, so a
         // missing path is rejected instead of created, and any write attempt is
         // rejected at the SQLite level regardless of which code path reaches the
         // writer.
-        let pool = ConnectionPool::new(config)?;
+        let pool = open_pool(config)?;
         Ok(Self {
             pool: Arc::new(pool),
             is_file_backed: true,
@@ -603,7 +637,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.writer_for_admitted_operation()?;
+        let writer = self.pool.writer()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -701,7 +735,7 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
@@ -718,7 +752,7 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let tx = writer
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -763,7 +797,7 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
@@ -1533,3 +1567,6 @@ mod tests;
 #[cfg(test)]
 #[path = "backend_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+mod live_readonly_tests;

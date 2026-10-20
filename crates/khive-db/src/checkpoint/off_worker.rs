@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{checkpoint_once_core, CheckpointConfig, CheckpointCoreOutcome, TruncateState};
-use crate::pool::ConnectionPool;
+use super::{CheckpointConfig, CheckpointCoreOutcome, TruncateState};
+use crate::pool::{CheckpointFile, ConnectionPool};
 
 #[cfg(test)]
 mod panic_tests;
@@ -38,12 +38,12 @@ pub(super) struct PanickedCycle {
 /// repeats cannot turn sustained WAL pressure into an attempt on every tick.
 pub(super) async fn run_checkpoint_core_off_worker(
     pool: Arc<ConnectionPool>,
-    conn: rusqlite::Connection,
+    conn: CheckpointFile,
     config: CheckpointConfig,
     mut truncate_state: TruncateState,
 ) -> Result<
     (
-        rusqlite::Connection,
+        CheckpointFile,
         TruncateState,
         Result<CheckpointCoreOutcome, rusqlite::Error>,
     ),
@@ -51,7 +51,7 @@ pub(super) async fn run_checkpoint_core_off_worker(
 > {
     let kept = kept_across_a_panic(&truncate_state);
     tokio::task::spawn_blocking(move || {
-        let outcome = checkpoint_once_core(&pool, &conn, &config, &mut truncate_state);
+        let outcome = conn.run_core(&pool, &config, &mut truncate_state);
         (conn, truncate_state, outcome)
     })
     .await

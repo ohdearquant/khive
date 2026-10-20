@@ -1399,46 +1399,50 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     {
         let backend = khive_db::StorageBackend::sqlite_for_test(&path).expect("open v6 backend");
         let writer = backend.pool().try_writer().expect("writer");
-        let conn = writer.conn();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _schema_migrations ( \
+        writer
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS _schema_migrations ( \
                  version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
-        )
-        .expect("create migration tracking table");
+                )
+                .expect("create migration tracking table");
 
-        let now = chrono::Utc::now().timestamp_micros();
-        for migration in khive_db::migrations::MIGRATIONS
-            .iter()
-            .filter(|m| m.version <= 6)
-        {
-            conn.execute_batch(migration.up)
-                .unwrap_or_else(|e| panic!("apply V{}: {e}", migration.version));
-            conn.execute(
+                let now = chrono::Utc::now().timestamp_micros();
+                for migration in khive_db::migrations::MIGRATIONS
+                    .iter()
+                    .filter(|m| m.version <= 6)
+                {
+                    conn.execute_batch(migration.up)
+                        .unwrap_or_else(|e| panic!("apply V{}: {e}", migration.version));
+                    conn.execute(
                 "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![migration.version, migration.name, now],
             )
             .unwrap_or_else(|e| panic!("record V{}: {e}", migration.version));
-        }
+                }
 
-        conn.execute(
-            "INSERT INTO notes \
+                conn.execute(
+                    "INSERT INTO notes \
              (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
               properties, created_at, updated_at, deleted_at) \
              VALUES (?1, 'local', 'message', 'active', NULL, 'pre-existing v6 message', \
                      NULL, NULL, NULL, ?2, ?3, ?3, NULL)",
-            rusqlite::params![
-                pre_existing_id.to_string(),
-                json!({
-                    "direction": "inbound",
-                    "to_actor": actor,
-                    "from_actor": "lambda:khive",
-                    "read": false,
-                })
-                .to_string(),
-                1_000_000_i64,
-            ],
-        )
-        .expect("insert pre-existing v6 message");
+                    rusqlite::params![
+                        pre_existing_id.to_string(),
+                        json!({
+                            "direction": "inbound",
+                            "to_actor": actor,
+                            "from_actor": "lambda:khive",
+                            "read": false,
+                        })
+                        .to_string(),
+                        1_000_000_i64,
+                    ],
+                )
+                .expect("insert pre-existing v6 message");
+                Ok(())
+            })
+            .expect("seed V6 fixture");
     }
 
     // Reopen through the normal runtime boot path -- this runs
@@ -1543,7 +1547,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     {
         let backend = khive_db::StorageBackend::sqlite_for_test(&path).expect("open backend");
         let writer = backend.pool().try_writer().expect("writer");
-        let conn = writer.conn();
+        writer.autocommit(|conn| {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _schema_migrations ( \
                  version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
@@ -1636,6 +1640,8 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
             [],
         )
         .expect("advance stale notes_seq high-water mark");
+        Ok(())
+        }).expect("seed original V7 fixture");
     }
 
     // Reopen through the normal runtime boot path -- this runs

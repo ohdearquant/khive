@@ -1648,10 +1648,7 @@ fn runtime_config_from_khive_config_toml_actor_wins_over_env_actor() {
 /// Create a migrated in-memory backend (for tests that need raw Arc<StorageBackend>).
 fn migrated_memory_backend() -> Arc<StorageBackend> {
     let backend = StorageBackend::memory().expect("memory backend");
-    {
-        let mut writer = backend.pool().try_writer().expect("writer");
-        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-    }
+    backend.pool().run_migrations().expect("migrations");
     Arc::new(backend)
 }
 

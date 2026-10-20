@@ -493,8 +493,17 @@ and the watermark actually live.
 ## Amendment 2 (2026-10-04): logical domain routes and partitioned vector destinations
 
 **Status: accepted (2026-10-19).** Refs #3696. Accepted on its own acceptance arm: the seven
-`namespace_move::partition_tests` fixtures named under Acceptance below pass on main as of
-2026-10-19.
+`namespace_move::partition_tests` fixtures named under Acceptance below pass at main commit
+`0dcb34b7` (the merge of #5324). The fixtures compile only with the `khive-db` `vectors` feature
+enabled (`cargo test -p khive-db --features vectors`); without it the module is absent and nothing
+runs. Each of the nine mutations that Acceptance says must fail a fixture was applied alone to that
+commit, turned its fixture red, and the fixture passed again once the mutation was removed:
+removing mirror exclusion, removing physical mirror carry, counting mirrors as ordinary atoms,
+routing mirror sections through Atom, removing the source-parent namespace predicate, removing the
+staging namespace predicate, reintroducing the compound SELECT term limit (one SELECT term per
+route), removing the orphan check, and removing the competing-subject check. As Acceptance states,
+these fixtures do not establish warmed ANN consumer behavior; Amendment 1's consumer acceptance and
+ADR-144's session/replay acceptance remain separate requirements.
 
 This amendment refines the route-key and derived-parent descriptions above for a
 domain's mirror atom and adds the partitioned vector destination rule. Amendment 1's

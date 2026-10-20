@@ -12,7 +12,7 @@ use khive_runtime::{
     RuntimeError,
 };
 use khive_storage::graph::{
-    CommitAnnotationCursorValue, CommitAnnotationGuard, CommitAnnotationInsertOutcome,
+    EdgeInsertIfAbsentOutcome, GraphStatementGuard, GraphStatementGuardFailureReason,
 };
 use khive_storage::usage::{scope, UsageContext};
 use khive_storage::{
@@ -111,19 +111,7 @@ impl Fixture {
         serde_json::to_value(rows).unwrap()
     }
     async fn snapshot(&self) -> Value {
-        let cursor = if self
-            .rows("SELECT name FROM sqlite_master WHERE type='table' AND name='git_mirror_cursor'")
-            .await
-            .as_array()
-            .unwrap()
-            .is_empty()
-        {
-            Value::Null
-        } else {
-            self.rows("SELECT * FROM git_mirror_cursor ORDER BY project_id,kind")
-                .await
-        };
-        json!({"cursor":cursor,"edges":self.rows("SELECT * FROM graph_edges ORDER BY namespace,id").await,
+        json!({"edges":self.rows("SELECT * FROM graph_edges ORDER BY namespace,id").await,
         "ledger":self.rows("SELECT * FROM graph_edges_seq ORDER BY seq").await,
         "sequence":self.rows("SELECT * FROM sqlite_sequence WHERE name='graph_edges_seq'").await,
         "events":self.rows("SELECT * FROM events ORDER BY id").await,
@@ -188,20 +176,17 @@ enum Path {
     Batch,
     Annotation,
 }
-async fn annotation_setup(f: &Fixture) -> CommitAnnotationGuard {
-    let mut project = Entity::new("local", "project", "source project");
-    project.id = id(2);
-    project.properties = Some(json!({"repo_slug":"fixture/source"}));
-    f.runtime
-        .entities(&f.token)
-        .unwrap()
-        .upsert_entity(project)
-        .await
-        .unwrap();
-    let mut commit = Note::new("local", "commit", "fixed commit");
-    commit.id = id(1);
-    commit.properties = Some(json!({"sha":"a".repeat(40)}));
-    // A commit note, rather than the concept originally seeded at this UUID, owns the endpoint.
+fn annotation_spec() -> LinkSpec {
+    LinkSpec {
+        relation: EdgeRelation::Annotates,
+        weight: 1.0,
+        metadata: None,
+        ..spec(id(2))
+    }
+}
+async fn annotation_setup(f: &Fixture) -> Vec<GraphStatementGuard> {
+    let mut note = Note::new("local", "observation", "guarded annotation");
+    note.id = id(1);
     f.runtime
         .entities(&f.token)
         .unwrap()
@@ -211,27 +196,25 @@ async fn annotation_setup(f: &Fixture) -> CommitAnnotationGuard {
     f.runtime
         .notes(&f.token)
         .unwrap()
-        .upsert_note(commit)
+        .upsert_note(note)
         .await
         .unwrap();
-    f.script(format!("CREATE TABLE IF NOT EXISTS git_mirror_cursor(project_id TEXT NOT NULL,kind TEXT NOT NULL,cursor_value TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY(project_id,kind)); INSERT INTO git_mirror_cursor VALUES ('{}','commits','cursor commits',41),('{}','commits_checkpoint','cursor checkpoint',42);",id(2),id(2))).await;
-    CommitAnnotationGuard {
-        expected_sha: "a".repeat(40),
-        source_identity: "fixture/source".into(),
-        commits: CommitAnnotationCursorValue {
-            value: b"cursor commits".to_vec(),
-            updated_at: 41,
-        },
-        checkpoint: CommitAnnotationCursorValue {
-            value: b"cursor checkpoint".to_vec(),
-            updated_at: 42,
-        },
-    }
+    ["source", "target", "precondition"]
+        .into_iter()
+        .map(|label| GraphStatementGuard {
+            label: label.into(),
+            statement: SqlStatement {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                label: None,
+            },
+        })
+        .collect()
 }
 async fn attempt(
     f: &Fixture,
     path: Path,
-    guard: Option<CommitAnnotationGuard>,
+    guard: Option<Vec<GraphStatementGuard>>,
 ) -> Result<Edge, RuntimeError> {
     match path {
         Path::Single => f
@@ -281,10 +264,10 @@ async fn attempt(
             }),
         Path::Annotation => f
             .runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), guard.unwrap())
+            .link_if_absent_with_guards(&f.token, annotation_spec(), guard.unwrap())
             .await
             .map(|r| match r {
-                CommitAnnotationInsertOutcome::Created(edge) => edge,
+                EdgeInsertIfAbsentOutcome::Created(edge) => edge,
                 other => panic!("expected Created, got {other:?}"),
             }),
     }
@@ -636,70 +619,54 @@ async fn replacement_and_resurrection() {
 async fn annotation_outcomes() {
     event_failure(Path::Annotation).await;
     let f = Fixture::new().await;
-    let guard = annotation_setup(&f).await;
-    let cursor_before = f
-        .rows("SELECT * FROM git_mirror_cursor ORDER BY kind")
-        .await;
-    let edge = attempt(&f, Path::Annotation, Some(guard.clone()))
+    let guards = annotation_setup(&f).await;
+    let edge = attempt(&f, Path::Annotation, Some(guards.clone()))
         .await
         .unwrap();
     assert_created(&f, &edge, "note", "entity").await;
+    let created = f.snapshot().await;
     assert!(matches!(
         f.runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), guard.clone())
+            .link_if_absent_with_guards(&f.token, annotation_spec(), guards.clone())
             .await
             .unwrap(),
-        CommitAnnotationInsertOutcome::ExistingLive
+        EdgeInsertIfAbsentOutcome::ExistingLive
     ));
+    assert_eq!(f.snapshot().await, created);
     f.runtime
         .graph(&f.token)
         .unwrap()
         .delete_edge(edge.id, DeleteMode::Soft)
         .await
         .unwrap();
+    let tombstoned = f.snapshot().await;
     assert!(matches!(
         f.runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), guard.clone())
+            .link_if_absent_with_guards(&f.token, annotation_spec(), guards.clone())
             .await
             .unwrap(),
-        CommitAnnotationInsertOutcome::Tombstoned
+        EdgeInsertIfAbsentOutcome::Tombstoned
     ));
-    let mut changed = guard.clone();
-    changed.commits.updated_at += 1;
-    assert!(matches!(
-        f.runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), changed)
+    assert_eq!(f.snapshot().await, tombstoned);
+    for index in 0..guards.len() {
+        let mut changed = guards.clone();
+        changed[index].statement.sql = "SELECT 0".into();
+        let outcome = f
+            .runtime
+            .link_if_absent_with_guards(&f.token, annotation_spec(), changed)
             .await
-            .unwrap(),
-        CommitAnnotationInsertOutcome::CursorChanged
-    ));
-    let mut changed = guard.clone();
-    changed.source_identity = "fixture/other".into();
-    assert!(matches!(
-        f.runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), changed)
-            .await
-            .unwrap(),
-        CommitAnnotationInsertOutcome::TargetChanged
-    ));
-    let mut changed = guard;
-    changed.expected_sha = "b".repeat(40);
-    assert!(matches!(
-        f.runtime
-            .link_commit_annotation_if_absent(&f.token, id(1), id(2), changed)
-            .await
-            .unwrap(),
-        CommitAnnotationInsertOutcome::SourceChanged
-    ));
+            .unwrap();
+        assert!(
+            matches!(outcome, EdgeInsertIfAbsentOutcome::GuardFailed(failure)
+            if failure.label == guards[index].label
+                && failure.reason == GraphStatementGuardFailureReason::PredicateFalse)
+        );
+        assert_eq!(f.snapshot().await, tombstoned);
+    }
     assert_eq!(
         f.link_events().await.len(),
         1,
         "every create-only no-write outcome is event-free"
-    );
-    assert_eq!(
-        f.rows("SELECT * FROM git_mirror_cursor ORDER BY kind")
-            .await,
-        cursor_before
     );
 }
 async fn attribution_and_note_event() {
@@ -854,8 +821,7 @@ async fn unknown_link_usage() {
         // file-backed route opens an independent standalone writer instead.
         pool.writer()
             .unwrap()
-            .conn()
-            .authorizer(Some(deny))
+            .autocommit(|conn| Ok(conn.authorizer(Some(deny))?))
             .unwrap();
     }
     let error = scope(
@@ -948,7 +914,7 @@ async fn exercise(name: &str) {
         "replacement_and_resurrection_failure_preserve_preimage_then_retry" => {
             replacement_and_resurrection().await
         }
-        "commit_annotation_event_failure_rolls_back_and_create_only_outcomes_keep_cursors" => {
+        "guarded_annotation_event_failure_rolls_back_and_create_only_outcomes_are_event_free" => {
             annotation_outcomes().await
         }
         "link_attribution_and_note_event_projection_stay_on_source" => {
@@ -1050,8 +1016,8 @@ fn replacement_and_resurrection_failure_preserve_preimage_then_retry() {
     run_case("replacement_and_resurrection_failure_preserve_preimage_then_retry")
 }
 #[test]
-fn commit_annotation_event_failure_rolls_back_and_create_only_outcomes_keep_cursors() {
-    run_case("commit_annotation_event_failure_rolls_back_and_create_only_outcomes_keep_cursors")
+fn guarded_annotation_event_failure_rolls_back_and_create_only_outcomes_are_event_free() {
+    run_case("guarded_annotation_event_failure_rolls_back_and_create_only_outcomes_are_event_free")
 }
 #[test]
 fn link_attribution_and_note_event_projection_stay_on_source() {

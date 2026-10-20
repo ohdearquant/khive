@@ -117,7 +117,9 @@ fn matching_daemon_claim_opens_read_only_snapshots_in_both_boot_routes() {
                 .pool()
                 .writer()
                 .unwrap()
-                .query_row("SELECT value FROM witness", [], |row| row.get::<_, i64>(0))
+                .autocommit(|conn| Ok(
+                    conn.query_row("SELECT value FROM witness", [], |row| row.get::<_, i64>(0))?
+                ))
                 .unwrap(),
             7
         );

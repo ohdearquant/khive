@@ -2987,17 +2987,22 @@ async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
     // COMMIT, ROLLBACK or SAVEPOINT issued by any helper fails.
     let set_tripwire = |armed: bool| {
         let writer = rt.backend().pool().writer().expect("pathless writer");
-        let result = if armed {
-            writer.authorizer(Some(|context: AuthContext<'_>| match context.action {
-                AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
-                    Authorization::Deny
-                }
-                _ => Authorization::Allow,
-            }))
-        } else {
-            writer.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
-        };
-        result.expect("set the transaction tripwire");
+        writer
+            .autocommit(|conn| {
+                let result = if armed {
+                    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+                        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                            Authorization::Deny
+                        }
+                        _ => Authorization::Allow,
+                    }))
+                } else {
+                    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                };
+                result.expect("set the transaction tripwire");
+                Ok(())
+            })
+            .expect("configure transaction tripwire");
     };
     set_tripwire(true);
     // The probe goes to the pooled connection itself: `SqlWriter::execute`
@@ -3008,7 +3013,8 @@ async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
         .pool()
         .writer()
         .expect("probe writer")
-        .execute_batch("BEGIN IMMEDIATE");
+        .autocommit(|conn| Ok(conn.execute_batch("BEGIN IMMEDIATE")))
+        .expect("run native transaction-control probe");
     assert!(
         probe.is_err(),
         "the tripwire must refuse transaction control: {probe:?}"

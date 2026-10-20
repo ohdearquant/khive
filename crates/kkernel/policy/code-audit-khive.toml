@@ -80,6 +80,7 @@ khive-pack-template = 6
 khive-pack-tool = 6
 khive-pack-web = 6
 khive-pack-workspace = 6
+khive-runtime-production-tests = 6
 khive-vcs = 7
 khive-pack-brain = 7
 khive-pack-exec = 7

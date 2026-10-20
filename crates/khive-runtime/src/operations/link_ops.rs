@@ -3,12 +3,11 @@ use khive_storage::{EdgeInsertIfAbsentOutcome, GraphStatementGuard};
 use super::{
     accepted_entity_relations_description, base_entity_rule_allows, canonical_edge_endpoint_kinds,
     canonical_edge_endpoints, compose_graph_mutation_events, merge_dependency_kind,
-    pack_rule_allows, validate_edge_metadata, validate_edge_weight, CommitAnnotationGuard,
-    CommitAnnotationInsertOutcome, Edge, EdgeEndpointKind, EdgeRelation, EdgeUpsertDisposition,
-    EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, Event, EventKind, GraphMutationOutcome,
-    GraphMutationPreconditions, GraphMutationRequest, GuardedEdgeUpsertOutcome,
-    GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken, Resolved, RuntimeError,
-    RuntimeResult, SubstrateKind, Uuid,
+    pack_rule_allows, validate_edge_metadata, validate_edge_weight, Edge, EdgeEndpointKind,
+    EdgeRelation, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    Event, EventKind, GraphMutationOutcome, GraphMutationPreconditions, GraphMutationRequest,
+    GuardedEdgeUpsertOutcome, GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken,
+    Resolved, RuntimeError, RuntimeResult, SubstrateKind, Uuid,
 };
 
 pub(super) fn guarded_link_batch_failure(
@@ -586,7 +585,12 @@ impl KhiveRuntime {
                 self.resolve_edge_endpoint(token, target_id).await?,
             ) {
                 (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
-                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
+                    Self::prepare_link_metadata(
+                        relation,
+                        Some(&src_e.kind),
+                        Some(&tgt_e.kind),
+                        metadata,
+                    )
                 }
                 _ => metadata,
             }
@@ -702,6 +706,28 @@ impl KhiveRuntime {
         .map(|result| result.edge)
     }
 
+    /// Apply dependency defaults using entity kinds resolved by the caller.
+    ///
+    /// Only `depends_on` uses the shared inference table. Explicit metadata is
+    /// preserved, including invalid values for the write boundary to reject.
+    /// Missing kinds and pairs without a default leave metadata unchanged.
+    /// This does not validate endpoints or make their kinds a write precondition.
+    /// Both the local link route and the coordinator route use this preparation
+    /// before writing; each retains its existing validation responsibilities.
+    pub fn prepare_link_metadata(
+        relation: EdgeRelation,
+        source_entity_kind: Option<&str>,
+        target_entity_kind: Option<&str>,
+        metadata: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        match (relation, source_entity_kind, target_entity_kind) {
+            (EdgeRelation::DependsOn, Some(source), Some(target)) => {
+                merge_dependency_kind(source, target, metadata)
+            }
+            _ => metadata,
+        }
+    }
+
     /// Policy-aware cross-backend form of [`Self::link_observed`]. Endpoint
     /// validation remains the coordinator's responsibility; mutation
     /// classification and tombstone handling stay inside the source store.
@@ -726,6 +752,27 @@ impl KhiveRuntime {
             canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
         let (source_id, target_id) = (canonical_source, canonical_target);
         validate_edge_metadata(relation, metadata.as_ref())?;
+        let metadata = if relation == EdgeRelation::DependsOn && target_backend.is_none() {
+            // Same-backend coordinator calls have both records here. Cross-backend
+            // callers prepare metadata from records on their respective runtimes.
+            // As on the local route, resolution is by-ID and namespace-unfiltered.
+            match (
+                self.resolve_edge_endpoint(token, source_id).await?,
+                self.resolve_edge_endpoint(token, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(source)), Some(Resolved::Entity(target))) => {
+                    Self::prepare_link_metadata(
+                        relation,
+                        Some(&source.kind),
+                        Some(&target.kind),
+                        metadata,
+                    )
+                }
+                _ => metadata,
+            }
+        } else {
+            metadata
+        };
         let now = chrono::Utc::now();
         let ns = token.namespace().as_str();
         let edge = Edge {
@@ -1171,73 +1218,5 @@ impl KhiveRuntime {
                 "create-only link: unexpected composition outcome".into(),
             )),
         }
-    }
-
-    /// Create a historical commit-to-project annotation without replacing a
-    /// curated edge or reviving a tombstone. The store rechecks the exact live
-    /// commit SHA and project under its writer transaction; only a newly
-    /// inserted edge produces the ordinary LinkCreated lifecycle event.
-    pub async fn link_commit_annotation_if_absent(
-        &self,
-        token: &NamespaceToken,
-        commit_id: Uuid,
-        project_id: Uuid,
-        guard: CommitAnnotationGuard,
-    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
-        if !matches!(guard.expected_sha.len(), 40 | 64)
-            || !guard
-                .expected_sha
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(RuntimeError::InvalidInput(
-                "expected full commit SHA".into(),
-            ));
-        }
-        let edge = self
-            .build_edge(
-                token,
-                &LinkSpec {
-                    namespace: None,
-                    source_id: commit_id,
-                    target_id: project_id,
-                    relation: EdgeRelation::Annotates,
-                    weight: 1.0,
-                    metadata: None,
-                    resurrect: false,
-                },
-            )
-            .await?;
-        let attribution = crate::EventAttribution::from_token(token);
-        let outcome = compose_graph_mutation_events(
-            self.backend(),
-            GraphMutationRequest::CommitAnnotation { edge, guard },
-            GraphMutationPreconditions::default(),
-            Vec::new(),
-            move |outcome| match &outcome.mutation {
-                GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(
-                    edge,
-                )) => Ok(vec![Self::link_mutation_event(
-                    &attribution,
-                    &EdgeUpsertResult {
-                        edge: edge.clone(),
-                        disposition: EdgeUpsertDisposition::Created,
-                        previous: None,
-                    },
-                    EdgeEndpointKind::Note,
-                    EdgeEndpointKind::Entity,
-                )]),
-                _ => Err(Self::link_composition_shape_error(
-                    "expected a created annotation",
-                )),
-            },
-        )
-        .await?;
-        let GraphMutationOutcome::CommitAnnotation(result) = outcome.mutation else {
-            return Err(RuntimeError::Internal(
-                "link annotation: unexpected composition outcome".into(),
-            ));
-        };
-        Ok(result)
     }
 }

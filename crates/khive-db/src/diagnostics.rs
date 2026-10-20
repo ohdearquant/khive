@@ -31,9 +31,9 @@
 //!    `TruncateState`, may escalate to TRUNCATE, and double-counts the
 //!    ADR-091 process-global counters. A verb that reports state must not
 //!    perturb the state it reports.
-//! 2. The probe's connection comes from
-//!    `ConnectionPool::open_standalone_writer_untracked`, opened without
-//!    `SQLITE_OPEN_CREATE`. A missing database yields `checkpoint_probe:
+//! 2. The pool's complete diagnostic collector opens its private connection
+//!    without `SQLITE_OPEN_CREATE` and returns data rather than a SQL handle.
+//!    A missing database yields `checkpoint_probe:
 //!    null` plus a `checkpoint_probe_error`, never a freshly created file.
 //! 3. WAL-pin attribution combines the read-only OS holder census with
 //!    `walpin::inspect_live`, a separate bounded sidecar enumerator whose
@@ -1011,11 +1011,11 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded_rows: Option<u64>,
     /// Why `audit_degraded_rows` is unavailable to this caller.
     pub audit_degraded_rows_unavailable_reason: Option<String>,
-    /// Monotonic process-lifetime flag set once any accepted row has been
-    /// released without a commit: a pure-observability row released degraded,
-    /// or a generation that failed to flush, whose rows are absent from the
-    /// audit trail whether or not their callers were told. `None` under the
-    /// same conditions as `audit_batch_flush_failures`.
+    /// Monotonic process-lifetime flag set by a failed audit append or driver
+    /// failure, or by accepted pure-observability rows released without a commit.
+    /// Abandoned or shed generations containing only obligation-bearing rows
+    /// increment `audit_batch_flush_failures` without setting this flag.
+    /// `None` under the same conditions as `audit_batch_flush_failures`.
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
@@ -2059,7 +2059,7 @@ fn collect_inner(
     }
 }
 
-struct PoolInspection {
+pub(crate) struct PoolInspection {
     checkpoint_probe: Option<CheckpointProbe>,
     checkpoint_probe_error: Option<String>,
     checkpoint_pin: CheckpointPinDiagnostics,
@@ -2119,8 +2119,17 @@ fn inspect_pool_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
     collect_size_composition: bool,
 ) -> StorageResult<PoolInspection> {
+    pool.inspect_diagnostic_connection_interruptibly(scope, collect_size_composition)
+}
+
+pub(crate) fn inspect_open_connection_interruptibly(
+    pool: &ConnectionPool,
+    opened: Result<rusqlite::Connection, crate::error::SqliteError>,
+    scope: &crate::read_cancellation::InterruptibleReadScope,
+    collect_size_composition: bool,
+) -> StorageResult<PoolInspection> {
     scope.ensure_active()?;
-    let conn = match pool.open_standalone_writer_untracked() {
+    let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
             scope.ensure_active()?;
@@ -2363,7 +2372,15 @@ async fn inspect_file_state_interruptibly(
 /// pragma/query itself — comes back in its section's error field. Nothing
 /// here can create a file.
 fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
-    let conn = match pool.open_standalone_writer_untracked() {
+    pool.inspect_diagnostic_connection(true)
+}
+
+pub(crate) fn inspect_open_connection(
+    pool: &ConnectionPool,
+    opened: Result<rusqlite::Connection, crate::error::SqliteError>,
+    collect_size_composition: bool,
+) -> PoolInspection {
+    let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
             let reason = format!("guarded standalone open refused: {e}");
@@ -2410,7 +2427,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         page_accounting_error,
         size_composition,
         size_composition_error,
-    } = size_composition::collect(&conn, true);
+    } = size_composition::collect(&conn, collect_size_composition);
     let (fts_segments, fts_segments_error) =
         split_fts_segments_result(crate::fts_maintenance::inspect_fts_segments(&conn));
 

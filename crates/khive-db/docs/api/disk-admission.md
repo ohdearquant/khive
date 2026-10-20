@@ -8,8 +8,9 @@ owned connection close. When rollback and close both fail, the owner retires the
 connection, returns an unknown-outcome error, and releases the lease. Checkpoints
 and read-only work remain available for recovery.
 
-The implementation below is the foundation for #3551. The raw and cached APIs in
-the remaining-work table are not covered by a complete execution-time guarantee.
+The implementation below is the foundation for #3551. The queued cached writer
+queries and the pre-pool code-map transition in the remaining-work table are not
+covered by this inventory.
 
 ## Configuration
 
@@ -105,13 +106,43 @@ checkout as proof that a later write was admitted. Symbols are under
   before releasing the lease, including on terminal return or unwind.
 - **Pooled transaction:** hold the lease before the writer mutex and sample
   after BEGIN. Roll back on refusal; replace a poisoned pooled connection.
+- **Public pooled calls:** `writer` and `try_writer` return an exclusion owner
+  without raw `conn`/`conn_mut` access or dereference coercions. Consuming
+  `autocommit` samples before its callback and refuses unfinished scripts;
+  consuming `transaction` samples after BEGIN and owns COMMIT/ROLLBACK. Both
+  retain the lease through settlement, including unwind. A delayed checkout
+  never substitutes its old capacity observation for execution admission.
 - **Standalone transaction:** own the connection and lease, then sample after
   BEGIN. Close or restore autocommit before releasing the lease.
+- **Public standalone calls:** `standalone_autocommit` owns one callback or
+  complete script; `standalone_transaction` also owns BEGIN IMMEDIATE and
+  COMMIT/ROLLBACK. Neither returns a connection. An unfinished script is rolled
+  back and refused, and unwinding closes the owned connection under its lease.
+- **Standalone factories:** one private native opener supplies complete owners
+  for typed write units, the lifetime writer task and cached SQL bridge handles.
+  Diagnostics return collected data; checkpoints return only fixed checkpoint
+  operations. No factory returns a raw pool-opened writer to another module.
+- **Cached SQL writer queries:** with the write queue off, `query_row`,
+  `query_all` and `query_page` admit writable SQL at execution, including DML
+  with `RETURNING`. Their call owner
+  retains the connection and lease through settlement, even if the observer is
+  aborted. Pure reader-shaped SQL keeps its read-only admission path. An
+  unowned transaction cannot survive a query call; successful rollback refuses
+  an otherwise successful call with `InvalidInput`, and preserves an original
+  error. Failed settlement retires the connection and reports an unknown
+  outcome. Scripts may complete their own transactions under the same rule.
+- **Manual atomic SQL:** file-backed manual atomic SQL runs in one blocking owner
+  with its permit, lease, connection and transaction evidence retained through
+  settlement, including when the async observer is aborted.
 - **Autocommit writes:** admit backend constructor DDL and entity, note,
   attachment, and sparse helpers before the first SQLite write. Retain the guard
   through the script and retire an unfinished transaction.
 - **FTS rowid-map backfill:** retain the constructor lease and sample after
   BEGIN. Refusal rolls back without filling the map or stamping completion.
+- **FTS merge maintenance:** use a separate ordinary write owner, retain its
+  lease and sample immediately before the bounded merge INSERT. The dedicated
+  checkpoint connection is never used for this DML. Maintenance keeps its zero
+  SQLite busy wait; acquiring the cooperative lease uses the guard deadline.
 - **Graph mutation plus events:** retain a standalone lease or pooled guard
   through the closure. The transaction helper samples after BEGIN.
 - **Schema bootstrap:** sample immediately before each ledger-table DDL and
@@ -140,14 +171,10 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 
 ## Remaining work
 
-- **#3594:** Public raw pooled writers can issue SQL outside the typed
-  transaction boundary; checkout-time sampling is insufficient.
-- **#3595:** `open_standalone_writer` returns a raw connection whose later
-  writes are not an owned logical unit.
-- **#3596:** Internal raw standalone connection escapes need call-site
-  conversion and inventory.
-- **#3597:** Cached `SqlWriter` handles and manual atomic SQL need per-write
-  leases and SQLite-aware classification.
+- **#3597:** With the write queue on, the default for a file-backed pool, a
+  cached `SqlWriter`'s `query_row`, `query_all` and `query_page` still accept
+  only reader-shaped SQL and refuse writable statements with `InvalidInput`.
+  Admitting writable SQL on that path remains open.
 - **#3551:** The code-map WAL-to-DELETE transition, including checkpoint and
   sidecar work before pool construction, remains outside this slice. A later
   ADR-154 slice must decide its admission classification.
@@ -156,6 +183,12 @@ The pre-pool WAL-to-DELETE transition and its callees are unchanged in this slic
 #3551 open; the foundation does not claim a universal guard over all SQL a caller
 can execute. Backend/pool-owned
 migration entry points carry the captured policy.
+
+The raw pooled writer API from #3594, raw standalone opener from #3595 and
+internal raw factory escapes from #3596 have been replaced by the boundaries above. Native lock, corruption and
+settlement fault fixtures open their own external SQLite connections explicitly;
+they are not production escape hatches or substitutes for admission and identity
+tests.
 
 Caller-owned raw connections can use `MigrationWritePolicy::new(effective_policy,
 absolute_lock_dir)` and `run_migrations_with_policy`, `apply_schema_plan_with_policy`,

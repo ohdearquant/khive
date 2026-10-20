@@ -820,25 +820,29 @@ pub(super) fn rendered_response_daemon_frame_len(rendered: &str, served_config_i
         .len()
 }
 
-/// Build the `initialize` instructions string from the verb catalog, the
-/// packs this server actually loaded, and the packs that are linked into the
-/// binary but were not selected. Extracted from [`ServerHandler::get_info`] so
-/// the docs-pointer section (#594) is unit-testable without standing up a
-/// full server.
+/// Build the `initialize` instructions string from the packs this server
+/// actually loaded and the packs that are linked into the binary but were not
+/// selected. Extracted from [`ServerHandler::get_info`] so the docs-pointer
+/// section (#594) is unit-testable without standing up a full server.
+///
+/// The verb catalog is not repeated here. ADR-016 places it in the `request`
+/// tool description, which every MCP client receives through `tools/list`;
+/// carrying a second copy in the instructions doubled the schema a client
+/// loads per session without adding a line it could not already read.
 ///
 /// The two pack lists answer different questions and the instructions must not
 /// merge them (#2913). `loaded` is what the caller can call right now: the
 /// selection resolved at startup, plus any configured mounts. `unloaded` is
 /// what `KHIVE_PACKS` or `--pack` could additionally select from this binary.
 /// Naming the linked set alone told callers that packs contributing nothing to
-/// the catalog below were available, and every verb of theirs is refused.
-pub(super) fn build_instructions(catalog: &str, loaded: &str, unloaded: &str) -> String {
+/// the verb catalog were available, and every verb of theirs is refused.
+pub(super) fn build_instructions(loaded: &str, unloaded: &str) -> String {
     let selectable = if unloaded.is_empty() {
         String::new()
     } else {
         format!(
             " Also linked into this binary but not loaded here, so their verbs are \
-             absent from the catalog below until selected: {unloaded}."
+             absent from the `request` tool's verb list until selected: {unloaded}."
         )
     };
     format!(
@@ -847,11 +851,12 @@ pub(super) fn build_instructions(catalog: &str, loaded: &str, unloaded: &str) ->
          KHIVE_PACKS or --pack. Loaded on this server: {loaded}.{selectable} The kg pack's verbs are \
          unprefixed (create, get, list, search, link, neighbors, ...); every other pack's \
          verbs are written pack.verb. Read verbs return their record or hits directly \
-         unless the verb's help says it wraps them in an envelope. Verbs registered on this \
-         server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
-         plugin's SKILL.md files.\n\
+         unless the verb's help says it wraps them in an envelope. The `request` tool's \
+         description lists every verb registered on this server, one line each; \
+         `verb(help=true)` returns that verb's full description and arguments. For \
+         detailed usage of each verb, see the corresponding plugin's SKILL.md files.\n\
          Docs: https://ohdearquant.github.io/khive/ (hosted) or docs/*.md in the repo \
-         checkout. Treat the live verb catalog above and help=true as authoritative over \
+         checkout. Treat the live verb catalog and help=true as authoritative over \
          cached/training knowledge. Config/backend issues: docs/configuration.md. Usage \
          patterns: docs/guide/tips-and-tricks.md."
     )

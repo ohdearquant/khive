@@ -2238,6 +2238,7 @@ dependencies = [
  "khive-channel-email",
  "khive-channel-telegram",
  "khive-db",
+ "khive-fs",
  "khive-mounts",
  "khive-pack-agent",
  "khive-pack-blob",
@@ -2502,6 +2503,7 @@ dependencies = [
  "khive-types",
  "lattice-embed",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
@@ -2961,6 +2963,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-runtime-production-tests"
+version = "0.14.0"
+dependencies = [
+ "async-trait",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "khive-score"
 version = "0.14.0"
 dependencies = [
@@ -3092,6 +3106,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "criterion",
  "dotenvy",
  "inventory",
  "khive-changeset",

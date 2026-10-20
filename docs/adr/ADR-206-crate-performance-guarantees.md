@@ -6,7 +6,11 @@
 [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)\
 **Grounding commit**: `d3619dec9e32045f273c61b5a7b2eb70fe6463a3`\
 **Amendments**: [Amendment 1](#amendment-1-2026-10-17-closure-selection-runs-once-per-merge-train)
-(2026-10-17, Proposed): D6 closure selection runs once per merge train
+(2026-10-17, Proposed): D6 closure selection runs once per merge train;
+[Amendment 2](#amendment-2-2026-10-18-fixed-references-are-measured-on-the-build-host-and-committed)
+(2026-10-18, Proposed): fixed references are measured on the build host and committed;
+[Amendment 3](#amendment-3-2026-10-20-a-reference-holds-one-entry-per-bench-target-and-feature-set-each-at-its-own-commit)
+(2026-10-20, Proposed): one reference entry per bench target and feature set, each at its own commit
 
 The maintainers' request of 2026-10-17, translated: "For every performance-critical
 crate I want crate-by-crate benches. Most crates had a bench setup at some point, but it
@@ -726,3 +730,399 @@ Result: 10 BASELINE, 10 NO-BASELINE. Band failures went from 26 runs to 0 (large
 
 No target was still running at the limit, so the stop in item 7 was not exercised. The ten NO-BASELINE crates are
 measured again in a later window.
+
+## Amendment 3 (2026-10-20): a reference holds one entry per bench target and feature set, each at its own commit
+
+**Status**: Proposed
+
+### The gap
+
+Amendment 2 makes a reference one committed file per crate that holds one commit (item 5), requires every bench target
+of the crate to run in the attempt (item 4), and gives a crate no reference for an attempt in which any of its
+benchmarks is UNMEASURED (item 3). What has been measured since does not fit those items.
+
+- **A crate's targets are measured at different commits.** At `ce6b9b61b3b0fb28c96157924149c4db495c6481`, the 23 crates
+  measured have 64 bench targets (`[[bench]]` entries plus `benches/` autodiscovery in the Cargo manifests at that
+  commit). The three jobs at that commit ran 44 of them. Of the other 20, 12 already hold a committed
+  `bench-reference/v1` file measured at `212bf72e` or `c8276608`, one target per file. Across the workspace, 30 crates
+  have 79 bench targets.
+- **One commit took three jobs.** The 44 targets' measured runs took 5,200 s (1,686 s, 1,708 s and 1,806 s, rounded to
+  whole seconds), more than one hold's lease of at most 60 minutes (item 1). Eleven crates had targets in two of the
+  jobs.
+- **One benchmark withholds the crate.** Keyed as D2 keys a result (A3.1), the three jobs hold 438 benchmarks, and the
+  reduction that wrote their summaries passed 428 of them (it judges an allocation report by equality between the runs,
+  and a timing benchmark by item 3's three conditions). Item 3 applied per crate leaves 5 crates and 125 of those 428
+  without a reference:
+
+| Crate                  | Benchmarks | Passed | Why the rest did not                                                                                                       |
+| ---------------------- | ---------- | ------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `khive-score`          | 35         | 33     | A/A spread 1.218 and 1.248 on two benchmarks                                                                               |
+| `khive-runtime`        | 30         | 29     | A/A spread 1.213 on one benchmark                                                                                          |
+| `khive-channel-email`  | 34         | 32     | one target's first run: another CPU above 20% busy in 5.9% of samples; one of its two benchmarks also had A/A spread 1.200 |
+| `khive-pack-knowledge` | 22         | 19     | one target's first run: another CPU above 20% busy in 8.3% of samples                                                      |
+| `khive-pack-code`      | 14         | 12     | two allocation reports differ between the runs                                                                             |
+
+Applied as written, with every bench target of the crate required in one attempt, items 3 to 5 give one crate a
+reference at `ce6b9b61` (`khive-mcp`, 1 benchmark).
+
+Item 3's reason stands: a number that did not pass its gates is never averaged into a reference. A reference holds
+per-benchmark values and no aggregate across benchmarks, so that reason does not need a whole crate to pass. D4 compares
+each benchmark only with its own later observations, and records the source SHA on every observation without making it
+part of the comparison key, so it requires neither one storage unit nor references taken at one commit. This amendment
+chooses the bench target as the unit, because a target's benchmarks share one build, one command and the same two runs,
+and gives each entry its own commit. That gives up one property: a file whose entries come from different commits is not
+a snapshot of the crate, so it supports no claim about the crate at one commit. D5's release evidence for an exact
+candidate SHA is unchanged.
+
+### A3.1 A benchmark is identified as D2 identifies a result
+
+D2 records `(package, target, features, scenario, metric, contract revision)` for every expected result. In a reference,
+the file carries the package, each entry carries its target, its resolved feature set (A3.4) and its contract revision,
+and a benchmark is keyed by its scenario id and its metric within the entry. In the producers at this revision each
+scenario id carries one metric (a Criterion median, one bench-json statistic, one allocation report), so within a target
+the key reduces to the scenario id; a producer that emits two metrics under one id names them apart before its target
+can enter a reference. The same scenario id in two targets is two benchmarks. A target measured under two feature sets
+has two entries, one per set, and neither is compared with observations made under the other.
+
+The summaries recorded at `ce6b9b61` count `khive-channel-email` as 26 benchmarks with 8 "listed by more than one
+target", because that reduction keyed a benchmark by its id alone and an allocation target names its scenarios after the
+Criterion benchmarks it mirrors. Under D2's identity those 8 ids are 16 benchmarks in different targets.
+
+### A3.2 What an attempt gives a target
+
+Each target that an in-class attempt runs ends in exactly one of four ways, decided from each run's own cause.
+
+A run is **not started** when item 7 keeps it from starting: the scheduler declines the target's first run, the
+scheduler leaves a second run unstarted because the first took longer than its estimate (`box_bench.py` records
+`arm b not started`), or the run would follow a stopped one. A run is **stopped** when item 7's stop ends it; its exit
+status, and every identity it did not emit, are then the stop's, not the producer's, and the runner records the stop
+before it reads the exit status, as `box_bench.py` does today. Any other run **ran to its end**. A run that ran to its
+end is judged for execution and completeness. A stopped run is judged for completeness only on the records its log holds
+complete. The stop ends the run's whole process group: the runner sends the kill to the group if any member outlives the
+grace, and appends its stop marker only once no member of the group remains, so nothing the run's processes write
+follows the marker. A last record left incomplete is treated as absent. This is a convention about what the log can
+show, not a finding about cause: the log records neither when the producer finished a record nor why a last record is
+incomplete, so every complete record, including one written while the run was being stopped, is read as the producer's
+emission, and an incomplete one as no one's.
+
+A target that meets the conditions of more than one outcome is decided by the first that applies, in this order:
+
+- (a) The build or list step fails, or a run that ran to its end exits nonzero: **execution failure**. A later run being
+  stopped or left unstarted does not erase it.
+- (b) Otherwise, a completeness condition of 3 below holds for the runs that ran to their end, or one of its positive
+  conditions holds for the complete records of a stopped run: **completeness failure**.
+- (c) Otherwise, a run is not started or stopped: **window failure**.
+- (d) Otherwise, a sampler condition of 2 below: **window failure**.
+- (e) Otherwise: **completed**.
+
+So a run that exits nonzero on its own, or emits a wrong identity set, is not rerun at that commit because its sampler
+readings were also bad or because the other run was stopped; and a run the hold stopped or never started is charged to
+its producer only for what it positively emitted.
+
+The stored runner (`box_bench.py` at `ce6b9b61`) records the stop before the exit status and keeps an earlier execution
+failure when a later run is stopped. A read of it finds the differences below from the rules above, each of which
+changes with this amendment. The list is what that read found, not a claim that there are no others; arm 4 below, not
+this list, holds the v2 runner to the order.
+
+- Its final reason for a target takes a scheduling skip before an execution failure
+  (`self.skipped.get(t) or self.failed.get(t)`), so a first run that exits nonzero followed by a second left unstarted
+  reads as not started, where (a) makes it an execution failure.
+- That final reason replaces the reason of every row the target listed, so a completeness defect it had already found
+  for the target, such as an identity its list names twice, reads as the later stop's reason, where (b) keeps it.
+- A Criterion run that ran to its end with no result for a listed identity makes that row UNMEASURED, where 3 makes it a
+  completeness failure, and results for identities the list does not name are ignored, where 3 checks them against D2's
+  registry.
+- Two bench-json runs that disagree in statistic or sample count are recorded as a reason on an UNMEASURED row beside
+  any sampler reasons, where (b) makes the target a completeness failure before the sampler is read.
+- It parses a bench-json target's rows only when both runs exist, where (b) judges a lone run that ran to its end.
+- When the termination signal ends the group's leader within the grace, it skips the kill and writes its marker without
+  waiting for the group's other members, so a member that ignores the signal can write after the marker, where this
+  amendment requires the marker to follow the whole group.
+
+1. **Execution failure: no entry, and no rerun at that commit.** The build or the list step fails (where the target kind
+   has a list step; an allocation target has none), or a run that ran to its end exits nonzero. These are D5's required
+   execution failures. Inside an exclusive hold no other job runs, and a nonzero exit can be the producer's own
+   assertion, so running it again until a run exits zero would be retry-until-green, which D5 prohibits. The target is
+   measured at a later commit.
+2. **Window failure: no entry from this attempt; the target may be run again (A3.3).** A run is not started or is
+   stopped under item 7. For a timing target, also: the sampler has no reading for a run, its readings leave no usable
+   loaded-core clock once invalid and floor readings are removed (the instrument's "pinned-core clock unreadable" band),
+   its readings give no busy share for a run ("busy fraction unreadable"), a run's clock band exceeds 10% (item 2),
+   another CPU is busy in more than 5% of a run's samples (item 3), or a run's clock median is below 97.5% of the
+   class's frequency cap (the clock bound below). A repeatable target is not judged by the sampler: its runs can end
+   inside one sampling period, and its readings are recorded when there are any.
+3. **Completeness failure: no entry, and no rerun at that commit.** The target's list, or the output of a run that ran
+   to its end, names one identity twice, misses an expected one, or names one D2 has not registered (D2), two runs that
+   both ran to their end report one identity with a different statistic, unit or sample count, or such a run reports a
+   value D2 rejects (not a finite number, an unknown unit, an invalid sample count, a zero denominator). A rerun that
+   happened to emit every identity once would select among executions of a producer that has already emitted a wrong
+   set, so the target is measured at a later commit after its producer is fixed. The positive conditions, which also
+   judge the complete records of a stopped run, are a duplicate identity, an identity D2 has not registered, a value D2
+   rejects, and a record that disagrees in statistic, unit or sample count with another run's record of the same
+   identity. A missing identity is not evidence against a stopped run.
+4. **Completed: the attempt supplies the target's entry** (A3.3), in which each benchmark is MEASURED or UNMEASURED.
+   - A **timing metric** (a Criterion median, or a bench-json statistic in nanoseconds) is MEASURED when its A/A spread
+     is within D4's `noise_ceiling` (1.15). When any timing benchmark of the target exceeds the ceiling, every timing
+     benchmark of the target is UNMEASURED; those within it carry the reason "withheld: the target's runs exceeded the
+     ceiling" with the benchmark that did. This is a conservative admission rule, not a finding that every sibling was
+     disturbed. A target's benchmarks run in the same two invocations of its bench binary, consecutively on the same
+     pinned cores, but Criterion measures them one after another inside each run, so the stored files do not show which
+     siblings the disturbance reached. The rule withholds them because a wrong value in a reference misleads every later
+     comparison until a D5 contract change replaces it, while a withheld value waits for an in-class observation at a
+     later commit that measures it, which may take more than one attempt. At `ce6b9b61` it withholds 41 timings that
+     were within the ceiling. Benchmarks of other targets ran in other invocations and are not withheld.
+   - A **repeatable metric** is every other metric: allocation reports, counts and quality values. It is MEASURED when
+     both runs report the same value; otherwise it is UNMEASURED with both values and the fields that differed, and the
+     pull request that commits the entry links an issue that decides whether the producer or the measured path is
+     nondeterministic. The clock band, clock bound and busy share do not apply, because a count of work for a fixed
+     workload does not depend on the clock. A metric that cannot repeat exactly, such as RSS or a ratio of durations,
+     needs its own rule before it enters a reference; none of the 44 targets measured at `ce6b9b61` emits one, and a
+     target outside them is checked when it is first measured.
+
+An UNMEASURED benchmark is absent evidence, never a pass. A reference disposition never satisfies or waives a
+deterministic or quality bound, and never satisfies a required execution or completeness check: D3 and D5 gate those,
+unchanged.
+
+**Window conditions select, and the selection is bounded and visible.** They are read from the job and the sampler, not
+from the benchmark's values, but they are not independent of the measured path. Item 7 sizes a later run by the earlier
+runs' actual durations, so a slow first run can leave the second unstarted, and a benchmark's own load can move its
+core's clock and other CPUs' busy share. A rerun therefore selects. If the measured path itself raises a window
+condition with probability p in each attempt and the attempts are independent, all three raise it with probability p^3,
+so at least one escapes with probability 1 - p^3; if the attempts are perfectly correlated, it is 1 - p. The jobs
+measured so far estimate neither p nor the dependence between attempts, so no bound on this selection is claimed beyond
+the cap of three. This amendment accepts that selection for window conditions only, on three terms: every attempt stays
+listed in the record with its readings; the runs of the attempt that supplies the entry are still judged by the A/A
+ceiling; and two window failures of one target at one commit file D4's environment issue, where a cause in the measured
+path is investigated. A rerun after an item 7 failure sizes the target by the longest run the failed attempt recorded.
+
+**The clock bound.** Item 2's band bounds how far the clock moves inside a run, not where it sits, so a run held at a
+steady lower clock passes the band. The bound reads the run's clock median on the basis its band used (the loaded core,
+or the both-core bound that Amendment 2's First references describes). At `ce6b9b61` the 82 timing runs had clock
+medians from 98.165% to 98.615% of the 3,600,000 kHz cap; the 18 v1 files hold 610 per-benchmark run readings, the
+lowest 98.348%. A drop of 3% from the highest run gives 95.66% and fails the bound; a drop of 1% gives 97.63% and
+passes. The drop a run can take before failing depends on where it sits, from about 0.68% at the lowest observed median
+to 1.13% at the highest. The 97.5% figure is set below every observed median; its false-positive rate and its
+sensitivity to a real slowdown are not measured here, and a clock median does not detect cache or memory interference.
+
+**The shift is recorded, not judged.** For every completed target with timing benchmarks, the entry records the median
+over those benchmarks of the second run's timing value divided by the first run's, and how many benchmarks it was taken
+over. A benchmark's timing value is the metric A3.2 item 4 names: a Criterion benchmark's median, or a bench-json
+benchmark's declared statistic as emitted (for `khive-pack-memory`'s `p95_gate`, `p95_ns`), never a figure the producer
+prints only for people. At `ce6b9b61` the 27 Criterion targets with at least five timing benchmarks had shifts no
+further from 1 than 0.9867. In an attempt at the same commit that ran without the frequency cap (out of class, so it
+supplies nothing), `khive-pack-memory`'s `fts_gather` shifted 1.064 with all 10 of its benchmarks inside the ceiling;
+its first run's clock band of 15.8% made it a window failure all the same. A disturbance of that shape that moves
+neither the band, the clock bound nor the busy share enters a reference, as it did under Amendment 2 for any crate whose
+benchmarks all passed.
+
+### A3.3 Which attempt supplies the entry
+
+1. A target's entry at a commit comes from the first in-class attempt at that commit that completed it. A completed
+   target is not run again at that commit to supply an entry, and repeatability is never retried at one commit. Item 6's
+   weekly re-measure and D5's release run do run at that commit when the head has not moved; each is a D4 observation
+   and changes no entry (A3.5). A benchmark the entry holds UNMEASURED gets its value from an entry at a later commit.
+2. A target whose attempt was a window failure may be run again at the same commit, up to three in-class attempts per
+   target per commit. This is the bounded rerun policy D5 requires to be registered in advance, on the terms A3.2 states
+   for window conditions. After two window failures of one target at one commit, D4's environment issue is filed.
+3. An attempt whose comparison class differs from the file's, such as one whose cores were not capped, is not in class.
+   It supplies nothing; its stored files remain evidence.
+4. An entry is compared only with its own later observations, so the entries in one file may come from different
+   commits, holds and jobs and need not agree with each other on load, clock or environment. Within one entry D4's
+   comparison key is unchanged: a later observation is compared with the entry only when every field D4's comparison
+   key names matches, and a changed or unknown key field starts a new series. Each entry records its attempt's
+   conditions and its resolved feature set (A3.4), which keeps D6's exact feature set with each emitted measurement.
+
+### A3.4 The record
+
+The file stays `crates/<crate>/perf/reference.json`, one per crate per comparison class; a class change starts a new
+file and never edits the old one (item 5). Its schema is `bench-reference/v2`.
+
+- **Top level**: the crate, the comparison class (item 5's fields), the reduction rule and its thresholds (noise
+  ceiling, band limit, clock bound, busy limits, idle floor, pin requirement), and coverage as two figures: targets with
+  an entry over the crate's bench targets, and MEASURED benchmarks over the benchmarks of the entered targets. Coverage
+  counts entries, not guarantees: D2's ledger keeps pending guarantees separately, and an entry with no MEASURED timing
+  is BASELINE-PENDING under D4.
+- **`targets`**: every bench target `cargo metadata` reports for the crate at the head of the pull request that commits
+  the file. Each has an entry per feature set measured, or a stated absence: execution failure, window failure (with its
+  attempts), completeness failure, excluded by the job (with the job's reason), or not yet measured in a converted
+  attempt.
+- **`attempts`**: per attempt, the job, its commit, the digest of its archived raw output (the archive stays outside the
+  repository, item 5), the host load and frequency posture at the start and end of its measurement, the build
+  environment its fingerprint records (`RUSTFLAGS`, `CARGO_PROFILE_BENCH_DEBUG`, toolchain, target directory), its
+  thresholds, `idle_min` and `require_pin`, the machine identity where the fingerprint has one, and the outcome for each
+  target it ran.
+- **Each entry**: target, kind, commit, attempt, the feature flags its job passed, the feature set Cargo resolved for
+  the crate under the run's exact command (read with `cargo tree -e features` under the same package, feature and
+  profile flags), and the contract revision (null while no D2 manifest covers the target). Per run: the exact command,
+  its measurement start and end times (kept apart from the commit's time, D8), the clock median and its basis, the band,
+  the busy share and the highest other-CPU reading. The shift (A3.2). `benchmarks`, keyed by scenario id and then
+  metric, each with its disposition and reasons. A Criterion benchmark holds `median_ns` (the mean of the two runs'
+  medians), `aa_spread`, and both runs' medians with their confidence intervals. A bench-json timing benchmark holds its
+  statistic, unit and sample count as emitted (for `khive-pack-memory`'s `p95_gate`, `p95_ns` over `n = 200`), both
+  runs' values, their mean as its reference value, and `aa_spread`. A repeatable benchmark holds both runs' reports in
+  full.
+- **v1 files convert** to one entry each at their own commit. Every v1 field is kept as committed: the reference values
+  (copied, never recomputed), the band basis, the run fields and the `evidence` record (archive manifest digest, band
+  bound, the reduction's provenance and job). A field v2 adds that a v1 file does not hold is read from that attempt's
+  archived raw output where the archive keeps it, and the resolved feature set from the v1 commit's manifests and
+  lockfile under the recorded command; anything else is written `legacy_unknown`, never inferred. An entry with an
+  unknown comparison-key field stays committed as evidence, but D4 compares no later observation with it and D8 does not
+  let it qualify a new baseline; a later in-class entry for the target replaces it under A3.5.
+
+### A3.5 Replacing an entry
+
+An entry changes only by reviewed pull request (item 5). Replacing one with an entry from a later commit changes a
+reference, which D5 names a contract change, so the pull request carries D5's fields in full: old and new values per
+benchmark, the reason, comparable before and after evidence, affected publication references, and the tradeoff in
+correctness or quality.
+
+A replacement that would hold UNMEASURED a benchmark the committed entry holds MEASURED is refused while that benchmark
+still exists at the new commit: the committed entry stays, and the new attempt is an UNMEASURED observation under D4,
+which pauses the breach sequence. A benchmark removed from the code leaves its entry through the same D5 diff. A
+re-measure under item 6 is a D4 observation and replaces nothing by itself.
+
+### Amendment 2 as amended
+
+- Item 3, last paragraph, becomes: "Numbers that did not pass these conditions are never averaged into a reference.
+  Which of a target's benchmarks enter is decided per target by Amendment 3."
+- Item 4 becomes: "The job reads `cargo metadata` and enables each target's required features. A target the job was
+  given that neither ran nor was left unstarted or stopped under item 7 fails the job. The reference file lists every
+  bench target of the crate (Amendment 3, A3.4)."
+- Item 5's list holds per entry what it held per file: the commit, the exact command of each run, and the runs' values
+  as A3.4 states them; the host load and frequency posture, and the archive digest, are recorded per attempt.
+- Item 6 is unchanged. Its weekly re-measure runs at the current head, which may be an entry's own commit, and supplies
+  no entry (A3.3).
+- Item 7's last sentence becomes: "Either way the target supplies no entry from the attempt, and the summary names the
+  target and the reason."
+
+### Alternatives considered
+
+Counts are at `ce6b9b61` over the 64 bench targets of the 23 measured crates.
+
+| Alternative                                                                      | Result                   | Why not                                                                                                                                                                         |
+| -------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Per crate and per attempt, every target of the crate in one attempt (as written) | 1 crate, 1 benchmark     | A crate whose targets do not fit one lease, or that already has a v1 reference for some targets, is excluded by scheduling, not by its numbers.                                 |
+| Per crate at one commit, assembled across attempts, withheld on any UNMEASURED   | 4 crates, 36 benchmarks  | Needs every target of the crate measured at one commit, and drops passing benchmarks for a failure in another target measured at another time.                                  |
+| Per target, the target rule applied to repeatable metrics as well                | 382 MEASURED             | A differing count is a property of that one benchmark's instrument; it does not show a disturbed window for its siblings.                                                       |
+| Per benchmark, no target rule                                                    | 428 MEASURED             | Admits siblings measured in the same two runs as a benchmark that crossed the ceiling, when the files cannot show which of them the disturbance reached.                        |
+| Sampler readings required of repeatable targets                                  | 41 entries, 373 MEASURED | An allocation run can end inside one sampling period (`email_allocations`: 0.42 s and 0.32 s, both before the first reading), and a count of work does not depend on the clock. |
+| Judge the shift (withhold a target whose shift exceeds a threshold)              | not adopted              | No threshold has been calibrated against false positives, and a target with few timing benchmarks gives its shift from few ratios.                                              |
+| Rerun a completed target at the same commit until its benchmarks pass            | not adopted              | Retry until green, which D5 prohibits; only window failures are rerun, bounded at three attempts.                                                                               |
+| Rerun execution and completeness failures at the same commit                     | not adopted              | Selects among executions of a producer that failed or emitted a wrong set; D5 prohibits retry-until-green.                                                                      |
+
+### Not decided here
+
+- Whether a machine identity joins the comparison class. The fingerprint records an OS image name and no machine
+  identity; while there is one build host the class does not need it.
+- A judged shift rule, which needs its own calibration.
+- A calibrated clock bound; 97.5% is set below every observed median, without a measured false-positive rate.
+- Rules for metrics that cannot repeat exactly (RSS, ratios of durations).
+- How a nondeterministic allocation report is repaired; that belongs to the issue each one files.
+- A wider noise ceiling for short benchmarks, which would change D4's evidence protocol.
+
+### Acceptance
+
+Inputs: the stored job directories of the three in-class attempts at `ce6b9b61` (`bb-ref1-ce6b9b61-r3`,
+`bb-ref2-ce6b9b61-r2`, `bb-ref3-ce6b9b61`), the two uncapped attempts (`bb-ref1-ce6b9b61-r2`, `bb-ref2-ce6b9b61`) as
+out-of-class fixtures, the 18 v1 files at the commit this amendment lands on with their archive manifests, the Cargo
+manifests at `ce6b9b61`, and fixtures built from them. Each arm's expected result is the one written here, stated before
+it runs.
+
+A fixture changes only what its description states. Everything else it holds is fixed by these defaults, whatever the
+stored files it was built from show: the target's list names each identity once and every identity is registered in D2;
+each of its runs is started, except a run that follows a stopped one, which A3.2 leaves unstarted; each started run the
+description does not stop runs to its end, exits zero and writes one complete, well-formed record for every listed
+identity and nothing else; each run the description stops holds, before its stop marker, complete, well-formed records
+only for listed identities, at most one for each, and no other output; every record of one identity has the same
+statistic, unit and sample count in every run and a value D2 accepts; a timing run's sampler rows give a usable
+loaded-core clock within the clock bound, a clock band within item 2's 10% and a busy share under the limit; and the
+target has no earlier attempt at the commit. A fixture that stops a run states that run's exit status. Mutations act on
+the reduction and the runner, never on a fixture, so a fixture whose description a mutation does not touch keeps its
+expected result.
+
+1. **Control first.** The reduction that wrote the recorded summaries, over their own stored files and thresholds,
+   reproduces every recorded verdict and per-benchmark reason, including `khive-channel-email`'s 26 benchmarks with 8
+   "listed by more than one target".
+2. **Population.** The manifests at `ce6b9b61` give 79 bench targets in 30 crates; the 23 measured crates have 64, of
+   which the three jobs ran 44.
+3. **Identity.** The three jobs hold 438 benchmarks; `khive-channel-email` has 34 and none carries "listed by more than
+   one target". Each of these fixtures is a completeness failure with no entry, and a second attempt at the same commit
+   is refused: a Criterion target whose list names one id twice; a target whose second run omits an identity its first
+   run emitted; a bench-json target whose second run reports `p95_gate` over `n = 100`; a bench-json target one of whose
+   runs reports a value that is not a finite number.
+4. **Window and execution.** `khive-pack-knowledge`'s `search_latency` (busy 0.083) and `khive-channel-email`'s
+   `email_fetch_suppression` (busy 0.059, with an A/A spread of 1.200 beside it) are window failures with no entry.
+   `khive-graph-diff`'s `graph_allocations`, an allocation target with a run at busy 0.077, has all 15 benchmarks
+   MEASURED. `khive-channel-email`'s `email_allocations`, whose two runs ended before the sampler's first reading, has
+   all 14 benchmarks MEASURED. All 82 timing runs pass the clock bound. Fixtures: one run's clock median set 3% below
+   the highest run's is a window failure; 1% below passes; a timing run with no sampler readings is a window failure; a
+   run that exits nonzero is an execution failure with no entry, and a second attempt at that commit is refused; a
+   timing run whose sampler rows leave no usable loaded-core clock is a window failure; a timing run whose readings give
+   no busy share is a window failure; a run that ran to its end and emits an identity D2 has not registered is a
+   completeness failure with no entry, and a second attempt at that commit is refused. Order (A3.2 (a)-(e)): a first run
+   stopped under item 7 that exits nonzero and misses identities is a window failure and may be run again; a first run
+   that completes cleanly followed by a second the scheduler leaves unstarted is a window failure and may be run again;
+   a first run that exits nonzero on its own followed by a second that is stopped and exits nonzero by the stop's signal
+   is an execution failure; a target whose build fails is an execution failure; a run that ran to its end, exits nonzero
+   before the sampler's first reading and emits a partial set is an execution failure; a first run that emits one
+   identity twice followed by a second the scheduler leaves unstarted is a completeness failure; a first run that
+   completes one identity's record twice and is then stopped, exiting nonzero by the stop's signal, is a completeness
+   failure; a bench-json first run that is stopped, exits nonzero by the stop's signal, and whose producer's last
+   output, which the runner's stop marker follows, is the first bytes of a record (a JSON object cut before its closing
+   brace) with later identities missing is a window failure and may be run again; a stopped run that exits nonzero by
+   the stop's signal, whose producer exits at once on the termination signal after starting a child in the producer's
+   process group that ignores the signal and appends one line that is not a record to the run's log every 100 ms until
+   killed, has no output after its stop marker and is a window failure that may be run again; a first run that ran to
+   its end with no result for one listed identity, followed by a second that is stopped and exits nonzero by the stop's
+   signal, is a completeness failure; a target whose list names one identity twice, with a clean first run and a second
+   run that is stopped and exits nonzero by the stop's signal, is a completeness failure; two bench-json runs that ran
+   to their end and disagree in sample count for one identity, beside a sampler reading over the busy limit, are a
+   completeness failure; a first run that exits nonzero followed by a second the scheduler leaves unstarted is an
+   execution failure; a run that exits zero, misses one identity and has a busy share of 0.08 is a completeness failure.
+   In each execution and completeness fixture a second attempt at that commit is refused.
+5. **Entries.** 42 entries at `ce6b9b61` hold 433 benchmarks, 387 MEASURED. The target rule withholds 33 in
+   `khive-score`'s `arithmetic_paths` and 8 in `khive-runtime`'s `runtime_writes`. `khive-pack-code`'s
+   `code_allocations` has 5 MEASURED and 2 UNMEASURED, each with both values and the three fields that differed.
+   `khive-fold`'s entries record `serde` in their resolved feature set although the job passed no feature flag for the
+   crate. Every attempt records its archive digest and every run its measurement start and end. `khive-pack-memory`'s
+   `p95_gate` entry records a shift of 1.0014 over 3 benchmarks, the median of the second run's `p95_ns` over the
+   first's.
+6. **File.** With the 18 v1 entries, 60 of the 79 targets have an entry, holding 738 benchmarks, 692 MEASURED; 18 crates
+   have every target entered. The 19 targets without an entry are listed with their reasons: 2 window failures that may
+   be run again at `ce6b9b61`, and 17 not measured in a converted attempt. Each v1 entry keeps its commit, band basis,
+   committed reference values unchanged and its `evidence` record; every field it lacks is read from its archive or
+   written `legacy_unknown`.
+7. **Attempts.** A fixture whose first attempt of a target is a window failure on the busy share and whose second
+   completes it takes the entry from the second and lists both. A fourth attempt after three window failures at one
+   commit is refused. A second attempt of a completed target at the same commit is refused as a source of an entry; a
+   weekly re-measure of it at that commit runs, is recorded as a D4 observation and leaves the entry unchanged.
+8. **Replacement.** A fixture replacement, given as a candidate entry whose dispositions it states rather than as runs
+   to be reduced, that holds UNMEASURED a benchmark the committed entry holds MEASURED, while the benchmark still
+   exists, is refused. The same benchmark removed from the code passes with D5's fields.
+9. **Out of class.** The two uncapped attempts supply no entry; their shifts are recorded as evidence (`fts_gather`
+   1.064, `e2e_recall` 1.920).
+10. **Mutation.** Each mutation is stated with every arm it turns red; the arms it does not name stay green. Target rule
+    removed: arm 5 gives 428 MEASURED and arm 6 gives 733. Target rule applied to repeatable metrics: arm 5 gives 382,
+    `code_allocations` 0, and arm 6 gives 687. Sampler readings required of repeatable targets: arm 4's
+    `email_allocations` has no entry, arm 5 gives 41 entries, 419 benchmarks and 373 MEASURED, and arm 6 gives 59
+    entries, 724 benchmarks and 678 MEASURED, with 20 targets absent. Clock bound removed: arm 4's 3% fixture enters.
+    Execution failures rerun as window failures: arm 4's nonzero-exit fixture, its partial-set nonzero fixture, its
+    nonzero-then-stopped fixture, its nonzero-then-unstarted fixture and its build-failure fixture get a second attempt.
+    Stopped runs judged for execution: arm 4's stopped fixture, its incomplete-last-record fixture, its surviving-child
+    fixture, its duplicate-then-stopped fixture, its missing-then-stopped fixture and its duplicate-list-then-stopped
+    fixture are execution failures and their second attempts are refused. A later stop decided before an earlier
+    execution failure: arm 4's nonzero-then-stopped fixture is a window failure and gets a second attempt. A second run
+    the scheduler leaves unstarted after a clean first run read as missing output: arm 4's unstarted-second-run fixture
+    is a completeness failure and its second attempt is refused. Stopped runs exempt from completeness: arm 4's
+    duplicate-then-stopped fixture is a window failure and gets a second attempt. An incomplete last record read as the
+    producer's: arm 4's incomplete-last-record fixture is a completeness failure and its second attempt is refused. The
+    stop waiting only for the group's leader: arm 4's surviving-child fixture has output after its stop marker. A stop
+    decided before completeness, taking (c) before (b) whenever a run is stopped: arm 4's duplicate-then-stopped,
+    missing-then-stopped and duplicate-list-then-stopped fixtures are window failures and get a second attempt.
+    Scheduling skip taken before an execution failure: arm 4's nonzero-then-unstarted fixture is a window failure and
+    gets a second attempt. Sampler conditions decided before completeness: arm 4's busy completeness fixture and its
+    disagreeing-runs fixture get a second attempt. Shift taken from the printed p50: arm 5's `p95_gate` shift reads
+    0.9943. Rerun of window failures removed: arm 4's stopped fixture, its unstarted-second-run fixture, its
+    incomplete-last-record fixture and its surviving-child fixture are no longer runnable again, arm 6's 2 window
+    failures are no longer runnable again, and arm 7's first fixture gets no entry and its second attempt is refused.
+    Same-commit ban applied to re-measures: arm 7's weekly re-measure is refused.

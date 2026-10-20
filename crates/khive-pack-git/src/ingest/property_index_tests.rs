@@ -17,9 +17,9 @@ fn configure_property_indexes(runtime: &KhiveRuntime, indexed: bool) {
     if indexed {
         install(runtime);
     } else {
-        runtime.backend().pool().try_writer().unwrap().conn().execute_batch(
+        runtime.backend().pool().try_writer().unwrap().autocommit(|conn| Ok(conn.execute_batch(
             "DROP INDEX idx_git_notes_live_commit_sha; DROP INDEX idx_git_notes_live_number_project; DROP INDEX idx_git_notes_history_canonical_sha; DROP INDEX idx_git_notes_history_noncanonical"
-        ).unwrap();
+        )?)).unwrap();
     }
 }
 
@@ -80,17 +80,16 @@ fn insert(
     deleted: bool,
 ) {
     let writer = runtime.backend().pool().try_writer().unwrap();
-    writer.conn().execute(
+    writer.autocommit(|conn| Ok(conn.execute(
         "INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at,deleted_at) VALUES(?1,?2,?3,?4,1,1,?5)",
         (id, ns, kind, properties.to_string(), deleted.then_some(1_i64)),
-    ).unwrap();
+    )?)).unwrap();
 }
 
 fn delete(runtime: &KhiveRuntime, id: &str) {
     let writer = runtime.backend().pool().try_writer().unwrap();
     writer
-        .conn()
-        .execute("UPDATE notes SET deleted_at=2 WHERE id=?1", [id])
+        .autocommit(|conn| Ok(conn.execute("UPDATE notes SET deleted_at=2 WHERE id=?1", [id])?))
         .unwrap();
 }
 
@@ -159,13 +158,15 @@ fn snapshot(rows: &[SqlRow]) -> Value {
 }
 
 fn annotation_count_sql() -> String {
-    let insert = include_str!(concat!(
+    let source = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../khive-db/sql/commit-annotation-insert.sql"
+        "/sql/commit_annotation_source_guard.sql"
     ));
-    let (_, rest) = insert.split_once("AND 1 = (\n").unwrap();
-    let (count, _) = rest.split_once("\n)\nAND EXISTS").unwrap();
-    format!("SELECT ({count}) AS holders").replace("?9", "?2")
+    let (_, rest) = source.split_once("AND 1 = (\n").unwrap();
+    let (count, _) = rest.rsplit_once("\n      )").unwrap();
+    format!("SELECT ({count}) AS holders")
+        .replace("?2", "?1")
+        .replace("?3", "?2")
 }
 
 async fn annotation_count(runtime: &KhiveRuntime, sha: &str) -> i64 {
@@ -256,8 +257,7 @@ async fn bundled_sqlite_uses_property_indexes_for_exact_production_queries() {
                     .pool()
                     .try_writer()
                     .unwrap()
-                    .conn()
-                    .execute_batch("ANALYZE")
+                    .autocommit(|conn| Ok(conn.execute_batch("ANALYZE")?))
                     .unwrap();
             }
             for (label, sql, params, index) in &queries {
@@ -940,8 +940,7 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
         .pool()
         .try_writer()
         .unwrap()
-        .conn()
-        .execute_batch(GIT_CORE_INDEXES)
+        .autocommit(|conn| Ok(conn.execute_batch(GIT_CORE_INDEXES)?))
         .unwrap();
     install(&runtime);
     let pack_indexes = query(
@@ -975,7 +974,7 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
         assert!(matches!(row.get("deleted_at"), Some(SqlValue::Integer(1))));
     }
     let writer = runtime.backend().pool().try_writer().unwrap();
-    let invalid_live = writer.conn().execute("INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at) VALUES('invalid-live-after','local','commit','{',1,1)",[]);
+    let invalid_live = writer.autocommit(|conn| Ok(conn.execute("INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at) VALUES('invalid-live-after','local','commit','{',1,1)",[]))).unwrap();
     assert_eq!(invalid_live.is_err(), EXPECT_GIT_PROPERTY_INDEXES);
 }
 
@@ -988,7 +987,7 @@ async fn current_core_notes_schema_retains_live_json_guards() {
             install(&runtime);
         }
         let writer = runtime.backend().pool().try_writer().unwrap();
-        let error = writer.conn().execute("INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at) VALUES('invalid-current-live','local','commit','{',1,1)",[]).unwrap_err().to_string();
+        let error = writer.autocommit(|conn| Ok(conn.execute("INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at) VALUES('invalid-current-live','local','commit','{',1,1)",[]))).unwrap().unwrap_err().to_string();
         assert!(error.contains("malformed JSON"), "full core guard: {error}");
     }
 }

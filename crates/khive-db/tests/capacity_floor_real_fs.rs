@@ -187,8 +187,7 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
     {
         let writer = pool.writer().expect("schema writer");
         writer
-            .conn()
-            .execute_batch(include_str!("fixtures/capacity-floor.sql"))
+            .autocommit(|conn| Ok(conn.execute_batch(include_str!("fixtures/capacity-floor.sql"))?))
             .expect("schema creation");
     }
     assert_eq!(

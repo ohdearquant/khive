@@ -79,6 +79,26 @@ async fn connect(
     Ok(client)
 }
 
+/// The `request` tool's description as an MCP client receives it from
+/// `tools/list`, served from `server`. The verb catalog lives there (ADR-016);
+/// the `initialize` instructions point to it instead of repeating it.
+async fn request_tool_description(server: KhiveMcpServer) -> anyhow::Result<String> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(server_service) = server.serve(server_transport).await {
+            let _ = server_service.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    let listed = client.list_tools(None).await?;
+    let request = listed
+        .tools
+        .iter()
+        .find(|t| t.name == "request")
+        .expect("request tool must be present");
+    Ok(request.description.as_deref().unwrap_or("").to_string())
+}
+
 fn first_text(r: &CallToolResult) -> String {
     r.content
         .first()

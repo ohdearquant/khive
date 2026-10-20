@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `khive_storage::graph::CommitAnnotationCursorValue`,
+  `khive_storage::graph::CommitAnnotationGuard`, and
+  `khive_storage::graph::CommitAnnotationInsertOutcome`.
+- `khive_storage::GraphStore::insert_commit_annotation_if_absent` and
+  `khive_runtime::KhiveRuntime::link_commit_annotation_if_absent`.
+  Git reconciliation uses pack-owned predicates and the existing generic
+  create-only graph insertion instead.
+- `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
+  `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
+
 ### Added
 
+- `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared
+  dependency-kind defaults to caller-resolved entity kinds without I/O.
 - Writer contention diagnostics now report per-pool FIFO admission depth, its
   high-water mark, capacity rejections and bounded lifetime duration histograms.
   Snapshots identify the FIFO stage and report unavailable call/rotation metrics
@@ -42,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
   `writer_admission_unavailable_reason`. Direct struct literals must set them.
 - `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
+- `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
+  `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
+  takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
+  `WriterGuard::transaction`, which admit the write before it runs and settle the
+  connection before the guard is released.
 
 ## [0.14.0] - 2026-10-18
 

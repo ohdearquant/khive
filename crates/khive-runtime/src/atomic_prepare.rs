@@ -65,6 +65,7 @@ use khive_db::stores::text::{delete_document_statements, insert_document_stateme
 mod add_update;
 pub(crate) use add_update::{
     attach_note_update_effects, prepare_add_entity_record, prepare_add_note_record,
+    prepare_import_entity_record, prepare_update_entity_record, validate_import_entity_record,
 };
 pub use add_update::{
     prepare_add_entity, prepare_add_note, prepare_op, prepare_update, prepare_update_entity_plan,

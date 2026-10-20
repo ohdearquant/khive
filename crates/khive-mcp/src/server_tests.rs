@@ -4625,8 +4625,7 @@ fn duplicate_verb_concatenates_descriptions_with_pack_attribution() {
 
 #[test]
 fn instructions_carry_docs_address_and_guidance_pointers() {
-    let instructions =
-        build_instructions("  create — Create an entity or note.\n", "kg, gtd", "web");
+    let instructions = build_instructions("kg, gtd", "web");
     assert!(instructions.contains("https://ohdearquant.github.io/khive/"));
     assert!(instructions.contains("docs/configuration.md"));
     assert!(instructions.contains("docs/guide/tips-and-tricks.md"));
@@ -4636,11 +4635,7 @@ fn instructions_carry_docs_address_and_guidance_pointers() {
 
 #[test]
 fn the_packs_loaded_and_the_packs_merely_linked_are_named_separately() {
-    let instructions = build_instructions(
-        "  create — Create an entity.\n",
-        "kg, gtd",
-        "web, telemetry",
-    );
+    let instructions = build_instructions("kg, gtd", "web, telemetry");
 
     let loaded = instructions
         .split_once("Loaded on this server: ")
@@ -4659,6 +4654,10 @@ fn the_packs_loaded_and_the_packs_merely_linked_are_named_separately() {
         .expect("the selectable clause ends in a period")
         .0;
     assert_eq!(selectable, "web, telemetry");
+    assert!(instructions.contains(
+        "Also linked into this binary but not loaded here, so their verbs are \
+         absent from the `request` tool's verb list until selected: web, telemetry."
+    ));
 
     // The defect: one list labelled "built-ins" carried both sets, so a
     // caller read every linked pack as callable. Spelling it out here
@@ -4669,7 +4668,7 @@ fn the_packs_loaded_and_the_packs_merely_linked_are_named_separately() {
 
 #[test]
 fn a_fully_loaded_binary_gets_no_selectable_clause() {
-    let instructions = build_instructions("  create — Create an entity.\n", "kg, gtd", "");
+    let instructions = build_instructions("kg, gtd", "");
 
     assert!(instructions.contains("Loaded on this server: kg, gtd."));
     assert!(!instructions.contains("Also linked into this binary"));
@@ -4721,6 +4720,37 @@ async fn the_instructions_name_as_loaded_only_what_this_server_loaded() {
     for pack in &loaded {
         assert!(!selectable.contains(pack), "{pack} appears in both clauses");
     }
+}
+
+#[tokio::test]
+#[serial(config_ledger)]
+async fn the_instructions_point_to_the_catalog_instead_of_repeating_it() {
+    let mut config = RuntimeConfig::no_embeddings();
+    config.db_path = None;
+    config.packs = vec!["kg".into()];
+    let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+    let server = KhiveMcpServer::new(runtime).expect("the kg factory is linked");
+
+    let instructions = rmcp::ServerHandler::get_info(&server)
+        .instructions
+        .expect("get_info always sets instructions");
+    let catalog = server.verb_catalog();
+    let rows: Vec<&str> = catalog
+        .lines()
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    assert!(
+        rows.len() > 1,
+        "the kg pack registers verbs, so its catalog has rows to look for"
+    );
+    for row in &rows {
+        assert!(
+            !instructions.contains(row),
+            "the instructions repeat a catalog row the request tool description already carries: {row:?}"
+        );
+    }
+    assert!(instructions.contains("The `request` tool's description lists every verb"));
+    assert!(instructions.contains("help=true"));
 }
 
 #[test]

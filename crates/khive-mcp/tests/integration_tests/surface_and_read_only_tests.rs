@@ -225,9 +225,25 @@ async fn server_info_advertises_request_tool_only() {
         instructions.contains("request-only"),
         "instructions should explain the request-only surface"
     );
-    // Pack verbs must appear in the catalog so agents can discover what's loaded.
-    assert!(instructions.contains("assign"), "gtd verb should appear");
-    assert!(instructions.contains("create"), "kg verb should appear");
+    // Pack verbs must appear in the catalog so agents can discover what's
+    // loaded. The catalog is carried once, by the `request` tool description
+    // (ADR-016); the instructions name where it is and do not repeat it.
+    assert!(
+        instructions.contains("The `request` tool's description lists every verb"),
+        "instructions should point to the catalog"
+    );
+    assert!(
+        !instructions.contains("\n  create — ") && !instructions.contains("gtd.assign — "),
+        "instructions must not repeat the verb catalog: {instructions}"
+    );
+    let catalog = request_tool_description(make_server())
+        .await
+        .expect("tools/list answers");
+    assert!(
+        catalog.contains("\n  gtd.assign — "),
+        "gtd verb should appear"
+    );
+    assert!(catalog.contains("\n  create — "), "kg verb should appear");
 }
 
 #[tokio::test]

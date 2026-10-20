@@ -656,7 +656,6 @@ impl ServerHandler for KhiveMcpServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let catalog = self.verb_catalog();
         let loaded_names = self.registry.pack_names();
         let loaded = loaded_names.join(", ");
         // Linked minus loaded: the packs `--pack`/`KHIVE_PACKS` could still
@@ -667,7 +666,7 @@ impl ServerHandler for KhiveMcpServer {
             .filter(|name| !loaded_names.contains(name))
             .collect::<Vec<_>>()
             .join(", ");
-        let instructions = build_instructions(&catalog, &loaded, &unloaded);
+        let instructions = build_instructions(&loaded, &unloaded);
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
