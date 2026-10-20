@@ -1,4 +1,4 @@
-use super::{Entity, Note, NoteFtsScalars, SubstrateKind, TextDocument};
+use super::{Entity, Note, SubstrateKind, TextDocument};
 
 // ---------------------------------------------------------------------------
 // FTS document construction
@@ -84,24 +84,5 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
         namespace: note.namespace.clone(),
         metadata: note.properties.clone(),
         updated_at,
-    }
-}
-
-/// Derive [`NoteFtsScalars`] from a [`Note`].
-///
-/// All values match the encoding that [`Fts5TextSearch::upsert_document`]
-/// applies when given the output of [`note_fts_document`].
-pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
-    let doc = note_fts_document(note);
-    NoteFtsScalars {
-        record_kind: doc.record_kind.unwrap_or_default(),
-        title: doc.title.unwrap_or_default(),
-        body: doc.body,
-        tags: "[]".to_string(),
-        metadata: doc
-            .metadata
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default()),
-        updated_at_micros: doc.updated_at.timestamp_micros(),
     }
 }

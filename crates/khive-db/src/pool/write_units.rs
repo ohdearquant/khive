@@ -567,16 +567,21 @@ impl<'pool> WriterGuard<'pool> {
                 "pooled autocommit write began on a connection in a transaction".to_string(),
             ));
         }
+        self.ensure_logical_write_checkout(
+            "checkpoint writer checkout cannot admit a logical write",
+        )?;
+        self.admission.check()?;
+        Ok(PooledAutocommitWriteUnit { writer: self })
+    }
+
+    fn ensure_logical_write_checkout(&self, message: &'static str) -> Result<(), SqliteError> {
         if self._volume_lease.is_none()
             && self.pool.canonical_path().is_some()
             && !self.pool.config.read_only
         {
-            return Err(SqliteError::InvalidData(
-                "checkpoint writer checkout cannot admit a logical write".to_string(),
-            ));
+            return Err(SqliteError::InvalidData(message.to_string()));
         }
-        self.admission.check()?;
-        Ok(PooledAutocommitWriteUnit { writer: self })
+        Ok(())
     }
 
     /// Borrow inside an already owned internal write boundary.
@@ -665,14 +670,9 @@ impl<'pool> WriterGuard<'pool> {
     {
         let mut tx_handle = None;
         let writer = self;
-        if writer._volume_lease.is_none()
-            && writer.pool.canonical_path().is_some()
-            && !writer.pool.config.read_only
-        {
-            return Err(SqliteError::InvalidData(
-                "checkpoint writer checkout cannot start a logical transaction".to_string(),
-            ));
-        }
+        writer.ensure_logical_write_checkout(
+            "checkpoint writer checkout cannot start a logical transaction",
+        )?;
         writer.begin_admitted_transaction()?;
         let _ = tx_handle.insert(khive_storage::tx_registry::register_scoped(
             Some("writer_guard_tx".to_string()),

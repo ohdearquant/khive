@@ -281,20 +281,6 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
         "{}",
         1,
     ),
-    (
-        "khive-runtime/src/curation/merge_sql.rs",
-        "merge_entity_sql",
-        "INSERT",
-        "{}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation/merge_sql.rs",
-        "merge_note_sql",
-        "INSERT",
-        "{}",
-        1,
-    ),
 ];
 
 // The lexical scanner also sees the Rust `ImportConflictMode::Update {` conditions

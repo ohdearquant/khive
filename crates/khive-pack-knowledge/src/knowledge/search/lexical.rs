@@ -19,6 +19,9 @@ use super::super::util::{
 use super::tests;
 use super::{phase_b_hydration_statement, HYDRATION_ID_CHUNK, LEXICAL_STAGE_BUDGET_MS};
 
+#[path = "lexical_sql.rs"]
+mod lexical_sql;
+
 // ─── FTS5 candidate expression ───────────────────────────────────────────────
 
 fn quote_fts5_phrase(raw_query: &str) -> String {
@@ -806,21 +809,13 @@ pub(super) async fn fetch_fts_candidates(
                 // Ceiling exhausted and still short: more than `widen_ceiling`
                 // ineligible top-ranked rows could still be hiding an
                 // eligible one further down the rowid sequence than phase A
-                // ever probed. Pay once for the pre-#2396-shape eligibility-
-                // scoped join, bounded to this term's own `per_term_limit`,
-                // so the ceiling bounds cost without letting an ineligible-
-                // heavy match set hide a real candidate (issue #2396 fix 2).
+                // ever probed. Recover from the namespace index and probe FTS
+                // membership for each local row, retaining this term's eligible
+                // rowid order and `per_term_limit`.
                 let (scoped_status_clause, scoped_status_params) =
                     status_sql_clause(statuses, exclude_statuses, 4);
-                let scoped_sql = format!(
-                    "SELECT a.* FROM fts_knowledge \
-                     CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-                     WHERE fts_knowledge MATCH ?1 \
-                       AND +a.namespace = ?2 \
-                       AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} \
-                     ORDER BY fts_knowledge.rowid \
-                     LIMIT ?3"
-                );
+                let scoped_sql =
+                    lexical_sql::eligibility_fallback_sql(&scoped_status_clause, &type_clause);
                 let scoped_term = term.clone();
                 #[cfg(all(test, feature = "namespace-trigram-proto"))]
                 let (scoped_sql, scoped_term) =

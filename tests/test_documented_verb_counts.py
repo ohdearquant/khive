@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -96,6 +99,56 @@ The server config loads all three (`kg`, `comm`, `workspace`).
 
         self.assertEqual(len(errors), 1)
         self.assertIn("claims comm verbs=7, registry says 8", errors[0])
+
+    def test_escaped_pipe_before_pack_columns_cannot_hide_stale_count(self) -> None:
+        for outer in ("closed", "open", "repeated"):
+            def frame(cells: str) -> str:
+                return {
+                    "closed": f"| {cells} |",
+                    "open": f"| {cells}",
+                    "repeated": f"|| {cells} ||",
+                }[outer]
+
+            with self.subTest(outer=outer), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                readme = root / "README.md"
+                header = frame("Example | Pack | Verbs")
+                separator = frame("--- | --- | ---")
+                for count in (20, 99):
+                    text = "\n".join((
+                        "28 verbs across 3 packs.",
+                        header,
+                        separator,
+                        frame(r"a\|b | kg | " + str(count)),
+                        frame("plain | comm | 8"),
+                        frame("plain | workspace | 0"),
+                    )) + "\n"
+                    readme.write_text(text, encoding="utf-8")
+                    claims = scan_document("README.md", text, PACK_COUNTS)
+                    table_claims = [claim for claim in claims if claim.form == "per-pack-table"]
+                    self.assertEqual(
+                        [(claim.pack, claim.value) for claim in table_claims],
+                        [("kg", count), ("comm", 8), ("workspace", 0)],
+                    )
+                    errors = validate_documented_counts(root, verbs_result())
+                    if count == 20:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertEqual(len(errors), 1)
+                        self.assertIn("README.md:4:", errors[0])
+                        self.assertIn("claims kg verbs=99, registry says 20", errors[0])
+
+    def test_count_tables_keep_empty_cells_and_optional_closing_pipe(self) -> None:
+        for suffix in ("", "|", "||"):
+            with self.subTest(suffix=suffix):
+                text = "| Example | Pack | Verbs " + suffix + "\n"
+                text += "| --- | --- | --- " + suffix + "\n"
+                text += "| | kg | 99 " + suffix + "\n"
+                claims = scan_document("README.md", text, PACK_COUNTS)
+                self.assertEqual(
+                    [(claim.pack, claim.value) for claim in claims if claim.form == "per-pack-table"],
+                    [("kg", 99)],
+                )
 
     def test_living_pages_and_inverted_mutations_fail_validation(self) -> None:
         published = """28 verbs across 3 production packs.
@@ -457,6 +510,32 @@ After persisting a reminder, the other three schedule verbs do not require `comm
         self.assertEqual(predicted, scanned & markdown)
         self.assertTrue(predicted, "the population must contain scanned files")
         self.assertTrue(markdown - predicted, "the population must contain unscanned files")
+
+    def test_copied_scanner_safe_path_cannot_mistake_import_failure_for_unscanned_markdown(self) -> None:
+        """A repository import failure exits 1, which CI mistakes for an unscanned Markdown path."""
+        source = Path(__file__).with_name("documented_verb_counts.py")
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scanner = root / "tests" / source.name
+            scanner.parent.mkdir()
+            shutil.copyfile(source, scanner)
+            for relative, content, expected in (
+                ("README.md", "28 verbs across 3 packs.\n", 0),
+                ("README.md", "# README\n\nNo registry claims.\n", 0),
+                ("notes/plain.md", "# Notes\n\nNo registry claims.\n", 1),
+            ):
+                with self.subTest(relative=relative, content=content, expected=expected):
+                    markdown = root / relative
+                    markdown.parent.mkdir(parents=True, exist_ok=True)
+                    markdown.write_text(content, encoding="utf-8")
+                    result = subprocess.run(
+                        [sys.executable, "-P", str(scanner), "--published-markdown", relative],
+                        cwd=root, env=env, text=True, capture_output=True, timeout=30, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(result.stdout, "")
 
     def test_published_markdown_predicate_matches_the_scanned_files(self) -> None:
         # ci-docs-only.sh asks this predicate about one changed path; the scan walks the
