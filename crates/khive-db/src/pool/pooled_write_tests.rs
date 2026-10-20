@@ -285,3 +285,94 @@ fn pooled_transaction_unwind_keeps_registry_and_lease_until_native_rollback() {
         .expect("panic rollback completed before another writer could begin");
     assert_eq!(count(&pool), 1);
 }
+
+#[test]
+fn public_autocommit_failed_script_preserves_native_error_after_rollback() {
+    use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+    for standalone in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(
+            &dir.path().join("failed_script.db"),
+            &dir.path().join("locks"),
+        );
+        pool.writer()
+            .unwrap()
+            .autocommit(|conn| {
+                conn.execute_batch("CREATE TABLE pooled_owner_probe(value INTEGER)")?;
+                Ok(())
+            })
+            .unwrap();
+        let drops_before = pool
+            .writer_acquisition_snapshot()
+            .writer_guard_drop_rollbacks;
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&rollbacks);
+        let body = move |conn: &Connection| -> Result<(), SqliteError> {
+            conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Rollback
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))?;
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO pooled_owner_probe VALUES(1); \
+                 INSERT INTO missing_public_script_table VALUES(1)",
+            )?;
+            Ok(())
+        };
+        let error = if standalone {
+            pool.standalone_autocommit(body)
+        } else {
+            pool.writer().unwrap().autocommit(body)
+        }
+        .expect_err("the unfinished script must retain its native statement failure");
+        let source = match &error {
+            SqliteError::Write { stage, source } => {
+                assert_eq!(*stage, SqliteWriteStage::Statement);
+                source
+            }
+            other => panic!("expected the original native write error, got {other:?}"),
+        };
+        assert!(source.to_string().contains("missing_public_script_table"));
+        assert_eq!(
+            error.write_failure(),
+            Some(SqliteWriteFailure {
+                stage: SqliteWriteStage::Statement,
+                primary_code: rusqlite::ffi::SQLITE_ERROR,
+                extended_code: rusqlite::ffi::SQLITE_ERROR,
+                settlement_unknown: false,
+            })
+        );
+        assert_eq!(
+            rollbacks.load(Ordering::SeqCst),
+            1,
+            "the call must execute rollback before returning its error"
+        );
+        assert_eq!(
+            pool.writer_acquisition_snapshot()
+                .writer_guard_drop_rollbacks,
+            drops_before,
+            "the call must settle before WriterGuard Drop"
+        );
+        assert_eq!(count(&pool), 0, "read before any later write callback");
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+
+        pool.writer()
+            .expect("the failed script released its owner and volume lease")
+            .autocommit(|conn| {
+                assert!(conn.is_autocommit());
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+                conn.execute_batch("INSERT INTO pooled_owner_probe VALUES(2)")?;
+                Ok(())
+            })
+            .expect("the writer is reusable after the original statement error");
+        assert_eq!(count(&pool), 1);
+    }
+}

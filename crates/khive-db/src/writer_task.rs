@@ -389,6 +389,10 @@ fn rollback_after_failure(conn: &Connection, failure_context: &'static str) -> R
 
 /// Execute an operation inside an already-open transaction and apply the
 /// shared commit, rollback, panic, and autocommit verification rules.
+///
+/// This worker/owned adapter catches callback panics, attempts rollback, and
+/// returns a typed terminal outcome. In contrast, [`crate::pool::WriterGuard::transaction`]
+/// propagates callback panics and settles its owner during unwinding.
 pub(crate) fn execute_wrapped_transaction<R, F>(
     conn: &Connection,
     commit_operation: &'static str,
@@ -436,6 +440,8 @@ where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
     let body_started = Instant::now();
+    // Keep panic-to-terminal conversion local to this adapter; the public
+    // WriterGuard transaction intentionally propagates the callback's unwind.
     let operation_outcome = catch_unwind(AssertUnwindSafe(|| {
         operation(conn).map_err(crate::error::statement_failure)
     }));

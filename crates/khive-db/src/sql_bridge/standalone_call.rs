@@ -45,7 +45,7 @@ impl StandaloneCallOwner {
         if self.conn().is_autocommit() {
             return Ok(false);
         }
-        if self.conn().execute_batch("ROLLBACK").is_ok() && self.conn().is_autocommit() {
+        if crate::connection_settlement::rollback_proves_autocommit(self.conn()) {
             return Ok(true);
         }
         self.retire()?;
