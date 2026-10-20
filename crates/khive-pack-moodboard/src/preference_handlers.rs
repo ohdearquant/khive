@@ -1701,7 +1701,7 @@ mod tests {
             .pool()
             .try_writer()
             .expect("V20 fixture writer")
-            .autocommit_sqlite(|conn| {
+            .autocommit(|conn| {
                 conn.execute_batch(
                     "CREATE TABLE _schema_migrations (\
                  version INTEGER PRIMARY KEY, \
@@ -1709,20 +1709,17 @@ mod tests {
                  applied_at INTEGER NOT NULL\
              ) STRICT;",
                 )
-            })
-            .expect("create V20 fixture migration ledger");
-        for migration in MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-        {
-            backend
-                .pool()
-                .try_writer()
-                .expect("V20 fixture writer")
-                .transaction(|conn| {
-                    conn.execute_batch(migration.up)
+                .expect("create V20 fixture migration ledger");
+                for migration in MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+                {
+                    let tx = conn
+                        .unchecked_transaction()
+                        .expect("begin V20 fixture migration");
+                    tx.execute_batch(migration.up)
                         .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO _schema_migrations (version, name, applied_at) \
                  VALUES (?1, ?2, ?3)",
                         (
@@ -1732,10 +1729,11 @@ mod tests {
                         ),
                     )
                     .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-                    Ok(())
-                })
-                .expect("commit V20 fixture migration");
-        }
+                    tx.commit().expect("commit V20 fixture migration");
+                }
+                Ok(())
+            })
+            .expect("seed V20 fixture");
         backend
     }
 
@@ -2407,8 +2405,8 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .autocommit_sqlite(|conn| {
-                    conn.execute(
+                .autocommit(|conn| {
+                    Ok(conn.execute(
                         "INSERT INTO entities (\
                          id, namespace, kind, entity_type, name, description, properties, tags, \
                          created_at, updated_at, deleted_at, merged_into, merge_event_id, \
@@ -2427,7 +2425,7 @@ mod tests {
                             entity.created_at,
                             bundle_content_ref.to_string(),
                         ),
-                    )
+                    )?)
                 })
                 .expect("insert pre-V21 legacy model");
         }
@@ -2440,7 +2438,7 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .autocommit_sqlite(|conn| conn.execute(
+                .autocommit(|conn| Ok(conn.execute(
                     "INSERT INTO events (\
                          id, namespace, verb, substrate, actor, kind, outcome, payload, \
                          payload_schema_version, profile_state_version, duration_us, target_id, \
@@ -2466,7 +2464,7 @@ mod tests {
                         published_event.aggregate_id.map(|id| id.to_string()),
                         published_event.created_at,
                     ),
-                ))
+                )?))
                 .expect("insert immutable legacy model event");
         }
 
