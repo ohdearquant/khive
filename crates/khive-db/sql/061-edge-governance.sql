@@ -132,10 +132,72 @@ BEGIN
     SELECT RAISE(ABORT, 'edge governance decision is spent');
 END;
 
+-- ADR159 §3:240–245 / 250–269: null-safe tuple/liveness transitions, not assignments.
+CREATE TRIGGER edge_governance_graph_update
+AFTER UPDATE OF namespace, source_id, target_id, relation, target_backend, deleted_at ON graph_edges
+WHEN OLD.namespace IS NOT NEW.namespace
+    OR OLD.source_id IS NOT NEW.source_id
+    OR OLD.target_id IS NOT NEW.target_id
+    OR OLD.relation IS NOT NEW.relation
+    OR OLD.target_backend IS NOT NEW.target_backend
+    OR OLD.deleted_at IS NOT NEW.deleted_at
+BEGIN
+    INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)
+    SELECT decision_id, edge_id,
+        CASE WHEN OLD.namespace IS NOT NEW.namespace
+            OR OLD.source_id IS NOT NEW.source_id
+            OR OLD.target_id IS NOT NEW.target_id
+            OR OLD.relation IS NOT NEW.relation
+            OR OLD.target_backend IS NOT NEW.target_backend
+        THEN 'endpoint_or_relation_or_backend_rewrite' ELSE 'edge_liveness_transition' END,
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+    FROM edge_governance_active WHERE edge_id = OLD.id;
+    DELETE FROM edge_governance_active WHERE edge_id = OLD.id;
+END;
+
+-- ADR159 §3:243 / 247 / 267–269: ledger append precedes projection FK cascade.
+CREATE TRIGGER edge_governance_graph_delete
+BEFORE DELETE ON graph_edges
+BEGIN
+    INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)
+    SELECT decision_id, edge_id, 'hard_delete',
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+    FROM edge_governance_active WHERE edge_id = OLD.id;
+    DELETE FROM edge_governance_active WHERE edge_id = OLD.id;
+END;
+
+-- ADR159 §3:246 / 252–269: both endpoint-note liveness directions invalidate incident markers.
+CREATE TRIGGER edge_governance_note_update
+AFTER UPDATE OF deleted_at ON notes
+WHEN OLD.deleted_at IS NOT NEW.deleted_at
+BEGIN
+    INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)
+    SELECT decision_id, edge_id, 'endpoint_note_liveness_transition',
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+    FROM edge_governance_active WHERE source_id = OLD.id OR target_id = OLD.id;
+    DELETE FROM edge_governance_active WHERE source_id = OLD.id OR target_id = OLD.id;
+END;
+
+-- ADR159 §3:247 / 267–269: endpoint hard delete records once before later incident-edge deletes.
+CREATE TRIGGER edge_governance_note_delete
+BEFORE DELETE ON notes
+BEGIN
+    INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)
+    SELECT decision_id, edge_id, 'hard_delete',
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+    FROM edge_governance_active WHERE source_id = OLD.id OR target_id = OLD.id;
+    DELETE FROM edge_governance_active WHERE source_id = OLD.id OR target_id = OLD.id;
+END;
+
 -- ADR159 §7:424–431: immutable names + SHA256 of installed SQL after whitespace collapse/trim.
+-- The terminal statement delimiter is not part of sqlite_schema.sql. Native parity requires owner-queue validation.
 -- ADR159-TRIGGER-SHA256 edge_governance_decisions_no_update a7d67310d78479046d8d253b8a9a7261284e21948fa4565d3430dfdc68d72c3a
 -- ADR159-TRIGGER-SHA256 edge_governance_decisions_no_delete 937a152f4f998e8f491ddc050fc1332fe04f52bb2e06d1af1184bd7ee23f6220
 -- ADR159-TRIGGER-SHA256 edge_governance_invalidations_no_update 6de3da121cc29abfc9d1b1eb772c74bf6c84be230ba9f00841de5b91ee024337
 -- ADR159-TRIGGER-SHA256 edge_governance_invalidations_no_delete 4962d393999be3f37acb7cc406399ac2d9b2a93e76d00e8df11d33ee6840625d
+-- ADR159-TRIGGER-SHA256 edge_governance_graph_update 0f68647ef161ac30e40ee67f9e1defed7b883ce1e9bdd7d54ac955046a3f92bc
+-- ADR159-TRIGGER-SHA256 edge_governance_graph_delete 7e11b604e090c0b774f51b7df44ed1c80e8132319e64e9527c459c29f76a6724
+-- ADR159-TRIGGER-SHA256 edge_governance_note_update 30a726a24910f3c66e8e51c6d05ecb66c04a1cf4ba21767b7ae073396f625263
+-- ADR159-TRIGGER-SHA256 edge_governance_note_delete 9c267fe3aac117ede8983cf87401d1554a1c828214d4c556f36fbc19738808a1
 -- ADR159-TRIGGER-SHA256 edge_governance_active_unspent_insert 43ba23e898e2b6e4ad2b434ee7223cd7eae644c739dd1ab45bab938fd1a6518c
 -- ADR159-TRIGGER-SHA256 edge_governance_active_unspent_update 05b07be6bc051ef6bdf0f4dde3e3f9cbf84f69fdb5441affedb4eb5c137ba603
