@@ -14,7 +14,6 @@ use khive_storage::types::{DeleteMode, SqlStatement};
 #[derive(Clone)]
 pub(super) enum Phase {
     ThreadPage(Vec<Uuid>),
-    ThreadRendered(usize),
     ThreadRetained { stage: &'static str, rows: usize },
     ThreadOwners(Vec<Uuid>),
     BatchRead(Vec<Uuid>),
@@ -31,6 +30,12 @@ type Hook = Arc<dyn Fn(Phase) -> HookFuture + Send + Sync>;
 
 tokio::task_local! {
     static PHASE_HOOK: Hook;
+    static MESSAGE_RENDER_COUNT: Arc<AtomicUsize>;
+}
+
+/// Count the real shared renderer, only inside a caller-established test scope.
+pub(crate) fn observe_message_render() {
+    let _ = MESSAGE_RENDER_COUNT.try_with(|count| count.fetch_add(1, Ordering::Relaxed));
 }
 
 pub(super) async fn observe_phase(phase: Phase) {

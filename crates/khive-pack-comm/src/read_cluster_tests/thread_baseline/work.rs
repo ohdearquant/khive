@@ -44,10 +44,9 @@ async fn matrix(count: u32) {
                 let expected: Vec<_> = indices.into_iter().map(id).collect();
                 expect_ids(&response, &observation, &expected);
                 assert_eq!(observation.fetched_rows, count as usize);
-                assert_eq!(observation.rendered_rows, count as usize);
-                assert_eq!(observation.peak_physical_rows, count as usize);
+                assert_eq!(observation.rendered_rows, expected.len());
+                assert_eq!(observation.peak_owner_rows, count as usize);
                 assert_eq!(observation.physical_pages, count as usize / 200 + 1);
-                assert_eq!(observation.retained_rows["visible"], count as usize);
                 assert_eq!(observation.retained_rows["folded"], count as usize);
                 assert_eq!(observation.retained_rows["after_cursor"], eligible);
                 assert_eq!(observation.retained_rows["limited"], expected.len());
@@ -79,7 +78,7 @@ async fn thread_baseline_t1_one_hundred_thousand_physical_rows() {
 }
 
 #[tokio::test]
-async fn thread_baseline_t1_discarded_physical_rows_still_render() {
+async fn thread_only_selected_owners_render_and_discarded_rows_are_not_retained() {
     discarded(211).await;
 }
 
@@ -109,16 +108,8 @@ async fn discarded(count: u32) {
         let (response, observation) = observed(&runtime, &registry, params.clone()).await;
         expect_ids(&response, &observation, &[root]);
         assert_eq!(observation.fetched_rows, count as usize);
-        assert_eq!(observation.rendered_rows, count as usize);
-        assert_eq!(observation.peak_physical_rows, count as usize);
-        assert_eq!(
-            observation.retained_rows["visible"],
-            if population == "invisible" {
-                1
-            } else {
-                count as usize
-            }
-        );
+        assert_eq!(observation.rendered_rows, 1);
+        assert_eq!(observation.peak_owner_rows, 1);
         assert_eq!(observation.retained_rows["folded"], 1);
         assert_eq!(response["messages"][0]["read"], population != "invisible");
         emit(
@@ -153,6 +144,7 @@ async fn thread_baseline_t2_late_twin_keeps_outbound_owner_and_property_read() {
     assert_eq!(response["messages"][0]["read"], true);
     assert_eq!(response["messages"][0]["properties"]["read"], false);
     assert_eq!(observation.physical_pages, 6);
-    assert_eq!(observation.rendered_rows, 1_002);
+    assert_eq!(observation.rendered_rows, 1);
+    assert_eq!(observation.peak_owner_rows, 1_001);
     assert_eq!(observation.retained_rows["folded"], 1_001);
 }
