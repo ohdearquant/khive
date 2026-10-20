@@ -18,6 +18,56 @@ class ContractTests(unittest.TestCase):
     def test_valid_output(self):
         self.assertEqual(set(contract.parse_reports(self.encode(self.rows), self.ids)), self.ids)
 
+    def test_probe_reports_require_explicit_statistic(self):
+        probes = [dict(row, statistic="report_contract_probe") for row in self.rows]
+        with self.assertRaisesRegex(ValueError, "expected report statistic p95_ns"):
+            contract.parse_reports(self.encode(probes), self.ids)
+        self.assertEqual(
+            set(contract.parse_reports(
+                self.encode(probes), self.ids, expected_statistic="report_contract_probe"
+            )),
+            self.ids,
+        )
+        with self.assertRaisesRegex(ValueError, "expected report statistic report_contract_probe"):
+            contract.parse_reports(
+                self.encode(self.rows), self.ids, expected_statistic="report_contract_probe"
+            )
+
+    def test_mixed_report_statistics_are_rejected(self):
+        rows = [dict(self.rows[0], statistic="report_contract_probe")] + self.rows[1:]
+        for statistic in ("p95_ns", "report_contract_probe"):
+            with self.subTest(statistic=statistic), self.assertRaises(ValueError):
+                contract.parse_reports(self.encode(rows), self.ids, expected_statistic=statistic)
+
+    def test_measurement_check_rejects_probe_rows(self):
+        def output(binary, args, environment, timeout):
+            cohort = "real-model" if environment["KHIVE_BENCH_REAL_MODEL"] == "1" else "synthetic-v1"
+            ids = ["p95_gate/" + cohort + "/" + case for case in ("m1", "m3", "m4-informational")]
+            if "--list" in args:
+                return "\n".join(name + ": benchmark" for name in ids)
+            if "--regression-case=report-contract" in args:
+                statistic = "report_contract_probe"
+            else:
+                self.assertEqual(args, ["--bench"])
+                statistic = measured_statistic
+            return self.encode([dict(id=name, statistic=statistic, value=250_000.0, n=200) for name in ids])
+
+        with (
+            patch.object(contract, "check_smoke"),
+            patch.object(contract, "check_argument_refusals"),
+            patch.object(contract, "check_caller_argv"),
+            patch.object(contract, "check_lifecycle"),
+            patch.dict(contract.os.environ, {"KHIVE_BENCH_REAL_MODEL": "0"}),
+            patch.object(contract, "invoke", side_effect=output) as invoke,
+        ):
+            measured_statistic = "p95_ns"
+            contract.check("unused", measure=True)
+            self.assertEqual(invoke.call_args.args[1], ["--bench"])
+            measured_statistic = "report_contract_probe"
+            with self.assertRaisesRegex(ValueError, "expected report statistic p95_ns"):
+                contract.check("unused", measure=True)
+            self.assertEqual(invoke.call_args.args[1], ["--bench"])
+
     def test_missing_row(self):
         with self.assertRaises(ValueError):
             contract.parse_reports(self.encode(self.rows[:-1]), self.ids)
