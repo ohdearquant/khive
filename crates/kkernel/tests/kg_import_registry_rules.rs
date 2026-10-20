@@ -366,3 +366,122 @@ fn import_accepts_code_pack_function_dependency_without_flags() {
         }
     }
 }
+
+impl Fixture {
+    fn export(&self) -> Value {
+        let target = self.directory.path().join("export.json");
+        let output = self
+            .command()
+            .args(["kg", "export", "--db"])
+            .arg(&self.db)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap()
+    }
+}
+
+#[test]
+fn exported_registry_rows_and_incident_edges_are_skipped_in_every_import_mode() {
+    let source = Fixture::new();
+    let tool_id = source.register_tool();
+    let ordinary = archive(
+        vec![
+            entity(5_767_201, "FirstOrdinary"),
+            entity(5_767_202, "SecondOrdinary"),
+        ],
+        vec![],
+    );
+    assert_insert_counts(&report(&source.import(&ordinary, &[])), 2, 0);
+    let mut input = source.export();
+    let registered = input["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["id"] == tool_id)
+        .collect::<Vec<_>>();
+    assert_eq!(registered.len(), 1, "export must retain the registry row");
+    assert!(registered[0]["tags"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("tool-registry")));
+    assert!(
+        input["edges"].as_array().unwrap().is_empty(),
+        "registration without capabilities creates no edges"
+    );
+    input["edges"] = json!([
+        {"edge_id": uuid(5_767_203), "source": tool_id, "target": uuid(5_767_201),
+         "relation": "supports", "weight": 1.0, "created_at": CREATED},
+        {"edge_id": uuid(5_767_204), "source": uuid(5_767_202), "target": tool_id,
+         "relation": "supports", "weight": 1.0, "created_at": CREATED},
+        {"edge_id": uuid(5_767_205), "source": uuid(5_767_201), "target": uuid(5_767_202),
+         "relation": "supports", "weight": 1.0, "created_at": CREATED}
+    ]);
+    for flags in [
+        &[][..],
+        &["--on-conflict", "skip"][..],
+        &["--on-conflict", "update"][..],
+    ] {
+        let destination = Fixture::new();
+        let mut preview_flags = flags.to_vec();
+        preview_flags.push("--dry-run");
+        let preview = report(&destination.import(&input, &preview_flags));
+        assert!(
+            !destination.db.exists(),
+            "preview must not create the destination"
+        );
+        let actual = report(&destination.import(&input, flags));
+        assert_eq!(actual, preview, "preview mismatch with {flags:?}");
+        for (field, expected) in [
+            ("entities_imported", 2),
+            ("entities_inserted", 2),
+            ("entities_updated", 0),
+            ("entities_skipped", 1),
+            ("entities_registry_skipped", 1),
+            ("edges_imported", 1),
+            ("edges_inserted", 1),
+            ("edges_updated", 0),
+            ("edges_skipped", 2),
+            ("edges_registry_skipped", 2),
+        ] {
+            assert_eq!(actual[field], expected, "{field} with {flags:?}: {actual}");
+        }
+        let skipped = actual["skipped_edges"].as_array().unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0]["edge_id"], json!(uuid(5_767_203)));
+        assert_eq!(skipped[1]["edge_id"], json!(uuid(5_767_204)));
+        assert!(skipped.iter().all(|row| row["cause"] == "skipped_record"));
+        let connection = destination.connection();
+        let registry_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                [&tool_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registry_count, 0);
+        let tags = connection
+            .prepare("SELECT tags FROM entities")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags
+            .iter()
+            .all(|tags| !serde_json::from_str::<Vec<String>>(tags)
+                .unwrap()
+                .iter()
+                .any(|tag| tag == "tool-registry")));
+        let edge_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 1);
+        let retained: String = connection
+            .query_row("SELECT id FROM graph_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, uuid(5_767_205).to_string());
+    }
+}

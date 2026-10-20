@@ -605,9 +605,11 @@ kkernel kg import archive.json --db knowledge.db --on-conflict skip --dry-run
 kkernel kg import archive.json --db knowledge.db --on-conflict update --force
 ```
 
-The default `--on-conflict error` refuses an existing entity or edge UUID before
-importing rows. `skip` preserves existing rows and omits edges incident to a skipped
-entity. `update` patches entities and updates edges under their existing UUIDs.
+The default `--on-conflict error` refuses an archive entity or edge UUID already
+held by an entity, note, edge or event before importing rows. `skip` preserves
+existing rows and omits edges incident to a skipped entity. `update` patches
+entities and updates edges under their existing UUIDs, refusing a UUID held by a
+different record substrate.
 A new edge UUID whose canonical source/relation/target tuple is already stored
 refuses every mode. Import never substitutes another UUID or restores a tombstone.
 
@@ -638,12 +640,22 @@ which can be retried against the new state. Each invocation admits at most 10,00
 entities plus edges and 64 MiB of serialized archive data; larger inputs must be
 partitioned into separate invocations with the required endpoints available.
 
+In every conflict mode, import skips archive entities carrying tool-registry tags
+and edges incident to those entities. It never creates or rewrites a tool-registry
+row. Export remains unchanged and may include these records. The JSON summary
+reports nonzero `entities_registry_skipped` and `edges_registry_skipped` counts as
+subsets of `entities_skipped` and `edges_skipped`; zero subset counts are omitted.
+Incident edges have cause `skipped_record`.
+Untagged archive entities still cannot overwrite a stored registry row in `update`
+mode. Tool registrations must go through the owning tool pack.
+
 The JSON summary retains `entities_imported`, `edges_imported`, `edges_skipped`,
 `embedding_truncation` and non-empty `skipped_edges`, adding
 `entities_inserted`, `entities_updated`, `entities_skipped`, `edges_inserted`
 and `edges_updated`. Missing-source/target reports carry the cause; endpoint-contract
-reports additionally carry the validation error. A skipped stored edge uses
-`existing_edge`, and an edge incident to a skipped entity uses `skipped_record`.
+reports additionally carry the validation error. An archive edge whose UUID is
+already held by a record uses `existing_edge`; an edge incident to a skipped
+record uses `skipped_record`.
 Repeated skipped input edges retain separate report entries. Duplicate entity UUIDs,
 or duplicate edge UUIDs/tuples among edges that would be written, refuse preflight.
 

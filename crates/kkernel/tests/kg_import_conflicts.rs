@@ -728,3 +728,173 @@ fn dry_run_matches_real_outcomes_preserves_all_row_images_and_creates_no_missing
         json!([edge(200, 4, 5, "supports")])
     );
 }
+
+impl Fixture {
+    fn seed_collision_note(&self) -> Uuid {
+        self.seed(&archive(vec![], vec![]));
+        let output = self
+            .command()
+            .args(["exec", "--strict", "--output-format", "json"])
+            .arg(
+                json!([{
+                    "tool": "create",
+                    "args": {"kind": "observation", "content": "import identity collision fixture"}
+                }])
+                .to_string(),
+            )
+            .arg("--db")
+            .arg(&self.db)
+            .arg("--config")
+            .arg(&self.config)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let connection =
+            Connection::open_with_flags(&self.db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let id: String = connection
+            .query_row(
+                "SELECT id FROM notes WHERE content = ?1",
+                ["import identity collision fixture"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        Uuid::parse_str(&id).unwrap()
+    }
+
+    fn collision_note_image(&self, id: Uuid) -> Vec<SqlValue> {
+        let connection =
+            Connection::open_with_flags(&self.db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut statement = connection
+            .prepare("SELECT * FROM notes WHERE id = ?1")
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_row([id.to_string()], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+    }
+
+    fn collision_identity_rows(&self, table: &str, id: Uuid) -> i64 {
+        assert!(matches!(table, "entities" | "graph_edges"));
+        Connection::open_with_flags(&self.db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn import_entity_refuses_note_uuid_before_any_row_write() {
+    let fixture = Fixture::new();
+    let note_id = fixture.seed_collision_note();
+    let note_before = fixture.collision_note_image(note_id);
+    let before = fixture.rows();
+    let input = archive(
+        vec![
+            entity(5_767_101, "FreshBeforeNoteCollision"),
+            entity(note_id.as_u128(), "MustNotShadowNote"),
+        ],
+        vec![],
+    );
+    for flags in [
+        &[][..],
+        &["--on-conflict", "error"][..],
+        &["--on-conflict", "update"][..],
+        &["--dry-run"][..],
+        &["--on-conflict", "update", "--dry-run"][..],
+    ] {
+        let output = fixture.import(&input, flags);
+        assert_refused(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&note_id.to_string()),
+            "must refuse the colliding identity: {output:?}"
+        );
+        assert_eq!(fixture.collision_identity_rows("entities", note_id), 0);
+        assert_eq!(fixture.collision_note_image(note_id), note_before);
+        assert_eq!(fixture.rows(), before, "partial import with {flags:?}");
+    }
+}
+
+#[test]
+fn import_skip_omits_note_uuid_entity_and_incident_edges() {
+    let fixture = Fixture::new();
+    let note_id = fixture.seed_collision_note();
+    let note_before = fixture.collision_note_image(note_id);
+    let before = fixture.rows();
+    let input = archive(
+        vec![
+            entity(note_id.as_u128(), "MustNotShadowNote"),
+            entity(5_767_102, "ImportedBesideNote"),
+        ],
+        vec![edge(5_767_103, note_id.as_u128(), 5_767_102, "supports")],
+    );
+    let preview = report(&fixture.import(&input, &["--on-conflict", "skip", "--dry-run"]));
+    assert_counts(&preview, [1, 0, 1], [0, 0, 1]);
+    assert_eq!(fixture.rows(), before);
+    let actual = report(&fixture.import(&input, &["--on-conflict", "skip"]));
+    assert_eq!(actual, preview);
+    assert_eq!(
+        actual["skipped_edges"],
+        json!([skipped(
+            5_767_103,
+            note_id.as_u128(),
+            5_767_102,
+            "supports",
+            "skipped_record"
+        )])
+    );
+    assert_eq!(fixture.collision_identity_rows("entities", note_id), 0);
+    assert_eq!(
+        fixture.collision_identity_rows("entities", uuid(5_767_102)),
+        1
+    );
+    assert_eq!(
+        fixture.collision_identity_rows("graph_edges", uuid(5_767_103)),
+        0
+    );
+    assert_eq!(fixture.collision_note_image(note_id), note_before);
+}
+
+#[test]
+fn import_edge_refuses_note_uuid_before_any_row_write() {
+    let fixture = Fixture::new();
+    let note_id = fixture.seed_collision_note();
+    fixture.seed(&archive(
+        vec![entity(5_767_104, "Source"), entity(5_767_105, "Target")],
+        vec![],
+    ));
+    let note_before = fixture.collision_note_image(note_id);
+    let before = fixture.rows();
+    let input = archive(
+        vec![entity(5_767_106, "FreshBeforeEdgeCollision")],
+        vec![edge(note_id.as_u128(), 5_767_104, 5_767_105, "supports")],
+    );
+    for flags in [
+        &[][..],
+        &["--on-conflict", "update"][..],
+        &["--dry-run"][..],
+        &["--on-conflict", "update", "--dry-run"][..],
+    ] {
+        let output = fixture.import(&input, flags);
+        assert_refused(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&note_id.to_string()),
+            "must refuse the colliding identity: {output:?}"
+        );
+        assert_eq!(fixture.collision_identity_rows("graph_edges", note_id), 0);
+        assert_eq!(fixture.collision_note_image(note_id), note_before);
+        assert_eq!(fixture.rows(), before, "partial import with {flags:?}");
+    }
+    let preview = report(&fixture.import(&input, &["--on-conflict", "skip", "--dry-run"]));
+    assert_counts(&preview, [1, 0, 0], [0, 0, 1]);
+    assert_eq!(fixture.rows(), before);
+    let actual = report(&fixture.import(&input, &["--on-conflict", "skip"]));
+    assert_eq!(actual, preview);
+    assert_eq!(fixture.collision_identity_rows("graph_edges", note_id), 0);
+    assert_eq!(fixture.collision_note_image(note_id), note_before);
+}

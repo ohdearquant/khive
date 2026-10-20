@@ -324,3 +324,274 @@ async fn import_resolves_existing_note_event_and_edge_endpoints_and_guards_note_
         if message.contains("destination changed during preflight")));
     assert_eq!(fixture.row_image().await, before);
 }
+
+#[tokio::test]
+async fn import_rechecks_cross_substrate_identity_before_any_dml() {
+    let fixture = Fixture::new();
+    let archive = fixture.archive();
+    let prepared = fixture
+        .runtime
+        .prepare_import(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut winner = khive_storage::Note::new("local", "observation", "racing note identity");
+    winner.id = archive.entities[0].id;
+    fixture
+        .runtime
+        .notes(&fixture.token)
+        .unwrap()
+        .upsert_note(winner)
+        .await
+        .unwrap();
+    let before = fixture.row_image().await;
+    let error = fixture
+        .runtime
+        .apply_prepared_import(&fixture.token, prepared)
+        .await
+        .expect_err("a note winning an absent archive UUID must refuse the entire import");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("destination changed during preflight")));
+    assert_eq!(
+        fixture.row_image().await,
+        before,
+        "the note must survive with no entity, edge, FTS or event writes"
+    );
+}
+
+#[tokio::test]
+async fn import_update_rechecks_all_identity_rows_when_canonical_existence_is_unchanged() {
+    let fixture = Fixture::new();
+    let archive = fixture.archive();
+    let mut original = archive_entity(&archive.entities[0], "local");
+    original.name = "StoredBeforeIdentityRace".into();
+    original.properties = Some(json!({"stored": true}));
+    fixture
+        .runtime
+        .entities(&fixture.token)
+        .unwrap()
+        .upsert_entity(original)
+        .await
+        .unwrap();
+    let prepared = fixture
+        .runtime
+        .prepare_import(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions {
+                on_conflict: ImportConflictMode::Update,
+                ..ImportOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (_, identity_before) =
+        read_probe(&fixture.runtime, identity_statement(archive.entities[0].id))
+            .await
+            .unwrap();
+    assert_eq!(identity_before.len(), 1);
+    let mut winner = khive_storage::Note::new("local", "observation", "additional identity winner");
+    winner.id = archive.entities[0].id;
+    fixture
+        .runtime
+        .notes(&fixture.token)
+        .unwrap()
+        .upsert_note(winner)
+        .await
+        .unwrap();
+    let (_, identity_after) =
+        read_probe(&fixture.runtime, identity_statement(archive.entities[0].id))
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(identity_before).unwrap(),
+        serde_json::to_value(identity_after).unwrap(),
+        "the canonical LIMIT 1 probe must hide this additional substrate row"
+    );
+    let before = fixture.row_image().await;
+    let error = fixture
+        .runtime
+        .apply_prepared_import(&fixture.token, prepared)
+        .await
+        .expect_err("the complete identity snapshot must detect the additional note");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("destination changed during preflight")));
+    assert_eq!(
+        fixture.row_image().await,
+        before,
+        "neither the stored entity nor the note, new entity, edge, FTS or events may change"
+    );
+    let error = fixture
+        .runtime
+        .prepare_import(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions {
+                on_conflict: ImportConflictMode::Update,
+                ..ImportOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("a preexisting entity must not hide another substrate's UUID");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("held by a different record substrate")));
+    assert_eq!(fixture.row_image().await, before);
+}
+
+#[tokio::test]
+async fn import_rechecks_edge_identity_before_any_dml() {
+    let fixture = Fixture::new();
+    let mut archive = fixture.archive();
+    let mut entities = archive.clone();
+    entities.edges.clear();
+    fixture
+        .runtime
+        .import_kg_with_options(
+            &entities,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    archive.entities.clear();
+    let prepared = fixture
+        .runtime
+        .prepare_import(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut winner = khive_storage::Note::new("local", "observation", "racing edge identity");
+    winner.id = archive.edges[0].edge_id;
+    fixture
+        .runtime
+        .notes(&fixture.token)
+        .unwrap()
+        .upsert_note(winner)
+        .await
+        .unwrap();
+    let before = fixture.row_image().await;
+    let error = fixture
+        .runtime
+        .apply_prepared_import(&fixture.token, prepared)
+        .await
+        .expect_err("a note winning an absent edge UUID must refuse the entire import");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("destination changed during preflight")));
+    assert_eq!(
+        fixture.row_image().await,
+        before,
+        "the note and existing endpoints must survive without edge, FTS or event changes"
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_same_unit_identity_overlap_only_for_written_records() {
+    let fixture = Fixture::new();
+    let mut archive = fixture.archive();
+    archive.edges[0].edge_id = archive.entities[0].id;
+    let before = fixture.row_image().await;
+    let error = fixture
+        .runtime
+        .import_kg_with_options(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .expect_err("two written substrates must not claim one new archive UUID");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("used by both an entity and an edge")));
+    assert_eq!(fixture.row_image().await, before);
+
+    let mut registry = archive.entities[0].clone();
+    registry.id = Uuid::from_u128(900);
+    registry.tags = vec![khive_types::pack::TOOL_REGISTRY_TAG.into()];
+    archive.edges[0].edge_id = registry.id;
+    archive.entities.push(registry);
+    let summary = fixture
+        .runtime
+        .import_kg_with_options(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.entities_inserted, 2);
+    assert_eq!(summary.entities_skipped, 1);
+    assert_eq!(summary.entities_registry_skipped, 1);
+    assert_eq!(summary.edges_inserted, 1);
+    assert_eq!(summary.edges_skipped, 0);
+    assert!(fixture
+        .runtime
+        .entities(&fixture.token)
+        .unwrap()
+        .get_entity(Uuid::from_u128(900))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(fixture
+        .runtime
+        .get_edge(&fixture.token, Uuid::from_u128(900))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn import_update_refuses_an_edge_uuid_also_held_by_a_note() {
+    let fixture = Fixture::new();
+    let mut archive = fixture.archive();
+    fixture
+        .runtime
+        .import_kg_with_options(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    archive.entities.clear();
+    let mut collision = khive_storage::Note::new("local", "observation", "edge identity collision");
+    collision.id = archive.edges[0].edge_id;
+    fixture
+        .runtime
+        .notes(&fixture.token)
+        .unwrap()
+        .upsert_note(collision)
+        .await
+        .unwrap();
+    let before = fixture.row_image().await;
+    let error = fixture
+        .runtime
+        .prepare_import(
+            &archive,
+            &fixture.token,
+            ImportKindPolicy::Strict,
+            ImportOptions {
+                on_conflict: ImportConflictMode::Update,
+                ..ImportOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("an existing edge must not hide another substrate's UUID");
+    assert!(matches!(error, RuntimeError::InvalidInput(message)
+        if message.contains("held by a different record substrate")));
+    assert_eq!(fixture.row_image().await, before);
+}

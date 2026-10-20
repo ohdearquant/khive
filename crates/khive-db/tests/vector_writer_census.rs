@@ -339,15 +339,16 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
     ),
 ];
 
-// The lexical scanner also sees the Rust `ImportConflictMode::Update {` condition
-// as an UPDATE of `{`. Pin this one non-SQL occurrence without excluding its
-// function or changing detection of actual dynamic-table SQL.
+// The lexical scanner also sees the Rust `ImportConflictMode::Update {` conditions
+// (the entity and edge identity checks) as UPDATEs of `{`. Pin these two non-SQL
+// occurrences without excluding their function or changing detection of actual
+// dynamic-table SQL.
 const LEXICAL_FALSE_POSITIVES: &[(&str, &str, &str, &str, usize)] = &[(
     "khive-runtime/src/portability/conflicts.rs",
     "prepare_import",
     "UPDATE",
     "{",
-    1,
+    2,
 )];
 
 const TEST_SUPPORT: &[(&str, &str, &str, &str, usize)] = &[

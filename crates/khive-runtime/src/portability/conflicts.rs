@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use khive_storage::types::SqlRow;
 use khive_storage::{Entity, SqlStatement, SqlValue};
+use khive_types::pack::pack_registry_tag;
 use khive_types::ImportKindPolicy;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -71,14 +72,22 @@ pub struct ImportConflictSummary {
     pub entities_inserted: usize,
     pub entities_updated: usize,
     pub entities_skipped: usize,
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub entities_registry_skipped: usize,
     pub edges_imported: usize,
     pub edges_inserted: usize,
     pub edges_updated: usize,
     pub edges_skipped: usize,
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub edges_registry_skipped: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_edges: Vec<ImportPolicySkippedEdge>,
     #[serde(default)]
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
+}
+
+fn is_zero_count(count: &usize) -> bool {
+    *count == 0
 }
 
 struct Probe {
@@ -128,6 +137,13 @@ fn archive_entity(record: &ExportedEntity, namespace: &str) -> Entity {
     }
 }
 
+fn is_registry_archive_entity(record: &ExportedEntity) -> bool {
+    record
+        .tags
+        .iter()
+        .any(|tag| pack_registry_tag(tag).is_some())
+}
+
 fn archive_patch(record: &ExportedEntity) -> EntityPatch {
     EntityPatch {
         name: Some(record.name.clone()),
@@ -136,6 +152,22 @@ fn archive_patch(record: &ExportedEntity) -> EntityPatch {
         properties: record.properties.clone().filter(|value| !value.is_null()),
         tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
     }
+}
+
+fn identity_statement(id: Uuid) -> SqlStatement {
+    SqlStatement::new(
+        include_str!("../../sql/canonical_identity_exists.sql"),
+        vec![SqlValue::Text(id.to_string())],
+    )
+    .labelled("import-id-collision")
+}
+
+fn identity_state_statement(id: Uuid) -> SqlStatement {
+    SqlStatement::new(
+        include_str!("../../sql/import-endpoint-state.sql"),
+        vec![SqlValue::Text(id.to_string())],
+    )
+    .labelled("import-endpoint-state")
 }
 
 fn entity_statement(id: Uuid) -> SqlStatement {
@@ -196,15 +228,7 @@ async fn read_endpoint(
 ) -> RuntimeResult<Option<ImportEndpoint>> {
     // Capture all substrate candidates, including absence and higher-precedence
     // identities, before canonical by-ID resolution (entity, note, event, edge).
-    let (probe, _) = read_probe(
-        runtime,
-        SqlStatement::new(
-            include_str!("../../sql/import-endpoint-state.sql"),
-            vec![SqlValue::Text(id.to_string())],
-        )
-        .labelled("import-endpoint-state"),
-    )
-    .await?;
+    let (probe, _) = read_probe(runtime, identity_state_statement(id)).await?;
     probes.push(probe);
     if let Some(record) = runtime.resolve_edge_endpoint(token, id).await? {
         return Ok(Some(ImportEndpoint::Record(Box::new(record))));
@@ -314,6 +338,9 @@ impl KhiveRuntime {
                     "duplicate archive entity UUID {}",
                     record.id
                 )));
+            }
+            if is_registry_archive_entity(record) {
+                continue;
             }
             validate_import_entity_record(
                 self,
@@ -441,23 +468,53 @@ impl KhiveRuntime {
             summary: ImportConflictSummary::default(),
         };
         let mut endpoints = HashMap::<Uuid, Option<ImportEndpoint>>::new();
-        let mut skipped_entities = HashSet::new();
+        let mut skipped_records = HashSet::new();
+        let mut registry_entities = HashSet::new();
+        let mut written_entities = HashSet::new();
         for record in &archive.entities {
+            if is_registry_archive_entity(record) {
+                result.summary.entities_skipped += 1;
+                result.summary.entities_registry_skipped += 1;
+                registry_entities.insert(record.id);
+                skipped_records.insert(record.id);
+                continue;
+            }
             let (probe, rows) = read_probe(self, entity_statement(record.id)).await?;
             if rows.len() > 1 {
                 return Err(invalid(format!("entity UUID {} is ambiguous", record.id)));
             }
             result.probes.push(probe);
-            if !rows.is_empty() && options.on_conflict == ImportConflictMode::Error {
+            let (identity_probe, identities) =
+                read_probe(self, identity_statement(record.id)).await?;
+            result.probes.push(identity_probe);
+            let identity_exists = !identities.is_empty();
+            if identity_exists && options.on_conflict == ImportConflictMode::Error {
                 return Err(invalid(format!(
                     "archive entity UUID {} already exists",
                     record.id
                 )));
             }
-            if !rows.is_empty() && options.on_conflict == ImportConflictMode::Skip {
+            if identity_exists && options.on_conflict == ImportConflictMode::Skip {
                 result.summary.entities_skipped += 1;
-                skipped_entities.insert(record.id);
+                skipped_records.insert(record.id);
                 continue;
+            }
+            if identity_exists && options.on_conflict == ImportConflictMode::Update {
+                // LIMIT 1 establishes existence, but cannot reveal a second substrate.
+                // Retain every identity row so revalidation also detects a later collision.
+                let (probe, identities) =
+                    read_probe(self, identity_state_statement(record.id)).await?;
+                result.probes.push(probe);
+                if rows.is_empty()
+                    || identities
+                        .iter()
+                        .any(|row| row.text("substrate") != Ok("entity"))
+                {
+                    return Err(invalid(format!(
+                        "archive entity UUID {} is held by a different record substrate",
+                        record.id
+                    )));
+                }
             }
             let entity = if rows.is_empty() {
                 let entity = archive_entity(record, namespace);
@@ -502,15 +559,44 @@ impl KhiveRuntime {
                 result.summary.entities_updated += 1;
                 entity
             };
+            written_entities.insert(record.id);
             endpoints.insert(
                 record.id,
                 Some(ImportEndpoint::Record(Box::new(Resolved::Entity(entity)))),
             );
         }
         let rules = self.pack_edge_rules();
+        let mut edge_identities = HashMap::new();
+        for record in &archive.edges {
+            if registry_entities.contains(&record.source)
+                || registry_entities.contains(&record.target)
+                || edge_identities.contains_key(&record.edge_id)
+            {
+                continue;
+            }
+            let (probe, identities) = read_probe(self, identity_statement(record.edge_id)).await?;
+            result.probes.push(probe);
+            let identity_exists = !identities.is_empty();
+            edge_identities.insert(record.edge_id, identity_exists);
+            if identity_exists && options.on_conflict == ImportConflictMode::Skip {
+                skipped_records.insert(record.edge_id);
+            }
+        }
         let mut edge_ids = HashSet::new();
         let mut edge_keys = HashSet::new();
         for record in &archive.edges {
+            if registry_entities.contains(&record.source)
+                || registry_entities.contains(&record.target)
+            {
+                result.summary.edges_registry_skipped += 1;
+                result.summary.skipped_edges.push(skipped(
+                    record,
+                    ImportPolicySkipCause::SkippedRecord,
+                    None,
+                ));
+                continue;
+            }
+            let identity_exists = edge_identities[&record.edge_id];
             let (probe, stored_ids) = read_probe(self, edge_statement(record.edge_id)).await?;
             if stored_ids.len() > 1 {
                 return Err(invalid(format!(
@@ -530,7 +616,7 @@ impl KhiveRuntime {
                     record.edge_id
                 )));
             }
-            if !stored_ids.is_empty() && options.on_conflict == ImportConflictMode::Error {
+            if identity_exists && options.on_conflict == ImportConflictMode::Error {
                 return Err(invalid(format!(
                     "archive edge UUID {} already exists",
                     record.edge_id
@@ -539,7 +625,20 @@ impl KhiveRuntime {
             // Force cannot hide a stored-identity/endpoint mismatch by turning it
             // into an endpoint skip. Validate the immutable identity first.
             let current_edge =
-                if !stored_ids.is_empty() && options.on_conflict == ImportConflictMode::Update {
+                if identity_exists && options.on_conflict == ImportConflictMode::Update {
+                    let (probe, identities) =
+                        read_probe(self, identity_state_statement(record.edge_id)).await?;
+                    result.probes.push(probe);
+                    if stored_ids.is_empty()
+                        || identities
+                            .iter()
+                            .any(|row| row.text("substrate") != Ok("edge"))
+                    {
+                        return Err(invalid(format!(
+                            "archive edge UUID {} is held by a different record substrate",
+                            record.edge_id
+                        )));
+                    }
                     let current = self
                         .get_edge_including_deleted(token, record.edge_id)
                         .await?
@@ -562,8 +661,7 @@ impl KhiveRuntime {
                 } else {
                     None
                 };
-            if skipped_entities.contains(&record.source)
-                || skipped_entities.contains(&record.target)
+            if skipped_records.contains(&record.source) || skipped_records.contains(&record.target)
             {
                 result.summary.skipped_edges.push(skipped(
                     record,
@@ -572,7 +670,7 @@ impl KhiveRuntime {
                 ));
                 continue;
             }
-            if !stored_ids.is_empty() && options.on_conflict == ImportConflictMode::Skip {
+            if identity_exists && options.on_conflict == ImportConflictMode::Skip {
                 result.summary.skipped_edges.push(skipped(
                     record,
                     ImportPolicySkipCause::ExistingEdge,
@@ -622,6 +720,12 @@ impl KhiveRuntime {
             // Repeated refused/skipped edges retain one report per input item. For
             // edges that would be written, reject duplicate identities and tuples
             // before the owner starts so no plan can overwrite another input row.
+            if written_entities.contains(&record.edge_id) {
+                return Err(invalid(format!(
+                    "archive UUID {} is used by both an entity and an edge",
+                    record.edge_id
+                )));
+            }
             if !edge_ids.insert(record.edge_id) {
                 return Err(invalid(format!(
                     "duplicate archive edge UUID {}",
