@@ -14,6 +14,8 @@ mod atom_weights;
 mod comm_legacy_quarantine;
 #[path = "migrations_tests/page_accounting.rs"]
 mod page_accounting;
+#[path = "migrations_tests/pending_entity_indexes.rs"]
+mod pending_entity_indexes;
 #[path = "migrations_tests/proposal_archive.rs"]
 mod proposal_archive;
 #[path = "migrations_tests/retrieval_snapshots.rs"]
