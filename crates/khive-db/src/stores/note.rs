@@ -2903,6 +2903,10 @@ mod tests;
 mod comm_filter_plan_tests;
 
 #[cfg(test)]
+#[path = "comm_quarantine_plan_tests.rs"]
+mod comm_quarantine_plan_tests;
+
+#[cfg(test)]
 #[path = "note_list_plan_tests.rs"]
 mod note_list_plan_tests;
 
