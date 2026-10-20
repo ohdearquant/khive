@@ -1207,12 +1207,14 @@ classes keep growing, and so does the compact identity state this amendment adds
 disk-pressure signal with a defined response, not a correctness line, and reaching it does not stop
 the deployment.
 
-**What this amendment decides against the base ADR, stated once.** This amendment is the separate,
-independently reviewed decision that §2 requires for moving a row to a weaker class. For the six
-keys only, it moves them from `age_archivable` (Table A row 1) to `expendable`, which is weaker
-because it keeps no sealed copy, and it carries its own contract for rows already written under the
-stronger class (§4 below). For the same six keys it also makes the following departures, and no
-others:
+**What this amendment decides against the base ADR, stated once.** §2 requires a separate,
+independently reviewed ADR carrying its own backfill contract for any move of a row to a weaker
+class. This amendment is that decision, written as an amendment section of ADR-168 instead of under
+a new number: it is proposed, reviewed and accepted on its own, independently of the base decision
+and of the October 17 amendment, and it carries its own backfill contract for rows already written
+under the stronger class (§4 below). For the six keys only, it moves them from
+`age_archivable` (Table A row 1) to `expendable`, which is weaker because it keeps no sealed copy.
+For the same six keys it also makes the following departures, and no others:
 
 - it adds a fourth value to §1's closed vocabulary;
 - it is the narrow exception to §3's sealed-copy rule and to the base's rejection of delete-only
