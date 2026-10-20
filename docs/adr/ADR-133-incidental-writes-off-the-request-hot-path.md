@@ -145,7 +145,8 @@ upper bound, not as the normal trigger.
 The consequences of the waiting clause, all of which follow from it directly:
 
 - **Store visibility is unchanged at the moment of return.** A row that is committed today before
-  the dispatch returns is still committed before the dispatch returns. INV-4 holds by construction
+  the dispatch returns is still committed before the dispatch returns (Amendment 10 names one
+  exception: the success rows ADR-103 Amendment 7 no longer produces). INV-4 holds by construction
   rather than by assertion. "Committed" here is write-path store visibility under the store's
   configured posture; whether a committed row survives an OS crash is the store's durability
   posture, which is ADR-134's subject, not this clause's.
@@ -483,6 +484,9 @@ instrumentation cannot see the population this record shrinks.
   situation**. That comparison basis is the whole content of the invariant and was previously left
   implicit. Batching changes _when_ the writer is acquired and _how many rows share one
   acquisition_, never whether a row survives a case the current implementation would have survived.
+  Amendment 10 records one deliberate exception: the success rows ADR-103 Amendment 7 omits or does
+  not select are no longer produced, so for those dispatches a row the current implementation
+  commits is not written at all.
 
   Read against D1's scope: for an obligation-bearing row this is strictly stronger than today, since
   a dispatch returns only after its row commits and a persistent failure fails it, where today it
@@ -694,8 +698,9 @@ loss from an unresolved one — see ADR-103 Amendment 3.
 
 **What does not change:** D4/INV-1 continues to hold without qualification for every write, every
 non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
-(Amendment 10 later qualifies "every write" for the success rows of two channel-maintenance
-subhandlers.)
+(Amendment 10 later qualifies both clauses for the success rows of ADR-103 Amendment 7's six verbs:
+"every write" for the two channel-maintenance subhandlers, and "every non-allowlisted Assertive
+handler" for `comm.cursor_get`, an Assertive handler off the allowlist whose success row it omits.)
 D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
 including the 39 allowlisted verbs — the exception is admission pressure specifically, not
 store failure generally.
@@ -729,7 +734,9 @@ Nothing else in Amendment 1 changes. The exception remains:
 D4/INV-1 continues to hold without qualification for every write, every non-allowlisted Assertive
 handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts — the sentence is
 unchanged; only the enumerated verb set it excepts has grown, by review. (Amendment 10 later
-qualifies "every write" for the success rows of two channel-maintenance subhandlers.)
+qualifies both clauses for the success rows of ADR-103 Amendment 7's six verbs: "every write" for
+the two channel-maintenance subhandlers, and "every non-allowlisted Assertive handler" for
+`comm.cursor_get`, an Assertive handler off the allowlist whose success row it omits.)
 
 The exception's enumerated verb set is authoritative in ADR-103 Amendment 4, which also requires
 the extended census test to assert list-to-enumeration equality and per-entry handler resolution —
@@ -1106,7 +1113,8 @@ ADR-103 Amendment 7 stops writing the audit rows of most successful dispatches o
 every call whose result reports a state change or a failed poll. Each of those rows carries
 `cost_unit`, so under D3 and D4/INV-1 it is an accounting-bearing record, and for the two
 subhandlers it is a write's dispatch audit. This amendment records the change as the third named
-exception to INV-1.
+exception to INV-1, and as an exception to INV-4: for these dispatches a row today's implementation
+commits is no longer produced.
 
 **The exception.** It covers a dispatch whose outcome is `Success`, of a verb on ADR-103
 Amendment 7's omitted or sampled constant, served by a pack registered through the trusted path,
@@ -1120,8 +1128,13 @@ amendment's per-verb counters, so the omission is counted, not silent.
   Amendment 1 and Amendments 3 to 6 never see it.
 - Every row Amendment 7 still writes, for these six verbs and for every other verb, keeps D1 to D5
   and INV-1 as written. The selected and forced rows of the two subhandlers are obligation-bearing:
-  committed before the dispatch returns, and a persistent commit failure fails the dispatch.
-- Error, denial and unknown-verb rows of the six verbs are written as today.
+  committed before the dispatch returns, and a persistent commit failure fails the dispatch. A
+  refused admission, a failed append and an elapsed resolution deadline end such a dispatch as they
+  end it today, under Amendments 3 to 6, and the row keeps the sequence number and `sampling` object
+  it was given at the cut, including when the driver commits it after the caller stopped waiting.
+- Error, denial and unknown-verb rows of the six verbs are written as today. For the four omitted
+  verbs the omission covers `Success` dispatches only: every non-`Success` dispatch of `comm.inbox`,
+  `comm.probe`, `comm.cursor_get` and `whoami` writes its row, unsampled.
 
 **D4's last clause.** "Not revisable by configuration, environment, or feature flag" still holds.
 The exception's verb set changes only by amendment, and `KHIVE_AUDIT_SUCCESS_ROWS` can only restore
@@ -1139,6 +1152,7 @@ would have carried a `cost_unit` of 1, since none of the six verbs is embedding-
 deployment that bills from `cost_unit` runs `all`, and ADR-168's aggregate rule for classes serving
 quota or admission accounting is unchanged.
 
-**Acceptance.** ADR-103 Amendment 7's arms 6 and 7 are this exception's arms: error, denial and
-unknown-verb rows written as today, a selected row's append failure failing its dispatch, and the
-operational-read admission tests passing in `all` mode.
+**Acceptance.** ADR-103 Amendment 7's arms 6, 7 and 13 are this exception's arms: error, denial
+and unknown-verb rows written as today; a selected or forced row's refused admission or failed
+append failing its dispatch, with its sequence number kept; the operational-read admission tests
+passing in `all` mode; and the response's `usage` unchanged.

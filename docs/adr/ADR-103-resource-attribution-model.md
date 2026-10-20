@@ -606,9 +606,9 @@ Adding fields is non-breaking" (`crates/khive-gate/src/audit.rs:10-11`). `resour
 `cost_unit` within it, is exactly this kind of additive field: no schema migration, no
 change to any existing field's meaning.
 
-**Absence has exactly four meanings** (the third added by Amendment 3, the fourth by Amendment 7).
-An audit row with no
-`resource.cost_unit` field is one of:
+**Missing `resource.cost_unit` evidence for a dispatch has exactly four meanings** (the third added
+by Amendment 3, the fourth by Amendment 7). In the first two a stored audit row lacks the field; in
+the last two the dispatch has no stored row at all:
 
 1. A pre-amendment event, written before a producer emitted this field.
 2. A dispatch that errored. The deferred audit path persists an `Error`-outcome row
@@ -620,7 +620,7 @@ An audit row with no
    received a successful result — see Amendment 3 for the exact scope and the counters that make
    this case distinguishable from the other two.
 4. A successful dispatch of one of Amendment 7's six named verbs whose row that amendment omits or
-   does not select. As in (3) the caller received a successful result; Amendment 7's per-verb
+   does not select, so no row is built. As in (3) the caller received a successful result; Amendment 7's per-verb
    counters count these dispatches.
 
 Because this amendment keeps Decision (b)'s every-dispatch scope, there is no third
@@ -734,7 +734,8 @@ already-proven mechanism, not new design surface.
 `b0d92a67aa2f69d070daca6911384057cc9bdca6`).
 
 The shipped implementation provides the seven-counter `UsageContext`, per-operation MCP envelope
-`usage`, and the identical frozen audit snapshot at `resource.units`. Production increments exist
+`usage`, and the identical frozen audit snapshot at `resource.units` on every audit row that is
+written (Amendment 7 names the success rows that are not). Production increments exist
 for embedding, FTS, vector probes, graph hops, graph-store round trips, and successfully appended
 event rows. Runtime entity/note multi-model create paths explicitly propagate the context into
 their joined child tasks.
@@ -867,7 +868,9 @@ warm contributes nothing to the dispatch's counters).
    resolved, and **before** the enclosing audit row is written — and that single
    snapshot is serialized into both read paths, which is why `event_rows` excludes
    the enclosing audit row (Part 1): the same exact object appears in the response
-   and in the audit payload.
+   and in the audit payload. Amendment 7 later stops writing most success rows of six named verbs;
+   for those dispatches the response's `usage` is frozen at the same point and is unchanged, and
+   only its audit copy is absent.
 
 ### Part 4: relation to `cost_unit`
 
@@ -1453,7 +1456,8 @@ Amendment 10 records the matching exception to that record's audit-row obligatio
 ### Context
 
 On one single-user development deployment, the UTC day 2026-10-19 wrote 164,793 audit rows
-(`brain.event_counts(kind="audit", all_actors=true, exhaustive=true)` over that day). Six verbs
+(`brain.event_counts(kind="audit", all_actors=true, exhaustive=true,
+since="2026-10-19T00:00:00Z", until="2026-10-20T00:00:00Z")`). Six verbs
 produced 135,765 of them, 82.4%:
 
 | Verb                              | Rows on 2026-10-19 | Category, visibility    | What one call does                                                                      |
@@ -1470,9 +1474,11 @@ They come from two groups of callers. Clients that poll for mail and identity ca
 dispatches `comm.cursor_get` once (`crates/khive-mcp/src/serve/channel_poll.rs:692`),
 `comm.heartbeat` once (`channel_poll.rs:658`) and `comm.cleanup_expired_quarantine` up to twice,
 once for the channel's slug and, when that succeeds, once for the slugless legacy form
-(`crates/khive-mcp/src/serve/channel_ingest.rs:734`, `:741` and `:746`). A cursor failure skips the
-rest of the cycle (`channel_poll.rs:139-143`). The measured 25,310 = 2 × 12,655 is consistent with
-that normal path; the counts alone do not identify every caller.
+(`crates/khive-mcp/src/serve/channel_ingest.rs:734`, `:741` and `:746`). Cleanup runs first: its
+failure records a failed heartbeat and skips the rest of the cycle, and a cursor failure after it
+skips the rest of the cycle, heartbeat included (`channel_poll.rs:116-148`). The measured
+25,310 = 2 × 12,655 is consistent with the normal path; the counts alone do not identify every
+caller.
 
 The poll loop's three verbs are `Visibility::Subhandler` verbs
 (`crates/khive-pack-comm/src/vocab.rs:650-652`, `:686-688` and `:906-911`). The agent-facing wire
@@ -1492,9 +1498,9 @@ overwrites the previous `last_error`.
 Their cost is real. The event store's file (`khive.db.events.db`, the store this record's rows live
 in) grew from 3,582,369,792 bytes at about 23:11Z on 2026-10-12 to 4,533,735,424 bytes at about
 11:05Z on 2026-10-20: 951,365,632 bytes in 7.50 days, about 121 MiB a day. Dividing that rate by
-one day's audit rows gives about 770 bytes per row. That ratio is an upper bound on a row's share
-of file growth, not a measured marginal size: the file also holds the lane's other records, its
-indexes and free pages.
+one day's audit rows gives about 770 bytes per row. That is an illustrative ratio, not a measured
+size per row: it divides a multi-day growth rate by one day's rows, and the file also holds the
+lane's other records, its indexes and free pages.
 
 ### Decision
 
@@ -1529,72 +1535,110 @@ for that list is unchanged.
 entries of `(pack, verb, every, forcing rule)`, bound to registration the same way. At this
 revision:
 
-- comm: `comm.heartbeat`, every 10; forced when the result's `outcome` is not the string
+- comm: `comm.heartbeat`, every 10; forced unless the result's `outcome` is the string
   `"success"`.
-- comm: `comm.cleanup_expired_quarantine`, every 10; forced when the result's `deleted` or
-  `routed_owners_detached` is greater than zero.
+- comm: `comm.cleanup_expired_quarantine`, every 10; forced unless the result's `deleted` and
+  `routed_owners_detached` are both the integer `0`.
 
 Selection works as follows:
 
-- Each entry owns one process-lifetime counter. Every `Success` dispatch of the entry's verb takes
-  exactly one sequence number `n` from it by a single atomic fetch-add, at the deferred append
-  described under "Stage 1 clarification", where the outcome and the handler's result are both
-  known. Numbers are unique per process and per verb, start at 0, and are taken by no other
-  outcome.
+- Each entry owns one process-wide counter, shared by every registry in the process (item 4).
+  Every `Success` dispatch of the entry's verb in `reduced` mode takes exactly one sequence number
+  `n` from it by a single atomic fetch-add, at the deferred append described under "Stage 1
+  clarification", where the outcome and the handler's result are both known. Numbers are unique
+  per process and per verb, start at 0, and are taken by no other outcome. The counter is 64 bits
+  wide and wraps only after 2^64 numbers, more than 500,000 years at a million dispatches a second,
+  so no wrap rule is specified.
 - The dispatch is **selected** when `mix64(n) % every == 0`, where `mix64` is the splitmix64
   finalizer: `z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9; z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
   z ^ (z >> 31)`, in wrapping 64-bit arithmetic. `mix64(0) = 0`, so the first success after a
   process start is always selected. Over `n` from 0 to 99 the selected numbers are 0, 2, 8, 12,
   34, 47, 77 and 90.
 - The dispatch is **forced** when the entry's forcing rule holds for the trusted canonical
-  handler's result. A named field that is missing or has the wrong type also forces, so a result
-  the rule cannot read fails toward writing. The rule is evaluated only at that seam and only for
-  an eligible registration; no other pack's result is parsed.
+  handler's result. Each rule names the one value that does not force, so a field that is missing,
+  null or of another type forces, and a result the rule cannot read fails toward writing. The rule
+  is evaluated only at that seam and only for an eligible registration; no other pack's result is
+  parsed.
 - A selected or forced dispatch writes its row; any other `Success` dispatch of the verb writes
   none. A written row carries `resource.sampling = {"every": 10, "seq": n, "selected_by": s}`, where
-  `s` is `"sample"` when the hash selected it and `"forced"` when only the forcing rule did.
+  `s` is `"sample"` when the hash selected it and `"forced"` when only the forcing rule did. A
+  dispatch both selected and forced writes one row, labelled `"sample"`, and no counter counts it
+  as forced.
 - A row describes only its own dispatch: its request id, duration, `resource.units` and
   `cost_unit` are that dispatch's, never a sum over skipped ones.
 
-Why a hash and not `n % every == 0`: the cleanup verb's dispatches alternate between the slug pass
-and the slugless pass. Over the measured day's 25,310 cleanup sequence numbers, the periodic rule
-selects 2,531 even numbers and no odd ones, so it would never write a row for the slugless pass;
-the hash selects 1,297 even and 1,281 odd. A fixed function of `n` also keeps the selected set
-exact and testable, which a random draw would not.
+Why a hash and not `n % every == 0`: in a serial stream where both cleanup passes of every cycle
+succeed, the slug pass takes the even numbers and the slugless pass the odd ones. Over 25,310 such
+numbers, the measured day's count, the periodic rule selects 2,531 even numbers and no odd ones, so
+it would never write a row for the slugless pass; the hash selects 1,297 even and 1,281 odd. A real
+stream need not alternate exactly, since callers interleave and a failed slug pass skips the
+slugless one, but a selector that cannot alias with a period-two pattern needs no assumption about
+the stream. A fixed function of `n` also keeps the selected set exact and testable, which a random
+draw would not.
 
 Why one counter per verb and no per-key state: a row stands only for itself, so nothing has to
 track which dispatches a row covers. The fetch-add is the only shared step, there is no map to cap
 or evict, and concurrent dispatches cannot lose or share a number.
 
-Why heartbeat failures are forced: the health row keeps only the latest `last_error`, so without a
-row per failed poll the history of failures would be lost. Failed polls are rare, so forcing them
-costs little.
+Why state changes and failed polls are forced: a cleanup that deleted or detached something and a
+poll that failed are the dispatches whose row a reader is most likely to look for, and forcing keeps
+a row for each of them. That row records only that the dispatch happened, when and for whom: like
+every row of these verbs it holds no channel, error or result, so it is not a history of failures.
+Nothing else is one today either: the health row keeps only the latest `last_error`, and the poll
+loop appends a `ChannelPollFailed` event only for the first failure of a class
+(`channel_poll.rs:481-484`).
 
-**3. Every other outcome is unchanged.** Gate denials, `Error` outcomes, unknown-verb rows,
-admission failures and Amendment 3's degraded rows are written exactly as today for these six
-verbs, carry no `sampling` object and take no sequence number. Denial receipts keep surfacing
-`audit_event_id` (`crates/khive-runtime/src/pack/dispatch.rs:223`) on the same conditions as today.
-A heartbeat whose parameters report a failed poll still resolves `Ok` (`channel_poll.rs:648`), so it
-is a `Success` dispatch here, and the forcing rule keeps its row.
+**3. Every other outcome is unchanged.** The cut is made from the domain outcome, at the seam
+where it is known. Gate denials, `Error` outcomes and unknown-verb dispatches never reach it: for
+these six verbs their rows are written exactly as today, carry no `sampling` object and take no
+sequence number. For `comm.inbox`, `comm.probe`, `comm.cursor_get` and `whoami` the omission covers
+`Success` dispatches only: every non-`Success` dispatch of those four verbs writes its row,
+unsampled, exactly as today. Denial receipts keep surfacing `audit_event_id`
+(`crates/khive-runtime/src/pack/dispatch.rs:223`) on the same conditions as today. A heartbeat that
+records a failed poll (`channel_poll.rs:648-656`) resolves `Ok` when its handler persists the
+failure, with `outcome = "failure"` in its result
+(`crates/khive-pack-comm/src/handlers/quarantine_heartbeat.rs:730-735`), so it is a `Success`
+dispatch here, and the forcing rule keeps its row.
 
-Every row this amendment still writes is produced, admitted and committed exactly as today. The
-heartbeat and cleanup rows keep their obligation: if a selected or forced row's append fails, the
-dispatch fails as it does today, and Amendment 3's degrade path still applies only to its own
-allowlist. An omitted or skipped success never reaches the audit lane, so it is never admitted,
-refused or degraded and moves none of Amendment 3's admission counters. The operational-read
-admission tests that drive `comm.inbox` and `comm.probe` through a real trusted pack
-(`crates/khive-mcp/tests/operational_read_admission.rs:283-300`) therefore run in `all` mode.
+What happens after the cut is unchanged as well. A selected or forced row is produced, admitted and
+committed exactly as a row is today, and keeps its obligation: when its admission is refused, its
+append fails or the caller's resolution deadline elapses, the dispatch ends as it does today
+(ADR-133 Amendments 3 to 6), and Amendment 3's degrade path still applies only to its own
+allowlist. The row keeps the sequence number and `sampling` object it was given at the cut through
+all of these, including when the driver commits it after the caller has stopped waiting. A number
+is never taken back or given to another dispatch, so a row that never commits leaves a gap in the
+stored numbers. An omitted or skipped success never reaches the audit lane, so it is never
+admitted, refused or degraded and moves none of Amendment 3's admission counters. The
+operational-read admission tests that drive `comm.inbox` and `comm.probe` through a real trusted
+pack (`crates/khive-mcp/tests/operational_read_admission.rs:283-300`) therefore run in `all` mode.
+In `all` mode every row of these six verbs, Amendment 3's degraded rows included, behaves as before
+this amendment.
 
-**4. Counters.** Per verb and per process, exported through `VerbRegistry::audit_batch_metrics()`
-beside Amendment 3's counters and visible on `db_diagnostics`:
+The response is unchanged too. Today the dispatch freezes its usage context while it builds the
+row's `resource` payload (`stamp_usage_units`, `crates/khive-runtime/src/cost_unit.rs:187` and
+`:198-207`), and the response envelope's `usage` reads the frozen object
+(`crates/khive-mcp/src/server/dispatch_helpers.rs:543-554`), or a live snapshot when nothing froze
+it (`crates/khive-storage/src/usage.rs:93-99` and `:133-138`). An omitted or skipped success builds
+no payload, so the cut freezes the context itself at the same point, after the handler's children
+are joined and its non-audit appends have resolved, and the response carries the `usage` it carries
+today. Amendment 2's statement that the same object also lands in the audit row holds for every row
+that is written.
+
+**4. Counters.** Per verb, exported through `VerbRegistry::audit_batch_metrics()` beside
+Amendment 3's counters and visible on `db_diagnostics`:
 
 - `audit_success_rows_omitted`: item 1 dispatches that wrote no row;
 - `audit_success_rows_sampled_out`: item 2 dispatches that were neither selected nor forced;
-- `audit_success_rows_forced`: item 2 dispatches written only because of the forcing rule;
+- `audit_success_rows_forced`: item 2 dispatches the forcing rule alone sent to be written.
 
-and, once per process, `audit_success_rows_mode`: `reduced` or `all`. Each dispatch increments at
-most one of the three counts, once. They reset when the process
-restarts, and they are the only record of omitted and skipped dispatches.
+Each dispatch increments at most one of the three, once, at the cut. They count decisions, not
+commits: a forced row whose admission is refused or whose append fails is still counted, and its
+dispatch ends as item 3 says. Like Amendment 3's counters and the sequence counters of item 2, they
+are process-wide: every registry in a process adds to the same counts and takes numbers from the
+same per-verb counter, so numbers stay unique per process and per verb however many registries the
+process builds. They reset when the process restarts, and they are the only record of omitted and
+skipped dispatches. Beside them, `audit_success_rows_mode` reports the mode of the registry
+answering, which item 6 fixes per registry.
 
 **5. Readers.** Every reader of audit rows keeps reading stored rows, with its current meaning.
 For these six verbs, after this amendment:
@@ -1607,18 +1651,30 @@ For these six verbs, after this amendment:
   are sampled totals, not dispatch totals.
 - `brain.event_counts` gains one field, `sampled_success_rows`, keyed by verb, with `rows` (stored
   rows carrying `resource.sampling`), `sample_rows` (those with `selected_by = "sample"`),
-  `forced_rows` (those with `selected_by = "forced"`) and `every`. It is computed over the same
-  authorized, filtered and fetched rows as the other fields (Amendment 6). When the fetch is
-  truncated it is named `sampled_success_rows_page_scoped`, as the verb-by-actor cross is. A reader
-  can estimate a window's successful dispatches of a sampled verb as `every × sample_rows`. That is
-  an estimate with sampling error, never an exact count; forced rows are outside the sample and are
-  not multiplied.
+  `forced_rows` (those with `selected_by = "forced"`), `unsampled_rows` (stored `Success` rows of
+  the verb with no `sampling` object: rows written before this amendment or in `all` mode) and
+  `every` (the value the window's `sampling` objects carry, or null when they carry more than one).
+  A row whose `sampling` object lacks one of these fields or holds another value counts in `rows`
+  only. The field is computed over the same authorized, filtered and fetched rows as the other
+  fields (Amendment 6). When the fetch is truncated it is named `sampled_success_rows_page_scoped`,
+  as the verb-by-actor cross is.
+- A reader can estimate a window's successful dispatches of a sampled verb as
+  `unsampled_rows + every × sample_rows`. Forced rows are neither multiplied nor added: their
+  dispatches belong to the population the second term estimates. The estimate has sampling error,
+  and it is biased at restarts: the first success of every process is always selected, so a window
+  covering many short process lifetimes overstates (ten processes of one success each estimate
+  100). It is never an exact count.
 - `count(kind="event", group_by=...)` (`crates/khive-pack-kg/src/handlers/stats.rs:83-87`),
   `brain.event_page` (`crates/khive-pack-brain/src/handlers/event_page.rs:178-182`),
   `list(kind="event")` (`crates/khive-pack-kg/src/handlers/list.rs:935`) and the `query` event
   source (`crates/khive-query/src/compilers/sql.rs:434`) return and count only stored rows. They
-  see fewer rows for these verbs, page and truncate accordingly, show `resource.sampling` as part of
-  the row's payload, and scale nothing.
+  see fewer rows for these verbs, page and truncate accordingly, and scale nothing; those that
+  return rows show `resource.sampling` as part of the row's payload.
+- The event store's own reads (`EventStore`'s query, page, count and grouped count,
+  `crates/khive-storage/src/event.rs:331-354`) and the events daemon that serves them
+  (`crates/khive-runtime/src/events_split/server.rs:306-328`) behave the same way: their counts are
+  stored-row totals, their pages and lookups keep every stored payload and id, and neither
+  reconstructs dispatches or scales by `every`.
 - `get` (`crates/khive-pack-kg/src/handlers/get.rs:371`) and `resolve`
   (`crates/khive-runtime/src/operations/identity_reads.rs:283`) keep reading every row already
   stored. An omitted or skipped success never had an event id, so there is nothing for them to
@@ -1627,14 +1683,17 @@ For these six verbs, after this amendment:
   (`scripts/perf/mcp_bench_client.py:493`) and reports a sample with no row as `no_audit_row` with
   a null server duration (`mcp_bench_client.py:502-504`). A bench therefore runs its daemon in
   `all` mode (item 6), and the bench client reads `audit_success_rows_mode` from `db_diagnostics`
-  before its first sample and refuses to run against a daemon in any other mode.
+  before its first sample and refuses to run unless it reads `all`: `reduced`, a missing or
+  unknown value and an unreadable `db_diagnostics` all refuse.
 
-**6. Mode.** One runtime setting, `KHIVE_AUDIT_SUCCESS_ROWS`, read once when the registry is
-built. `reduced` (the default) applies items 1 and 2; `all` writes every success row as before this
-amendment, takes no sequence numbers and adds no `sampling` object. A builder option overrides the
-environment variable, so an embedder or a test fixes the mode without touching the process
-environment. An unrecognized value resolves to `all` and logs a warning naming the value. The
-setting can only restore rows: no value removes a row this amendment keeps.
+**6. Mode.** One runtime setting, `KHIVE_AUDIT_SUCCESS_ROWS`, read once when each registry is
+built. The registry keeps that mode for its lifetime, and a later change to the environment does
+not move it. `reduced` (the default, and the mode when the variable is unset) applies items 1 and
+2; `all` writes every success row as before this amendment, takes no sequence numbers, adds no
+`sampling` object and raises none of item 4's counts. A builder option overrides the environment
+variable for the registry it builds, so an embedder or a test fixes the mode without touching the
+process environment. An unrecognized value resolves to `all` and logs a warning naming the value.
+The setting can only restore rows: no value removes a row this amendment keeps.
 
 The daemon a performance bench launches runs with `all`. A deployment that needs a complete
 per-dispatch record, or that bills from `cost_unit`, runs with `all`. ADR-168's
@@ -1650,8 +1709,8 @@ takes sequence numbers 0 to 12,654 for `comm.heartbeat` and 0 to 25,309 for
 `comm.cleanup_expired_quarantine`; the hash selects 1,268 and 2,578 of them, 3,846 rows against the
 3,796.5 of an exact one in ten. The day falls from 164,793 rows to 32,874 before forced rows, an
 80.05% cut. Forced rows add to that, and each restart starts the sequence again at 0, whose
-first success is always selected. If file growth
-tracks audit rows, it falls from about 121 MiB a day to about 24 MiB a day. That projection is
+first success is always selected. If file growth tracks audit rows, it falls from about 121 MiB a
+day to about 24 MiB a day, less what each kept row's `sampling` object adds. That projection is
 conditional, and acceptance arm 12 measures it. Rows already written stay; removing old rows is
 retention's question (ADR-168), not this amendment's.
 
@@ -1667,8 +1726,9 @@ retention's question (ADR-168), not this amendment's.
    weight cannot be split across a reader's time window, the tail after the last written row is
    lost at exit or eviction, concurrent dispatches need a reservation protocol, and the capped map
    needs eviction rules. A row that stands only for itself needs none of that.
-3. **Select by a hash of the event id.** Stateless, but the selected set changes from run to run,
-   so a test cannot assert it exactly.
+3. **Select by a hash of the event id.** Stateless, and deterministic for given ids, but production
+   ids are random, so the selected set differs from run to run unless a test supplies the ids. A
+   sequence gives the same selected set in every run without that.
 4. **Retention alone.** Deleting old rows bounds the store but leaves the write volume, the
    audit-lane admission load and the WAL churn. It is needed as well (ADR-168), not instead.
 5. **A periodic summary row per poller.** One row per interval with a count. Needs a new row shape,
@@ -1685,55 +1745,96 @@ Each arm names the control that must turn it red.
    `comm.cursor_get` and `whoami` through the trusted registry writes no audit row and increments
    that verb's `audit_success_rows_omitted` by one. Control: removing any one entry from the
    omitted constant turns that verb's case red.
-2. The omitted and sampled constants are disjoint, every entry resolves to a handler of the named
-   pack, and the precomputed sets equal the constants. A pack registered through
-   `VerbRegistryBuilder::register` that serves `comm.inbox` and `comm.heartbeat` writes every
-   success row of both. Control: dropping the trusted-registration condition makes its success
-   rows omit or sample.
-3. One hundred serial `Success` dispatches of `comm.heartbeat` with a passing result write rows
-   whose `seq` values are exactly 0, 2, 8, 12, 34, 47, 77 and 90, each with `every = 10` and
-   `selected_by = "sample"`, and `audit_success_rows_sampled_out` reads 92. Control: replacing the
-   hash with `n % 10 == 0` turns the set red.
-4. Eight tasks dispatch `comm.cleanup_expired_quarantine` 1,000 times each, concurrently: the
-   sequence numbers taken are exactly 0 to 7,999 with no repeat, the written rows are exactly the
-   hash-selected numbers in that range, and written rows plus `sampled_out` equal 8,000. Control: a
-   counter read and written in two steps instead of one fetch-add turns it red.
-5. Forcing: a cleanup result with `deleted = 1` and `routed_owners_detached = 0`, one with
-   `deleted = 0` and `routed_owners_detached = 1`, one missing `deleted`, and a heartbeat whose
-   result has `outcome = "failure"`, each at a sequence number the hash skips, write their rows with
-   `selected_by = "forced"` and increment `audit_success_rows_forced`. A cleanup returning zeros at a
-   skipped number writes none. Control: removing either field from the cleanup rule, or the
-   heartbeat rule, turns its case red. A census test pins each handler's result key set, so a new
-   result field fails it until the forcing rule is reviewed.
-6. Error and denial rows: a `comm.heartbeat` with an empty `channel_kind`, a cleanup that returns
-   an error, an unknown verb and a gate-denied `whoami` write their rows as today, with no
-   `sampling` object, take no sequence number, and the denial returns `audit_event_id`. Control:
-   applying the cut before the outcome is known drops them.
-7. Obligation: with an injected append failure, a selected `comm.heartbeat` dispatch fails as it
-   does today, and a skipped one succeeds. The operational-read admission tests pass in `all`
-   mode. Control: routing a selected row through a best-effort path makes the first case succeed.
-8. `db_diagnostics` reports the three counts and the mode per verb, equal to the dispatches of
-   arms 1, 3 and 5, and all zero in `all` mode.
+2. The omitted constant equals exactly the four pairs of item 1 and the sampled constant exactly
+   the two entries of item 2, each written out in the test as literals; the two are disjoint, every
+   entry resolves to a handler of the named pack, and the precomputed sets equal the constants. A
+   pack registered through `VerbRegistryBuilder::register` that serves `comm.inbox` and
+   `comm.heartbeat` is called 20 times for each and writes 20 success rows of each, and a trusted
+   dispatch of a verb on neither list (`stats`) writes its row with no `sampling` object. Control:
+   adding an entry to either constant fails the literal comparison, and dropping the
+   trusted-registration condition from either set makes the untrusted pack's rows omit or sample.
+3. From a fresh counter (a test-only reset), one hundred serial `Success` dispatches of
+   `comm.heartbeat` with a passing result write rows whose `seq` values are exactly 0, 2, 8, 12,
+   34, 47, 77 and 90, each with `every = 10` and `selected_by = "sample"`, and
+   `audit_success_rows_sampled_out` rises by 92. A second reset, standing for a process restart,
+   starts again at 0 and writes that row. Control: replacing the hash with `n % 10 == 0` turns the
+   set red.
+4. From a fresh counter, eight tasks on a multi-threaded runtime start together at a barrier and
+   dispatch `comm.cleanup_expired_quarantine` 1,000 times each with zero results: the numbers taken
+   are exactly 0 to 7,999 with no repeat, the written rows are exactly the 775 hash-selected numbers
+   in that range, and `sampled_out` rises by 7,225. Control: a counter that loads, yields to the
+   scheduler and then stores, in place of the fetch-add, turns it red.
+5. Forcing, at sequence numbers the hash skips, through an injected trusted result: cleanup results
+   with `deleted` = 1, `routed_owners_detached` = 1, either field missing, either field null, either
+   field the string `"1"`, -1 or 0.5 each write their row with `selected_by = "forced"` and
+   increment `audit_success_rows_forced`; heartbeat results with `outcome` = `"failure"`, missing,
+   null or the number 1 do the same. A cleanup returning both counts as `0` and a heartbeat
+   returning `"success"` write none. At a hash-selected number a result the rule forces writes one
+   row labelled `"sample"` and no forced count. Through the real handlers, a cleanup that deletes
+   one expired message and a heartbeat recording a failed poll are forced. Control: removing either
+   field from the cleanup rule, reading a value of another type as zero, or dropping the heartbeat
+   rule turns its cases red, and writing two rows for the overlap turns that case red. A census test
+   pins each handler's result key set and each field's type, so a new or retyped field fails it
+   until the forcing rule is reviewed.
+6. Outcomes before the cut: a `comm.heartbeat` with an empty `channel_kind`, a cleanup that returns
+   an error, an unknown verb, a gate-denied `whoami`, and an invalid-argument `Error` dispatch of
+   each of `comm.inbox`, `comm.probe` and `comm.cursor_get` write their rows as today with no
+   `sampling` object, the denial returns `audit_event_id`, and none takes a sequence number, so the
+   next success takes the next one. Control: applying the cut before the outcome is known, or to
+   every outcome of a listed verb, drops them.
+7. Obligation after the cut, through an injected audit lane, for each of a hash-selected
+   `comm.heartbeat`, a force-only `comm.heartbeat` and a force-only
+   `comm.cleanup_expired_quarantine`: when admission is refused or the append fails, the dispatch
+   returns the audit-obligation error it returns today, carrying the handler's success as its
+   domain disposition (ADR-133 Amendment 3); when the caller's resolution deadline elapses and the
+   driver commits the row afterwards, the dispatch returns `ResolutionDeadlineExpired` and the
+   committed row carries the `seq` and `sampling` object given at the cut. In every case the next
+   success takes the next number. A skipped heartbeat under the same injection succeeds. The
+   operational-read admission tests pass in `all` mode. Control: sending force-only rows down a
+   best-effort path makes their cases succeed, and giving a number back on failure makes the next
+   success repeat it.
+8. `db_diagnostics` reports per verb the three counts and the answering registry's mode. Over arms
+   1, 3, 5 and 7 each count rises by exactly the dispatches those arms give it, a forced row whose
+   append fails included, and a registry built `all` that dispatches each of the six verbs raises
+   none. Control: counting in `all` mode, or counting a forced row twice, breaks the deltas.
 9. Readers, over one stored fixture holding pre-amendment rows, `all`-mode rows and sampled rows
-   (both `selected_by` values) for two actors and two namespaces: every existing
-   `brain.event_counts` field equals the value a build without this amendment returns over the same
-   rows; `sampled_success_rows` equals stated expected values under actor, namespace, kind and time
-   filters; and with a row cap below the fixture size it is named
-   `sampled_success_rows_page_scoped`. `count(kind="event")`, `brain.event_page` and
-   `list(kind="event")` return the stored rows unchanged. Control: scaling an existing field by
-   `every` breaks the equality.
-10. The bench client refuses to run against a daemon whose `db_diagnostics` reports `reduced`.
-    Against a daemon it launched in `all` mode it reports zero `no_audit_row` for successful
-    `comm.inbox`, `comm.probe` and `whoami` samples. Control: with the refusal removed, a `reduced`
-    daemon makes every successful sample of those three verbs `no_audit_row`.
-11. An unrecognized `KHIVE_AUDIT_SUCCESS_ROWS` value resolves to `all` with one warning, and the
-    builder option overrides the environment variable in both directions.
+   (both `selected_by` values) of both sampled verbs for two actors and two namespaces: every
+   existing `brain.event_counts` field equals the value a build without this amendment returns over
+   the same rows; `sampled_success_rows` equals stated expected values under actor, namespace, kind
+   and time filters, keeps the two verbs apart, and counts a row with a malformed `sampling` object
+   in `rows` only; and with a row cap below the fixture size it is named
+   `sampled_success_rows_page_scoped`. For `comm.heartbeat` in one window the fixture holds 100
+   `all`-mode success rows and the 8 sample rows of numbers 0 to 99: `unsampled_rows` reads 100,
+   `sample_rows` 8, and the item 5 estimate 180. `count(kind="event")`, `brain.event_page`,
+   `list(kind="event")`, `get`, the `query` event source and the event store's own reads return the
+   stored rows unchanged. Control: scaling an existing field by `every`, or leaving the unsampled
+   rows out of the estimate, breaks the equality.
+10. The bench client refuses to run when `db_diagnostics` reports `reduced`, reports no mode or an
+    unknown one, or cannot be read. Against a daemon it launched in `all` mode, at least 50
+    successful samples of each of `comm.inbox`, `comm.probe` and `whoami` each join exactly one
+    audit row and report a server duration. Control: with the refusal removed, a `reduced` daemon
+    makes every successful sample of those three verbs `no_audit_row`, and a preflight that reads a
+    missing mode as `all` passes the missing-mode case.
+11. With `KHIVE_AUDIT_SUCCESS_ROWS` unset the mode is `reduced`; an unrecognized value resolves to
+    `all` with one warning; the builder option overrides the environment variable in both
+    directions; and changing the variable after a registry is built leaves that registry's mode
+    unchanged. Control: reading the variable at dispatch instead of at build turns the last case
+    red.
 12. A replay of the 2026-10-19 verb mix at 1/100 scale through a test registry (each of the six
     verbs called its measured count divided by 100, rounded, with passing results, and 290 calls of
     unaffected verbs) writes exactly 330 rows in `reduced` mode, against 1,649 in `all` mode, a
-    79.99% cut. Control: emptying either constant changes the count. Separately, 24 hours of a deployment with this change record the six verbs'
-    per-verb audit counts and the event store's daily file growth beside the 2026-10-19 figures
-    above; that record is an observation, not a gate.
+    79.99% cut. Control: emptying either constant changes the count. Separately, 24 hours of a
+    deployment with this change record the six verbs' per-verb audit counts and the event store's
+    daily file growth beside the 2026-10-19 figures above; that record is an observation, not a
+    gate.
+13. Response usage: for each of the six verbs, a dispatch whose row is omitted or skipped returns
+    the same `usage` object as the same dispatch in `all` mode, equal to the `resource.units` that
+    `all`-mode row stores. Control: leaving the context unfrozen when no payload is built turns it
+    red under a test hook that adds to the context after the freeze point.
+14. Two registries in one process: with one `reduced` and one built `all`, each `db_diagnostics`
+    reports its own mode and only the `reduced` one raises the counts; with two `reduced`, their
+    `comm.heartbeat` successes take numbers from one counter with no repeat. Control: a counter per
+    registry repeats numbers in the second case.
 
 ### Consequences
 
@@ -1742,7 +1843,9 @@ Each arm names the control that must turn it red.
 - Poll volume for the omitted verbs is visible only on process-lifetime counters; across a restart
   it is gone.
 - `brain.event_counts` counts and `cost_unit` sums undercount the six verbs' successes. For the two
-  sampled verbs, `sampled_success_rows` supports an estimate; nothing recovers the omitted ones.
+  sampled verbs, `sampled_success_rows` supports an estimate, biased upward across short process
+  lifetimes (item 5); nothing recovers the omitted ones.
+- The response's `usage` is unchanged for every dispatch, including those that write no row.
 - Every dispatch whose row is omitted or skipped returns its result without a committed audit row;
   ADR-133 Amendment 10 names this as an exception to that record's obligations.
 - A verb joins either set only by amendment, with the same evidence: its row count, what its row
