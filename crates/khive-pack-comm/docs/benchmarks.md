@@ -72,6 +72,8 @@ public Rust registry dispatch, not public MCP verbs.
 | ------------------------ | -------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `comm_lifecycle`         | `ingest`                         | One generated inbound message; one `comm.ingest` dispatch                                     | Fresh, non-deduplicated UUID; no committed-write degradation; actual inbound note and recipient  |
 | `comm_lifecycle`         | `cleanup_expired_quarantine/100` | 100 notes ingested with quarantine metadata; one cleanup dispatch                             | All 100 hard-deleted; no routed-owner detachment; each UUID absent                               |
+| `comm_lifecycle`         | `cursor_get`                     | One seeded cursor at generation 1 / high-water 100; one get dispatch                          | Returned checkpoint remains at 100 and equals an additional persisted read                        |
+| `comm_lifecycle`         | `cursor_commit`                  | One seeded cursor at generation 1 / high-water 100; one commit to high-water 101               | Receipt is at 101 and equals an additional persisted read                                         |
 | `comm_lifecycle`         | `cursor_get_commit`              | One seeded cursor at generation 1 / high-water 100; get then commit high-water 101            | Old read, new receipt and an additional persisted read agree                                     |
 | `comm_lifecycle`         | `mark_read/200`                  | 200 distinct unread inbound notes; one `comm.mark_read(atomic=false)` dispatch                | Requested, unique and marked counts all 200; no failures or unknowns; all stored read flags true |
 | `comm_lifecycle`         | `suppression_list/100`           | 100 unique outbound address suppressions seeded via `comm.suppression_add`; one list dispatch | Exact 100-entry identity/value set, with limit 100 and offset 0                                  |
@@ -82,7 +84,11 @@ deadline. No sleep or row rewrite makes it eligible. This workload fits the clea
 handler's 128-row page and contains no retained attachment originals, so it measures
 note cleanup rather than attachment garbage collection. Cursor get and commit both
 execute the handler's writer-side schema bootstrap; the get is not a read-only SQL
-operation. Suppression operations use the configured maintainer identity.
+operation. The isolated get and commit scenarios use the same seeded checkpoint
+and handler paths as the existing pair, separating their costs without replacing
+the round-trip measurement. They do not measure first-time schema creation or
+persistent-store writer-queue contention. Suppression operations use the configured
+maintainer identity.
 
 Fixture construction, all seeding, JSON argument preparation, receipt/state checks
 and destruction are outside each timer. The timer includes executor entry, registry
@@ -95,7 +101,8 @@ current-thread executor with at most two blocking threads.
 Each new scenario prints a JSON report from 11 independent actual operations: the
 median is sorted rank 6, reported in both nanoseconds and milliseconds per operation.
 The cleanup operation is the entire 100-note dispatch; mark-read is the entire
-200-message dispatch; the cursor operation includes both dispatch calls. These are
+200-message dispatch; `cursor_get_commit` includes both dispatch calls, while
+`cursor_get` and `cursor_commit` each include exactly one. These are
 not per-message latencies or batch-average percentiles. The separate Criterion
 trend uses sequential `iter_custom` samples, sample size 10, one-second warmup and
 three-second measurement targets. Fixture preparation and checks still consume wall
@@ -110,7 +117,13 @@ cd crates
 cargo bench -p khive-pack-comm --benches -- --quick --noplot
 # The new dispatch target on its own.
 cargo bench -p khive-pack-comm --bench comm_lifecycle -- --quick --noplot
+# Test mode executes the target's fixture/receipt checks without a Criterion timing run.
+cargo bench -p khive-pack-comm --bench comm_lifecycle -- --test
 ```
+
+The target's 11-sample JSON reporting pass precedes Criterion dispatch. It still
+runs for every scene in test mode and when a Criterion name filter is supplied;
+a filtered invocation is not a promise to construct only that scene's fixtures.
 
 ## Performance guarantees
 
@@ -143,6 +156,8 @@ owning component.
 | ----------------------------------------------- | ---------------------------------------------------------- | -------- | ------- | ------------------- |
 | `comm_lifecycle/ingest`                         | Median ns per single dispatch                              | pending  | pending | pending             |
 | `comm_lifecycle/cleanup_expired_quarantine/100` | Median ms per 100-note cleanup dispatch                    | pending  | pending | pending             |
+| `comm_lifecycle/cursor_get`                     | Median ns per single get dispatch                         | pending  | pending | pending             |
+| `comm_lifecycle/cursor_commit`                  | Median ns per single commit dispatch                      | pending  | pending | pending             |
 | `comm_lifecycle/cursor_get_commit`              | Median ns per get + commit round-trip                      | pending  | pending | pending             |
 | `comm_lifecycle/mark_read/200`                  | Median ns per 200-message dispatch                         | pending  | pending | pending             |
 | `comm_lifecycle/suppression_list/100`           | Median ns per 100-entry list dispatch                      | pending  | pending | pending             |
