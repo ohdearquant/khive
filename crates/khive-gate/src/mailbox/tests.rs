@@ -219,3 +219,105 @@ fn policy_validation_and_fingerprint_are_bounded_and_structural() {
         Err(MailboxPolicyError::TooManyReaders)
     ));
 }
+
+#[test]
+fn probe_requires_an_exact_grant_for_the_actor_selector() {
+    let gate = policy(Arc::new(AllowAllGate));
+    let req = request(
+        ActorRef::new("actor", "lambda:owner:reader"),
+        "comm.probe",
+        // This decoy must not replace probe's actual `actor` selector.
+        json!({"actor":"lambda:owner", "mailbox_actor":"lambda:owner:reader"}),
+    );
+    assert_eq!(
+        mailbox_read_owner(&req).unwrap(),
+        Some(ActorRef::new("actor", "lambda:owner"))
+    );
+    assert_denied(check_with_mailbox_policy(&AllowAllGate, &req));
+    assert!(check_with_mailbox_policy(&gate, &req).unwrap().is_allow());
+    for actor in [
+        ActorRef::new("actor", "lambda:owner:reader:child"),
+        ActorRef::new("actor", "lambda:owner:Reader"),
+        ActorRef::new("agent", "lambda:owner:reader"),
+        ActorRef::anonymous(),
+    ] {
+        let mut changed = req.clone();
+        changed.actor = actor;
+        changed.namespace = Namespace::parse("lambda:owner").unwrap();
+        assert_denied(check_with_mailbox_policy(&gate, &changed));
+    }
+    let mut other_owner = req;
+    other_owner.args["actor"] = json!("lambda:owner:child");
+    assert_denied(check_with_mailbox_policy(&gate, &other_owner));
+}
+
+#[test]
+fn probe_own_local_and_invalid_selectors_preserve_policy() {
+    for (actor, selected) in [
+        (ActorRef::new("actor", "lambda:owner"), "lambda:owner"),
+        (ActorRef::anonymous(), "local"),
+    ] {
+        let req = request(actor, "comm.probe", json!({"actor":selected}));
+        assert_eq!(mailbox_read_owner(&req).unwrap(), None);
+        assert!(check_with_mailbox_policy(&AllowAllGate, &req)
+            .unwrap()
+            .is_allow());
+        let expected_reason = if req.actor.is_anonymous() {
+            "unattributed caller is not enrolled"
+        } else {
+            "actor is not enrolled"
+        };
+        assert!(matches!(
+            check_with_mailbox_policy(&CallerEnrollmentGate::new(vec![], false), &req).unwrap(),
+            GateDecision::Deny { reason } if reason == expected_reason
+        ));
+    }
+    for value in [
+        json!(null),
+        json!(7),
+        json!(" "),
+        json!("a\nb"),
+        json!("x".repeat(256)),
+    ] {
+        let req = request(
+            ActorRef::new("actor", "lambda:owner:reader"),
+            "comm.probe",
+            json!({"actor":value}),
+        );
+        assert_eq!(
+            mailbox_read_owner(&req).unwrap_err(),
+            MailboxPolicyError::InvalidSelector
+        );
+        assert!(matches!(
+            check_with_mailbox_policy(&AllowAllGate, &req),
+            Err(GateError::Policy(_))
+        ));
+    }
+}
+
+#[test]
+fn probe_grant_preserves_base_errors_and_obligations() {
+    let req = request(
+        ActorRef::new("actor", "lambda:owner:reader"),
+        "comm.probe",
+        json!({"actor":"lambda:owner"}),
+    );
+    assert!(matches!(
+        check_with_mailbox_policy(&policy(Arc::new(CallerEnrollmentGate::new(vec![], false))), &req).unwrap(),
+        GateDecision::Deny { reason } if reason == "actor is not enrolled"
+    ));
+    assert!(matches!(
+        check_with_mailbox_policy(&policy(Arc::new(BrokenGate)), &req),
+        Err(GateError::Internal(reason)) if reason == "backend failure"
+    ));
+    assert!(matches!(
+        check_with_mailbox_policy(&BrokenMailboxGate, &req),
+        Err(GateError::Internal(reason)) if reason == "mailbox backend failure"
+    ));
+    let decision = check_with_mailbox_policy(&policy(Arc::new(ObligatedGate)), &req).unwrap();
+    let GateDecision::Allow { obligations } = decision else {
+        panic!("expected probe allow")
+    };
+    assert_eq!(obligations.len(), 1);
+    assert!(matches!(&obligations[0], Obligation::Audit { tag } if tag == "base-policy"));
+}
