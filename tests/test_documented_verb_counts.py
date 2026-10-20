@@ -97,6 +97,56 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         self.assertEqual(len(errors), 1)
         self.assertIn("claims comm verbs=7, registry says 8", errors[0])
 
+    def test_escaped_pipe_before_pack_columns_cannot_hide_stale_count(self) -> None:
+        for outer in ("closed", "open", "repeated"):
+            def frame(cells: str) -> str:
+                return {
+                    "closed": f"| {cells} |",
+                    "open": f"| {cells}",
+                    "repeated": f"|| {cells} ||",
+                }[outer]
+
+            with self.subTest(outer=outer), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                readme = root / "README.md"
+                header = frame("Example | Pack | Verbs")
+                separator = frame("--- | --- | ---")
+                for count in (20, 99):
+                    text = "\n".join((
+                        "28 verbs across 3 packs.",
+                        header,
+                        separator,
+                        frame(r"a\|b | kg | " + str(count)),
+                        frame("plain | comm | 8"),
+                        frame("plain | workspace | 0"),
+                    )) + "\n"
+                    readme.write_text(text, encoding="utf-8")
+                    claims = scan_document("README.md", text, PACK_COUNTS)
+                    table_claims = [claim for claim in claims if claim.form == "per-pack-table"]
+                    self.assertEqual(
+                        [(claim.pack, claim.value) for claim in table_claims],
+                        [("kg", count), ("comm", 8), ("workspace", 0)],
+                    )
+                    errors = validate_documented_counts(root, verbs_result())
+                    if count == 20:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertEqual(len(errors), 1)
+                        self.assertIn("README.md:4:", errors[0])
+                        self.assertIn("claims kg verbs=99, registry says 20", errors[0])
+
+    def test_count_tables_keep_empty_cells_and_optional_closing_pipe(self) -> None:
+        for suffix in ("", "|", "||"):
+            with self.subTest(suffix=suffix):
+                text = "| Example | Pack | Verbs " + suffix + "\n"
+                text += "| --- | --- | --- " + suffix + "\n"
+                text += "| | kg | 99 " + suffix + "\n"
+                claims = scan_document("README.md", text, PACK_COUNTS)
+                self.assertEqual(
+                    [(claim.pack, claim.value) for claim in claims if claim.form == "per-pack-table"],
+                    [("kg", 99)],
+                )
+
     def test_living_pages_and_inverted_mutations_fail_validation(self) -> None:
         published = """28 verbs across 3 production packs.
 | Pack | Verbs |

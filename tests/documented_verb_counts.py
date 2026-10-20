@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 from typing import Iterable
 
+from markdown_table_rows import split_row
+
 
 NUMBER_WORDS = {
     "zero": 0,
@@ -368,9 +370,11 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             return raw_window if match.end() > current_line_end else raw
 
         if stripped.startswith("|"):
+            # Keep counts' optional/repeated outer pipes. Padding the synthetic
+            # closing pipe keeps a terminal backslash in its original cell.
             cells = [
                 re.sub(r"[`*_]", "", cell).strip()
-                for cell in stripped.strip("|").split("|")
+                for cell in split_row(f"|{stripped.strip('|')} |")
             ]
             lowered_cells = [cell.lower() for cell in cells]
             pack_column = next(
