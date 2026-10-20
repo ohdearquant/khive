@@ -75,7 +75,9 @@ pub(crate) async fn with_embedding_admission<T>(
                     _ = &mut stopped, if !bound_expired => bound_expired = true,
                 }
                 match admission.state.load(Ordering::Acquire) {
-                    ADMISSION_ACCEPTED => return future.await.map_err(RuntimeError::from),
+                    // An accepted job can be followed by another admission wait.
+                    // Keep supervising that next phase without cancelling this one.
+                    ADMISSION_ACCEPTED => {}
                     ADMISSION_WAITING if bound_expired => {
                         return Err(RuntimeError::Storage(
                             khive_storage::StorageError::AdmissionTimeout {
@@ -1423,6 +1425,57 @@ mod tests {
         assert!(after_deadline.is_pending(),
             "already-running inference cannot be called a pre-admission refusal: {after_deadline:?}");
         assert_eq!(call.await.unwrap(), vec![1.0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_second_job_keeps_the_original_admission_bound() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let service = BlockingEmbeddingService::new(Arc::clone(&inner));
+        let first = vec!["first".to_owned()];
+        let second = vec!["second".to_owned()];
+        let mut call = Box::pin(khive_storage::scope_request_read_deadline(
+            Duration::from_millis(100),
+            with_embedding_admission(async {
+                service.embed(&first, EmbeddingModel::default()).await?;
+                service.embed(&second, EmbeddingModel::default()).await
+            }),
+        ));
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        drive_until_entered(call.as_mut(), &inner, 1).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(
+            poll_once(call.as_mut()).await.is_pending(),
+            "the admitted first job must finish despite expiry"
+        );
+        inner.release();
+
+        // A wall-clock watchdog keeps the paused clock from racing worker completion.
+        let watchdog = std::time::Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let std::task::Poll::Ready(result) = poll_once(call.as_mut()).await {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "second-job admission must settle instead of waiting forever"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Storage(
+                    khive_storage::StorageError::AdmissionTimeout {
+                        timeout_ms: 100,
+                        ..
+                    }
+                ))
+            ),
+            "the second job must use the original bound: {result:?}"
+        );
+        assert_eq!(*inner.calls.lock().unwrap(), vec!["first".to_owned()]);
+        assert_eq!(inner.entered.load(Ordering::Acquire), 1);
     }
 
     struct CustomWaitingService {
