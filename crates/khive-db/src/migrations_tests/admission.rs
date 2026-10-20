@@ -60,14 +60,14 @@ fn service_schema_bootstrap_refusal_precedes_its_tracking_table() {
     };
 
     assert!(!table_exists(
-        pool.writer_for_admitted_operation().unwrap().conn(),
+        pool.writer().unwrap().conn(),
         "_schema_versions"
     ));
     assert!(matches!(
         apply_schema_plan_with_admission(&mut pool.migration_transactions(), &plan, &admission),
         Err(SqliteError::CapacityFloor { .. })
     ));
-    let writer = pool.writer_for_admitted_operation().unwrap();
+    let writer = pool.writer().unwrap();
     assert!(!table_exists(writer.conn(), "_schema_versions"));
     assert!(writer.conn().is_autocommit());
 }
@@ -90,7 +90,7 @@ fn core_bootstrap_refusal_precedes_ledger_and_post_begin_refusal_rolls_back() {
         run_versioned_migrations(&mut pool.migration_transactions(), None, &admission),
         Err(SqliteError::CapacityFloor { .. })
     ));
-    let writer = pool.writer_for_admitted_operation().unwrap();
+    let writer = pool.writer().unwrap();
     assert!(!table_exists(writer.conn(), "_schema_migrations"));
     assert!(writer.conn().is_autocommit());
     drop(writer);
@@ -110,7 +110,7 @@ fn core_bootstrap_refusal_precedes_ledger_and_post_begin_refusal_rolls_back() {
         Err(SqliteError::CapacityFloor { .. })
     ));
     assert_eq!(samples.load(Ordering::SeqCst), 2);
-    let writer = pool.writer_for_admitted_operation().unwrap();
+    let writer = pool.writer().unwrap();
     assert!(table_exists(writer.conn(), "_schema_migrations"));
     assert_eq!(read_schema_version(writer.conn()).unwrap(), 0);
     assert!(writer.conn().is_autocommit());
@@ -155,7 +155,7 @@ fn both_bootstrap_ledgers_refuse_capacity_and_probe_errors_without_wal_growth() 
             } else {
                 run_versioned_migrations(&mut writes, None, &admission).map(|_| ())
             };
-            let writer = pool.writer_for_admitted_operation().unwrap();
+            let writer = pool.writer().unwrap();
             if probe_error {
                 assert!(matches!(
                     result,
@@ -214,7 +214,7 @@ fn service_bootstrap_and_migration_have_separate_admission_samples() {
         &admission,
     )
     .unwrap();
-    let writer = pool.writer_for_admitted_operation().unwrap();
+    let writer = pool.writer().unwrap();
     assert_eq!(samples.load(Ordering::SeqCst), 2);
     assert!(table_exists(writer.conn(), "_schema_versions"));
     assert!(writer.conn().is_autocommit());

@@ -543,11 +543,9 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let mut tx_handle = None;
-            let guard = pool
-                .writer_for_admitted_operation()
-                .map_err(|e: SqliteError| {
-                    StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
-                })?;
+            let guard = pool.writer().map_err(|e: SqliteError| {
+                StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
+            })?;
             let result = (|| {
                 let prepared = prepare_batch_statements(guard.conn(), &statements)
                     .map_err(|e| map_write_err(e, "pool_writer.execute_batch"))?;

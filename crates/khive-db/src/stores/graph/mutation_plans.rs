@@ -378,7 +378,7 @@ where
             })
         } else {
             let guard = pool
-                .writer_for_admitted_operation()
+                .writer()
                 .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
             run_graph_mutation_transaction(&pool, guard.conn(), true, move |conn| {
                 graph_mutation_events_enlisted(
