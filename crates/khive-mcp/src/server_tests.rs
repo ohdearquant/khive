@@ -4654,6 +4654,10 @@ fn the_packs_loaded_and_the_packs_merely_linked_are_named_separately() {
         .expect("the selectable clause ends in a period")
         .0;
     assert_eq!(selectable, "web, telemetry");
+    assert!(instructions.contains(
+        "Also linked into this binary but not loaded here, so their verbs are \
+         absent from the `request` tool's verb list until selected: web, telemetry."
+    ));
 
     // The defect: one list labelled "built-ins" carried both sets, so a
     // caller read every linked pack as callable. Spelling it out here
