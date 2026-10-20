@@ -1011,11 +1011,11 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded_rows: Option<u64>,
     /// Why `audit_degraded_rows` is unavailable to this caller.
     pub audit_degraded_rows_unavailable_reason: Option<String>,
-    /// Monotonic process-lifetime flag set once any accepted row has been
-    /// released without a commit: a pure-observability row released degraded,
-    /// or a generation that failed to flush, whose rows are absent from the
-    /// audit trail whether or not their callers were told. `None` under the
-    /// same conditions as `audit_batch_flush_failures`.
+    /// Monotonic process-lifetime flag set by a failed audit append or driver
+    /// failure, or by accepted pure-observability rows released without a commit.
+    /// Abandoned or shed generations containing only obligation-bearing rows
+    /// increment `audit_batch_flush_failures` without setting this flag.
+    /// `None` under the same conditions as `audit_batch_flush_failures`.
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
