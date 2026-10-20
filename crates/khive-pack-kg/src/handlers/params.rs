@@ -430,3 +430,7 @@ pub(crate) fn tri_string<'de, D: Deserializer<'de>>(
 ) -> Result<Option<Option<String>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }
+
+#[cfg(test)]
+#[path = "neighbors_params_contract_tests.rs"]
+mod neighbors_contract_tests;
