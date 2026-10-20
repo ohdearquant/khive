@@ -4447,6 +4447,24 @@ class InertDocumentationDataTests(unittest.TestCase):
         self.assertEqual(verdict, "true", reasons)
         self.assertIn("documentation only: CHANGELOG.md", reasons)
 
+    def test_inert_list_reader_does_not_execute_checkout_modules(self):
+        """A Python stdin reader must not execute import-shadowing modules from the checkout."""
+        marker = self.repo / "inert-reader-shadow-imported"
+        self.write("re.py", 'with open("inert-reader-shadow-imported", "w") as marker:\n'
+                            '    marker.write("checkout module executed\\n")\n')
+        source = self.classifier.read_text()
+        scanner_call = '    python3 "$scanner" --published-markdown "$path" < /dev/null'
+        self.assertEqual(source.count(scanner_call), 1)
+        # The existing scanner is a separate import site; only the new stdin reader is under test here.
+        self.classifier.write_text(source.replace(scanner_call, "    false"))
+        self.env.pop("PYTHONPATH", None)
+        self.env.pop("PYTHONSAFEPATH", None)
+        self.base = self.commit("checkout shadow module and isolated reader")
+        verdict, reasons = self.classify_change()
+        self.assertFalse(marker.exists(), "the inert-list reader imported the checkout's re.py")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
     def test_unlisted_changelog_takes_full_suite(self):
         self.write(self.LIST, "# No exceptions.\n")
         self.base = self.commit("unlisted")

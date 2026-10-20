@@ -64,7 +64,7 @@ done <<< "$entries"
 
 # Read the checked-out classifier's policy once; an unreadable or malformed policy cannot narrow CI.
 inert_data=$(dirname "$0")/ci-inert-docs-data.txt
-python3 - "$inert_data" > "$inert" <<'PY_INERT'
+python3 -P - "$inert_data" > "$inert" <<'PY_INERT'
 import pathlib
 import re
 import sys
