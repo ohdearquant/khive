@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `exec.events` returns every event `id` as a string: a UUID for new
+  lifecycle events and a decimal string for legacy rows. New lifecycle events use
+  the shared event store with the caller's canonical actor attribution. Legacy
+  rows remain visible in the same oldest-first list, ordered by timestamp and
+  string ID before applying the requested limit.
+
 ### Removed
 
 - `khive_storage::graph::CommitAnnotationCursorValue`,

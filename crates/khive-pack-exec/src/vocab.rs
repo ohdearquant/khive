@@ -135,7 +135,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.events",
-        description: "Append-only materialization and launch audit rows, oldest first.",
+        description: "Materialized, launched, and exited lifecycle rows from legacy and event stores, oldest time then string id first. Excludes per-call dispatch audits; every id is a string.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
