@@ -12,10 +12,25 @@ cargo bench -p kkernel --bench locator -- 'get_hit/100000' --quick --noplot
 cargo bench -p kkernel --bench coord_locate -- 'cache_miss/1000' --quick --noplot
 ```
 
-Fixture construction and fixed reports run only for selected scenarios.
-`--list` lists names without constructing caches or databases. Each fixture is
-dropped before the next scenario starts. The coordinator executor uses one
-current thread and at most two blocking threads.
+Fixture construction runs only for selected scenarios. `--list` and filtered-out
+scenarios construct no caches or databases. Correctness-only mode (`--test`, or
+execution without `--bench`) performs one checked workload call per selected
+scenario, without the supplemental timing report or its warm call. Fixture setup
+and its complete identity, capacity and hit-count assertions still run. In the
+locator target, the default-capacity census still runs once per selected size.
+Each fixture is dropped before the next scenario starts. The coordinator executor
+uses one current thread and at most two blocking threads.
+
+```sh
+cargo bench -p kkernel --bench locator -- --test
+cargo bench -p kkernel --bench coord_locate -- --test
+```
+
+Criterion owns listing and scenario filtering. Explicit `--test` takes precedence
+over `--bench`; mode-like text after `--` remains filter text. Explicit
+`--profile-time` runs also omit the supplemental report and warm call, so only
+Criterion's selected workload enters the profile. These mode changes supply no
+new performance baseline.
 
 ## Scenarios
 
@@ -28,8 +43,9 @@ current thread and at most two blocking threads.
 | `coord_locate` | `cache_miss/{100,1000}`              | Actual service lookup after removing the key, including concurrent backend probes and cache population | Same two-backend fixture, rotating known entity IDs                  | pending  |
 | `coord_locate` | `unknown_uuid/{100,1000}`            | Actual service lookup of an absent UUID across both backends                                           | Same fixture; unknown ID never collides with fixture IDs             | pending  |
 
-Each selected scenario first emits a `routing_call_report` from **1,001 separately
-timed calls**, following one untabulated warm call. It reports the median at rank
+In ordinary measurement mode (`--bench`, supplied by `cargo bench`), each selected
+scenario first emits one `routing_call_report` from **1,001 separately timed calls**,
+following one untabulated warm call. It reports the median at rank
 501 and the nearest-rank p99 at rank 991. These include `Instant` timer overhead.
 A separate Criterion run provides an advisory distribution of iteration averages;
 its confidence interval is not used as a per-call p99. Criterion uses 10 samples,
