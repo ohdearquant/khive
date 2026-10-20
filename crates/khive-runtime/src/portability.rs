@@ -18,6 +18,12 @@ use std::str::FromStr;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+mod conflicts;
+pub use conflicts::{
+    ImportConflictMode, ImportConflictSummary, ImportOptions, ImportPolicySkipCause,
+    ImportPolicySkippedEdge,
+};
+
 /// Parse an optional archive timestamp, using `fallback` only when absent.
 ///
 /// Present values must be RFC3339 and are converted to UTC. Invalid values keep
