@@ -21,6 +21,7 @@ members = [
     "khive-hnsw",
     "khive-vamana",
     "khive-runtime",
+    "khive-runtime-production-tests",
     "khive-mounts",
     "khive-wire-protocol",
     "khive-request",
