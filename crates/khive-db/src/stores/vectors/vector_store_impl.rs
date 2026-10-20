@@ -49,6 +49,14 @@ impl SqliteVecStore {
             .namespace
             .clone()
             .unwrap_or_else(|| self.namespace.clone());
+        // Runtime entity retrieval excludes pack-owned atom vectors before KNN.
+        // Ordinary VectorStore searches retain their existing population.
+        let exclude_knowledge_atoms = request.kind == Some(SubstrateKind::Entity)
+            && request
+                .backend_hints
+                .as_ref()
+                .and_then(|hints| hints.get("exclude_knowledge_atoms"))
+                .is_some_and(|hint| hint.as_bool() == Some(true));
         let kind_filter = request.kind.map(|k| k.to_string());
         // Use the request's embedding_model filter, or fall back to this store's model.
         let effective_model = request
@@ -86,6 +94,13 @@ impl SqliteVecStore {
             } else {
                 ""
             };
+            // `field` is non-null vec0 metadata; NOT_EQUALS is applied by
+            // sqlite-vec during KNN, rather than after its bounded window.
+            let entity_field_clause = if exclude_knowledge_atoms {
+                "AND field != 'knowledge.atom'"
+            } else {
+                ""
+            };
             let match_sql = format!(
                 "SELECT subject_id, distance \
                  FROM {t} \
@@ -93,10 +108,12 @@ impl SqliteVecStore {
                    AND namespace = ?3 \
                    AND embedding_model = ?4 \
                    {kind_clause} \
+                   {entity_field_clause} \
                  ORDER BY distance \
                  LIMIT ?2",
                 t = table,
-                kind_clause = kind_clause
+                kind_clause = kind_clause,
+                entity_field_clause = entity_field_clause
             );
             let exact_sql = format!(
                 "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
@@ -104,10 +121,12 @@ impl SqliteVecStore {
                  WHERE namespace = ?3 \
                    AND embedding_model = ?4 \
                    {kind_clause} \
+                   {entity_field_clause} \
                  ORDER BY exact_distance, subject_id \
                  LIMIT ?2",
                 t = table,
-                kind_clause = kind_clause
+                kind_clause = kind_clause,
+                entity_field_clause = entity_field_clause
             );
 
             let query_blob = encode_f32_native(&query_embedding);
