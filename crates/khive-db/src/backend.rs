@@ -637,7 +637,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.writer_for_admitted_operation()?;
+        let writer = self.pool.writer()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -735,7 +735,7 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
@@ -752,7 +752,7 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let tx = writer
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -797,7 +797,7 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let admission = self.pool.write_admission();
         crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }

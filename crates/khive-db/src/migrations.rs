@@ -414,6 +414,7 @@ const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql")
 const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
 const V57_UP: &str = include_str!("../sql/057-retrieval-snapshots.sql");
 const V58_UP: &str = include_str!("../sql/058-proposal-archive.sql");
+const V59_UP: &str = include_str!("../sql/059-comm-legacy-quarantine-index.sql");
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
@@ -825,6 +826,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 58,
         name: "proposal_archive",
         up: V58_UP,
+    },
+    VersionedMigration {
+        version: 59,
+        name: "comm_legacy_quarantine_index",
+        up: V59_UP,
     },
 ];
 

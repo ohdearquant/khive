@@ -765,7 +765,7 @@ impl crate::migrations::MigrationTransactions for PooledMigrationTransactions<'_
         &mut self,
         operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
     ) -> Result<T, SqliteError> {
-        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let mut writer = self.pool.writer()?;
         let result = operation(writer.conn_mut());
         if writer.guard.is_autocommit() {
             return result;
@@ -888,14 +888,14 @@ impl ConnectionPool {
     pub(crate) fn autocommit_write_unit(
         &self,
     ) -> Result<PooledAutocommitWriteUnit<'_>, SqliteError> {
-        self.writer_for_admitted_operation()?.admit_autocommit()
+        self.writer()?.admit_autocommit()
     }
 
     #[track_caller]
     pub(crate) fn transaction_write_unit(
         &self,
     ) -> Result<super::PooledTransactionWriteUnit<'_>, SqliteError> {
-        let writer = self.writer_for_admitted_operation()?;
+        let writer = self.writer()?;
         writer.begin_admitted_transaction()?;
         Ok(PooledTransactionWriteUnit { writer })
     }
