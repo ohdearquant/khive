@@ -137,3 +137,6 @@ fn greedy_selector_handles_extreme_f32_products_without_overflow() {
 }
 
 include!("selector_tests/rank_score_and_zero_cost_tests.rs");
+
+#[path = "selector_tests/diversity_index_tests.rs"]
+mod diversity_index_tests;
