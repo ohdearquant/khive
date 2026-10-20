@@ -1844,9 +1844,11 @@ amendment's acceptance gate.
 The eager registry is retained, including discovery, mount resolution, pack dependency and
 collision checks, and every mounted pack's schema plan. Idempotent DDL still acquires a writer:
 the writable pack-catalog path calls `apply_pack_ddl_statements_with_columns` for a nonempty plan.
-Pool identity bootstrap, vector-table preparation and direct events-sidecar open can also write
-before the first request. Skipping core migrations alone therefore does not establish the
-deferred property.
+Pool identity bootstrap, journal-mode setup, configured embedding-model registration,
+vector-table preparation, the Events schema gate the audit binding reaches, blob-root creation and
+direct events-sidecar open can also write before the first request, and diagnostic and attribution
+files outside the stores are written as well. Skipping core migrations alone therefore does not
+establish the deferred property.
 
 This amendment proposes a boot-admission policy separate from configured store mode. A configured
 writable store remains writable, with the same configuration identity, routes and capabilities.
@@ -1888,27 +1890,129 @@ outcomes, and all existing no-retry rules are unchanged.
 
 Under the conditional policy, open every configured store without creating its database or parent
 directories. Retain physical-file, volume, path-trust and backend-identity checks. Do not bootstrap
-a database nonce, change journal mode, apply core migrations or pack DDL, prepare vector tables
-through a writer, run attachment conversion, or acquire a volume write lease during successful
-boot. No partly validated runtime may become the serving registry.
+a database nonce, change journal mode, apply core migrations or pack DDL, register configured
+embedding models, prepare vector tables or store schemas through a writer, create a blob root, run
+attachment conversion, or acquire a volume write lease during successful boot. No partly validated
+runtime may become the serving registry.
 
 Use the existing reader-side core compatibility check and pack declared-column validation for
 all selected plans, including mounts. The pack check validates `PackColumnAddition` declarations;
 an empty declaration list does no work. It does **not** prove that arbitrary SQL tables, indexes
-or triggers exist. This amendment keeps that existing validation contract rather than executing
-SQL as a probe or claiming complete validation of undeclared pack SQL. Eager plan collection and
-collision checks still run.
+or triggers exist, and this amendment neither prepares nor executes undeclared pack SQL nor claims
+complete validation of it. The model-registry and boot-reached schema-gate checks below read
+definitions and rows and prepare their own built-in statements without stepping them; no
+validation DDL or DML runs against a configured store, and a reference definition is built only in
+a private in-memory database. Eager plan collection and collision checks still run.
+
+Each exit below is decided from a typed classification of what validation found, never from an
+error variant or message text. Where an existing validator folds a missing prerequisite and an
+incompatible one into one error, the check is split at its source. A result containing any
+refusal class is a refusal, even when it also contains a missing prerequisite. A native query
+error remains that error.
 
 The following exits are explicit:
 
 - A missing configured database, including a configured direct events sidecar, first asks the
   daemon to start through the existing startup/recovery protocol. The client holds no store
-  writer or volume lease while it does so. Retry the no-create validation after startup; a store
-  still absent then takes today's ordinary eager boot.
+  writer, volume lease or recovery-lock descriptor while it does so: a client that took the boot
+  recovery lock releases it before invoking that protocol, which takes the lock itself, and does
+  not hold it while waiting for the daemon to become ready. After startup the client reacquires
+  its boot lock, reads the rendezvous again, and repeats Decision 1's selection and the no-create
+  validation from the start. A store still absent then takes today's ordinary eager boot under
+  that lock.
 - A core schema behind this build, missing declared pack columns or configured vector tables,
-  or an incomplete attachment cutover requires ordinary eager boot. A configured writable
-  database without its persistent identity nonce also takes that path; the conditional path
-  does not mint one or substitute weaker physical-identity checks.
+  or an incomplete attachment cutover requires ordinary eager boot. For an incomplete cutover the
+  exit is the selection, not a promise that the ordinary repair succeeds; a corrupt cutover state
+  may still refuse there. A configured writable database whose identity table is absent also
+  takes that path; the conditional path does not mint a nonce or substitute weaker
+  physical-identity checks. An identity table without its row, or with a malformed identity,
+  keeps its existing error.
+- The persistent registration population of a runtime is what ordinary boot registers today: on a
+  writable backend, the models `configured_embedding_models` returns for that runtime's
+  configuration (configured engines whose names parse as built-in model aliases, or, with no engine
+  list, the configured embedding model and the additional embedding models). A model in that
+  population without its active registry row takes ordinary eager boot, which registers it as today.
+  Its active registry row is an `active` row whose canonical key equals the one ordinary boot writes
+  for it (engine name, model id, key version and dimensions) under the upsert's own binding and
+  comparison, a BLOB value, so a TEXT value with the same characters is a different key, and whose
+  activation time is set, and every column of which holds a value that the column's declared
+  affinity stores as it is: inserting the row's values into the private in-memory registry described
+  below gives each column the same value with the same storage class. An update rewrites the whole
+  record and applies each column's affinity again, so a row holding the real number 8.0 in the
+  INTEGER `output_dim` column, which a store can carry while still reading normally and which the
+  integrity check below reports as `ok`, would be changed by the upsert. Whether the upsert leaves
+  such a row as it is
+  depends on the registry's whole definition, so the check compares the definition rather than
+  listing properties of it. In one consistent read snapshot, the registry table and every index and
+  trigger attached to it, implicit indexes included, must equal the objects this build's registry
+  DDL creates when run against a private in-memory database: object type, name and table compared
+  exactly, and SQL text compared token for token, ignoring only whitespace and comments between
+  tokens. The two creators of the table in this build, the registry DDL and the V1 schema, produce
+  the same tokens. An added column, constraint, index or trigger, a changed definition under an
+  existing name, and a temporary object in the reader's connection that names the registry are each
+  outside that definition. With the definition matched, the reader also prepares the registry DDL
+  and the registration upsert without stepping them, on a connection with foreign key enforcement on
+  as every connection the source sets up has it (`crates/khive-db/src/pool/connection_setup.rs:300`,
+  `:333`), so a statement SQLite would refuse when compiling it is found before boot is selected; an
+  empty table elsewhere whose column references a registry column that is not a key leaves every
+  registry object exact and makes the upsert refuse to compile there. In the same snapshot, `PRAGMA
+  integrity_check` naming the registry table, which checks that table's records and every index on
+  it, must return the single result `ok`. Definitions and stored values say nothing about index
+  contents: a registry whose one-active index lacks the active row's entry matches every other
+  condition here, and its upsert fails as a malformed image, while a quick check, which reads the
+  index pages but does not verify that index content matches table content, reports `ok` there.
+  For that definition the upsert supplies every
+  column that requires a value and satisfies the status check, and on an existing key it sets only
+  the status and an unset activation time, so in a registry that passes that integrity check an
+  active row whose activation time is set and whose values its columns' affinities store as they are
+  is left unchanged. Any other state takes ordinary
+  eager boot, which creates, fills, reactivates or refuses as it does today: a definition outside
+  the one above, a missing table, index or column among them, a failed preparation, an integrity
+  check of the registry that reports anything but `ok`, no row with that key, an active row with
+  that key and no activation time, an active row with that key holding a
+  value its column's affinity would convert, a row with that key in another status, or, with no row
+  carrying that key, an active row for that engine name under another key, which ordinary boot's
+  insert
+  refuses on the one-active-per-engine index. A store whose registry was created from text with
+  other tokens is never admitted, because ordinary boot leaves an existing definition as it is; the
+  acceptance below includes a long-lived store migrated through the supported history, so a rule
+  that admits only freshly created stores fails it. A refused insert has the host result it has today:
+  `from_prepared_backend`, which a single-backend host uses, returns the error, while
+  `try_from_backend` and `from_backend`, which a multi-backend host uses for its default and
+  per-pack runtimes, log it and continue. Conditional boot classifies none of these states itself
+  and changes neither result. With every such model registered, conditional boot writes nothing to
+  the registry. Every runtime the host assembles, default and per pack, follows this rule. A
+  provider a pack registers under a name in that population replaces only the in-memory provider:
+  ordinary boot registers the row before provider hooks run, so the model stays in the population
+  and a missing row takes ordinary eager boot as it would without the pack. A read-only runtime, and
+  a provider a pack registers under a name that parses as no built-in model alias, have no
+  persistent registration obligation at ordinary boot, whatever rows the store already holds:
+  conditional boot neither checks nor writes a row for them, and their provider binding is validated
+  as ordinary boot validates it.
+- A per-store schema gate that boot itself reaches is marked ready only after a reader check, in
+  one consistent read snapshot, that its initializer would leave the store unchanged without
+  refusing. Marking the gate ready is what keeps its initializer from running; the reader check
+  alone does not. Today the audit binding reaches the Events gate during boot; its initializer runs
+  `CREATE ... IF NOT EXISTS` for the events tables and their indexes, adds both operation
+  attribution columns to an events table that has neither, and refuses one that has exactly one.
+  For that gate the check requires three things: every table and index the initializer's DDL names
+  exists as an object of that type; both attribution columns are present as the initializer's own
+  column check sees them; and every statement of that DDL prepares, without being stepped, on a
+  reader connection holding no temporary object. Each covers what the others cannot. Preparation
+  succeeds for a `CREATE ... IF NOT EXISTS` whose object is absent, so it does not show the object
+  exists. A name that exists does not show its statement is a no-op, because SQLite refuses some
+  statements when compiling them: an index statement naming a virtual table is refused even when an
+  index of that name already exists. The column check reads `pragma_table_info`, which does not
+  list a generated virtual column, so a column declared that way counts as absent: the initializer
+  would run its upgrade, and the upgrade's refusal is ordinary boot's. The check does not compare
+  definitions: an index of an expected name on another ordinary table is one the initializer leaves
+  as it is, and an events table whose attribution columns the upgrade added passes as a fresh one
+  does. A state the initializer would change or refuse takes ordinary eager boot, which upgrades or
+  refuses as today. Preparing these statements authorizes no execution of them against the store.
+- A missing filesystem blob root, configured explicitly or resolved by default, takes ordinary
+  eager boot, which creates it as today. Conditional boot opens an existing root without creating
+  it and keeps hydration configured: it does not treat a missing default root as the absence of a
+  blob store. Malformed blob configuration and path-trust refusal keep their errors.
 - A direct events sidecar whose existing permissions require the ordinary hardening procedure
   takes ordinary eager boot. Conditional validation must not expose a sink that the existing
   permission policy would first have hardened.
@@ -1917,24 +2021,32 @@ The following exits are explicit:
   general excuse to retry with more write authority.
 
 Before an ordinary-boot exit, discard provisional boot state and its handles; do not mix a partly
-validated catalog with a writable fallback catalog. Preserve configured modes and `config_id`
-through both paths. The ordinary path performs its normal repairs and readiness checks, and its
-own writes acquire the ordinary leases. A failed daemon start never authorizes a local request
-that strict forwarding would refuse.
+validated catalog with a writable fallback catalog. This includes a process-lifetime cache entry
+the provisional boot published, such as a direct events-sidecar backend: conditional boot either
+publishes no such entry until its runtime is selected to serve, or evicts the entries it
+published before the exit, so the ordinary path opens its own. Preserve configured modes and
+`config_id` through both paths. The ordinary path performs its normal repairs and readiness
+checks, and its own writes acquire the ordinary leases. A failed daemon start never authorizes a
+local request that strict forwarding would refuse.
 
 ### Decision 3: account for each boot writer
 
 Each row is part of the implementation and acceptance population. A no-create flag on the main
-database alone is insufficient.
+database alone is insufficient. Boot ends when the transport admits its first request. An effect
+scheduled before that point belongs to boot, including one that completes asynchronously after
+the server build returns.
 
-| Surface                          | Conditional-boot disposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Database connection and identity | No CREATE, directory bootstrap, nonce initialization or journal-mode change. Keep physical identity, volume admission, path checks and existing WAL/SHM safety rules. Connection pragmas needed for reads must not execute schema or application writes.                                                                                                                                                                                                                                                                                                               |
-| Core and pack schema             | Reader validation with the coverage stated above. No migration, idempotent DDL transaction or catalog omission. Missing/behind prerequisites take Decision 2's ordinary path.                                                                                                                                                                                                                                                                                                                                                                                          |
-| Configured vectors and ANN files | Validate existing vector tables and columns through a reader, without forcing configured read-only mode or relying on a new instance's empty preparation cache. Do not warm a client ANN, register its checkpoint consumer, or create segment directories/checkpoint locks at boot. Path calculation is not evidence of file creation.                                                                                                                                                                                                                                 |
-| Events sidecar                   | A direct binding needs an existing-file, no-create validation route retaining configured writable mode, canonical-path cache policy and trust checks. Validate existing permissions against the same policy; required hardening takes Decision 2's ordinary path, so conditional boot does not chmod or admit insecure backing. The frozen-snapshot read-only opener, which rejects live-writer SHM, is not a substitute, and its guards must not be weakened. Socket-backed events retain their existing forwarding route. Missing direct storage follows Decision 2. |
-| Attachment cutover and hydration | Read and require complete cutover, including the existing secondary-store legacy-attachment check. No GC-owner acquisition, staging, importing or finalization at conditional boot. Hydrator setup must obey the same no-create policy; its construction cannot be assumed pure merely because cutover is complete.                                                                                                                                                                                                                                                    |
-| Audit sink                       | Retain the configured sink and idempotent-audit capability preflight, using no-create validated backing. Do not call `with_read_only_audit_store` for a configured writable client: that drops the sink and changes request behavior. Missing backing follows Decision 2; incompatible capability remains an error.                                                                                                                                                                                                                                                    |
+| Surface                          | Conditional-boot disposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database connection and identity | No CREATE, directory bootstrap, nonce initialization or journal-mode change. Keep physical identity, volume admission, path checks and existing WAL/SHM safety rules. Connection pragmas needed for reads must not execute schema or application writes.                                                                                                                                                                                                                                                                                                                                       |
+| Core and pack schema             | Reader validation with the coverage stated above. No migration, idempotent DDL transaction or catalog omission. Missing/behind prerequisites take Decision 2's ordinary path.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Model registry                   | Reader check that each model in a runtime's persistent registration population (Decision 2) has its active registry row as Decision 2 defines it, in a registry whose definition matches Decision 2's reference and whose integrity check reads `ok` (Decision 2), in every writable runtime the host assembles. The registry DDL and upsert are prepared without stepping; none is executed at conditional boot. A missing row takes Decision 2's ordinary path.                                                                                                                              |
+| Store schema gates and repairs   | Per-store schema gates, the notes sequence repair, sparse and text index preparation, and vector preparation keep their first-use behavior: conditional validation marks none of them ready, except a gate boot itself reaches (Decision 2). The first local request that needs one runs it with its ordinary writer, lease and audit, as request work; on a writable store the notes sequence repair still runs on the first notes acquisition, before any local cursor read. A factory, hook or mount that reaches one during conditional boot is a defect the acquisition observer reports. |
+| Configured vectors and ANN files | Validate existing vector tables and columns through a reader, without forcing configured read-only mode or relying on a new instance's empty preparation cache. Do not warm a client ANN, register its checkpoint consumer, or create segment directories/checkpoint locks at boot. Path calculation is not evidence of file creation.                                                                                                                                                                                                                                                         |
+| Events sidecar                   | A direct binding needs an existing-file, no-create validation route retaining configured writable mode, canonical-path cache policy and trust checks. Validate existing permissions against the same policy; required hardening takes Decision 2's ordinary path, so conditional boot does not chmod or admit insecure backing. The frozen-snapshot read-only opener, which rejects live-writer SHM, is not a substitute, and its guards must not be weakened. Socket-backed events retain their existing forwarding route. Missing direct storage follows Decision 2.                         |
+| Attachment cutover and hydration | Read and require complete cutover, including the existing secondary-store legacy-attachment check. No GC-owner acquisition, staging, importing or finalization at conditional boot. Hydrator setup opens an existing blob root without creating it; Decision 2 gives a missing root its exit. Its construction cannot be assumed pure merely because cutover is complete.                                                                                                                                                                                                                      |
+| Audit sink                       | Retain the configured sink and idempotent-audit capability preflight, using no-create validated backing. Do not call `with_read_only_audit_store` for a configured writable client: that drops the sink and changes request behavior. Missing backing follows Decision 2; incompatible capability remains an error.                                                                                                                                                                                                                                                                            |
+| Diagnostic and attribution files | Keep their existing writes: the writer-timeout diagnostic sink (its directory resolves from `KHIVE_WRITER_TIMEOUT_SINK_DIR`, else `~/.khive/logs`, else `.khive-logs` beside the database; it is started at pool construction and writes from its own thread), the session WAL-pin beacons that ADR-091 Amendment 2 attributes with, the daemon rendezvous and recovery lock files, and the daemon launch log. They lie outside the configured stores, take no volume lease and hold no application or schema state. They are not disabled or deferred to obtain a zero count.                 |
 
 SQLite's coordination with an existing live WAL/SHM retains its existing rules. The claim here is
 no store creation, application/schema initialization or client volume-lease acquisition during
@@ -1954,22 +2066,41 @@ existing host validation queue; this Proposed text claims no native result.
 
 1. A test-support-only observer at the khive-db volume-lease acquisition point counts attempts in
    the **client process**, across every configured store and boot phase, including identity,
-   schema, vectors and a direct events sidecar. It must observe the real acquisition path, not
-   a wrapper that a boot writer can bypass. An uninstalled observer fails the witness. The
-   daemon's own acquisitions are separately attributed.
-2. Use one persistent, already-current fixture with a persistent identity, configured vectors,
-   complete attachment cutover, audit backing, and a mounted nonempty schema plan with declared
-   columns. With the condition true, eager boot plus one actual forwarded request records zero
-   client acquisitions. With the **same fixture** and only the boot condition made false,
-   ordinary boot records at least one. A normal forward must reach the daemon, not an injected
-   response. Removing conditional selection or executing the writable pack plan must make the
-   zero-count witness fail; disabling the observer must also fail.
+   schema, model registration, vectors and a direct events sidecar. It must observe the real
+   acquisition path, not a wrapper that a boot writer can bypass. An uninstalled observer fails
+   the witness, and every run asserts that the test-only measurement bypass, which returns before
+   the acquisition point, is off. The daemon's own acquisitions are separately attributed.
+2. Use one persistent, already-current fixture with a persistent identity, registered configured
+   models, configured vectors, complete attachment cutover, an existing blob root, audit backing,
+   and a mounted nonempty schema plan with declared columns. With the condition true, eager boot
+   plus one actual forwarded request records zero client acquisitions. With the **same fixture**
+   and only the boot condition made false, ordinary boot records at least one. A normal forward
+   must reach the daemon, not an injected response. Removing conditional selection, executing the
+   writable pack plan or running model registration must make the zero-count witness fail;
+   disabling the observer must also fail. A second run uses a store created by an earlier release
+   and migrated through every supported schema version to this one, served by a daemon of this
+   build: it too must take conditional boot with zero client acquisitions, so a registry or schema
+   rule that admits only freshly created stores fails it. That fixture names the release and commit
+   that created it, the sha256 of its archived image and the schema versions it migrated through,
+   and the run keeps the migration and boot-selection records, so the control can be repeated.
 3. Compare client boot before/after images independently: database identity and schema/version,
-   configured vector tables, sidecar and segment/checkpoint paths, attachment state and relevant
-   permissions. Observe before the forwarded request so a legitimate daemon write is not
-   attributed to client boot. Existing WAL/SHM safety checks and configured `config_id` must
-   match ordinary boot. A forced read-only configuration must fail the identity/capability
-   witness.
+   the model registry, configured vector tables, sidecar and segment/checkpoint paths, attachment
+   state, the blob root and relevant permissions. The after image is taken when the transport
+   admits its first request, after every boot-scheduled asynchronous effect has signalled
+   completion (the diagnostic sink's startup line, beacon registration). During this interval the
+   fixture's daemon makes no store writes: its warmup and checkpoint tasks are held by
+   test-support configuration until the client's after image is taken, no other client is
+   attached, and the daemon's own acquisition count across the interval is asserted zero, so no
+   daemon write is attributed to the client and none can hide a client write. Then release those
+   tasks and send the forwarded request. The diagnostic and attribution paths of Decision 3 are
+   listed expected differences. Images do not show a write undone before the after image, so
+   test-support observers count in the client process across the same interval. The observer at
+   the native database open counts opens carrying the create flag, which must read zero, and opens
+   without it, which must read at least one per configured store, so the zero is not an
+   uninstalled or bypassed observer. The observers at directory bootstrap, journal-mode change,
+   nonce initialization and permission hardening count attempts and must read zero. Existing WAL/SHM safety checks and
+   configured `config_id` must match ordinary boot. A forced read-only configuration must fail the
+   identity/capability witness.
 4. Exercise socket-only and PID-only rendezvous, unset/truthy/explicit-false strict values,
    absent rendezvous, `KHIVE_NO_DAEMON=1`, daemon role and in-memory main. Check Decision 1's
    selection and the strict request refusal contract, including the retained boot observation and
@@ -1985,17 +2116,99 @@ existing host validation queue; this Proposed text claims no native result.
    request entry does not exercise this earlier lifetime. Pair it with the existing no-boot-
    rendezvous and explicit-false behavior, and a second independent host that cannot inherit the
    first host's observation.
-5. Independently remove a configured store, identity nonce, declared pack column, vector table
-   or direct sidecar, and provide behind-schema/incomplete-cutover fixtures. Check the specified
-   daemon-first or ordinary-boot exit, without serving the provisional runtime. Identity swap,
-   volume/path-trust refusal and incompatible schema remain must-refuse controls, not repair
-   opportunities. A sidecar requiring permission hardening must leave the conditional path
-   before exposing its sink. Include a mounted pack in these checks; built-in-only coverage is
-   insufficient.
+5. Independently remove a configured store, the identity table, a declared pack column, a vector
+   table, a configured model's registry row, a boot-reached store schema object, the default blob
+   root, an explicitly configured blob root or a direct sidecar, and provide behind-schema and
+   incomplete-cutover fixtures. Check the specified daemon-first or ordinary-boot exit, without
+   serving the provisional runtime; after a blob-root exit hydration is available, and for an
+   incomplete cutover the selected exit is asserted separately from whether the ordinary repair
+   succeeds. Test a missing and an incompatible declared pack column separately and together; the
+   pair must refuse. Identity swap, an identity table without its row, a malformed identity,
+   volume/path-trust refusal, malformed blob configuration and incompatible schema remain
+   must-refuse controls, asserted before any repair write, not repair opportunities. A sidecar
+   requiring permission hardening must leave the conditional path before exposing its sink. A
+   later store's exit after a direct sidecar was opened must leave the serving runtime on the
+   ordinary path's events backend, not the provisional one. The missing-store case runs through
+   the production startup entrypoint, which holds the boot recovery lock, with a real daemon child
+   that needs that lock to start: the child must become ready and the client must validate again
+   after it; a direct server-build call lacks the outer lock and does not exercise this ordering.
+   Include a mounted pack in these checks; built-in-only coverage is insufficient. The removed model
+   row belongs to a built-in model in a writable runtime's persistent registration population. A
+   second arm removes the row of a configured built-in alias whose provider a pack replaces before
+   serving with one of matching dimensions; it too takes ordinary eager boot and registers the row.
+   Two controls keep conditional boot: a read-only per-pack runtime whose configured model has no
+   row, and a configured engine whose name parses as no built-in model alias, served by a provider a
+   pack registers. Neither takes an ordinary-boot exit or gains a registry row, and each configured
+   provider is bound as under ordinary boot. Registry states other than a missing row each take
+   ordinary eager boot with its result as today: a row with the model's key in `superseded` status,
+   with no other active row for its engine name, is reactivated; an active row with the model's key
+   and no activation time has it set; a missing registry index is created. An active row for the
+   model's engine name under another key, with no row carrying the model's key, and a registry table
+   without its `output_dim` column with the model's active row and both indexes intact, each keep
+   ordinary boot's refusal of the insert, with the host result Decision 2 names: an error on a
+   single-backend host, a logged warning on a multi-backend host that goes on to serve. An events
+   table with neither operation attribution column takes ordinary eager boot and is upgraded; one
+   with exactly one keeps ordinary boot's refusal; one whose two attribution columns exist only as
+   generated virtual columns takes ordinary eager boot and keeps the refusal of the upgrade; a
+   missing events index takes ordinary eager boot and is created. Further registry arms each keep
+   the model's active row, its activation time and the names of all three registry objects, and each
+   takes ordinary eager boot with ordinary boot's result: a table without the `UNIQUE` on
+   `canonical_key`, whose upsert SQLite refuses when compiling it; an added column that requires a
+   value and has no default, with the existing row given one, whose insert is refused; an added
+   `CHECK` that the existing row satisfies and the next registration's creation time does not; an
+   added trigger that writes another table on update, one that refuses the update, and one that
+   writes another table before an insert, which SQLite runs before the upsert resolves its conflict;
+   an added index, and an existing index redefined under its own name; a whitespace change inside a
+   string literal of the status check; and an active row whose canonical key is stored as TEXT with
+   the same characters, whose insert is refused on the one-active-per-engine index. A further
+   registry arm keeps the definition exact and the model's active row with its activation time set,
+   and stores the text `8` in that row's INTEGER `output_dim` (an image written under a TEXT
+   declaration of equal length whose declaration is then changed, which reads normally and which an
+   integrity check reports); it takes ordinary eager boot, whose upsert succeeds and stores the
+   integer 8 there. Another stores the real number 8.0 in that `output_dim` (written under a
+   declaration of equal length with no affinity, `BLOB`, which is then changed), which reads
+   normally and which the registry-scoped integrity check reports as `ok`; it too takes ordinary
+   eager boot, whose upsert succeeds and stores the integer 8. Another keeps the definition, the
+   model's active row and its values exact and removes that row's entry from the one-active index
+   (an image edit), which the registry-scoped integrity check reports and a quick check does not; it
+   takes ordinary eager boot, whose upsert fails as a malformed image, with the host result Decision
+   2 names. Another adds an empty table elsewhere whose column references the registry's `status`
+   column, which leaves every registry object and the row exact; it takes ordinary eager boot, whose
+   upsert SQLite refuses when compiling it with foreign key enforcement on. Further Events arms take
+   ordinary eager boot with ordinary boot's refusal: an
+   `events` table that is an FTS5 virtual table carrying every expected column, with every expected
+   index name placed on another table, and the same for `event_observations` alone. Controls keep
+   conditional boot: a registry created by the V1 schema, one created by the registry DDL, and one
+   whose definition differs from the DDL only in whitespace and comments between tokens; an events
+   table whose attribution columns the upgrade added; and an expected events index name that exists
+   on another ordinary table. A test-support observer counts the prepared check statements that are
+   stepped against a configured store and must read zero. A mutation that classifies any must-exit
+   state by a reader without taking ordinary boot must fail its arm, and so must a reader that
+   checks registry columns, indexes or other properties by list instead of comparing the definition,
+   compares only the objects the DDL names, skips preparation, prepares the registry statements
+   without foreign key enforcement (the incoming foreign key arm), prepares only the first Events
+   statement, steps a prepared statement, compares the definition but not the stored values of the
+   model's row (the real `output_dim` arm), replaces the registry-scoped integrity check with a
+   quick check or none (the missing index entry arm), or counts hidden or generated columns as
+   present, as an
+   unfiltered `pragma_table_xinfo` listing does (the generated-column arm).
 6. After validated conditional boot, exercise local planning/diagnostics and a local `save_to`
    request that writes and audits. Require its real lease and audit record. Require exactly the
    existing daemon-side dispatch audit for a forwarded write and no duplicate client dispatch
-   audit. Dropping the configured sink or bypassing idempotent-audit preflight must fail.
+   audit. Dropping the configured sink must fail. A test-support event store whose
+   idempotent-audit capability reads false, bound through the conditional host build, must refuse
+   before serving with the existing incompatible-event-store error, beside the healthy-backing
+   success above; removing the capability preflight must make that refusal witness fail.
+   A first-use notes witness runs on the same conditional host. The fixture is current in every
+   respect Decision 2 checks and holds two live notes in one namespace: one with its `notes_seq`
+   row and one without it. After conditional boot, with the client's boot lease count and the
+   backend's notes sequence repair count both zero, a local `save_to` request carrying
+   `list(kind="note", after=<the sequenced note's id>)` must run the repair on its notes
+   acquisition, through the ordinary writer and its lease, before the sequence-cursor query reads,
+   and the saved result must contain the unsequenced note. `save_to` keeps the request local under
+   the preserved forwarding policy, and the `after` argument selects the cursor read. The same
+   request after ordinary boot is the control. Marking the repair as already run during
+   conditional construction alone must make this witness fail.
 
 The acceptance gate needs executed baseline and independent mutation controls, with compilation
 or setup failures distinguished from the intended assertion failures. In particular, removal of

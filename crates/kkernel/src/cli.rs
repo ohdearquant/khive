@@ -1470,7 +1470,7 @@ mod tests {
             .pool()
             .try_writer()
             .expect("open V20 fixture writer")
-            .autocommit(|conn| {
+            .autocommit_sqlite(|conn| {
                 conn.execute_batch(
                     "CREATE TABLE _schema_migrations (\
                  version INTEGER PRIMARY KEY, \
@@ -1478,15 +1478,20 @@ mod tests {
                  applied_at INTEGER NOT NULL\
              ) STRICT;",
                 )
-                .expect("create V20 ledger");
-                for migration in MIGRATIONS
-                    .iter()
-                    .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-                {
-                    let tx = conn.unchecked_transaction().expect("begin V20 migration");
-                    tx.execute_batch(migration.up)
+            })
+            .expect("create V20 ledger");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+        {
+            backend
+                .pool()
+                .try_writer()
+                .expect("open V20 fixture writer")
+                .transaction(|conn| {
+                    conn.execute_batch(migration.up)
                         .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-                    tx.execute(
+                    conn.execute(
                         "INSERT INTO _schema_migrations (version, name, applied_at) \
                  VALUES (?1, ?2, ?3)",
                         (
@@ -1496,9 +1501,15 @@ mod tests {
                         ),
                     )
                     .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-                    tx.commit().expect("commit V20 migration");
-                }
-
+                    Ok(())
+                })
+                .expect("commit V20 migration");
+        }
+        backend
+            .pool()
+            .try_writer()
+            .expect("open V20 fixture writer")
+            .autocommit(|conn| {
                 Ok(legacy.map(|(entity_type, deleted_at)| {
                     let content_ref = khive_storage::ContentRef::from_hex("a".repeat(64))
                         .expect("canonical legacy ref");
@@ -1724,7 +1735,7 @@ mod tests {
         {
             let writer = backend.pool().try_writer().expect("tamper V21 fixture");
             writer
-                .autocommit(|conn| Ok(conn.execute("DELETE FROM attachment_cutover_state", [])?))
+                .autocommit_sqlite(|conn| conn.execute("DELETE FROM attachment_cutover_state", []))
                 .expect("remove completion marker");
             backend
                 .pool()
@@ -1905,7 +1916,7 @@ mod tests {
                 .pool()
                 .try_writer()
                 .expect("V20 fixture writer")
-                .autocommit(|conn| {
+                .autocommit_sqlite(|conn| {
                     conn.execute_batch(
                         "CREATE TABLE _schema_migrations (\
                      version INTEGER PRIMARY KEY, \
@@ -1913,18 +1924,21 @@ mod tests {
                      applied_at INTEGER NOT NULL\
                  ) STRICT;",
                     )
-                    .expect("create V20 migration ledger");
-                    for migration in MIGRATIONS
-                        .iter()
-                        .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-                    {
-                        let tx = conn
-                            .unchecked_transaction()
-                            .expect("begin V20 fixture migration");
-                        tx.execute_batch(migration.up).unwrap_or_else(|error| {
+                })
+                .expect("create V20 migration ledger");
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+            {
+                backend
+                    .pool()
+                    .try_writer()
+                    .expect("V20 fixture writer")
+                    .transaction(|conn| {
+                        conn.execute_batch(migration.up).unwrap_or_else(|error| {
                             panic!("apply V{}: {error}", migration.version)
                         });
-                        tx.execute(
+                        conn.execute(
                             "INSERT INTO _schema_migrations (version, name, applied_at) \
                      VALUES (?1, ?2, ?3)",
                             (
@@ -1934,8 +1948,15 @@ mod tests {
                             ),
                         )
                         .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-                        tx.commit().expect("commit V20 fixture migration");
-                    }
+                        Ok(())
+                    })
+                    .expect("commit V20 fixture migration");
+            }
+            backend
+                .pool()
+                .try_writer()
+                .expect("V20 fixture writer")
+                .autocommit_sqlite(|conn| {
                     conn.execute(
                         "INSERT INTO entities (\
                      id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
@@ -1944,10 +1965,8 @@ mod tests {
                      1, 1, ?2)",
                         (entity_id.to_string(), content_ref.as_str()),
                     )
-                    .expect("insert legacy attachment-bearing entity");
-                    Ok(())
                 })
-                .expect("seed V20 fixture");
+                .expect("insert legacy attachment-bearing entity");
         }
         drop(backend);
 
@@ -2021,7 +2040,7 @@ mod tests {
             .pool()
             .try_writer()
             .expect("secondary writer")
-            .autocommit(|conn| Ok(conn.execute("UPDATE entities SET content_ref = NULL", [])?))
+            .autocommit_sqlite(|conn| conn.execute("UPDATE entities SET content_ref = NULL", []))
             .expect("relocate legacy secondary attachment authority");
         drop(secondary_backend);
 
