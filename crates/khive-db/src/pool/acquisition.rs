@@ -266,13 +266,6 @@ impl ConnectionPool {
         self.writer_checkout(false)
     }
 
-    /// Callers that own an explicit §4 logical-write boundary probe there,
-    /// so checkout must not refuse ahead of their BEGIN/bootstrap statement.
-    #[track_caller]
-    pub(crate) fn writer_for_admitted_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_checkout(false)
-    }
-
     /// Checkpoint ownership setup changes only SQLite's checkpoint policy.
     /// Its bounded checkout must remain available below the write reserve.
     pub(super) fn writer_for_checkpoint_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
