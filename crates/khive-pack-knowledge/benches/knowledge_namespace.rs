@@ -1,3 +1,5 @@
+// This target uses only namespace setup from the fixture shared with the workload/index benches.
+#[allow(dead_code)]
 #[path = "knowledge_support/fixture.rs"]
 mod fixture;
 #[path = "knowledge_support/namespace.rs"]

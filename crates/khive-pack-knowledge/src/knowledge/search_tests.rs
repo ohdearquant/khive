@@ -21,6 +21,13 @@ pub(super) async fn with_prototype_phase_times<F: std::future::Future>(
     PROTOTYPE_PHASE_TIMES.scope(timings, future).await
 }
 
+// The ordinary path scopes atoms first; the two prototype paths still start at FTS.
+fn is_namespace_existence_probe(sql: &str) -> bool {
+    sql.starts_with(
+        "SELECT 1 AS present FROM knowledge_atoms AS a INDEXED BY idx_knowledge_atoms_ns CROSS JOIN fts_knowledge",
+    ) || sql.starts_with("SELECT 1 AS present FROM fts_")
+}
+
 #[cfg(feature = "namespace-trigram-proto")]
 fn prototype_phase(sql: &str) -> &'static str {
     let prefixed = sql.contains("fts_knowledge_namespace_proto");
@@ -46,9 +53,11 @@ fn prototype_phase(sql: &str) -> &'static str {
         }
     } else if sql.starts_with("SELECT a.*, a.rowid AS rowid") {
         "phase_b_hydration"
-    } else if sql.starts_with("SELECT 1 AS present FROM fts_") {
+    } else if is_namespace_existence_probe(sql) {
         if prefixed {
             "namespace_existence_prefixed"
+        } else if sql.starts_with("SELECT 1 AS present FROM knowledge_atoms") {
+            "namespace_existence_global"
         } else {
             "namespace_existence_slot_table"
         }
@@ -328,9 +337,7 @@ async fn term_bound_covers_staged_fallback_and_namespace_probes() {
     assert_eq!(
         probes
             .iter()
-            .filter(|statement| statement
-                .sql
-                .starts_with("SELECT 1 AS present FROM fts_knowledge"))
+            .filter(|statement| is_namespace_existence_probe(&statement.sql))
             .count(),
         FTS_TERM_COUNT_LIMIT
     );
