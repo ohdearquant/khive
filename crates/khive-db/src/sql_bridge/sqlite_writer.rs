@@ -14,12 +14,12 @@ use super::admit_standalone_operation;
 use super::{
     admit_reader_capability_sql, bind_params, cached_read_transaction_control,
     execute_prepared_batch, execute_query_interruptibly, execute_query_page_interruptibly,
-    execute_query_row_interruptibly, execute_standalone_read, map_write_err,
-    open_explicit_read_transaction_handle, prepare_batch_statements, prepare_cached_sql_statement,
-    reject_transaction_control_statements, run_pool_reader_query, run_standalone_batch,
-    run_standalone_script, run_standalone_statement, run_standalone_top_level,
-    transaction_control_head, AtomicEventRows, CachedReadTransactionControl, StandaloneHandle,
-    StandaloneWriteError,
+    execute_query_row_interruptibly, execute_standalone_read, execute_standalone_writer_query,
+    map_write_err, open_explicit_read_transaction_handle, prepare_batch_statements,
+    prepare_cached_sql_statement, reject_transaction_control_statements, run_pool_reader_query,
+    run_standalone_batch, run_standalone_script, run_standalone_statement,
+    run_standalone_top_level, transaction_control_head, writer_query_requires_admission,
+    AtomicEventRows, CachedReadTransactionControl, StandaloneHandle, StandaloneWriteError,
 };
 
 // =============================================================================
@@ -186,12 +186,12 @@ impl khive_storage::SqlReader for SqliteWriter {
             self.close_inactive_queue_read_transaction_handle();
             return result;
         }
-        let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        let requires_admission = writer_query_requires_admission(&statement);
+        execute_standalone_writer_query(
             &mut self.handle,
             Arc::clone(&self.pool),
             "writer.query_row",
-            transaction_control,
+            requires_admission,
             move |scope, conn, rollback, interruptible| {
                 execute_query_row_interruptibly(
                     scope,
@@ -253,12 +253,12 @@ impl khive_storage::SqlReader for SqliteWriter {
             self.close_inactive_queue_read_transaction_handle();
             return result;
         }
-        let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        let requires_admission = writer_query_requires_admission(&statement);
+        execute_standalone_writer_query(
             &mut self.handle,
             Arc::clone(&self.pool),
             "writer.query_all",
-            transaction_control,
+            requires_admission,
             move |scope, conn, rollback, interruptible| {
                 execute_query_interruptibly(
                     scope,
@@ -323,12 +323,12 @@ impl khive_storage::SqlReader for SqliteWriter {
             self.close_inactive_queue_read_transaction_handle();
             return result;
         }
-        let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        let requires_admission = writer_query_requires_admission(&statement);
+        execute_standalone_writer_query(
             &mut self.handle,
             Arc::clone(&self.pool),
             "writer.query_page",
-            transaction_control,
+            requires_admission,
             move |scope, conn, rollback, interruptible| {
                 execute_query_page_interruptibly(
                     scope,

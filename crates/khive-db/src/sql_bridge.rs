@@ -28,6 +28,11 @@ use standalone_batch::{
     run_standalone_top_level, BatchFailure, PoisonedBatchError,
 };
 
+mod standalone_call;
+use standalone_call::{
+    execute_standalone_writer_query, writer_query_requires_admission, StandaloneCallOwner,
+};
+
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -169,3 +174,6 @@ mod manual_atomic_owner_tests;
 #[cfg(test)]
 #[path = "sql_bridge/settlement_hazard_tests.rs"]
 mod settlement_hazard_tests;
+
+#[cfg(test)]
+mod writer_query_admission_tests;

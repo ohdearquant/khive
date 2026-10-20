@@ -106,6 +106,8 @@ pub(crate) fn build_standalone_writer(
     slot: OwnedSemaphorePermit,
 ) -> Result<Box<dyn khive_storage::SqlWriter>, StorageError> {
     let conn = configure_standalone_writer(&pool, conn)?;
+    #[cfg(test)]
+    super::writer_query_admission_tests::configure_test_connection(&pool, &conn)?;
     Ok(Box::new(super::SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
