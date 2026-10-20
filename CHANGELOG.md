@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission` and
   `writer_admission_unavailable_reason`. Direct struct literals must set them.
 - `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs`. Direct struct literals must set it.
+- `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
+  `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
+  takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
+  `WriterGuard::transaction`, which admit the write before it runs and settle the
+  connection before the guard is released.
 
 ## [0.14.0] - 2026-10-18
 
