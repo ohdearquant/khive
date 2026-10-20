@@ -16,6 +16,30 @@ import re
 from typing import Iterable
 
 
+def split_row(line: str) -> tuple[str, ...]:
+    """Split one Markdown table row on its unescaped pipes; ``\\|`` stays in its cell."""
+    body = line.strip()
+    if not (body.startswith("|") and body.endswith("|")) or len(body) < 2:
+        raise ValueError(f"not a table row: {line!r}")
+    cells: list[str] = []
+    current: list[str] = []
+    index = 1
+    while index < len(body) - 1:
+        char = body[index]
+        if char == "\\" and body[index + 1] == "|":
+            current.append("|")
+            index += 2
+            continue
+        if char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    cells.append("".join(current).strip())
+    return tuple(cells)
+
+
 NUMBER_WORDS = {
     "zero": 0,
     "one": 1,
@@ -368,9 +392,11 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             return raw_window if match.end() > current_line_end else raw
 
         if stripped.startswith("|"):
+            # Keep counts' optional/repeated outer pipes. Padding the synthetic
+            # closing pipe keeps a terminal backslash in its original cell.
             cells = [
                 re.sub(r"[`*_]", "", cell).strip()
-                for cell in stripped.strip("|").split("|")
+                for cell in split_row(f"|{stripped.strip('|')} |")
             ]
             lowered_cells = [cell.lower() for cell in cells]
             pack_column = next(
