@@ -432,9 +432,7 @@ fn db_capacity_floor_refuses_pooled_transaction_after_begin() {
         Ok(100)
     });
 
-    let writer = pool
-        .writer_for_admitted_operation()
-        .expect("the lease precedes writer checkout");
+    let writer = pool.writer().expect("the lease precedes writer checkout");
     let error = writer
         .transaction::<_, ()>(|_| panic!("the refused transaction body must not run"))
         .expect_err("the reserve must refuse after BEGIN");
@@ -480,12 +478,12 @@ fn db_capacity_floor_samples_each_pooled_transaction() {
         }
     });
 
-    pool.writer_for_admitted_operation()
+    pool.writer()
         .expect("first writer checkout")
         .transaction(|_| Ok(()))
         .expect("first transaction clears the reserve");
     let second = pool
-        .writer_for_admitted_operation()
+        .writer()
         .expect("second writer checkout")
         .transaction::<_, ()>(|_| panic!("second body must not run"));
     assert!(
