@@ -914,6 +914,16 @@ async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation()
         abandoned >= 1,
         "generation 1 must be recorded as DriverAppendAbandoned once the driver gives up on it"
     );
+    let health = batch.health_metrics();
+    assert!(
+        health.flush_failures >= abandoned as u64,
+        "every observed abandoned generation contributes a flush failure"
+    );
+    assert_eq!(health.degraded_rows, 0);
+    assert!(
+        !health.degraded,
+        "abandoning only obligation rows must not set the degraded flag"
+    );
 
     // (a) continued: a fresh row is admitted (pushed onto `pending`) again,
     // not synchronously refused — the bug this test guards against.
@@ -1082,6 +1092,13 @@ async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
         "exactly generations 1 and 2 must have abandoned before the cap takes effect: {:?}",
         snap.per_generation
     );
+    let before_shed = batch.health_metrics();
+    assert_eq!(before_shed.flush_failures, 2);
+    assert_eq!(before_shed.degraded_rows, 0);
+    assert!(
+        !before_shed.degraded,
+        "the two abandoned obligation-only generations must leave the flag clear"
+    );
 
     // (a): with the cap reached, three more generations shed immediately —
     // no store call is ever attempted (the call-gate count stays at 2),
@@ -1115,6 +1132,19 @@ async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
         batch.test_snapshot().outstanding_abandoned_appends,
         2,
         "shedding must not spawn or retain any additional detached appends"
+    );
+    let after_shed = batch.health_metrics();
+    assert_eq!(
+        after_shed
+            .flush_failures
+            .checked_sub(before_shed.flush_failures),
+        Some(3),
+        "each of the three shed generations contributes one flush failure"
+    );
+    assert_eq!(after_shed.degraded_rows, 0);
+    assert!(
+        !after_shed.degraded,
+        "shedding only obligation rows must not set the degraded flag"
     );
 
     // (d): admission capacity was never at risk — `pending` stayed far below
