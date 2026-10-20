@@ -1380,12 +1380,13 @@ An atomic batch commits in one writer transaction or writes nothing (A1.1, Amend
 
 1. Sends the batch with `atomic=true`. Without a fence the default is per-member (A1.1), and the
    rule below holds only for a batch that commits as one unit. Before the first attempt the client
-   fixes the batch's member list and gives it an operation token: a random value of at least 128 bits,
-   drawn once per operation and never derived from the batch's content. A digest of the member list
-   would let a reader who may read the stream, but not the documents the batch writes, confirm a
-   guessed document from the record at `N`; a random token also cannot be produced by another client
-   or planted at `N` ahead of the batch. The token is the client's operation identity. It does not
-   replace any event id the records already carry.
+   fixes the batch's member list and gives it an operation token: at least 122 random bits from a
+   cryptographically secure generator (a version 4 UUID qualifies), drawn once per operation and never
+   derived from the batch's content. A digest of the member list would let a reader who may read the
+   stream, but not the documents the batch writes, confirm a guessed document from the record at `N`.
+   The client writes the token nowhere else until the reply is settled, so another client cannot
+   produce it or plant it at `N` ahead of the batch. The token is the client's operation identity. It
+   does not replace any event id the records already carry.
 2. Puts the token inside the record of one `append` member that carries `expected_seq=N` on stream
    `S`. A batch with no append member adds one witness append for the token; that costs one record.
 3. On a lost reply, reads `stream.read(stream=S, after=N-1, limit=1)`. Only an entry whose `seq` is
@@ -1404,9 +1405,15 @@ in the batch.
 ### A11.2 What the store guarantees, and what it does not
 
 - **Guaranteed, and now stated as contract:** a committed atomic batch is visible to every later read
-  as a whole: no snapshot of the store shows some of its members committed and others not. A read of
-  one stream sees only that stream's members, which is not a partial view of the batch. A refused
-  atomic batch is visible to no read.
+  as a whole until truncation removes any of its members: no snapshot of the store shows some of its
+  members committed and others not. A read of one stream sees only that stream's members, which is not
+  a partial view of the batch. A refused atomic batch is visible to no read.
+- **Removal exception:** truncation (A3.2) removes entries per stream, below that stream's
+  `before_seq`, with no knowledge of batches. After it, a read can show a batch's members on one stream
+  and not its members on another, and on one stream it can show the members above the floor and not
+  those below (same-stream members take consecutive numbers, Amendment 1). The `floor_seq` each read
+  returns is the signal that a prefix is gone; a missing member below the floor is not evidence that
+  the batch was partial.
 - **Not provided:** the original per-member results. The witness proves that the batch happened; it
   does not return the `version` and `updated_at` the batch's head writes produced (Amendment 5 A5.2).
   After another writer changes such a head, those values cannot be read back from the store. A client
@@ -1445,7 +1452,7 @@ client's value nor its version and leave the outcome unresolved.
    another writer at `N` makes the read return that writer's record, not the token.
 3. **No partial visibility.** While one process commits atomic batches of K appends across K
    streams, a second process reads the K streams' last entries inside one store read transaction,
-   repeatedly (a store-level test: no verb reads several streams in one snapshot); every reading
+   repeatedly (a store-level test, so that the K reads share one snapshot); every reading
    shows either all K members of a batch or none of them. A control that commits the same members as
    a per-member batch (`atomic=false`) must produce at least one partial reading in the same harness,
    so the arm is known to be able to see one.
