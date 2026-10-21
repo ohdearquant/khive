@@ -12,6 +12,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
     ("apply_changeset", OperationAccess::Write),
+    ("attach", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
@@ -209,7 +210,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v21");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v22");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

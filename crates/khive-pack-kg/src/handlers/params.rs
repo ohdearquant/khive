@@ -76,6 +76,8 @@ pub(crate) struct GetParams {
     pub(crate) kind: Option<String>,
     pub(crate) note_kind: Option<String>,
     pub(crate) include_deleted: Option<bool>,
+    #[serde(default)]
+    pub(crate) hydrate: Vec<String>,
 }
 
 #[derive(Deserialize)]

@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 30    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 31    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -238,7 +238,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 30 verbs
+## `kg` pack — 31 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -315,6 +315,19 @@ committed `id`, with entries such as `{"stage":"event_append","error":"..."}`. T
 means the record exists but the later telemetry write failed. Reconcile the returned id;
 retrying `create` would make a duplicate.
 
+### `attach` — Commissive
+
+Add or replace one role on an existing entity or note from base64 `bytes`:
+
+```text
+attach(id="<record UUID>", role="markdown", bytes="aGVsbG8K", media_type="text/markdown")
+```
+
+Returns `id`, `role`, `content_ref`, `size`, `media_type` and `replaced`. Publication
+confirms blob bytes before committing the attachment row. Generic publication
+refuses pack-owned authenticated roles and secondary-backend mutations. See
+[record attachments](../../crates/khive-pack-kg/docs/api/attachments.md).
+
 ### `get` — Assertive
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
@@ -342,6 +355,10 @@ The returned object has the full substrate shape documented under `list` below. 
 notes annotate the edge), and each full note object includes `annotation_edge_id`, the UUID of the
 `annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
 annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
+
+`hydrate=["markdown", ...]` returns selected attachment bytes as base64. With
+attachments present, the default response adds a role-keyed `attachments` metadata
+object and never inlines bytes. An unknown requested attachment role is an error.
 
 ### `restore` — Declaration
 
