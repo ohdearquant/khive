@@ -798,8 +798,10 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    answer `true` for the revoked older grant whenever any newer matching grant is live. Repeat the
    two-grant fixture once for each other term the older grant can fail alone, the newer matching grant
    staying live each time: the older grant still `granted` but expired at the supplied `now`; carrying only
-   `invalidated_by_registry_id`, then only `invalidated_at`, each written directly by the fixture; pinned
-   differently from the given registration; and with its stored actor pattern, then its tool pattern, not
+   `invalidated_by_registry_id`, then only `invalidated_at`, each written directly by the fixture; with a
+   registration given, a stored registry id that differs from it, then only a stored digest that differs; with
+   no registration given, carrying only a non-null registry id, then only a non-null digest, the newer grant's
+   pin columns null; and with its stored actor pattern, then its tool pattern, not
    matching the supplied actor or tool. In each, the by-id entry answers `false` for the older id and `true`
    for the newer id, and `decide` still cites the newer id. This separates a by-id check from one that
    applies any activity or match term to a different grant than the one named.
@@ -820,6 +822,8 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    SELECT twice turns this arm red, which shows the entry keeps the one-statement contract rather than only
    returning the right answer on the first poll. Also inject an error from the supplied reader on its first
    query: exactly one query invocation occurs, the entry returns that error, and a mutant that retries the
-   query after a reader error turns this arm red.
+   query after a reader error turns this arm red. Inject a retryable error (`StorageError::Timeout`) and a
+   non-retryable one (`StorageError::Driver`) in turn: each is returned after exactly one invocation, and a
+   mutant that retries only when `is_retryable()` holds turns the retryable case red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
