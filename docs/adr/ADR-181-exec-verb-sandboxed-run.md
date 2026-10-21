@@ -991,7 +991,10 @@ accepted by its driven arms, never by its text.
    separates attributed actors and does not keep one same-uid client from another. Binding a run to
    an individually verified holder needs the connection-identity mechanism that ADR-096 defers to
    its own record. Until a transport supplies one, the deployment limits network reach through
-   which registrations may declare it (item 1), not through the grant's actor.
+   which registrations may declare it (item 1), not through the grant's actor. A deployment in
+   which more than one principal shares the daemon's uid, such as any multi-tenant or hosted
+   service, enables no row carrying `network` until that record exists: on such a host item 1 is a
+   default deny, not a limit.
 
 4. **A run that would not be honoured is refused, never run without network.** When the row
    carries `network` and any condition in item 3 fails, exec writes a refusal receipt (Amendment 1
