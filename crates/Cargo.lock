@@ -2375,13 +2375,17 @@ name = "khive-pack-charter"
 version = "0.14.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "chrono",
  "inventory",
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

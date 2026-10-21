@@ -2,6 +2,7 @@
 //!
 //! This foundation exposes no verbs or action admission. See ADR-193 M1.
 
+pub mod lang;
 mod pack;
 mod schema;
 pub mod transition;

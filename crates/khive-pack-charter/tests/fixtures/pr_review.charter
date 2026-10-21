@@ -1,0 +1,69 @@
+charter pr_review v1
+title "Review a pull request through to merge"
+subject pull_request
+
+roles:
+    author "opened the pull request and answers findings"
+    reviewer "reads the change and posts a verdict"
+    approver "records the approval; never the author"
+    maintainer "merges, and may override a held approval"
+
+triggers:
+    pull_request.opened
+    review.posted
+    checks.concluded
+    approval.recorded
+
+workflow:
+    phase intake by author:
+        await pull_request.opened
+        require pull_request.open hard
+        require pull_request.base(branch="main") hard
+        require pull_request.ready advisory
+        evidence intake_record
+
+    phase review by reviewer:
+        action review.request by author
+        await review.posted
+        require review.verdict_present hard
+        require review.reviewer_independent hard
+        require review.within_words(words=500) advisory
+        when review.decision is approve: goto approval
+        when review.decision is request_changes: goto fix
+        when review.decision is blocked: goto split
+        max_rounds 3 then split
+        evidence review_record
+        goto split
+
+    phase fix by author:
+        perform pr_fix
+        when pr_fix is completed: goto review
+        when pr_fix is terminated: goto split
+        when pr_fix is cancelled: goto split
+
+    phase split by author:
+        perform pr_split
+        terminate "split into smaller pull requests"
+
+    phase approval by approver:
+        await checks.concluded
+        require checks.required_green(event=pull_request) hard
+        await approval.recorded
+        require approval.present(reader_not_author=true) hard
+        require approval.approver_not_last_pusher hard
+        grants:
+            approver may pull_request.approve
+        evidence approval_record
+
+    phase merge by maintainer:
+        require pull_request.head_unchanged hard
+        require pull_request.auto_merge_off hard
+        action pull_request.merge by maintainer
+        evidence merge_record
+        complete
+
+break_glass:
+    by maintainer
+    on approval.approval.present
+    reason_min 50
+    marks_degraded

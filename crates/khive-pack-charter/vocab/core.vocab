@@ -1,0 +1,98 @@
+vocabulary core v1
+# The phrase registry compiled into the charter pack. A deployment publishes its own
+# vocabularies beside this one with charter.vocabulary; a name belongs to one vocabulary.
+#
+# Defaults when an entry omits a field:
+#   trigger  outcomes observed               passes observed
+#   phrase   outcomes pass fail              passes pass       ceiling advisory
+#   action   outcomes done failed skipped    passes done skipped
+# Self-reported and undecidable phrases keep the advisory ceiling.
+
+subject pull_request "a pull request on a forge, referenced as <owner>/<repo>#<number>"
+subject issue "an issue on a forge"
+subject message "a message or thread in an inbox"
+subject task "a task record"
+subject release "a release of a project, referenced by its version"
+subject session "one working session of an agent or person"
+
+trigger pull_request.opened "the pull request was opened or reopened"
+trigger pull_request.head_moved "the pull request head changed"
+trigger pull_request.closed "the pull request was closed"
+trigger review.requested "a review was requested for the current head"
+trigger review.posted "a reviewer posted a verdict for the current head"
+trigger fix.pushed "the author pushed a change answering review findings"
+trigger checks.concluded "the required checks concluded for the current head"
+trigger approval.recorded "an approval was recorded for the current head"
+trigger message.arrived "a message arrived for the subject"
+trigger schedule.fired "a scheduled reminder fired"
+trigger prompt.received "a person sent a prompt"
+
+phrase pull_request.open "the pull request is open":
+    ceiling hard
+phrase pull_request.ready "the pull request is out of draft":
+    outcomes ready draft
+    passes ready
+phrase pull_request.base "the pull request targets the named base branch":
+    param branch string
+    ceiling hard
+phrase pull_request.head_unchanged "the head is the one the approval was recorded against":
+    ceiling hard
+phrase pull_request.auto_merge_off "no automatic merge is armed on the pull request":
+    ceiling hard
+phrase pull_request.size "the pull request size class":
+    outcomes small large oversized
+    passes small large
+phrase review.verdict_present "a verdict exists for the current head":
+    ceiling hard
+phrase review.decision "the reviewer's decision for the current head":
+    outcomes approve request_changes blocked
+    passes approve
+    ceiling hard
+phrase review.reviewer_independent "the reviewer is independent of the author":
+    ceiling hard
+phrase review.within_words "the verdict stays within a word budget":
+    param words integer
+phrase review.findings_reproducible "each finding carries a command that reproduces it":
+    ceiling soft
+phrase findings.addressed "every finding is answered at the new head":
+    ceiling soft
+phrase checks.required_green "every required check concluded successfully on the merge ref":
+    param event word optional
+    ceiling hard
+phrase gate.result "a named gate's result for the current head":
+    param name word
+    ceiling hard
+phrase approval.present "an approval exists for the current head":
+    param reader_not_author bool optional
+    ceiling hard
+phrase approval.approver_not_last_pusher "the approver did not push the current head":
+    ceiling hard
+phrase tree.clean "the working tree is clean and the head unchanged after the work":
+    ceiling hard
+phrase agent.no_outward_writes "the agent wrote nothing outside its workspace"
+phrase message.kind "the kind of the message":
+    outcomes directive stop_order question report other
+    passes
+phrase inbox.unread_older_than "unread messages older than the given age":
+    param age duration
+    outcomes none some
+    passes none
+phrase memory.recorded "the decision was recorded where later sessions find it"
+phrase loop.log_written "the session's log entry was written"
+
+action review.request "start a review of the current head":
+    param reviewer word optional
+action review.write_verdict "write the verdict with its findings"
+action review.return_verdict "deliver the verdict to the requester"
+action review.read_diff "read the diff and every cited site"
+action tests.run_targeted "run the targeted tests"
+action tests.run_mutations "run the mutation probes"
+action fix.push "push a change answering the findings"
+action pull_request.approve "approve the pull request"
+action pull_request.merge "merge the pull request"
+action pull_request.split "split the pull request into reviewable parts"
+action inbox.read "read the inbox":
+    param limit integer optional
+action tasks.list_next "list the next tasks"
+action work.unit "do one reversible unit of work"
+action agents.halt "stop every running agent"
