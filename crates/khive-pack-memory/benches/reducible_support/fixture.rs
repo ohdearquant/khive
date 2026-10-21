@@ -225,6 +225,18 @@ impl Fixture {
     }
 }
 
+/// Use a short coalescing window for finite synthetic benchmark writes.
+/// Explicit operator overrides, including the production delay, remain intact.
+///
+/// # Safety
+/// Call only from benchmark `main` before starting any threads or executor.
+pub unsafe fn configure_synthetic_ann_debounce() {
+    if std::env::var_os("KHIVE_ANN_REBUILD_DEBOUNCE_MS").is_none() {
+        // SAFETY: the caller guarantees this benchmark process is single-threaded.
+        unsafe { std::env::set_var("KHIVE_ANN_REBUILD_DEBOUNCE_MS", "5") };
+    }
+}
+
 pub fn executor() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(2)
