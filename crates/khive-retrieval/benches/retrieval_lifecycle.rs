@@ -1,4 +1,5 @@
 //! Public orchestration and materialization; generated fixtures, no model or storage I/O.
+use std::cell::OnceCell;
 use std::convert::Infallible;
 use std::future::{ready, Ready};
 use std::num::NonZeroUsize;
@@ -12,6 +13,9 @@ use khive_retrieval::{
 };
 use khive_score::DeterministicScore;
 use serde_json::Value;
+
+#[path = "fixtures/mode.rs"]
+mod mode;
 
 const ROWS: usize = 500;
 type Rows = Vec<(usize, DeterministicScore)>;
@@ -120,18 +124,33 @@ fn no_custom(
 }
 
 fn lifecycle(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let candidates: Vec<_> = (0..ROWS)
-        .map(|key| RankedCandidate {
-            key,
-            score: ROWS - key,
+    let profile = mode::is_profile_mode();
+    let runtime = OnceCell::new();
+    let get_runtime = || {
+        runtime.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
         })
-        .collect();
-    let prefix = rt.block_on(materialize(candidates.clone()));
-    check_prefix(&prefix);
+    };
+    let materialization = OnceCell::new();
+    let get_materialization = || {
+        materialization.get_or_init(|| {
+            let candidates: Vec<_> = (0..ROWS)
+                .map(|key| RankedCandidate {
+                    key,
+                    score: ROWS - key,
+                })
+                .collect();
+            let prefix = get_runtime().block_on(materialize(candidates.clone()));
+            check_prefix(&prefix);
+            (candidates, prefix)
+        })
+    };
+    if profile {
+        get_materialization();
+    }
     let mut group = c.benchmark_group("materialization");
     group.bench_function("limits_500", |b| {
         b.iter(|| {
@@ -147,6 +166,7 @@ fn lifecycle(c: &mut Criterion) {
         })
     });
     group.bench_function("drop_counts_500", |b| {
+        let (_, prefix) = get_materialization();
         b.iter(|| {
             let counts = black_box(&prefix.drop_counts);
             black_box((
@@ -157,6 +177,8 @@ fn lifecycle(c: &mut Criterion) {
         })
     });
     group.bench_function("prefix_500", |b| {
+        let (candidates, _) = get_materialization();
+        let rt = get_runtime();
         b.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
@@ -172,17 +194,24 @@ fn lifecycle(c: &mut Criterion) {
     });
     group.finish();
 
-    let primary = ranked(0);
-    let legacy = ranked(250);
-    let text = ranked(500);
-    let strategy = FusionStrategy::Rrf { k: 60 };
-    let router = DualIndexRouter::new(DualIndexConfig::default().with_strategy(
-        DualIndexStrategy::Both {
-            fusion: strategy.clone(),
-        },
-    ));
+    let orchestration = OnceCell::new();
+    let get_orchestration = || {
+        orchestration.get_or_init(|| {
+            let strategy = FusionStrategy::Rrf { k: 60 };
+            let router = DualIndexRouter::new(DualIndexConfig::default().with_strategy(
+                DualIndexStrategy::Both {
+                    fusion: strategy.clone(),
+                },
+            ));
+            (ranked(0), ranked(250), ranked(500), strategy, router)
+        })
+    };
+    if profile {
+        get_orchestration();
+    }
     let mut group = c.benchmark_group("orchestration");
     group.bench_function("dual_index_2x500", |b| {
+        let (primary, legacy, _, _, router) = get_orchestration();
         b.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
@@ -200,6 +229,8 @@ fn lifecycle(c: &mut Criterion) {
         })
     });
     group.bench_function("two_stage_fusion_2x500_plus_text500", |b| {
+        let (primary, legacy, text, strategy, _) = get_orchestration();
+        let rt = get_runtime();
         b.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
@@ -208,9 +239,9 @@ fn lifecycle(c: &mut Criterion) {
                 let result = rt
                     .block_on(fuse_two_stage(
                         black_box(arms),
-                        Some(&strategy),
+                        Some(strategy),
                         black_box(text),
-                        &strategy,
+                        strategy,
                         no_custom,
                     ))
                     .expect("two-stage fusion");
