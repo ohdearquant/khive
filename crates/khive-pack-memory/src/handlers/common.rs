@@ -16,6 +16,7 @@ use khive_fusion::FusionStrategy;
 use khive_retrieval::hybrid::{
     combine_best_ranked_evidence, fuse_labelled_scored, HitLabel, HybridConfig,
 };
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     fts_text_leg_or_err, MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError,
     SearchHit, SearchSource, VerbRegistry,
@@ -320,7 +321,8 @@ pub(crate) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
     match mt {
         "episodic" | "semantic" => Ok(()),
         other => Err(RuntimeError::InvalidInput(format!(
-            "unknown memory_type {other:?}; valid: episodic | semantic"
+            "unknown memory_type {:?}; valid: episodic | semantic",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -335,7 +337,8 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
         "vector_only" => Ok(FusionStrategy::VectorOnly),
         "keyword_only" => Ok(FusionStrategy::KeywordOnly),
         other => Err(RuntimeError::InvalidInput(format!(
-            "invalid fusion_strategy {other:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\""
+            "invalid fusion_strategy {:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\"",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
