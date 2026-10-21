@@ -98,6 +98,7 @@ pub mod registry;
 pub mod resource;
 pub mod retrieval;
 pub mod runtime;
+pub mod search_audit;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
 mod sql_include;
