@@ -2792,13 +2792,15 @@ async fn atomic_delete_rejects_kind_mismatch_and_accepts_matching_or_omitted_kin
 /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
 #[tokio::test]
 async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
-    if crate::test_process::run_in_child() {
+    // Debug builds approach the default 2 MiB stack even with the futures below
+    // boxed. Give this child headroom without changing production worker stacks.
+    if crate::test_process::run_in_child_with_stack_size(4 * 1024 * 1024) {
         return;
     }
 
     // The dispatch and atomic pipelines are awaited from many points of this
-    // one test future. Boxing them keeps each behind a pointer, so the test
-    // future stays inside a default test-thread stack in debug builds.
+    // one test future. Boxing them keeps each behind a pointer instead of
+    // embedding each pipeline future in the outer test frame.
     async fn call(db_path: &str, ops: &str) -> serde_json::Value {
         let server = isolated_server(db_path);
         let envelope = Box::pin(dispatch_json(&server, ops)).await;
