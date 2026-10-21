@@ -619,12 +619,12 @@ async fn a_stop_order_terminates_the_inbox_charter() {
     let started = f
         .call(
             "charter.start",
-            json!({"charter": "inbox_triage", "subject_kind": "message", "subject_ref": "inbox:seat", "bindings": {"seat": "seat-1"}}),
+            json!({"charter": "inbox_triage", "subject_kind": "message", "subject_ref": "inbox:agent", "bindings": {"agent": "agent-1"}}),
         )
         .await;
     let run = started["run_id"].as_str().unwrap().to_owned();
     let obs = |kind: &str, outcome: Option<&str>, args: Value| {
-        let mut p = json!({"subject_kind": "message", "subject_ref": "inbox:seat", "kind": kind, "args": args});
+        let mut p = json!({"subject_kind": "message", "subject_ref": "inbox:agent", "kind": kind, "args": args});
         if let Some(o) = outcome {
             p["outcome"] = json!(o);
         }
