@@ -240,7 +240,7 @@ must never be used to omit `cost_unit` alone.
 ### Successful search query shape
 
 Successful `search` dispatch audit payloads additionally contain `match_mode`
-(`all_terms` or `any_term`), `arms` (`text`, `vector`, `both`, or `none`), `limit`
+(`all_terms` or `any_term`), `arms` (`text`, `vector`, `both`, or `none`), `effective_limit`
 (the effective public limit: default 10, capped at 100), and `result_count`
 (the final returned array length, including zero). These are top-level payload
 fields beside `resource`; the executed-work counter vocabulary is unchanged.

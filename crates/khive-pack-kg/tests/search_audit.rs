@@ -109,7 +109,7 @@ async fn empty_entity_and_note_searches_record_actual_arms_not_the_source_filter
             assert_eq!(event.outcome, EventOutcome::Success);
             assert_eq!(event.payload["arms"], if hybrid { "both" } else { "text" });
             assert_eq!(event.payload["match_mode"], "all_terms");
-            assert_eq!(event.payload["limit"], 7);
+            assert_eq!(event.payload["effective_limit"], 7);
             assert_eq!(event.payload["result_count"], 0);
             assert!(!event.payload.to_string().contains(query));
         }
@@ -138,7 +138,7 @@ async fn populated_any_term_search_counts_final_rows_and_caps_public_limit() {
     let event = audit(&rt, "search").await;
     assert_eq!(event.payload["arms"], "text");
     assert_eq!(event.payload["match_mode"], "any_term");
-    assert_eq!(event.payload["limit"], 100);
+    assert_eq!(event.payload["effective_limit"], 100);
     assert_eq!(event.payload["result_count"], 1);
 }
 
@@ -150,14 +150,14 @@ async fn defaults_and_other_verbs_have_distinct_audit_shapes() {
         .await
         .unwrap();
     let event = audit(&rt, "search").await;
-    assert_eq!(event.payload["limit"], 10);
+    assert_eq!(event.payload["effective_limit"], 10);
     assert_eq!(event.payload["match_mode"], "all_terms");
     registry
         .dispatch("list", json!({"kind":"entity"}))
         .await
         .unwrap();
     let event = audit(&rt, "list").await;
-    for key in ["match_mode", "arms", "limit", "result_count"] {
+    for key in ["match_mode", "arms", "effective_limit", "result_count"] {
         assert!(event.payload.get(key).is_none(), "{key}");
     }
 }
@@ -174,7 +174,7 @@ async fn unsuccessful_search_has_no_success_shape() {
         .is_err());
     let event = audit(&rt, "search").await;
     assert_eq!(event.outcome, EventOutcome::Error);
-    for key in ["match_mode", "arms", "limit", "result_count"] {
+    for key in ["match_mode", "arms", "effective_limit", "result_count"] {
         assert!(event.payload.get(key).is_none(), "{key}");
     }
 }

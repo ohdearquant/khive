@@ -106,7 +106,7 @@ pub(super) fn enrich_stream_truncate_success(
 
 /// Content-free query shape on successful search dispatch rows only.
 /// Arm facts come from execution, never from hit provenance or hit counts.
-/// `limit` is the effective public limit (default 10, maximum 100), not the
+/// `effective_limit` is the effective public limit (default 10, maximum 100), not the
 /// larger candidate window used internally before filtering.
 pub(super) fn enrich_search_success(
     event: &mut Event,
@@ -134,7 +134,7 @@ pub(super) fn enrich_search_success(
     if let Value::Object(ref mut payload) = event.payload {
         payload.insert("match_mode".into(), Value::from(match_mode));
         payload.insert("arms".into(), Value::from(arms.as_str()));
-        payload.insert("limit".into(), Value::from(limit));
+        payload.insert("effective_limit".into(), Value::from(limit));
         payload.insert("result_count".into(), Value::from(rows.len()));
     }
 }

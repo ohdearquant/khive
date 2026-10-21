@@ -66,7 +66,7 @@ async fn intercepted_fanout_records_empty_text_execution_and_empty_backend_set()
             if backend_count == 0 { "none" } else { "text" }
         );
         assert_eq!(payload["result_count"], 0);
-        assert_eq!(payload["limit"], 10);
+        assert_eq!(payload["effective_limit"], 10);
         assert_eq!(payload["match_mode"], "all_terms");
         assert!(!payload.to_string().contains("privateauditneedle"));
     }
