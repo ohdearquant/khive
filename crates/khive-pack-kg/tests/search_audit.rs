@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
-    EmbedderProvider, KhiveRuntime, Namespace, RuntimeConfig, RuntimeResult, VerbRegistry,
-    VerbRegistryBuilder,
+    EmbedderProvider, InterceptedDispatchResult, KhiveRuntime, Namespace, RuntimeConfig,
+    RuntimeResult, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::{Entity, EventFilter, PageRequest};
 use khive_types::{EventKind, EventOutcome};
@@ -190,7 +190,7 @@ async fn intercepted_joined_empty_hybrid_records_execution_without_result_proven
     let (rt, registry) = fixture(true);
     let runtime = rt.clone();
     let result = registry
-        .dispatch_intercepted_with_identity(
+        .dispatch_intercepted_with_metadata_with_identity(
             "search",
             &json!({"kind":"entity", "query":"emptyneedle"}),
             None,
@@ -202,14 +202,17 @@ async fn intercepted_joined_empty_hybrid_records_execution_without_result_proven
                         .hybrid_search(&token, "emptyneedle", None, 10, None, None, &[], None)
                         .await?;
                     assert!(hits.is_empty());
-                    Ok::<Value, khive_runtime::RuntimeError>(json!([]))
+                    Ok::<_, khive_runtime::RuntimeError>(InterceptedDispatchResult::new(
+                        json!([]),
+                        (),
+                    ))
                 }));
                 async move { handle.await.unwrap() }
             },
         )
         .await
         .unwrap();
-    assert_eq!(result, json!([]));
+    assert_eq!(result.result, json!([]));
     let event = audit(&rt, "search").await;
     assert_eq!(event.payload["arms"], "both");
     assert_eq!(event.payload["result_count"], 0);
