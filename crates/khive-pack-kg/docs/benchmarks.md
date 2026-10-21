@@ -1,5 +1,34 @@
 # khive-pack-kg Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-kg`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                    | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| -------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `kg_create/entity`                           | 3.802 ms         | 1.019     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_create/note`                             | 287.978 µs       | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_delete/hard_entity_one_edge_edges_9000`  | 3.826 ms         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_delete/soft_entity_one_edge_edges_9000`  | 4.027 ms         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_get/by_uuid`                             | 27.576 µs        | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_link/single_edge`                        | 371.889 µs       | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_list/entity_all_limit50`                 | 247.267 µs       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_list/entity_kind_concept_limit20`        | 134.234 µs       | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_list_notes/one_namespace_5000_limit20`   | 60.597 µs        | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_list_notes/two_namespaces_10000_limit20` | 144.250 µs       | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_neighbors/hub_100_out`                   | 1.232 ms         | 1.015     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_search/entity_fts/100`                   | 2.425 ms         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_search/entity_fts/1000`                  | 7.637 ms         | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_search/entity_fts/500`                   | 4.653 ms         | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_stats/entities_1000_edges_3999`          | 6.329 ms         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_traverse/chain_depth/1`                  | 172.899 µs       | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_traverse/chain_depth/2`                  | 209.506 µs       | 1.025     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `kg_traverse/chain_depth/3`                  | 223.635 µs       | 1.034     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Run command
 
 ```bash

@@ -1,5 +1,49 @@
 # khive-fold Benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-fold`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `fold/count/10`                 | 3.888 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/count/100`                | 45.190 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/count/500`                | 273.978 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/derive/10`                | 6.926 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/derive/100`               | 47.860 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/derive/500`               | 276.900 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/fn_closure/10`            | 2.826 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/fn_closure/100`           | 14.976 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/fn_closure/500`           | 71.768 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/sum_i64/10`               | 19.635 ns        | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/sum_i64/100`              | 173.057 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fold/sum_i64/500`              | 855.016 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/batch_score/10`      | 24.031 ns        | 1.019     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/batch_score/100`     | 147.290 ns       | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/batch_score/500`     | 631.554 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_all/10`       | 231.538 ns       | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_all/100`      | 2.017 µs         | 1.032     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_all/500`      | 11.741 µs        | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_top/10`       | 119.949 ns       | 1.018     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_top/100`      | 1.630 µs         | 1.005     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `objective/select_top/500`      | 7.182 µs         | 1.028     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/cmp_desc/scalar`      | 16.334 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/heap_top_k/100`       | 798.806 ns       | 1.035     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/heap_top_k/500`       | 4.294 µs         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/sort/10`              | 48.211 ns        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/sort/100`             | 1.277 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ordering/sort/500`             | 9.514 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy/10`            | 538.735 ns       | 1.047     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy/100`           | 5.251 µs         | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy/500`           | 30.332 µs        | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy_diversity/10`  | 1.630 µs         | 1.037     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy_diversity/100` | 110.148 µs       | 1.018     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `selector/greedy_diversity/500` | 2.758 ms         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 Benchmark suite: `benches/fold_bench.rs`. Run with:
 
 ```bash
