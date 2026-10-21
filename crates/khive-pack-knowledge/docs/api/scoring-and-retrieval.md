@@ -212,3 +212,19 @@ All public request float fields (`min_score`, `intersection_bonus`, `rerank_alph
 `diversity_bias`, `epistemic_weight`, `category_weights.*`, `candidates[*].score`,
 `candidates[*].information_gain`, `weights.*`) are validated with `is_finite()` at the handler
 boundary before being cast to `f32`. Non-finite values return `RuntimeError::InvalidInput`.
+
+## Suggest query admission
+
+`knowledge.suggest` requires at least five words of orientation context. Each
+whitespace-separated piece without CJK characters counts as one word, preserving
+existing Latin-query behavior. Han, Hiragana, Katakana, and Hangul letters in the
+shared CJK script ranges count as one word per two letters; the total is rounded
+down once across the entire query. Punctuation within these CJK script ranges does not contribute letters
+or an additional whitespace word. A piece containing CJK does not also count as
+a separate Latin word.
+
+For example, `如何提升中文检索质量` has ten CJK letters and is admitted;
+`如何提升中文检索质` has nine and is refused. `如何提升中文检索质 retrieval`
+has four CJK-derived words plus one whitespace word and is admitted. Short queries
+can use `knowledge.search`. This admission rule does not change retrieval ranking,
+embedding-model selection, or auto-`knowledge.compose`'s ten-whitespace-word gate.
