@@ -683,7 +683,7 @@ impl CharterPack {
                         ));
                     }
                     let (subject_id, epoch, current) = engine
-                        .subject(&subject_kind, &subject_ref, generation.as_deref())
+                        .subject(&subject_kind, &subject_ref, generation.as_deref(), true)
                         .await?;
                     if let Some(run_id) = engine
                         .open_run_for_charter(&charter_id, &subject_id)
@@ -749,6 +749,9 @@ impl CharterPack {
                 "wrong_entry_kind: {kind} is a subject, not an observation"
             )));
         }
+        let establishes = registry
+            .get(&subject_kind)
+            .is_some_and(|s| s.new_generation.contains(&kind));
         let outcome = match params.opt_str("outcome")? {
             Some(o) if entry.outcomes.contains(&o) => o,
             Some(o) => {
@@ -792,13 +795,18 @@ impl CharterPack {
                         return Ok(boxed(json!({"recorded": [], "events": []})));
                     }
                     let (subject_id, _, current) = engine
-                        .subject(&subject_kind, &subject_ref, generation.as_deref())
+                        .subject(
+                            &subject_kind,
+                            &subject_ref,
+                            generation.as_deref(),
+                            establishes,
+                        )
                         .await?;
                     let payload = json!({
                         "outcome": outcome,
                         "args": args,
                         "detail": detail,
-                        "generation": current,
+                        "generation": generation.or(current),
                     });
                     let mut recorded = Vec::new();
                     for (run_id, charter_id) in engine.open_runs_for_subject(&subject_id).await? {

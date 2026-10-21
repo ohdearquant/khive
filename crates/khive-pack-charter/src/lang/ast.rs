@@ -166,6 +166,7 @@ pub struct EntrySource {
     pub passes: Option<Vec<String>>,
     pub ceiling: Option<Level>,
     pub params: Vec<ParamSource>,
+    pub new_generation: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]

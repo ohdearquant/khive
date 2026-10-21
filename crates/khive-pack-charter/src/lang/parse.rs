@@ -739,6 +739,7 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
         passes: None,
         ceiling: None,
         params: Vec::new(),
+        new_generation: None,
     };
     for child in &node.children {
         no_children(child, errors);
@@ -791,12 +792,19 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
                     f.end()?;
                     entry.params.push(ParamSource { name, ty, optional });
                 }
+                "new_generation" => {
+                    let mut names = Vec::new();
+                    while !f.done() {
+                        names.push(f.dotted("a trigger name")?);
+                    }
+                    entry.new_generation = Some(names);
+                }
                 other => {
                     return Err(f.err(
                         "unknown_field",
                         format!(
                             "unknown entry field {other:?}; fields are outcomes, passes, ceiling, \
-                             param"
+                             param, new_generation"
                         ),
                     ))
                 }

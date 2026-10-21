@@ -511,12 +511,15 @@ impl<'w> Engine<'w> {
         load_definition(&mut *self.w, &self.scope.domain, charter_id, None).await
     }
 
-    /// Find or create the subject row. A new `generation` value starts a new subject epoch.
+    /// Find or create the subject row. A subject without a generation takes the first one it is
+    /// given; after that a different `generation` starts a new subject epoch only when
+    /// `establishes` is set, so a late observation for an older candidate never moves it back.
     pub async fn subject(
         &mut self,
         kind: &str,
         reference: &str,
         generation: Option<&str>,
+        establishes: bool,
     ) -> StorageResult<(String, i64, Option<String>)> {
         let found = self
             .w
@@ -552,7 +555,7 @@ impl<'w> Engine<'w> {
             .as_str()
             .map(str::to_owned);
         match generation {
-            Some(g) if held.as_deref() != Some(g) => {
+            Some(g) if held.as_deref() != Some(g) && (establishes || held.is_none()) => {
                 let affected = self
                     .w
                     .execute(stmt(

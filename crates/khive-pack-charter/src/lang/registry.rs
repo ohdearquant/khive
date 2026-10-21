@@ -64,6 +64,8 @@ pub struct EntryDef {
     pub passes: Vec<String>,
     pub ceiling: Level,
     pub params: Vec<ParamDef>,
+    /// For a subject kind: the triggers whose observation starts a new generation.
+    pub new_generation: Vec<String>,
     pub vocabulary: String,
     pub vocabulary_version: i64,
 }
@@ -82,6 +84,7 @@ impl EntryDef {
                 "type": p.ty.as_str(),
                 "optional": p.optional,
             })).collect::<Vec<_>>(),
+            "new_generation": self.new_generation,
             "vocabulary": self.vocabulary,
             "vocabulary_version": self.vocabulary_version,
         })
@@ -195,7 +198,18 @@ impl Registry {
                 errors.push(Diagnostic::new(
                     entry.line,
                     "bad_entry",
-                    "a subject kind takes only a description",
+                    "a subject kind takes only a description and new_generation",
+                ));
+                continue;
+            }
+            if entry.kind != EntryKind::Subject && entry.new_generation.is_some() {
+                errors.push(Diagnostic::new(
+                    entry.line,
+                    "bad_entry",
+                    format!(
+                        "{:?}: only a subject kind declares new_generation",
+                        entry.name
+                    ),
                 ));
                 continue;
             }
@@ -258,10 +272,31 @@ impl Registry {
                         _ => entry.ceiling.unwrap_or(Level::Hard),
                     },
                     params,
+                    new_generation: entry.new_generation.clone().unwrap_or_default(),
                     vocabulary: source.name.clone(),
                     vocabulary_version: source.version,
                 },
             );
+        }
+        for entry in &source.entries {
+            for name in entry.new_generation.iter().flatten() {
+                let trigger = resolved.get(name).or_else(|| {
+                    self.entries
+                        .get(name)
+                        .filter(|held| held.vocabulary != source.name)
+                });
+                if trigger.is_none_or(|t| t.kind != EntryKind::Trigger) {
+                    errors.push(Diagnostic::new(
+                        entry.line,
+                        "unknown_trigger",
+                        format!(
+                            "{:?} starts a new generation on {name:?}, which is not a registered \
+                             trigger",
+                            entry.name
+                        ),
+                    ));
+                }
+            }
         }
         if !errors.is_empty() {
             return Err(errors);

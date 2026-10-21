@@ -754,6 +754,11 @@ async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended()
     );
     f.call(
         "charter.observe",
+        at("pull_request.head_moved", "observed", json!({}), "h2"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
         at("gate.result", "pass", json!({"name": "box"}), "h2"),
     )
     .await;
@@ -769,6 +774,59 @@ async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended()
         "completed",
         "the gate's second visit counts the pass recorded while the run was in repair"
     );
+}
+
+#[tokio::test]
+async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+    let at = |kind: &str, outcome: &str, args: Value, generation: &str| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
+               "outcome": outcome, "args": args, "generation": generation})
+    };
+    f.call(
+        "charter.observe",
+        at("pull_request.opened", "observed", json!({}), "h1"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at("pull_request.head_moved", "observed", json!({}), "h2"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at("pull_request.open", "pass", json!({}), "h1"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at("pull_request.base", "pass", json!({"branch": "main"}), "h1"),
+    )
+    .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "intake", "waiting_gate", 1),
+        "the subject is still at h2"
+    );
+    let pending = f.run(&run).await["phases"][0]["waiting_on"]["pending"].to_string();
+    assert!(
+        pending.contains("pull_request.open") && pending.contains("pull_request.base"),
+        "results for h1 arriving after the head moved to h2 neither count nor move the subject \
+         back: {pending}"
+    );
+    f.call(
+        "charter.observe",
+        at("pull_request.open", "pass", json!({}), "h2"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at("pull_request.base", "pass", json!({"branch": "main"}), "h2"),
+    )
+    .await;
+    assert_eq!(f.at(&run).await.1, "review");
 }
 
 /// The `pr_merge/v1` definition block of ADR-193, read from the record so the comparison has no

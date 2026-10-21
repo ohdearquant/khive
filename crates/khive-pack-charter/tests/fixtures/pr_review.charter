@@ -10,13 +10,14 @@ roles:
 
 triggers:
     pull_request.opened
+    pull_request.head_moved
     review.posted
     checks.concluded
     approval.recorded
 
 workflow:
     phase intake by author:
-        await pull_request.opened
+        await pull_request.opened or pull_request.head_moved
         require pull_request.open hard
         require pull_request.base(branch="main") hard
         require pull_request.ready advisory

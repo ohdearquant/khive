@@ -179,6 +179,47 @@ fn a_vocabulary_cannot_take_a_name_another_vocabulary_holds() {
 }
 
 #[test]
+fn a_subject_kind_names_the_triggers_that_start_a_new_generation() {
+    let registry = Registry::core();
+    assert_eq!(
+        registry
+            .get("pull_request")
+            .expect("pull_request")
+            .new_generation,
+        ["pull_request.opened", "pull_request.head_moved"]
+    );
+    let mut registry = Registry::core();
+    let accepted = parse_vocabulary_source(
+        "vocabulary acme v1\nsubject widget \"a widget\":\n    new_generation acme.rebuilt \
+         pull_request.head_moved\ntrigger acme.rebuilt \"the widget was rebuilt\"\n",
+    )
+    .unwrap();
+    registry
+        .add(&accepted)
+        .expect("own and core triggers both count");
+    for (source, code) in [
+        (
+            "vocabulary acme v2\nsubject widget \"a widget\":\n    new_generation acme.nope\n",
+            "unknown_trigger",
+        ),
+        (
+            "vocabulary acme v2\nsubject widget \"a widget\":\n    new_generation review.decision\n",
+            "unknown_trigger",
+        ),
+        (
+            "vocabulary acme v2\ntrigger acme.rebuilt \"rebuilt\":\n    new_generation \
+             pull_request.opened\n",
+            "bad_entry",
+        ),
+    ] {
+        let errors = Registry::core()
+            .add(&parse_vocabulary_source(source).unwrap())
+            .unwrap_err();
+        assert!(errors.iter().any(|d| d.code == code), "{code}: {errors:?}");
+    }
+}
+
+#[test]
 fn every_refusal_names_its_construct() {
     let cases: &[(&str, &str)] = &[
         (
