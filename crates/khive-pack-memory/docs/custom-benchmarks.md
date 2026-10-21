@@ -34,6 +34,16 @@ retains its original temporary database, `RuntimeConfig::default()` constructor,
 registry setup, multi-thread Tokio executor, and lifecycle; its volume-lock policy
 comes from that existing runtime configuration. No benchmark reads the user's data.
 
+Synthetic `e2e_recall` and `p95_gate` processes default the chained ANN rebuild
+coalescing delay to 5 ms before starting their executor. The finite generated write
+burst does not need the production 30-second coalescing window. An explicit
+`KHIVE_ANN_REBUILD_DEBOUNCE_MS` remains unchanged; set it to `30000` to measure the
+production delay. Real-model mode keeps the production default. This reduces
+coalescing waits paid during setup and teardown; background scheduling may also
+affect timings. The existing readiness checks, p95 settle interval, event-count
+and per-sample guards, and joined writer teardown remain. Compare runs with the
+same cohort and debounce setting; this change supplies no new reference measurements.
+
 ## Listing and running
 
 Run from the repository root:
