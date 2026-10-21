@@ -945,8 +945,13 @@ value; moving a Git commit does not implicitly repin archive content or fetch an
 ## Amendment (2026-10-19): import conflict modes over edges, the update projection and the force flag (#4766)
 
 **Status: Accepted (2026-10-21).** Refs #4766. `kkernel kg import` implements it (#5767):
-`--on-conflict error|skip|update` and `--force` in `crates/kkernel/src/kg/types.rs`, and
-`crates/kkernel/tests/kg_import_conflicts.rs` checks each case listed under Acceptance below.
+`--on-conflict error|skip|update` and `--force` in `crates/kkernel/src/kg/types.rs`. The rules
+below cover every archive record and edge except tool-registry rows:
+[ADR-036](ADR-036-kg-import-export-adapters.md) Amendment 2 skips those, with the edges incident
+to them, in every conflict mode. `crates/kkernel/tests/kg_import_conflicts.rs` checks each case
+listed under Acceptance below, except that it checks an unknown relation only with `--force`;
+without `--force` the archive reader refuses it (`invalid_relation_rejected_at_deserialize` in
+`crates/khive-runtime/src/portability.rs`).
 
 §13 names the three `--on-conflict` modes and §5 names `--force`, but neither says how a mode
 applies to edges, what `update` writes, or what `--force` bypasses. #4766 adds both flags to
@@ -960,7 +965,8 @@ unknown entity kinds follow `[schema].strict`, and unknown relations are refused
 The mode governs records and edges alike, and is decided before any write:
 
 - `error`: an archive record or edge whose UUID already exists fails the import, and nothing is
-  written.
+  written. A tool-registry row is the exception: ADR-036 Amendment 2 skips it, with its incident
+  edges, in this mode as in the others.
 - `skip`: the existing row is left untouched and counted as skipped. Edges incident to a skipped
   record are omitted and counted, as §13 states.
 - `update`: an existing record is patched as described below, and an existing edge is updated
@@ -999,7 +1005,8 @@ endpoint contract, refuses the whole import before any write. With `--force` the
 without those edges and reports each one with its edge UUID and cause (missing source, missing
 target or endpoint contract). `--force` relaxes nothing else: unknown relations, malformed weights
 or reserved fields, unknown entity kinds under a strict schema, and `error`-mode collisions are
-refused with or without it.
+refused with or without it. Tool-registry rows and their incident edges are skipped with or
+without `--force` under ADR-036 Amendment 2, and are never an `error`-mode collision.
 
 ### Scope
 
