@@ -157,8 +157,9 @@ write. Count and traverse reuse a fixed read fixture. Each fixture is destroyed
 before the next one is constructed. The current-thread executor permits at most
 two blocking threads; no batch of fixture runtimes is held concurrently.
 
-Each merge, bulk, count and traverse scenario reports 21 actual individual call
-durations: nearest-rank p50 is sorted rank 11 and p95 is rank 20. Update reports
+In ordinary benchmark mode, each selected merge, bulk, count and traverse
+scenario reports 21 actual individual call durations: nearest-rank p50 is sorted
+rank 11 and p95 is rank 20. Update reports
 p50/p95 from 1000 actual single-call timers (ranks 500/950), plus elapsed time and
 throughput for that complete 1000-call batch. The batch timer includes loop and
 per-call timer bookkeeping; argument and result buffers are prepared/reserved
@@ -172,6 +173,22 @@ throughput counts actual rewires. Setup, validation and destruction still consum
 additional wall time, especially rebuilding the largest merge fixture, even though
 `iter_custom` excludes them from the measured duration. Existing `kg_bench` sampling
 and workloads remain unchanged.
+
+Listing (`--list`) and excluded scenarios construct no lifecycle executor or
+fixture and execute no workload calls. Default test mode (without `--bench`)
+and explicit `--test` execute one fully checked Criterion unit per selected
+scenario, without the supplemental timing report. For update, that unit remains
+a complete 1000-update batch; merge, bulk, count and traverse each execute one
+complete operation. Selected tests still construct their full fixtures, including
+the 10,000-event ledger and the largest merge graph. Profiling also skips the
+supplemental report; first-use fixture setup can still appear in an external
+profile. Arguments after `--` are filter text, not mode flags.
+
+Ordinary benchmark mode emits each selected scenario's supplemental report once,
+inside its first Criterion callback before `iter_custom`. The report remains
+outside Criterion's recorded duration. The 22 lifecycle scenario IDs, fixtures,
+per-call assertions, report sample counts, percentiles and Criterion settings
+are unchanged. This scheduling change supplies no new measured baseline.
 
 ### Execution
 
