@@ -986,7 +986,12 @@ accepted by its driven arms, never by its text.
    The host setting is part of the daemon's configuration, read when the daemon starts, and is off
    unless the configuration turns it on; no verb changes it. It is checked at run time, not at
    registration, so it holds for every row carrying `network` however the row was written,
-   including a restored row or one written by another writer.
+   including a restored row or one written by another writer. Off is the daemon's bare default, the
+   value with no configuration. A deployment profile ships its own configuration template: a local
+   single-user install, where one principal holds the daemon's uid, may ship the setting on, so its
+   first networked run is not refused, and a multi-tenant or hosted profile ships it off (below).
+   A template ships it on only for macOS versions on which arm 59 has run every class (Scope,
+   item 1).
 
    For a non-anonymous token the request's `actor` must also equal the caller. That check exists
    today and runs first in preflight, before registration and policy (`handlers.rs:1025-1032`); it
@@ -1073,10 +1078,15 @@ The grantor should read these as the approval's actual scope.
    also refuses the host's LAN and VPN addresses was measured, not explained. UDP, ICMP and raw
    sockets, IPv4-mapped IPv6 forms of the host's addresses, the host's IPv6 global and link-local
    addresses, and IPv6 and UDP bind and listen were not run. Arm 59 names each of these classes as
-   an operation with its own unsandboxed control, and a host enables networked runs (Decision
-   item 3) only after arm 59 has run every class on that host's macOS version. A class that was not
-   run is not treated as refused. A multicast datagram is delivered by default to the host's own
-   members of the group as well as to other hosts, so it is an own-address path the `localhost`
+   an operation with its own unsandboxed control. Arm 59 runs in the project's own gate, once for
+   each macOS version, before a release supports networked runs on that version; it is not an
+   obligation on each host. A configuration template ships the host setting on (Decision item 3)
+   only for macOS versions on which arm 59 has run every class, and the release names those
+   versions. The daemon does not check the macOS version at run time, so a host that moves to a
+   version the arm has not run on keeps its configuration and runs a profile not measured there.
+   A class that was not run is not treated as refused. A multicast datagram is delivered by default
+   to the host's own members of the group as well as to other hosts, so it is an own-address path
+   the `localhost`
    rule does not name; arm 59 records it rather than assuming either outcome.
 2. **Anything the run can read can leave.** The existing data read set is retained: the
    materialized tree, the configured read roots, the system read roots, and the values of
@@ -1191,13 +1201,16 @@ Identity, approval, the remaining address forms and the host setting:
 
     A multicast send to a group the host has joined is run and its outcome recorded. Each operation
     has its unsandboxed control in the same run, made with the same call, so a failure to create the
-    socket, a missing privilege or a failed setup bind is never read as the profile's refusal. An
-    operation the unsandboxed control cannot perform at the daemon's uid, such as a raw socket
-    without the privilege, is recorded as unavailable to that uid; the profile only narrows what the
-    uid can do, so such an operation is closed for runs, and the arm is run again for it if the
-    daemon's privileges change. Any other class not run, and a multicast outcome other than refused,
-    keeps the host setting off on that host until the class is run or an accepted scope change
-    covers it.
+    socket, a missing privilege or a failed setup bind is never read as the profile's refusal. The
+    arm runs at an unprivileged uid; the daemon does not refuse to start as root, so this is a
+    statement about the arm, not about every daemon. An operation the unsandboxed control cannot
+    perform there, such as a raw socket without the privilege, is recorded as unavailable to an
+    unprivileged daemon; the profile only narrows what the uid can do, so such an operation is
+    closed for runs of an unprivileged daemon. A daemon run with more privilege than the arm's uid
+    is outside what the arm measured, and its configuration keeps the host setting off. Any other
+    class not run, and a multicast outcome other than refused, leaves networked runs
+    unsupported on that macOS version, so no configuration template ships the setting on for it,
+    until the class is run or an accepted scope change covers it.
 60. With the host setting off, a row carrying `network: "outbound"`, a grant pinned to it and a
     non-anonymous caller naming itself as `actor` is refused with `network_unhonoured:` naming the
     host setting, before the binary digest and with no run directory; the same holds for such a row
