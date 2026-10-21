@@ -66,6 +66,11 @@ The decider is the calling actor and must differ from the actor that requested t
 `tool_grants` and `tool_policy`, created by the pack's schema plan; when the general grants
 primitive lands, the request rows migrate onto it and this record is amended to say so.
 
+The fast path is amended for one kind of row by
+[ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations)
+(proposed, Decision item 7): for a registered row carrying `network`, a request inserts a row
+unless the decision is already `allow` from a grant. Every other row keeps the fast path.
+
 ## Acceptance
 
 1. `tool.register` of a new name creates one `project` entity with the four properties and the two
@@ -109,6 +114,10 @@ amendment closes the remaining gap on the decision side.
    over the whole entity: name, description, tags, capabilities and `registered_at` are outside it,
    so linking a capability or editing a description does not invalidate a grant. `tool.request` does
    not pin; the request records what was asked for, and only the decision binds.
+
+   Item 1's input set is amended for one property by [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (proposed):
+   `network` joins the pinned inputs when the row carries the key, and a row without it keeps these
+   four inputs byte for byte.
 
 2. **`tool.check` resolves an active grant by id.** A `granted` row is active when it has not
    expired, its pinned id equals the id the name resolves to now, and its pinned digest equals the

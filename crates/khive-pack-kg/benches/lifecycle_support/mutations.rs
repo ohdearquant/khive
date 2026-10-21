@@ -1,10 +1,11 @@
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use criterion::{black_box, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 
-use super::{bulk_params, executor, measure, report, Fixture, REPORT_SAMPLES};
+use super::{bulk_params, executor, measure, report, reports_enabled, Fixture, REPORT_SAMPLES};
 
 const UPDATES: usize = 1000;
 
@@ -53,31 +54,37 @@ fn update_batch(rt: &tokio::runtime::Runtime, corpus: usize) -> (Duration, Vec<D
 }
 
 pub fn bench_updates(c: &mut Criterion) {
-    let rt = executor();
+    let rt = OnceCell::new();
+    let reports = reports_enabled();
     let mut group = c.benchmark_group("kg_update_dispatch");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(UPDATES as u64));
     for corpus in [100, 1000] {
-        let (batch, calls) = update_batch(&rt, corpus);
-        report(
-            &format!("kg_update_dispatch/corpus{corpus}/single_call"),
-            &calls,
-            None,
-        );
-        println!(
-            "{}",
-            json!({"scenario":format!("kg_update_dispatch/corpus{corpus}/1000_updates"),
-            "updates":UPDATES, "batch_seconds":batch.as_secs_f64(),
-            "updates_per_second":UPDATES as f64 / batch.as_secs_f64()})
-        );
+        let mut reported = false;
         group.bench_with_input(
             BenchmarkId::new("1000_updates", corpus),
             &corpus,
             |b, &corpus| {
+                let rt = rt.get_or_init(executor);
+                if reports && !reported {
+                    let (batch, calls) = update_batch(rt, corpus);
+                    report(
+                        &format!("kg_update_dispatch/corpus{corpus}/single_call"),
+                        &calls,
+                        None,
+                    );
+                    println!(
+                        "{}",
+                        json!({"scenario":format!("kg_update_dispatch/corpus{corpus}/1000_updates"),
+                        "updates":UPDATES, "batch_seconds":batch.as_secs_f64(),
+                        "updates_per_second":UPDATES as f64 / batch.as_secs_f64()})
+                    );
+                    reported = true;
+                }
                 b.iter_custom(|iterations| {
-                    (0..iterations).map(|_| update_batch(&rt, corpus).0).sum()
+                    (0..iterations).map(|_| update_batch(rt, corpus).0).sum()
                 });
             },
         );
@@ -151,16 +158,10 @@ fn merge_once(rt: &tokio::runtime::Runtime, incident: usize) -> Duration {
 }
 
 pub fn bench_merge(c: &mut Criterion) {
-    let rt = executor();
+    let rt = OnceCell::new();
+    let reports = reports_enabled();
     for incident in [0, 100, 1000] {
-        let samples: Vec<_> = (0..REPORT_SAMPLES)
-            .map(|_| merge_once(&rt, incident))
-            .collect();
-        report(
-            &format!("kg_merge_dispatch/incident_each/{incident}"),
-            &samples,
-            (incident > 0).then_some(incident),
-        );
+        let mut reported = false;
         // Separate groups keep the zero-edge case from inheriting a fabricated
         // positive throughput denominator from another case.
         let mut group = c.benchmark_group(format!("kg_merge_dispatch/incident_each/{incident}"));
@@ -171,7 +172,19 @@ pub fn bench_merge(c: &mut Criterion) {
             group.throughput(Throughput::Elements(incident as u64));
         }
         group.bench_function("merge", |b| {
-            b.iter_custom(|iterations| (0..iterations).map(|_| merge_once(&rt, incident)).sum());
+            let rt = rt.get_or_init(executor);
+            if reports && !reported {
+                let samples: Vec<_> = (0..REPORT_SAMPLES)
+                    .map(|_| merge_once(rt, incident))
+                    .collect();
+                report(
+                    &format!("kg_merge_dispatch/incident_each/{incident}"),
+                    &samples,
+                    (incident > 0).then_some(incident),
+                );
+                reported = true;
+            }
+            b.iter_custom(|iterations| (0..iterations).map(|_| merge_once(rt, incident)).sum());
         });
         group.finish();
     }
@@ -191,21 +204,27 @@ fn bulk_once(rt: &tokio::runtime::Runtime, count: usize) -> Duration {
 }
 
 pub fn bench_bulk(c: &mut Criterion) {
-    let rt = executor();
+    let rt = OnceCell::new();
+    let reports = reports_enabled();
     let mut group = c.benchmark_group("kg_create_bulk_dispatch");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     for count in [10, 100, 1000] {
-        let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| bulk_once(&rt, count)).collect();
-        report(
-            &format!("kg_create_bulk_dispatch/atomic/{count}"),
-            &samples,
-            Some(count),
-        );
+        let mut reported = false;
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::new("atomic", count), &count, |b, &count| {
-            b.iter_custom(|iterations| (0..iterations).map(|_| bulk_once(&rt, count)).sum());
+            let rt = rt.get_or_init(executor);
+            if reports && !reported {
+                let samples: Vec<_> = (0..REPORT_SAMPLES).map(|_| bulk_once(rt, count)).collect();
+                report(
+                    &format!("kg_create_bulk_dispatch/atomic/{count}"),
+                    &samples,
+                    Some(count),
+                );
+                reported = true;
+            }
+            b.iter_custom(|iterations| (0..iterations).map(|_| bulk_once(rt, count)).sum());
         });
     }
     group.finish();

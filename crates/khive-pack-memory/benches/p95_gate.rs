@@ -576,6 +576,8 @@ fn main() {
     }
     let executor = if synthetic {
         fixture::reject_fts_overrides();
+        // SAFETY: this main branch has not created an executor or any threads.
+        unsafe { fixture::configure_synthetic_ann_debounce() };
         fixture::executor()
     } else {
         // Equivalent to the original #[tokio::main] multi-thread executor.

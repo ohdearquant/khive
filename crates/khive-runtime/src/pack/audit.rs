@@ -104,6 +104,41 @@ pub(super) fn enrich_stream_truncate_success(
     }
 }
 
+/// Content-free query shape on successful search dispatch rows only.
+/// Arm facts come from execution, never from hit provenance or hit counts.
+/// `effective_limit` is the effective public limit (default 10, maximum 100), not the
+/// larger candidate window used internally before filtering.
+pub(super) fn enrich_search_success(
+    event: &mut Event,
+    gate_req: &GateRequest,
+    result: &Value,
+    arms: crate::search_audit::SearchArms,
+) {
+    if gate_req.verb != "search" {
+        return;
+    }
+    let Some(rows) = result.as_array() else {
+        return;
+    };
+    let match_mode = match gate_req.args.get("text_mode").and_then(Value::as_str) {
+        None | Some("all_terms") => "all_terms",
+        Some("any_term") => "any_term",
+        Some(_) => return,
+    };
+    let limit = gate_req
+        .args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .min(100);
+    if let Value::Object(ref mut payload) = event.payload {
+        payload.insert("match_mode".into(), Value::from(match_mode));
+        payload.insert("arms".into(), Value::from(arms.as_str()));
+        payload.insert("effective_limit".into(), Value::from(limit));
+        payload.insert("result_count".into(), Value::from(rows.len()));
+    }
+}
+
 /// Process-wide pure-observability audit appends whose errors were logged
 /// and swallowed — never an obligation-bearing row, which fails its dispatch
 /// instead and is counted separately by

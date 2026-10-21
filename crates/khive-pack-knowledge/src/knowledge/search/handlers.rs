@@ -73,6 +73,21 @@ async fn apply_atom_weights(
     (weights, None)
 }
 
+fn suggest_word_count(query: &str) -> usize {
+    let mut other_words = 0;
+    let mut cjk_letters = 0;
+    for piece in query.split_whitespace() {
+        let mut has_cjk = false;
+        for ch in piece.chars().filter(|ch| khive_text::is_cjk_char(*ch)) {
+            has_cjk = true;
+            // Script blocks also contain punctuation, such as Katakana middle dot.
+            cjk_letters += usize::from(ch.is_alphabetic());
+        }
+        other_words += usize::from(!has_cjk);
+    }
+    other_words + cjk_letters / 2
+}
+
 // ─── handler impls ────────────────────────────────────────────────────────────
 
 impl KnowledgeHandlers {
@@ -441,11 +456,12 @@ impl KnowledgeHandlers {
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
-        let word_count = raw_query.split_whitespace().count();
+        let word_count = suggest_word_count(&raw_query);
         if word_count < 5 {
             return Err(RuntimeError::InvalidInput(format!(
                 "suggest query must be at least 5 words for meaningful domain matching \
-                 (got {word_count}). Use knowledge.search for short keyword queries."
+                 (got {word_count}; two CJK letters count as one word). \
+                 Use knowledge.search for short keyword queries."
             )));
         }
         let limit = p.limit.unwrap_or(8).clamp(1, 100);

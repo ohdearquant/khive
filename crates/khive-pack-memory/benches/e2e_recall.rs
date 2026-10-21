@@ -77,6 +77,10 @@ fn main() {
     }
     report::assert_not_list_probe();
     fixture::reject_fts_overrides();
+    if synthetic {
+        // SAFETY: main has not created Criterion, an executor, or any threads.
+        unsafe { fixture::configure_synthetic_ann_debounce() };
+    }
     let mut criterion = Criterion::default()
         .sample_size(10)
         .warm_up_time(Duration::from_millis(100))
