@@ -66,7 +66,9 @@ covers every charter, so the open loops of every declared procedure are one quer
 
 A subject is a registered subject kind plus a reference under the policy domain. A pull request (forge, repository id,
 pull request id, target) is one kind. ADR-193 D8's generation and run-key rules apply per kind, and each kind declares
-what starts a new generation.
+what starts a new generation: the triggers whose observation moves the subject to the generation it names. Any other
+observation is recorded at the generation it names and never moves the subject, so a late result for an older candidate
+cannot roll the subject back.
 
 ### D6. Levels and milestones are unchanged
 
