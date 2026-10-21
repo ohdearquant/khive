@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-21
+
 ### Removed
 
 - `khive_storage::graph::CommitAnnotationCursorValue`,
@@ -44,6 +46,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueryMailboxScope`, filtering every note source, synthetic observation target and graph
   edge in the compiled SQL by the note store's mailbox rule. `khive_query::compile` keeps
   its unscoped behavior for callers that supply no scope.
+- Add `stream.truncate` to remove a stream prefix atomically while preserving its sequence
+  floor. `stream.read` and `stream.stat` report the floor, and empty streams retain their
+  sequence position.
+- KG archive imports now support explicit conflict handling, a dry-run preflight and forced
+  skipping of invalid edges. Dry runs report the planned counts without writing; force only
+  relaxes endpoint validation.
+- Change sets add `RestoreOp` for active entities, notes and edges, and soft-delete inversion
+  now produces restore operations. Restore cannot yet be applied, and schema-version 1
+  change sets no longer decode.
+- `attach(id, role, bytes, media_type?)` stores a role-keyed attachment on an existing entity or
+  note on the main backend, replacing any earlier attachment in that role. Representations a pack
+  protects stay with that pack, and inline input keeps the 64 MiB limit. `get` returns role-keyed
+  attachment metadata and hydrates only the roles a caller requests, with verified base64 bytes;
+  an unknown role is refused. Soft deletion keeps attachment rows and hard deletion removes them.
+- `RuntimeCloseOwner` closes a quiescent single-backend runtime slot explicitly. A successful close
+  waits for the audit tasks, drains the writer and joins the final store's timeout sink. Progress
+  survives cancellation, and while other holders keep pool, backend or audit roots alive the close
+  reports `Incomplete` with the observed strong counts so the host can release them and retry.
+  Runtimes with embeddings, ANN, blob hydration, split events, host background loops or several
+  backends are refused at preflight. Ordinary `Drop` remains best effort.
+
+### Changed
+
+- The knowledge suggest verb now admits unspaced Chinese, Japanese and Korean queries by counting
+  every two supported letters as one word, while retaining the existing whitespace-piece
+  count for other scripts.
+- Successful search audit records include the retrieval arms actually started, lexical match
+  mode, effective limit and result count, including for empty results.
+- `kkernel reindex` reads `[embed].batch_size` from the selected config file when the option
+  is omitted; `--batch-size` takes precedence and the configured value is bounded to 1–500.
+- Quarantined email records now retain the parsed To recipients in `quarantine_claimed_to`.
+  Empty recipient lists and malformed-message envelopes omit the field.
+- `comm.thread` renders only the selected visible message owners when building message JSON
+  and previews, avoiding rendering discarded rows.
+- Atom weights are applied to knowledge search results after embedding blending and status
+  normalization. Missing weights use 1.0, and unavailable weight reads preserve results with
+  a degradation reason.
+- Event-count cursor reads now preserve typed `Timeout` and `AdmissionTimeout` refusals from
+  storage, including failures while checking page-boundary completeness.
+- When `KHIVE_SEARCH_PROFILE` is enabled, deadline phase records now carry the same search
+  call and backend identifiers as their profile records, distinguishing timeout and late
+  completion observations.
+- Legacy quarantine cleanup now has a partial index for its typed quarantine and blank-slug
+  filters, while keeping the existing expiry-or-creation ordering.
+- MCP instructions now direct clients to the `request` tool's verb list for linked packs
+  that are not loaded.
+- MCP server instructions no longer repeat the verb catalog already present in the `request`
+  tool description.
+- Entity vector searches exclude knowledge atom vectors before candidate limits are applied,
+  so nearby atoms cannot crowd entities out of entity search results. Other vector searches
+  retain their existing populations.
+- SQLite vector batch searches now use one admitted reader and one read transaction per batch,
+  so every query sees the same snapshot. Per-query failures remain isolated.
+- Writable cached SQL queries on standalone writers and pools with the write queue disabled
+  now take write admission immediately before execution and retain the connection through
+  settlement. Queued writer queries retain their existing read-only behavior.
+- Standalone database writes now use consuming write owners that keep the connection and
+  volume lease through settlement, including when an async observer is cancelled.
+- Malformed active tool-grant rows now return an authorization error naming the row and
+  invalid column, instead of falling through to policy or the default decision.
+- Windows code-map pools can now obtain the native handle for an opened main database file,
+  allowing the post-open identity check to succeed without reopening the path.
+- Event-daemon supervision retains a child handle after transient exit-poll errors, allowing
+  a later poll to reap it and preventing a second daemon from starting beside it.
+- On Unix, dropping a volume lease explicitly unlocks its file before closing it, so a
+  duplicated descriptor cannot keep the old lease locked.
+- Refusal diagnostics now mask credential-shaped values before including them in error messages:
+  brain profile lifecycle and feedback signals; comm inbox box and status values and thread order;
+  scheduled-action `kind`, `entity_kind` and `note_kind`; session export formats, resume and export
+  ids, list timestamps and search sources and timestamps; memory types, fusion strategies and
+  feedback signals; knowledge feedback signals and section keys; knowledge import `chunk_strategy`
+  and `format`; and tool argument values. Ordinary invalid values, accepted-value lists, validation
+  order and error variants are unchanged.
+- Invalid KG search `text_mode`, `source` and `order_by` values are now named in the diagnostic,
+  masked when credential-shaped, and an invalid tool string-list argument identifies the refused
+  element.
+- `kkernel reindex` warns once when the selected configuration sets `embed.batch_size` above the
+  500 cap, naming the file, the configured value and the effective value. An explicit
+  `--batch-size`, an in-range value, a validation-only run and single-record repair do not warn.
+- Bounded FTS ranking (`RankWithinCap`) materializes the bounded candidate rows before ranking,
+  avoiding a second id lookup, and duplicate ids outside the exact filters no longer expand the
+  gather cap. Default ranked search is unchanged.
 
 ### Fixed
 
@@ -53,6 +137,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering and pagination, as `get`, `search`, `list`, `neighbors` and `context` already
   did, so another actor's message copies and quarantine records can no longer be read
   through a query. An edge whose endpoint is a hidden message is dropped.
+- Idle ANN checkpoint tasks now release their runtime and storage handles when the final
+  ANN owner is dropped, without waiting for the checkpoint interval.
+- Updates rustls-webpki and webpki-roots to patched releases addressing RUSTSEC-2026-0381
+  and RUSTSEC-2026-0382.
+- Knowledge search recovers eligible rows from the namespace index before checking FTS
+  membership when the bounded global FTS window contains foreign or ineligible rows.
+- `brain.resolve` now returns a successful absence result when a loaded consumer has no
+  eligible profile, without adding an error audit row.
+- Ordinary runtime builds no longer retain per-generation audit history that is only read by
+  instrumentation; cumulative counters and health metrics remain available.
+- Non-Unix builds no longer compile Unix-only event forwarder and server exports.
+- `RankWithinCap` text search keeps every exact filter when a candidate id occurs in more than one
+  namespace.
 
 ### Breaking (Rust crates)
 
@@ -67,6 +164,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
   `WriterGuard::transaction`, which admit the write before it runs and settle the
   connection before the guard is released.
+- The public standalone writer opener is removed. Use the consuming
+  `standalone_autocommit` or `standalone_transaction` operations, or the restricted
+  `open_standalone_checkpoint` handle.
+- `khive_changeset::Op` adds `Restore`, and `khive_changeset::InvertError` adds
+  `InverseRestore`, which also moves the implicit discriminant of `InverseUpdate`.
+  Exhaustive matches on either enum must handle the new variant.
+- `khive_runtime::KhiveConfig` adds `embed`, the `[embed]` table that carries the
+  reindex batch size. Direct struct literals must set it or use `Default`.
+- `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation`. Exhaustive
+  matches must handle it.
+- `kkernel::kg::ImportArgs` adds `on_conflict`, `force`, `dry_run` and
+  `continue_on_error`. Direct struct literals must set them.
+
+### Upgrade note
+
+- Change sets now use schema version 2. Change sets stored at schema version 1 no longer decode,
+  so a canonical proposal stored before this release must be proposed again.
 
 ## [0.14.0] - 2026-10-18
 

@@ -15,10 +15,10 @@ description = "Code ontology pack - typed edge rules and audit findings vocabula
 bench = false
 
 [dependencies]
-khive-types = { version = "0.14.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.14.0", path = "../khive-runtime" }
-khive-storage = { version = "0.14.0", path = "../khive-storage" }
-khive-fs = { version = "0.14.0", path = "../khive-fs" }
+khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
+khive-storage = { version = "0.15.0", path = "../khive-storage" }
+khive-fs = { version = "0.15.0", path = "../khive-fs" }
 tokio = { workspace = true }
 inventory = { workspace = true }
 async-trait = { workspace = true }
@@ -37,8 +37,8 @@ rusqlite = { workspace = true, features = ["functions"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
-khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.15.0", path = "../khive-db", features = ["test-support"] }
+khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 

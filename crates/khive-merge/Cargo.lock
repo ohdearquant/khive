@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "khive-changeset"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "khive-score",
  "serde",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "khive-merge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "khive-runtime",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "khive-types",
  "thiserror",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -1448,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "serde",
