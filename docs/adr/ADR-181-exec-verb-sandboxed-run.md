@@ -860,3 +860,218 @@ certification.
 Implementation released by this ratification is receipt-only, with the tests this amendment lists
 for the receipt vocabulary, `seen_alive` preservation, historical receipts and the uniform
 publication policy, plus the reserved-value test above.
+
+## Amendment 13 (2026-10-21): an outbound network declaration on exec registrations
+
+**Status: Proposed.** Partial amendment. It amends, for registrations that declare network only:
+Decision step 3 ("no network"), Acceptance 4 as restated by Amendment 11, the posture sentence in
+Amendment 12's Ratification scope ("a run has no network"), Amendment 1 item 5 (one new refusal
+class), Amendment 1 item 7 with Amendment 7 (two additive `sandbox` fields) and Amendment 2 item 3
+(`exec.identity` reports a second template digest). It amends ADR-180 Amendment 1 item 1 (the
+grant pin inputs) for one property. Every other decision in this record and in ADR-180 stands. A
+registration that does not declare network runs exactly as before, and its pin and grants are
+unchanged byte for byte.
+
+### Context
+
+A registered tool that talks to a remote service, such as a deployment CLI or a package registry
+client, cannot run under exec today. The profile allows no network operation
+(`khive-pack-exec/src/sandbox.rs:9-10`), and the renderer takes no network input:
+`render_profile(run_dir, read_roots, never)` (`sandbox.rs:168`). Run without network, such a tool
+fails with timeouts and resolution errors that read as the remote service's fault, not the policy's.
+
+The policy surface already distinguishes how a run was allowed. `tool.check` answers with a
+`source` of `grant`, `policy` or `default`, and exec records it on the receipt
+(`khive-pack-exec/src/handlers.rs:1048-1052`). A grant matches only while its pinned registry id
+and definition digest equal the row's current ones (ADR-180 Amendment 1 item 2). The digest covers
+four properties, and a missing one is written into the pinned bytes as an explicit null
+(`khive-pack-tool/src/pin.rs:11-24`). A grant whose pattern ends in `*` carries a null pin and stops
+being active once any matching name is registered (ADR-180 Amendment 1 item 3's rule applied to
+patterns; test `wildcard_grants_record_registrations_that_precede_the_approval`,
+`khive-pack-tool/tests/grant_pins.rs:304`). Since
+exec runs only registered tools, a run allowed from `grant` is always allowed by an exact-name grant
+pinned to the row it runs.
+
+One preflight detail matters below. The check that the request's `actor` equals the authenticated
+caller is skipped for an anonymous token (`handlers.rs:1025-1031`), so an anonymous caller can name
+any actor and is decided against that actor's grants.
+
+What the platform does was measured before writing the rule set (macOS 27.2, `/usr/bin/curl` and
+`/usr/bin/nc`, this record's template written out by hand from `render_profile` at main `76717299`, rules appended;
+every target answered from an unsandboxed process as the control):
+
+| profile                                                              | remote https  | v4 loopback | v6 loopback | host's own LAN and VPN addresses | unix socket under `/private/tmp` | listen  |
+| -------------------------------------------------------------------- | ------------- | ----------- | ----------- | -------------------------------- | -------------------------------- | ------- |
+| template today                                                       | refused       | not run     | not run     | not run                          | not run                          | not run |
+| plus `(allow network-outbound)`, no resolver reads                   | no resolution | not run     | not run     | not run                          | not run                          | not run |
+| plus `(allow network-outbound)` and resolver reads                   | reached       | reached     | reached     | not run                          | reached                          | refused |
+| plus `(allow network-outbound (remote ip "*:*"))` and resolver reads | no resolution | reached     | not run     | not run                          | refused                          | not run |
+| the same plus `(deny network-outbound (remote ip "localhost:*"))`    | no resolution | reached     | not run     | not run                          | refused                          | not run |
+| the rule set in item 5                                               | reached       | refused     | refused     | refused                          | refused                          | refused |
+
+Three readings follow. A bare outbound allowance reaches every loopback service on the host and any
+unix socket the run can name, which is the host's own daemons rather than the internet. Name
+resolution needs the resolver's unix socket; an address-only rule resolves nothing. And the
+`localhost` deny took effect in the last row and had no effect in the row above it, which differ only by
+the resolver socket allowance; this was repeated and is not explained. The rule set is therefore
+accepted by its driven arms, never by its text.
+
+### Decision
+
+1. **One registration property, `network`, with one value.** A registry row either has no `network`
+   property, and runs with no network as today, or has `network: "outbound"`. `tool.register`
+   accepts `network` only with the value `"outbound"` and only with an `exec:` source, since no
+   other executor reads it; any other value, including null, and `network` on any other source are
+   refused with the reason named. There is no host or port list. The Seatbelt rules below name `*`
+   and `localhost` as hosts and nothing narrower, so a destination list would read as enforced when
+   it is not. Per-destination egress is later work and is not decided here.
+
+   Re-registering an existing name keeps the stored row unchanged (ADR-180 test
+   `re_registration_keeps_the_approved_object_and_definition`), so a `network` passed on a
+   re-registration does not reach the row. `tool.describe`, `tool.list` and the register response
+   report the stored `network`, so the caller sees what is stored rather than what was asked.
+
+2. **`network` joins the grant pin when the row carries it.** This amends ADR-180 Amendment 1
+   item 1 for one property. When the row's properties contain the key `network`, the pinned inputs
+   contain `network` with the stored value, whatever that value is. When the key is absent, the
+   pinned inputs are the four properties exactly as today, with no `network` key.
+
+   This is the one exception to `pin.rs`'s explicit-null rule, and the reason is the upgrade. Under
+   that rule a row without the key would gain `"network": null` in its pinned bytes, its digest
+   would change, and every grant written before the change would stop being active at once, for
+   rows nobody changed. With the exception, a row without `network` keeps byte-identical pinned
+   inputs and keeps its grants. A row that gains the key, by any path, has a different digest, so a
+   grant approved for the row without network does not cover it and the owner grants again. No verb
+   adds the key to an existing row today (item 1); the pin covers the paths ADR-180 Amendment 1
+   item 4 names: a restore, a second writer inside the owning pack, a later update verb.
+
+3. **The declaration is honoured only by a grant to an authenticated caller.** A run of a row
+   carrying `network` proceeds only when all of these hold, checked in preflight after the policy
+   decision and before the binary digest:
+   - the stored value is `"outbound"`;
+   - the decision is `allow` with `source` `grant`;
+   - the token is not anonymous, and the authenticated caller equals the request's `actor` (the
+     second half is already enforced for a non-anonymous token at `handlers.rs:1027`).
+
+   A `policy` or `default` allow never opens network. The anonymous condition closes the path in
+   the Context: without it, an anonymous caller naming another actor would be decided against that
+   actor's grant and run with its network. A caller-supplied actor may be removed in general later;
+   this condition is exec's own floor and does not wait for that.
+
+4. **A run that would not be honoured is refused, never run without network.** When the row
+   carries `network` and any condition in item 3 fails, exec writes a refusal receipt (Amendment 1
+   item 5): `decision` as decided, `tree_out` null, no run directory, `sandbox` null (Amendment 7),
+   and a `reason` that starts with `network_unhonoured:` and names the failed condition (the
+   decision source, or an anonymous caller). A stored value other than `"outbound"` is refused the
+   same way with the prefix `network_invalid:`. Refusing is never weaker than running without
+   network, and the reason names the real cause instead of a timeout inside the tool.
+
+5. **An honoured run gets outbound rules only, under its own template.** The profile is this
+   record's template with these lines appended:
+
+   ```text
+   (allow network-outbound (remote ip "*:*"))
+   (allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+   (deny network-outbound (remote ip "localhost:*"))
+   (allow file-read-metadata (literal "/etc") (literal "/var") (literal "/private/var/run"))
+   (allow file-read* (literal "/private/var/run/resolv.conf"))
+   ```
+
+   Nothing allows bind, listen or inbound traffic, so the template's default deny keeps refusing
+   them. The renderer takes the honoured decision as an input; the outbound template has its own
+   template digest, computed the way `template_digest` computes today's (`sandbox.rs:237`).
+   `exec.identity` keeps `profile_template_digest` for the template without network and adds
+   `profile_template_digest_outbound`. The receipt's `profile_digest` already digests the profile
+   that ran, so every receipt names which one it was.
+
+6. **The receipt names the declaration and the profile separately.** The `sandbox` object gains
+   two additive fields (Amendment 7): `network_declared`, read from the registry row, and
+   `network_honoured`, read from the template the renderer used. Under this amendment a prepared
+   sandbox always has them equal, since an unhonoured declaration is refused before the sandbox is
+   prepared. They are kept as two fields because they come from two sources, and their equality is
+   an arm: a renderer that ignored the decision would show up as a mismatch.
+
+### What a grant on a networked registration approves
+
+The grantor should read these as the approval's actual scope.
+
+1. **Every routable address that is not the host's own.** `*` admits other hosts on private
+   networks and VPN peers the host can route to. That was not measured, and it holds by
+   construction. Only the host's own addresses are refused.
+2. **Anything the run can read can leave.** The read set does not change: the materialized tree,
+   the configured read roots, the system read roots, and the values of allow-listed environment
+   keys the caller supplied. A grant for a networked tool approves sending any of them anywhere.
+3. **Code the tool fetches runs.** The profile allows process execution except the denied set
+   (Amendment 9), so a binary the tool downloads into the run directory runs under the same profile.
+   Materialized tree content can already do that; network adds code whose origin is outside the
+   store.
+4. **Outbound reach can outlive the receipt.** A descendant that leaves the initial process group
+   keeps the profile it was launched under (Amendment 11), so a detached descendant of an honoured
+   run keeps outbound reach after `exec.run` returns. Amendment 11's survivor arm keeps its refused
+   outbound connection for runs without network; for an honoured run the survivor's write and bind
+   denials still hold and its outbound reach does not end. This stays open with the process-lifetime
+   design (#3631).
+5. **Names go through the host resolver.** Lookups the run makes are sent by the host's resolver,
+   and the resolver socket is the one unix socket the run may reach.
+6. **Measured with one client.** The rule set was measured with `/usr/bin/curl`. A tool that checks
+   certificates through a platform service it reaches by a mach lookup is not covered; adding that
+   service is a template change with a new template digest and its own arm.
+7. **Other backends.** A backend other than Seatbelt must enforce the declaration as stated here or
+   refuse a run that carries it. It never ignores it.
+
+### Acceptance
+
+The network arms (50 to 56) run on macOS and pass only with each operation's unsandboxed control
+succeeding in the same run; an arm whose control fails is reported as not run, never as passed. An
+arm that needs something the host lacks (no egress for 50, no non-loopback address for 51) is also
+not run, not passed. They run again on every macOS version the daemon supports, because the rule
+set is accepted by these arms and not by its text.
+
+Pin and registration:
+
+43. A row without `network` has pinned bytes equal to the bytes the four-property function produces
+    (a golden fixture computed before the change), and a grant written before the change still
+    answers `allow` from `grant` after it. Mutation control, stated before running: writing
+    `"network": null` into the pinned inputs of a row without the key turns this arm red.
+44. With an active grant on a row without `network`, writing `network: "outbound"` onto the row
+    through the same storage write the ADR-180 pin tests use makes `tool.check` answer from policy
+    or default, and `exec.run` refuses. A new grant on the changed row answers `allow` from `grant`
+    with the new digest. Mutation control: leaving `network` out of the pinned inputs turns this arm
+    red.
+45. `tool.register` accepts `network: "outbound"` with an `exec:` source and refuses `network` set
+    to null, `"inbound"`, `"OUTBOUND"` and `true`, and `network` on an `mcp:` source, each with the
+    reason named. The accepted case is the control.
+
+Decision path (each refusal arm asserts the `network_unhonoured:` or `network_invalid:` prefix,
+`sandbox` null, `tree_out` null and no run directory; each has the same row run by an authenticated
+caller holding an exact-name grant as its control):
+
+46. A row carrying `network` allowed from `policy` is refused.
+47. A row carrying `network` allowed from `default` is refused.
+48. An anonymous token naming an actor that holds the grant is refused. Mutation control: removing
+    the anonymous condition turns this arm red and leaves 46 and 47 green.
+49. A stored `network` value other than `"outbound"`, written through storage, is refused with
+    `network_invalid:`, and the pin includes the stored value (its digest differs from the same row
+    without the key).
+
+An honoured run (exact-name grant, authenticated caller):
+
+50. Resolves a public name and connects to a remote HTTPS endpoint named by the test configuration.
+51. Is refused a connection to a v4 loopback listener, to a v6 loopback listener, and to a listener
+    on each non-loopback address of the host. Mutation control: removing the `localhost` deny line
+    turns this arm red.
+52. Is refused a connection to a unix socket under the run's temporary directory and under
+    `/private/tmp`.
+53. Is refused bind and listen on a TCP port on `127.0.0.1` and on `0.0.0.0`.
+54. Records `network_declared` and `network_honoured` both true, and a `profile_digest` whose
+    profile re-renders from the outbound template; `exec.identity` reports two different template
+    digests. Mutation control: rendering the template without network for an honoured run turns 50
+    and this arm red.
+55. A row without `network`, granted, runs under the template without network: both fields false,
+    outbound connect refused as in Acceptance 4. Mutation control: rendering the outbound template
+    for every allowed run turns this arm red.
+56. A detached descendant of an honoured run, alive after the receipt, is still refused a write
+    outside the run directory and a bind, and still reaches the remote endpoint. This arm records
+    item 4 of the scope above as current behavior; it is not a containment claim.
+
+Implementation follows acceptance of this amendment and goes through the usual review and gates.
