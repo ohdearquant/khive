@@ -118,6 +118,7 @@ async fn remember_masks_refused_memory_types_and_preserves_valid_writes() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_masks_refused_types_and_strategies_without_changing_accepted_sets() {
     let registry = fixture();
     let created = remember(&registry, "semantic").await;
