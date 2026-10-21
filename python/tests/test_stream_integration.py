@@ -144,7 +144,7 @@ def test_stream_batch_two_processes_atomic_members_are_consecutive(scratch_daemo
             assert batch == list(range(batch[0], batch[0] + 3)), batch
             all_seqs.extend(batch)
     assert sorted(all_seqs) == list(range(1, 121))
-    assert one(session(scratch_daemon), "stream.stat", stream=stream) == {"count": 120, "head_seq": 120}
+    assert one(session(scratch_daemon), "stream.stat", stream=stream) == {"count": 120, "head_seq": 120, "floor_seq": 1}
 
 
 def test_stream_batch_two_processes_per_member_increase_and_interleave(scratch_daemon):

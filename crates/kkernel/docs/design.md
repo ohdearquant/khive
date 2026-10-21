@@ -58,11 +58,11 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 29 verbs: the bare names (no dot prefix) `create`, `get`,
+- The kg substrate pack owns 30 verbs: the bare names (no dot prefix) `create`, `get`,
   `list`, `count`, `stats`, `update`, `delete`, `restore`, `search`, `link`, `neighbors`, `traverse`,
   `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `schema`, `context`
   (ADR-089), `whoami`, `scan`, `db_diagnostics` (ADR-091), `apply_changeset` (ADR-102), plus its one documented
-  sub-namespace, `stream.append` / `stream.read` / `stream.stat` / `stream.batch` (ADR-174 §2).
+  sub-namespace, `stream.append` / `stream.read` / `stream.stat` / `stream.batch` / `stream.truncate` (ADR-174 §2 and Amendment 3.2).
 - Every other pack must prefix verbs with `<pack>.` (e.g. `memory.recall`).
 - Sub-variants use underscore, not nested dots: `memory.recall_embed`, not
   `memory.recall.embed`.
