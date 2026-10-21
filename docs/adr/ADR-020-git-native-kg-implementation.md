@@ -944,7 +944,9 @@ value; moving a Git commit does not implicitly repin archive content or fetch an
 
 ## Amendment (2026-10-19): import conflict modes over edges, the update projection and the force flag (#4766)
 
-**Status: Proposed.** Refs #4766.
+**Status: Accepted (2026-10-21).** Refs #4766. `kkernel kg import` implements it (#5767):
+`--on-conflict error|skip|update` and `--force` in `crates/kkernel/src/kg/types.rs`, and
+`crates/kkernel/tests/kg_import_conflicts.rs` checks each case listed under Acceptance below.
 
 §13 names the three `--on-conflict` modes and §5 names `--force`, but neither says how a mode
 applies to edges, what `update` writes, or what `--force` bypasses. #4766 adds both flags to
