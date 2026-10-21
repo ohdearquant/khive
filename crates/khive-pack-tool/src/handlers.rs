@@ -40,15 +40,21 @@ async fn pause_before_claim() {
 // ── parameter helpers ────────────────────────────────────────────────────────
 
 fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
     match params.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.trim().is_empty() => Err(RuntimeError::InvalidInput(format!(
             "{key} must be a non-empty string when provided"
         ))),
         Some(Value::String(s)) => Ok(Some(s.trim().to_string())),
-        Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{key} must be a string; got {other}"
-        ))),
+        Some(other) => {
+            let rendered = other.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &rendered);
+            Err(RuntimeError::InvalidInput(format!(
+                "{key} must be a string; got {shown}"
+            )))
+        }
     }
 }
 
@@ -67,6 +73,8 @@ fn opt_i64(params: &Value, key: &str) -> Result<Option<i64>, RuntimeError> {
 }
 
 fn opt_str_list(params: &Value, key: &str) -> Result<Vec<String>, RuntimeError> {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
     match params.get(key) {
         None | Some(Value::Null) => Ok(vec![]),
         Some(Value::Array(items)) => items
@@ -76,24 +84,34 @@ fn opt_str_list(params: &Value, key: &str) -> Result<Vec<String>, RuntimeError> 
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| {
+                        let rendered = v.to_string();
+                        let shown =
+                            mask_for_redaction_surface(RedactionSurface::GateProbe, &rendered);
                         RuntimeError::InvalidInput(format!(
-                            "{key} must be an array of non-empty strings"
+                            "{key} must be an array of non-empty strings; got {shown}"
                         ))
                     })
             })
             .collect(),
-        Some(_) => Err(RuntimeError::InvalidInput(format!(
-            "{key} must be an array of strings"
-        ))),
+        Some(other) => {
+            let rendered = other.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &rendered);
+            Err(RuntimeError::InvalidInput(format!(
+                "{key} must be an array of strings; got {shown}"
+            )))
+        }
     }
 }
 
 fn one_of(value: &str, allowed: &[&str], what: &str) -> Result<(), RuntimeError> {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
     if allowed.contains(&value) {
         Ok(())
     } else {
+        let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
         Err(RuntimeError::InvalidInput(format!(
-            "{what} must be one of {}; got {value:?}",
+            "{what} must be one of {}; got {shown:?}",
             allowed.join(", ")
         )))
     }
