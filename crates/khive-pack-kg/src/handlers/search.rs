@@ -11,6 +11,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     micros_to_iso, KhiveRuntime, NamespaceToken, RankScoreKind, RuntimeError, SearchSignals,
     SearchSource, VerbRegistry,
@@ -144,10 +145,11 @@ impl ValidatedSearchRequest {
         let text_mode = match p.text_mode.as_deref() {
             None | Some("all_terms") => TextQueryMode::Plain,
             Some("any_term") => TextQueryMode::AnyTerm,
-            Some(_) => {
-                return Err(RuntimeError::InvalidInput(
-                    "text_mode must be one of: all_terms, any_term".to_string(),
-                ));
+            Some(value) => {
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
+                return Err(RuntimeError::InvalidInput(format!(
+                    "text_mode must be one of: all_terms, any_term; got {shown:?}"
+                )));
             }
         };
         super::common::require_object_param(p.properties.as_ref(), "properties")?;
@@ -182,10 +184,11 @@ impl ValidatedSearchRequest {
             Some("text") => Some(SearchSource::Text),
             Some("vector") => Some(SearchSource::Vector),
             Some("both") => Some(SearchSource::Both),
-            Some(_) => {
-                return Err(RuntimeError::InvalidInput(
-                    "source must be one of: text, vector, both".to_string(),
-                ));
+            Some(value) => {
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
+                return Err(RuntimeError::InvalidInput(format!(
+                    "source must be one of: text, vector, both; got {shown:?}"
+                )));
             }
         };
         // Both time orders are descending: the question they exist to answer is
@@ -197,10 +200,11 @@ impl ValidatedSearchRequest {
             None | Some("score") => SearchOrder::Score,
             Some("updated_at") => SearchOrder::UpdatedAt,
             Some("created_at") => SearchOrder::CreatedAt,
-            Some(_) => {
-                return Err(RuntimeError::InvalidInput(
-                    "order_by must be one of: score, updated_at, created_at".to_string(),
-                ));
+            Some(value) => {
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
+                return Err(RuntimeError::InvalidInput(format!(
+                    "order_by must be one of: score, updated_at, created_at; got {shown:?}"
+                )));
             }
         };
 
