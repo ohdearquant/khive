@@ -1195,13 +1195,16 @@ Identity, approval, the remaining address forms and the host setting:
       IPv6 global and link-local address of the host, link-local with its scope;
     - a TCP bind and listen, and a UDP bind, on `::1` and `::`, and a UDP bind on `127.0.0.1` and
       `0.0.0.0`;
-    - creating a raw socket (`SOCK_RAW`, IPv4 and IPv6, ICMP protocol) and sending on it, and an
-      ICMP echo through a datagram ICMP socket (`SOCK_DGRAM`, `IPPROTO_ICMP`), each to the host's own
-      addresses.
+    - creating a raw socket (`AF_INET`, `SOCK_RAW`, `IPPROTO_ICMP` and `AF_INET6`, `SOCK_RAW`,
+      `IPPROTO_ICMPV6`) and sending on it, and an echo through a datagram ICMP socket in each family
+      (`AF_INET`, `SOCK_DGRAM`, `IPPROTO_ICMP` and `AF_INET6`, `SOCK_DGRAM`, `IPPROTO_ICMPV6`), each
+      a family-correct echo request to the host's own addresses of that family.
 
     A multicast send to a group the host has joined is run and its outcome recorded. Each operation
     has its unsandboxed control in the same run, made with the same call, so a failure to create the
-    socket, a missing privilege or a failed setup bind is never read as the profile's refusal. The
+    socket, a missing privilege or a failed setup bind is never read as the profile's refusal. A
+    control that fails on a family, protocol or setup error is a defect in the arm, not a missing
+    privilege, and does not qualify as unavailable. The
     arm runs at an unprivileged uid; the daemon does not refuse to start as root, so this is a
     statement about the arm, not about every daemon. An operation the unsandboxed control cannot
     perform there, such as a raw socket without the privilege, is recorded as unavailable to an
@@ -1214,8 +1217,11 @@ Identity, approval, the remaining address forms and the host setting:
 60. With the host setting off, a row carrying `network: "outbound"`, a grant pinned to it and a
     non-anonymous caller naming itself as `actor` is refused with `network_unhonoured:` naming the
     host setting, before the binary digest and with no run directory; the same holds for such a row
-    written through storage. Control: the same row and caller with the setting on runs honoured.
-    Mutation control: deleting the host-setting check turns this arm red and leaves 46 to 49, 57
-    and 58 green.
+    written through storage. The refusal is repeated with the setting's key omitted from an
+    otherwise valid exec configuration, so the bare default is witnessed and not only an explicit
+    off. Control: the same row and caller with the setting on runs honoured. Mutation controls:
+    deleting the host-setting check turns this arm red and leaves 46 to 49, 57 and 58 green;
+    defaulting an absent key to on turns the omitted-key case red and leaves the explicit-off case
+    and the control green.
 
 Implementation follows acceptance of this amendment and goes through the usual review and gates.
