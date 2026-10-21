@@ -1575,7 +1575,10 @@ Added arms:
       seam still holds the opener. With a source open delayed but completing before the deadline set before the open, a
       byte copy that finishes before that deadline, followed by a digest of the staged copy that crosses it but would
       finish inside a deadline restarted after the open (a timing test seam), is refused with
-      `binary_digest_time_limit`. None of the five leaves a staging or run directory or a digest in any receipt.
+      `binary_digest_time_limit`. None of the five leaves a staging or run directory or a digest in any receipt. With
+      clones available, a clone held past the deadline set before the open (a test seam that holds the clone after the
+      source handle is returned) is refused with `binary_digest_time_limit` while the seam still holds the clone, and
+      leaves no staging or run directory and no digest in any receipt.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
@@ -1588,7 +1591,8 @@ Added arms:
     starting the deadline after the copy turns the stalled case red; opening the source outside the deadline's guard,
     with the deadline still started before the open, turns the open-stall case red; giving the digest of the staged copy
     a deadline of its own, restarted after the copy, or restarting the deadline once the source handle is returned,
-    turns the copy-then-digest case red; removing the staging directory only when a spawned run ends turns the
+    turns the copy-then-digest case red; awaiting the clone outside the deadline's guard turns the clone-hold case
+    red; removing the staging directory only when a spawned run ends turns the
     tree-load case red; and removing the staging directory under the run directory's `keep` condition turns the
     kept-run case red.
 62. **Registration and stored digests.** `tool.register` refuses `network` without `executable_digest`,
