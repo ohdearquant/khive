@@ -1,4 +1,5 @@
 use super::*;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
@@ -40,7 +41,8 @@ pub(crate) async fn handle_inbox(
         mailbox @ ("inbox" | "sent") => mailbox,
         other => {
             return Err(RuntimeError::InvalidInput(format!(
-                "inbox: invalid `box` {other:?}; expected one of: inbox, sent"
+                "inbox: invalid `box` {:?}; expected one of: inbox, sent",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, other)
             )));
         }
     };
@@ -84,7 +86,8 @@ pub(crate) async fn handle_inbox(
             s @ ("unread" | "read" | "all") => s,
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "inbox: invalid status {other:?}; expected one of: unread, read, all"
+                    "inbox: invalid status {:?}; expected one of: unread, read, all",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, other)
                 )));
             }
         };
