@@ -103,7 +103,7 @@ def test_observed_id_arm9_socket_second_process_recreation(scratch_daemon):
         assert result["ok"] and result["result"]["committed"] is True, result
         members = result["result"]["results"]
         assert len(members) == 3 and members[0]["seq"] == 1 and members[1]["version"] == 2 and members[2]["seq"] == 1
-        assert [one("stream.stat", stream=s) for s in streams] == [{"count":1, "head_seq":1}] * 2
+        assert [one("stream.stat", stream=s) for s in streams] == [{"count":1, "head_seq":1, "floor_seq":1}] * 2
         written = one("get", kind="head", key=target)
         assert written["version"] == 2 and json.loads(written["content"]) == {"published":True}
         # Control on the predicate itself: the batch that just committed wrote

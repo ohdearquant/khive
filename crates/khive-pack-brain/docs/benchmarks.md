@@ -1,5 +1,22 @@
 # Brain pack benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-brain`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                             | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `brain_pack/feedback_plain/useful`                    | 714.177 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/feedback_sections/capped_200_opposing`    | 45.351 ms        | 1.024     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/profile_read/balanced_recall_v1`          | 43.134 µs        | 1.017     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/reset/balanced_recall_v1`                 | 599.688 µs       | 1.090     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/section_posterior_gate/mean_shift_ge_0_3` | 0.035 ns         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/snapshot_roundtrip/state_read_twice`      | 89.976 µs        | 1.030     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 These benchmarks call public verbs through a real BrainPack, VerbRegistry and private in-memory
 KhiveRuntime. They measure dispatch behavior rather than the isolated khive-brain-core primitives.
 Fixtures are generated locally; no external corpus, model provider or network service is needed.

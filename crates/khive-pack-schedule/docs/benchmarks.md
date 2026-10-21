@@ -1,5 +1,21 @@
 # khive-pack-schedule Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-schedule`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark             | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `schedule/agenda/10`  | 138.067 µs       | 1.014     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `schedule/agenda/100` | 360.031 µs       | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `schedule/cancel`     | 709.018 µs       | 1.018     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `schedule/remind`     | 2.288 ms         | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `schedule/schedule`   | 769.494 µs       | 1.008     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Run command
 
 ```bash

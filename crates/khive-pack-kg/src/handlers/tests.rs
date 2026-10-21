@@ -177,22 +177,22 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG keeps 29 public verbs and one operator-only proposal cleanup handler.
+// KG keeps 30 public verbs and one operator-only proposal cleanup handler.
 #[test]
-fn kg_pack_exposes_29_verbs_and_cleanup_subhandler() {
+fn kg_pack_exposes_30_verbs_and_cleanup_subhandler() {
     use crate::KgPack;
     use khive_types::{Pack, Visibility};
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        30,
+        31,
         "KG handler inventory must stay explicit"
     );
     let public: Vec<_> = handlers
         .iter()
         .filter(|handler| handler.visibility == Visibility::Verb)
         .collect();
-    assert_eq!(public.len(), 29, "KG must retain 29 public verbs");
+    assert_eq!(public.len(), 30, "KG must retain 30 public verbs");
     let subhandlers: Vec<_> = handlers
         .iter()
         .filter(|handler| handler.visibility == Visibility::Subhandler)
@@ -210,6 +210,10 @@ fn kg_pack_exposes_29_verbs_and_cleanup_subhandler() {
     );
     assert!(names.contains(&"verbs"), "verbs must be in KG_HANDLERS");
     assert!(names.contains(&"stats"), "stats must be in KG_HANDLERS");
+    assert!(
+        names.contains(&"stream.truncate"),
+        "stream.truncate must be in KG_HANDLERS"
+    );
     assert!(
         names.contains(&"context"),
         "context must be in KG_HANDLERS (ADR-089)"

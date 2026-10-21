@@ -1,9 +1,9 @@
-//! Pin every classification while adding the operator cleanup name.
+//! Pin every classification while adding the stream truncation write.
 use khive_gate::{
     classify_operation, OperationAccess, CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION,
 };
 
-// Frozen v19 inventory plus the single reviewed v20 addition. Independent of the
+// Frozen v19 inventory plus the reviewed v20 cleanup and v21 stream additions. Independent of the
 // production lookup table so changing an existing effect is a contract regression.
 const EXPECTED: &[(&str, OperationAccess)] = &[
     ("agent.kill", OperationAccess::Write),
@@ -176,6 +176,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("stream.batch", OperationAccess::Write),
     ("stream.read", OperationAccess::Read),
     ("stream.stat", OperationAccess::Read),
+    ("stream.truncate", OperationAccess::Write),
     ("telemetry.channels", OperationAccess::Read),
     ("telemetry.counts", OperationAccess::Read),
     ("telemetry.emit", OperationAccess::Write),
@@ -208,7 +209,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v20");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v21");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

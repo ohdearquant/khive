@@ -449,87 +449,24 @@ pub(crate) async fn prepare_delete_from_snapshot(
             if let Some(error) = runtime.stream_member_error(&note).await? {
                 return Err(error);
             }
-            let namespace = note.namespace.clone();
-            // Storage parity: `note_soft_delete_statement`/
-            // `note_hard_delete_statement` are the SAME khive-db builders
-            // khive-db's own `SqlNoteStore::delete_note` calls.
-            let mut statements = if hard {
-                vec![
-                    PlanStatement {
-                        statement: delete_record_attachments_statement(
-                            id,
-                            AttachmentSubstrate::Note,
-                        ),
-                        guard: None,
-                    },
-                    PlanStatement {
-                        statement: note_hard_delete_statement(id),
-                        guard: Some(AffectedRowGuard::exactly(1)),
-                    },
-                ]
-            } else {
-                let deleted_at = chrono::Utc::now().timestamp_micros();
-                vec![PlanStatement {
-                    statement: note_soft_delete_statement(id, deleted_at),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }]
-            };
-            if hard {
-                statements.extend(
-                    hard_delete_lineage_warning_statements(
-                        &namespace,
-                        &actor,
-                        id,
-                        SubstrateKind::Note,
-                    )
-                    .into_iter()
-                    .map(|statement| PlanStatement {
-                        statement,
-                        guard: None,
-                    }),
-                );
-                statements.push(PlanStatement {
-                    statement: purge_incident_edges_statement(id),
-                    guard: None,
-                });
-            }
-            // FTS + vector index purge, matching operations.rs
-            // `delete_note`: both soft and hard delete clean indexes (a hard
-            // delete of an already-tombstoned record must still purge
-            // them); only hard additionally cascades edges above.
+            let mut index_statements = Vec::new();
             push_index_purge_statements(
                 runtime,
-                &mut statements,
+                &mut index_statements,
                 "fts_notes",
-                &namespace,
+                &note.namespace,
                 id,
                 "atomic-delete-note",
             )
             .await?;
-            // operations.rs's `delete_note` appends a `NoteDeleted` event
-            // after a successful row delete, on both soft and hard delete:
-            // same reasoning as the entity branch above.
-            statements.extend(event_append_statements(
+            note_delete_plan(
                 token,
-                &namespace,
-                "delete",
-                EventKind::NoteDeleted,
-                SubstrateKind::Note,
                 id,
-                serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
-            )?);
-            Ok(AtomicOpPlan::Delete(DeletePlan {
-                target_id: id,
-                statements,
-                // A committed atomic note delete must fire the same
-                // pack-installed note-mutation hook `operations.rs::
-                // delete_note` fires, so a warm ANN cache sees the deletion
-                // even when the mutation went through the atomic-plan path.
-                post_commit: PostCommitEffect::NoteDeleted {
-                    note_id: id,
-                    kind: note.kind.clone(),
-                },
-            }))
+                &note.namespace,
+                &note.kind,
+                hard,
+                index_statements,
+            )
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
             "delete target {id} must be an entity, note, or edge"
@@ -620,5 +557,83 @@ pub(crate) async fn prepare_delete_edge(
         target_id: id,
         statements,
         post_commit: PostCommitEffect::None,
+    }))
+}
+
+/// Build canonical note deletion after the caller has established authority and
+/// membership. A stream caller must remove the authorized ledger rows in the
+/// same applying transaction before these guarded note statements can run.
+pub(crate) fn note_delete_plan(
+    token: &NamespaceToken,
+    id: Uuid,
+    namespace: &str,
+    kind: &str,
+    hard: bool,
+    index_statements: Vec<PlanStatement>,
+) -> RuntimeResult<AtomicOpPlan> {
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+    // Storage parity: `note_soft_delete_statement`/
+    // `note_hard_delete_statement` are the SAME khive-db builders
+    // khive-db's own `SqlNoteStore::delete_note` calls.
+    let mut statements = if hard {
+        vec![
+            PlanStatement {
+                statement: delete_record_attachments_statement(id, AttachmentSubstrate::Note),
+                guard: None,
+            },
+            PlanStatement {
+                statement: note_hard_delete_statement(id),
+                guard: Some(AffectedRowGuard::exactly(1)),
+            },
+        ]
+    } else {
+        let deleted_at = chrono::Utc::now().timestamp_micros();
+        vec![PlanStatement {
+            statement: note_soft_delete_statement(id, deleted_at),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }]
+    };
+    if hard {
+        statements.extend(
+            hard_delete_lineage_warning_statements(namespace, &actor, id, SubstrateKind::Note)
+                .into_iter()
+                .map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }),
+        );
+        statements.push(PlanStatement {
+            statement: purge_incident_edges_statement(id),
+            guard: None,
+        });
+    }
+    // FTS + vector index purge, matching operations.rs
+    // `delete_note`: both soft and hard delete clean indexes (a hard
+    // delete of an already-tombstoned record must still purge
+    // them); only hard additionally cascades edges above.
+    statements.extend(index_statements);
+    // operations.rs's `delete_note` appends a `NoteDeleted` event
+    // after a successful row delete, on both soft and hard delete:
+    // same reasoning as the entity branch above.
+    statements.extend(event_append_statements(
+        token,
+        namespace,
+        "delete",
+        EventKind::NoteDeleted,
+        SubstrateKind::Note,
+        id,
+        serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
+    )?);
+    Ok(AtomicOpPlan::Delete(DeletePlan {
+        target_id: id,
+        statements,
+        // A committed atomic note delete must fire the same
+        // pack-installed note-mutation hook `operations.rs::
+        // delete_note` fires, so a warm ANN cache sees the deletion
+        // even when the mutation went through the atomic-plan path.
+        post_commit: PostCommitEffect::NoteDeleted {
+            note_id: id,
+            kind: kind.to_owned(),
+        },
     }))
 }

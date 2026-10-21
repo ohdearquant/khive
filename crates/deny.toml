@@ -27,7 +27,14 @@ all-features = false
 # "workspace" = only unmaintained direct workspace deps are reported.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+    # webpki-roots 0.26.11 (via ureq 2, from lattice-inference) is a shim whose
+    # only item is `pub use parent::TLS_SERVER_ROOTS` with parent = webpki-roots
+    # ^1, so its roots are the locked 1.x copy (1.0.10, patched). The advisory's
+    # patched range (>= 1.0.10) cannot match a 0.26 version. Remove this entry
+    # when ureq 2 leaves the tree or the 1.x lock drops below 1.0.10.
+    { id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports the patched webpki-roots 1.0.10 roots" },
+]
 
 [licenses]
 confidence-threshold = 0.93

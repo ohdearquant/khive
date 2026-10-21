@@ -242,7 +242,8 @@ async fn refresh_discloses_bounded_embeddings_in_reply_and_receipt_for_each_upda
         .expect("refresh must retain its bounded embedding result");
         let request = receipt(&runtime, &token, &reply).await;
         if long {
-            let expected = json!({"truncated": 1, "discarded_bytes": 1});
+            let expected =
+                json!({"truncated": 1, "discarded_bytes": 1, "token_reporting_unavailable": 1});
             assert_eq!(
                 reply["embedding_truncation_report"], expected,
                 "reply {arm}"
