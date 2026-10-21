@@ -4,8 +4,9 @@
 - **Date:** 2026-10-21
 - **Relates to:** ADR-193 (charter runs), ADR-127 and ADR-143 (authenticated grant seams), ADR-182 (git merge verb).
 - **Supersedes, when accepted:** ADR-193 D2 (definitions are bounded data for one closed template), the ADR-193 Context
-  sentence "There is no language", and the ADR-193 deferred items "charter topologies beyond the template" and "any
-  definition language". Every other ADR-193 decision and Amendments 1 to 4 stand unchanged.
+  sentence "There is no language", and the ADR-193 deferred items "charter topologies beyond the template", "any
+  definition language" and "cross-charter cascades". Every other ADR-193 decision and Amendments 1 to 4 stand
+  unchanged.
 
 ## Context
 
@@ -28,7 +29,7 @@ topology.
 ### D1. A charter is authored in a small declarative language, compiled by the charter pack
 
 Keywords: `charter`, `roles`, `triggers`, `workflow`, `phase`, `await`, `or`, `require`, `when ... is`, `action`,
-`grants for`, `evidence`, `max_rounds ... then`, `complete`, `terminate`, `break_glass`. Blocks are indented.
+`perform`, `grants for`, `evidence`, `max_rounds ... then`, `complete`, `terminate`, `break_glass`. Blocks are indented.
 `charter.compile(source)` parses and validates and returns the canonical definition with diagnostics, writing nothing.
 `charter.publish(source)` stores that canonical definition immutably, with the source bytes kept beside it for display.
 ADR-193 D10 pinning applies to the canonical definition, never to the source text.
@@ -73,8 +74,14 @@ M2 terms, and only where every hard phrase it depends on has a producer independ
 ### D7. Actions are registered adapters
 
 An `action` names an entry in an action registry beside the phrase registry. In a phase it records the intended effect
-and its designated actor; the charter itself performs no external I/O (ADR-193 D7). `terminate` ends the run and
-cancels the runs it started.
+and its designated actor; the charter itself performs no external I/O (ADR-193 D7).
+
+`perform <charter>` is the one built-in action kind: it starts a child run of the named published charter on the same
+subject, and the phase waits for that run to end. The child's terminal state is recorded in the parent run as an
+observation of kind `<charter>` with the closed outcome set `completed`, `terminated`, `cancelled`, so the parent routes
+on it with `when <charter> is <label>`. A procedure such as "review; if the review fails perform the fix procedure; if
+the fix fails perform the split procedure and terminate" is therefore three charters composed, not one. `terminate`
+ends the run and cancels every open run it started, transitively.
 
 ## `pr_merge/v1`
 
@@ -89,6 +96,8 @@ gates, floors and levels as the template, so the existing acceptance cases keep 
 3. Changing any registry entry changes `gate_registry_digest`.
 4. An `await` is released by a matching observation and by no other write.
 5. The waiting view lists a phase that waits on a role the caller holds.
+6. A `perform` step starts one child run, its terminal state releases the parent phase as an observation, and
+   terminating the parent cancels the child.
 
 ## Alternatives considered
 
