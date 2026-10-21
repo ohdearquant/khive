@@ -67,7 +67,9 @@ async fn foundation_records_only_recording_assurance_and_exposes_no_claim() {
         "INSERT INTO charter_runs (policy_domain, run_id, namespace, run_key, subject_id, subject_epoch, charter_id, definition_version, definition_digest, candidate_digest, candidate_bytes, assurance, state, created_at_us, updated_at_us) SELECT policy_domain, 'run-enforced', namespace, 'key-enforced', subject_id, subject_epoch, charter_id, definition_version, definition_digest, candidate_digest, candidate_bytes, 'enforced', state, created_at_us, updated_at_us FROM charter_runs WHERE run_id = 'run-a'",
         vec![],
     ), "CHECK").await;
-    assert!(CharterPack::HANDLERS.is_empty());
+    assert!(CharterPack::HANDLERS
+        .iter()
+        .all(|h| h.name != "charter.claim"));
     assert!(f.registry.describe_verb("charter.claim").is_err());
     assert!(f
         .registry

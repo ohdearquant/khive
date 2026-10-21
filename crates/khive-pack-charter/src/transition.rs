@@ -16,6 +16,7 @@ use thiserror::Error;
 pub enum RunState {
     Open,
     Completed,
+    Terminated,
     Cancelled,
     Superseded,
     Invalidated,
@@ -27,6 +28,7 @@ impl RunState {
         match self {
             Self::Open => "open",
             Self::Completed => "completed",
+            Self::Terminated => "terminated",
             Self::Cancelled => "cancelled",
             Self::Superseded => "superseded",
             Self::Invalidated => "invalidated",

@@ -247,13 +247,6 @@ pub fn is_dotted(word: &str) -> bool {
     !word.is_empty() && word.split('.').all(is_ident)
 }
 
-fn first_word(node: &Node) -> Option<&str> {
-    match node.line.toks.first() {
-        Some(Tok::Word(w)) => Some(w),
-        _ => None,
-    }
-}
-
 fn no_children(node: &Node, errors: &mut Vec<Diagnostic>) {
     if let Some(child) = node.children.first() {
         errors.push(Diagnostic::new(

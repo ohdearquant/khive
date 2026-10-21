@@ -110,7 +110,7 @@ fn assert_revision_conflict(error: &StorageError) {
 }
 
 #[tokio::test]
-async fn inventory_loading_installs_seven_tables_and_reapplying_preserves_rows() {
+async fn inventory_loading_installs_eight_tables_and_reapplying_preserves_rows() {
     let fixture = Fixture::new();
     let mut reader = fixture.runtime.sql().reader().await.expect("reader");
     let rows = reader
@@ -131,6 +131,7 @@ async fn inventory_loading_installs_seven_tables_and_reapplying_preserves_rows()
             "charter_phases",
             "charter_runs",
             "charter_subjects",
+            "charter_vocabularies",
         ]
     );
     drop(reader);
@@ -151,7 +152,7 @@ fn definition(domain: &str, charter: &str, version: i64) -> SqlStatement {
 
 fn subject(domain: &str, id: &str, pull_request: &str) -> SqlStatement {
     sql(
-        "INSERT INTO charter_subjects (policy_domain, subject_id, namespace, forge, repository_id, pull_request_id, target, candidate_digest, candidate_bytes, created_at_us, updated_at_us) VALUES (?1, ?2, 'test', 'github', 'repository-1', ?3, 'main', 'candidate-a', X'7B7D', 1, 1)",
+        "INSERT INTO charter_subjects (policy_domain, subject_id, namespace, subject_kind, subject_ref, candidate_digest, candidate_bytes, created_at_us, updated_at_us) VALUES (?1, ?2, 'test', 'pull_request', ?3, 'candidate-a', X'7B7D', 1, 1)",
         vec![text(domain), text(id), text(pull_request)],
     )
 }

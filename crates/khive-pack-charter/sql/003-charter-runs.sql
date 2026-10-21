@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     candidate_digest TEXT NOT NULL CHECK (length(candidate_digest) > 0),
     candidate_bytes BLOB NOT NULL CHECK (typeof(candidate_bytes) = 'blob'),
     assurance TEXT NOT NULL DEFAULT 'recording_only' CHECK (assurance = 'recording_only'),
-    state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'cancelled', 'superseded', 'invalidated', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'terminated', 'cancelled', 'superseded', 'invalidated', 'failed')),
+    parent_run_id TEXT,
     current_phase_id TEXT,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(revision) = 'integer' AND revision >= 0),
     created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
@@ -22,6 +23,8 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     UNIQUE (policy_domain, subject_id, run_id),
     FOREIGN KEY (subject_id)
         REFERENCES charter_subjects (subject_id),
+    FOREIGN KEY (policy_domain, parent_run_id)
+        REFERENCES charter_runs (policy_domain, run_id),
     FOREIGN KEY (policy_domain, charter_id, definition_version, definition_digest)
         REFERENCES charter_definitions (policy_domain, charter_id, version, definition_digest),
     FOREIGN KEY (policy_domain, run_id, current_phase_id)
@@ -44,6 +47,7 @@ WHEN NEW.policy_domain IS NOT OLD.policy_domain OR NEW.run_id IS NOT OLD.run_id
     OR NEW.charter_id IS NOT OLD.charter_id OR NEW.definition_version IS NOT OLD.definition_version
     OR NEW.definition_digest IS NOT OLD.definition_digest OR NEW.candidate_digest IS NOT OLD.candidate_digest
     OR NEW.candidate_bytes IS NOT OLD.candidate_bytes OR NEW.assurance IS NOT OLD.assurance
+    OR NEW.parent_run_id IS NOT OLD.parent_run_id
     OR NEW.created_at_us IS NOT OLD.created_at_us
 BEGIN
     SELECT RAISE(ABORT, 'charter run pins are immutable');
