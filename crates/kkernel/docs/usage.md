@@ -433,7 +433,10 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 The batch size is selected from an explicit `--batch-size`, then
 `[embed] batch_size` in the selected config file, then 128. It controls entity,
 note and knowledge embedding batches. Config values must be positive integers;
-values above 500 are capped. The CLI retains its zero-to-one clamp. An explicit
+values above 500 are capped. A bulk run using a configured value above 500 warns
+once with the selected file, configured value and effective value. An explicit
+CLI override does not produce this configuration warning. The CLI retains its
+zero-to-one clamp. An explicit
 `--batch-size`, including 128, conflicts with `--id`; a configured batch size
 does not. Invalid config values are refused before the database is opened, even
 when a CLI override is present.
