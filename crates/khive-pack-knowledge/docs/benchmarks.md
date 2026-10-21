@@ -1,5 +1,25 @@
 # khive-pack-knowledge — Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-knowledge`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                           | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `knowledge_get/by_slug`             | 91.599 µs        | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_learn/concept_create`    | 809.172 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/10`          | 165.499 µs       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/100`         | 223.354 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_search_fts/rerank_false` | 1.174 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_stats/stats_query`       | 215.177 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/1`    | 513.688 µs       | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/10`   | 2.180 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/50`   | 7.180 ms         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite
 
 | Benchmark               | File                         | Description                                                                                   |
@@ -104,7 +124,6 @@ cargo test --manifest-path crates/Cargo.toml -p khive-pack-knowledge --lib \
 
 #### `knowledge_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
 
-
 | Scenario                          | Low      | Median   | High     | Outliers   |
 | --------------------------------- | -------- | -------- | -------- | ---------- |
 | knowledge_learn/concept_create    | 1.030 ms | 1.368 ms | 1.774 ms | 4/50 (8%)  |
@@ -134,7 +153,6 @@ Numbers not yet recorded in this ledger entry; will be added on next full bench 
 A p50 regression gate of +20% applies to the Criterion `knowledge_bench` scenarios.
 
 Last reviewed: v0.2.8 (2026-06-08)
-
 
 ## Generated workload coverage
 
@@ -216,6 +234,64 @@ index operation and does not claim to reproduce the private ticker measurement.
 The historical `search_latency` and tick-gap ledger entries still have no new
 measurement. Record commit, toolchain, machine, command, environment and concurrent
 load alongside each qualified-host baseline. Workflow selection is separate work.
+
+## Namespace fallback and automatic compose
+
+`knowledge_namespace` reuses the private queued-WAL fixture without an embedder.
+It runs two paired corpora: 10 local atoms and 3 local domains, preceded by either
+0 or 20,000 matching foreign atoms. Each domain has one live local member.
+Fixture insertion, reader acquisition, parameter preparation, result validation
+and writer shutdown are outside the measured SQL interval.
+
+Two clocks are reported separately:
+
+- `eligibility_fallback_sql` executes the same private SQL builder as production,
+  for one admitted term, through the runtime reader. It is the fallback query
+  duration, not the duration of the complete lexical stage.
+- `full_suggest` measures the public `knowledge.suggest` dispatch, including
+  lexical gathering, hydration, scoring and member sizing. It validates all
+  three expected domain names and their member costs.
+
+Both arms take one untimed warm-up, then 21 individual samples and print
+nearest-rank p50/p95. They use fixed repetitions rather than adaptive Criterion
+iterations. The ordinary lexical-stage budget, candidate limits and status/type
+filters remain unchanged. Successful lexical-stage timing is not exposed by the
+benchmark API; use the daemon's phase diagnostics for that separate observation.
+The accompanying regressions bound VDBE/join work and preserve exact legacy
+rows/order. VDBE counts do not measure work hidden inside an FTS virtual-table step.
+
+```bash
+cd crates
+# Small smoke: one measured call of each clock per corpus, then Success.
+cargo test -p khive-pack-knowledge --bench knowledge_namespace
+# Paired fallback SQL and full-suggest measurements.
+cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+# Explicit larger reference scene; exclude this setting from scheduled CI.
+KHIVE_BENCH_COMPOSE_STORE_SIZE=1 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+```
+
+The opt-in scene adds exactly 180,474 ordinary local atoms and 25,504 local
+domains with their mirror rows. `knowledge.stats` verifies those counts before
+measurement; domain mirrors are excluded from its ordinary atom count. It then
+runs three automatic `knowledge.compose` calls with a 17-word query,
+`max_tokens=1500`, and no pinned atoms or domains. Each response must be
+nonempty, free of hydration degradation and suggestion errors, and within the
+rendered-byte budget. The **absolute acceptance target is below 6,000 ms per
+call**. Each JSON line reports the elapsed time and whether it met that target;
+a missed target is retained rather than hidden by retries or a timing-sensitive
+unit assertion. Smoke mode never enables the larger scene, even if the variable
+is set.
+
+This is a synthetic store-size measurement, not a replay of a production store.
+All rows have deterministic matching content, every domain has one member, and
+there are no model, persistent dispatch-audit or network costs. It deliberately
+places the ordinary atoms before the domain mirrors, exercising recovery beyond
+the bounded initial candidate window. No production-latency or six-second
+success claim follows from the source change. Record the three observations,
+commit, toolchain, hardware and concurrent load, and compare with a disposable
+copy using both original FTS-first statements. Keep fixture bytes and all other
+code identical. Qualified-host baseline and acceptance results are not recorded
+in this ledger yet.
 
 ## Performance guarantees
 

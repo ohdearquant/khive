@@ -1,1 +1,1 @@
-SELECT 1 AS present FROM fts_knowledge CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 LIMIT 1
+SELECT 1 AS present FROM knowledge_atoms AS a INDEXED BY idx_knowledge_atoms_ns CROSS JOIN fts_knowledge ON fts_knowledge.rowid = a.rowid WHERE a.namespace = ?2 AND fts_knowledge MATCH ?1 LIMIT 1

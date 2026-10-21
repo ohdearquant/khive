@@ -1,5 +1,37 @@
 # khive-text Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-text`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                   | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `analyze/cjk/mixed`                         | 2.479 µs         | 1.032     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/kg_name/identifier`                | 531.298 ns       | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/simple/medium`                     | 2.543 µs         | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/simple/short`                      | 214.966 ns       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/standard/long`                     | 13.317 µs        | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/standard/medium`                   | 3.443 µs         | 1.011     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `analyze/standard/short`                    | 314.963 ns       | 1.039     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `filter/lowercase/medium_tokens`            | 1.078 µs         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `filter/min_length/medium_tokens`           | 509.191 ns       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `filter/pipeline_chain/medium`              | 3.734 µs         | 1.020     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `filter/stopword/medium_tokens`             | 1.149 µs         | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/contains_cjk/latin`            | 439.760 ns       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/contains_cjk/mixed`            | 119.610 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/is_meaningful_query/gibberish` | 229.841 ns       | 1.010     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/is_meaningful_query/normal`    | 698.010 ns       | 1.024     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/script_profile/long`           | 2.759 µs         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `lang_detect/script_profile/short`          | 73.839 ns        | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `tokenize/cjk/mixed`                        | 1.013 µs         | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `tokenize/whitespace/long`                  | 6.049 µs         | 1.040     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `tokenize/whitespace/medium`                | 1.598 µs         | 1.032     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `tokenize/whitespace/short`                 | 133.817 ns       | 1.015     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Additional isolated workloads
 
 The additional targets isolate KeywordTokenizer, IdentifierTokenizer and the

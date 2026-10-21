@@ -1,5 +1,39 @@
 # khive-bm25 Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-bm25`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                         | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `index_document/docs/100`         | 6.187 ms         | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `index_document/docs/1000`        | 68.417 ms        | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `index_document/docs/5000`        | 343.417 ms       | 1.069     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `index_document_single/words/200` | 123.136 µs       | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `index_document_single/words/50`  | 42.860 µs        | 1.030     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `index_document_single/words/500` | 220.759 µs       | 1.021     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `memory_usage/docs/100`           | 5.529 µs         | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `memory_usage/docs/1000`          | 64.629 µs        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `memory_usage/docs/500`           | 32.612 µs        | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `remove_document/1k_corpus`       | 2.012 ms         | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_1k/1-term`                | 4.577 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_1k/2-term`                | 7.899 µs         | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_1k/3-term`                | 10.196 µs        | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_1k/4-term`                | 12.694 µs        | 1.012     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_1k/5-term`                | 15.046 µs        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/fresh_ctx`        | 7.920 µs         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_context/reused_ctx`       | 7.505 µs         | 1.009     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_corpus_scale/docs/100`    | 2.345 µs         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_corpus_scale/docs/1000`   | 10.324 µs        | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_corpus_scale/docs/500`    | 5.841 µs         | 1.023     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_topk/k/1`                 | 9.961 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_topk/k/10`                | 10.204 µs        | 1.005     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search_topk/k/50`                | 11.487 µs        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Targets
 
 | Target              | Harness          | Command                                                                                       |

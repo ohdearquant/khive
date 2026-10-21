@@ -2,6 +2,109 @@
 
 use super::*;
 
+impl ThreadRow {
+    fn from_note(note: Note) -> Self {
+        let display_read = note
+            .properties
+            .as_ref()
+            .and_then(|props| props.get("read"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Self {
+            created_at: note.created_at,
+            full_id: note.id,
+            note,
+            display_read,
+        }
+    }
+
+    fn logical_id(&self) -> Uuid {
+        let props = self.note.properties.as_ref();
+        if props
+            .and_then(|props| props.get("direction"))
+            .and_then(Value::as_str)
+            == Some("inbound")
+        {
+            if let Some(reference) = props
+                .and_then(|props| props.get("outbound_ref"))
+                .and_then(Value::as_str)
+            {
+                if let Ok(id) = reference.parse::<Uuid>() {
+                    return id;
+                }
+            }
+        }
+        self.full_id
+    }
+
+    fn is_outbound(&self) -> bool {
+        self.note
+            .properties
+            .as_ref()
+            .and_then(|props| props.get("direction"))
+            .and_then(Value::as_str)
+            == Some("outbound")
+    }
+
+    fn into_message_json(self) -> Value {
+        let mut message = note_to_message_json(&self.note);
+        message["read"] = json!(self.display_read);
+        message
+    }
+}
+
+/// Fold captured rows in physical encounter order after mailbox visibility.
+/// An outbound owner inherits the first pre-promotion read value; later inbound
+/// rows replace only the display value, never the owner's captured properties.
+fn fold_thread_note(
+    canonical: &mut HashMap<Uuid, ThreadRow>,
+    canonical_order: &mut Vec<Uuid>,
+    note: Note,
+    actor_id: &str,
+    delegated: bool,
+    inherits_legacy_pool: bool,
+) {
+    // Apply the same shared mailbox predicates before retaining an owner.
+    let props = note.properties.as_ref();
+    let to_actor = props
+        .and_then(|props| props.get("to_actor"))
+        .and_then(Value::as_str);
+    let from_actor = props
+        .and_then(|props| props.get("from_actor"))
+        .and_then(Value::as_str);
+    let visible = if delegated {
+        to_actor.is_some_and(|recipient| {
+            is_valid_mailbox_actor_label(recipient)
+                && (from_actor == Some(actor_id) || recipient == actor_id)
+        })
+    } else {
+        addressed_recipient(props)
+            .is_some_and(|recipient| from_actor == Some(actor_id) || recipient == actor_id)
+            || (inherits_legacy_pool && legacy_recipient(props))
+    };
+    if !visible {
+        return;
+    }
+
+    let row = ThreadRow::from_note(note);
+    let logical_id = row.logical_id();
+    match canonical.get_mut(&logical_id) {
+        None => {
+            canonical_order.push(logical_id);
+            canonical.insert(logical_id, row);
+        }
+        Some(existing) => {
+            if row.is_outbound() && !existing.is_outbound() {
+                let display_read = existing.display_read;
+                *existing = row;
+                existing.display_read = display_read;
+            } else if !row.is_outbound() && existing.is_outbound() {
+                existing.display_read = row.display_read;
+            }
+        }
+    }
+}
+
 /// `thread` — retrieve all messages in a conversation thread, ordered
 /// chronologically: the originating message plus all messages whose
 /// `properties.thread_id` equals the root UUID. The root ID is validated: it
@@ -87,7 +190,9 @@ pub(crate) async fn handle_thread(
     // starts from its canonical root, a new v1 child, or a legacy child.
     let thread_store = runtime.notes(token)?;
     const PAGE_SIZE: u32 = 200;
-    let mut rows: Vec<ThreadRow> = Vec::new();
+    let mut canonical_order: Vec<Uuid> = Vec::new();
+    let mut canonical: HashMap<Uuid, ThreadRow> = HashMap::new();
+    let inherits_legacy_pool = caller_inherits_legacy_pool(token);
     let canonical_root = canonical_thread_id
         .parse::<Uuid>()
         .expect("canonical_thread_id is produced from a parsed UUID");
@@ -136,26 +241,22 @@ pub(crate) async fn handle_thread(
             page.items.iter().map(|note| note.id).collect(),
         ))
         .await;
-        #[cfg(test)]
-        let rendered_before = rows.len();
-        for n in &page.items {
-            if seen_row_ids.insert(n.id) {
-                rows.push(ThreadRow {
-                    created_at: n.created_at,
-                    full_id: n.id,
-                    json: note_to_message_json(n),
-                });
+        for note in page.items {
+            if seen_row_ids.insert(note.id) {
+                fold_thread_note(
+                    &mut canonical,
+                    &mut canonical_order,
+                    note,
+                    &view.actor_id,
+                    view.delegated,
+                    inherits_legacy_pool,
+                );
             }
         }
         #[cfg(test)]
-        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRendered(
-            rows.len() - rendered_before,
-        ))
-        .await;
-        #[cfg(test)]
         read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
-            stage: "physical",
-            rows: rows.len(),
+            stage: "owners",
+            rows: canonical.len(),
         })
         .await;
         if fetched < PAGE_SIZE {
@@ -165,118 +266,24 @@ pub(crate) async fn handle_thread(
 
     // Explicitly include the already-validated root when the SQL filter missed it
     // (issue #479b: a root lacking a `thread_id` property, e.g. legacy/imported data).
-    let root_already_present = rows.iter().any(|r| r.full_id == root_note.id);
+    let root_already_present = seen_row_ids.contains(&root_note.id);
     if !root_already_present {
-        rows.push(ThreadRow {
-            created_at: root_note.created_at,
-            full_id: root_note.id,
-            json: note_to_message_json(&root_note),
-        });
-        #[cfg(test)]
-        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRendered(1)).await;
+        fold_thread_note(
+            &mut canonical,
+            &mut canonical_order,
+            root_note,
+            &view.actor_id,
+            view.delegated,
+            inherits_legacy_pool,
+        );
     }
     #[cfg(test)]
     read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
         stage: "with_selected_root",
-        rows: rows.len(),
+        rows: canonical.len(),
     })
     .await;
 
-    // Exclude pool/malformed physical rows before pair deduplication and read
-    // folding. Named own views retain participation only on addressed rows.
-    rows.retain(|r| {
-        let props = r.json.get("properties");
-        let to_actor = props
-            .and_then(|p| p.get("to_actor"))
-            .and_then(Value::as_str);
-        let from_actor = props
-            .and_then(|p| p.get("from_actor"))
-            .and_then(Value::as_str);
-        if view.delegated {
-            to_actor.is_some_and(|recipient| {
-                is_valid_mailbox_actor_label(recipient)
-                    && (from_actor == Some(view.actor_id.as_str())
-                        || recipient == view.actor_id.as_str())
-            })
-        } else {
-            addressed_recipient(props).is_some_and(|recipient| {
-                from_actor == Some(view.actor_id.as_str()) || recipient == view.actor_id.as_str()
-            }) || (caller_inherits_legacy_pool(token) && legacy_recipient(props))
-        }
-    });
-    #[cfg(test)]
-    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
-        stage: "visible",
-        rows: rows.len(),
-    })
-    .await;
-
-    // #94 fix 2/2 — collapse the ADR-057 dual-write pair (outbound copy +
-    // inbound copy) of one logical message into a single thread entry. The
-    // inbound copy's `properties.outbound_ref` names its outbound twin's
-    // note id (set by `dual_write_message`); a row without that link (a
-    // directly-ingested inbound message, or legacy data) is its own logical
-    // message. Without this, `thread` rendered both dual-write copies as two
-    // entries — a reply appeared twice with no marker distinguishing the
-    // copies (issue #94 symptom 3). The outbound copy (always the physically
-    // earlier row — `dual_write_message` creates it first) is kept as the
-    // canonical entry; the inbound twin's `read` state is folded in, since
-    // that is the only field where the two copies can differ meaningfully.
-    fn logical_id(row: &ThreadRow) -> Uuid {
-        let props = row.json.get("properties");
-        let direction = props
-            .and_then(|p| p.get("direction"))
-            .and_then(Value::as_str);
-        if direction == Some("inbound") {
-            if let Some(oref) = props
-                .and_then(|p| p.get("outbound_ref"))
-                .and_then(Value::as_str)
-            {
-                if let Ok(u) = oref.parse::<Uuid>() {
-                    return u;
-                }
-            }
-        }
-        row.full_id
-    }
-    fn is_outbound(row: &ThreadRow) -> bool {
-        row.json
-            .get("properties")
-            .and_then(|p| p.get("direction"))
-            .and_then(Value::as_str)
-            == Some("outbound")
-    }
-
-    let mut canonical_order: Vec<Uuid> = Vec::new();
-    let mut canonical: HashMap<Uuid, ThreadRow> = HashMap::new();
-    for row in rows {
-        let lid = logical_id(&row);
-        match canonical.get_mut(&lid) {
-            None => {
-                canonical_order.push(lid);
-                canonical.insert(lid, row);
-            }
-            Some(existing) => {
-                // Prefer the outbound copy as the canonical entry (earlier,
-                // and it is what `comm.send`/`comm.reply` return as `id`),
-                // but carry the inbound twin's `read` state across either way.
-                if is_outbound(&row) && !is_outbound(existing) {
-                    let read = existing.json.get("read").cloned();
-                    let mut promoted = row;
-                    if let (Some(read), Some(obj)) = (read, promoted.json.as_object_mut()) {
-                        obj.insert("read".to_string(), read);
-                    }
-                    *existing = promoted;
-                } else if !is_outbound(&row) && is_outbound(existing) {
-                    if let (Some(read), Some(obj)) =
-                        (row.json.get("read").cloned(), existing.json.as_object_mut())
-                    {
-                        obj.insert("read".to_string(), read);
-                    }
-                }
-            }
-        }
-    }
     let mut rows: Vec<ThreadRow> = canonical_order
         .into_iter()
         .filter_map(|lid| canonical.remove(&lid))
@@ -375,15 +382,14 @@ pub(crate) async fn handle_thread(
         rows.iter().map(|row| row.full_id).collect(),
     ))
     .await;
-    crate::file_attachments::enrich_many(
-        runtime,
-        rows.iter_mut().map(|row| &mut row.json).collect(),
-    )
-    .await?;
-    let count = rows.len();
-    let messages: Vec<Value> = rows
+    // Render only the final owners. Captured Notes preserve the fetched image,
+    // and the folded read value never rewrites their stored properties.
+    let mut messages: Vec<Value> = rows.into_iter().map(ThreadRow::into_message_json).collect();
+    crate::file_attachments::enrich_many(runtime, messages.iter_mut().collect()).await?;
+    let count = messages.len();
+    let messages: Vec<Value> = messages
         .into_iter()
-        .map(|row| project_message_json(row.json, p.fields.as_deref()))
+        .map(|message| project_message_json(message, p.fields.as_deref()))
         .collect();
 
     Ok(json!({

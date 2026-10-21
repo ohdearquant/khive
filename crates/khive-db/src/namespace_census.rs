@@ -362,12 +362,16 @@ fn index_key_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<Opt
 /// so moving a watermark would claim a consumer is caught up on entries it has
 /// never seen. `retrieval_snapshots` is only deleted from, never written for a
 /// target, so its `(namespace, index_type)` key has nothing to collide with.
+/// Stream floors and truncation permits retain their original stream identity;
+/// a subject move leaves both tables behind and reports their remaining rows.
 pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] = &[
     "events",
     "weight_events",
     "ann_consumer_watermark",
     "ann_consumer_pending",
     "retrieval_snapshots",
+    "note_stream_floors",
+    "note_stream_truncations",
 ];
 
 /// `note_streams` is read by a move and never written by one. Four triggers in
@@ -446,6 +450,8 @@ mod tests {
             "ann_consumer_watermark",
             "ann_consumer_pending",
             "note_streams",
+            "note_stream_floors",
+            "note_stream_truncations",
             "fts_notes_rowids",
             "fts_entities_rowids",
         ] {
@@ -609,6 +615,8 @@ mod tests {
 
         for out_of_reach in [
             "note_streams",
+            "note_stream_floors",
+            "note_stream_truncations",
             "ann_consumer_watermark",
             "ann_consumer_pending",
         ] {

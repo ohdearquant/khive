@@ -570,7 +570,7 @@ fn main() {
     if mode == p95_args::Mode::ReportContract {
         // Exercises the actual emitter with known values, not a timing claim.
         for id in ids {
-            report::emit(id, "p95_ns", 250_000.0, RECALL_ITERS);
+            report::emit(id, "report_contract_probe", 250_000.0, RECALL_ITERS);
         }
         return;
     }
