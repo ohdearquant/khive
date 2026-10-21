@@ -307,6 +307,7 @@ impl ConnectionPool {
             opened_file_identity,
             opened_database_id,
             identity_registration: None,
+            timeout_sink_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -318,15 +319,13 @@ impl ConnectionPool {
                 .expect("reader queue must have capacity during pool initialization");
         }
 
-        // Best-effort, process-global diagnostics belong only to pools that
-        // can acquire a writer. A read-only inspection pool has no writer
-        // timeout to report and must neither mutate `<db_parent>/.khive-logs`
-        // nor consume the global sink claim before a later writable pool.
+        // Read-only inspection must not create a diagnostic sink. Writable
+        // pools register with the writer for their resolved log directory.
         if !pool.config.read_only {
-            crate::timeout_sink::init(
+            pool.timeout_sink_registration = crate::timeout_sink::init(
                 pool.canonical_path().and_then(Path::parent),
                 &crate::timeout_sink::db_label(&pool),
-            );
+            )?;
         }
 
         pool.identity_registration = pool.canonical_path().map(PoolIdentityRegistration::new);

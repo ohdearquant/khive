@@ -1209,7 +1209,7 @@ pub(crate) fn spawn_with_connection(
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
     let join = tokio::spawn(run_writer_task(
-        conn,
+        (conn, pool.timeout_sink_writer_lease()),
         rx,
         origin,
         db.clone(),
@@ -1395,7 +1395,7 @@ impl std::ops::Deref for BlockingWriterConnection {
 /// See
 /// `crates/khive-db/docs/api/writer-task.md` for the full failure matrix.
 async fn run_writer_task(
-    mut conn: Connection,
+    mut owner: (Connection, Option<crate::timeout_sink::WriterLease>),
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
@@ -1413,163 +1413,170 @@ async fn run_writer_task(
         let blocking_counters = Arc::clone(&acquisition_counters);
         let blocking_admission = Arc::clone(&write_admission);
         let blocking_db = db.clone();
+        // Tuple field order drops the connection before its sink lease, both
+        // while idle and when a cancelled parent discards a native result.
+        let conn = owner.0;
+        let blocking_sink_lease = owner.1.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let mut conn = BlockingWriterConnection::new(conn, Arc::clone(&blocking_admission));
-            let acquisition_counters = blocking_counters;
-            // A top-level request deliberately skips BEGIN, so it would
-            // silently join any transaction leaked by an earlier request.
-            // Refuse every request before dispatch if the connection is not
-            // demonstrably clean, then retire the writer task.
-            if !conn.is_autocommit() {
-                tracing::error!(
+            let outcome = (|| {
+                let mut conn = BlockingWriterConnection::new(conn, Arc::clone(&blocking_admission));
+                let acquisition_counters = blocking_counters;
+                // A top-level request deliberately skips BEGIN, so it would
+                // silently join any transaction leaked by an earlier request.
+                // Refuse every request before dispatch if the connection is not
+                // demonstrably clean, then retire the writer task.
+                if !conn.is_autocommit() {
+                    tracing::error!(
                     "writer task: connection is not in autocommit mode before request dispatch; \
                      retiring the poisoned writer without running the request"
                 );
-                let request_state = WriterTaskRequestState::NotStarted;
-                request.reply_error(writer_task_terminated(request_state));
-                return conn.finish(Some(request_state));
-            }
-
-            // The lease precedes SQLite writer acquisition and remains held
-            // until the request has committed, rolled back, or returned to
-            // autocommit. Checkpoint requests deliberately skip both steps.
-            conn.volume_lease = if request.is_checkpoint_bypass() {
-                None
-            } else {
-                match blocking_admission.acquire() {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        request.reply_error(error.into_storage_error(
-                            khive_storage::StorageCapability::Sql,
-                            "writer_task_admission",
-                        ));
-                        return conn.finish(None);
-                    }
+                    let request_state = WriterTaskRequestState::NotStarted;
+                    request.reply_error(writer_task_terminated(request_state));
+                    return conn.finish(Some(request_state));
                 }
-            };
 
-            let terminal_state = if request.is_top_level() {
-                if !request.is_checkpoint_bypass() {
-                    let admission = if request.needs_vacuum_headroom() {
-                        blocking_admission.check_for_vacuum()
-                    } else {
-                        blocking_admission.check()
-                    };
-                    if let Err(error) = admission {
-                        request.reply_error(error.into_storage_error(
-                            khive_storage::StorageCapability::Sql,
-                            "writer_task_admission",
-                        ));
-                        return conn.finish(None);
+                // The lease precedes SQLite writer acquisition and remains held
+                // until the request has committed, rolled back, or returned to
+                // autocommit. Checkpoint requests deliberately skip both steps.
+                conn.volume_lease = if request.is_checkpoint_bypass() {
+                    None
+                } else {
+                    match blocking_admission.acquire() {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            request.reply_error(error.into_storage_error(
+                                khive_storage::StorageCapability::Sql,
+                                "writer_task_admission",
+                            ));
+                            return conn.finish(None);
+                        }
                     }
-                }
-                // ADR-067 Component A:
-                // no BEGIN IMMEDIATE for this request — some statements
-                // (e.g. VACUUM) are rejected by SQLite inside any open
-                // transaction. Still runs on this task's dedicated
-                // connection and still serialized one-request-at-a-time by
-                // this same drain loop, so the single-writer guarantee
-                // holds; only the transaction wrap is skipped.
-                acquisition_counters.record_writer_task_acquisition();
-                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
-                    request, &conn, queue_wait,
-                )
-            } else {
-                let tx_span = khive_storage::tx_registry::register_scoped(
-                    Some("writer_task_tx".to_string()),
-                    origin,
-                );
-                let (begin_outcome, transaction_acquire, begin_attempt) =
-                    begin_immediate_with_retry(
-                        &conn,
-                        &acquisition_counters,
-                        busy_timeout,
-                        Connection::busy_timeout,
+                };
+
+                let terminal_state = if request.is_top_level() {
+                    if !request.is_checkpoint_bypass() {
+                        let admission = if request.needs_vacuum_headroom() {
+                            blocking_admission.check_for_vacuum()
+                        } else {
+                            blocking_admission.check()
+                        };
+                        if let Err(error) = admission {
+                            request.reply_error(error.into_storage_error(
+                                khive_storage::StorageCapability::Sql,
+                                "writer_task_admission",
+                            ));
+                            return conn.finish(None);
+                        }
+                    }
+                    // ADR-067 Component A:
+                    // no BEGIN IMMEDIATE for this request — some statements
+                    // (e.g. VACUUM) are rejected by SQLite inside any open
+                    // transaction. Still runs on this task's dedicated
+                    // connection and still serialized one-request-at-a-time by
+                    // this same drain loop, so the single-writer guarantee
+                    // holds; only the transaction wrap is skipped.
+                    acquisition_counters.record_writer_task_acquisition();
+                    sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
+                        request, &conn, queue_wait,
+                    )
+                } else {
+                    let tx_span = khive_storage::tx_registry::register_scoped(
+                        Some("writer_task_tx".to_string()),
+                        origin,
                     );
-                match begin_outcome {
-                    Ok(()) => {
-                        if let Err(error) = blocking_admission.check() {
-                            let request_state =
-                                match rollback_after_failure(&conn, "capacity admission") {
-                                    RollbackDisposition::RolledBack => None,
-                                    RollbackDisposition::SideEffectsUnknown => {
-                                        Some(WriterTaskRequestState::SideEffectsUnknown)
-                                    }
+                    let (begin_outcome, transaction_acquire, begin_attempt) =
+                        begin_immediate_with_retry(
+                            &conn,
+                            &acquisition_counters,
+                            busy_timeout,
+                            Connection::busy_timeout,
+                        );
+                    match begin_outcome {
+                        Ok(()) => {
+                            if let Err(error) = blocking_admission.check() {
+                                let request_state =
+                                    match rollback_after_failure(&conn, "capacity admission") {
+                                        RollbackDisposition::RolledBack => None,
+                                        RollbackDisposition::SideEffectsUnknown => {
+                                            Some(WriterTaskRequestState::SideEffectsUnknown)
+                                        }
+                                    };
+                                drop(tx_span);
+                                let error = if let Some(state) = request_state {
+                                    writer_task_terminated(state)
+                                } else {
+                                    error.into_storage_error(
+                                        khive_storage::StorageCapability::Sql,
+                                        "writer_task_admission",
+                                    )
                                 };
+                                sealed::Sealed::reply_error_after_begin(
+                                    request,
+                                    error,
+                                    queue_wait,
+                                    transaction_acquire,
+                                );
+                                return conn.finish(request_state);
+                            }
+                            acquisition_counters.record_writer_task_acquisition();
+                            sealed::Sealed::execute_and_reply_reporting_terminal(
+                                request,
+                                &conn,
+                                Some(tx_span),
+                                queue_wait,
+                                transaction_acquire,
+                            )
+                        }
+                        Err(e) => {
+                            // Do NOT run the request's operation: `conn` never
+                            // entered a transaction, so executing the op's DML
+                            // here would run in autocommit mode and land partial
+                            // writes for a request the caller is about to be told
+                            // failed.
+                            crate::timeout_sink::maybe_emit_sqlite_full(&blocking_db, &e);
+                            tracing::warn!(
+                                error = %e,
+                                attempts = begin_attempt,
+                                "writer task: BEGIN IMMEDIATE failed; replying an \
+                                 error without running the request's operation"
+                            );
+                            // Although BEGIN never opened a SQL transaction, the
+                            // scoped attempt is observable in tx_registry. Drop
+                            // it before waking the caller for the same reply-side
+                            // lifecycle guarantee as successful requests (#1790).
                             drop(tx_span);
-                            let error = if let Some(state) = request_state {
-                                writer_task_terminated(state)
-                            } else {
-                                error.into_storage_error(
-                                    khive_storage::StorageCapability::Sql,
-                                    "writer_task_admission",
-                                )
-                            };
+                            // A busy/locked refusal was already counted inside
+                            // the retry loop above, including this final one —
+                            // classifying and counting it again here would
+                            // double it. Only a non-busy BEGIN failure (which
+                            // never enters the retry loop's busy arm) still
+                            // needs its counter recorded at this seam.
+                            let begin_error = writer_task_begin_error(e, busy_timeout);
+                            if !matches!(
+                                begin_error.without_sqlite_write_stage(),
+                                StorageError::WriterTaskBusy { .. }
+                            ) {
+                                acquisition_counters.record_writer_task_begin_error();
+                            }
                             sealed::Sealed::reply_error_after_begin(
                                 request,
-                                error,
+                                begin_error,
                                 queue_wait,
                                 transaction_acquire,
                             );
-                            return conn.finish(request_state);
+                            None
                         }
-                        acquisition_counters.record_writer_task_acquisition();
-                        sealed::Sealed::execute_and_reply_reporting_terminal(
-                            request,
-                            &conn,
-                            Some(tx_span),
-                            queue_wait,
-                            transaction_acquire,
-                        )
                     }
-                    Err(e) => {
-                        // Do NOT run the request's operation: `conn` never
-                        // entered a transaction, so executing the op's DML
-                        // here would run in autocommit mode and land partial
-                        // writes for a request the caller is about to be told
-                        // failed.
-                        crate::timeout_sink::maybe_emit_sqlite_full(&blocking_db, &e);
-                        tracing::warn!(
-                            error = %e,
-                            attempts = begin_attempt,
-                            "writer task: BEGIN IMMEDIATE failed; replying an \
-                             error without running the request's operation"
-                        );
-                        // Although BEGIN never opened a SQL transaction, the
-                        // scoped attempt is observable in tx_registry. Drop
-                        // it before waking the caller for the same reply-side
-                        // lifecycle guarantee as successful requests (#1790).
-                        drop(tx_span);
-                        // A busy/locked refusal was already counted inside
-                        // the retry loop above, including this final one —
-                        // classifying and counting it again here would
-                        // double it. Only a non-busy BEGIN failure (which
-                        // never enters the retry loop's busy arm) still
-                        // needs its counter recorded at this seam.
-                        let begin_error = writer_task_begin_error(e, busy_timeout);
-                        if !matches!(
-                            begin_error.without_sqlite_write_stage(),
-                            StorageError::WriterTaskBusy { .. }
-                        ) {
-                            acquisition_counters.record_writer_task_begin_error();
-                        }
-                        sealed::Sealed::reply_error_after_begin(
-                            request,
-                            begin_error,
-                            queue_wait,
-                            transaction_acquire,
-                        );
-                        None
-                    }
-                }
-            };
-            conn.finish(terminal_state)
+                };
+                conn.finish(terminal_state)
+            })();
+            (outcome, blocking_sink_lease)
         })
         .await;
 
         match outcome {
-            Ok((Some(returned_conn), None)) => conn = returned_conn,
-            Ok((_returned_conn, Some(request_state))) => {
+            Ok(((Some(returned_conn), None), _sink_lease)) => owner.0 = returned_conn,
+            Ok(((_returned_conn, Some(request_state)), _sink_lease)) => {
                 acquisition_counters.record_writer_task_request_failure();
                 if request_state == WriterTaskRequestState::SideEffectsUnknown {
                     acquisition_counters.record_writer_task_side_effects_unknown();
@@ -1586,7 +1593,9 @@ async fn run_writer_task(
                 close_and_fail_queued_requests(&mut rx).await;
                 return;
             }
-            Ok((None, None)) => unreachable!("a reusable writer returns its connection"),
+            Ok(((None, None), _sink_lease)) => {
+                unreachable!("a reusable writer returns its connection")
+            }
             Err(join_err) => {
                 acquisition_counters.record_writer_task_request_failure();
                 tracing::error!(
