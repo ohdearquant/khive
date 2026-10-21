@@ -1565,15 +1565,17 @@ Added arms:
       which the same path string reaches a program that prints another marker, and resumes; that marker is absent from
       the run's output.
     - **Copy bounds.** With clones unavailable (a test seam), the copy is a byte copy and the run is honoured with the
-      same digest. A source larger than the byte budget, and a source that a writer extends well past the budget plus
-      one byte while a test seam holds the copy, are refused with `binary_digest_byte_limit`, `bytes_read` at most the
-      budget plus one byte; a probe on the source reader itself counts at most the budget plus one byte read from the
-      source, independently of `bytes_read` and of any later digest's progress. A
-      source read stalled past `binary_digest_timeout_s` (a test seam) is refused with `binary_digest_time_limit`,
-      `elapsed_ms` at least `time_cap_ms`. A byte copy that finishes inside the time cap, followed by a digest of the
-      staged copy that crosses the deadline set before the source was opened but would finish inside a deadline
-      restarted after the copy (a timing test seam), is refused with `binary_digest_time_limit`. None of the four leaves
-      a staging or run directory or a digest in any receipt.
+      same digest. A source larger than the byte budget plus one byte, and a source that a writer extends well past the
+      budget plus one byte while a test seam holds the copy, are refused with `binary_digest_byte_limit`, `bytes_read`
+      at most the budget plus one byte; a probe on the source reader itself counts at most the budget plus one byte read
+      from the source, independently of `bytes_read` and of any later digest's progress. A source read stalled past
+      `binary_digest_timeout_s` (a test seam) is refused with `binary_digest_time_limit`, `elapsed_ms` at least
+      `time_cap_ms`. A source open held past `binary_digest_timeout_s` (a test seam that holds the opener after the
+      conditions of item 5 and before it returns a source handle) is refused with `binary_digest_time_limit` while the
+      seam still holds the opener. A byte copy that finishes inside the time cap, followed by a digest of the staged
+      copy that crosses the deadline set before the source was opened but would finish inside a deadline restarted after
+      the copy (a timing test seam), is refused with `binary_digest_time_limit`. None of the five leaves a staging or
+      run directory or a digest in any receipt.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
@@ -1581,13 +1583,13 @@ Added arms:
     Mutation controls: skipping the comparison turns the replacement case red; running the registered path instead of
     the staged copy turns the paused case red; leaving `executable_digest` out of the pinned inputs turns the storage
     case red; admitting a `..` component to the exception turns the `/usr/bin/../bin/nc` case red (the writable-prefix
-    row still stages, by its ancestor's mount); reading `statfs` on `/` alone turns
-    the Data-volume cases red; copying to the end of the source before checking the budget turns the over-limit cases
-    red on the source-reader probe; starting the deadline after the copy turns the stalled case red; giving the digest
-    of the staged copy a deadline of its own, restarted after the copy, turns the copy-then-digest case red; removing
-    the staging directory only when a
-    spawned run ends turns the tree-load case red; and removing the staging directory under the run directory's `keep`
-    condition turns the kept-run case red.
+    row still stages, by its ancestor's mount); reading `statfs` on `/` alone turns the Data-volume cases red; copying
+    to the end of the source before checking the budget turns the over-limit cases red on the source-reader probe;
+    starting the deadline after the copy turns the stalled case red; opening the source outside the deadline's guard,
+    with the deadline still started before the open, turns the open-stall case red; giving the digest of the staged copy
+    a deadline of its own, restarted after the copy, turns the copy-then-digest case red; removing the staging directory
+    only when a spawned run ends turns the tree-load case red; and removing the staging directory under the run
+    directory's `keep` condition turns the kept-run case red.
 62. **Registration and stored digests.** `tool.register` refuses `network` without `executable_digest`,
     `executable_digest` without `network`, and an `executable_digest` that is uppercase, 63 characters, 65 characters
     or not hexadecimal, each with the reason named; the accepted case is the control. Through storage, a row carrying
