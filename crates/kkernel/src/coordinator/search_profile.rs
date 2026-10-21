@@ -313,6 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn deadline_profile_keeps_call_identity_and_snapshot_fields() {
         let snapshot = khive_storage::request_context::SearchPhaseSnapshot {
             in_flight_phase: "vector_embedding".into(),

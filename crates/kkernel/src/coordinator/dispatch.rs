@@ -1915,6 +1915,7 @@ mod search_phase_trace_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn deadline_profile_preserves_frozen_phases_and_labels_fallbacks() {
         let trace = khive_storage::request_context::SearchPhaseTrace::new();
         let held = trace.enter(SearchPhase::VectorEmbedding);
