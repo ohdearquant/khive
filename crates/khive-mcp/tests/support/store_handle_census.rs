@@ -74,7 +74,7 @@ fn process_file_paths() -> io::Result<Vec<PathBuf>> {
         if returned >= bytes {
             continue;
         }
-        if returned as usize % item_size != 0 {
+        if !(returned as usize).is_multiple_of(item_size) {
             return Err(io::Error::other("partial descriptor census entry"));
         }
         entries.truncate(returned as usize / item_size);
