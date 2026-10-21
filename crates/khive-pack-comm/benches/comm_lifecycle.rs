@@ -49,20 +49,25 @@ fn lifecycle(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(1));
     for scene in Scene::ALL {
-        let mut observed: Vec<_> = (0..REPORT_SAMPLES).map(|_| sample(&rt, scene)).collect();
-        observed.sort_unstable();
-        // Eleven actual operations: median is sorted rank6, not a batch mean.
-        let median = observed[REPORT_SAMPLES / 2];
-        println!(
-            "{}",
-            serde_json::json!({
-                "scenario": scene.name(), "samples":REPORT_SAMPLES,
-                "median_ns_per_operation":median.as_nanos(),
-                "median_ms_per_operation":median.as_secs_f64()*1000.0,
-                "operation":scene.operation(),
-            })
-        );
+        let mut reported = false;
         group.bench_function(scene.name(), |b| {
+            if !reported {
+                let mut observed: Vec<_> =
+                    (0..REPORT_SAMPLES).map(|_| sample(&rt, scene)).collect();
+                observed.sort_unstable();
+                // Eleven actual operations: median is sorted rank6, not a batch mean.
+                let median = observed[REPORT_SAMPLES / 2];
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "scenario": scene.name(), "samples":REPORT_SAMPLES,
+                        "median_ns_per_operation":median.as_nanos(),
+                        "median_ms_per_operation":median.as_secs_f64()*1000.0,
+                        "operation":scene.operation(),
+                    })
+                );
+                reported = true;
+            }
             b.iter_custom(|iterations| {
                 (0..iterations)
                     .map(|_| sample(&rt, scene))
@@ -73,5 +78,9 @@ fn lifecycle(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, lifecycle);
+criterion_group!(
+    benches,
+    lifecycle,
+    lifecycle_support::thread_rendering::benchmark
+);
 criterion_main!(benches);

@@ -72,6 +72,9 @@ Revision `domain-effects-v20` classifies `kg.proposal_cleanup` as `Write`: the
 operator-only subhandler archives resolved proposal projection rows. Its internal
 visibility does not exempt it from ordinary caller write restrictions.
 
+Revision `domain-effects-v21` classifies `stream.truncate` as `Write`: it removes
+a stream prefix and its notes in one transaction.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -242,6 +245,7 @@ visibility does not exempt it from ordinary caller write restrictions.
 | `stream.batch`                    | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L57)                     |
 | `stream.read`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L35)                     |
 | `stream.stat`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L47)                     |
+| `stream.truncate`                 | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L110)                    |
 | `telemetry.channels`              | Read   | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L9)                        |
 | `telemetry.counts`                | Read   | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L113)                      |
 | `telemetry.emit`                  | Write  | Verb       | [khive-pack-telemetry/src/pack.rs](../../../khive-pack-telemetry/src/pack.rs#L18)                       |

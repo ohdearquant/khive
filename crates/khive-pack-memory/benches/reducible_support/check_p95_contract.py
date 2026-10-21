@@ -26,7 +26,7 @@ def parse_list(text):
     return set(ids)
 
 
-def parse_reports(text, expected):
+def parse_reports(text, expected, *, expected_statistic="p95_ns"):
     rows = {}
     for line in text.splitlines():
         if not line.startswith("BENCH-JSON "):
@@ -38,8 +38,8 @@ def parse_reports(text, expected):
         if not isinstance(name, str) or name not in expected or name in rows:
             raise ValueError("unknown or duplicate report id")
         value, count = row["value"], row["n"]
-        if row["statistic"] != "p95_ns":
-            raise ValueError("p95 must report nanoseconds")
+        if row["statistic"] != expected_statistic:
+            raise ValueError("expected report statistic " + expected_statistic)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError("expected finite positive timing")
         if type(count) is not int or count != 200:
@@ -196,7 +196,7 @@ def check(binary, measure=False):
         if parse_list(invoke(binary, ["--list", "--test", "--bench", "--regression-case=clean-row"], environment, 5)) != expected:
             raise ValueError("valid modes must not override listing")
         output = invoke(binary, ["--regression-case=report-contract", "--save-baseline", "contract-probe", "--noplot", "--bench"], environment, 5)
-        rows = parse_reports(output, expected)
+        rows = parse_reports(output, expected, expected_statistic="report_contract_probe")
         if any(row["value"] != 250_000.0 for row in rows.values()):
             raise ValueError("known report-contract values changed")
     check_lifecycle(binary)

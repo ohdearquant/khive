@@ -595,7 +595,15 @@ impl Drop for HeldLease {
     fn drop(&mut self) {
         // The advisory lock goes first, then the in-process slot, so a
         // waiter woken by the slot finds the file lock already free.
-        self.file.take();
+        if let Some(file) = self.file.take() {
+            // A forked or duplicated descriptor can outlive this File, so
+            // closing it alone does not necessarily release the shared lock.
+            #[cfg(any(unix, windows))]
+            if let Err(error) = fs4::FileExt::unlock(&file) {
+                tracing::warn!(%error, "failed to unlock volume lease before closing its file");
+            }
+            drop(file);
+        }
         self.process.take();
     }
 }
@@ -732,6 +740,56 @@ mod tests {
         second
             .acquire_in(Duration::from_millis(100), &lock_dir)
             .expect("dropping the first lease releases both lock layers");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_volume_lease_unlocks_while_duplicate_descriptor_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = VolumeIdentity::resolve(&dir.path().join("a.db")).unwrap();
+        identity.key = isolated_test_key(8);
+        let lock_dir = dir.path().join("locks");
+        let held = identity
+            .acquire_in(Duration::from_secs(5), &lock_dir)
+            .unwrap();
+        let duplicate = held
+            ._held
+            .file
+            .as_ref()
+            .expect("a real lease owns its lock file")
+            .try_clone()
+            .unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_dir.join(identity.lock_filename()))
+            .unwrap();
+        assert!(
+            matches!(
+                fs4::FileExt::try_lock(&probe),
+                Err(fs4::TryLockError::WouldBlock)
+            ),
+            "the independent probe must observe the original held lease"
+        );
+
+        drop(held);
+        fs4::FileExt::try_lock(&probe)
+            .expect("lease drop must unlock even while its duplicate descriptor is alive");
+        fs4::FileExt::unlock(&probe).unwrap();
+        let peer = identity
+            .acquire_in(Duration::from_secs(5), &lock_dir)
+            .expect("lease drop must also release its in-process slot");
+        drop(duplicate);
+        assert!(
+            matches!(
+                fs4::FileExt::try_lock(&probe),
+                Err(fs4::TryLockError::WouldBlock)
+            ),
+            "closing the old duplicate must not unlock the new peer lease"
+        );
+        drop(peer);
+        fs4::FileExt::try_lock(&probe).expect("the peer lease must release its own advisory lock");
+        fs4::FileExt::unlock(&probe).unwrap();
     }
 
     #[test]

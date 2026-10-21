@@ -66,6 +66,30 @@ Knowledge retrieval uses the default embedder for both query and atom vectors. A
 `knowledge.index` writes only default-model atom vectors; additional registered models are not
 indexed until a knowledge read path can select or fuse them.
 
+### Learned atom weights
+
+`knowledge.search` reads persisted `atom_weights` for candidate atom IDs in the
+caller's namespace on each request, in one bounded batch. Each candidate stage fetches up to
+100 candidates regardless of the requested output limit; the lexical raw candidate
+pool remains unchanged. The distinct lexical/ANN union may therefore contain up
+to 200 candidates. Candidates outside those stage caps are not globally reranked.
+Missing weight rows apply a factor of `1.0`; stored weights use the shared
+loader's `0.1` to `5.0` bounds. Domain hits always apply `1.0`.
+
+After any embedding blend and status normalization/multipliers, the score is
+multiplied by the learned factor. Search then sorts by weighted score (slug
+breaks ties), applies `min_score` to that weighted score and takes the requested
+limit. The resulting score can exceed `1.0`; it is not clamped. A factor of
+`1.0` preserves the candidate's prior score. Each hit reports its applied factor
+as numeric `atom_weight`.
+
+A failed weight read retains the candidate scores with factor `1.0` and reports
+`degraded.atom_weights_unavailable`, even when results are nonempty. The reason
+is `cancelled` for request cancellation, `timeout` for a deadline or admission
+timeout, and `storage` for other read failures. This fallback does not claim
+that stored weight rows are absent. The read uses the original request deadline
+and adds no retry. A request with no atom candidates performs no weight read.
+
 ### Vamana ANN Signal
 
 Alongside the TF-IDF signal, if a Vamana ANN index is warm (populated via `knowledge.index
@@ -112,7 +136,8 @@ composes with `knowledge.suggest`'s existing ANN-unavailable degradation object 
 through auto-`knowledge.compose` when its internal suggestion is degraded.
 
 Eligibility refill does not override caller-requested score semantics: `min_score` is reapplied
-after status multipliers, so a genuine score-floor rejection may still return fewer than `limit`.
+after status multipliers and learned atom weights, so a genuine score-floor rejection may still
+return fewer than `limit`.
 
 ## Fold (`knowledge.fold`)
 

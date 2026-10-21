@@ -2032,6 +2032,23 @@ class DocsFormatPhaseTests(unittest.TestCase):
         install = docs_job.index("run: scripts/ci-install-ripgrep.sh")
         self.assertLess(install, docs_job.index("run: scripts/ci.sh content-sweeps"))
 
+    def test_docs_job_checks_generated_benchmark_reference_blocks(self):
+        # The benchmark reference block is generated from a committed file. A
+        # shallow checkout can hold the document without the baseline commit the
+        # renderer must date, so the docs job fetches full history before running
+        # the renderer's own tests and its fail-closed drift check.
+        job = indented_block(workflow_text("ci.yml"), "docs", 2)
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("actions/setup-python@v6", job)
+        self.assertIn(
+            "run: python3 -m unittest scripts.tests.test_render_bench_reference -v",
+            job,
+        )
+        self.assertIn("run: python3 scripts/render-bench-reference.py --check", job)
+        tests = job.index("test_render_bench_reference")
+        check = job.index("render-bench-reference.py --check")
+        self.assertLess(tests, check)
+
     def test_ripgrep_install_has_one_copy(self):
         workflow = workflow_text("ci.yml")
         self.assertNotIn("apt-get install", workflow)
@@ -2749,6 +2766,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         head = self.commit("adr")
         (self.repo / "scripts").mkdir(exist_ok=True)
         shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
         completed = subprocess.run(
             ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo, env=self.env,
             text=True, capture_output=True, timeout=30, check=False,
@@ -2945,6 +2963,7 @@ class DocsOnlyClassifierTests(unittest.TestCase):
             shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
         else:
             self.write("scripts/ci-docs-only.sh", classifier)
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
         (self.repo / "tests").mkdir(exist_ok=True)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
@@ -4274,6 +4293,269 @@ class BenchTrainScopeTests(ScopeFixture):
         # The train maps a crate to crates/<name>/Cargo.toml, so every member's directory is its package name.
         self.assertEqual({m for m in members if m not in packages or packages[m].parent.name != m}, set(),
                          "a component names a crate that is not a package of that directory name")
+
+
+class InertDocumentationDataTests(unittest.TestCase):
+    """An explicit inert-data exception cannot hide a source reader from CI."""
+
+    DOCS = "docs" + "/"
+    DATA = DOCS + "testing/fixture-exclusions.tsv"
+    LIST = "scripts/ci-inert-docs-data.txt"
+
+    @classmethod
+    def entries(cls, root):
+        paths = []
+        for number, line in enumerate((root / cls.LIST).read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            path, marker, reason = line.partition("#")
+            path = path.strip()
+            parts = pathlib.PurePosixPath(path).parts
+            if (not marker or not reason.strip() or not path.startswith(cls.DOCS)
+                    or any(part in (".", "..") for part in path.split("/"))
+                    or "//" in path or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+                    or pathlib.PurePosixPath(path).suffix not in (".tsv", ".csv", ".txt")
+                    or path in paths or len(parts) < 2):
+                raise ValueError(f"invalid inert data entry at line {number}: {path}")
+            if not (root / path).is_file() or (root / path).is_symlink():
+                raise ValueError(f"inert data is not a regular file: {path}")
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def path_pieces(line):
+        def expand(token):
+            brace = re.search(r"\{([^{}]*)\}", token)
+            if brace is None:
+                return [token]
+            return [expanded for arm in brace[1].split(",")
+                    for expanded in expand(token[:brace.start()] + arm + token[brace.end():])]
+
+        pieces = []
+        for token in re.findall(r"[A-Za-z0-9_.*/?\[\]{},-]+", line):
+            candidates = re.split(r"[{},]", token)
+            candidates += [part for expanded in expand(token) for part in expanded.split(",")]
+            for piece in candidates:
+                while piece.startswith(("[", "./", "../", "/")):
+                    if piece.startswith("../"):
+                        piece = piece[3:]
+                    elif piece.startswith("./"):
+                        piece = piece[2:]
+                    else:
+                        piece = piece[1:]
+                pieces.append(piece.rstrip("].,"))
+        return pieces
+
+    @classmethod
+    def permitted_root_line(cls, source, line):
+        allowed = {
+            "Makefile": {"deno fmt " + cls.DOCS, "deno fmt --check " + cls.DOCS},
+            "deno.json": {'"include": ["' + cls.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'},
+            ".github/workflows/ci.yml": {
+                "# Pull requests from this repository's `split/` and `" + cls.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + cls.DOCS + "'))",
+            },
+            "scripts/ci.sh": {
+                "# Reads Markdown under " + cls.DOCS
+                + ", crates/ and scripts/ by content, so the documentation lane must run it.",
+            },
+        }
+        return line.strip() in allowed.get(source, set())
+
+    @classmethod
+    def naming_error(cls, source, line, listed):
+        target = pathlib.PurePosixPath(listed)
+        if target.name in line:
+            return "file name"
+        directories = {str(parent) for parent in target.parents if len(parent.parts) >= 2}
+        for piece in cls.path_pieces(line):
+            if piece in (cls.DOCS, cls.DOCS + "*", cls.DOCS + "**"):
+                if not cls.permitted_root_line(source, line):
+                    return "documentation root"
+            if any(piece in (directory, directory + "/", directory + "/*", directory + "/**")
+                   for directory in directories):
+                return "containing directory"
+            segment = piece.rsplit("/", 1)[-1]
+            if any(char in segment for char in "*?[") and segment.endswith(target.suffix):
+                return "extension pattern"
+        return None
+
+    @classmethod
+    def inventory_errors(cls, root):
+        listed = cls.entries(root)
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True,
+                                 timeout=10).stdout.decode().split("\0")
+        errors = []
+        for source in tracked:
+            # The inventory declares exceptions; it is not a consumer of the data it lists.
+            if not source or source == cls.LIST or source.startswith(cls.DOCS) or source.endswith(".md"):
+                continue
+            for number, line in enumerate((root / source).read_bytes().decode("utf-8", errors="replace").splitlines(), 1):
+                for path in listed:
+                    reason = cls.naming_error(source, line, path)
+                    if reason:
+                        errors.append(f"{source}:{number}: {reason} names {path}")
+        return errors
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        self.write(self.LIST, self.DATA + " # Historical exclusions, not read by source.\n")
+        self.write(self.DATA, "CHANGELOG.md\thistorical exclusion\n")
+        self.write("CHANGELOG.md", "# Changes\n")
+        self.classifier = self.repo / "scripts/ci-docs-only.sh"
+        shutil.copy(REPO_ROOT / "scripts/ci-docs-only.sh", self.classifier)
+        (self.repo / "tests").mkdir()
+        shutil.copy(REPO_ROOT / "tests/documented_verb_counts.py", self.repo / "tests/documented_verb_counts.py")
+        self.base = self.commit("base")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo,
+                              env=self.env, text=True, capture_output=True, timeout=10, check=True).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify_change(self):
+        self.write("CHANGELOG.md", "# Changes\n\nA documented change.\n")
+        head = self.commit("changelog")
+        result = subprocess.run(["bash", str(self.classifier), self.base, head], cwd=self.repo,
+                                env=self.env, text=True, capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip(), result.stderr
+
+    def test_listed_changelog_takes_documentation_lane(self):
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_inert_list_reader_does_not_execute_checkout_modules(self):
+        """A Python stdin reader must not execute import-shadowing modules from the checkout."""
+        marker = self.repo / "inert-reader-shadow-imported"
+        self.write("re.py", 'with open("inert-reader-shadow-imported", "w") as marker:\n'
+                            '    marker.write("checkout module executed\\n")\n')
+        source = self.classifier.read_text()
+        scanner_call = '    python3 "$scanner" --published-markdown "$path" < /dev/null'
+        self.assertEqual(source.count(scanner_call), 1)
+        # The existing scanner is a separate import site; only the new stdin reader is under test here.
+        self.classifier.write_text(source.replace(scanner_call, "    false"))
+        self.env.pop("PYTHONPATH", None)
+        self.env.pop("PYTHONSAFEPATH", None)
+        self.base = self.commit("checkout shadow module and isolated reader")
+        verdict, reasons = self.classify_change()
+        self.assertFalse(marker.exists(), "the inert-list reader imported the checkout's re.py")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_unlisted_changelog_takes_full_suite(self):
+        self.write(self.LIST, "# No exceptions.\n")
+        self.base = self.commit("unlisted")
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("named by a non-Markdown file", reasons)
+
+    def test_unreadable_or_malformed_list_takes_full_suite(self):
+        malformed = ["missing", self.DATA + "\n", self.DATA + " # \n",
+                     "elsewhere/file.tsv # Outside documentation\n",
+                     self.DOCS + "testing/../file.tsv # Traversal\n",
+                     self.DOCS + "testing/file.json # Wrong extension\n"]
+        for content in malformed:
+            with self.subTest(content=content):
+                if content == "missing":
+                    (self.repo / self.LIST).unlink(missing_ok=True)
+                else:
+                    self.write(self.LIST, content)
+                self.base = self.commit("invalid list")
+                self.write("CHANGELOG.md", "# Before\n")
+                self.base = self.commit("before markdown change")
+                verdict, reasons = self.classify_change()
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn("cannot read or parse inert documentation data list", reasons)
+
+    def test_inventory_rejects_non_documentation_and_other_extensions(self):
+        for path in ("elsewhere/file.tsv", self.DOCS + "testing/file.json"):
+            with self.subTest(path=path):
+                self.write(path, "data\n")
+                self.write(self.LIST, path + " # Invalid location or extension\n")
+                with self.assertRaises(ValueError):
+                    self.inventory_errors(self.repo)
+
+    def assert_reader_rejected(self, text):
+        self.write("scripts/consumer.txt", text + "\n")
+        self.git("add", "scripts/consumer.txt")
+        errors = self.inventory_errors(self.repo)
+        self.assertTrue(any(error.startswith("scripts/consumer.txt:1:") for error in errors), errors)
+
+    def test_inventory_rejects_file_directory_and_extension_readers(self):
+        directory = self.DOCS + "testing"
+        suffix = pathlib.PurePosixPath(self.DATA).suffix
+        for text in (pathlib.PurePosixPath(self.DATA).name, self.DATA, directory, directory + "/",
+                     directory + "/*", directory + "/**", "*" + suffix, "?" + suffix,
+                     "row[ab]" + suffix, self.DOCS + "**/*" + suffix):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_rejects_root_readers_except_exact_documented_lines(self):
+        for text in (self.DOCS, self.DOCS + "*", self.DOCS + "**"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+        for source in ("Makefile", "deno.json", ".github/workflows/ci.yml", "scripts/ci.sh"):
+            self.assertIsNotNone(self.naming_error(source, "cat " + self.DOCS, self.DATA))
+        permitted = {
+            "Makefile": ["deno fmt " + self.DOCS, "deno fmt --check " + self.DOCS],
+            "deno.json": ['"include": ["' + self.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'],
+            ".github/workflows/ci.yml": [
+                "# Pull requests from this repository's `split/` and `" + self.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + self.DOCS + "'))"],
+            "scripts/ci.sh": ["# Reads Markdown under " + self.DOCS
+                              + ", crates/ and scripts/ by content, so the documentation lane must run it."],
+        }
+        for source, lines in permitted.items():
+            for line in lines:
+                with self.subTest(source=source, line=line):
+                    self.assertIsNone(self.naming_error(source, line, self.DATA))
+                    self.assertIsNotNone(self.naming_error("scripts/consumer.txt", line, self.DATA))
+                    self.assertIsNotNone(self.naming_error(source, line + " extra", self.DATA))
+
+    def test_inventory_rejects_list_and_variable_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("{" + directory + ",elsewhere}", "[" + directory + ",elsewhere]",
+                     "elsewhere," + directory, "${ROOT}/" + directory,
+                     self.DOCS + "{testing,guide}", "*." + "{tsv,csv}", "[*" + ".tsv,*" + ".csv]",
+                     "${ROOT}/*" + ".tsv", "elsewhere,*" + ".tsv"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_normalizes_relative_and_punctuated_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("./" + directory, "../../" + directory, "/" + directory,
+                     "[../" + directory + "].", directory + ".", directory + ","):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_longer_paths_do_not_name_containing_directories(self):
+        for text in ("docs/testing/sibling.csv", self.DOCS + "testing-extra", self.DOCS + "testing/other/file"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.naming_error("scripts/consumer.txt", text, self.DATA))
+
+    def test_repository_inventory_has_no_source_readers(self):
+        self.assertNotEqual(self.entries(REPO_ROOT), [])
+        self.assertEqual(self.inventory_errors(REPO_ROOT), [])
+
 
 
 class OptionalWorkflowCodexSkipTests(unittest.TestCase):

@@ -1,5 +1,23 @@
 # khive-request Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-request`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark               | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `parse/batch/10`        | 4.702 µs         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/batch/3`         | 821.109 ns       | 1.011     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/chain/2`         | 830.479 ns       | 1.021     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/chain/5`         | 2.094 µs         | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/json_form/3_ops` | 1.592 µs         | 1.034     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/single/complex`  | 944.605 ns       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `parse/single/simple`   | 199.715 ns       | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Run command
 
 ```bash
