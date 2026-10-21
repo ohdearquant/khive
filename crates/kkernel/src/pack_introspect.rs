@@ -641,7 +641,7 @@ mod tests {
             .iter()
             .filter(|verb| verb.visibility == VerbVisibility::Verb)
             .collect();
-        assert_eq!(public.len(), 29, "kg public verb inventory: {public:?}");
+        assert_eq!(public.len(), 30, "kg public verb inventory: {public:?}");
         let internal: Vec<_> = info
             .verbs
             .iter()

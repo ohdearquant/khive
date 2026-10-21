@@ -25,7 +25,7 @@ https://khive.ai/?utm_source=github&utm_campaign=khive-readme
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **158 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **159 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 20 closed relations in 10 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic, ownership)          |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,13 +63,13 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **158 verbs** out of the box (updated from the
+All 14 packs load by default, giving **159 verbs** out of the box (updated from the
 current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                                                                                                     |
 | ------------- | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 29    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
+| **kg**        | _(bare)_     | 30    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
 | **gtd**       | `gtd.`       | 7     | Task lifecycle, timestamp census, and explicit historical repair                                                                                                                 |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                                 |
 | **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                           |
@@ -139,7 +139,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 29 public verbs        │
+│  khive-pack-kg:        KG vocabulary + 30 public verbs        │
 │  khive-pack-gtd:       task lifecycle (7 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (17 verbs)           │
@@ -272,7 +272,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 158-verb catalog.
+MCP client discovers the `request` tool with the full 159-verb catalog.
 
 ### Alternative: npm
 
@@ -404,7 +404,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-158 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
+159 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

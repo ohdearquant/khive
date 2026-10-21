@@ -81,6 +81,10 @@ harness = false
 name = "knowledge_index_build"
 harness = false
 
+[[bench]]
+name = "knowledge_namespace"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"

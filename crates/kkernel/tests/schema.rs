@@ -629,7 +629,7 @@ async fn schema_is_an_explicit_read_without_weakening_enrollment_or_unknown_deni
     }
     assert_eq!(classify_operation("schema"), Some(OperationAccess::Read));
     assert_eq!(classify_operation("schema.lookalike"), None);
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v20");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v21");
     let gate = Arc::new(CallerEnrollmentGate::with_write_denials(
         vec!["schema-test".into()],
         false,

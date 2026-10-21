@@ -29,7 +29,7 @@ pub fn slug(index: usize) -> String {
 
 pub struct Fixture {
     pub registry: VerbRegistry,
-    runtime: KhiveRuntime,
+    pub(crate) runtime: KhiveRuntime,
     backend: Arc<StorageBackend>,
     directory: TempDir,
 }

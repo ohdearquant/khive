@@ -62,6 +62,15 @@ struct StatParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TruncateParams {
+    stream: String,
+    before_seq: i64,
+    #[serde(rename = "namespace")]
+    _namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchParams {
     ops: Vec<Value>,
     fence: Option<Value>,
@@ -281,6 +290,17 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let p: StatParams = deser(params)?;
         self.runtime.stream_stat(token, &p.stream).await
+    }
+
+    pub(crate) async fn handle_stream_truncate(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: TruncateParams = deser(params)?;
+        self.runtime
+            .stream_truncate(token, &p.stream, p.before_seq)
+            .await
     }
 
     /// Both modes validate every member's shape before anything is written;

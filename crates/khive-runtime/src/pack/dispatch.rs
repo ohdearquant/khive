@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::error::{AuditObligationFailure, DispatchError, RuntimeError};
 use crate::runtime::NamespaceToken;
 
+use super::audit::enrich_stream_truncate_success;
 use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
@@ -411,7 +412,7 @@ impl VerbRegistry {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
-        let event = match result {
+        let mut event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
                 let resource = crate::cost_unit::resource_payload(
                     verb,
@@ -468,6 +469,9 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
+        if let Ok(value) = result {
+            enrich_stream_truncate_success(&mut event, gate_req, value);
+        }
         let producer = if result.is_ok() {
             crate::audit_batch::AuditProducer::DispatchSucceeded
         } else {
@@ -1142,6 +1146,13 @@ impl VerbRegistry {
                                 let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Ok(value) = &result {
+                                    enrich_stream_truncate_success(
+                                        &mut storage_event,
+                                        &gate_req,
+                                        value,
+                                    );
+                                }
                                 if let Some(metadata) = &mounted_audit {
                                     storage_event.payload["mounted_tool"] = metadata.clone();
                                 }

@@ -1500,3 +1500,6 @@ async fn malformed_fts5_match_expression_still_errors() {
         "a syntax error must not be classified as StorageError::Timeout, got {err:?}"
     );
 }
+
+#[path = "compose_no_binding_tests.rs"]
+mod compose_no_binding_tests;

@@ -22,6 +22,8 @@ mod page_accounting;
 mod proposal_archive;
 #[path = "migrations_tests/retrieval_snapshots.rs"]
 mod retrieval_snapshots;
+#[path = "migrations_tests/stream_truncation_tests.rs"]
+mod stream_truncation;
 
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
