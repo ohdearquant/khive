@@ -22,6 +22,7 @@ impl KhiveRuntime {
             let mut vector_error: Option<String> = None;
             let mut vector_hits =
                 if query_vector.is_some() || !self.default_embedder_name().is_empty() {
+                    crate::search_audit::record(crate::search_audit::SearchArm::Vector);
                     match self
                         .vector_search(
                             token,
