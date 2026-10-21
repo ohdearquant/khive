@@ -48,7 +48,10 @@ bound, and a workflow from which `complete` or `terminate` is unreachable.
 Each entry carries a name, an observation kind, an argument schema, an outcome set, a maximum enforcement level and a
 producer class. The registry's canonical digest is the definition's `gate_registry_digest`. Every phrase evaluates by
 the one ADR-193 D3 rule: the newest complete observation of its kind for the subject at the current generation, from a
-registered producer; an unknown, missing, partial or conflicting observation blocks. Phrases over the store's own state
+registered producer; an unknown, missing, partial or conflicting observation blocks. A phase's first visit reads every
+observation at the current generation, including those recorded while the run was in an earlier phase; a revisit reads
+only observations recorded after its previous visit ended, so a bounded loop never reuses the evidence that sent it
+round. Phrases over the store's own state
 (a task's status, a message present, a graph edge, a schedule fire) are produced by a built-in instrument that reads the
 store and records an observation, so evaluation stays pure. A phrase whose truth cannot be established mechanically,
 or that only the checked actor can report about itself, has an advisory ceiling.
