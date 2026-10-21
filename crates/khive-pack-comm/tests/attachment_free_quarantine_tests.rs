@@ -264,3 +264,73 @@ async fn attachment_free_duplicate_identity_is_scoped_to_channel_slug() {
         assert_eq!(f.message_count().await, 3);
     }
 }
+
+#[tokio::test]
+async fn quarantined_attachment_free_replay_preserves_an_ordinary_delivered_row() {
+    // Exercise conditional insert, account-key prelookup, and legacy IMAP lookup.
+    for (with_legacy_lookup, stored_legacy_key) in [(false, false), (true, false), (true, true)] {
+        let f = Fixture::new().await;
+        let mut original = f.original_delivery();
+        original["content"] = json!("stored ordinary delivered body");
+        original["metadata"] = json!({"replay_marker": {"phase": "stored"}});
+        if stored_legacy_key {
+            original["external_id"] = json!(LEGACY_ID);
+        }
+        let stored = f.registry.dispatch("comm.ingest", original).await.unwrap();
+        assert_eq!(stored["deduplicated"], false);
+        assert!(stored.get("quarantine_original_retained").is_none());
+        let id = note_id(&stored);
+        let before = f.snapshot(id).await;
+        let properties = before.0.properties.as_ref().unwrap();
+        assert_ne!(properties.get("quarantined"), Some(&Value::Bool(true)));
+        assert!(before.0.expires_at.is_none());
+        assert!(before.1.is_empty());
+
+        let input = replay(FIRST_SLUG, with_legacy_lookup);
+        assert_eq!(input["metadata"]["quarantined"], true);
+        assert!(input["metadata"].get("quarantine_content_ref").is_none());
+        assert_ne!(input["content"].as_str(), Some(before.0.content.as_str()));
+        let ack = f
+            .registry
+            .dispatch("comm.ingest", input.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            ack,
+            json!({
+                "ok": true,
+                "deduplicated": true,
+                "external_id": EXTERNAL_ID,
+                "thread_id": properties["thread_id"],
+            }),
+            "the duplicate receipt reports stored identity, not a replay screening decision"
+        );
+        assert_eq!(
+            f.snapshot(id).await,
+            before,
+            "replay changed the delivered row or its custody"
+        );
+        assert_eq!(
+            f.message_count().await,
+            1,
+            "replay persisted another message"
+        );
+
+        // The same quarantine verdict is accepted and recorded for a new identity:
+        // unchanged duplicate state must not be explained by ignoring the input shape.
+        let mut fresh = input;
+        fresh["external_id"] = json!("imap:mail.example.com:verdict-control:17:43");
+        fresh.as_object_mut().unwrap().remove("legacy_external_id");
+        let accepted = f.registry.dispatch("comm.ingest", fresh).await.unwrap();
+        assert_eq!(accepted["deduplicated"], false);
+        assert_eq!(accepted["quarantine_original_retained"], false);
+        let quarantined = f.note(note_id(&accepted)).await;
+        assert_eq!(
+            quarantined.properties.as_ref().unwrap()["quarantined"],
+            true
+        );
+        assert!(quarantined.expires_at.is_some());
+        assert_eq!(f.message_count().await, 2);
+        assert_eq!(f.snapshot(id).await, before);
+    }
+}

@@ -889,6 +889,15 @@ note unchanged; that receipt does not prove possession of the original or that
 changed replay content, sender, or metadata was stored. Delivered withheld retries
 retain their stricter original-custody requirements described above.
 
+This includes an attachment-free replay marked quarantined when the stored row is
+an ordinary delivered message. The duplicate acknowledgement preserves that
+original delivery: it does not record or disclose the replay's quarantine verdict,
+replace the body, install quarantine expiry, or attach original bytes. Its
+`deduplicated: true` receipt reports the existing identity and thread, not a new
+screening decision. A new identity with the same quarantined input still creates
+a quarantine record and reports its original-retention outcome. Delivered withheld
+replays and attachment-bearing replays remain subject to their custody checks.
+
 When a replay supplies an original attachment, a duplicate transport id repairs a
 missing attachment only when its stored reference matches the replayed bytes and
 the exact channel kind and slug match. The one-release legacy IMAP lookup applies
