@@ -1,4 +1,5 @@
 //! Shared-storage snapshot persistence; database creation/migration/cleanup are untimed.
+use std::cell::OnceCell;
 use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -8,6 +9,8 @@ use khive_storage::SqlAccess;
 
 #[path = "fixtures/persistence.rs"]
 mod fixture;
+#[path = "fixtures/mode.rs"]
+mod mode;
 use fixture::{Fixture, Indexes, ROWS};
 
 const NAMESPACE: &str = "bench:retrieval:甲'current";
@@ -200,23 +203,36 @@ async fn iteration(kind: Kind, scenario: Scenario, current: &Indexes, old: &Inde
 }
 
 fn persistence(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let current = Indexes::generated(42, 0);
-    let old = Indexes::generated(43, 10_000);
+    let inputs = OnceCell::new();
+    let get_inputs = || {
+        inputs.get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            (
+                rt,
+                Indexes::generated(42, 0),
+                Indexes::generated(43, 10_000),
+            )
+        })
+    };
+    if mode::is_profile_mode() {
+        get_inputs();
+    }
     let mut group = c.benchmark_group("persistence");
     group.sample_size(10);
     for kind in [Kind::Bm25, Kind::Hnsw] {
         for scenario in [Scenario::Fresh, Scenario::Replace, Scenario::Shadow] {
             group.bench_function(BenchmarkId::new(kind.name(), scenario.name()), |b| {
+                // Ordinary selection stays lazy; profiling prewarms outside its callback.
+                let (rt, current, old) = get_inputs();
                 // Sequential setup prevents Criterion warmup from accumulating fixtures.
                 b.iter_custom(|iterations| {
                     let mut elapsed = Duration::ZERO;
                     for _ in 0..iterations {
-                        elapsed += rt.block_on(iteration(kind, scenario, &current, &old));
+                        elapsed += rt.block_on(iteration(kind, scenario, current, old));
                     }
                     elapsed
                 });
