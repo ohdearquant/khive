@@ -869,7 +869,8 @@ Amendment 12's Ratification scope ("a run has no network"), Amendment 1 item 5 (
 class), Amendment 1 item 7 with Amendment 7 (two additive `sandbox` fields), Amendment 2 item 3
 (`exec.identity` reports a second template digest), and, for honoured runs only, Amendment 9 item 2
 with the Consequences line that rests on arm 4. It amends ADR-180 Amendment 1 item 1 (the grant pin
-inputs) for one property, and ADR-180's Approval fast path for rows that carry that property. Every
+inputs) for one property, and ADR-180's Approval fast path for rows that carry that property. It
+adds one host setting, off unless configured, without which no declaration is honoured. Every
 other decision in this record and in ADR-180 stands. A
 registration that does not declare network runs exactly as before, and its pin and grants are
 unchanged byte for byte.
@@ -891,10 +892,14 @@ The policy surface already distinguishes how a run was allowed. `tool.check` ans
 and definition digest equal the row's current ones (ADR-180 Amendment 1 item 2). The digest covers
 four properties, and a missing one is written into the pinned bytes as an explicit null
 (`khive-pack-tool/src/pin.rs:11-24`). A grant whose tool name resolves to no registration when it
-is granted carries a null pin and stops being active once a matching name is registered (ADR-180
-Amendment 1 item 3's rule applied to patterns; test
+is granted carries a null pin and cannot authorize a registered row: a pinned row is matched only
+by a grant carrying its pin (`khive-pack-tool/src/policy.rs:387-405`). A matching registration in
+the grant's own namespace invalidates it permanently (the registry-insert trigger,
+`khive-pack-tool/sql/grant-invalidation.sql:7-23`; test
 `wildcard_grants_record_registrations_that_precede_the_approval`,
-`khive-pack-tool/tests/grant_pins.rs:304`). A name ending in `*` is also a literal name: a tool
+`khive-pack-tool/tests/grant_pins.rs:304`). A matching registration in another namespace makes it
+inapplicable to that row without invalidating it, so it still answers for matching names that
+remain unregistered in its own namespace. A name ending in `*` is also a literal name: a tool
 registered as `family.*` is resolved by a grant for `family.*`, which then carries that row's pin.
 So for exec, which runs only registered tools, `source` `grant` means an approved grant whose actor
 and tool patterns match the request and whose pin equals the row being run. It does not mean an
@@ -953,7 +958,8 @@ accepted by its driven arms, never by its text.
 
    Which registrations may carry `network` is the hosting deployment's registration policy, not
    exec's. exec enforces the declaration a row carries; it does not decide eligibility, and nothing
-   here promises that a deployment's general code runs without network.
+   here promises that a deployment's general code runs without network. Whether the host runs
+   networked rows at all is a separate host setting, item 3.
 
 2. **`network` joins the grant pin when the row carries it.** This amends ADR-180 Amendment 1
    item 1 for one property. When the row's properties contain the key `network`, the pinned inputs
@@ -969,12 +975,18 @@ accepted by its driven arms, never by its text.
    adds the key to an existing row today (item 1); the pin covers the paths ADR-180 Amendment 1
    item 4 names: a restore, a second writer inside the owning pack, a later update verb.
 
-3. **The declaration is honoured only by a grant to a non-anonymous actor.** A run of a row
-   carrying `network` proceeds only when all of these hold, checked in preflight after the policy
-   decision and before the binary digest:
+3. **The declaration is honoured only on an enabled host, by a grant to a non-anonymous actor.** A
+   run of a row carrying `network` proceeds only when all of these hold, checked in preflight after
+   the policy decision and before the binary digest:
+   - the host has enabled networked runs;
    - the stored value is `"outbound"`;
    - the decision is `allow` with `source` `grant`;
    - the token is not anonymous.
+
+   The host setting is part of the daemon's configuration, read when the daemon starts, and is off
+   unless the configuration turns it on; no verb changes it. It is checked at run time, not at
+   registration, so it holds for every row carrying `network` however the row was written,
+   including a restored row or one written by another writer.
 
    For a non-anonymous token the request's `actor` must also equal the caller. That check exists
    today and runs first in preflight, before registration and policy (`handlers.rs:1025-1032`); it
@@ -991,16 +1003,19 @@ accepted by its driven arms, never by its text.
    separates attributed actors and does not keep one same-uid client from another. Binding a run to
    an individually verified holder needs the connection-identity mechanism that ADR-096 defers to
    its own record. Until a transport supplies one, the deployment limits network reach through
-   which registrations may declare it (item 1), not through the grant's actor. A deployment in
-   which more than one principal shares the daemon's uid, such as any multi-tenant or hosted
-   service, enables no row carrying `network` until that record exists: on such a host item 1 is a
-   default deny, not a limit.
+   which registrations may declare it (item 1) and through the host setting, not through the
+   grant's actor. The daemon cannot tell how many principals share its uid (ADR-096; the
+   connection check is same-uid, not same-principal, `khive-runtime/src/daemon/boot_guard.rs:347-354`), so the host
+   setting is the operator's statement that one principal does. A deployment in which more than one
+   principal shares the daemon's uid, such as any multi-tenant or hosted service, leaves the setting
+   off until the connection-identity mechanism is accepted, implemented and binds the request
+   principal; with it off, every row carrying `network` is refused (item 4).
 
 4. **A run that would not be honoured is refused, never run without network.** When the row
    carries `network` and any condition in item 3 fails, exec writes a refusal receipt (Amendment 1
    item 5): `decision` as decided, `tree_out` null, no run directory, `sandbox` null (Amendment 7),
-   and a `reason` that starts with `network_unhonoured:` and names the failed condition (the
-   decision source, or an anonymous caller). A stored value other than `"outbound"` is refused the
+   and a `reason` that starts with `network_unhonoured:` and names the failed condition (the host
+   setting, the decision source, or an anonymous caller). A stored value other than `"outbound"` is refused the
    same way with the prefix `network_invalid:`. A non-anonymous caller whose request names another
    actor is refused earlier by the existing identity check, with its existing reason and neither
    prefix. Refusing is never weaker than running without network, and the reason names the real
@@ -1037,9 +1052,13 @@ accepted by its driven arms, never by its text.
    and a registration with `side_effect: "read"` defaults to `allow`, so under that contract a
    networked row allowed by `policy` or `default` could never obtain the grant item 3 requires. For
    a registered row carrying `network`, `tool.request` inserts a request row and returns its id
-   whenever the decision is not `allow` with `source` `grant`. The response still carries the
-   decision, so the caller sees both that the tool is allowed and that a run with network waits for
-   the grant. For every other row the fast path is unchanged.
+   whenever the decision is not `allow` with `source` `grant`. The row is the one the reference
+   resolves to, by name, id or prefix, as exec resolves it (`khive-pack-tool/src/handlers.rs:262-269`),
+   not the spelling of the reference. The inserted request follows ADR-180's Approval contract
+   unchanged: it is created `requested` with a null pin, approval pins it, the self-grant refusal
+   and status transitions apply, and `notify` is sent as for any other request. The response still
+   carries the decision, so the caller sees both that the tool is allowed and that a run with
+   network waits for the grant. For every other row the fast path is unchanged.
 
 ### What a grant on a networked registration approves
 
@@ -1053,8 +1072,10 @@ The grantor should read these as the approval's actual scope.
    not by a rule that names those addresses: the template denies `localhost` only, and why that
    also refuses the host's LAN and VPN addresses was measured, not explained. UDP, ICMP and raw
    sockets, IPv4-mapped IPv6 forms of the host's addresses, the host's IPv6 global and link-local
-   addresses, and IPv6 bind and listen were not run; arm 59 covers them and is required before any
-   backend enables the declaration. A multicast datagram is delivered by default to the host's own
+   addresses, and IPv6 and UDP bind and listen were not run. Arm 59 names each of these classes as
+   an operation with its own unsandboxed control, and a host enables networked runs (Decision
+   item 3) only after arm 59 has run every class on that host's macOS version. A class that was not
+   run is not treated as refused. A multicast datagram is delivered by default to the host's own
    members of the group as well as to other hosts, so it is an own-address path the `localhost`
    rule does not name; arm 59 records it rather than assuming either outcome.
 2. **Anything the run can read can leave.** The existing data read set is retained: the
@@ -1094,7 +1115,8 @@ The network arms (50 to 56, and 59) run on macOS and pass only with each operati
 succeeding in the same run; an arm whose control fails is reported as not run, never as passed. An
 arm that needs something the host lacks (no egress for 50, no non-loopback address for 51) is also
 not run, not passed. They run again on every macOS version the daemon supports, because the rule
-set is accepted by these arms and not by its text.
+set is accepted by these arms and not by its text. Every arm except 60 runs with the host setting of
+Decision item 3 on.
 
 Pin and registration:
 
@@ -1145,22 +1167,42 @@ An honoured run (a grant pinned to the row, a non-anonymous caller naming itself
     outside the run directory and a bind, and still reaches the remote endpoint. This arm records
     item 4 of the scope above as current behavior; it is not a containment claim.
 
-Identity, approval and the remaining address forms:
+Identity, approval, the remaining address forms and the host setting:
 
 57. A non-anonymous caller B sending a request whose `actor` is A, where A holds an active grant
     pinned to the row, is refused before the row is materialized, with the existing identity reason
     and neither prefix of Decision item 4. Control: the same row run by A. Mutation control:
     deleting the equality check in preflight turns this arm red and leaves 46 to 49 green.
 58. For a row carrying `network`, starting once from a `policy` allow and once from a `default`
-    allow: exec refuses with `network_unhonoured:`; `tool.request` returns a non-null request id
-    with no change to policy; a different actor grants it; exec then runs honoured. Mutation
-    control: restoring the fast path for rows carrying `network` turns this arm red.
-59. An honoured run is refused a UDP send to v4 and v6 loopback; a TCP connection to
-    `::ffff:127.0.0.1` and to the IPv4-mapped form of each non-loopback IPv4 address of the host; a
-    TCP connection to each IPv6 global and link-local address of the host; and bind and listen on
-    `::1` and `::`. ICMP to the host's own addresses and a multicast send to a group the host has
-    joined are run and their outcomes recorded; enabling the declaration on a backend requires them
-    refused, or an accepted scope change for them first. Each operation has its unsandboxed control
-    in the same run.
+    allow: exec refuses with `network_unhonoured:`; `tool.request`, given the row by name and once
+    by id, returns a non-null request id with no change to policy, and with `notify` set it sends
+    the notice as for any other request; a different actor grants it; exec then runs honoured.
+    Mutation controls: restoring the fast path for rows carrying `network` turns this arm red, and
+    so does skipping `notify` for the inserted request.
+59. An honoured run is refused, for each address below that the host has:
+    - a UDP send and a TCP connection to v4 and v6 loopback, to each non-loopback IPv4 address of
+      the host, to the IPv4-mapped form of each of those (`::ffff:127.0.0.1` included), and to each
+      IPv6 global and link-local address of the host, link-local with its scope;
+    - a TCP bind and listen, and a UDP bind, on `::1` and `::`, and a UDP bind on `127.0.0.1` and
+      `0.0.0.0`;
+    - creating a raw socket (`SOCK_RAW`, IPv4 and IPv6, ICMP protocol) and sending on it, and an
+      ICMP echo through a datagram ICMP socket (`SOCK_DGRAM`, `IPPROTO_ICMP`), each to the host's own
+      addresses.
+
+    A multicast send to a group the host has joined is run and its outcome recorded. Each operation
+    has its unsandboxed control in the same run, made with the same call, so a failure to create the
+    socket, a missing privilege or a failed setup bind is never read as the profile's refusal. An
+    operation the unsandboxed control cannot perform at the daemon's uid, such as a raw socket
+    without the privilege, is recorded as unavailable to that uid; the profile only narrows what the
+    uid can do, so such an operation is closed for runs, and the arm is run again for it if the
+    daemon's privileges change. Any other class not run, and a multicast outcome other than refused,
+    keeps the host setting off on that host until the class is run or an accepted scope change
+    covers it.
+60. With the host setting off, a row carrying `network: "outbound"`, a grant pinned to it and a
+    non-anonymous caller naming itself as `actor` is refused with `network_unhonoured:` naming the
+    host setting, before the binary digest and with no run directory; the same holds for such a row
+    written through storage. Control: the same row and caller with the setting on runs honoured.
+    Mutation control: deleting the host-setting check turns this arm red and leaves 46 to 49, 57
+    and 58 green.
 
 Implementation follows acceptance of this amendment and goes through the usual review and gates.
