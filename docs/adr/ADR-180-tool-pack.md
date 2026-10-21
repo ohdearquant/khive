@@ -737,9 +737,10 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
 
    It answers `true` exactly when the row with that id passes item 1's activity test and its `actor`
    and `tool` patterns match the given actor and tool under the same pattern rule the by-actor
-   lookup uses (`pattern_match_sql`, `:282`). It answers `false` when no row has that id in `ns`,
-   when the row is not `granted`, has expired, was invalidated, carries a different pin, or does not
-   match the actor or tool. A row that has the id and fails the parse is an error naming the row id,
+   lookup uses (`pattern_match_sql`, `:282`). It answers `false` when no row has that id in `ns`, when the
+   row is not `granted`, has expired relative to the supplied `now`, was invalidated, carries a different
+   pin, or does not match the actor or tool. A row that has the id and fails the parse is an error naming
+   the row id,
    never `false`, for the same reason `from_active_row` refuses it: a malformed grant must not be
    read as either a live approval or the absence of one. `GrantRow` stays crate-private (`:150`);
    the entry returns a boolean because the caller already holds the id.
@@ -748,8 +749,9 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    grants match the same actor and tool, it returns the newer one. A unit consuming on the strength
    of the older grant would then either refuse a consumption whose own grant is still live or have to
    compare ids and reason about which grant won. The by-id entry answers about the grant the caller
-   holds. It also requires that grant to match the actor and tool being consumed for, so a live grant
-   for one tool cannot be presented to authorize a consumption for another.
+   holds. It also requires that grant to match the actor and tool being consumed for, so a grant whose
+   stored patterns exclude the supplied actor or tool cannot be presented to authorize a consumption for that
+   actor or tool.
 
 4. **Inside a unit.** The entry issues one statement on the reader it is given and awaits nothing
    else, so on a unit's writer it completes on the first poll, as `atomic_unit` requires. The tool
@@ -772,7 +774,11 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    `decide` does; it does not resolve the tool's name. A registry change committed after the caller
    computed its pin and before its unit opens is not seen by this check. Closing that window needs
    the pin read inside the same unit, which this amendment does not specify. No wire verb changes,
-   and `tool.check`'s answers do not change.
+   and `tool.check`'s answers do not change. `now` is also a caller-prepared snapshot: expiry can pass between
+   that sample and the unit's admission to the writer, or between the check and the consumption or commit. The
+   entry serializes grant-state checks against other writers; it does not guarantee validity at consumption or
+   commit time. A consumer that needs a fresher deadline than the supplied `now` must establish it on its own
+   admitted writer.
 
 ### Acceptance for Amendment 7
 
@@ -782,10 +788,14 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    revoked; expired at `now`; invalidated by a registry change; re-pinned, meaning the same actor and
    tool with a registration whose id or definition digest differs. The last four answer `false`, and
    `decide` answers from policy or default.
-2. A selected row with a missing or mistyped required column is an error naming the row id from both
-   the by-id entry and `decide`; neither reads it as no grant.
+2. A selected row with a missing or mistyped required column is an error naming the row id when the id is
+   readable, otherwise the existing `<unreadable id>` diagnostic, from both the by-id entry and `decide`;
+   neither reads it as no grant.
 3. With two live grants matching the same actor and tool, `decide` cites the newer one and the by-id
-   entry answers `true` for the older one.
+   entry answers `true` for the older one. Revoke only the older grant in a committed unit while the newer
+   grant remains live: the by-id entry then answers `false` for the older id and `true` for the newer id,
+   while `decide` still cites the newer id. This separates a by-id check from an existence guard that would
+   answer `true` for the revoked older grant whenever any newer matching grant is live.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
@@ -798,6 +808,9 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    lenient `GrantRow::from_row` turns arm 2 red. Dropping the actor or tool match from the by-id
    statement turns arm 4 red.
 9. On the single-writer path, the unit that runs the by-id entry completes without the single-poll
-   driver's pending refusal.
+   driver's pending refusal. The supplied reader is instrumented and each call issues exactly one query on it,
+   for a live grant, a missing id, an inactive id and a malformed selected row alike; a mutant that runs the
+   SELECT twice turns this arm red, which shows the entry keeps the one-statement contract rather than only
+   returning the right answer on the first poll.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
