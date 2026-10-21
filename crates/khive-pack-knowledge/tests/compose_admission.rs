@@ -32,12 +32,22 @@ async fn fixture() -> VerbRegistry {
         .dispatch(
             "knowledge.upsert_atoms",
             json!({"atoms": [{
-                "slug": MEMBER, "name": "Populated compose admission member", "content": body
+                "slug": MEMBER, "name": "Populated compose admission member", "content": body,
+                "finalized": true
             }]}),
         )
         .await
         .expect("seed member");
     assert_eq!(atoms["created"], 1);
+    let member = registry
+        .dispatch("knowledge.get", json!({"id": MEMBER}))
+        .await
+        .expect("read seeded member");
+    assert_eq!(
+        member["status"], "reviewed",
+        "auto-compose excludes draft atoms"
+    );
+    assert_eq!(member["finalized"], true);
     let domains = registry
         .dispatch(
             "knowledge.upsert_domains",
