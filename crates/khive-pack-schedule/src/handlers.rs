@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::embedding_warning::add_embedding_truncation_warning;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
@@ -448,8 +449,9 @@ fn classify_create_kind(
         });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "schedule.action: verb \"create\" with kind={raw:?} always fails at replay (unknown \
+        "schedule.action: verb \"create\" with kind={:?} always fails at replay (unknown \
          kind; valid: entity | note | edge | event | proposal | {} | {})",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         registry.all_entity_kinds().join(" | "),
         registry.all_note_kinds().join(" | "),
     )))
@@ -475,7 +477,8 @@ fn canonical_entity_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_entity_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown entity_kind {raw:?}; valid: {}",
+        "unknown entity_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
@@ -494,7 +497,8 @@ fn canonical_note_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_note_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown note_kind {raw:?}; valid: {}",
+        "unknown note_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
