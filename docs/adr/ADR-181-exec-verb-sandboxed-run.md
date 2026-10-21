@@ -872,6 +872,9 @@ grant pin inputs) for one property. Every other decision in this record and in A
 registration that does not declare network runs exactly as before, and its pin and grants are
 unchanged byte for byte.
 
+This amendment provides the network declaration that a host needs to run adapters which reach a
+remote service under exec. It does not decide which registrations may declare it.
+
 ### Context
 
 A registered tool that talks to a remote service, such as a deployment CLI or a package registry
@@ -930,6 +933,10 @@ accepted by its driven arms, never by its text.
    `re_registration_keeps_the_approved_object_and_definition`), so a `network` passed on a
    re-registration does not reach the row. `tool.describe`, `tool.list` and the register response
    report the stored `network`, so the caller sees what is stored rather than what was asked.
+
+   Which registrations may carry `network` is the hosting deployment's registration policy, not
+   exec's. exec enforces the declaration a row carries; it does not decide eligibility, and nothing
+   here promises that a deployment's general code runs without network.
 
 2. **`network` joins the grant pin when the row carries it.** This amends ADR-180 Amendment 1
    item 1 for one property. When the row's properties contain the key `network`, the pinned inputs
@@ -997,7 +1004,9 @@ The grantor should read these as the approval's actual scope.
 
 1. **Every routable address that is not the host's own.** `*` admits other hosts on private
    networks and VPN peers the host can route to. That was not measured, and it holds by
-   construction. Only the host's own addresses are refused.
+   construction. Only the host's own addresses are refused, and that refusal is held by arm 51, not
+   by a rule that names them: the template denies `localhost` only, and why that also refuses the
+   host's LAN and VPN addresses was measured, not explained.
 2. **Anything the run can read can leave.** The read set does not change: the materialized tree,
    the configured read roots, the system read roots, and the values of allow-listed environment
    keys the caller supplied. A grant for a networked tool approves sending any of them anywhere.
