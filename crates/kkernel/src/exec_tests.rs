@@ -2790,10 +2790,10 @@ async fn atomic_delete_rejects_kind_mismatch_and_accepts_matching_or_omitted_kin
 
 /// Canonical and atomic updates preserve nullable-field presence and applicability.
 /// See `crates/kkernel/docs/design.md#execrs-regression-test-notes`.
+/// Debug builds approach the default 2 MiB stack even with boxed futures.
+/// Reserve headroom only in this isolated child, not production worker stacks.
 #[tokio::test]
 async fn atomic_update_null_and_type_semantics_match_canonical_behavior() {
-    // Debug builds approach the default 2 MiB stack even with the futures below
-    // boxed. Give this child headroom without changing production worker stacks.
     if crate::test_process::run_in_child_with_stack_size(4 * 1024 * 1024) {
         return;
     }
