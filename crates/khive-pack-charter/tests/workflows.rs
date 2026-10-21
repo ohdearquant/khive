@@ -239,7 +239,8 @@ async fn an_await_is_released_only_by_a_matching_observation() {
         .await;
     assert_eq!(
         f.at(&run).await,
-        tuple("open", "review", "waiting_trigger", 1)
+        tuple("open", "review", "waiting_actor", 1),
+        "the review posted during intake is at the current generation, so the first visit counts it and waits on the action"
     );
 }
 

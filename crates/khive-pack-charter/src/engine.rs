@@ -827,19 +827,21 @@ impl<'w> Engine<'w> {
             .ok_or_else(|| corrupt(format!("unknown phase {phase_id}")))?
             .clone();
         let subject_generation = self.subject_generation(&run).await?;
-        let obs: Vec<Obs> = observations_since(
-            &mut *self.w,
-            &self.scope.domain,
-            run_id,
-            row.entered_sequence.unwrap_or(0),
-        )
-        .await?
-        .into_iter()
-        .filter(|o| match (&o.generation, &subject_generation) {
-            (Some(g), Some(current)) => g == current,
-            _ => true,
-        })
-        .collect();
+        // A first visit reads every observation at the current generation (ADR-208 D3); a
+        // revisit reads only what arrived after it, so a loop waits for fresh evidence.
+        let window = if row.round > 1 {
+            row.entered_sequence.unwrap_or(0)
+        } else {
+            0
+        };
+        let obs: Vec<Obs> = observations_since(&mut *self.w, &self.scope.domain, run_id, window)
+            .await?
+            .into_iter()
+            .filter(|o| match (&o.generation, &subject_generation) {
+                (Some(g), Some(current)) => g == current,
+                _ => true,
+            })
+            .collect();
         match evaluate(&def, &obs) {
             Eval::Wait {
                 state,
