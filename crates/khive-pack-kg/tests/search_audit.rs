@@ -10,7 +10,7 @@ use khive_runtime::{
 use khive_storage::{Entity, EventFilter, PageRequest};
 use khive_types::{EventKind, EventOutcome};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-use serde_json::{json, Value};
+use serde_json::json;
 
 struct Provider;
 struct Embeddings;
