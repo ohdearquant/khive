@@ -795,7 +795,14 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    entry answers `true` for the older one. Revoke only the older grant in a committed unit while the newer
    grant remains live: the by-id entry then answers `false` for the older id and `true` for the newer id,
    while `decide` still cites the newer id. This separates a by-id check from an existence guard that would
-   answer `true` for the revoked older grant whenever any newer matching grant is live.
+   answer `true` for the revoked older grant whenever any newer matching grant is live. Repeat the
+   two-grant fixture once for each other term the older grant can fail alone, the newer matching grant
+   staying live each time: the older grant still `granted` but expired at the supplied `now`; carrying only
+   `invalidated_by_registry_id`, then only `invalidated_at`, each written directly by the fixture; pinned
+   differently from the given registration; and with its stored actor pattern, then its tool pattern, not
+   matching the supplied actor or tool. In each, the by-id entry answers `false` for the older id and `true`
+   for the newer id, and `decide` still cites the newer id. This separates a by-id check from one that
+   applies any activity or match term to a different grant than the one named.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
@@ -811,6 +818,8 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    driver's pending refusal. The supplied reader is instrumented and each call issues exactly one query on it,
    for a live grant, a missing id, an inactive id and a malformed selected row alike; a mutant that runs the
    SELECT twice turns this arm red, which shows the entry keeps the one-statement contract rather than only
-   returning the right answer on the first poll.
+   returning the right answer on the first poll. Also inject an error from the supplied reader on its first
+   query: exactly one query invocation occurs, the entry returns that error, and a mutant that retries the
+   query after a reader error turns this arm red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
