@@ -1219,17 +1219,25 @@ Identity, approval, the remaining address forms and the host setting:
 60. With the host setting off, a row carrying `network: "outbound"`, a grant pinned to it and a
     non-anonymous caller naming itself as `actor` is refused with `network_unhonoured:` naming the
     host setting, before the binary digest and with no run directory; the same holds for such a row
-    written through storage. The refusal is repeated in two further cases: with the setting's key
-    omitted from an otherwise valid exec configuration, and with no configuration at all, where the
-    daemon starts with no explicit, project, database-anchored or home configuration file selected
-    and no configuration derived from the environment replacing its base. Together they witness the
-    bare default and not only an explicit off. In the no-configuration case the arm also asserts that
-    the resolved setting is off, so an unrelated refusal cannot stand in for this one. Control: the
-    same row and caller with the setting on runs honoured. Mutation controls: deleting the
+    written through storage. The setting is on only where a parsed configuration file sets it; every
+    other route by which the daemon builds its exec configuration resolves it off. The refusal is
+    repeated on each of the daemon's routes: with the setting's key omitted from an otherwise valid
+    exec configuration; with no configuration at all, where the daemon starts with no explicit,
+    project, database-anchored or home configuration file selected and no configuration derived from
+    the environment replacing its base; and with no configuration file selected but an embedding
+    model named in the environment, so that the configuration derived from the environment replaces
+    the base. Together they witness the bare default and not only an explicit off. In the two cases
+    without a file the arm also asserts that the resolved setting is off, so an unrelated refusal
+    cannot stand in for this one, and it asserts directly that the generic configuration default,
+    which commands outside the daemon use when they find no file, resolves the setting off. Control:
+    the same row and caller with the setting on runs honoured. Mutation controls: deleting the
     host-setting check turns this arm red and leaves 46 to 49, 57 and 58 green; defaulting an absent
     key to on turns the omitted-key case red and leaves the explicit-off case and the control green;
-    defaulting the setting to on only in the configuration the daemon builds when no file is
-    selected turns the no-configuration case red and leaves the explicit-on, explicit-off and
-    omitted-key cases green.
+    defaulting the setting to on only in the base the daemon keeps when no file is selected and the
+    environment names no model turns the no-configuration case red and leaves the explicit-on,
+    explicit-off, omitted-key and environment cases green; defaulting it to on only in the
+    configuration derived from the environment turns the environment case red and leaves the
+    explicit-on, explicit-off, omitted-key and no-configuration cases green. A route added later
+    carries its own case here.
 
 Implementation follows acceptance of this amendment and goes through the usual review and gates.
