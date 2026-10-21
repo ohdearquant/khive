@@ -10,6 +10,8 @@ const PR_REVIEW: &str = include_str!("fixtures/pr_review.charter");
 const PR_FIX: &str = include_str!("fixtures/pr_fix.charter");
 const PR_SPLIT: &str = include_str!("fixtures/pr_split.charter");
 const INBOX_TRIAGE: &str = include_str!("fixtures/inbox_triage.charter");
+const PR_MERGE: &str = include_str!("fixtures/pr_merge.charter");
+const PR_MERGE_VOCABULARY: &str = include_str!("fixtures/pr_merge.vocab");
 
 const PR: &str = "acme/widgets#7";
 
@@ -767,4 +769,114 @@ async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended()
         "completed",
         "the gate's second visit counts the pass recorded while the run was in repair"
     );
+}
+
+/// The `pr_merge/v1` definition block of ADR-193, read from the record so the comparison has no
+/// second copy of the template to drift.
+fn pr_merge_template() -> Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/adr/ADR-193-charter-runs.md"
+    );
+    let adr = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let (_, section) = adr
+        .split_once("## `pr_merge/v1`")
+        .expect("ADR-193 has a pr_merge/v1 section");
+    let (_, block) = section
+        .split_once("```json\n")
+        .expect("the section carries the definition as JSON");
+    let (block, _) = block.split_once("\n```").expect("the JSON block is closed");
+    serde_json::from_str(block).expect("the template block parses")
+}
+
+#[tokio::test]
+async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
+    let f = Fixture::new();
+    f.call("charter.vocabulary", json!({"source": PR_MERGE_VOCABULARY}))
+        .await;
+    let out = f.call("charter.compile", json!({"source": PR_MERGE})).await;
+    assert_eq!(out["valid"], true, "{out}");
+    let phases = out["definition"]["phases"].as_array().unwrap();
+    let template = pr_merge_template();
+    let expected = template["phases"].as_array().unwrap();
+    assert_eq!(
+        phases.iter().map(|p| &p["id"]).collect::<Vec<_>>(),
+        expected.iter().map(|p| &p["id"]).collect::<Vec<_>>()
+    );
+    for (i, (phase, want)) in phases.iter().zip(expected).enumerate() {
+        let id = &want["id"];
+        assert_eq!(phase["owner"], want["assignee"]["role"], "{id}");
+        let requires = phase["requires"].as_array().unwrap();
+        for r in requires {
+            assert_eq!(r["level"], "hard", "{id}: {r}");
+        }
+        let gates: std::collections::BTreeSet<String> = requires
+            .iter()
+            .map(|r| r["phrase"].as_str().unwrap())
+            .filter(|p| *p != "pr_merge.floor_check")
+            .map(|p| format!("{}/v1", p.strip_prefix("pr_merge.").unwrap()))
+            .collect();
+        let want_gates: std::collections::BTreeSet<String> = want["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(gates, want_gates, "{id}");
+        if want["await"] == "predecessor_completed" {
+            assert_eq!(phase["awaits"], json!([]), "{id}");
+            assert_eq!(
+                phases[i - 1]["next"],
+                json!({"kind": "goto", "phase": id}),
+                "{id} follows its predecessor"
+            );
+        } else {
+            let trigger = format!("pr_merge.{}", want["await"].as_str().unwrap());
+            assert_eq!(phase["awaits"], json!([[trigger]]), "{id}");
+        }
+    }
+
+    let policy = &template["check_policy"];
+    let validate = phases[0]["requires"].as_array().unwrap();
+    let floor: Vec<&Value> = validate
+        .iter()
+        .filter(|r| r["phrase"] == "pr_merge.floor_check")
+        .map(|r| &r["args"]["name"])
+        .collect();
+    let want_floor: Vec<&Value> = policy["floor"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| &c["name"])
+        .collect();
+    assert_eq!(floor, want_floor);
+    let checks = validate
+        .iter()
+        .find(|r| r["phrase"] == "pr_merge.required_checks")
+        .unwrap();
+    assert_eq!(checks["args"]["event"], policy["allowed_event"]);
+    assert_eq!(checks["args"]["tested_revision"], policy["tested_revision"]);
+    let self_approval = phases[1]["requires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["phrase"] == "pr_merge.no_self_approval")
+        .unwrap();
+    assert_eq!(
+        self_approval["args"]["controller"],
+        template["independence"]["controller"]
+    );
+
+    let merge = phases.last().unwrap();
+    let action = &expected.last().unwrap()["action"];
+    assert_eq!(
+        merge["actions"],
+        json!([{
+            "name": format!("pr_merge.{}", action["kind"].as_str().unwrap()),
+            "args": {"method": action["method"], "expected_head": action["expected_head"]},
+            "by": template["principals"]["merge_initiator_role"],
+            "passes": ["done", "skipped"],
+        }])
+    );
+    assert_eq!(merge["next"], json!({"kind": "complete"}));
 }

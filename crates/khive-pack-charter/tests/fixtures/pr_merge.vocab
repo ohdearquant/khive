@@ -1,0 +1,40 @@
+vocabulary pr_merge v1
+# The gate groups of the ADR-193 `pr_merge/v1` template, one phrase per gate. Every gate is hard
+# in that template, so every phrase carries a hard ceiling.
+
+trigger pr_merge.candidate_observed "a merge candidate was observed for the pull request"
+
+phrase pr_merge.candidate_supported "the candidate's repository, target and merge method are supported":
+    ceiling hard
+phrase pr_merge.evidence_complete_trusted "every evidence item is complete and comes from a trusted producer":
+    ceiling hard
+phrase pr_merge.required_checks "every required check, the platform's rules united with the floor, succeeded at the tested revision":
+    param event word
+    param tested_revision word
+    ceiling hard
+phrase pr_merge.floor_check "a check on the definition's floor succeeded at the tested revision":
+    param name string
+    ceiling hard
+phrase pr_merge.review_at_head "an authorised approve verdict is bound to the head and the scope digest":
+    ceiling hard
+phrase pr_merge.family_independent "the reviewer's family differs from every family that produced the change":
+    ceiling hard
+phrase pr_merge.no_self_approval "approvers are disjoint from the producing actors and the author's and last pusher's accounts":
+    param controller word
+    ceiling hard
+phrase pr_merge.adr_scope_approved "a change under docs/adr carries the architecture authority's approval at the head and scope":
+    outcomes pass fail not_applicable
+    passes pass not_applicable
+    ceiling hard
+phrase pr_merge.scope_and_policy_paths_approved "the changed paths equal the approved scope and protected paths carry the policy authority's attestation":
+    ceiling hard
+phrase pr_merge.all_merge_requirements_current "every merge requirement is current at claim time":
+    ceiling hard
+phrase pr_merge.exact_action_authorized "the exact action descriptor naming the expected head is authorised":
+    ceiling hard
+phrase pr_merge.platform_enforcement_verified "the platform's protection settings match the charter":
+    ceiling hard
+
+action pr_merge.git_pr_merge "merge the pull request through the git merge verb":
+    param method word
+    param expected_head word
