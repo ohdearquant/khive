@@ -75,6 +75,10 @@ visibility does not exempt it from ordinary caller write restrictions.
 Revision `domain-effects-v21` classifies `stream.truncate` as `Write`: it removes
 a stream prefix and its notes in one transaction.
 
+Revision `domain-effects-v22` classifies `attach` as `Write`: it writes blob bytes and
+adds or replaces an existing record's attachment row. Selective hydration through
+`get` remains `Read`.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -83,6 +87,7 @@ a stream prefix and its notes in one transaction.
 | `agent.spawn`                     | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L13)                               |
 | `agent.suspend`                   | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L74)                               |
 | `apply_changeset`                 | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
+| `attach`                          | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs)                         |
 | `blob.abort`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L133)                                |
 | `blob.begin`                      | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L67)                                 |
 | `blob.commit`                     | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L118)                                |
