@@ -830,6 +830,88 @@ async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
 }
 
 #[tokio::test]
+async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_results() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+    let at = |kind: &str, outcome: &str, args: Value, generation: &str, event: &str| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
+               "outcome": outcome, "args": args, "generation": generation, "event_id": event})
+    };
+    for (kind, generation, event) in [
+        ("pull_request.opened", "h1", "opened"),
+        ("pull_request.head_moved", "h2", "moved-h2"),
+    ] {
+        f.call(
+            "charter.observe",
+            at(kind, "observed", json!({}), generation, event),
+        )
+        .await;
+    }
+    let first = f
+        .call(
+            "charter.observe",
+            at("pull_request.open", "pass", json!({}), "h2", "open"),
+        )
+        .await;
+    assert_eq!(first["recorded"][0]["already_recorded"], false, "{first}");
+    f.call(
+        "charter.observe",
+        at(
+            "pull_request.head_moved",
+            "observed",
+            json!({}),
+            "h1",
+            "moved-h1",
+        ),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at(
+            "pull_request.head_moved",
+            "observed",
+            json!({}),
+            "h2",
+            "moved-h2-again",
+        ),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at(
+            "pull_request.base",
+            "pass",
+            json!({"branch": "main"}),
+            "h2",
+            "base",
+        ),
+    )
+    .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "intake", "waiting_gate", 1),
+        "the head went h2, h1, h2: the open result from the first h2 belongs to an earlier epoch"
+    );
+    let pending = f.run(&run).await["phases"][0]["waiting_on"]["pending"].to_string();
+    assert!(
+        pending.contains("pull_request.open") && !pending.contains("pull_request.base"),
+        "{pending}"
+    );
+    let again = f
+        .call(
+            "charter.observe",
+            at("pull_request.open", "pass", json!({}), "h2", "open"),
+        )
+        .await;
+    assert_eq!(
+        again["recorded"][0]["already_recorded"], false,
+        "the same event id at a new epoch is a new observation: {again}"
+    );
+    assert_eq!(f.at(&run).await.1, "review");
+}
+
+#[tokio::test]
 async fn a_request_id_runs_a_command_once_and_refuses_a_different_request() {
     let f = Fixture::new();
     f.publish_review_set().await;

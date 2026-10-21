@@ -109,6 +109,7 @@ struct Obs {
     outcome: Option<String>,
     args: Map<String, Value>,
     generation: Option<String>,
+    epoch: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +254,7 @@ async fn observations_since(
             outcome: payload["outcome"].as_str().map(str::to_owned),
             args: payload["args"].as_object().cloned().unwrap_or_default(),
             generation: payload["generation"].as_str().map(str::to_owned),
+            epoch: payload["epoch"].as_i64(),
         });
     }
     Ok(out)
@@ -689,11 +691,14 @@ impl<'w> Engine<'w> {
         Ok(run_id)
     }
 
-    /// Record an external observation on one open run and queue its advance.
+    /// Record an external observation on one open run and queue its advance. The same event id
+    /// is a new observation at each subject epoch, so a candidate that returns re-reads its gates.
+    #[allow(clippy::too_many_arguments)]
     pub async fn observe(
         &mut self,
         run_id: &str,
         subject_id: &str,
+        epoch: i64,
         kind: &str,
         producer: &str,
         event_id: &str,
@@ -705,7 +710,7 @@ impl<'w> Engine<'w> {
             run_id,
             kind,
             producer,
-            subject_id,
+            &format!("{subject_id}@{epoch}"),
             event_id,
             payload,
         )
@@ -855,10 +860,10 @@ impl<'w> Engine<'w> {
             .phase(&phase_id)
             .ok_or_else(|| corrupt(format!("unknown phase {phase_id}")))?
             .clone();
-        let subject_generation = self.subject_generation(&run).await?;
-        // A first visit reads every observation at the current generation (ADR-208 D3); a
-        // revisit reads only what arrived after its previous visit ended, so a loop never
-        // reuses the evidence that sent it round.
+        let (subject_generation, subject_epoch) = self.subject_generation(&run).await?;
+        // A first visit reads every observation at the current generation and subject epoch
+        // (ADR-208 D3, ADR-193 D8); a revisit reads only what arrived after its previous visit
+        // ended, so a loop never reuses the evidence that sent it round.
         let window = if row.round > 1 {
             previous_visit_end(
                 &mut *self.w,
@@ -875,7 +880,7 @@ impl<'w> Engine<'w> {
             .await?
             .into_iter()
             .filter(|o| match (&o.generation, &subject_generation) {
-                (Some(g), Some(current)) => g == current,
+                (Some(g), Some(current)) => g == current && o.epoch == Some(subject_epoch),
                 _ => true,
             })
             .collect();
@@ -929,7 +934,7 @@ impl<'w> Engine<'w> {
         Ok(())
     }
 
-    async fn subject_generation(&mut self, run: &RunRow) -> StorageResult<Option<String>> {
+    async fn subject_generation(&mut self, run: &RunRow) -> StorageResult<(Option<String>, i64)> {
         let row = self
             .w
             .query_row(stmt(
@@ -938,9 +943,10 @@ impl<'w> Engine<'w> {
             ))
             .await?
             .ok_or_else(|| corrupt("run subject missing"))?;
-        Ok(col_json(&row, "candidate_bytes")?["generation"]
+        let generation = col_json(&row, "candidate_bytes")?["generation"]
             .as_str()
-            .map(str::to_owned))
+            .map(str::to_owned);
+        Ok((generation, col_i64(&row, "subject_epoch")?))
     }
 
     async fn leave(&mut self, run_id: &str, phase_id: &str) -> StorageResult<()> {

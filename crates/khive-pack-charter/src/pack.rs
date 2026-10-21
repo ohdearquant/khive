@@ -897,7 +897,7 @@ impl CharterPack {
                         if !exists {
                             return Ok(boxed(json!({"recorded": [], "events": []})));
                         }
-                        let (subject_id, _, current) = engine
+                        let (subject_id, epoch, current) = engine
                             .subject(
                                 &subject_kind,
                                 &subject_ref,
@@ -909,6 +909,7 @@ impl CharterPack {
                             "outcome": outcome,
                             "args": args,
                             "detail": detail,
+                            "epoch": epoch,
                             "generation": generation.or(current),
                         });
                         let mut recorded = Vec::new();
@@ -922,6 +923,7 @@ impl CharterPack {
                                 .observe(
                                     &run_id,
                                     &subject_id,
+                                    epoch,
                                     &kind,
                                     &producer,
                                     &event_id,
