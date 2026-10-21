@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry};
 use khive_storage::{
-    SqlReader, SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult,
+    AtomicUnitOp, SqlReader, SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult,
 };
 use khive_types::{
     HandlerDef, IdResolutionMode, Pack, PackSchemaPlan, ParamDef, VerbCategory, Visibility,
@@ -18,7 +18,7 @@ use crate::engine::{
 };
 use crate::lang::ast::EntryKind;
 use crate::lang::definition::LANGUAGE;
-use crate::lang::{compile, digest, parse_vocabulary_source, Diagnostic, Registry};
+use crate::lang::{canonical_json, compile, digest, parse_vocabulary_source, Diagnostic, Registry};
 
 const DEFAULT_DOMAIN: &str = "default";
 const DEFAULT_LIMIT: i64 = 50;
@@ -67,7 +67,13 @@ const GENERATION: ParamDef = param(
     "generation",
     "string",
     false,
-    "The subject's current generation (a pull request head, a release candidate). A new value starts a new subject epoch; observations carrying an older generation stop counting.",
+    "The subject's current generation (a pull request head, a release candidate). charter.start, or an observation of a trigger the subject kind lists under new_generation, moves the subject to a new value and a new epoch; any other observation is recorded at the generation it names and counts only while the subject is there.",
+);
+const REQUEST_ID: ParamDef = param(
+    "request_id",
+    "string",
+    false,
+    "Caller-scoped key for a retry. The same key with the same parameters returns the stored result with replayed=true; the same key with different parameters is refused.",
 );
 const LIMIT: ParamDef = param(
     "limit",
@@ -89,14 +95,14 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
         description: "Compile and store a charter version. Republishing identical source is a no-op; a different definition under a published version is refused. Every performed charter must already be published.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[SOURCE, DOMAIN],
+        params: &[SOURCE, DOMAIN, REQUEST_ID],
     },
     HandlerDef {
         name: "charter.vocabulary",
         description: "Publish a vocabulary of subjects, triggers, phrases and actions beside the built-in one. A name belongs to one vocabulary.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[SOURCE, DOMAIN],
+        params: &[SOURCE, DOMAIN, REQUEST_ID],
     },
     HandlerDef {
         name: "charter.start",
@@ -111,6 +117,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             param("version", "integer", false, "Charter version; default the latest published."),
             GENERATION,
             DOMAIN,
+            REQUEST_ID,
         ],
     },
     HandlerDef {
@@ -130,6 +137,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             GENERATION,
             param("charter", "string", false, "Only advance this charter's open run on the subject."),
             DOMAIN,
+            REQUEST_ID,
         ],
     },
     HandlerDef {
@@ -141,6 +149,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             param("run_id", "string", true, "The run to cancel."),
             param("reason", "string", false, "Recorded with the cancellation."),
             DOMAIN,
+            REQUEST_ID,
         ],
     },
     HandlerDef {
@@ -328,6 +337,24 @@ impl Params {
             .unwrap_or_else(|| DEFAULT_DOMAIN.to_owned()))
     }
 
+    /// The caller's request key and a digest of everything else the request asked, or `None`
+    /// when the call carries no `request_id`.
+    fn command(&self, scope: &Scope) -> Result<Option<Command>, RuntimeError> {
+        let Some(request_id) = self.opt_str("request_id")? else {
+            return Ok(None);
+        };
+        let mut asked = self.map.clone();
+        asked.insert("domain".to_owned(), json!(scope.domain));
+        Ok(Some(Command {
+            scope: scope.clone(),
+            request_id,
+            verb: self.verb.clone(),
+            request_digest: digest(&canonical_json(
+                &json!({"verb": self.verb, "params": asked}),
+            )),
+        }))
+    }
+
     fn scope(&self, token: &NamespaceToken) -> Result<Scope, RuntimeError> {
         Ok(Scope {
             domain: self.domain()?,
@@ -405,6 +432,73 @@ async fn registry_from<R: SqlReader + ?Sized>(
     Ok(registry)
 }
 
+/// A caller-scoped request key (ADR-193 D8).
+struct Command {
+    scope: Scope,
+    request_id: String,
+    verb: String,
+    request_digest: String,
+}
+
+/// Run `op` at most once per caller request key. A repeat of the same request returns the stored
+/// result; the same key on a different request is refused. The receipt commits with the effect.
+fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
+    let Some(command) = command else {
+        return op;
+    };
+    Box::new(move |writer| {
+        Box::pin(async move {
+            let held = writer
+                .query_row(stmt(
+                    include_str!("../sql/engine/command-get.sql"),
+                    vec![text(&command.scope.actor), text(&command.request_id)],
+                ))
+                .await?;
+            if let Some(row) = held {
+                if col_text(&row, "request_digest")? != command.request_digest {
+                    return Err(refuse(
+                        &command.verb,
+                        Refusal::new(
+                            "request_id_reused",
+                            format!(
+                                "request_id {} was used for a different request",
+                                command.request_id
+                            ),
+                        ),
+                    ));
+                }
+                let mut stored = col_json(&row, "result_bytes")?;
+                stored["replayed"] = json!(true);
+                return Ok(boxed(stored));
+            }
+            let out = op(&mut *writer).await?;
+            let result = out.downcast_ref::<Value>().ok_or_else(|| {
+                refuse(&command.verb, Refusal::new("invalid_outcome", "not JSON"))
+            })?;
+            let run_id = result["run_id"]
+                .as_str()
+                .or_else(|| result["cancelled"].as_str());
+            writer
+                .execute(stmt(
+                    include_str!("../sql/engine/command-insert.sql"),
+                    vec![
+                        text(&command.scope.domain),
+                        text(&command.scope.actor),
+                        text(&command.request_id),
+                        text(&command.scope.namespace),
+                        text(&command.verb),
+                        text(&command.request_digest),
+                        SqlValue::Blob(canonical_json(result)),
+                        SqlValue::from_opt_text(run_id),
+                        SqlValue::Integer(command.scope.now_us),
+                    ],
+                ))
+                .await?;
+            Ok(out)
+        })
+    })
+}
+
 fn unit_value(result: Box<dyn Any + Send>, verb: &str) -> Result<Value, RuntimeError> {
     result
         .downcast::<Value>()
@@ -438,6 +532,7 @@ impl CharterPack {
     async fn publish(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let source = params.str("source")?;
         let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
         let registry = self.registry(&scope.domain).await?;
         let compiled = compile(&source, &registry)
             .map_err(|d| params.invalid(format!("charter source refused: {}", refusal_text(&d))))?;
@@ -445,7 +540,7 @@ impl CharterPack {
         let result = self
             .runtime
             .sql()
-            .atomic_unit(Box::new(move |writer| {
+            .atomic_unit(with_receipt(command, Box::new(move |writer| {
                 Box::pin(async move {
                     let definition = &compiled.definition;
                     let mut engine = Engine::new(writer, scope.clone());
@@ -511,7 +606,7 @@ impl CharterPack {
                         .await?;
                     Ok(boxed(json!({"published": true, "charter": compiled.summary()})))
                 })
-            }))
+            })))
             .await?;
         unit_value(result, &params.verb)
     }
@@ -523,6 +618,7 @@ impl CharterPack {
     ) -> Result<Value, RuntimeError> {
         let source = params.str("source")?;
         let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
         let parsed = parse_vocabulary_source(&source).map_err(|d| {
             params.invalid(format!("vocabulary source refused: {}", refusal_text(&d)))
         })?;
@@ -531,7 +627,7 @@ impl CharterPack {
         let result = self
             .runtime
             .sql()
-            .atomic_unit(Box::new(move |writer| {
+            .atomic_unit(with_receipt(command, Box::new(move |writer| {
                 Box::pin(async move {
                     let rows = writer
                         .query_all(stmt(
@@ -592,7 +688,7 @@ impl CharterPack {
                         "entries": added.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
                     })))
                 })
-            }))
+            })))
             .await?;
         unit_value(result, &params.verb)
     }
@@ -612,103 +708,107 @@ impl CharterPack {
         let version = params.opt_i64("version")?;
         let generation = params.opt_str("generation")?;
         let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
         let verb = params.verb.clone();
         let result = self
             .runtime
             .sql()
-            .atomic_unit(Box::new(move |writer| {
-                Box::pin(async move {
-                    let mut engine = Engine::new(writer, scope.clone());
-                    let found = match version {
-                        Some(v) => {
-                            engine
-                                .writer()
-                                .query_row(stmt(
-                                    include_str!("../sql/engine/definition-get.sql"),
-                                    vec![
-                                        text(&scope.domain),
-                                        text(&charter_id),
-                                        SqlValue::Integer(v),
-                                    ],
-                                ))
-                                .await?
-                        }
-                        None => {
-                            engine
-                                .writer()
-                                .query_row(stmt(
-                                    include_str!("../sql/engine/definition-latest.sql"),
-                                    vec![text(&scope.domain), text(&charter_id)],
-                                ))
-                                .await?
-                        }
-                    };
-                    let Some(row) = found else {
-                        return Err(refuse(
-                            &verb,
-                            Refusal::new(
-                                "not_published",
-                                format!(
+            .atomic_unit(with_receipt(
+                command,
+                Box::new(move |writer| {
+                    Box::pin(async move {
+                        let mut engine = Engine::new(writer, scope.clone());
+                        let found = match version {
+                            Some(v) => {
+                                engine
+                                    .writer()
+                                    .query_row(stmt(
+                                        include_str!("../sql/engine/definition-get.sql"),
+                                        vec![
+                                            text(&scope.domain),
+                                            text(&charter_id),
+                                            SqlValue::Integer(v),
+                                        ],
+                                    ))
+                                    .await?
+                            }
+                            None => {
+                                engine
+                                    .writer()
+                                    .query_row(stmt(
+                                        include_str!("../sql/engine/definition-latest.sql"),
+                                        vec![text(&scope.domain), text(&charter_id)],
+                                    ))
+                                    .await?
+                            }
+                        };
+                        let Some(row) = found else {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new(
+                                    "not_published",
+                                    format!(
                                     "charter {charter_id} has no published version in domain {}",
                                     scope.domain
                                 ),
-                            ),
-                        ));
-                    };
-                    let definition = decode_definition(&row)?;
-                    let definition_version = col_i64(&row, "version")?;
-                    let definition_digest = col_text(&row, "definition_digest")?;
-                    if definition.subject != subject_kind {
-                        return Err(refuse(
-                            &verb,
-                            Refusal::new(
-                                "subject_mismatch",
-                                format!(
+                                ),
+                            ));
+                        };
+                        let definition = decode_definition(&row)?;
+                        let definition_version = col_i64(&row, "version")?;
+                        let definition_digest = col_text(&row, "definition_digest")?;
+                        if definition.subject != subject_kind {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new(
+                                    "subject_mismatch",
+                                    format!(
                                     "charter {charter_id} runs on {} subjects, not {subject_kind}",
                                     definition.subject
                                 ),
-                            ),
-                        ));
-                    }
-                    if let Some(role) = bindings
-                        .keys()
-                        .find(|role| !definition.roles.iter().any(|r| &r.name == *role))
-                    {
-                        return Err(refuse(
-                            &verb,
-                            Refusal::new(
-                                "unknown_role",
-                                format!("charter {charter_id} declares no role {role}"),
-                            ),
-                        ));
-                    }
-                    let (subject_id, epoch, current) = engine
-                        .subject(&subject_kind, &subject_ref, generation.as_deref(), true)
-                        .await?;
-                    if let Some(run_id) = engine
-                        .open_run_for_charter(&charter_id, &subject_id)
-                        .await?
-                    {
-                        return Ok(boxed(json!({"started": false, "run_id": run_id})));
-                    }
-                    let run_id = engine
-                        .start_run(
-                            definition_version,
-                            &definition_digest,
-                            &definition,
-                            (&subject_id, epoch, current.as_deref()),
-                            &bindings,
-                            None,
-                        )
-                        .await?;
-                    engine.settle().await?;
-                    Ok(boxed(json!({
-                        "started": true,
-                        "run_id": run_id,
-                        "events": engine.journal.events,
-                    })))
-                })
-            }))
+                                ),
+                            ));
+                        }
+                        if let Some(role) = bindings
+                            .keys()
+                            .find(|role| !definition.roles.iter().any(|r| &r.name == *role))
+                        {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new(
+                                    "unknown_role",
+                                    format!("charter {charter_id} declares no role {role}"),
+                                ),
+                            ));
+                        }
+                        let (subject_id, epoch, current) = engine
+                            .subject(&subject_kind, &subject_ref, generation.as_deref(), true)
+                            .await?;
+                        if let Some(run_id) = engine
+                            .open_run_for_charter(&charter_id, &subject_id)
+                            .await?
+                        {
+                            return Ok(boxed(json!({"started": false, "run_id": run_id})));
+                        }
+                        let run_id = engine
+                            .start_run(
+                                definition_version,
+                                &definition_digest,
+                                &definition,
+                                (&subject_id, epoch, current.as_deref()),
+                                &bindings,
+                                None,
+                            )
+                            .await?;
+                        engine.settle().await?;
+                        Ok(boxed(json!({
+                            "started": true,
+                            "run_id": run_id,
+                            "events": engine.journal.events,
+                        })))
+                    })
+                }),
+            ))
             .await?;
         let mut out = unit_value(result, &params.verb)?;
         if let Some(run_id) = out["run_id"].as_str().map(str::to_owned) {
@@ -726,6 +826,7 @@ impl CharterPack {
         let generation = params.opt_str("generation")?;
         let only_charter = params.opt_str("charter")?;
         let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
         let producer = params
             .opt_str("producer")?
             .unwrap_or_else(|| scope.actor.clone());
@@ -780,54 +881,66 @@ impl CharterPack {
         let result = self
             .runtime
             .sql()
-            .atomic_unit(Box::new(move |writer| {
-                Box::pin(async move {
-                    let mut engine = Engine::new(writer, scope.clone());
-                    let exists = engine
-                        .writer()
-                        .query_row(stmt(
-                            include_str!("../sql/engine/subject-get.sql"),
-                            vec![text(&subject_kind), text(&subject_ref)],
-                        ))
-                        .await?
-                        .is_some();
-                    if !exists {
-                        return Ok(boxed(json!({"recorded": [], "events": []})));
-                    }
-                    let (subject_id, _, current) = engine
-                        .subject(
-                            &subject_kind,
-                            &subject_ref,
-                            generation.as_deref(),
-                            establishes,
-                        )
-                        .await?;
-                    let payload = json!({
-                        "outcome": outcome,
-                        "args": args,
-                        "detail": detail,
-                        "generation": generation.or(current),
-                    });
-                    let mut recorded = Vec::new();
-                    for (run_id, charter_id) in engine.open_runs_for_subject(&subject_id).await? {
-                        if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
-                            continue;
+            .atomic_unit(with_receipt(
+                command,
+                Box::new(move |writer| {
+                    Box::pin(async move {
+                        let mut engine = Engine::new(writer, scope.clone());
+                        let exists = engine
+                            .writer()
+                            .query_row(stmt(
+                                include_str!("../sql/engine/subject-get.sql"),
+                                vec![text(&subject_kind), text(&subject_ref)],
+                            ))
+                            .await?
+                            .is_some();
+                        if !exists {
+                            return Ok(boxed(json!({"recorded": [], "events": []})));
                         }
-                        let (sequence, fresh) = engine
-                            .observe(&run_id, &subject_id, &kind, &producer, &event_id, &payload)
+                        let (subject_id, _, current) = engine
+                            .subject(
+                                &subject_kind,
+                                &subject_ref,
+                                generation.as_deref(),
+                                establishes,
+                            )
                             .await?;
-                        recorded.push(json!({
-                            "run_id": run_id, "charter": charter_id,
-                            "sequence": sequence, "already_recorded": !fresh,
-                        }));
-                    }
-                    engine.settle().await?;
-                    Ok(boxed(json!({
-                        "recorded": recorded,
-                        "events": engine.journal.events,
-                    })))
-                })
-            }))
+                        let payload = json!({
+                            "outcome": outcome,
+                            "args": args,
+                            "detail": detail,
+                            "generation": generation.or(current),
+                        });
+                        let mut recorded = Vec::new();
+                        for (run_id, charter_id) in
+                            engine.open_runs_for_subject(&subject_id).await?
+                        {
+                            if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
+                                continue;
+                            }
+                            let (sequence, fresh) = engine
+                                .observe(
+                                    &run_id,
+                                    &subject_id,
+                                    &kind,
+                                    &producer,
+                                    &event_id,
+                                    &payload,
+                                )
+                                .await?;
+                            recorded.push(json!({
+                                "run_id": run_id, "charter": charter_id,
+                                "sequence": sequence, "already_recorded": !fresh,
+                            }));
+                        }
+                        engine.settle().await?;
+                        Ok(boxed(json!({
+                            "recorded": recorded,
+                            "events": engine.journal.events,
+                        })))
+                    })
+                }),
+            ))
             .await?;
         unit_value(result, &params.verb)
     }
@@ -836,46 +949,50 @@ impl CharterPack {
         let run_id = params.str("run_id")?;
         let reason = params.opt_str("reason")?;
         let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
         let verb = params.verb.clone();
         let result = self
             .runtime
             .sql()
-            .atomic_unit(Box::new(move |writer| {
-                Box::pin(async move {
-                    let mut engine = Engine::new(writer, scope.clone());
-                    let row = engine
-                        .writer()
-                        .query_row(stmt(
-                            include_str!("../sql/engine/run-get.sql"),
-                            vec![text(&run_id)],
-                        ))
-                        .await?;
-                    let Some(row) = row else {
-                        return Err(refuse(
-                            &verb,
-                            Refusal::new("unknown_run", format!("no run {run_id}")),
-                        ));
-                    };
-                    let state = col_text(&row, "state")?;
-                    if state != "open" || col_text(&row, "policy_domain")? != scope.domain {
-                        return Err(refuse(
-                            &verb,
-                            Refusal::new(
-                                "not_open",
-                                format!(
-                                    "run {run_id} is {state} in domain {}",
-                                    col_text(&row, "policy_domain")?
+            .atomic_unit(with_receipt(
+                command,
+                Box::new(move |writer| {
+                    Box::pin(async move {
+                        let mut engine = Engine::new(writer, scope.clone());
+                        let row = engine
+                            .writer()
+                            .query_row(stmt(
+                                include_str!("../sql/engine/run-get.sql"),
+                                vec![text(&run_id)],
+                            ))
+                            .await?;
+                        let Some(row) = row else {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new("unknown_run", format!("no run {run_id}")),
+                            ));
+                        };
+                        let state = col_text(&row, "state")?;
+                        if state != "open" || col_text(&row, "policy_domain")? != scope.domain {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new(
+                                    "not_open",
+                                    format!(
+                                        "run {run_id} is {state} in domain {}",
+                                        col_text(&row, "policy_domain")?
+                                    ),
                                 ),
-                            ),
-                        ));
-                    }
-                    engine.cancel(&run_id, reason);
-                    engine.settle().await?;
-                    Ok(boxed(
-                        json!({"cancelled": run_id, "events": engine.journal.events}),
-                    ))
-                })
-            }))
+                            ));
+                        }
+                        engine.cancel(&run_id, reason);
+                        engine.settle().await?;
+                        Ok(boxed(
+                            json!({"cancelled": run_id, "events": engine.journal.events}),
+                        ))
+                    })
+                }),
+            ))
             .await?;
         unit_value(result, &params.verb)
     }

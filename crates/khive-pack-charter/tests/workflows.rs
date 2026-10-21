@@ -829,6 +829,91 @@ async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
     assert_eq!(f.at(&run).await.1, "review");
 }
 
+#[tokio::test]
+async fn a_request_id_runs_a_command_once_and_refuses_a_different_request() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let start = json!({
+        "charter": "pr_review", "subject_kind": "pull_request", "subject_ref": PR,
+        "bindings": {"author": "alice", "reviewer": "rita", "approver": "ann", "maintainer": "max"},
+        "request_id": "start-1",
+    });
+    let first = f.call("charter.start", start.clone()).await;
+    assert_eq!(first["started"], true, "{first}");
+    let again = f.call("charter.start", start.clone()).await;
+    assert_eq!(again["replayed"], true, "{again}");
+    assert_eq!(again["run_id"], first["run_id"]);
+    let mut explicit = start;
+    explicit["domain"] = json!("default");
+    let same = f.call("charter.start", explicit).await;
+    assert_eq!(
+        same["replayed"], true,
+        "naming the default domain is the same request: {same}"
+    );
+    let run = first["run_id"].as_str().unwrap().to_owned();
+
+    let opened = |request_id: &str| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.opened", "request_id": request_id})
+    };
+    let sequence = |out: &Value| out["recorded"][0]["sequence"].as_i64().unwrap();
+    let a = f.call("charter.observe", opened("observe-1")).await;
+    let b = f.call("charter.observe", opened("observe-1")).await;
+    assert_eq!(b["replayed"], true, "{b}");
+    assert_eq!(b["recorded"], a["recorded"]);
+    let c = f.call("charter.observe", opened("observe-2")).await;
+    assert_eq!(
+        sequence(&c),
+        sequence(&a) + 1,
+        "the replay wrote no evidence row; a new key without an event id writes one"
+    );
+
+    let err = f
+        .refused(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR,
+                   "kind": "review.posted", "request_id": "observe-1"}),
+        )
+        .await;
+    assert!(err.contains("request_id_reused"), "{err}");
+    let err = f
+        .refused(
+            "charter.cancel",
+            json!({"run_id": run, "request_id": "start-1"}),
+        )
+        .await;
+    assert!(err.contains("request_id_reused"), "{err}");
+    assert_eq!(
+        f.at(&run).await.0,
+        "open",
+        "a refused request changes nothing"
+    );
+    let cancelled = f
+        .call(
+            "charter.cancel",
+            json!({"run_id": run, "request_id": "cancel-1"}),
+        )
+        .await;
+    assert_eq!(cancelled["cancelled"], run.as_str());
+    let replayed = f
+        .call(
+            "charter.cancel",
+            json!({"run_id": run, "request_id": "cancel-1"}),
+        )
+        .await;
+    assert_eq!(
+        replayed["replayed"], true,
+        "a retried cancel returns its receipt instead of refusing a closed run: {replayed}"
+    );
+    let vocab = |name: &str| {
+        json!({"source": format!("vocabulary {name} v1\nphrase {name}.gate \"a gate\":\n    ceiling hard\n"),
+               "request_id": "vocab-1"})
+    };
+    f.call("charter.vocabulary", vocab("acme")).await;
+    let err = f.refused("charter.vocabulary", vocab("other")).await;
+    assert!(err.contains("request_id_reused"), "{err}");
+}
+
 /// The `pr_merge/v1` definition block of ADR-193, read from the record so the comparison has no
 /// second copy of the template to drift.
 fn pr_merge_template() -> Value {
