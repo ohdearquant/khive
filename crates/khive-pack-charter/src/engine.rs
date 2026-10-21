@@ -128,7 +128,6 @@ struct RunRow {
 struct PhaseRow {
     phase_id: String,
     round: i64,
-    entered_sequence: Option<i64>,
 }
 
 async fn load_run(w: &mut dyn SqlWriter, run_id: &str) -> StorageResult<Option<RunRow>> {
@@ -200,11 +199,38 @@ async fn load_phases(
         let phase = PhaseRow {
             phase_id: col_text(&row, "phase_id")?,
             round: col_i64(&row, "round")?,
-            entered_sequence: col_opt_i64(&row, "entered_sequence")?,
         };
         out.insert(phase.phase_id.clone(), phase);
     }
     Ok(out)
+}
+
+/// The sequence that ended the previous visit of a phase: the first phase entry recorded after
+/// that visit's own entry.
+async fn previous_visit_end(
+    w: &mut dyn SqlWriter,
+    domain: &str,
+    run_id: &str,
+    phase_id: &str,
+    round: i64,
+) -> StorageResult<i64> {
+    let rows = w
+        .query_all(stmt(
+            include_str!("../sql/engine/entries-for-run.sql"),
+            vec![text(domain), text(run_id)],
+        ))
+        .await?;
+    let mut previous_found = false;
+    for row in rows {
+        if previous_found {
+            return col_i64(&row, "sequence");
+        }
+        let payload = col_json(&row, "payload_bytes")?;
+        previous_found = payload["phase"] == phase_id && payload["round"] == round - 1;
+    }
+    Err(corrupt(format!(
+        "phase {phase_id} round {round} has no ended previous visit"
+    )))
 }
 
 async fn observations_since(
@@ -828,9 +854,17 @@ impl<'w> Engine<'w> {
             .clone();
         let subject_generation = self.subject_generation(&run).await?;
         // A first visit reads every observation at the current generation (ADR-208 D3); a
-        // revisit reads only what arrived after it, so a loop waits for fresh evidence.
+        // revisit reads only what arrived after its previous visit ended, so a loop never
+        // reuses the evidence that sent it round.
         let window = if row.round > 1 {
-            row.entered_sequence.unwrap_or(0)
+            previous_visit_end(
+                &mut *self.w,
+                &self.scope.domain,
+                run_id,
+                &phase_id,
+                row.round,
+            )
+            .await?
         } else {
             0
         };

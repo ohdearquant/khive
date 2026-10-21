@@ -721,3 +721,50 @@ async fn a_failing_requirement_holds_unless_the_matched_when_routes_on_it() {
         "a when on review.decision does not release a failing review.verdict_present"
     );
 }
+
+#[tokio::test]
+async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended() {
+    let f = Fixture::new();
+    let source = "charter gate_loop v1\nsubject pull_request\nroles:\n    author\nworkflow:\n    phase gate:\n        require gate.result(name=box) hard\n        when gate.result(name=box) is fail: goto repair\n        max_rounds 3 then give_up\n        goto done\n    phase repair:\n        action fix.push\n        goto gate\n    phase done:\n        complete\n    phase give_up:\n        terminate \"three gate rounds without a pass\"\n";
+    let out = f.call("charter.publish", json!({"source": source})).await;
+    assert_eq!(out["published"], true, "{out}");
+    let run = f
+        .call(
+            "charter.start",
+            json!({"charter": "gate_loop", "subject_kind": "pull_request", "subject_ref": PR, "generation": "h1"}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let at = |kind: &str, outcome: &str, args: Value, generation: &str| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
+               "outcome": outcome, "args": args, "generation": generation})
+    };
+    f.call(
+        "charter.observe",
+        at("gate.result", "fail", json!({"name": "box"}), "h1"),
+    )
+    .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "repair", "waiting_actor", 1)
+    );
+    f.call(
+        "charter.observe",
+        at("gate.result", "pass", json!({"name": "box"}), "h2"),
+    )
+    .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "repair", "waiting_actor", 1),
+        "the repair phase reads no gate result"
+    );
+    f.call("charter.observe", at("fix.push", "done", json!({}), "h2"))
+        .await;
+    assert_eq!(
+        f.at(&run).await.0,
+        "completed",
+        "the gate's second visit counts the pass recorded while the run was in repair"
+    );
+}
