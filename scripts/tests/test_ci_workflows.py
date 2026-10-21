@@ -2032,6 +2032,23 @@ class DocsFormatPhaseTests(unittest.TestCase):
         install = docs_job.index("run: scripts/ci-install-ripgrep.sh")
         self.assertLess(install, docs_job.index("run: scripts/ci.sh content-sweeps"))
 
+    def test_docs_job_checks_generated_benchmark_reference_blocks(self):
+        # The benchmark reference block is generated from a committed file. A
+        # shallow checkout can hold the document without the baseline commit the
+        # renderer must date, so the docs job fetches full history before running
+        # the renderer's own tests and its fail-closed drift check.
+        job = indented_block(workflow_text("ci.yml"), "docs", 2)
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("actions/setup-python@v6", job)
+        self.assertIn(
+            "run: python3 -m unittest scripts.tests.test_render_bench_reference -v",
+            job,
+        )
+        self.assertIn("run: python3 scripts/render-bench-reference.py --check", job)
+        tests = job.index("test_render_bench_reference")
+        check = job.index("render-bench-reference.py --check")
+        self.assertLess(tests, check)
+
     def test_ripgrep_install_has_one_copy(self):
         workflow = workflow_text("ci.yml")
         self.assertNotIn("apt-get install", workflow)
