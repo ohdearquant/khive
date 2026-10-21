@@ -1,4 +1,5 @@
 use super::*;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 // ── BrainPack handler impl ────────────────────────────────────────────────────
 
@@ -426,7 +427,8 @@ impl BrainPack {
                 "inactive" => Ok(ProfileLifecycle::Inactive),
                 "archived" => Ok(ProfileLifecycle::Archived),
                 other => Err(RuntimeError::InvalidInput(format!(
-                    "invalid lifecycle {other:?}; expected one of 'active', 'inactive', 'archived'"
+                    "invalid lifecycle {:?}; expected one of 'active', 'inactive', 'archived'",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, other)
                 ))),
             })
             .transpose()?;
@@ -917,9 +919,10 @@ impl BrainPack {
             "correction" => "correction",
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "unknown signal {other:?}; valid: useful | not_useful | wrong | \
+                    "unknown signal {:?}; valid: useful | not_useful | wrong | \
                      explicit_positive | explicit_negative | implicit_positive | \
-                     implicit_negative | correction"
+                     implicit_negative | correction",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, other)
                 )))
             }
         };
