@@ -237,6 +237,26 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
 
+### Successful search query shape
+
+Successful `search` dispatch audit payloads additionally contain `match_mode`
+(`all_terms` or `any_term`), `arms` (`text`, `vector`, `both`, or `none`), `limit`
+(the effective public limit: default 10, capped at 100), and `result_count`
+(the final returned array length, including zero). These are top-level payload
+fields beside `resource`; the executed-work counter vocabulary is unchanged.
+No query text, hit content, identifiers, or embeddings are copied into them.
+
+`arms` records retrieval arms entered by the dispatch, including a vector arm
+that later degrades. It is independent of the `source` result filter and whether
+an arm found any hits. A text-store call that short-circuits an empty lexical query
+still entered the text arm; this is distinct from counting executed FTS statements.
+`none` means no arm started, such as an empty coordinator backend set. The
+coordinator unions facts from request-owned spawned children before publishing the
+audit. Nested and concurrent dispatches are isolated; detached work is excluded.
+
+The fields are absent from other verbs and unsuccessful search dispatches. Ordinary
+and intercepted dispatches use the same enrichment; response shapes are unchanged.
+
 ## persist_git_digest_receipt
 
 Successful `git.digest` is the one strict exception to best-effort audit
