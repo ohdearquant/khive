@@ -251,3 +251,79 @@ async fn valid_deadlines_keep_normalization_aliases_and_unused_timezone_behavior
     }
     assert_eq!(tasks(&registry).await.as_array().unwrap().len(), 8);
 }
+
+#[tokio::test]
+async fn task_update_timezone_strings_mask_credentials_and_preserve_the_snapshot() {
+    let registry = fixture();
+    let id = seed(&registry).await;
+    let before = registry.dispatch("get", json!({"id": id})).await.unwrap();
+    let secret = credential();
+    for (field, other) in [("timezone", "due_timezone"), ("due_timezone", "timezone")] {
+        for (raw, shown, masked) in [
+            ("Mars/Olympus", "Mars/Olympus", false),
+            (secret.as_str(), "***MASKED***", true),
+        ] {
+            // A valid companion alias must not hide either invalid spelling;
+            // zone refusal must still precede parsing this invalid due value.
+            let mut properties = json!({"due": "not-a-date"});
+            properties[field] = json!(raw);
+            properties[other] = json!("UTC");
+            refuse(
+                &registry,
+                "update",
+                json!({"id": id, "properties": properties}),
+                format!(
+                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
+                ),
+                masked.then_some(secret.as_str()),
+            )
+            .await;
+            assert_eq!(
+                registry.dispatch("get", json!({"id": id})).await.unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn task_update_timezone_types_mask_nested_credentials_and_preserve_the_snapshot() {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
+    let registry = fixture();
+    let id = seed(&registry).await;
+    let before = registry.dispatch("get", json!({"id": id})).await.unwrap();
+    let secret = credential();
+    for (field, other) in [("timezone", "due_timezone"), ("due_timezone", "timezone")] {
+        for (value, masked) in [
+            (json!(17), false),
+            (json!(["Mars/Olympus"]), false),
+            (json!([{"credential": secret}]), true),
+        ] {
+            let serialized = value.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+            if masked {
+                assert!(!shown.contains(&secret), "synthetic fixture must be masked");
+            } else {
+                assert_eq!(shown, serialized, "ordinary JSON operand must be retained");
+            }
+            let mut properties = json!({"due": "not-a-date"});
+            properties[field] = value;
+            properties[other] = json!("UTC");
+            refuse(
+                &registry,
+                "update",
+                json!({"id": id, "properties": properties}),
+                format!(
+                    "{field} must be an IANA zone name string (e.g. \"America/New_York\"); got {shown}"
+                ),
+                masked.then_some(secret.as_str()),
+            )
+            .await;
+            assert_eq!(
+                registry.dispatch("get", json!({"id": id})).await.unwrap(),
+                before
+            );
+        }
+    }
+}
