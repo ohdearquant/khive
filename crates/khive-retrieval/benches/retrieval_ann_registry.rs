@@ -1,4 +1,5 @@
 //! Execute pathless statements against fresh private in-memory SQLite fixtures.
+use std::cell::OnceCell;
 use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -9,6 +10,9 @@ use khive_retrieval::ann::registry::{
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
+
+#[path = "fixtures/mode.rs"]
+mod mode;
 
 const NAMESPACE: &str = "bench:registry";
 const MODEL: &str = "bench-model";
@@ -160,16 +164,25 @@ async fn iteration(entries: usize, scenario: Scenario) -> Duration {
 }
 
 fn registry(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
+    let runtime = OnceCell::new();
+    let get_runtime = || {
+        runtime.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime")
+        })
+    };
+    if mode::is_profile_mode() {
+        get_runtime();
+    }
     let mut group = c.benchmark_group("ann_registry");
     group.sample_size(10);
     for entries in [100, 500] {
         for scenario in [Scenario::Register, Scenario::Recover, Scenario::Compact] {
             group.bench_function(BenchmarkId::new(scenario.name(), entries), |b| {
+                let rt = get_runtime();
                 b.iter_custom(|iterations| {
                     let mut elapsed = Duration::ZERO;
                     for _ in 0..iterations {
