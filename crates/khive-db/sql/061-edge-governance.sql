@@ -1,6 +1,6 @@
 -- ADR159 §1:120–140: append-only decisions, bound to one graph incarnation.
 -- IDs use the graph_edges TEXT representation; INTEGER timestamps are Unix microseconds.
-CREATE TABLE edge_governance_decisions (
+CREATE TABLE IF NOT EXISTS edge_governance_decisions (
     decision_id TEXT PRIMARY KEY NOT NULL, -- ADR159 §1:127.
     edge_id TEXT NOT NULL, -- ADR159 §1:127; no graph FK: history survives hard delete (§3:247).
     edge_namespace TEXT NOT NULL, -- ADR159 §1:128–129.
@@ -32,7 +32,7 @@ CREATE TABLE edge_governance_decisions (
 );
 
 -- ADR159 §1:142–161: append-only event ledger; no FK to a deletable graph/note row.
-CREATE TABLE edge_governance_invalidations (
+CREATE TABLE IF NOT EXISTS edge_governance_invalidations (
     invalidation_id INTEGER PRIMARY KEY, -- ADR159 §1:147.
     decision_id TEXT NOT NULL REFERENCES edge_governance_decisions(decision_id), -- ADR159 §1:147–148.
     edge_id TEXT NOT NULL, -- ADR159 §1:148.
@@ -45,11 +45,11 @@ CREATE TABLE edge_governance_invalidations (
     invalidated_at INTEGER NOT NULL -- ADR159 §1:152.
 );
 -- ADR159 §1:154–161: spent-decision lookup without constraining event multiplicity.
-CREATE INDEX idx_edge_governance_invalidations_decision
+CREATE INDEX IF NOT EXISTS idx_edge_governance_invalidations_decision
     ON edge_governance_invalidations(decision_id);
 
 -- ADR159 §1:163–175: bound serving projection, deliberately separate from authority history.
-CREATE TABLE edge_governance_active (
+CREATE TABLE IF NOT EXISTS edge_governance_active (
     -- ADR159 §1:166 / §3:247: projection may cascade, history must be recorded BEFORE DELETE.
     edge_id TEXT PRIMARY KEY NOT NULL REFERENCES graph_edges(id) ON DELETE CASCADE,
     decision_id TEXT NOT NULL UNIQUE REFERENCES edge_governance_decisions(decision_id), -- ADR159 §1:166.
@@ -61,11 +61,11 @@ CREATE TABLE edge_governance_active (
     stamped_at INTEGER NOT NULL -- ADR159 §1:168.
 );
 -- ADR159 §1:169–170 / §4:301–304: covering index begins with target_id.
-CREATE INDEX idx_edge_governance_active_target
+CREATE INDEX IF NOT EXISTS idx_edge_governance_active_target
     ON edge_governance_active(target_id, source_id, edge_id);
 
 -- ADR159 §1:177–181 / §7:424–431: per-store activation receipt, not edge authority.
-CREATE TABLE edge_governance_state (
+CREATE TABLE IF NOT EXISTS edge_governance_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), -- ADR159 §1:177, singleton.
     schema_version INTEGER NOT NULL CHECK (schema_version = 61), -- ADR159 §7:429–431.
     status TEXT NOT NULL CHECK (status IN ('inactive', 'active')), -- ADR159 §1:178.
@@ -91,32 +91,34 @@ CREATE TABLE edge_governance_state (
         AND provider_mode IS NOT NULL AND provider_version IS NOT NULL AND trigger_manifest IS NOT NULL))
 );
 -- ADR159 §6:383: schema deployment is dormant and selects no provider mode.
+-- Tail replay must retain any existing activation receipt.
 INSERT INTO edge_governance_state (singleton, schema_version, status)
-VALUES (1, 61, 'inactive');
+VALUES (1, 61, 'inactive')
+ON CONFLICT(singleton) DO NOTHING;
 
 -- ADR159 §1:124–125: decision history is append-only, including after graph hard deletion.
-CREATE TRIGGER edge_governance_decisions_no_update
+CREATE TRIGGER IF NOT EXISTS edge_governance_decisions_no_update
 BEFORE UPDATE ON edge_governance_decisions BEGIN
     SELECT RAISE(ABORT, 'edge governance decisions are append-only');
 END;
 -- ADR159 §1:124–125 / §3:247: history is never removed with the graph incarnation.
-CREATE TRIGGER edge_governance_decisions_no_delete
+CREATE TRIGGER IF NOT EXISTS edge_governance_decisions_no_delete
 BEFORE DELETE ON edge_governance_decisions BEGIN
     SELECT RAISE(ABORT, 'edge governance decisions are append-only');
 END;
 -- ADR159 §1:142–161: invalidation history is append-only and decisions stay permanently spent.
-CREATE TRIGGER edge_governance_invalidations_no_update
+CREATE TRIGGER IF NOT EXISTS edge_governance_invalidations_no_update
 BEFORE UPDATE ON edge_governance_invalidations BEGIN
     SELECT RAISE(ABORT, 'edge governance invalidations are append-only');
 END;
 -- ADR159 §1:142–161: deleting the ledger cannot re-mint a spent incarnation.
-CREATE TRIGGER edge_governance_invalidations_no_delete
+CREATE TRIGGER IF NOT EXISTS edge_governance_invalidations_no_delete
 BEFORE DELETE ON edge_governance_invalidations BEGIN
     SELECT RAISE(ABORT, 'edge governance invalidations are append-only');
 END;
 
 -- ADR159 §1:154–161 / §Verification:520–522: no projection insertion can reuse a spent decision.
-CREATE TRIGGER edge_governance_active_unspent_insert
+CREATE TRIGGER IF NOT EXISTS edge_governance_active_unspent_insert
 BEFORE INSERT ON edge_governance_active
 WHEN EXISTS (SELECT 1 FROM edge_governance_invalidations WHERE decision_id = NEW.decision_id)
 BEGIN
@@ -124,7 +126,7 @@ BEGIN
 END;
 
 -- ADR159 §1:154–161 / §3:257–266: replacing a decision obeys the same spent guard.
-CREATE TRIGGER edge_governance_active_unspent_update
+CREATE TRIGGER IF NOT EXISTS edge_governance_active_unspent_update
 BEFORE UPDATE OF decision_id ON edge_governance_active
 WHEN OLD.decision_id IS NOT NEW.decision_id
     AND EXISTS (SELECT 1 FROM edge_governance_invalidations WHERE decision_id = NEW.decision_id)
@@ -133,7 +135,7 @@ BEGIN
 END;
 
 -- ADR159 §3:240–245 / 250–269: null-safe tuple/liveness transitions, not assignments.
-CREATE TRIGGER edge_governance_graph_update
+CREATE TRIGGER IF NOT EXISTS edge_governance_graph_update
 AFTER UPDATE OF namespace, source_id, target_id, relation, target_backend, deleted_at ON graph_edges
 WHEN OLD.namespace IS NOT NEW.namespace
     OR OLD.source_id IS NOT NEW.source_id
@@ -156,7 +158,7 @@ BEGIN
 END;
 
 -- ADR159 §3:243 / 247 / 267–269: ledger append precedes projection FK cascade.
-CREATE TRIGGER edge_governance_graph_delete
+CREATE TRIGGER IF NOT EXISTS edge_governance_graph_delete
 BEFORE DELETE ON graph_edges
 BEGIN
     INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)
@@ -167,7 +169,7 @@ BEGIN
 END;
 
 -- ADR159 §3:246 / 252–269: both endpoint-note liveness directions invalidate incident markers.
-CREATE TRIGGER edge_governance_note_update
+CREATE TRIGGER IF NOT EXISTS edge_governance_note_update
 AFTER UPDATE OF deleted_at ON notes
 WHEN OLD.deleted_at IS NOT NEW.deleted_at
 BEGIN
@@ -179,7 +181,7 @@ BEGIN
 END;
 
 -- ADR159 §3:247 / 267–269: endpoint hard delete records once before later incident-edge deletes.
-CREATE TRIGGER edge_governance_note_delete
+CREATE TRIGGER IF NOT EXISTS edge_governance_note_delete
 BEFORE DELETE ON notes
 BEGIN
     INSERT INTO edge_governance_invalidations (decision_id, edge_id, cause, invalidated_at)

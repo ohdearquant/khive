@@ -267,11 +267,52 @@ fn edge_governance_upgrade_reopen_and_replay_preserve_existing_rows() {
         ),
         history
     );
+    // Fixture-only active receipt and spent history must survive a tail replay.
+    // This exercises row preservation, not the deferred activation protocol.
+    insert_decision(&conn, &fixture_edge(), "replay-decision").unwrap();
+    conn.execute_batch(
+        "INSERT INTO edge_governance_invalidations
+            (decision_id,edge_id,cause,invalidated_at)
+         SELECT decision_id,edge_id,'hard_delete',101 FROM edge_governance_decisions;
+         UPDATE edge_governance_state SET status='active',activation_epoch=7,
+            activated_at=100,inventoried_edges=1,authorized_edges=1,rejected_edges=0,
+            late_arrival_edges=0,provider_mode='single-principal',
+            provider_version='fixture-only',trigger_manifest='fixture-only'",
+    )
+    .unwrap();
+    let decisions = rows(&conn, "SELECT rowid,* FROM edge_governance_decisions");
+    let invalidations = rows(&conn, "SELECT rowid,* FROM edge_governance_invalidations");
     let state = rows(&conn, "SELECT * FROM edge_governance_state");
     let schema = rows(&conn, "SELECT type,name,sql FROM sqlite_schema WHERE name LIKE '%edge_governance%' ORDER BY type,name");
     conn.close().unwrap();
     let mut reopened = Connection::open(&path).unwrap();
+    // Rewind only the migration ledger, as older-tail replay tests do; the
+    // installed schema and governance rows already exist when V61 runs again.
+    reopened
+        .execute("DELETE FROM _schema_migrations WHERE version=61", [])
+        .unwrap();
+    let schema_version: i64 = reopened
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .unwrap();
     run_migrations(&mut reopened).unwrap();
+    assert_eq!(
+        reopened
+            .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        schema_version,
+        "migration replay must not alter the installed schema"
+    );
+    assert_eq!(
+        rows(&reopened, "SELECT rowid,* FROM edge_governance_decisions"),
+        decisions
+    );
+    assert_eq!(
+        rows(
+            &reopened,
+            "SELECT rowid,* FROM edge_governance_invalidations"
+        ),
+        invalidations
+    );
     assert_eq!(
         rows(&reopened, "SELECT * FROM edge_governance_state"),
         state

@@ -134,6 +134,7 @@ async fn generic_import_processes_fixed_substrates_without_governance_writes() {
     for table in GOVERNANCE_TABLES {
         claims[table] = json!({"decision_id":"import-forged", "status":"active"});
     }
+    // Concept-to-concept extends is valid; governance-shaped metadata remains inert.
     let mut archive = json!({
         "format":"khive-kg", "version":"0.1", "namespace":"local",
         "exported_at":"2026-10-19T00:00:00Z",
@@ -144,7 +145,7 @@ async fn generic_import_processes_fixed_substrates_without_governance_writes() {
              "created_at":"2026-10-19T00:00:00Z", "updated_at":"2026-10-19T00:00:00Z"}
         ],
         "edges":[{"edge_id":edge_id, "source":source_id, "target":target_id,
-            "relation":"depends_on", "weight":0.75, "properties":claims.clone(),
+            "relation":"extends", "weight":0.75, "properties":claims.clone(),
             "created_at":"2026-10-19T00:00:00Z", "updated_at":"2026-10-19T00:00:00Z"}]
     });
     for table in GOVERNANCE_TABLES {
@@ -155,7 +156,7 @@ async fn generic_import_processes_fixed_substrates_without_governance_writes() {
         .await
         .unwrap();
     assert_eq!(summary.entities_imported, 2);
-    assert_eq!(summary.edges_imported, 1);
+    assert_eq!(summary.edges_imported, 1, "{:?}", summary.skipped_edges);
     assert_eq!(summary.edges_skipped, 0);
     assert_eq!(
         runtime.get_entity(&token, source_id).await.unwrap().name,
