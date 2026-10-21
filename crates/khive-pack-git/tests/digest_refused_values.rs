@@ -15,6 +15,9 @@ fn fixture() -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(runtime.clone()));
     builder.register(GitPack::new(runtime.clone()));
+    builder
+        .with_runtime_event_store(&runtime)
+        .expect("private runtime event store");
     let registry = builder.build().expect("git registry");
     registry
         .apply_schema_plans_with_map(&Default::default(), runtime.backend())
