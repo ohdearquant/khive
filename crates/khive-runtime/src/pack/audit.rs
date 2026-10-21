@@ -80,6 +80,30 @@ pub(super) fn build_audit_storage_event(
     storage_event
 }
 
+/// Add the three ADR-174 truncation facts to the existing successful audit.
+/// Other verbs, the resource payload and the event envelope are untouched.
+pub(super) fn enrich_stream_truncate_success(
+    event: &mut Event,
+    gate_req: &GateRequest,
+    result: &Value,
+) {
+    if gate_req.verb != "stream.truncate" {
+        return;
+    }
+    let (Some(stream), Some(before_seq), Some(removed)) = (
+        gate_req.args.get("stream").and_then(Value::as_str),
+        gate_req.args.get("before_seq").and_then(Value::as_i64),
+        result.get("removed").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    if let Value::Object(ref mut payload) = event.payload {
+        payload.insert("stream".into(), Value::String(stream.into()));
+        payload.insert("before_seq".into(), Value::from(before_seq));
+        payload.insert("removed".into(), Value::from(removed));
+    }
+}
+
 /// Process-wide pure-observability audit appends whose errors were logged
 /// and swallowed — never an obligation-bearing row, which fails its dispatch
 /// instead and is counted separately by
@@ -728,3 +752,7 @@ pub fn resolve_explicit_namespace(
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "stream_truncate_audit_tests.rs"]
+mod stream_truncate_tests;
