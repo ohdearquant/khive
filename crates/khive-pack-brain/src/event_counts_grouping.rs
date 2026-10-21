@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
+use khive_runtime::audit_error::AuditErrorClass;
 use khive_storage::Event;
+use khive_types::{EventKind, EventOutcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -78,6 +80,8 @@ pub(crate) struct EventCountsAccumulator {
     counts_by_kind: std::collections::BTreeMap<String, u64>,
     counts_by_actor: std::collections::BTreeMap<String, u64>,
     counts_by_verb: std::collections::BTreeMap<String, u64>,
+    counts_by_error_class: BTreeMap<&'static str, u64>,
+    unclassified_error_count: u64,
     by_profile: std::collections::BTreeMap<String, u64>,
     feedback_by_originating_verb: std::collections::BTreeMap<String, u64>,
     // #34: flat and profile-crossed signal counts read the same payload
@@ -110,6 +114,22 @@ impl EventCountsAccumulator {
         let actor_key = self.default_actor.as_ref().unwrap_or(&event.actor);
         *self.counts_by_actor.entry(actor_key.clone()).or_insert(0) += 1;
         *self.counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
+        if event.kind == EventKind::Audit && event.outcome != EventOutcome::Success {
+            match event
+                .payload
+                .get("error_class")
+                .and_then(Value::as_str)
+                .and_then(AuditErrorClass::from_token)
+            {
+                Some(class) => {
+                    *self
+                        .counts_by_error_class
+                        .entry(class.as_str())
+                        .or_default() += 1
+                }
+                None => self.unclassified_error_count += 1,
+            }
+        }
         if event.kind == khive_types::EventKind::FeedbackExplicit {
             let originating_verb = event
                 .payload
@@ -165,6 +185,14 @@ impl EventCountsAccumulator {
         result["counts_by_kind"] = json!(self.counts_by_kind);
         result["counts_by_actor"] = json!(self.counts_by_actor);
         result["counts_by_verb"] = json!(self.counts_by_verb);
+        // Unknown and historical classes are counted without inventing a class
+        // or changing stored payloads. Omit both keys if no failed audit was read.
+        if !self.counts_by_error_class.is_empty() || self.unclassified_error_count != 0 {
+            result[BrainPack::truncatable_total_key("counts_by_error_class", truncated)] =
+                json!(self.counts_by_error_class);
+            result[BrainPack::truncatable_total_key("unclassified_error_count", truncated)] =
+                json!(self.unclassified_error_count);
+        }
         if let Some(cross) = self.group_counts {
             cross.add_to_result(result, truncated);
         }
