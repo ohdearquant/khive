@@ -138,6 +138,7 @@ fn cases() -> Vec<(&'static str, ErrorFactory)> {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn every_handler_class_is_recorded_on_ordinary_and_intercepted_dispatch() {
     for (expected, error) in cases() {
         for intercepted in [false, true] {
@@ -184,6 +185,7 @@ impl Gate for Unavailable {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn registry_denials_are_distinct_from_handler_policy_refusals() {
     for intercepted in [false, true] {
         let (registry, store) = registry(None, Some(Arc::new(Deny)));
@@ -207,6 +209,7 @@ async fn registry_denials_are_distinct_from_handler_policy_refusals() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn unavailable_gate_unknown_verb_and_success_keep_distinct_shapes() {
     for intercepted in [false, true] {
         let (registry, store) = registry(None, Some(Arc::new(Unavailable)));
