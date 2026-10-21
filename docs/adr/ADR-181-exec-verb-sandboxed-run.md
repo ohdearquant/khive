@@ -1341,14 +1341,16 @@ item 8).
    Then the file and every directory its path resolves through are on the read-only root snapshot. No run and no
    unprivileged process can change what that path resolves to or the bytes behind it, before or after the test, so
    the test, the digest and the spawn reach the same file. The digest is computed at that path, as today, and
-   `sandbox-exec` runs that same path string. An Apple platform binary copied off that volume is killed at launch
-   (measured: a copy of `/usr/bin/nc` ended with SIGKILL, unsandboxed and sandboxed), which is why these files are not
-   staged. A registered path that fails either test is staged like any other path: one that reaches a system-volume
+   `sandbox-exec` runs that same path string. A copy of an Apple platform binary made off that volume can be killed at
+   launch (measured on one binary: a copy of `/usr/bin/nc` ended with SIGKILL, unsandboxed and sandboxed; no other
+   binary was measured), which is why these files are not staged. A registered path that fails either test is staged
+   like any other path: one that reaches a system-volume
    file through a symbolic link, one with a `..` component, and one whose file or any ancestor directory is on
    another volume. `statfs` follows a firmlink, so `/usr/local/bin` reports the Data volume and is staged (measured).
    The test reads the mount point and the two flags above, all three observed on the root volume (measured); it does
-   not depend on a sealed flag. A platform binary stays launchable only when its direct system path is registered: an
-   alias of it is staged, and a staged copy of it is killed at launch.
+   not depend on a sealed flag. Registering a platform binary's direct system path avoids staging it, and an alias of
+   it is staged. The one staged copy measured, of `/usr/bin/nc`, was killed at launch; other platform binaries and
+   alias spellings were not measured.
 
    An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
    changes the stored row (item 2).
@@ -1563,10 +1565,15 @@ Added arms:
       which the same path string reaches a program that prints another marker, and resumes; that marker is absent from
       the run's output.
     - **Copy bounds.** With clones unavailable (a test seam), the copy is a byte copy and the run is honoured with the
-      same digest. A source larger than the byte budget, and a source that a writer extends past it while a test seam
-      holds the copy, are refused with `binary_digest_byte_limit`, `bytes_read` at most the budget plus one byte. A
+      same digest. A source larger than the byte budget, and a source that a writer extends well past the budget plus
+      one byte while a test seam holds the copy, are refused with `binary_digest_byte_limit`, `bytes_read` at most the
+      budget plus one byte; a probe on the source reader itself counts at most the budget plus one byte read from the
+      source, independently of `bytes_read` and of any later digest's progress. A
       source read stalled past `binary_digest_timeout_s` (a test seam) is refused with `binary_digest_time_limit`,
-      `elapsed_ms` at least `time_cap_ms`. None of the three leaves a staging or run directory or a digest in any receipt.
+      `elapsed_ms` at least `time_cap_ms`. A byte copy that finishes inside the time cap, followed by a digest of the
+      staged copy that crosses the deadline set before the source was opened but would finish inside a deadline
+      restarted after the copy (a timing test seam), is refused with `binary_digest_time_limit`. None of the four leaves
+      a staging or run directory or a digest in any receipt.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
@@ -1576,7 +1583,9 @@ Added arms:
     case red; admitting a `..` component to the exception turns the `/usr/bin/../bin/nc` case red (the writable-prefix
     row still stages, by its ancestor's mount); reading `statfs` on `/` alone turns
     the Data-volume cases red; copying to the end of the source before checking the budget turns the over-limit cases
-    red; starting the deadline after the copy turns the stalled case red; removing the staging directory only when a
+    red on the source-reader probe; starting the deadline after the copy turns the stalled case red; giving the digest
+    of the staged copy a deadline of its own, restarted after the copy, turns the copy-then-digest case red; removing
+    the staging directory only when a
     spawned run ends turns the tree-load case red; and removing the staging directory under the run directory's `keep`
     condition turns the kept-run case red.
 62. **Registration and stored digests.** `tool.register` refuses `network` without `executable_digest`,
@@ -1621,10 +1630,12 @@ Added arms:
     seam) is refused naming the unreadable build. Control: the running build listed runs honoured. A networked row with
     a `tool.policy` deny for the caller and no grant is refused with the existing policy refusal with the setting off,
     with the build unlisted, and with both valid; each receipt carries the deny decision and the digest worker's probe
-    counts zero. The same three fixtures with a `tool.policy` ask for the caller and no grant, and with a row whose side
+    counts zero, and call-count probes on the host-setting reader, the build reader and the loopback-address reader
+    each count zero calls (a reader never called, which a result read early and left unused does not satisfy). The
+    same three fixtures with a `tool.policy` ask for the caller and no grant, and with a row whose side
     effect is not `read` and no policy or grant (the default ask, `khive-pack-tool/src/policy.rs:902-905`), are refused
     with the existing policy refusal naming `ask`; each receipt carries the ask decision, the digest worker's probe
-    counts zero, and no run or staging directory is left.
+    and the three reader probes count zero, and no run or staging directory is left.
 
     For an `allow`, each fixture below fails two conditions of Decision item 5 with every other condition met, and is
     refused naming the earlier one, with the digest worker's probe counting zero and no run or staging directory:
@@ -1641,7 +1652,9 @@ Added arms:
 
     Mutation controls: skipping the build check turns the unlisted case red and leaves arm 60 green; moving the
     networked conditions ahead of the policy refusal turns the deny cases red; letting an `ask` on a networked row
-    reach the conditions turns the ask cases red; and moving the stored-row checks
+    reach the conditions turns the ask cases red; reading the host setting, the build or the loopback addresses before
+    the policy refusal, even with the result left unused, turns the deny and ask cases red on the reader probes; and
+    moving the stored-row checks
     (conditions 4 and 5) ahead of the host checks turns the last two cases red.
 66. **The resolver operations, per listed build.** Under the outbound profile, a query, a service browse, a service
     registration and a proxy registration each run beside their unsandboxed control in the same run, and the arm
