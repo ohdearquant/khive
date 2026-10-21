@@ -875,6 +875,9 @@ other decision in this record and in ADR-180 stands. A
 registration that does not declare network runs exactly as before, and its pin and grants are
 unchanged byte for byte.
 
+Amended by [Amendment 14](#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs) (proposed) for Decision items 1 to 5 and 7, approval scope items 1
+and 5, and acceptance arms 49, 51, 56, 59 and 60. No host turns networked runs on before Amendment 14 is accepted.
+
 This amendment provides the network declaration that a host needs to run adapters which reach a
 remote service under exec. It does not decide which registrations may declare it.
 
@@ -1241,3 +1244,247 @@ Identity, approval, the remaining address forms and the host setting:
     carries its own case here.
 
 Implementation follows acceptance of this amendment and goes through the usual review and gates.
+
+## Amendment 14 (2026-10-21): the executable's bytes, the macOS build and the resolver socket for networked runs
+
+**Status: Proposed.** Partial amendment of Amendment 13, which stays Proposed and stands except where this amendment
+changes it: Decision items 1, 2, 3, 4, 5 and 7; items 1 and 5 of what a grant on a networked registration approves, with
+three items added; acceptance arms 49, 51, 56, 59 and 60, with six arms added. It amends ADR-180 Amendment 1 item 1 for
+one more property, on rows that carry `network` only. A host turns networked runs on only under Amendment 13 as amended
+here. A registration that does not declare `network` is unaffected: its pin, its grants and its runs are unchanged byte
+for byte.
+
+### Context
+
+A review of Amendment 13 found three gaps that matter once a host turns networked runs on, and a set of text defects
+(Decision item 8).
+
+1. **The grant does not cover the executable's bytes.** The pinned inputs include `source`, which for exec is
+   `exec:<absolute path>` (`khive-pack-exec/src/handlers.rs:547-567`), so the pin names a path. exec hashes the file in
+   preflight (`handlers.rs:1075`) and writes the digest to the receipt (`handlers.rs:1469`). Nothing compares it with
+   anything, so a file replaced in place at the approved path runs with network under the same grant.
+
+2. **The resolver socket grants the resolver daemon's whole client surface.** Measured on macOS 27.2, build 26B118, with
+   `/usr/bin/dns-sd`, each operation beside its unsandboxed control in the same pass:
+
+   | operation                                                              | unsandboxed                  | Decision item 5 rule set     | template without network |
+   | ---------------------------------------------------------------------- | ---------------------------- | ---------------------------- | ------------------------ |
+   | query an A record                                                      | answered                     | answered                     | not run                  |
+   | browse service types                                                   | 35 types                     | 35 types                     | refused (`-65563`)       |
+   | register a service, observed by an unsandboxed browser                 | advertised                   | advertised                   | refused (`-65563`)       |
+   | register a service and an address record for another host (proxy form) | advertised, address answered | advertised, address answered | not run                  |
+
+   The sandboxed registration was advertised on interface indexes 1, 14, 16 and 30 (`lo0`, the Wi-Fi LAN interface,
+   `anri1` and `bridge100`) and lived while the registering client's connection was open. The rule allows a connection
+   to the socket path. It says nothing about what is sent over that connection, and every operation measured was
+   served. Name resolution through the system resolver needs that socket (Amendment 13 Context), so removing it removes
+   name resolution.
+
+3. **The host setting is not bound to what was measured.** On the measured build, own-host refusal needed two lines
+   together: with the `localhost` deny and no resolver socket line, loopback was reached (Amendment 13 Context, the row
+   above item 5's). A later macOS build could change that interaction with no change in this repository. The setting
+   persists across macOS updates, and the daemon checks only that `/usr/bin/sandbox-exec` exists
+   (`khive-pack-exec/src/sandbox.rs:47-58`).
+
+   The `localhost` deny refuses `127.0.0.1` and `::1` ("Operation not permitted" where the unsandboxed control reads
+   "Connection refused", and where it connects to a live loopback service). A connection to `127.0.0.2`, which the
+   measured host had not assigned, behaved as it did unsandboxed, with no permission error. An address assigned to `lo0`
+   beyond those two is therefore an own-host address the profile admits.
+
+### Decision
+
+1. **A networked registration pins its executable's bytes.** A row carrying `network` also carries
+   `executable_digest`: the BLAKE3 digest of the registered file's bytes as 64 lowercase hexadecimal characters, the
+   function and form of the receipt's `tool_binary_digest` (`handlers.rs:708-803`). `tool.register` requires it when
+   `network` is passed, refuses it without `network`, and refuses a value that is not 64 lowercase hexadecimal
+   characters, each with the reason named. `tool.describe`, `tool.list` and the register response report it, so an
+   approver can compare the row with the file before granting.
+
+   `executable_digest` joins the grant pin's inputs under Amendment 13 Decision item 2's rule for `network`: when the
+   row carries the key, the pinned inputs contain it with its stored value, and when the key is absent, they do not
+   contain it. A stored digest that changes by any path changes the pin, and a grant approved for the old bytes stops
+   being active.
+
+   At run time, after the binary digest is computed (Amendment 10) and before the tree is loaded (`handlers.rs:1102`),
+   the computed digest is compared with the stored one. A mismatch is refused with `network_unhonoured:` naming the
+   executable digest, with both digests in the refusal detail and no run directory.
+
+   An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
+   changes the stored row (item 2).
+
+2. **Re-registration refuses a conflicting network declaration.** `tool.register` on a name that already has a row
+   validates a passed `network` or `executable_digest` as it would for a new row. When a passed value differs from the
+   stored one, an absent stored key counting as a value, the call is refused and the reason names the property and the
+   stored value. When the passed values equal the stored ones, or neither is passed, the existing row is returned
+   unchanged as today. This replaces Amendment 13 Decision item 1's statement that a re-registration's `network`
+   silently does not reach the row. ADR-180's `re_registration_keeps_the_approved_object_and_definition` passes neither
+   property and is unaffected.
+
+3. **The host setting is named, typed and bound to measured builds.** The setting is the `[exec.network]` table of the
+   daemon's configuration:
+
+   ```toml
+   [exec.network]
+   enabled = true
+   os_builds = ["26B118"]
+   ```
+
+   `enabled` is a boolean that resolves to false wherever Amendment 13 arm 60 requires the setting off. `os_builds`
+   lists macOS build identifiers, the value of `sysctl kern.osversion`. The table refuses unknown keys, as the `[exec]`
+   section does (`khive-runtime/src/engine_config.rs:988-989`). Each of the following is refused at configuration load
+   the way Amendment 2 item 1 refuses an unsupported limit: the daemon does not start, and the reason names the key.
+   - `enabled` with a value that is not a boolean, a string `"true"` included;
+   - `enabled = true` with `os_builds` absent or empty;
+   - an `os_builds` entry that is not two digits, one uppercase letter, one to four digits and an optional lowercase
+     letter.
+
+   With `enabled` false, `os_builds` is still validated and has no effect.
+
+4. **A networked run proceeds only on a listed build.** The running build is read from `kern.osversion` at each
+   networked run. A build that is not in `os_builds`, or a build that cannot be read, is refused with
+   `network_unhonoured:` naming the running build (or that it could not be read) and the configured list.
+   `exec.identity` reports `network_enabled`, `network_os_builds`, `os_build` (null when unreadable) and
+   `network_os_build_listed`, so a host's state reads without a run.
+
+   Adding a build is the re-measure step. On a host running that build, from a source checkout of the running release,
+   run the network arm suite (arms 50 to 53, 59 and 66), whose report names the build it ran on, and add the build to
+   `os_builds` only after a report in which every arm passed with its controls. A configuration template that ships
+   `enabled = true` lists the builds the project's gate measured, and the release names them. This replaces approval
+   scope item 1's sentence that the daemon does not check the macOS version at run time.
+
+5. **The order of the networked-run conditions.** This replaces Amendment 13 Decision item 3's list and item 4's
+   mapping of refusals to prefixes. For a row carrying `network`, after the policy decision and before the binary
+   digest, these are checked in order and the first that fails is refused and named:
+   1. the host setting is on (`network_unhonoured:`);
+   2. the running build is listed (`network_unhonoured:`);
+   3. the stored `network` is `"outbound"` (`network_invalid:`);
+   4. the stored `executable_digest` is present and well formed (`network_invalid:`);
+   5. the decision is `allow` from `grant` (`network_unhonoured:`);
+   6. the token is not anonymous (`network_unhonoured:`).
+
+   After the digest is computed, the computed digest must equal the stored one (`network_unhonoured:`, item 1). The
+   identity check for a non-anonymous caller keeps its earlier position (Amendment 13 Decision item 3). Every refusal
+   here writes the receipt Amendment 13 Decision item 4 describes.
+
+6. **The resolver socket stays, and its reach is stated and recorded on every listed build.** Decision item 5's rule
+   set is unchanged. Its `localhost` deny and its resolver socket line act together on the measured build (Context 3),
+   so a change to either is a template change with a new template digest, and arm 51 holds both (its mutation controls,
+   amended below). Approval scope item 5 is replaced below, and arm 66 records the resolver operations on each build a
+   template lists.
+
+7. **Policy verbs answer the policy question, and exec reports host state.** `tool.check`, `tool.describe` and
+   `tool.suggest` keep answering what grants and policy decide and read no exec configuration. With the host setting
+   off or the build unlisted they can answer `allow` from `grant` for a row exec refuses. A caller that needs to know
+   whether a networked run can start reads `exec.identity` (item 4). Amendment 13 Decision item 7's "a run with network
+   waits for the grant" reads "a run with network waits for the grant and, on the host, for the setting and a listed
+   build". `tool.request` still inserts and notifies with the setting off, and a grant written then is usable once the
+   host turns networked runs on.
+
+8. **Text corrections to Amendment 13.**
+   - Context, the sentences from "So for exec" to "every actor label under it" read: for exec, which runs only
+     registered tools, `source` `grant` means an approved grant pinned to the row being run. A grant written for a
+     pattern carries a null pin and authorizes no registered row, except a row registered under that literal name. Its
+     actor can still be a pattern: `agent:team:*` matches every actor label under it.
+   - Decision item 2's last sentence names the paths ADR-180 Amendment 1 item 4 names: a later relaxation, a restore
+     from a backup, and a second writer inside the owning pack. Item 4 does not name an update verb.
+   - The index entry for Amendment 13 in `docs/adr/README.md` says the declaration is honoured by a grant pinned to the
+     row, to a non-anonymous caller, on a host whose setting is on, and points here.
+
+### What a grant on a networked registration approves (amended)
+
+Item 1 gains this: the `localhost` deny refuses `127.0.0.1` and `::1` and no other `127/8` address (Context 3). An
+address assigned to `lo0` beyond those two is an own-host address the profile admits, and arm 59 covers each address
+assigned to the loopback interface when it runs. Item 1's sentence that the daemon does not check the macOS version at
+run time is replaced by Decision item 4.
+
+Item 5 is replaced:
+
+5. **The resolver daemon's client surface is reachable.** A run can look up names, browse services, register services,
+   and register a service with an address record for another host. Registrations are advertised on every interface the
+   host advertises on, the LAN included, for as long as the run holds the connection, and a detached descendant
+   (item 4) can hold it after the receipt. The measured operations are in the Context, and arm 66 records them on each
+   listed build. The template already allowed a mach lookup of the directory service
+   (`com.apple.system.opendirectoryd.libinfo`, `sandbox.rs:220`) before Amendment 13. What that service does on a run's
+   behalf is its own policy and is not measured here.
+
+Three items are added:
+
+8. **The pinned bytes are the registered file's, at preflight.** An interpreter named on a script's `#!` line, a
+   dynamic library, and any file the program reads are outside the digest. The digest is taken before the tree is
+   materialized and the file is then run by its path (`handlers.rs:1075`, `handlers.rs:1491-1496`), so a file replaced
+   between the two runs bytes nobody hashed, once. The pin closes a replacement that persists across runs and does not
+   close that window. Closing it needs exec to run the bytes it hashed, for example from a daemon-owned copy, which
+   this amendment does not decide.
+9. **A grant outranks a policy deny.** Grants are consulted before policy rows (`khive-pack-tool/src/policy.rs:872-891`;
+   ADR-180 Amendment 4 item 7), so a `tool.policy` deny for the same actor and tool does not stop a granted networked
+   run. `tool.revoke` or `tool.deny` on the grant does.
+10. **The approver's notice carries the requester's words.** With `notify` set, the actor, reason and scope in the
+    notice come from the request (Amendment 13 Decision item 7). The approver reads the row's `source`, `network` and
+    `executable_digest` from `tool.describe` before granting, not the request's account of them.
+
+### Alternatives considered
+
+- **The grant records the digest at approval.** `tool.grant` would read files the tool pack does not otherwise read,
+  and the approver would approve bytes the registration never named. Not chosen.
+- **Trust on first use.** The first honoured run records the digest and later changes are refused. The first run is
+  unverified, and exec would write into the tool pack's row. Not chosen.
+- **An executable digest on every exec row.** It hardens runs without network too, but it changes the pin, and so the
+  grants, of every exec row. Not decided here, and rows without `network` keep Amendment 13's byte-identical pin.
+- **The macOS version instead of the build.** Builds change within a version through updates, and the profile's
+  behaviour belongs to the build that runs it. The cost is that every macOS update refuses networked runs, naming the
+  build, until the re-measure step lists it.
+- **Refusing to start the daemon on an unlisted build.** Only networked runs depend on the measured profile. Every
+  other verb, and every run without network, is unaffected. Not chosen.
+- **Narrowing the resolver socket.** No profile rule was found that admits lookups and refuses registration. Resolving
+  names outside the run, in the daemon, changes how every tool resolves names. Neither is decided here.
+
+### Acceptance
+
+Amended arms:
+
+- **49.** Its control is a sibling row in the same namespace carrying `network: "outbound"` and a valid
+  `executable_digest`, with its own grant pinned to it, run by the same caller. The control runs honoured. The arm's own
+  row stays refused with `network_invalid:`, so the decision-path preface's "same row" control does not apply to arm 49.
+- **51.** A second mutation control: removing the resolver socket line turns this arm red, beside removing the
+  `localhost` deny.
+- **56.** The detached descendant's refused write and refused bind are asserted. Its reach to the remote endpoint is
+  recorded and not asserted, so a containment change (#3631) that ends it does not turn this arm red.
+- **59.** Adds a TCP connection and a UDP send to every address assigned to `lo0` when the arm runs, and records the
+  outcome of a connection to a `127/8` address that is not assigned.
+- **60.** The setting is `exec.network.enabled`. The omitted-key case runs twice: once with an `[exec.network]` table
+  that lacks `enabled`, and once with no `[exec.network]` table.
+
+Added arms:
+
+61. **The executable pin.** A row carrying `network` and an `executable_digest` equal to an independent BLAKE3 of the
+    file runs honoured, and its receipt's `tool_binary_digest` equals the stored value. Replacing the file in place
+    with different bytes at the same path is refused with `network_unhonoured:` naming the executable digest, both
+    digests in the refusal detail, `sandbox` null and no run directory. Restoring the original bytes runs honoured
+    again. Changing the stored `executable_digest` through storage makes `tool.check` answer from policy or default.
+    Mutation controls: skipping the comparison turns the replacement case red, and leaving `executable_digest` out of
+    the pinned inputs turns the storage case red.
+62. **Registration.** `tool.register` refuses `network` without `executable_digest`, `executable_digest` without
+    `network`, and an `executable_digest` that is uppercase, 63 characters, 65 characters or not hexadecimal, each
+    with the reason named. The accepted case is the control. A row carrying `network` with no `executable_digest`,
+    written through storage, is refused with `network_invalid:` before the binary digest starts (the digest worker's
+    test probe counts zero).
+63. **Re-registration.** On an existing networked row, re-registering with a different `executable_digest` is refused
+    naming the stored value, and passing `network` on an existing row that lacks it is refused. Passing the stored
+    values, and passing neither, return the row unchanged with `created` false (the controls). Mutation control:
+    merging passed properties into the stored row turns this arm red.
+64. **Configuration.** Each refused case of Decision item 3 fails configuration load with the key named: `enabled =
+    "true"`, `enabled = 1`, `enabled = true` with `os_builds` absent, `enabled = true` with `os_builds = []`, an entry
+    `"26b118"`, and an unknown key in the table. A valid table loads (control). Mutation control: accepting a string
+    for `enabled` turns this arm red.
+65. **The build.** With the setting on and the running build not listed, a run is refused with `network_unhonoured:`
+    naming the build and the list, before the binary digest starts and with no run directory, and `exec.identity`
+    reports the running build and `network_os_build_listed` false. A build reader that fails (a test seam) is refused
+    naming the unreadable build. Control: the running build listed runs honoured. Mutation control: skipping the build
+    check turns this arm red and leaves arm 60 green.
+66. **The resolver operations, per listed build.** Under the outbound profile, a query, a service browse, a service
+    registration and a proxy registration each run beside their unsandboxed control in the same run, and the arm
+    records each outcome and the interfaces a registration was advertised on. It passes when every operation ran with
+    its control, and the outcomes are recorded, not asserted. Under the template without network, the browse and the
+    registration are asserted refused. A template lists a build only with this arm's report from that build.
+
+Implementation of Amendments 13 and 14 follows acceptance of both and goes through the usual review and gates.

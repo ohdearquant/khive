@@ -117,7 +117,8 @@ amendment closes the remaining gap on the decision side.
 
    Item 1's input set is amended for one property by [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (proposed):
    `network` joins the pinned inputs when the row carries the key, and a row without it keeps these
-   four inputs byte for byte.
+   four inputs byte for byte. [ADR-181 Amendment 14](ADR-181-exec-verb-sandboxed-run.md#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs)
+   (proposed) adds `executable_digest` under the same rule, on rows that carry `network`.
 
 2. **`tool.check` resolves an active grant by id.** A `granted` row is active when it has not
    expired, its pinned id equals the id the name resolves to now, and its pinned digest equals the
