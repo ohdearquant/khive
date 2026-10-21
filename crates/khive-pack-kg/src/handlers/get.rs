@@ -26,6 +26,15 @@ use super::redirect::{followed_entity, reject_live_redirect};
 use crate::sql::sql;
 use crate::KgPack;
 
+fn reject_nonrecord_hydration(roles: &[String]) -> Result<(), RuntimeError> {
+    if let Some(role) = roles.first() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "unknown attachment role {role:?}: attachments require an entity or note"
+        )));
+    }
+    Ok(())
+}
+
 impl KgPack {
     pub(crate) async fn handle_get(
         &self,
@@ -71,13 +80,14 @@ impl KgPack {
                     Some(&mailbox.note_scope(token)),
                 )
                 .await?;
-            return flatten_get_result(
+            let record = flatten_get_result(
                 "note",
                 parse_note_content(
                     remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                     p.parse_content,
                 )?,
-            );
+            )?;
+            return self.get_with_attachments(note.id, record, &p.hydrate).await;
         }
         if p.kind.is_some() || p.note_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
@@ -112,6 +122,7 @@ impl KgPack {
             Some(id) => id,
             None => {
                 if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
+                    reject_nonrecord_hydration(&p.hydrate)?;
                     return Ok(payload_val);
                 }
                 return Err(RuntimeError::NotFound(id_ref.to_string()));
@@ -143,22 +154,24 @@ impl KgPack {
         match resolved {
             Some(Resolved::Entity(entity)) => {
                 reject_live_redirect(&entity)?;
-                return flatten_get_result(
-                    "entity",
-                    normalize_entity_timestamps(to_json(&entity)?),
-                );
+                let record =
+                    flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?))?;
+                return self
+                    .get_with_attachments(entity.id, record, &p.hydrate)
+                    .await;
             }
             Some(Resolved::Note(note)) => {
                 if !mailbox.permits_message_note(token, &note) {
                     return Err(RuntimeError::NotFound(id_ref.to_string()));
                 }
-                return flatten_get_result(
+                let record = flatten_get_result(
                     "note",
                     parse_note_content(
                         remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                         p.parse_content,
                     )?,
-                );
+                )?;
+                return self.get_with_attachments(note.id, record, &p.hydrate).await;
             }
             _ => {}
         }
@@ -176,7 +189,10 @@ impl KgPack {
                         .await?;
                     value["redirected_from"] = to_json(&redirected_from)?;
                 }
-                return flatten_get_result("entity", value);
+                let record = flatten_get_result("entity", value)?;
+                return self
+                    .get_with_attachments(entity.id, record, &p.hydrate)
+                    .await;
             }
         }
 
@@ -194,7 +210,9 @@ impl KgPack {
             }
             let note_val = normalize_entity_timestamps(to_json(&note)?);
             let remapped = remap_note_status(note_val);
-            return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
+            let record =
+                flatten_get_result("note", parse_note_content(remapped, p.parse_content)?)?;
+            return self.get_with_attachments(note.id, record, &p.hydrate).await;
         }
         if include_deleted {
             if let Some(deleted) = self
@@ -208,11 +226,16 @@ impl KgPack {
             {
                 let note_val = normalize_entity_timestamps(to_json(&deleted)?);
                 let remapped = remap_note_status(note_val);
-                return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
+                let record =
+                    flatten_get_result("note", parse_note_content(remapped, p.parse_content)?)?;
+                return self
+                    .get_with_attachments(deleted.id, record, &p.hydrate)
+                    .await;
             }
         }
 
         // PR-A1: by-ID edge get returns the edge regardless of namespace.
+        reject_nonrecord_hydration(&p.hydrate)?;
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
             if !super::message_scope::message_endpoint_permitted(
                 &self.runtime,

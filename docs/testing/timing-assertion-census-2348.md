@@ -111,6 +111,21 @@ The A rows above retain the original census base and classifications. Subsequent
 - The comm hold-time tests already use the shared helper: ordinary runs retain the calibrated median/p95 limits, while coverage omits those numeric gates and retains sample-integrity checks. The calibration remains historical rather than fixture-derived.
 - `test_stalled_request_is_bounded_and_reaped` already gives initialization a separate 2-second startup allowance; the stalled request and reap budgets remain 0.25 seconds. Its setup no longer consumes the request's measured timeout.
 
+### Comm long-poll follow-up (21 October 2026)
+
+The two live absolute-ceiling rows formerly at `comm/tests/integration.rs:502,642`
+are `inbox_long_poll_wakes_after_concurrent_ingest` and
+`inbox_long_poll_returns_immediately_when_matches_exist` in
+`crates/khive-pack-comm/tests/integration.rs`. Both now select a strict bound
+through the shared timing helper: one fifth of their 5-second wait budget
+ordinarily (unchanged `<1 s`), or the midpoint of that budget under coverage
+(`<2.5 s`). Both retain their result assertions and must beat the 5-second
+fallback. Separate 10-second watchdogs guard hangs; they do not replace the
+numeric assertions. The ingest watchdog now aborts and joins its waiter on
+expiry. The original stopwatch boundaries and unrelated-wake checks remain.
+This closes these two absolute-ceiling follow-ups only; selector-branch tests
+without compiler instrumentation do not establish coverage-run acceptance.
+
 These updates do not establish coverage-run acceptance or close the other census follow-ups.
 
 The Python completion-envelope assertion at

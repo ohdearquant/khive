@@ -131,7 +131,8 @@ pub(crate) async fn handle_thread(
         o @ ("asc" | "desc") => o,
         other => {
             return Err(RuntimeError::InvalidInput(format!(
-                "thread: invalid order {other:?}; expected one of: asc, desc"
+                "thread: invalid order {:?}; expected one of: asc, desc",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, other)
             )));
         }
     };
