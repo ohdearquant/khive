@@ -725,6 +725,7 @@ fn report_serializes_per_model_truncation_accounting() {
         EmbeddingTruncationReport {
             truncated: 2,
             discarded_bytes: 17,
+            ..Default::default()
         },
     );
     let json = serde_json::to_value(report).expect("serialize report");
@@ -743,6 +744,7 @@ fn human_report_renders_per_model_truncation_in_sorted_order() {
         EmbeddingTruncationReport {
             truncated: 3,
             discarded_bytes: 29,
+            ..Default::default()
         },
     );
     report.truncation_by_model.insert(
@@ -750,6 +752,7 @@ fn human_report_renders_per_model_truncation_in_sorted_order() {
         EmbeddingTruncationReport {
             truncated: 1,
             discarded_bytes: 7,
+            ..Default::default()
         },
     );
 
