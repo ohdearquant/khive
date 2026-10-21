@@ -100,6 +100,7 @@ pub(crate) struct AnnState {
     pub(super) checkpoint_policy: std::sync::RwLock<CheckpointPolicy>,
     pub(super) checkpoint_timers: std::sync::Mutex<HashSet<AnnKey>>,
     pub(super) checkpoint_timers_enabled: bool,
+    pub(super) owner_dropped: tokio_util::sync::CancellationToken,
     #[cfg(test)]
     pub(super) segment_load_count: AtomicUsize,
     #[cfg(test)]
@@ -191,6 +192,12 @@ pub(crate) struct AnnState {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
+impl Drop for AnnState {
+    fn drop(&mut self) {
+        self.owner_dropped.cancel();
+    }
+}
+
 pub(crate) fn enable_note_search_consumer(ann: &SharedAnn) {
     ann.note_search_consumer_enabled
         .store(true, Ordering::Release);
@@ -218,6 +225,7 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         checkpoint_policy: std::sync::RwLock::new(CheckpointPolicy::from_env()),
         checkpoint_timers: std::sync::Mutex::new(HashSet::new()),
         checkpoint_timers_enabled: cfg!(not(test)),
+        owner_dropped: tokio_util::sync::CancellationToken::new(),
         #[cfg(test)]
         segment_load_count: AtomicUsize::new(0),
         #[cfg(test)]

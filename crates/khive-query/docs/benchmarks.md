@@ -1,5 +1,41 @@
 # khive-query Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-query`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                        | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------ | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `gql/gql/node_with_limit`                        | 457.744 ns       | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql/gql/simple_node`                            | 434.744 ns       | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql/gql/two_node_edge`                          | 706.192 ns       | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/node_multi_property_map`        | 922.358 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/three_node_chain`               | 1.048 µs         | 1.020     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/three_node_mixed_direction`     | 1.118 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/undirected_edge`                | 743.697 ns       | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/variable_length_multi_rel`      | 861.763 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/variable_length_with_where`     | 985.223 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/node_with_properties`            | 684.617 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_and`                       | 1.107 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_and_or`                    | 1.235 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_eq_string`                 | 998.720 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_or`                        | 1.041 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_with_edge_var`             | 973.680 ns       | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/gql_dispatch`                   | 732.759 ns       | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/gql_with_leading_whitespace`    | 518.975 ns       | 1.028     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/sparql_dispatch`                | 1.402 µs         | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/sparql_with_leading_whitespace` | 1.060 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/explicit_range`                   | 1.070 µs         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/two_node`                         | 1.395 µs         | 1.022     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/variable_length_plus`             | 1.424 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/kind_and_property_filter`  | 1.830 µs         | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/three_node_chain`          | 1.807 µs         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/with_property_filter`      | 1.725 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Run Command
 
 ```bash

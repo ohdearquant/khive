@@ -1,5 +1,28 @@
 # khive-brain-core Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-brain-core`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `core_primitives/apply_signal/feedback_useful`                  | 54.861 ns        | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/apply_signal/recall_hit`                       | 54.505 ns        | 1.010     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/apply_signal/recall_miss`                      | 14.800 ns        | 1.020     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/ess_cap/section_posterior_capped/100`          | 9.027 µs         | 1.010     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/ess_cap/section_posterior_capped/200`          | 17.946 µs        | 1.010     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/ess_cap/section_posterior_capped/50`           | 4.316 µs         | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/section_weights/deterministic/after_50_events` | 746.442 ns       | 1.008     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/section_weights/deterministic/default_priors`  | 747.646 ns       | 1.010     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/snapshot/brain_state/roundtrip`                | 2.032 µs         | 1.021     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/snapshot/from_snapshot/restore`                | 285.792 ns       | 1.013     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/snapshot/to_snapshot/100_events`               | 63.871 ns        | 1.015     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `core_primitives/snapshot/to_snapshot/fresh`                    | 15.964 ns        | 1.018     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 These Criterion measurements cover in-memory primitives. They exclude registry
 dispatch, authorization, persistence, event append and transport; they do not
 represent the public `brain.*` verb cost. Use the brain pack benchmarks for that

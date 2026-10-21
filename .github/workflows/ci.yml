@@ -1029,6 +1029,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          # The reference renderer dates each baseline from its commit. A
+          # shallow checkout can contain the document but not the baseline commit.
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Benchmark reference renderer tests
+        run: python3 -m unittest scripts.tests.test_render_bench_reference -v
+      - name: Check benchmark reference blocks
+        run: python3 scripts/render-bench-reference.py --check
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x

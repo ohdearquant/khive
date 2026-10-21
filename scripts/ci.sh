@@ -96,6 +96,7 @@ phase_lint() {
 
     echo "=== CI Workflow Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_clippy.py"
     python3 "$SCRIPT_DIR/tests/test_ci_infra_retry.py"
 
     echo "=== CI Empty-HOME Sentinel Tests ==="
@@ -192,18 +193,23 @@ phase_no_stubs() {
 }
 
 phase_clippy() {
-    echo "=== Clippy ==="
     if scoped; then
         packages=$(scope_package_args) || return 1
         if [ -z "$packages" ]; then
             echo "scope: no workspace member is under test; clippy skipped"
             return 0
         fi
-        # shellcheck disable=SC2086
-        cargo clippy $packages --all-targets --all-features -- -D warnings
-        return
+    else
+        packages="--workspace"
     fi
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    # Optional features can hide warnings in the default configuration. Keep
+    # both checks on the same affected-package closure, with default first.
+    echo "=== Clippy (default features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets -- -D warnings || return $?
+    echo "=== Clippy (all features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets --all-features -- -D warnings
 }
 
 phase_docs() {

@@ -1,5 +1,33 @@
 # Vamana Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-vamana`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                        | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| -------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `build/VamanaIndex::build/1000`  | 453.218 ms       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `build/VamanaIndex::build/10000` | 30.084 s         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `build/VamanaIndex::build/5000`  | 9.752 s          | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `distance/cosine_from_l2sq`      | 0.865 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `distance/l2_squared/384d`       | 46.858 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `free_fns/build/1k`              | 452.963 ms       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `free_fns/search/1k/k10`         | 148.011 µs       | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=1000/k=10`             | 150.513 µs       | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=1000/k=50`             | 150.497 µs       | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=10000/k=10`            | 1.002 ms         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=10000/k=50`            | 1.002 ms         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=5000/k=10`             | 715.000 µs       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `search/n=5000/k=50`             | 722.100 µs       | 1.021     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `snapshot/from_snapshot/1000`    | 1.558 ms         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `snapshot/from_snapshot/5000`    | 8.708 ms         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `snapshot/to_snapshot/1000`      | 73.308 µs        | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `snapshot/to_snapshot/5000`      | 589.408 µs       | 1.009     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 **Crate:** `khive-vamana`
 **ADR refs:** ADR-048 (recall and latency targets)
 

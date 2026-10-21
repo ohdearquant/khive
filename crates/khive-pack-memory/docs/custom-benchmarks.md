@@ -111,10 +111,13 @@ cargo bench --manifest-path crates/Cargo.toml -p khive-pack-memory --bench fts_g
 The checker tests both cohort listings with five-second watchdogs. A list-only
 sentinel immediately after the list branch makes accidental workload entry fail
 without loading models. `--regression-case=report-contract` feeds known values
-through the same p95 JSON emitter, checks the exact ID set, and rejects missing
-or duplicate rows, nonfinite values, wrong units, and incomplete sample counts.
-Those known values are protocol probes, never measured baselines. `--measure`
-additionally runs the caller-selected cohort with a 300-second watchdog.
+through the same JSON emitter with the distinct statistic `report_contract_probe`,
+checks the exact ID set, and rejects missing or duplicate rows, nonfinite values,
+wrong statistics, and incomplete sample counts. Those known values are protocol
+probes, never measured baselines. The checker accepts that statistic only for the
+explicit report-contract probe. `--measure` additionally runs the caller-selected
+cohort with a 300-second watchdog and requires `p95_ns`; probe rows and mixed
+probe/timing output fail measurement validation, even when the values match.
 
 All previous p95 `--regression-case` names remain available, including held build,
 held rebuild, chained handoff, task-completion, timeout, and gate-role controls.
