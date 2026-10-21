@@ -296,7 +296,7 @@ async fn reindex_child() {
         std::path::PathBuf::from(std::env::var_os(FIXTURE_DIR).expect("private fixture path"));
     let mut args = snapshot_reindex_args(&dir, false);
     args.model = Some(MODEL.into());
-    args.batch_size = 4;
+    args.batch_size = Some(4);
     args.no_sections = true;
     run_reindex_with_setup(
         args,

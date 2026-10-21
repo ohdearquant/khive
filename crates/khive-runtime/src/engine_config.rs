@@ -16,6 +16,10 @@ use crate::{config::BackendId, presentation::OutputFormat};
 #[path = "engine_config_backend_disk_guard.rs"]
 mod backend_disk_guard;
 
+#[path = "engine_config_embed_batch.rs"]
+mod embed_batch;
+pub use embed_batch::EmbedSectionConfig;
+
 #[path = "engine_config_peers.rs"]
 mod peers;
 pub use peers::EngineConfig;
@@ -1378,6 +1382,7 @@ where
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
 /// - `[schema]`: explicit import unknown-entity-kind admission
+/// - `[embed].batch_size`: explicit reindex batch size
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
@@ -1397,6 +1402,10 @@ pub struct KhiveConfig {
     /// Admission policy for explicit KG imports only; never VCS sync or create.
     #[serde(default)]
     pub schema: SchemaSectionConfig,
+
+    /// Explicit reindex batch size; automatic embedding settings remain separate.
+    #[serde(default, deserialize_with = "embed_batch::deserialize_table")]
+    pub embed: EmbedSectionConfig,
 
     /// Read by `credentials::read_tables` at load, never by this derive.
     #[serde(skip)]
@@ -1630,6 +1639,7 @@ impl KhiveConfig {
                     .collect()
             })
             .unwrap_or_default();
+        let (embed, unknown_embed_keys) = embed_batch::parse(&raw, &document, &diagnostic_path)?;
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
@@ -1637,6 +1647,7 @@ impl KhiveConfig {
             source,
         })?;
         cfg.schema = schema_probe.schema;
+        cfg.embed = embed;
         cfg.engines_declared = engines_declared;
         crate::credentials::read_tables(&raw, &mut cfg)
             .map_err(|error| ConfigError::from(error).in_file(&diagnostic_path))?;
@@ -1650,6 +1661,12 @@ impl KhiveConfig {
                 key = %crate::secret_gate::bounded_masked_log_text(&key),
                 file = %crate::secret_gate::bounded_masked_log_text(&diagnostic_path.to_string_lossy()),
                 "ignoring unknown schema configuration key");
+        }
+        for key in unknown_embed_keys {
+            tracing::warn!(target: "khive.config.embed",
+                key = %crate::secret_gate::bounded_masked_log_text(&key),
+                file = %crate::secret_gate::bounded_masked_log_text(&diagnostic_path.to_string_lossy()),
+                "ignoring unknown embed configuration key");
         }
         Ok(Some(cfg))
     }

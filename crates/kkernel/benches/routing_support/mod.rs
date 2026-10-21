@@ -6,6 +6,22 @@ use uuid::Uuid;
 
 const REPORT_SAMPLES: usize = 1_001;
 
+fn reports_enabled() -> bool {
+    let mut bench = false;
+    for arg in std::env::args_os().skip(1).take_while(|arg| arg != "--") {
+        if arg == "--test"
+            || arg == "--profile-time"
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--profile-time="))
+        {
+            return false;
+        }
+        bench |= arg == "--bench";
+    }
+    bench
+}
+
 pub fn id(index: u64) -> Uuid {
     Uuid::from_u128((5_665_u128 << 64) | u128::from(index))
 }
@@ -27,12 +43,13 @@ pub fn scene<W: Workload>(
     name: &str,
     mut make: impl FnMut() -> W,
 ) {
+    let reports = reports_enabled();
     let mut workload = None;
     let mut reported = false;
     // Criterion invokes this closure only for selected, non-list scenarios.
     group.bench_function(name, |b| {
         let workload = workload.get_or_insert_with(&mut make);
-        if !reported {
+        if reports && !reported {
             let _ = workload.sample();
             let mut durations = Vec::with_capacity(REPORT_SAMPLES);
             for _ in 0..REPORT_SAMPLES {

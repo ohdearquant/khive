@@ -1,4 +1,5 @@
 mod fixture;
+pub mod thread_rendering;
 
 use std::collections::BTreeSet;
 

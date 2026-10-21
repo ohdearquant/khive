@@ -147,6 +147,8 @@ fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError)
 }
 
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
+    #[cfg(test)]
+    crate::handlers::read_cluster_tests::observe_message_render();
     let props = note.properties.as_ref();
     let full_id = note.id.as_hyphenated().to_string();
 

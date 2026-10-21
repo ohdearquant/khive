@@ -1,5 +1,41 @@
 # khive-query Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-query`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                        | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------ | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `gql/gql/node_with_limit`                        | 457.744 ns       | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql/gql/simple_node`                            | 434.744 ns       | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql/gql/two_node_edge`                          | 706.192 ns       | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/node_multi_property_map`        | 922.358 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/three_node_chain`               | 1.048 µs         | 1.020     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/three_node_mixed_direction`     | 1.118 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/undirected_edge`                | 743.697 ns       | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/variable_length_multi_rel`      | 861.763 ns       | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_complex/gql/variable_length_with_where`     | 985.223 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/node_with_properties`            | 684.617 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_and`                       | 1.107 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_and_or`                    | 1.235 µs         | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_eq_string`                 | 998.720 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_or`                        | 1.041 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `gql_medium/gql/where_with_edge_var`             | 973.680 ns       | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/gql_dispatch`                   | 732.759 ns       | 1.011     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/gql_with_leading_whitespace`    | 518.975 ns       | 1.028     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/sparql_dispatch`                | 1.402 µs         | 1.016     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `parse_auto/auto/sparql_with_leading_whitespace` | 1.060 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/explicit_range`                   | 1.070 µs         | 1.017     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/two_node`                         | 1.395 µs         | 1.022     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql/sparql/variable_length_plus`             | 1.424 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/kind_and_property_filter`  | 1.830 µs         | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/three_node_chain`          | 1.807 µs         | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `sparql_medium/sparql/with_property_filter`      | 1.725 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Run Command
 
 ```bash
@@ -155,10 +191,23 @@ The 15 GQL fixture suffixes exactly reuse the existing inputs:
   `variable_length_with_where`, `three_node_mixed_direction`,
   `node_multi_property_map`, `undirected_edge`.
 
-There are 48 new scenarios. Each prints a `query_call_report` from 1,001 actual
-single calls, with median defined as sorted rank 501. This report follows one
-untimed preflight and precedes a separate Criterion run (10 samples, one-second
-warmup, three-second measurement target; `--quick` selects Criterion quick mode).
+There are 48 new scenarios. In measurement mode (`--bench`, as supplied by
+`cargo bench`), each selected scenario prints one `query_call_report` from
+1,001 actual single calls, with median defined as sorted rank 501. This report
+follows one preflight and runs inside Criterion's first selected callback,
+before `iter_custom` begins recording its iteration timing (10 samples,
+one-second warmup, three-second measurement target; `--quick` selects
+Criterion quick mode).
+
+`--list` and filtered-out scenarios execute no operation, preflight or report
+samples. Test mode (`--test`, or no `--bench`) executes one checked operation
+per selected scenario and emits no supplemental timing report. Profiling
+(`--profile-time`) also omits the supplemental report and preflight, so they do
+not enter Criterion's profiler. Small deterministic strings are still constructed
+while registering the scenarios; GQL fixture parsing is lazy and occurs during
+untimed preparation only when a scenario executes. Listing is not an allocation
+measurement. Benchmark IDs, fixture contents and per-call timing boundaries are
+unchanged.
 Only 1,001 durations are retained at once. Per-call `Instant` overhead is included;
 these short-call observations are advisory and should be compared using the same
 harness and host, rather than treated as interchangeable with the historical

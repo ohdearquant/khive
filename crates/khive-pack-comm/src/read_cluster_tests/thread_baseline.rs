@@ -18,7 +18,7 @@ struct Observation {
     fetched_rows: usize,
     rendered_rows: usize,
     retained_rows: BTreeMap<String, usize>,
-    peak_physical_rows: usize,
+    peak_owner_rows: usize,
     final_owner_ids: Vec<String>,
     reader_acquisitions: u64,
     statement_starts: BTreeMap<String, usize>,
@@ -31,10 +31,9 @@ impl Observation {
                 self.physical_pages += 1;
                 self.fetched_rows += ids.len();
             }
-            Phase::ThreadRendered(count) => self.rendered_rows += count,
             Phase::ThreadRetained { stage, rows } => {
-                if matches!(stage, "physical" | "with_selected_root") {
-                    self.peak_physical_rows = self.peak_physical_rows.max(rows);
+                if matches!(stage, "owners" | "with_selected_root") {
+                    self.peak_owner_rows = self.peak_owner_rows.max(rows);
                 }
                 self.retained_rows.insert(stage.into(), rows);
             }
@@ -66,24 +65,29 @@ async fn observed_as(
         .observe_test_statement_starts(20_000)
         .expect("private pool's existing statement observer");
     let before = reader_acquisitions(runtime);
-    let response = PHASE_HOOK
-        .scope(callback, async {
-            match actor {
-                Some(actor) => {
-                    registry
-                        .dispatch_as(
-                            "comm.thread",
-                            params,
-                            khive_runtime::VerifiedActor::new(actor).unwrap(),
-                        )
-                        .await
+    let rendered = Arc::new(AtomicUsize::new(0));
+    let response = MESSAGE_RENDER_COUNT
+        .scope(
+            Arc::clone(&rendered),
+            PHASE_HOOK.scope(callback, async {
+                match actor {
+                    Some(actor) => {
+                        registry
+                            .dispatch_as(
+                                "comm.thread",
+                                params,
+                                khive_runtime::VerifiedActor::new(actor).unwrap(),
+                            )
+                            .await
+                    }
+                    None => registry.dispatch("comm.thread", params).await,
                 }
-                None => registry.dispatch("comm.thread", params).await,
-            }
-        })
+            }),
+        )
         .await
         .expect("real thread handler");
     let mut result = observation.lock().unwrap().clone();
+    result.rendered_rows = rendered.load(Ordering::Relaxed);
     result.reader_acquisitions = reader_acquisitions(runtime) - before;
     for statement in statements
         .started_statements()

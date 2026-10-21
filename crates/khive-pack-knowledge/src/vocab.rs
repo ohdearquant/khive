@@ -418,7 +418,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 22] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "Orientation query text",
+                description: "Orientation query text, at least 5 words: each whitespace-separated piece without CJK counts as one; every two Han/Kana/Hangul letters count as one, rounded down across the query. Punctuation inside those script ranges does not count. Use knowledge.search for shorter queries.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ROLE_PARAM,

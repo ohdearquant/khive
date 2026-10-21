@@ -1,5 +1,25 @@
 # khive-pack-knowledge — Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-knowledge`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                           | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `knowledge_get/by_slug`             | 91.599 µs        | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_learn/concept_create`    | 809.172 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/10`          | 165.499 µs       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/100`         | 223.354 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_search_fts/rerank_false` | 1.174 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_stats/stats_query`       | 215.177 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/1`    | 513.688 µs       | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/10`   | 2.180 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/50`   | 7.180 ms         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite
 
 | Benchmark               | File                         | Description                                                                                   |

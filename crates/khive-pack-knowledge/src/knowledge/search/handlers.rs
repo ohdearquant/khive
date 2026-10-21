@@ -25,6 +25,69 @@ use super::{
 #[cfg(test)]
 use super::{compose_read_tests, MEMBER_SIZING_READ_TIMEOUT};
 
+async fn apply_atom_weights(
+    sql: &dyn khive_storage::SqlAccess,
+    namespace: &str,
+    hits: &mut [super::ScoredHit],
+) -> (HashMap<Uuid, f32>, Option<&'static str>) {
+    use khive_retrieval::persist::PersistError;
+    use khive_storage::{RequestReadStopReason, StorageError};
+
+    let atom_ids: Vec<_> = hits
+        .iter()
+        .filter(|hit| !hit.is_domain)
+        .filter_map(|hit| Uuid::parse_str(&hit.id).ok())
+        .collect();
+    if atom_ids.is_empty() {
+        return (HashMap::new(), None);
+    }
+    let outcome = khive_storage::await_request_read_phase(
+        "knowledge.atom_weights",
+        khive_retrieval::weights::batch_load_weights(sql, namespace, &atom_ids),
+    )
+    .await;
+    let weights = match outcome {
+        Ok(Ok(weights)) => weights,
+        refused => {
+            let reason = match khive_storage::capture_request_read_context().stop_reason() {
+                Some(RequestReadStopReason::Cancelled) => "cancelled",
+                Some(RequestReadStopReason::Deadline) => "timeout",
+                None => match refused {
+                    Err(StorageError::Timeout { .. } | StorageError::AdmissionTimeout { .. })
+                    | Ok(Err(PersistError::Storage(
+                        StorageError::Timeout { .. } | StorageError::AdmissionTimeout { .. },
+                    ))) => "timeout",
+                    _ => "storage",
+                },
+            };
+            return (HashMap::new(), Some(reason));
+        }
+    };
+    for hit in hits.iter_mut().filter(|hit| !hit.is_domain) {
+        let weight = Uuid::parse_str(&hit.id)
+            .ok()
+            .and_then(|id| weights.get(&id).copied())
+            .unwrap_or(1.0);
+        hit.score *= weight;
+    }
+    (weights, None)
+}
+
+fn suggest_word_count(query: &str) -> usize {
+    let mut other_words = 0;
+    let mut cjk_letters = 0;
+    for piece in query.split_whitespace() {
+        let mut has_cjk = false;
+        for ch in piece.chars().filter(|ch| khive_text::is_cjk_char(*ch)) {
+            has_cjk = true;
+            // Script blocks also contain punctuation, such as Katakana middle dot.
+            cjk_letters += usize::from(ch.is_alphabetic());
+        }
+        other_words += usize::from(!has_cjk);
+    }
+    other_words + cjk_letters / 2
+}
+
 // ─── handler impls ────────────────────────────────────────────────────────────
 
 impl KnowledgeHandlers {
@@ -85,6 +148,7 @@ impl KnowledgeHandlers {
 
         let limit = p.limit.unwrap_or(10).clamp(1, 100);
         let min_score = p.min_score.unwrap_or(0.0) as f32;
+        let admission_min_score = min_score.min(0.0);
         let w = Weights::from_opts(&p);
         if let Some(kind) = p.kind.as_deref() {
             if !matches!(kind, "atom" | "domain") {
@@ -100,7 +164,8 @@ impl KnowledgeHandlers {
         let requested_rerank = p.rerank.unwrap_or(true);
         let do_rerank = requested_rerank && !runtime.default_embedder_name().is_empty();
         let rerank_alpha = p.rerank_alpha.unwrap_or(0.7) as f32;
-        let fetch_limit = if do_rerank { limit * 3 } else { limit }.min(100);
+        // Weighting must see candidates beyond the requested output limit.
+        let fetch_limit = 100;
 
         let non_stop_count = raw_query
             .split_whitespace()
@@ -170,7 +235,7 @@ impl KnowledgeHandlers {
             ns: &ns,
             role: p.role.as_deref(),
             type_filter,
-            min_score,
+            min_score: admission_min_score,
             w: &w,
             fetch_limit,
             statuses: &requested_statuses,
@@ -214,7 +279,7 @@ impl KnowledgeHandlers {
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
-            fuse_ann_hits(&mut hits, &ann_hits, min_score);
+            fuse_ann_hits(&mut hits, &ann_hits, admission_min_score);
         }
         // FTS hits remain valid partial results. Preserve the existing
         // advisory only for a non-empty corpus with no lexical fallback.
@@ -252,7 +317,15 @@ impl KnowledgeHandlers {
         }
 
         apply_status_multipliers(&mut hits, allow_deprecated);
+        let (atom_weights, atom_weights_unavailable) =
+            apply_atom_weights(runtime.sql().as_ref(), &ns, &mut hits).await;
         enforce_min_score_floor(&mut hits, min_score);
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
         hits.truncate(limit);
 
         let atom_ids: Vec<String> = hits
@@ -276,6 +349,14 @@ impl KnowledgeHandlers {
         let results: Vec<Value> = hits
             .iter()
             .map(|h| {
+                let atom_weight = if h.is_domain {
+                    1.0
+                } else {
+                    Uuid::parse_str(&h.id)
+                        .ok()
+                        .and_then(|id| atom_weights.get(&id).copied())
+                        .unwrap_or(1.0)
+                };
                 let body_lines = if h.is_domain {
                     None
                 } else {
@@ -294,6 +375,7 @@ impl KnowledgeHandlers {
                     "finalized": h.finalized,
                     "kind": if h.is_domain { "domain" } else { "atom" },
                     "score": h.score,
+                    "atom_weight": atom_weight,
                     "score_provenance": h.provenance.to_json(),
                 })
             })
@@ -320,6 +402,12 @@ impl KnowledgeHandlers {
             attach_body_lines_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
+        if let Some(reason) = atom_weights_unavailable {
+            if !out.get("degraded").is_some_and(Value::is_object) {
+                out["degraded"] = json!({});
+            }
+            out["degraded"]["atom_weights_unavailable"] = json!(reason);
+        }
         // The lexical stage's own budget no longer implies the request
         // deadline is spent (issue #1930 Amendment 2), so this last check
         // re-reads the live ambient deadline rather than the stage-local
@@ -368,11 +456,12 @@ impl KnowledgeHandlers {
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
         }
-        let word_count = raw_query.split_whitespace().count();
+        let word_count = suggest_word_count(&raw_query);
         if word_count < 5 {
             return Err(RuntimeError::InvalidInput(format!(
                 "suggest query must be at least 5 words for meaningful domain matching \
-                 (got {word_count}). Use knowledge.search for short keyword queries."
+                 (got {word_count}; two CJK letters count as one word). \
+                 Use knowledge.search for short keyword queries."
             )));
         }
         let limit = p.limit.unwrap_or(8).clamp(1, 100);
@@ -1248,5 +1337,283 @@ impl KnowledgeHandlers {
         ));
         timing.finish(count);
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod atom_weight_tests {
+    use super::super::{ScoreProvenance, ScoredHit};
+    use super::apply_atom_weights;
+    use khive_storage::types::SqlColumn;
+    use khive_storage::{
+        AtomicUnitOp, SqlAccess, SqlReader, SqlRow, SqlStatement, SqlValue, SqlWriter,
+        StorageError, StorageResult,
+    };
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        Timeout,
+        Admission,
+        Storage,
+    }
+
+    impl Refusal {
+        fn error(self) -> StorageError {
+            match self {
+                Self::Timeout => StorageError::Timeout {
+                    operation: "weights fixture".into(),
+                },
+                Self::Admission => StorageError::AdmissionTimeout {
+                    operation: "weights fixture".into(),
+                    timeout_ms: 37,
+                    pool_identity: Some("weights-pool".into()),
+                },
+                Self::Storage => StorageError::Pool {
+                    operation: "weights fixture".into(),
+                    message: "injected refusal".into(),
+                },
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingSql {
+        readers: Arc<AtomicUsize>,
+        statements: Arc<Mutex<Vec<SqlStatement>>>,
+        rows: Vec<SqlRow>,
+        refusal: Option<Refusal>,
+        refuse_reader: bool,
+        query_started: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl RecordingSql {
+        fn new() -> Self {
+            Self {
+                readers: Arc::new(AtomicUsize::new(0)),
+                statements: Arc::new(Mutex::new(Vec::new())),
+                rows: vec![weight_row(1, 1.5), weight_row(2, 5.0)],
+                refusal: None,
+                refuse_reader: false,
+                query_started: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SqlAccess for RecordingSql {
+        async fn reader(&self) -> StorageResult<Box<dyn SqlReader>> {
+            self.readers.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_reader {
+                return Err(self.refusal.expect("reader refusal").error());
+            }
+            Ok(Box::new(self.clone()))
+        }
+
+        async fn writer(&self) -> StorageResult<Box<dyn SqlWriter>> {
+            panic!("weights must not acquire a writer")
+        }
+
+        async fn atomic_unit(&self, _: AtomicUnitOp) -> StorageResult<Box<dyn Any + Send>> {
+            panic!("weights must not enter a write transaction")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SqlReader for RecordingSql {
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            assert_eq!(statement.label.as_deref(), Some("weights.batch_load"));
+            self.statements.lock().unwrap().push(statement);
+            if let Some(started) = &self.query_started {
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            match self.refusal {
+                Some(refusal) => Err(refusal.error()),
+                None => Ok(self.rows.clone()),
+            }
+        }
+
+        async fn query_row(&mut self, _: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            panic!("weights must use a batch read")
+        }
+
+        async fn query_scalar(&mut self, _: SqlStatement) -> StorageResult<Option<SqlValue>> {
+            panic!("weights must use a batch read")
+        }
+
+        async fn explain(&mut self, _: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            panic!("weights must not explain the query")
+        }
+    }
+
+    fn weight_row(id: u128, weight: f64) -> SqlRow {
+        SqlRow {
+            columns: vec![
+                SqlColumn {
+                    name: "atom_id".into(),
+                    value: SqlValue::Text(Uuid::from_u128(id).to_string()),
+                },
+                SqlColumn {
+                    name: "weight".into(),
+                    value: SqlValue::Float(weight),
+                },
+            ],
+        }
+    }
+
+    fn hit(id: u128, is_domain: bool) -> ScoredHit {
+        ScoredHit {
+            id: Uuid::from_u128(id).to_string(),
+            slug: format!("atom-{id:03}"),
+            name: format!("atom {id}"),
+            content: None,
+            tags: None,
+            atom_embed_text: None,
+            finalized: true,
+            is_domain,
+            status: Some("reviewed".into()),
+            score: 0.8,
+            provenance: ScoreProvenance::lexical(),
+        }
+    }
+
+    #[tokio::test]
+    async fn atom_weights_batch_candidates_once_and_preserve_defaults_and_domains() {
+        let sql = RecordingSql::new();
+        let mut hits: Vec<_> = (1..=200).map(|id| hit(id, false)).collect();
+        hits.push(hit(201, true));
+        let (weights, unavailable) = apply_atom_weights(&sql, "request-ns", &mut hits).await;
+        assert_eq!(unavailable, None);
+        assert_eq!(weights.len(), 2);
+        assert_eq!(hits[0].score.to_bits(), (0.8_f32 * 1.5).to_bits());
+        assert_eq!(hits[1].score, 4.0, "learned scores are not clamped");
+        assert!(hits[2..]
+            .iter()
+            .all(|hit| hit.score.to_bits() == 0.8_f32.to_bits()));
+        assert_eq!(sql.readers.load(Ordering::SeqCst), 1);
+        let statements = sql.statements.lock().unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].params.len(), 201);
+        assert!(matches!(&statements[0].params[0], SqlValue::Text(ns) if ns == "request-ns"));
+        let ids: Vec<_> = statements[0].params[1..]
+            .iter()
+            .map(|value| match value {
+                SqlValue::Text(id) => id.clone(),
+                _ => panic!("atom ID must be text"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            (1..=200)
+                .map(|id| Uuid::from_u128(id).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn atom_weights_empty_or_domain_only_candidates_do_not_read() {
+        let sql = RecordingSql::new();
+        for mut hits in [Vec::new(), vec![hit(1, true)]] {
+            let (weights, unavailable) = apply_atom_weights(&sql, "local", &mut hits).await;
+            assert!(weights.is_empty());
+            assert_eq!(unavailable, None);
+            assert!(hits.iter().all(|hit| hit.score == 0.8));
+        }
+        assert_eq!(sql.readers.load(Ordering::SeqCst), 0);
+        assert!(sql.statements.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn atom_weights_reader_and_query_failures_keep_nonempty_hits_unweighted() {
+        for refuse_reader in [false, true] {
+            for (refusal, expected) in [
+                (Refusal::Timeout, "timeout"),
+                (Refusal::Admission, "timeout"),
+                (Refusal::Storage, "storage"),
+            ] {
+                let mut sql = RecordingSql::new();
+                sql.refusal = Some(refusal);
+                sql.refuse_reader = refuse_reader;
+                let mut hits = vec![hit(1, false), hit(2, false), hit(3, true)];
+                let (weights, unavailable) = apply_atom_weights(&sql, "local", &mut hits).await;
+                assert!(weights.is_empty());
+                assert_eq!(unavailable, Some(expected));
+                assert_eq!(hits.len(), 3);
+                assert!(hits
+                    .iter()
+                    .all(|hit| hit.score.to_bits() == 0.8_f32.to_bits()));
+                assert_eq!(sql.readers.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    sql.statements.lock().unwrap().len(),
+                    usize::from(!refuse_reader)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn atom_weights_cancelled_request_keeps_nonempty_hits_without_admission() {
+        let sql = RecordingSql::new();
+        let mut hits = vec![hit(1, false)];
+        let (_sender, receiver) = tokio::sync::watch::channel(true);
+        let (weights, unavailable) = khive_storage::scope_request_read_cancellation(
+            receiver,
+            apply_atom_weights(&sql, "local", &mut hits),
+        )
+        .await;
+        assert!(weights.is_empty());
+        assert_eq!(unavailable, Some("cancelled"));
+        assert_eq!(hits[0].score, 0.8);
+        assert_eq!(sql.readers.load(Ordering::SeqCst), 0);
+        assert!(sql.statements.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn atom_weights_expired_request_keeps_nonempty_hits_without_new_deadline() {
+        let sql = RecordingSql::new();
+        let mut hits = vec![hit(1, false)];
+        let (weights, unavailable) = khive_storage::scope_request_read_deadline(
+            Duration::ZERO,
+            apply_atom_weights(&sql, "local", &mut hits),
+        )
+        .await;
+        assert!(weights.is_empty());
+        assert_eq!(unavailable, Some("timeout"));
+        assert_eq!(hits[0].score, 0.8);
+        assert_eq!(sql.readers.load(Ordering::SeqCst), 0);
+        assert!(sql.statements.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn atom_weights_cancellation_during_query_keeps_nonempty_hits_without_retry() {
+        let mut sql = RecordingSql::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        sql.query_started = Some(started.clone());
+        let mut hits = vec![hit(1, false), hit(2, false)];
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let read = khive_storage::scope_request_read_cancellation(
+            receiver,
+            apply_atom_weights(&sql, "local", &mut hits),
+        );
+        let cancel = async {
+            started.notified().await;
+            sender.send(true).expect("active request receiver");
+        };
+        // Test-only virtual-time guard: a context-ignoring adapter must not hang the call.
+        let ((weights, unavailable), ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(read, cancel) })
+                .await
+                .expect("ambient cancellation must stop the pending read");
+        assert!(weights.is_empty());
+        assert_eq!(unavailable, Some("cancelled"));
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.score == 0.8));
+        assert_eq!(sql.readers.load(Ordering::SeqCst), 1);
+        assert_eq!(sql.statements.lock().unwrap().len(), 1);
     }
 }

@@ -1,5 +1,22 @@
 # Brain pack benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-brain`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                             | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `brain_pack/feedback_plain/useful`                    | 714.177 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/feedback_sections/capped_200_opposing`    | 45.351 ms        | 1.024     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/profile_read/balanced_recall_v1`          | 43.134 µs        | 1.017     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/reset/balanced_recall_v1`                 | 599.688 µs       | 1.090     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/section_posterior_gate/mean_shift_ge_0_3` | 0.035 ns         | 1.000     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `brain_pack/snapshot_roundtrip/state_read_twice`      | 89.976 µs        | 1.030     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 These benchmarks call public verbs through a real BrainPack, VerbRegistry and private in-memory
 KhiveRuntime. They measure dispatch behavior rather than the isolated khive-brain-core primitives.
 Fixtures are generated locally; no external corpus, model provider or network service is needed.
@@ -18,12 +35,31 @@ Fixtures are generated locally; no external corpus, model provider or network se
 
 Baselines are pending the qualified-host storage-brain producer. Record the full commit, toolchain,
 machine, load and command with each future measurement. There is no measured baseline supplied here.
-The existing brain_pack_bench source and its correctness gate remain unchanged.
+The existing workloads, correctness assertions and timing boundaries are retained.
+
+## Selection and execution modes
+
+Both targets construct executors and database fixtures only inside selected Criterion callbacks.
+`--list` and unmatched filters perform no brain fixture construction or verb dispatch. A selected
+default or `--test` run executes one Criterion correctness iteration without supplemental timing
+samples; `--test` takes precedence over `--bench`.
+
+The section-posterior gate remains a separate selectable scenario. Selecting
+`brain_pack/section_posterior_gate/mean_shift_ge_0_3` runs its unchanged 200 positive and 200 opposing
+feedback assertions once, outside its trivial timed loop, including in correctness and profile
+modes. Selecting another scenario does not run this independent gate. The capped section-feedback
+scenario still primes 200 events and executes 200 opposing events per Criterion iteration.
+
+Only an ordinary selected `--bench` resolution run prints the 101-sample supplemental report, once
+before Criterion iterations. Default, `--test`, list, unmatched-filter and `--profile-time` modes
+print no supplemental report. Mode options after `--` are filter text rather than mode switches.
+Profiling can include lazy setup and the selected correctness gate; the reported Criterion duration
+still uses the existing timing boundary.
 
 ## Resolution fixture and timing boundary
 
 The new target uses one current-thread executor with at most two blocking threads and one runtime
-for its whole run. KhiveRuntime::memory disables embeddings and uses a private in-memory store.
+for its selected run. KhiveRuntime::memory disables embeddings and uses a private in-memory store.
 It registers the real KG and brain packs under caller brain-resolve-099. Setup dispatches brain.bind
 100 times with distinct actor labels brain-resolve-000 through brain-resolve-099, consumer recall,
 wildcard namespace and profile balanced-recall-v1. Each public acknowledgment must match its input.
@@ -46,9 +82,11 @@ iteration is one resolution; the custom timer sums those call intervals. State i
 increments serialization diagnostics, which is why the post-run check compares bindings and
 profiles rather than asserting equality of the full diagnostic snapshot.
 
-The target also prints a fixed report of 101 individually timed calls before Criterion sampling.
+An ordinary selected benchmark run also prints a fixed report of 101 individually timed calls
+before Criterion sampling.
 The median is the 51st sorted observation and nearest-rank p99 is the 100th. These are individual
-call samples, not percentiles of Criterion batch means. The fixed report runs even with --quick.
+call samples, not percentiles of Criterion batch means. The fixed report runs even with --quick
+when ordinary benchmark mode is selected.
 No timing threshold or allocation claim is enforced for resolution.
 
 ## Reading the existing measurements correctly
@@ -65,7 +103,7 @@ these different boundaries must be retained in comparisons.
 The existing state_read_twice scenario checks only the optional top-level total_events fields
 with debug_assert_eq. The actual snapshot keeps counters inside its state records, so that
 comparison is not proof of full snapshot equality and is disabled in optimized builds. The
-benchmark is a two-read timing scenario, not an independent stability gate. Its source is preserved.
+benchmark is a two-read timing scenario, not an independent stability gate. Its timed body is preserved.
 
 brain.resolve uses the same binding-resolution primitive as the feedback fallback path, but a
 known explicit served_by_profile_id bypasses that lookup. This benchmark must not be described as

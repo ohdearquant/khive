@@ -1,5 +1,51 @@
 # khive-score Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-score`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ---------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `DeterministicScore/arithmetic/add`      | 1.130 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/arithmetic/div_i64`  | 1.836 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/arithmetic/mul_f64`  | 4.316 ns         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/arithmetic/mul_i64`  | 0.989 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/arithmetic/sub`      | 1.130 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f32/batch_1000` | 6.678 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f32/scalar`     | 4.505 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f64/batch_1000` | 6.321 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f64/nan`        | 0.638 ns         | 1.020     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f64/pos_inf`    | 0.708 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/from_f64/scalar`     | 4.180 ns         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/to_f64/batch_1000`   | 841.047 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `DeterministicScore/to_f64/scalar`       | 0.565 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `comparator/cmp_desc_scalar`             | 1.412 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `comparator/ranked_heap_1000`            | 3.209 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `comparator/sort_1000_pairs`             | 12.903 µs        | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/avg_scores/10`                      | 7.910 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/avg_scores/100`                     | 36.739 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/avg_scores/1000`                    | 349.152 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/max_min/max_1000`                   | 651.839 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/max_min/min_1000`                   | 651.823 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/rrf_score/batch_1000_k60`           | 5.686 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/rrf_score/rank_1_k60`               | 5.754 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/sum_scores/10`                      | 4.144 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/sum_scores/100`                     | 32.548 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/sum_scores/1000`                    | 342.490 ns       | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/weighted_sum/2`                     | 12.982 ns        | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/weighted_sum/32`                    | 175.029 ns       | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `ops/weighted_sum/8`                     | 45.185 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/cosine_batch_1000`  | 6.889 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/cosine_scalar`      | 5.174 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/dot_batch_1000`     | 6.410 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/dot_scalar`         | 4.303 ns         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/l2_batch_1000`      | 8.200 µs         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `score_from_distance/l2_scalar`          | 6.885 ns         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 **Bench targets:** `score_ops` and `arithmetic_paths` under `benches/`.
 **Harness:** Criterion (`harness = false` in `Cargo.toml`).
 

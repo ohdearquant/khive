@@ -4,13 +4,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
-    EmbedderProvider, KhiveRuntime, Namespace, RuntimeConfig, RuntimeResult, VerbRegistry,
-    VerbRegistryBuilder,
+    EmbedderProvider, InterceptedDispatchResult, KhiveRuntime, Namespace, RuntimeConfig,
+    RuntimeResult, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::{Entity, EventFilter, PageRequest};
 use khive_types::{EventKind, EventOutcome};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-use serde_json::{json, Value};
+use serde_json::json;
 
 struct Provider;
 struct Embeddings;
@@ -90,6 +90,7 @@ async fn audit(rt: &KhiveRuntime, verb: &str) -> khive_storage::Event {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn empty_entity_and_note_searches_record_actual_arms_not_the_source_filter() {
     for hybrid in [false, true] {
         for kind in ["entity", "note"] {
@@ -118,6 +119,7 @@ async fn empty_entity_and_note_searches_record_actual_arms_not_the_source_filter
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn populated_any_term_search_counts_final_rows_and_caps_public_limit() {
     let (rt, registry) = fixture(false);
     let token = rt.authorize(Namespace::local()).unwrap();
@@ -144,6 +146,7 @@ async fn populated_any_term_search_counts_final_rows_and_caps_public_limit() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn defaults_and_other_verbs_have_distinct_audit_shapes() {
     let (rt, registry) = fixture(false);
     registry
@@ -164,6 +167,7 @@ async fn defaults_and_other_verbs_have_distinct_audit_shapes() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn unsuccessful_search_has_no_success_shape() {
     let (rt, registry) = fixture(false);
     assert!(registry
@@ -181,11 +185,12 @@ async fn unsuccessful_search_has_no_success_shape() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn intercepted_joined_empty_hybrid_records_execution_without_result_provenance() {
     let (rt, registry) = fixture(true);
     let runtime = rt.clone();
     let result = registry
-        .dispatch_intercepted_with_identity(
+        .dispatch_intercepted_with_metadata_with_identity(
             "search",
             &json!({"kind":"entity", "query":"emptyneedle"}),
             None,
@@ -197,14 +202,17 @@ async fn intercepted_joined_empty_hybrid_records_execution_without_result_proven
                         .hybrid_search(&token, "emptyneedle", None, 10, None, None, &[], None)
                         .await?;
                     assert!(hits.is_empty());
-                    Ok::<Value, khive_runtime::RuntimeError>(json!([]))
+                    Ok::<_, khive_runtime::RuntimeError>(InterceptedDispatchResult::new(
+                        json!([]),
+                        (),
+                    ))
                 }));
                 async move { handle.await.unwrap() }
             },
         )
         .await
         .unwrap();
-    assert_eq!(result, json!([]));
+    assert_eq!(result.result, json!([]));
     let event = audit(&rt, "search").await;
     assert_eq!(event.payload["arms"], "both");
     assert_eq!(event.payload["result_count"], 0);

@@ -1,5 +1,23 @@
 # khive-pack-comm Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-comm`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                          | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ---------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `comm/inbox/10`                    | 309.641 µs       | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/inbox/100`                   | 440.808 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/read`                        | 141.573 µs       | 1.018     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/reply`                       | 722.030 µs       | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/send`                        | 411.994 µs       | 1.042     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/thread/5`                    | 196.582 µs       | 1.007     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `comm/thread_in_busy_mailbox/2000` | 201.326 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Inventory
 
 | Name         | File                    | Purpose                                                                                                                                                                                                                      |
