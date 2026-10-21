@@ -29,7 +29,7 @@ impl Population {
     }
 
     fn owner_read(self, index: u32) -> bool {
-        matches!(self, Self::Unique) && index % 2 == 0
+        matches!(self, Self::Unique) && index.is_multiple_of(2)
     }
 }
 
