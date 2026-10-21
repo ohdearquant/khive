@@ -1,4 +1,5 @@
 //! Public resolution with 100 durable bindings; setup and assertions are untimed.
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -102,50 +103,81 @@ fn resolve_once(
 }
 
 fn resolve(c: &mut Criterion) {
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(2)
-        .build()
-        .expect("bounded executor");
-    let registry = executor.block_on(build_registry());
+    let executor = OnceCell::new();
+    let registry = OnceCell::new();
+    let before = OnceCell::new();
     let params = json!({"consumer_kind": "recall"});
-    let before = executor
-        .block_on(registry.dispatch("brain.state", json!({})))
-        .expect("before state");
-    let mut samples: Vec<_> = (0..REPORT_SAMPLES)
-        .map(|_| resolve_once(&executor, &registry, &params).as_nanos())
-        .collect();
-    samples.sort_unstable();
-    println!(
-        "{}",
-        json!({
-            "scenario": "brain_resolve_100_bindings",
-            "bindings": BINDINGS,
-            "calls": samples.len(),
-            "median_ns": samples[REPORT_SAMPLES / 2],
-            "p99_ns": samples[99],
-            "percentile_method": "nearest-rank p99: 100th of 101 single-call samples"
-        })
-    );
+    let report_enabled = reports_enabled();
+    let mut reported = false;
 
     let mut group = c.benchmark_group("brain_pack/resolve");
     group.sample_size(50);
     group.throughput(Throughput::Elements(1));
     group.bench_function("100_bindings", |b| {
+        let executor = executor.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(2)
+                .build()
+                .expect("bounded executor")
+        });
+        let registry = registry.get_or_init(|| executor.block_on(build_registry()));
+        before.get_or_init(|| {
+            executor
+                .block_on(registry.dispatch("brain.state", json!({})))
+                .expect("before state")
+        });
+        if report_enabled && !reported {
+            let mut samples: Vec<_> = (0..REPORT_SAMPLES)
+                .map(|_| resolve_once(executor, registry, &params).as_nanos())
+                .collect();
+            samples.sort_unstable();
+            println!(
+                "{}",
+                json!({
+                    "scenario": "brain_resolve_100_bindings",
+                    "bindings": BINDINGS,
+                    "calls": samples.len(),
+                    "median_ns": samples[REPORT_SAMPLES / 2],
+                    "p99_ns": samples[99],
+                    "percentile_method": "nearest-rank p99: 100th of 101 single-call samples"
+                })
+            );
+            reported = true;
+        }
         b.iter_custom(|iterations| {
             (0..iterations)
-                .map(|_| resolve_once(&executor, &registry, &params))
+                .map(|_| resolve_once(executor, registry, &params))
                 .sum::<Duration>()
         })
     });
     group.finish();
 
-    let after = executor
-        .block_on(registry.dispatch("brain.state", json!({})))
-        .expect("after state");
-    assert_eq!(after["bindings"], before["bindings"]);
-    assert_eq!(after["profiles"], before["profiles"]);
+    if let Some(registry) = registry.get() {
+        let after = executor
+            .get()
+            .expect("selected executor")
+            .block_on(registry.dispatch("brain.state", json!({})))
+            .expect("after state");
+        let before = before.get().expect("selected before state");
+        assert_eq!(after["bindings"], before["bindings"]);
+        assert_eq!(after["profiles"], before["profiles"]);
+    }
     drop(registry);
+}
+
+fn reports_enabled() -> bool {
+    let mut bench = false;
+    for arg in std::env::args_os().skip(1).take_while(|arg| arg != "--") {
+        if arg == "--test"
+            || arg == "--profile-time"
+            || arg.to_string_lossy().starts_with("--profile-time=")
+        {
+            return false;
+        }
+        bench |= arg == "--bench";
+    }
+    bench
 }
 
 criterion_group!(benches, resolve);
