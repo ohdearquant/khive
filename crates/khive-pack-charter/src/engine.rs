@@ -7,12 +7,12 @@
 //!
 //! Phase semantics, evaluated over the observations recorded since the phase was entered:
 //! a phase is settled once every `await` line, action, perform, holding `require` and `when`
-//! name has an observation. A failing hard or soft `require` then holds the phase, unless a
-//! `when` routes on that phrase. Otherwise the first `when` whose label matches the newest
-//! observation decides the route; with none matching, every action and perform must have a
-//! passing outcome before the phase takes its `next` route. Advisory requirements are
-//! recorded and never hold. Entering a phase past its `max_rounds` bound enters the bound's
-//! `then` phase instead.
+//! name has an observation. A hard or soft `require`, an action or a perform without a passing
+//! outcome then holds the phase, unless the first `when` whose label matches the newest
+//! observation routes on that same name; a `when` on another name releases nothing. With
+//! nothing held, the matched `when` decides the route, or the phase takes its `next` route.
+//! Advisory requirements are recorded and never hold. Entering a phase past its `max_rounds`
+//! bound enters the bound's `then` phase instead.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -310,7 +310,6 @@ enum Eval {
 }
 
 fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
-    let routed: BTreeSet<&str> = phase.whens.iter().map(|w| w.name.as_str()).collect();
     let mut pending = Vec::new();
     let mut waiting_trigger = false;
     let mut waiting_actor = false;
@@ -365,9 +364,17 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
         };
     }
 
+    // A failing requirement, action or perform holds the phase unless the `when` that matched
+    // routes on that same name; a `when` on another name does not release it.
+    let matched = phase.whens.iter().find(|w| {
+        newest(obs, &w.name, &w.args).and_then(|o| o.outcome.as_deref()) == Some(w.label.as_str())
+    });
+    let routes_on = |name: &str, args: &BTreeMap<String, Value>| {
+        matched.is_some_and(|w| w.name == name && &w.args == args)
+    };
     let mut blocked = Vec::new();
     for req in &phase.requires {
-        if !req.level.holds_phase() || routed.contains(req.phrase.as_str()) {
+        if !req.level.holds_phase() || routes_on(&req.phrase, &req.args) {
             continue;
         }
         let outcome = newest(obs, &req.phrase, &req.args).and_then(|o| o.outcome.clone());
@@ -381,15 +388,8 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
             waiting_on: json!({"blocked": blocked}),
         };
     }
-    for when in &phase.whens {
-        if newest(obs, &when.name, &when.args).and_then(|o| o.outcome.as_deref())
-            == Some(when.label.as_str())
-        {
-            return Eval::Route(when.route.clone());
-        }
-    }
     for action in &phase.actions {
-        if routed.contains(action.name.as_str()) {
+        if routes_on(&action.name, &action.args) {
             continue;
         }
         let outcome = newest(obs, &action.name, &action.args).and_then(|o| o.outcome.clone());
@@ -398,7 +398,7 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
         }
     }
     for child in &phase.performs {
-        if routed.contains(child.as_str()) {
+        if routes_on(child, &none) {
             continue;
         }
         let outcome = newest(obs, child, &none).and_then(|o| o.outcome.clone());
@@ -411,6 +411,9 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
             state: "waiting_actor",
             waiting_on: json!({"blocked": blocked}),
         };
+    }
+    if let Some(when) = matched {
+        return Eval::Route(when.route.clone());
     }
     Eval::Route(phase.next.clone())
 }

@@ -652,3 +652,71 @@ async fn a_stop_order_terminates_the_inbox_charter() {
     .await;
     assert_eq!(f.at(&run).await.0, "terminated");
 }
+
+#[tokio::test]
+async fn a_failing_requirement_holds_unless_the_matched_when_routes_on_it() {
+    let f = Fixture::new();
+    let gate = "charter gatecheck v1\nsubject pull_request\nroles:\n    author\nworkflow:\n    phase review:\n        require review.decision hard\n        when review.decision is request_changes: goto fix\n        max_rounds 2 then stop\n        complete\n    phase fix:\n        action fix.push\n        goto review\n    phase stop:\n        terminate \"rounds\"\n";
+    f.call("charter.publish", json!({"source": gate})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "gatecheck", "subject_kind": "pull_request", "subject_ref": PR}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
+    f.observe("review.decision", Some("blocked"), json!({}))
+        .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "review", "waiting_gate", 1),
+        "an outcome no when routes on holds a hard requirement"
+    );
+    f.observe("review.decision", Some("request_changes"), json!({}))
+        .await;
+    assert_eq!(
+        f.at(&run).await.1,
+        "fix",
+        "the matched when routes on the phrase"
+    );
+    f.observe("fix.push", Some("done"), json!({})).await;
+    f.observe("review.decision", Some("approve"), json!({}))
+        .await;
+    assert_eq!(f.at(&run).await.0, "completed");
+
+    f.publish_review_set().await;
+    let other = "acme/widgets#8";
+    let review = f
+        .call(
+            "charter.start",
+            json!({"charter": "pr_review", "subject_kind": "pull_request", "subject_ref": other}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let on = |kind: &str, outcome: Option<&str>, args: Value| {
+        let mut p = json!({"subject_kind": "pull_request", "subject_ref": other, "kind": kind, "args": args});
+        if let Some(o) = outcome {
+            p["outcome"] = json!(o);
+        }
+        p
+    };
+    for (kind, outcome, args) in [
+        ("pull_request.opened", None, json!({})),
+        ("pull_request.open", Some("pass"), json!({})),
+        ("pull_request.base", Some("pass"), json!({"branch": "main"})),
+        ("review.request", Some("done"), json!({})),
+        ("review.posted", None, json!({})),
+        ("review.verdict_present", Some("fail"), json!({})),
+        ("review.reviewer_independent", Some("pass"), json!({})),
+        ("review.decision", Some("approve"), json!({})),
+    ] {
+        f.call("charter.observe", on(kind, outcome, args)).await;
+    }
+    assert_eq!(
+        f.at(&review).await,
+        tuple("open", "review", "waiting_gate", 1),
+        "a when on review.decision does not release a failing review.verdict_present"
+    );
+}
