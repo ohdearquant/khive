@@ -91,6 +91,14 @@ The task runs a bounded sequence of rebuild attempts. A write that lands during 
 
 The RAII `WarmingGuard` owns guard release on every exit path. Benign shutdown cancellation is logged at debug level; genuine build errors remain warnings.
 
+Idle checkpoint timers retain ANN state weakly and use a runtime clone without pack callbacks,
+so a timer cannot keep its own note-search provider alive. Dropping the last strong ANN owner
+cancels the idle timer and releases its runtime/storage handles without waiting for the checkpoint
+interval. Dropping an intermediate clone does not cancel it. Once a timer upgrades its weak owner
+and starts a checkpoint, that strong owner covers the existing attempt; last-owner cancellation
+does not interrupt an admitted publication. Process-wide daemon shutdown keeps its existing
+cancellation behavior. Checkpoint intervals, rebuild debounce, and claim coalescing are unchanged.
+
 ## `ensure_ann_for_model`
 
 `ensure_ann_for_model` is the shared warm chokepoint for boot, background work, and cold recall. It:
