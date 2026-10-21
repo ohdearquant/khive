@@ -49,7 +49,7 @@ This also amends ADR-196 D1, which kept `located_in` to one base row.
 the tenth category (Ownership), and the base pairs `Person owns Org` and
 `Org owns Org`, expanding the closed set from 19 → 20. ADR-197 keeps its
 own status.
-**Amendment 2026-10-19 (Proposed)**: a `depends_on` edge whose endpoint pair has no inference
+**Amendment 2026-10-19 (accepted 2026-10-21)**: a `depends_on` edge whose endpoint pair has no inference
 default is accepted without a `dependency_kind` and stored without one; an explicit value is
 validated on every pair. See "Amendment 2026-10-19: an omitted qualifier on a pair with no
 default" under "`depends_on` governed metadata" below and "Why the 2026-10-19 qualifier
@@ -687,7 +687,8 @@ Unknown `dependency_kind` values are rejected. `dependency_kind` is only valid o
 
 #### Amendment 2026-10-19: an omitted qualifier on a pair with no default (#5709)
 
-**Status**: Proposed
+**Status**: Accepted (2026-10-21). The coordinator route applies the same dependency defaults as the
+local route (#5786), and `crates/kkernel/src/coordinator/link_inference_tests.rs` checks both routes.
 
 "Requires" above governs what a stored qualifier may say, and inference supplies one where the
 endpoint pair has a default. When `dependency_kind` is omitted and the pair has no default (the
