@@ -15,6 +15,7 @@ use super::{BackendRegistry, SubstrateCoordinator};
 async fn intercepted_fanout_records_empty_text_execution_and_empty_backend_set() {
     for backend_count in [0, 1, 2] {
         let rt = KhiveRuntime::new_for_test(RuntimeConfig {
+            db_path: None,
             packs: vec!["kg".into()],
             ..RuntimeConfig::no_embeddings()
         })
@@ -28,6 +29,7 @@ async fn intercepted_fanout_records_empty_text_execution_and_empty_backend_set()
         let mut backends = BackendRegistry::new();
         for name in ["main", "lore"].into_iter().take(backend_count) {
             let backend = KhiveRuntime::new_for_test(RuntimeConfig {
+                db_path: None,
                 packs: vec!["kg".into()],
                 ..RuntimeConfig::no_embeddings()
             })

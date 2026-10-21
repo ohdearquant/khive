@@ -35,11 +35,27 @@ tokio::task_local! {
     static CURRENT: Option<Arc<AtomicU8>>;
 }
 
-pub(crate) async fn capture<F: Future>(enabled: bool, future: F) -> (F::Output, SearchArms) {
-    let recorder = enabled.then(|| Arc::new(AtomicU8::new(0)));
-    let output = CURRENT.scope(recorder.clone(), future).await;
-    let arms = recorder.map_or(0, |r| r.load(Ordering::Relaxed));
-    (output, SearchArms(arms))
+pub(crate) fn capture<F: Future>(
+    enabled: bool,
+    future: F,
+) -> impl Future<Output = (F::Output, SearchArms)> {
+    // Box before returning: an async constructor would retain F inline until
+    // first poll and grow every enclosing dispatch state machine.
+    let future = Box::pin(future);
+    async move {
+        // Check the parent at poll time: this future can be constructed before
+        // its caller enters an outer search scope.
+        let has_parent = CURRENT
+            .try_with(|recorder| recorder.is_some())
+            .unwrap_or(false);
+        if !enabled && !has_parent {
+            return (future.await, SearchArms::default());
+        }
+        let recorder = enabled.then(|| Arc::new(AtomicU8::new(0)));
+        let output = CURRENT.scope(recorder.clone(), future).await;
+        let arms = recorder.map_or(0, |r| r.load(Ordering::Relaxed));
+        (output, SearchArms(arms))
+    }
 }
 
 /// Record an actual arm entry. No allocation or effect outside search dispatch.
@@ -55,12 +71,56 @@ pub fn record(arm: SearchArm) {
 /// The returned future must be joined before the dispatch audit is produced.
 pub fn inherit<F: Future>(future: F) -> impl Future<Output = F::Output> {
     let recorder = CURRENT.try_with(Clone::clone).ok().flatten();
+    let future = Box::pin(future);
     async move { CURRENT.scope(recorder, future).await }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn large_child() -> impl Future<Output = u8> {
+        let bytes = std::hint::black_box([7_u8; 32 * 1024]);
+        async move {
+            tokio::task::yield_now().await;
+            std::hint::black_box(bytes)[0]
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_inherit_box_children_before_returning() {
+        for enabled in [false, true] {
+            let future = capture(enabled, large_child());
+            assert!(
+                std::mem::size_of_val(&future) < 4096,
+                "capture must not retain the 32 KiB child inline"
+            );
+            let (value, arms) = future.await;
+            assert_eq!(value, 7);
+            assert_eq!(arms.as_str(), "none");
+        }
+        let future = inherit(large_child());
+        assert!(
+            std::mem::size_of_val(&future) < 4096,
+            "inherit must not retain the 32 KiB child inline"
+        );
+        assert_eq!(future.await, 7);
+    }
+
+    #[tokio::test]
+    async fn non_search_capture_masks_a_parent_entered_after_construction() {
+        let child = capture(false, async {
+            tokio::task::yield_now().await;
+            record(SearchArm::Vector);
+        });
+        let (_, outer) = capture(true, async {
+            record(SearchArm::Text);
+            let (_, masked) = child.await;
+            assert_eq!(masked.as_str(), "none");
+        })
+        .await;
+        assert_eq!(outer.as_str(), "text");
+    }
 
     #[tokio::test]
     async fn joined_children_union_arms_and_nested_dispatches_are_isolated() {

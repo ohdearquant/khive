@@ -47,6 +47,7 @@ impl EmbeddingService for Embeddings {
 
 fn fixture(hybrid: bool) -> (KhiveRuntime, VerbRegistry) {
     let rt = KhiveRuntime::new_for_test(RuntimeConfig {
+        db_path: None,
         embedding_model: hybrid.then_some(EmbeddingModel::AllMiniLmL6V2),
         packs: vec!["kg".into()],
         ..RuntimeConfig::no_embeddings()
