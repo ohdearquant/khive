@@ -883,9 +883,11 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    without any local dispatch. Each is reported once per process as a `tracing` record (target
    `khive::config_lock`, fields `name` and `value`), and no `ConfigLocked` row is written for it. Any
    store chosen for these rows would name a store that did not read the value. At `4500273d` no
-   production code selects `ConfigLocked` rows by kind (every such reader is a test). Generic event
-   counts and listings include them, so their totals change: the three process-scope names no longer
-   appear in any store, and a runtime-scope name appears once per runtime instead of once per process.
+   production code reads `ConfigLocked` rows for a purpose of its own, but the production `list` and
+   `count` handlers select them through their generic event-kind filters (`event_kind="config_locked"`,
+   `khive-pack-kg/src/handlers/common.rs:1060-1068`), and unfiltered event listings and counts include
+   them. Every such population changes: the three process-scope names no longer appear in any store,
+   and a runtime-scope name appears once per runtime instead of once per process.
    A later amendment may give the coordinator or the bridge an audit store of its own; this one does
    not.
 
@@ -908,7 +910,7 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
 ### Test list (acceptance)
 
 Real `OnceLock` producers run in an isolated process with no earlier read of the name; synthetic tests
-use one config name per fixture. Each mutation must compile and turn its named test red.
+use config names that no other fixture uses. Each mutation must compile and turn its named test red.
 
 1. **Destination.** Runtimes A and B with separate stores and distinct namespace and actor, one registry
    each bound with `with_runtime_event_store`. A's handler reads a fresh name; A's dispatch completes;
@@ -916,19 +918,35 @@ use one config name per fixture. Each mutation must compile and turn its named t
    exactly one. Mutation: restore the process-wide queue; B's store gains A's row.
 2. **Cardinality.** Further reads and dispatches in A add no row. B then reads the same, already cached
    name and dispatches: B's store gains exactly one row. Mutation: observe inside `get_or_init`; B's row
-   is absent.
+   is absent. In a third runtime C, two distinct names K and L are observed before one drain, a new name
+   M after it, then K, L and M again with a dispatch between each: C's store holds exactly one row for
+   each of K, L and M. Mutation: replace the ledger's set of seen names with one seen-anything flag; the
+   rows for L and M are absent.
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B.
 4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
    A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
    through the bound registry.
-5. **Process scope.** A coordinated search and a bridge request in a process with one bound registry:
-   no `ConfigLocked` row for the three process-scope names in any store, and one `khive::config_lock`
-   tracing record per name. Mutation: route one of them through a runtime ledger; a row appears.
-6. **Unchanged behaviour.** The `config.lock` verb, the `{key, value}` payload, and a failed
-   `ConfigLocked` append that leaves the dispatch's own result unchanged (the existing tests at
-   `khive-runtime/src/pack_tests.rs:5667` and `:5721`) still pass.
+5. **Process scope.** In a process with one bound registry, a coordinated search and a bridge request
+   exercise all three process-scope accessors. Neither drains a ledger itself (the coordinated path,
+   `dispatch.rs:268`, has no drain, and a forwarded bridge request returns at `bridge.rs:542-557` without a
+   local dispatch), so an ordinary dispatch on the bound registry follows, and its audit append completes
+   before any store is read. No store holds a `ConfigLocked` row for the three names, and there is one
+   `khive::config_lock` tracing record per name. Mutation: keep the tracing record and also observe one
+   of the three names on the bound runtime's ledger; the final dispatch writes its row.
+6. **Unchanged behaviour.** A successful drain writes a row whose verb is `config.lock` and whose payload
+   is exactly `{key, value}` with the observed name and value. A failed `ConfigLocked` append leaves the
+   dispatch's own result unchanged and records the degradation it records today. The existing failure
+   tests (`khive-runtime/src/pack_tests.rs:5667` and `:5721`) enqueue through the process-wide queue and
+   set an explicit `with_event_store` sink, which under item 1 drains no ledger, so they are ported: the
+   name is observed on a runtime's ledger, the registry is bound to that runtime with
+   `with_runtime_event_store`, and that runtime's store refuses the append through a test seam. The
+   failing store is not set with `with_event_store` afterwards, because that setter clears the runtime
+   binding (`khive-runtime/src/pack/builder.rs:241-244`). The ported tests show that a `ConfigLocked`
+   append was attempted and refused. Mutations: changing the verb or dropping `value` from the payload
+   turns the successful-drain test red; returning the append's error from the dispatch turns a failure
+   test red.
 
 ### Sequencing
 
