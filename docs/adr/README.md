@@ -328,6 +328,7 @@ Amendments to accepted records:
 - [ADR-144 Amendment 4](ADR-144-memory-write-visibility-fence.md#amendment-4-2026-10-04-unknown-write-epochs-at-the-sealed-receipt-cutover) (2026-10-04): Accepted unknown-epoch refusal and durable provenance at the sealed-receipt cutover (#3619).
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
 - [ADR-181 Amendment 11](ADR-181-exec-verb-sandboxed-run.md#amendment-11-2026-09-29-timeout-residual-for-detached-descendants) (2026-09-29): timeout residual for detached descendants.
+- [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (2026-10-21): proposed outbound network declaration on exec registrations: a pin input only when declared, honoured only by an exact-name grant to an authenticated caller, refused rather than run without network, outbound-only rules under their own template digest; amends ADR-180 Amendment 1 item 1 for one property.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
 
 Amendments inside records whose own status is Proposed:
