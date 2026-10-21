@@ -31,6 +31,18 @@ carries no blob reference, and ordinary inbox, read, thread and notice surfaces 
 not carry those bytes.
 Executable attachments or two withholding families are quarantined as `screened`.
 
+Quarantine metadata preserves the claimed sender as `quarantine_claimed_from`.
+When a parsed message has `To` recipients, `quarantine_claimed_to` is a JSON array
+encoded as a string, for example `["first@example.com","second@example.com"]`.
+It preserves the order and duplicates in the existing parsed, lowercased `To`
+list; it excludes `Delivered-To` and `Cc` and performs no additional normalization.
+Both claimed fields are sender-asserted information for inspection. They do not
+change quarantine attribution, its maintainer address, the resolved recipient
+actor, or the replay notification recipient, and do not grant trust or route mail.
+An empty `To` list omits the key. Malformed, oversized or missing-body envelopes
+also omit it: those envelopes have no parsed `RawEmail` recipient list, and replay
+bytes, when available, are not parsed again to infer one.
+
 An authenticated opt-out on a marked or withheld delivery, or on a message
 quarantined as `screened`, commits an outbound address suppression through the
 real ingest path before duplicate acknowledgement or message creation. A
