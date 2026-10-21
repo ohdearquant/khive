@@ -8,6 +8,22 @@ use khive_query::error::QueryError;
 
 const REPORT_SAMPLES: usize = 1001;
 
+fn reports_enabled() -> bool {
+    let mut bench = false;
+    for arg in std::env::args_os().skip(1).take_while(|arg| arg != "--") {
+        if arg == "--test"
+            || arg == "--profile-time"
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--profile-time="))
+        {
+            return false;
+        }
+        bench |= arg == "--bench";
+    }
+    bench
+}
+
 // Setup, assertions, and output/input destruction are outside the timer. In
 // particular, validators receive a new AST even during Criterion warmup.
 fn sample<P, R>(
@@ -32,18 +48,22 @@ pub fn scene<P, R>(
     mut operation: impl FnMut(&mut P) -> Result<R, QueryError>,
     check: impl Fn(&P, &R),
 ) {
-    sample(&mut prepare, &mut operation, &check);
-    let mut durations = Vec::with_capacity(REPORT_SAMPLES);
-    for _ in 0..REPORT_SAMPLES {
-        durations.push(sample(&mut prepare, &mut operation, &check));
-    }
-    durations.sort_unstable();
-    println!(
-        "query_call_report scenario={name} samples={REPORT_SAMPLES} median_ns={}",
-        durations[REPORT_SAMPLES / 2].as_nanos()
-    );
-    // Report observations are independent of Criterion's adaptive samples.
+    let reports = reports_enabled();
+    let mut reported = false;
     group.bench_function(name, |b| {
+        if reports && !reported {
+            sample(&mut prepare, &mut operation, &check);
+            let mut durations = Vec::with_capacity(REPORT_SAMPLES);
+            for _ in 0..REPORT_SAMPLES {
+                durations.push(sample(&mut prepare, &mut operation, &check));
+            }
+            durations.sort_unstable();
+            println!(
+                "query_call_report scenario={name} samples={REPORT_SAMPLES} median_ns={}",
+                durations[REPORT_SAMPLES / 2].as_nanos()
+            );
+            reported = true;
+        }
         b.iter_custom(|iterations| {
             let mut total = Duration::ZERO;
             for _ in 0..iterations {
