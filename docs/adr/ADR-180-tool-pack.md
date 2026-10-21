@@ -693,3 +693,111 @@ the shared emission call, emitting before the gate, or dropping `caller_verb`
 must turn the corresponding acceptance arm red.
 
 Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.
+
+## Amendment 7 (2026-10-21): a unit checks the grant it holds, by id, on the writer it was handed
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent
+implementation merges.**
+
+`decide` (`crates/khive-pack-tool/src/policy.rs:872` at `98508c8f`) finds a live grant through
+`select_active_grant` (`:371`), which reads `tool_grants` on a pooled reader of its own,
+`rt.sql().reader()` (`:395`). An operation passed to `SqlAccess::atomic_unit`
+(`crates/khive-storage/src/sql.rs:236`) receives one writer and may only run synchronous statements
+on it, so neither function can run inside a unit. A caller that consumes something on the strength
+of a grant (an approval bound to that grant, a one-shot authorization) therefore checks the grant in
+one place and writes the consumption in another. A revocation (`set_grant_status`, `:655`, the
+`granted -> revoked` move that `validate_transition` allows, `:743`) can commit between the two, and
+the consumption then succeeds on a grant that is no longer live. Copying the predicate into the
+caller's unit closes the window but gives the predicate two homes. Issue #5906.
+
+1. **One home for the predicate.** The activity test and the parse of a selected row become one
+   crate-internal piece that takes `&mut dyn SqlReader`. The activity test is the one
+   `select_active_grant` applies today, term for term: the namespace, status `granted`, `expires_at`
+   null or later than `now`, `invalidated_by_registry_id` and `invalidated_at` both null, and the pin
+   clause (both pin columns null when no registration is given, otherwise `registry_id` and
+   `definition_digest` equal to the given pin). The parse is `GrantRow::from_active_row` (`:169`),
+   including its refusal of a selected row whose required columns are missing or mistyped.
+   `SqlWriter` extends `SqlReader` (`sql.rs:120`), so a unit passes the writer it was handed and
+   `select_active_grant` passes its pooled reader. The by-actor lookup keeps its statement, its
+   order (`requested_at DESC, id ASC`), its `LIMIT 1` and its label, and `decide` keeps calling it.
+
+2. **The entry a unit calls is by id.** The tool pack exports
+
+   ```rust
+   pub async fn grant_is_active_on(
+       reader: &mut dyn SqlReader,
+       ns: &str,
+       grant_id: &str,
+       actor: &str,
+       tool: &str,
+       now: i64,
+       registration: Option<&RegistryPin>,
+   ) -> Result<bool, RuntimeError>;
+   ```
+
+   It answers `true` exactly when the row with that id passes item 1's activity test and its `actor`
+   and `tool` patterns match the given actor and tool under the same pattern rule the by-actor
+   lookup uses (`pattern_match_sql`, `:282`). It answers `false` when no row has that id in `ns`,
+   when the row is not `granted`, has expired, was invalidated, carries a different pin, or does not
+   match the actor or tool. A row that has the id and fails the parse is an error naming the row id,
+   never `false`, for the same reason `from_active_row` refuses it: a malformed grant must not be
+   read as either a live approval or the absence of one. `GrantRow` stays crate-private (`:150`);
+   the entry returns a boolean because the caller already holds the id.
+
+3. **Why by id and not by actor.** The by-actor lookup returns the newest live match. When two live
+   grants match the same actor and tool, it returns the newer one. A unit consuming on the strength
+   of the older grant would then either refuse a consumption whose own grant is still live or have to
+   compare ids and reason about which grant won. The by-id entry answers about the grant the caller
+   holds. It also requires that grant to match the actor and tool being consumed for, so a live grant
+   for one tool cannot be presented to authorize a consumption for another.
+
+4. **Inside a unit.** The entry issues one statement on the reader it is given and awaits nothing
+   else, so on a unit's writer it completes on the first poll, as `atomic_unit` requires. The tool
+   pack already reads on a unit's writer this way (`policy.rs:438`, `:510`, `:685`). The entry writes
+   nothing and appends no `tool_check_decided` event: Amendment 6 receipts record decisions that
+   `tool.check` and the `exec.run` preflight compute, and this entry computes no decision. The
+   caller's own write in the same unit is the record of the consumption.
+   A caller that opens a unit around this entry is a new `atomic_unit` caller and updates ADR-091's
+   write-transaction audit table, as `sql.rs` requires of one; this amendment adds no such caller.
+
+5. **The namespace term is the grant's scope.** Grants are namespace scoped (this record's header,
+   ADR-007), and `decide` in a namespace selects only that namespace's grants. The by-id entry keeps
+   the same term so that it and `decide` agree on every row; a grant decided in one namespace is not
+   live in another under either. This is not a by-id record operation in the sense of ADR-007 Rule 9:
+   the entry declares no wire parameter, resolves no record for the caller, and adds no comparison
+   after a fetch. The term sits in the statement beside the other activity terms, exactly where the
+   by-actor lookup already has it.
+
+6. **What this does not cover.** The entry answers for the registration pin it is handed, as
+   `decide` does; it does not resolve the tool's name. A registry change committed after the caller
+   computed its pin and before its unit opens is not seen by this check. Closing that window needs
+   the pin read inside the same unit, which this amendment does not specify. No wire verb changes,
+   and `tool.check`'s answers do not change.
+
+### Acceptance for Amendment 7
+
+1. For each row state, the by-id entry run on a unit's writer inside `atomic_unit` and `decide` give
+   the same answer, in a fixture where the grant under test is the only one matching its actor and
+   tool: granted and live (`true`, and `decide` answers `allow` from `grant` with that row id);
+   revoked; expired at `now`; invalidated by a registry change; re-pinned, meaning the same actor and
+   tool with a registration whose id or definition digest differs. The last four answer `false`, and
+   `decide` answers from policy or default.
+2. A selected row with a missing or mistyped required column is an error naming the row id from both
+   the by-id entry and `decide`; neither reads it as no grant.
+3. With two live grants matching the same actor and tool, `decide` cites the newer one and the by-id
+   entry answers `true` for the older one.
+4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
+   follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
+5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
+6. A grant id from another namespace answers `false`, as `decide` in the caller's namespace does not
+   select that grant.
+7. The tool pack's existing `decide` and `tool.check` tests pass unchanged.
+8. Mutation controls, each stated before it runs: dropping the expiry term, the invalidation term or
+   the pin clause from the shared predicate turns the corresponding arm of 1 red for both the by-id
+   entry and `decide`, which shows the predicate has one home. Replacing the shared parse with the
+   lenient `GrantRow::from_row` turns arm 2 red. Dropping the actor or tool match from the by-id
+   statement turns arm 4 red.
+9. On the single-writer path, the unit that runs the by-id entry completes without the single-poll
+   driver's pending refusal.
+
+Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
