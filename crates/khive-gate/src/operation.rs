@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v21";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v22";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
     ("apply_changeset", OperationAccess::Write),
+    ("attach", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
