@@ -1,5 +1,21 @@
 # khive-pack-gtd Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-gtd`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                    | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ---------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `gtd/assign`                 | 289.588 µs       | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `gtd/next/10`                | 78.478 µs        | 1.017     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `gtd/next/100`               | 183.852 µs       | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `gtd/tasks/filter_by_status` | 134.356 µs       | 1.004     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `gtd/transition`             | 413.637 µs       | 1.062     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Run command
 
 ```bash
