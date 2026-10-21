@@ -12,6 +12,7 @@ use serde_json::json;
 use super::{BackendRegistry, SubstrateCoordinator};
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn intercepted_fanout_records_empty_text_execution_and_empty_backend_set() {
     for backend_count in [0, 1, 2] {
         let rt = KhiveRuntime::new_for_test(RuntimeConfig {
