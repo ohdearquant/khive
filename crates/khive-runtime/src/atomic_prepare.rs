@@ -21,8 +21,11 @@ use uuid::Uuid;
 
 mod index_purge;
 
-pub(crate) use index_purge::event_append_statements;
 use index_purge::push_index_purge_statements;
+pub(crate) use index_purge::{
+    event_append_statements, push_index_purge_for_tables, vector_table_names,
+    vector_tables_in_writer,
+};
 
 use khive_storage::types::SqlValue;
 use khive_storage::{AttachmentSubstrate, EdgeRelation, EdgeUpsertDisposition, SqlStatement};
@@ -124,8 +127,8 @@ pub(crate) use post_commit::apply_one_post_commit_effect;
 pub use post_commit::{apply_post_commit_effects, apply_post_commit_effects_with_report};
 
 mod edge_delete;
-pub(crate) use edge_delete::prepare_delete_edge;
 use edge_delete::prepare_update_edge;
+pub(crate) use edge_delete::{note_delete_plan, prepare_delete_edge};
 pub use edge_delete::{prepare_delete, AtomicDeleteKind};
 pub(crate) use edge_delete::{prepare_delete_from_snapshot, prepare_update_edge_plan};
 

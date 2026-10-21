@@ -10,7 +10,7 @@ use crate::atomic_runner::apply_plan;
 /// `curation::merge_entity_sql` uses (`"vec_{sanitize_key(model_name)}"`) —
 /// reused here so atomic delete/merge purge the same tables the non-atomic
 /// paths do.
-fn vector_table_names(runtime: &KhiveRuntime) -> Vec<String> {
+pub(crate) fn vector_table_names(runtime: &KhiveRuntime) -> Vec<String> {
     runtime
         .registered_embedding_model_names()
         .iter()
@@ -166,35 +166,83 @@ pub(super) async fn push_index_purge_statements(
     subject_id: Uuid,
     label_prefix: &str,
 ) -> RuntimeResult<()> {
+    let mut tables = Vec::new();
+    for table in vector_table_names(runtime) {
+        if vector_table_exists(runtime, &table).await? {
+            tables.push(table);
+        }
+    }
+    push_index_purge_for_tables(
+        statements,
+        fts_table,
+        namespace,
+        subject_id,
+        label_prefix,
+        &tables,
+    );
+    Ok(())
+}
+
+/// Resolve optional vector tables under the applying writer, so a truncation
+/// cannot miss a table created by an append before its transaction begins.
+/// This only drives the supplied SQL handle; it never acquires another lease.
+pub(crate) async fn vector_tables_in_writer(
+    writer: &mut dyn khive_storage::SqlWriter,
+    candidates: &[String],
+) -> Result<Vec<String>, khive_storage::StorageError> {
+    let mut tables = Vec::new();
+    for table in candidates {
+        let present = writer
+            .query_scalar(
+                SqlStatement::new(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    vec![SqlValue::Text(table.clone())],
+                )
+                .labelled("stream-truncate-vector-table"),
+            )
+            .await?;
+        if present.is_some() {
+            tables.push(table.clone());
+        }
+    }
+    Ok(tables)
+}
+
+/// Shared DML construction once the caller has resolved the vector tables.
+pub(crate) fn push_index_purge_for_tables(
+    statements: &mut Vec<PlanStatement>,
+    fts_table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label_prefix: &str,
+    tables: &[String],
+) {
     statements.extend(purge_fts_document_statements(
         fts_table,
         namespace,
         subject_id,
         &format!("{label_prefix}-purge-fts"),
     ));
-    for vec_table in vector_table_names(runtime) {
-        if vector_table_exists(runtime, &vec_table).await? {
-            statements.push(log_vector_row_delete_statement(
-                &vec_table,
-                namespace,
-                subject_id,
-                &format!("{label_prefix}-log-delete-vec-{vec_table}"),
-            ));
-            statements.push(purge_index_row_statement(
-                &vec_table,
-                namespace,
-                subject_id,
-                &format!("{label_prefix}-purge-vec-{vec_table}"),
-            ));
-            statements.push(purge_vector_provenance_statement(
-                &vec_table,
-                namespace,
-                subject_id,
-                &format!("{label_prefix}-purge-vec-provenance-{vec_table}"),
-            ));
-        }
+    for vec_table in tables {
+        statements.push(log_vector_row_delete_statement(
+            vec_table,
+            namespace,
+            subject_id,
+            &format!("{label_prefix}-log-delete-vec-{vec_table}"),
+        ));
+        statements.push(purge_index_row_statement(
+            vec_table,
+            namespace,
+            subject_id,
+            &format!("{label_prefix}-purge-vec-{vec_table}"),
+        ));
+        statements.push(purge_vector_provenance_statement(
+            vec_table,
+            namespace,
+            subject_id,
+            &format!("{label_prefix}-purge-vec-provenance-{vec_table}"),
+        ));
     }
-    Ok(())
 }
 
 /// Event-store append parity for the canonical handlers that emit a
