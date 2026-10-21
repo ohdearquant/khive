@@ -2541,10 +2541,12 @@ name = "khive-pack-kg"
 version = "0.14.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "inventory",
  "khive-changeset",
+ "khive-db",
  "khive-gate",
  "khive-pack-comm",
  "khive-pack-formal",
