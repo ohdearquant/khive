@@ -213,10 +213,20 @@ async fn a_single_hung_backend_is_named_with_its_timeout() {
 
     assert_eq!(
         stages(&lines),
-        ["backend", "fanout", "finalize", "hydrate", "search"],
+        [
+            "backend_deadline",
+            "backend",
+            "fanout",
+            "finalize",
+            "hydrate",
+            "search"
+        ],
         "{lines:?}"
     );
     assert_eq!(lines[0]["b"], "hung");
-    assert_eq!(lines[0]["o"], "timeout");
-    assert_eq!(lines[0]["n"], 0);
+    assert_eq!(lines[0]["observation"], "timed_out");
+    assert_eq!(lines[0]["c"], lines[1]["c"], "{lines:?}");
+    assert_eq!(lines[1]["b"], "hung");
+    assert_eq!(lines[1]["o"], "timeout");
+    assert_eq!(lines[1]["n"], 0);
 }
