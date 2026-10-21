@@ -876,7 +876,8 @@ registration that does not declare network runs exactly as before, and its pin a
 unchanged byte for byte.
 
 Amended by [Amendment 14](#amendment-14-2026-10-21-the-executables-bytes-the-macos-build-and-the-resolver-socket-for-networked-runs) (proposed) for Decision items 1 to 5 and 7, approval scope items 1
-and 5, and acceptance arms 49, 51, 56, 59 and 60. No host turns networked runs on before Amendment 14 is accepted.
+and 5 with three items added, and acceptance arms 44, 45, 49 to 53, 56, 58, 59 and 60, with arms 61 to 67 added. No host
+turns networked runs on before Amendment 14 is accepted.
 
 This amendment provides the network declaration that a host needs to run adapters which reach a
 remote service under exec. It does not decide which registrations may declare it.
@@ -1313,20 +1314,38 @@ item 8).
    being active.
 
    A networked run executes a staged copy, never the registered path. After the conditions of item 5, exec creates a
-   staging directory for the run, mode `0700`, outside every root a run's profile can write, and copies the registered
-   file into it: as an APFS clone where the file's volume allows one, otherwise as a byte copy. The copy is made
-   read-only. The binary digest (Amendment 10, with its size bound) is computed over the staged copy and compared with
-   the stored one before the tree is loaded (`handlers.rs:1102`). A mismatch is refused with `network_unhonoured:`
-   naming the executable digest, with both digests in the refusal detail. The staging directory is removed before the
-   refusal returns, and no run directory is created. On a match, the staged copy is the file `sandbox-exec` runs, the
-   profile renders the staging directory as a read-only root, and the receipt's `tool_binary_digest` is the staged
-   copy's digest. The staging directory is removed when the run ends, whatever its outcome.
+   staging directory for the run, mode `0700`, outside every root a run's profile can write, the run's own directory
+   and temporary directory included, and copies the registered file into it: as an APFS clone where the source file
+   and the staging directory are on one volume that supports clones, otherwise as a byte copy. Opening the source,
+   the clone or copy, and the digest of the staged copy spend one Amendment 10 budget: its deadline starts before the
+   source is opened, and its byte cap bounds the copy as it bounds the digest. A byte copy reads at most the cap plus
+   one byte and stops there, so an over-limit or growing source is refused with `binary_digest_byte_limit` without
+   being copied to its end, and a copy unfinished at the deadline is refused with `binary_digest_time_limit`, as a
+   stalled digest read is today. The staged copy is made read-only and executable (mode `0500`). The binary digest is
+   computed over the staged copy and compared with the stored one before the tree is loaded (`handlers.rs:1102`). A
+   mismatch is refused with `network_unhonoured:` naming the executable digest, with both digests in the refusal
+   detail, and no run directory is created. On a match, the staged copy is the file `sandbox-exec` runs, the profile
+   renders the staging directory as a read-only root, and the receipt's `tool_binary_digest` is the staged copy's
+   digest. The staging directory, with any partial copy in it, is removed on every return after it is created: a
+   refusal in the copy or the comparison, a refusal by a later preflight step (the tree load and working-directory
+   checks at `handlers.rs:1102-1107` included), a failure while materializing the tree or spawning, a timeout, a
+   cancellation, and the end of a run whatever the child's exit status.
 
-   One exception: a registered file on the sealed system volume runs in place. That holds when `statfs` reports the
-   root mount as sealed and read-only and no component of the registered path is a symbolic link. Its bytes cannot
-   change without changing the system volume, and an Apple platform binary copied off that volume is killed at launch
-   (measured: a copy of `/usr/bin/nc` ended with SIGKILL, unsandboxed and sandboxed). Its digest is computed at its
-   path, as today. A path that reaches a system-volume file through a symbolic link is staged like any other path.
+   One exception: a registered file on the system volume runs in place. That holds only when both of these are true,
+   read after the conditions of item 5 and before the digest:
+   - the registered path is absolute, has no empty, `.` or `..` component, and no component is a symbolic link;
+   - `statfs` on the file, and on each directory from `/` down to the file's parent, reports the mount point `/`,
+     mounted read-only from a snapshot (`MNT_RDONLY` and `MNT_SNAPSHOT` set).
+
+   Then the file and every directory its path resolves through are on the read-only root snapshot. No run and no
+   unprivileged process can change what that path resolves to or the bytes behind it, before or after the test, so
+   the test, the digest and the spawn reach the same file. The digest is computed at that path, as today, and
+   `sandbox-exec` runs that same path string. An Apple platform binary copied off that volume is killed at launch
+   (measured: a copy of `/usr/bin/nc` ended with SIGKILL, unsandboxed and sandboxed), which is why these files are not
+   staged. A registered path that fails either test is staged like any other path: one that reaches a system-volume
+   file through a symbolic link, one with a `..` component, and one whose file or any ancestor directory is on
+   another volume. `statfs` follows a firmlink, so `/usr/local/bin` reports the Data volume and is staged (measured).
+   `statfs` carries no sealed flag; the read-only snapshot mount is the property this test reads (measured).
 
    An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
    changes the stored row (item 2).
@@ -1462,7 +1481,8 @@ Three items are added:
    finds files relative to its own path (an `@executable_path` library, data beside the binary) finds the staging
    directory instead, and fails or behaves differently under network. A process of the same user outside the sandbox
    can write the staging directory; such a process can already open connections itself, which is Amendment 13's
-   same-user model, and the pin is not a boundary against it. A file on the sealed system volume runs in place.
+   same-user model, and the pin is not a boundary against it. A file on the root snapshot whose path passes Decision
+   item 1's test runs in place.
 9. **A grant outranks a policy deny.** Grants are consulted before policy rows (`khive-pack-tool/src/policy.rs:872-891`;
    ADR-180 Amendment 4 item 7), so a `tool.policy` deny for the same actor and tool does not stop a granted networked
    run. `tool.revoke` or `tool.deny` on the grant does.
@@ -1526,11 +1546,31 @@ Added arms:
     refusal detail, `sandbox` null, and no run or staging directory left. Restoring the original bytes runs honoured
     again. A test seam pauses a run after the digest comparison and before the spawn; the test replaces the registered
     file with a program that prints a different marker and resumes; the run prints the approved program's marker and
-    its receipt names the stored digest. A row at a sealed system volume path runs in place and its receipt names that
-    path, and a row whose path reaches the same file through a symbolic link is staged (its outcome is recorded).
-    Changing the stored `executable_digest` through storage makes `tool.check` answer from policy or default. Mutation
-    controls: skipping the comparison turns the replacement case red, running the registered path instead of the staged
-    copy turns the paused case red, and leaving `executable_digest` out of the pinned inputs turns the storage case red.
+    its receipt names the stored digest. Changing the stored `executable_digest` through storage makes `tool.check`
+    answer from policy or default. The arm also covers:
+    - **The in-place exception.** A row at a path on the root snapshot (every ancestor directory and the file reporting
+      mount point `/`, read-only, from a snapshot) runs in place: its receipt names that path and the profile lists no
+      staging directory. Each of these is staged instead, and its outcome is recorded: a row whose path reaches a
+      root-snapshot file through a symbolic link; a row whose path reaches it through a `..` component; and a row whose
+      file is on the Data volume at a path under the user's home directory, and, on a host where `/usr/local` holds a
+      file, at that path. For the
+      `..` row, the pause seam holds the run after the comparison, the test replaces a directory in the path's prefix,
+      inside a directory the run itself can write, with a symbolic link under which the same path string reaches a
+      program that prints another marker, and resumes; that marker is absent from the run's output.
+    - **Copy bounds.** With clones unavailable (a test seam), the copy is a byte copy and the run is honoured with the
+      same digest. A source larger than the byte budget, and a source that a writer extends past it while a test seam
+      holds the copy, are refused with `binary_digest_byte_limit`, `bytes_read` at most the budget plus one byte. A
+      source read stalled past `binary_digest_timeout_s` (a test seam) is refused with `binary_digest_time_limit`,
+      `elapsed_ms` at least `time_cap_ms`. None of the three leaves a staging or run directory or a digest in any receipt.
+    - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
+      failure (a test seam), a run that times out and a cancelled run each leave no staging directory.
+
+    Mutation controls: skipping the comparison turns the replacement case red; running the registered path instead of
+    the staged copy turns the paused case red; leaving `executable_digest` out of the pinned inputs turns the storage
+    case red; admitting a `..` component to the exception turns the `..` case red; reading `statfs` on `/` alone turns
+    the Data-volume cases red; copying to the end of the source before checking the budget turns the over-limit cases
+    red; starting the deadline after the copy turns the stalled case red; and removing the staging directory only when
+    a spawned run ends turns the tree-load case red.
 62. **Registration and stored digests.** `tool.register` refuses `network` without `executable_digest`,
     `executable_digest` without `network`, and an `executable_digest` that is uppercase, 63 characters, 65 characters
     or not hexadecimal, each with the reason named; the accepted case is the control. Through storage, a row carrying
@@ -1542,23 +1582,52 @@ Added arms:
 63. **Re-registration.** On an existing networked row, re-registering with a different `executable_digest` is refused
     naming the stored value, and passing `network` on an existing row that lacks it is refused. Passing the stored
     values, and passing neither, return the row unchanged with `created` false (the controls). Two registrations of one
-    new name released together by a barrier, one passing digest A and the other digest B, and in a second run one
-    passing `network` and the other not: exactly one creates the row, the other is refused naming the conflicting
-    property and the winning value, and the winning row is unchanged. Mutation controls: merging passed properties into
-    the stored row turns the serial cases red, and comparing only on the name-lookup branch turns the concurrent case
-    red.
+    new name are held at the claim seam (`pause_before_claim`, `khive-pack-tool/src/handlers.rs:444-445`) until both
+    have found no row, and the seam is extended to release them one at a time so that a chosen caller claims first.
+    Each pairing runs in both winner orders:
+    - digest A against digest B: the loser is refused naming `executable_digest` and the winning value;
+    - `network` with its digest against neither property: when the networked caller wins, the other returns the
+      winning row unchanged with `created` false; when the caller passing neither wins, the networked caller is refused
+      naming `network` and that the winning row has none.
+
+    In every case exactly one call creates the row and the winning row is unchanged. Mutation controls: merging passed
+    properties into the stored row turns the serial cases red; comparing only on the name-lookup branch turns the
+    concurrent refusals red; and treating an omitted property as a conflict on the claim branch turns the
+    networked-winner case red.
 64. **Configuration.** Each refused case of Decision item 3 fails configuration load with the key named: `enabled =
-    "true"`, `enabled = 1`, `enabled = true` with `os_builds` absent, `enabled = true` with `os_builds = []`, an entry
-    `"26b118"`, and an unknown key in the table. A valid table loads (control). Mutation control: accepting a string
-    for `enabled` turns this arm red.
-65. **The build and the policy order.** With the setting on and the running build not listed, a run is refused with
+    "true"`, `enabled = 1`, `enabled = true` with `os_builds` absent, `enabled = true` with `os_builds = []`, and an
+    unknown key in the table. The `os_builds` entries `"26b118"` (lowercase letter), `"2B1"` and `"266B118"` (one and
+    three leading digits), `"26B"` and `"26B12345"` (zero and five following digits), `"26B118A"` (uppercase suffix),
+    `"26B118ab"` and `"26B118 "` (trailing characters) are each refused naming `os_builds`, once with `enabled = true`
+    and once with `enabled = false`. The entries `"26B118"`, `"26B1"` and `"26B1234"` (one and four following digits)
+    and `"26B118a"` (lowercase suffix) load in both settings (controls). Mutation controls: accepting a string for
+    `enabled` turns the first case red; a grammar without the digit counts (`[0-9]+[A-Z][0-9]+[a-z]?`) turns the
+    `"2B1"`, `"266B118"` and `"26B12345"` cases red; and skipping entry validation when `enabled` is false turns the
+    disabled cases red.
+65. **The build and the condition order.** With the setting on and the running build not listed, a run is refused with
     `network_unhonoured:` naming the build and the list, before the digest and with no run or staging directory, and
     `exec.identity` reports the running build and `network_os_build_listed` false. A build reader that fails (a test
     seam) is refused naming the unreadable build. Control: the running build listed runs honoured. A networked row with
     a `tool.policy` deny for the caller and no grant is refused with the existing policy refusal with the setting off,
     with the build unlisted, and with both valid; each receipt carries the deny decision and the digest worker's probe
-    counts zero. Mutation controls: skipping the build check turns the unlisted case red and leaves arm 60 green, and
-    moving the networked conditions ahead of the policy refusal turns the deny cases red.
+    counts zero.
+
+    For an `allow`, each fixture below fails two conditions of Decision item 5 with every other condition met, and is
+    refused naming the earlier one, with the digest worker's probe counting zero and no run or staging directory:
+    - the setting off with the build unlisted (the setting);
+    - the build unlisted with an unmeasured loopback address (the build);
+    - an unmeasured loopback address with a stored `network` of `"OUTBOUND"` (the loopback address);
+    - a stored `network` of `"OUTBOUND"` with an uppercase stored digest (`network_invalid:` naming `network`);
+    - an uppercase stored digest with the decision `allow` from policy (`network_invalid:` naming
+      `executable_digest`);
+    - the decision `allow` from policy with an anonymous token (the decision's source);
+    - an anonymous token with a file whose bytes differ from the stored digest (the anonymous token, with no copy);
+    - a stored `network` of `"OUTBOUND"` under a fresh grant pinned to that row, once with the setting off and once
+      with the build unlisted (the setting in the first case and the build in the second, never `network_invalid:`).
+
+    Mutation controls: skipping the build check turns the unlisted case red and leaves arm 60 green; moving the
+    networked conditions ahead of the policy refusal turns the deny cases red; and moving the stored-row checks
+    (conditions 4 and 5) ahead of the host checks turns the last two cases red.
 66. **The resolver operations, per listed build.** Under the outbound profile, a query, a service browse, a service
     registration and a proxy registration each run beside their unsandboxed control in the same run, and the arm
     records each outcome and the interfaces a registration was observed on. It passes when every operation ran with
