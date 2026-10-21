@@ -58,7 +58,6 @@ The write benchmarks reuse their in-memory fixture, so their task corpus grows d
 - Dataset: in-memory SQLite; task corpus seeded with 10 / 100 tasks; sample size 50
 - vs prior: first formal release ledger entry — no prior comparable baseline
 
-
 | Scenario                   | Low      | Median   | High     | Outliers   |
 | -------------------------- | -------- | -------- | -------- | ---------- |
 | gtd/assign                 | 2.787 ms | 3.030 ms | 3.272 ms | 2/50 (4%)  |
@@ -70,7 +69,6 @@ The write benchmarks reuse their in-memory fixture, so their task corpus grows d
 - Notes: none
 
 Last reviewed: v0.2.8 (2026-06-08)
-
 
 ## Current maintenance scenarios
 
@@ -122,19 +120,38 @@ There is one current-thread Tokio executor with at most two blocking threads, on
 fixture at a time, no shared model, ambient database or accumulating task corpus.
 Asynchronous audit activity may overlap dispatch; full audit drain is untimed.
 
-Every scenario first records 11 actual operation durations and prints the sorted
-rank-6 median in nanoseconds and milliseconds. These fixed observations also run
-in Criterion test/quick mode. Criterion then measures the same interval through
-serial `iter_custom`, reporting one operation per complete dispatch/pair. The
-Criterion trend and the individual-operation median are distinct reports. The
-1000-task setup is repeated untimed for every census operation, so wall time can
+Each selected scenario in ordinary benchmark mode records 11 actual operation
+durations once and prints the sorted rank-6 median in nanoseconds and
+milliseconds. This supplemental sampling runs inside the first selected Criterion
+callback, before `iter_custom`; it contributes no time to Criterion's reported
+dispatch interval. Criterion then measures the same interval through serial
+`iter_custom`, reporting one operation per complete dispatch/pair. The Criterion
+trend and the individual-operation median are distinct reports. The 1000-task
+setup is repeated untimed for every census operation, so wall time can
 substantially exceed measured dispatch time. No percentile, allocation count or
 hard timing threshold is invented.
+
+Executor creation and all fixture work are deferred until Criterion invokes a
+selected scene. Listing and unmatched filters create no executor or fixture and
+perform no dispatch. Correctness mode (direct invocation without `--bench`, or
+with `--test`, including `--bench --test`) executes one complete checked sample
+per selected scene and emits no supplemental median report. With all four scenes
+selected, that is four fresh fixtures instead of the previous 48: the 44
+supplemental samples no longer run. Ordinary `--bench`, including `--quick`, keeps
+the 11-sample report for each selected scene. Arguments after `--` are filters,
+not mode switches.
+
+Profiling with either `--profile-time N` or `--profile-time=N` skips supplemental
+sampling. The ordinary fixture setup and checks remain part of each callback, so
+an external profiler may observe them, along with the first lazy executor setup;
+the duration returned by `iter_custom` still covers only the dispatch interval.
 
 ```bash
 # From crates/: new scenarios only.
 cargo bench -p khive-pack-gtd --bench gtd_maintenance -- --quick --noplot
 cargo bench -p khive-pack-gtd --bench gtd_maintenance -- --test
+cargo bench -p khive-pack-gtd --bench gtd_maintenance -- --list
+cargo bench -p khive-pack-gtd --bench gtd_maintenance -- --test '^gtd_maintenance/complete$'
 
 # Record existing and new targets on the same qualified machine.
 cargo bench -p khive-pack-gtd --benches -- --quick --noplot
