@@ -11,6 +11,19 @@ use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
+#[path = "../../test_support/timing.rs"]
+mod timing;
+
+const LONG_POLL_TIMING_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const LONG_POLL_TIMING_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn long_poll_return_bound() -> std::time::Duration {
+    // Keep the strict one-second ordinary contract; coverage must still beat
+    // the fixture's five-second fallback rather than merely avoid a hang.
+    timing::duration_bound(LONG_POLL_TIMING_WAIT / 5, Some(LONG_POLL_TIMING_WAIT / 2))
+        .expect("both timing modes retain a numeric long-poll bound")
+}
+
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
         .as_array()
@@ -442,6 +455,7 @@ async fn delivered_rejects_short_or_malformed_ids() {
 async fn inbox_long_poll_wakes_after_concurrent_ingest() {
     let (registry, _rt) = build_registry_for_ns("local");
     let waiter_registry = registry.clone();
+    let bound = long_poll_return_bound();
     let started = std::time::Instant::now();
     let mut waiter = tokio::spawn(async move {
         waiter_registry
@@ -451,7 +465,7 @@ async fn inbox_long_poll_wakes_after_concurrent_ingest() {
                     "status": "all",
                     "from_actor": "email:sender@example.com",
                     "content_contains": "wake the blocked inbox",
-                    "wait_ms": 5_000,
+                    "wait_ms": LONG_POLL_TIMING_WAIT.as_millis(),
                 }),
             )
             .await
@@ -516,18 +530,19 @@ async fn inbox_long_poll_wakes_after_concurrent_ingest() {
         .expect("concurrent ingest succeeds");
     assert_eq!(ingest["deduplicated"].as_bool(), Some(false));
 
-    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+    let inbox = match tokio::time::timeout(LONG_POLL_TIMING_WATCHDOG, &mut waiter).await {
         Ok(joined) => joined
             .expect("long-poll task must not panic")
             .expect("long-poll inbox succeeds"),
         Err(_) => {
             waiter.abort();
-            panic!("long-poll inbox did not wake within one second of ingest");
+            let _ = waiter.await;
+            panic!("long-poll inbox exceeded the hang watchdog after ingest");
         }
     };
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "signal wake must beat the five-second polling baseline"
+        started.elapsed() < bound,
+        "signal wake must finish within {bound:?}, before the five-second polling baseline"
     );
     assert_eq!(inbox["count"].as_u64(), Some(1));
     assert_eq!(
@@ -656,18 +671,25 @@ async fn inbox_long_poll_returns_immediately_when_matches_exist() {
         .await
         .expect("send succeeds");
 
+    let bound = long_poll_return_bound();
     let started = std::time::Instant::now();
-    let inbox = registry
-        .dispatch(
+    let inbox = tokio::time::timeout(
+        LONG_POLL_TIMING_WATCHDOG,
+        registry.dispatch(
             "comm.inbox",
-            serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
-        )
-        .await
-        .expect("long poll over a non-empty inbox succeeds");
+            serde_json::json!({
+                "status": "all",
+                "wait_ms": LONG_POLL_TIMING_WAIT.as_millis(),
+            }),
+        ),
+    )
+    .await
+    .expect("non-empty inbox must finish within the hang watchdog")
+    .expect("long poll over a non-empty inbox succeeds");
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "an initial query with matches must return without waiting out the budget"
+        started.elapsed() < bound,
+        "an initial query with matches must return within {bound:?}, without waiting out the budget"
     );
     assert_eq!(inbox["count"].as_u64(), Some(1));
     assert_eq!(
