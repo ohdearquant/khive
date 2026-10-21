@@ -6,7 +6,7 @@ use crate::reindex::record_repair::DEFAULT_REINDEX_BATCH_SIZE;
 fn repair_args(dir: &std::path::Path, id: Uuid) -> ReindexArgs {
     let mut args = snapshot_reindex_args(dir, false);
     args.id = Some(id);
-    args.batch_size = DEFAULT_REINDEX_BATCH_SIZE;
+    args.batch_size = None;
     args
 }
 
@@ -28,7 +28,7 @@ fn record_selector_rejects_bulk_options_and_non_uuid_ids() {
     let parsed = ReindexArgs::try_parse_from(["reindex", "--id", &id])
         .expect("single record with ordinary defaults");
     assert_eq!(parsed.id.unwrap().to_string(), id);
-    assert_eq!(parsed.batch_size, DEFAULT_REINDEX_BATCH_SIZE);
+    assert_eq!(parsed.batch_size, None);
     let default_batch_size = DEFAULT_REINDEX_BATCH_SIZE.to_string();
     for tail in [
         vec!["--model", "model"],
@@ -63,7 +63,7 @@ fn record_repair_validator_rejects_each_bulk_option() {
         let mut args = ReindexArgs::try_parse_from(["reindex", "--id", &id]).unwrap();
         match option {
             "model" => args.model = Some("repair-model".into()),
-            "batch-size" => args.batch_size = DEFAULT_REINDEX_BATCH_SIZE + 1,
+            "batch-size" => args.batch_size = Some(DEFAULT_REINDEX_BATCH_SIZE + 1),
             "knowledge-only" => args.knowledge_only = true,
             "no-sections" => args.no_sections = true,
             "sections-only" => args.sections_only = true,
