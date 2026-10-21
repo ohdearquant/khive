@@ -1780,11 +1780,21 @@ impl Fts5TextSearch {
                 .collect();
             let in_clause = id_placeholders.join(", ");
 
+            // A subject ID may exist in more than one namespace. Reapply
+            // exact predicates when resolving the gathered IDs to ranked rows.
+            let filter_start = 3 + gathered_ids.len();
+            let (rank_filter_clause, rank_filter_params) = if let Some(ref filter) = request.filter
+            {
+                build_filter_clause(filter, &table, filter_start)
+            } else {
+                (String::new(), Vec::new())
+            };
+
             let rank_sql = format!(
                 "SELECT subject_id, rank, title, {snippet_expr} \
                  FROM {table} WHERE {table} MATCH ?1 \
                  AND rank MATCH '{LEXICAL_BM25_RANK}' \
-                 AND subject_id IN ({in_clause}) \
+                 AND subject_id IN ({in_clause}){rank_filter_clause} \
                  ORDER BY rank LIMIT ?2",
             );
 
@@ -1794,6 +1804,12 @@ impl Fts5TextSearch {
             stmt2.raw_bind_parameter(2, request.top_k as i64)?;
             for (i, id_str) in gathered_ids.iter().enumerate() {
                 stmt2.raw_bind_parameter(3 + i, id_str.as_str())?;
+            }
+            for (i, param) in rank_filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt2.raw_bind_parameter(filter_start + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
             }
 
             let mut hits = Vec::new();

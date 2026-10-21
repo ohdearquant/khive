@@ -1627,3 +1627,6 @@ fn memory_kind_match_work_is_bounded_by_memory_corpus() {
          small plan:\n{small_plan}\nlarge plan:\n{large_plan}"
     );
 }
+
+#[path = "text_tests/bounded_ranking_tests.rs"]
+mod bounded_ranking_tests;
