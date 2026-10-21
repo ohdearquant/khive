@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS edge_governance_active (
 -- ADR159 §1:169–170 / §4:301–304: covering index begins with target_id.
 CREATE INDEX IF NOT EXISTS idx_edge_governance_active_target
     ON edge_governance_active(target_id, source_id, edge_id);
+-- ADR159 §3:252–253 / §Measurements:504–505: endpoint-note triggers match either endpoint;
+-- without a source_id index every note liveness transition scans the projection.
+CREATE INDEX IF NOT EXISTS idx_edge_governance_active_source
+    ON edge_governance_active(source_id);
 
 -- ADR159 §1:177–181 / §7:424–431: per-store activation receipt, not edge authority.
 CREATE TABLE IF NOT EXISTS edge_governance_state (

@@ -187,6 +187,10 @@ fn edge_governance_fresh_schema_is_registered_and_inactive() {
         ]
     );
     assert_eq!(
+        rows(&conn, "SELECT name FROM pragma_index_info('idx_edge_governance_active_source') ORDER BY seqno"),
+        vec![vec![Value::Text("source_id".into())]]
+    );
+    assert_eq!(
         rows(&conn, "SELECT * FROM edge_governance_state"),
         vec![vec![
             Value::Integer(1),
@@ -209,6 +213,49 @@ fn edge_governance_fresh_schema_is_registered_and_inactive() {
             []
         )
         .is_err());
+}
+
+#[test]
+fn edge_governance_note_triggers_find_incident_markers_by_index() {
+    let conn = migrated();
+    let predicate = "WHERE source_id = OLD.id OR target_id = OLD.id";
+    for trigger in ["edge_governance_note_update", "edge_governance_note_delete"] {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                [trigger],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sql.matches(predicate).count(),
+            2,
+            "{trigger} lookup changed"
+        );
+    }
+    let plan = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT decision_id, edge_id FROM edge_governance_active \
+             WHERE source_id = ?1 OR target_id = ?1",
+        )
+        .unwrap()
+        .query_map(["note"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter().all(|step| !step.starts_with("SCAN")),
+        "endpoint lookup scans the projection: {plan:?}"
+    );
+    for index in [
+        "idx_edge_governance_active_source",
+        "idx_edge_governance_active_target",
+    ] {
+        assert!(
+            plan.iter().any(|step| step.contains(index)),
+            "endpoint lookup does not use {index}: {plan:?}"
+        );
+    }
 }
 
 #[test]

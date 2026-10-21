@@ -5,12 +5,12 @@ Migration 061 installs the storage layer from
 inactive. Installing these objects does not authorize an edge or enable memory
 supersession filtering.
 
-| Object                          | Stored evidence                                                                                               | Contract                                     |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `edge_governance_decisions`     | Append-only authorization/rejection and bound edge preimage; authorizer, provider, action and review evidence | ADR-159 §1, lines 124–140                    |
-| `edge_governance_invalidations` | Append-only events naming a decision, edge, cause and time                                                    | ADR-159 §1, lines 142–161                    |
-| `edge_governance_active`        | One current projection per edge and decision; target/source/edge covering index                               | ADR-159 §1, lines 163–175; §4, lines 301–304 |
-| `edge_governance_state`         | One inactive row; complete activation receipts required before an active row can be stored                    | ADR-159 §1, lines 177–181; §7, lines 424–431 |
+| Object                          | Stored evidence                                                                                                              | Contract                                                        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `edge_governance_decisions`     | Append-only authorization/rejection and bound edge preimage; authorizer, provider, action and review evidence                | ADR-159 §1, lines 124–140                                       |
+| `edge_governance_invalidations` | Append-only events naming a decision, edge, cause and time                                                                   | ADR-159 §1, lines 142–161                                       |
+| `edge_governance_active`        | One current projection per edge and decision; target/source/edge covering index; source index for the endpoint-note triggers | ADR-159 §1, lines 163–175; §3, lines 252–253; §4, lines 301–304 |
+| `edge_governance_state`         | One inactive row; complete activation receipts required before an active row can be stored                                   | ADR-159 §1, lines 177–181; §7, lines 424–431                    |
 
 Identifiers use the existing graph TEXT representation; timestamps use Unix
 microseconds in INTEGER columns. The invalidation ledger allocates a local
