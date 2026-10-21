@@ -232,7 +232,7 @@ async fn interleaved_reindex(entities: bool, mutation: Mutation) {
             db: Some(db.to_str().unwrap().to_owned()),
             config: Some(config.clone()),
             model: Some(MODEL.into()),
-            batch_size: 1,
+            batch_size: Some(1),
             keep_existing: false,
             namespace: Some("local".into()),
             knowledge_only: false,
