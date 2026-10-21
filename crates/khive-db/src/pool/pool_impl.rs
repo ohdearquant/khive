@@ -909,6 +909,28 @@ impl ConnectionPool {
         self.checkpoint_ownership.wal_autocheckpoint_pages()
     }
 
+    /// Whether a checkpoint owner is claiming or has claimed this pool.
+    /// A host without that owner's join must conservatively refuse teardown.
+    pub fn checkpoint_owner_present(&self) -> bool {
+        self.checkpoint_ownership.state.lock().phase
+            != super::admission::CheckpointOwnership::Unclaimed
+    }
+
+    /// Retain this pool's diagnostic sink completion witness before Drop.
+    /// Explicit close waits until all pools and writer tasks sharing the sink
+    /// have released their ownership; ordinary Drop never stops the sink.
+    pub fn timeout_sink_close_handle(&self) -> Option<super::TimeoutSinkCloseHandle> {
+        self.timeout_sink_registration
+            .as_ref()
+            .map(crate::timeout_sink::Registration::close_handle)
+    }
+
+    pub(crate) fn timeout_sink_writer_lease(&self) -> Option<crate::timeout_sink::WriterLease> {
+        self.timeout_sink_registration
+            .as_ref()
+            .map(crate::timeout_sink::Registration::writer_lease)
+    }
+
     /// Claim routine WAL-checkpoint ownership for this pool.
     ///
     /// Called by the scheduled checkpoint task at startup — the one caller
@@ -1058,5 +1080,26 @@ impl ConnectionPool {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_presence_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_owner_presence_is_conservative_during_claim() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        assert!(!pool.checkpoint_owner_present());
+        assert!(pool.checkpoint_ownership.begin_claim());
+        assert!(pool.checkpoint_owner_present());
+        pool.checkpoint_ownership.finish_claim(false);
+        assert!(!pool.checkpoint_owner_present());
+        pool.claim_checkpoint_ownership().unwrap();
+        assert!(pool.checkpoint_owner_present());
     }
 }
