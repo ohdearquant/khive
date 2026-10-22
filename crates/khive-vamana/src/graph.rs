@@ -82,7 +82,7 @@ fn set_max_passes(v: Option<usize>) {
 /// reruns greedy search and robust_prune over the graph the first pass just
 /// produced, and a more-connected graph changes which candidates survive
 /// pruning. This is not idempotent — differential testing at production scale
-/// (n>=250, 384-dim normalized vectors) shows the two-pass and skip-second-pass
+/// (n>=300, 384-dim normalized vectors) shows the two-pass and skip-second-pass
 /// adjacency diverge, so a run with only the first pass is a materially
 /// different (and less-refined) graph, not a redundant rerun.
 fn refinement_alpha_schedule(config_alpha: f64) -> Vec<f64> {
