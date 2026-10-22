@@ -790,7 +790,9 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    `decide` answers from policy or default.
 2. A selected row with a missing or mistyped required column is an error naming the row id when the id is
    readable, otherwise the existing `<unreadable id>` diagnostic, from both the by-id entry and `decide`;
-   neither reads it as no grant.
+   neither reads it as no grant. Also place a named grant whose expiry is stored as text that still passes
+   the SQL expiry filter beside a valid live grant with the same `requested_at` and an earlier id under
+   `id ASC`: the by-id entry errors naming the malformed grant, while `decide` selects the valid one.
 3. With two live grants matching the same actor and tool, `decide` cites the newer one and the by-id
    entry answers `true` for the older one. Revoke only the older grant in a committed unit while the newer
    grant remains live: the by-id entry then answers `false` for the older id and `true` for the newer id,
@@ -812,7 +814,14 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    carrying the same `requested_at`, failing each id in turn under the `id ASC` tie order: the by-id entry
    answers `false` for the failing id and `true` for the other, and `decide` cites the other id. A mutant
    that correlates through `requested_at` instead of `id` (an equality cutoff, or a filter on the named
-   row's timestamp) turns this arm red, which distinct timestamps alone cannot show.
+   row's timestamp) turns this arm red, which distinct timestamps alone cannot show. With no registration
+   supplied, also repeat the equal-timestamp pair with both pin columns non-null on the named grant and both
+   null on the other, failing each id in turn: `false` for the named id, `true` for the other, and `decide`
+   cites the other. Every one of these cases states one rule: the by-id answer depends on the named row
+   alone. For each named-grant state in arms 1 to 3, the answer (`true`, `false`, or the error naming the
+   grant) with the named grant alone in its namespace equals the answer with a live matching grant beside it
+   at an earlier, the same, and a later `requested_at`, on either side of it under `id ASC`; an
+   implementation that reads any term or any decoded column from another row turns one of these red.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
