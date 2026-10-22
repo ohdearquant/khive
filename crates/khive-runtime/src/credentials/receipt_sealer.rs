@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chacha20poly1305::{AeadInPlace, KeyInit, Tag, XChaCha20Poly1305, XNonce};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -97,7 +97,7 @@ impl ReceiptSealer {
         fences: &[(String, u64)],
     ) -> Result<String, ReceiptSealError> {
         self.seal_with_nonce_source(namespace, fences, |nonce| {
-            OsRng
+            SysRng
                 .try_fill_bytes(nonce)
                 .map_err(|_| ReceiptSealError::NonceUnavailable)
         })
