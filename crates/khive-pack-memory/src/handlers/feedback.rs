@@ -10,6 +10,8 @@ use khive_runtime::{NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry}
 use crate::recall_feedback::on_explicit_feedback;
 use crate::MemoryPack;
 
+use super::common::decode_params;
+
 #[derive(Debug, Deserialize)]
 struct FeedbackParams {
     target_id: String,
@@ -25,7 +27,7 @@ impl MemoryPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let p: FeedbackParams = serde_json::from_value(params).map_err(|e| {
+        let p: FeedbackParams = decode_params(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.feedback: invalid params: {e}"))
         })?;
         validate_feedback_signal(&p.signal)?;
@@ -35,7 +37,7 @@ impl MemoryPack {
                 "memory.feedback: target_id must be a full UUID because a short-prefix \
                  resolution can miss or be ambiguous, while feedback must identify one exact \
                  recalled record; got {:?}",
-                p.target_id
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &p.target_id)
             ))
         })?;
         let canonical_target_id = target_id.as_hyphenated().to_string();
