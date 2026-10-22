@@ -862,7 +862,11 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    `VerbRegistryBuilder::with_runtime_event_store(&runtime)` drains that runtime's ledger and no other.
    A registry configured with an explicit `with_event_store` sink, or with no sink, drains no ledger.
    Two registries bound to one runtime share its ledger, and either may drain it; they write to the same
-   runtime's store.
+   runtime's store. A runtime handle that `KhiveRuntime::core()` returns over a different backend is not a
+   clone and does not share its source's ledger: a runtime with a core backend creates one core ledger
+   when it is constructed, shares it with its clones, and gives it to every such handle, so a value read
+   through those handles is written to the core store, once per name, and only by a registry bound to one
+   of them.
 
 2. **One row per config name per runtime.** The resolved value stays in the process-wide `OnceLock`, so
    when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
@@ -908,15 +912,29 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    writes its rows. A ledger holds at most one pending entry per config name, so it cannot grow without
    bound. A row is never moved to another runtime's store to force its delivery.
 
-7. **Cost.** Dispatch's empty-ledger case stays one atomic read-and-clear, now of the bound runtime's
-   pending flag. Observing a name the ledger has already seen takes no I/O, no allocation and no await.
+7. **Cost.** Dispatch's empty-ledger case stays one atomic read, now of the bound runtime's pending
+   flag. Observing a name the ledger has already seen takes no I/O, no allocation and no await.
+
+8. **Ledger structure.** A ledger's seen set, pending entries and pending flag sit under one mutex, and
+   only the two operations below touch them. Outside that mutex the flag is true exactly when entries are
+   pending. Observing is one critical section: insert the name into the seen set, and only if that
+   insertion added it, push the entry and set the flag. A drain reads the flag without the mutex and does
+   nothing when it is false; otherwise, in one critical section, it takes every pending entry and clears
+   the flag. Nothing else writes the flag. Acquiring the mutex waits; neither operation skips on
+   contention. The taken entries belong to that drain alone and are appended to its own registry's store
+   with no ledger lock held, so two drains of one ledger never share a batch or a destination.
 
 ### Test list (acceptance)
 
 Real `OnceLock` producers run in an isolated process with no earlier read of the name; synthetic tests
 use config names that no other fixture uses. Each mutation must compile and turn its named test red.
 These fixtures discriminate the named mutations; they do not establish correctness for every entry age,
-value length, name or retry policy, and Decision 2 still forbids a loss or a duplicate of that kind.
+value length, name or retry policy, and Decision 2 still forbids a loss or a duplicate of that kind. Nor
+do they establish Decision 8: an implementation that splits a critical section, skips on contention or
+shares a batch between drains can pass every arm below. Decision 8 is checked by reading the ledger
+module, which holds the seen set, the pending entries, the flag and the two operations and nothing else,
+and every change to that module is read against it. The schedules in arm 3 remain regression checks for
+the mutations they name.
 
 1. **Destination.** Runtimes A and B with separate stores and distinct namespace and actor, one registry
    each bound with `with_runtime_event_store`. A's handler reads a fresh name; A's dispatch completes;
@@ -967,7 +985,7 @@ value length, name or retry policy, and Decision 2 still forbids a loss or a dup
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B. Also test one fresh runtime and name: pause
-   the first observation immediately before acquiring the mutex used to enqueue its pair, complete a drain
+   the first observation immediately before it first acquires a ledger mutex, complete a drain
    through a registry bound to that same runtime, resume the observation, then complete another drain.
    Exactly one row exists; rereading the name and draining adds none. Mutation: publishing the pending flag
    before acquiring that mutex and enqueueing lets the overlapping drain clear the flag too early, and the
@@ -976,14 +994,20 @@ value length, name or retry policy, and Decision 2 still forbids a loss or a dup
    and complete the first drain, then complete another drain. The store holds exactly one row each for K
    and L; rereading L and draining adds none. Mutation: clearing the pending flag again after the append
    loop erases L's publication, and L is stranded. Also pause a first observation of one fresh name just
-   after its seen-set step has released its lock, complete a second observation of that name through a
+   after it first releases a ledger mutex, complete a second observation of that name through a
    clone of the same runtime, then resume and complete the first. One bound drain completes: exactly one
    row exists; rereading the name and draining adds none. Mutation: checking the seen set and inserting
    under separate lock acquisitions, ignoring the insertion's result, lets both observations enqueue and
    the store holds two rows.
 4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
    A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
-   through the bound registry.
+   through the bound registry. A secondary runtime S over one store and its `core()` handle over a
+   different main store each get a bound registry. A fresh name read only through S: the core registry
+   drains first and the main store gains no row, then S's registry drains and S's store holds exactly one.
+   A second fresh name read through two separate `core()` handles of S, and never through S: after the
+   core registry drains, the main store holds exactly one row for it and S's store none. Mutations: give
+   the core handle S's own ledger (the first name lands in the main store); give each `core()` call a
+   fresh ledger (the second name gets two rows).
 5. **Process scope.** In a process with one bound registry, a coordinated search and a bridge request
    exercise all three process-scope accessors. Neither drains a ledger itself (the coordinated path,
    `dispatch.rs:268`, has no drain, and a forwarded bridge request returns at `bridge.rs:542-557` without a
