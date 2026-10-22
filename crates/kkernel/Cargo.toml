@@ -77,7 +77,7 @@ inventory = { workspace = true }
 khive-db = { version = "0.14.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-template = { version = "0.14.0", path = "../khive-pack-template" }
 libc = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
