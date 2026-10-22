@@ -918,10 +918,13 @@ use config names that no other fixture uses. Each mutation must compile and turn
    exactly one. Mutation: restore the process-wide queue; B's store gains A's row.
 2. **Cardinality.** Further reads and dispatches in A add no row. B then reads the same, already cached
    name and dispatches: B's store gains exactly one row. Mutation: observe inside `get_or_init`; B's row
-   is absent. In a third runtime C, two distinct names K and L are observed before one drain, a new name
-   M after it, then K, L and M again with a dispatch between each: C's store holds exactly one row for
-   each of K, L and M. Mutation: replace the ledger's set of seen names with one seen-anything flag; the
-   rows for L and M are absent. Runtimes D and E are constructed independently with
+   is absent. In a third runtime C, two distinct names K and L are observed before one drain; right after
+   that completed drain, before any other name is observed, C's store holds exactly one row for K and one
+   for L. A new name M is then observed, then K, L and M again with a dispatch between each: C's store
+   holds exactly one row for each of K, L and M. Mutations: replace the ledger's set of seen names with one
+   seen-anything flag (the rows for L and M are absent); drain only one entry per dispatch and re-arm the
+   flag while entries remain (after the first drain, K or L has no row). Runtimes D and E are constructed
+   independently with
    `KhiveRuntime::from_backend` over the same prepared `Arc<StorageBackend>`, with the same namespace and
    actor. D observes a fresh name; E observes that cached name before either drains. After D's completed
    drain their shared store holds exactly one row for that name; after E's completed drain it holds exactly
