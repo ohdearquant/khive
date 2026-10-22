@@ -964,7 +964,12 @@ value length, name or retry policy, and Decision 2 still forbids a loss or a dup
    wait that long.
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
-   cleared by either registry; A's row is lost or lands in B.
+   cleared by either registry; A's row is lost or lands in B. Also test one fresh runtime and name: pause
+   the first observation immediately before acquiring the mutex used to enqueue its pair, complete a drain
+   through a registry bound to that same runtime, resume the observation, then complete another drain.
+   Exactly one row exists; rereading the name and draining adds none. Mutation: publishing the pending flag
+   before acquiring that mutex and enqueueing lets the overlapping drain clear the flag too early, and the
+   pair is stranded.
 4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
    A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
    through the bound registry.
