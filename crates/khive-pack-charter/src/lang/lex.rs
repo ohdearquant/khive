@@ -6,6 +6,9 @@
 
 use super::Diagnostic;
 
+pub(super) const MAX_SOURCE_BYTES: usize = 1_048_576;
+const MAX_NESTING_DEPTH: usize = 64;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Word(String),
@@ -30,6 +33,13 @@ pub struct Line {
 }
 
 pub fn lex(source: &str) -> Result<Vec<Line>, Vec<Diagnostic>> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(vec![Diagnostic::new(
+            1,
+            "source_too_large",
+            format!("source exceeds the {} byte limit", MAX_SOURCE_BYTES),
+        )]);
+    }
     let mut lines = Vec::new();
     let mut errors = Vec::new();
     for (index, raw) in source.lines().enumerate() {
@@ -137,7 +147,14 @@ fn lex_line(text: &str, number: usize) -> Result<Vec<Tok>, Diagnostic> {
                             'h' => 3_600,
                             _ => 86_400,
                         };
-                        toks.push(Tok::Duration(value.saturating_mul(scale)));
+                        let seconds = value.checked_mul(scale).ok_or_else(|| {
+                            Diagnostic::new(
+                                number,
+                                "duration_range",
+                                "duration literal is out of range",
+                            )
+                        })?;
+                        toks.push(Tok::Duration(seconds));
                         i += 1;
                     }
                     Some(u) if u.is_ascii_alphabetic() || u == '_' => {
@@ -196,6 +213,21 @@ pub struct Node {
 /// Build the indentation tree. A child block is every following line indented deeper than its
 /// parent; a dedent must return to an indent already in use.
 pub fn tree(lines: Vec<Line>) -> Result<Vec<Node>, Vec<Diagnostic>> {
+    let mut levels = Vec::new();
+    for line in &lines {
+        while levels.last().is_some_and(|indent| *indent >= line.indent) {
+            levels.pop();
+        }
+        levels.push(line.indent);
+        if levels.len() > MAX_NESTING_DEPTH {
+            return Err(vec![Diagnostic::new(
+                line.number,
+                "nesting_too_deep",
+                format!("source nesting exceeds the {MAX_NESTING_DEPTH} level limit"),
+            )]);
+        }
+    }
+
     let mut iter = lines.into_iter().peekable();
     let mut errors = Vec::new();
     let nodes = block(&mut iter, None, &mut errors);

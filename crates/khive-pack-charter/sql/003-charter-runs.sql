@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     assurance TEXT NOT NULL DEFAULT 'recording_only' CHECK (assurance = 'recording_only'),
     state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'terminated', 'cancelled', 'superseded', 'invalidated', 'failed')),
     parent_run_id TEXT,
+    terminal_outcome TEXT,
     current_phase_id TEXT,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(revision) = 'integer' AND revision >= 0),
     created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
@@ -57,4 +58,11 @@ CREATE TRIGGER IF NOT EXISTS charter_runs_no_delete
 BEFORE DELETE ON charter_runs
 BEGIN
     SELECT RAISE(ABORT, 'charter run identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS charter_runs_parent_immutable
+BEFORE UPDATE ON charter_runs
+WHEN NEW.parent_run_id IS NOT OLD.parent_run_id
+BEGIN
+    SELECT RAISE(ABORT, 'charter run parent is immutable');
 END;
