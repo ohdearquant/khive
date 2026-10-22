@@ -150,6 +150,12 @@ build, `make build-local`, enables all three). A build without one does not link
 absent from the pack list the server reports, and naming it in `--pack` or `KHIVE_PACKS` is refused
 as an unknown pack.
 
+Two command-line features are also off by default and on in the operator build. `kg-adapters`
+adds JSON, NDJSON, CSV, TSV and BibTeX input to `kkernel kg import`; without it `kg import` reads
+native khive-kg archives and refuses any other format, named or inferred from the file extension,
+before it reads the source. `repo-showcase` adds `kkernel repo export` and `kkernel repo build`,
+which write offline repository showcase bundles.
+
 ## Where this sits
 
 `kkernel` sits at the top of the storage dependency chain — it depends on every pack crate

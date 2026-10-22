@@ -109,14 +109,16 @@ build:
 # The same applies at runtime to any KHIVE_PACKS naming `formal` or `moodboard`.
 # pack-agent, pack-telemetry and pack-web are off in the default build as well;
 # this recipe enables them so an operator's installed binary keeps every pack it
-# linked before they became optional.
+# linked before they became optional. kg-adapters and repo-showcase keep the
+# non-native `kg import` formats and the `repo export` / `repo build` commands
+# in the installed binary for the same reason.
 build-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-agent, pack-telemetry, pack-web, pack-formal, pack-moodboard)..."
+	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-agent, pack-telemetry, pack-web, pack-formal, pack-moodboard, kg-adapters, repo-showcase)..."
 	@python3 scripts/build_local_artifact.py \
 		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
-		--features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard \
+		--features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase \
 		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
 # Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a
