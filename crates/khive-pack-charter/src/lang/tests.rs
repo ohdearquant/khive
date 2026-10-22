@@ -24,7 +24,6 @@ const REPLY_AFTER_VERIFICATION: &str =
     include_str!("../../tests/fixtures/reply_after_verification.charter");
 const PR_MERGE_AFTER_CI_GATE: &str =
     include_str!("../../tests/fixtures/pr_merge_after_ci_gate.charter");
-const PR_MERGE_VOCAB: &str = include_str!("../../vocab/pr_merge.vocab");
 
 const HEADER: &str = "charter probe v1\nsubject pull_request\nroles:\n    author\n";
 
@@ -148,6 +147,7 @@ fn the_workflow_fixtures_compile() {
         DIRECTIVE_RELAY,
         PR_GATE_JOB_LAUNCH,
         REPLY_AFTER_VERIFICATION,
+        PR_MERGE_AFTER_CI_GATE,
     ] {
         let compiled = compile(source, &registry).unwrap_or_else(|e| panic!("{e:?}\n{source}"));
         assert!(compiled.definition_digest.starts_with("blake3:"));
@@ -156,19 +156,6 @@ fn the_workflow_fixtures_compile() {
             compiled.gate_registry_digest
         );
     }
-
-    let mut registry = Registry::core();
-    let vocabulary = parse_vocabulary_source(PR_MERGE_VOCAB).expect("pr_merge vocabulary");
-    registry
-        .add(&vocabulary)
-        .expect("register pr_merge vocabulary");
-    let compiled = compile(PR_MERGE_AFTER_CI_GATE, &registry)
-        .unwrap_or_else(|e| panic!("{e:?}\n{PR_MERGE_AFTER_CI_GATE}"));
-    assert!(compiled.definition_digest.starts_with("blake3:"));
-    assert_eq!(
-        compiled.definition.gate_registry_digest,
-        compiled.gate_registry_digest
-    );
 }
 
 #[test]

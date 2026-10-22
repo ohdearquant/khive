@@ -754,8 +754,8 @@ fn check_topology(
 
     let bounded: Vec<bool> = phases.iter().map(|p| p.max_rounds.is_some()).collect();
     let mut redirect_cycle = None;
-    for i in 0..phases.len() {
-        if bounded[i] {
+    for (i, &is_bounded) in bounded.iter().enumerate() {
+        if is_bounded {
             if let Err(cycle) = resolve_exhausted(i, &redirects) {
                 redirect_cycle = Some(cycle);
                 break;
