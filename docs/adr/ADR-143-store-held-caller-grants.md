@@ -643,3 +643,11 @@ permanent design.
 The first two refusal controls must fail if cross-actor selection merely trusts
 `AllowAllGate` or promotes explicit namespace visibility into a grant. Passing
 these local-policy tests does not satisfy the store-held grant acceptance above.
+
+## Amendment 2 (2026-10-22): the `RecordObservation` standing right
+
+Status: Accepted. ADR-193 Amendment 5 adds one constrained right type to the caller-right vocabulary:
+`RecordObservation`, a standing right to record charter observations of named kinds for an exact typed
+subject selection. It is administered through §2's grant surface under the same attenuation rule, its
+changes are recorded under §4a, and it is not consumed by use. Its fields, matching rules, lifecycle
+and bootstrap are stated in ADR-193 Amendment 5 D1, D4, D6 and D7. No other right changes.
