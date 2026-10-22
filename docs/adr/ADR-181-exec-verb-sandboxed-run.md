@@ -1584,7 +1584,10 @@ Added arms:
       deadline by less than the time the clone took: it is refused the same way and leaves no staging or run directory
       and no digest in any receipt. In both copy-then-digest cases the refusal is observed while the timing seam still
       holds the staged digest, before the seam releases it to complete; awaiting the staged digest without a deadline
-      guard and checking expiry only after it completes turns the clone repeat red.
+      guard and checking expiry only after it completes turns the clone repeat red. Both cases run on a controlled budget
+      clock: the test holds that clock at the deadline set before the open and requires the refusal before any further
+      advance, then advances it to the planned release. A digest guard whose deadline lies anywhere after the original
+      one (a grace period for the digest alone) is not ready at the held instant and turns the case red.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
