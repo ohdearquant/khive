@@ -343,7 +343,7 @@ async fn store_publishes_at_byte_limit_and_refuses_over_limit_before_put() {
     // Newlines occupy one input byte but two serialized bytes. Test the JSON
     // budget, including escaping, rather than an input-string length limit.
     entry.path = "\n".repeat(path_bytes / 2);
-    if path_bytes % 2 != 0 {
+    if !path_bytes.is_multiple_of(2) {
         entry.path.push('x');
     }
     assert_eq!(
