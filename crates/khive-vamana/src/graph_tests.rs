@@ -5,6 +5,20 @@ fn make_line_vectors(n: usize) -> Vec<f32> {
 }
 
 #[test]
+fn medoid_sample_spans_the_whole_input() {
+    // Rows lie on a line in order. A uniform sample has its mean near the middle,
+    // so the medoid lands near the middle row; a sample taken mostly from the
+    // first rows would put it near the start.
+    let n = 10 * MEDOID_SAMPLE_K;
+    let vectors = make_line_vectors(n);
+    let medoid = select_medoid(&vectors, 1, n).unwrap() as usize;
+    assert!(
+        (n * 4 / 10..=n * 6 / 10).contains(&medoid),
+        "medoid {medoid} of {n} ordered rows is not near the middle"
+    );
+}
+
+#[test]
 fn visited_set_marks_first_visit_only() {
     let mut vs = VisitedSet::new(10);
     assert!(vs.mark_if_new(3));

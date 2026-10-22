@@ -1028,11 +1028,11 @@ fn select_medoid(vectors: &[f32], dimensions: usize, num_vectors: usize) -> Resu
     let sample_count = MEDOID_SAMPLE_K.min(num_vectors);
 
     let mut indices: Vec<usize> = (0..num_vectors).collect();
-    indices.partial_shuffle(&mut rng, sample_count);
-    let sample = &indices[..sample_count];
+    // The selected elements are the returned slice, which rand places at the end.
+    let (sample, _) = indices.partial_shuffle(&mut rng, sample_count);
 
     let mut mean = vec![0.0f32; dimensions];
-    for &idx in sample {
+    for &idx in sample.iter() {
         let v = row(vectors, dimensions, idx as u32);
         for (m, x) in mean.iter_mut().zip(v.iter()) {
             *m += x;
