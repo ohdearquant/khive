@@ -383,11 +383,13 @@ pub(super) async fn resolve_serving_profile(
     if let Some(profile_id) = brain_profile {
         return Some(profile_id.clone());
     }
-    khive_brain_core::resolve_consumer_profile(
+    // Boxed for the same reason as the profile load: the resolution
+    // dispatches through the registry.
+    Box::pin(khive_brain_core::resolve_consumer_profile(
         registry,
         token,
         khive_brain_core::ConsumerKind::Recall,
-    )
+    ))
     .await
 }
 
