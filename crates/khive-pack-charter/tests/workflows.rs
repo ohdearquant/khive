@@ -638,6 +638,14 @@ async fn observations_and_starts_are_checked_against_the_registry() {
             },
             "reserved",
         ),
+        (
+            {
+                let mut p = base("pull_request.opened");
+                p["producer"] = json!("store");
+                p
+            },
+            "reserved",
+        ),
     ];
     for (params, code) in cases {
         let err = f.refused("charter.observe", params).await;

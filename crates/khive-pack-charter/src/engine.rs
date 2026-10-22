@@ -25,6 +25,8 @@ use crate::lang::{canonical_json, digest};
 
 /// The producer recorded on observations the engine writes itself.
 pub const ENGINE_PRODUCER: &str = "charter";
+/// The producer recorded on observations `charter.sample` reads from the store.
+pub const STORE_PRODUCER: &str = "store";
 const STEP_LIMIT: usize = 4_096;
 
 #[derive(Clone, Debug)]

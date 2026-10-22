@@ -1629,9 +1629,9 @@ impl CharterPack {
         let producer = params
             .opt_str("producer")?
             .unwrap_or_else(|| scope.actor.clone());
-        if producer == crate::engine::ENGINE_PRODUCER {
+        if producer == crate::engine::ENGINE_PRODUCER || producer == crate::engine::STORE_PRODUCER {
             return Err(params.invalid(format!(
-                "producer {producer:?} is reserved for the engine's own observations"
+                "producer {producer:?} is reserved for observations the charter pack records itself"
             )));
         }
         let event_id = params
@@ -1710,7 +1710,8 @@ impl CharterPack {
             )));
         }
 
-        let sampled = json!({"kind": kind, "outcome": outcome, "producer": "store"});
+        let sampled =
+            json!({"kind": kind, "outcome": outcome, "producer": crate::engine::STORE_PRODUCER});
         self.commit_observation(
             params.verb.clone(),
             scope,
@@ -1725,7 +1726,7 @@ impl CharterPack {
                 detail: Map::new(),
                 generation: None,
                 only_charter: None,
-                producer: "store".to_owned(),
+                producer: crate::engine::STORE_PRODUCER.to_owned(),
                 event_id: uuid::Uuid::new_v4().to_string(),
                 sampled: Some(sampled),
             },
