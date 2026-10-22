@@ -1573,14 +1573,16 @@ Added arms:
       `time_cap_ms`. A source open held past `binary_digest_timeout_s` (a test seam that holds the opener after the
       conditions of item 5 and before it returns a source handle) is refused with `binary_digest_time_limit` while the
       seam still holds the opener. With a source open delayed but completing before the deadline set before the open, a
-      byte copy that finishes before that deadline, followed by a digest of the staged copy that crosses it but would
-      finish inside a deadline restarted after the open (a timing test seam), is refused with
+      byte copy that finishes before that deadline, followed by a digest of the staged copy that crosses it by less
+      than the time the byte copy took and would finish inside a deadline restarted after the open (a timing test
+      seam), is refused with
       `binary_digest_time_limit`. None of the five leaves a staging or run directory or a digest in any receipt. With
       clones available, a clone held past the deadline set before the open (a test seam that holds the clone after the
       source handle is returned) is refused with `binary_digest_time_limit` while the seam still holds the clone, and
       leaves no staging or run directory and no digest in any receipt. The copy-then-digest case is repeated with clones
-      available and a clone that finishes before the deadline in place of the byte copy: it is refused the same way and
-      leaves no staging or run directory and no digest in any receipt.
+      available and a clone that finishes before the deadline in place of the byte copy, the digest crossing the
+      deadline by less than the time the clone took: it is refused the same way and leaves no staging or run directory
+      and no digest in any receipt.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
@@ -1595,6 +1597,8 @@ Added arms:
     a deadline of its own, restarted after the copy, or restarting the deadline once the source handle is returned,
     turns the copy-then-digest case red; awaiting the clone outside the deadline's guard turns the clone-hold case
     red; restarting the deadline once a clone completes turns the clone repeat of the copy-then-digest case red;
+    carrying the time that remained before the copy or the clone began past its end, as a deadline restarted then,
+    turns the copy-then-digest case or its clone repeat red;
     removing the staging directory only when a spawned run ends turns the tree-load case red; and removing the staging
     directory under the run directory's `keep` condition turns the kept-run case red.
 62. **Registration and stored digests.** `tool.register` refuses `network` without `executable_digest`,
