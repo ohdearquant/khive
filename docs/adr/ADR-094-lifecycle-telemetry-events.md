@@ -936,11 +936,17 @@ use config names that no other fixture uses. Each mutation must compile and turn
    dispatches once more after its first completed drain and before E drains: their store still holds
    exactly one row for N and none for Q. Mutation: intern only pending state while keeping runtime-local
    seen sets, and drain one queued entry per distinct name that the draining runtime has seen (D's second
-   drain writes E's N, two rows before E dispatches). In a further pair D2 and E2
-   built the same way, only D2 has a registry bound with `with_runtime_event_store`, and only E2 observes a
-   fresh name R. After D2's completed drain their store holds no row for R; after a registry bound to E2
-   dispatches and drains, it holds exactly one. Mutation: a backend-shared pending queue drained by whichever
-   bound registry dispatches next (D2's drain writes R).
+   drain writes E's N, two rows before E dispatches). In a further pair D2 and E2 built the same way, only
+   D2 has a registry bound with `with_runtime_event_store`, and only E2 observes a fresh name R. After D2's
+   completed drain their store holds no row for R; after a registry bound to E2 dispatches and drains, it
+   holds exactly one. Mutation: a backend-shared pending queue drained by whichever bound registry
+   dispatches next (D2's drain writes R). Last, a fresh pair D3 and E3 built the same way, both bound, runs
+   a seeded schedule of at least 200 steps, each step one of: D3 or E3 observes a name drawn from a pool of
+   four fresh names, or D3 or E3 dispatches once. After every completed drain, the store's row count for
+   each name equals the count from a reference model in which each runtime keeps its own seen set and its
+   own pending entries and a drain writes only the draining runtime's entries; a failure reports the seed
+   and the step. Mutation: each pending-state mutation named in this arm diverges from the model at some
+   step of the fixed seed.
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B.
