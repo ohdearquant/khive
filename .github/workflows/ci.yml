@@ -1660,6 +1660,16 @@ jobs:
         run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
       - name: Run the server suites that need an optional pack
         run: cargo test -p khive-mcp --features pack-agent,pack-telemetry,pack-web --locked --test mcp_mount_fixture --test mounts --test telemetry_activation --test web_backend_routing
+      # kg-adapters and repo-showcase are off by default, so the ci job runs only the
+      # refusal side of kg import and none of the repo commands. This step runs the
+      # import adapter and repository showcase suites with both features on.
+      - name: Run the kg import adapter and repository showcase suites
+        run: cargo test -p kkernel --features kg-adapters,repo-showcase --locked --lib --test kg_import_csv --test kg_import_bibtex --test kg_import_schema --test kg_import_conflicts --test repo_showcase_cli
+      # blob-s3 is off by default, so the ci job runs only the refusal side of an S3
+      # store configuration, and the MinIO job runs only the conformance suite. This
+      # step runs the S3 store, configuration and server library tests.
+      - name: Run the S3 blob store library tests
+        run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}

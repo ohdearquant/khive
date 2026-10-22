@@ -115,7 +115,7 @@ const GENERATION: ParamDef = param(
     "generation",
     "string",
     false,
-    "The subject's current generation (a pull request head, a release candidate). charter.start, or an observation of a trigger the subject kind lists under new_generation, moves the subject to a new value and a new epoch; any other observation is recorded at the generation it names and counts only while the subject is there.",
+    "The subject's current generation (a pull request head, a release candidate). charter.start records it for a subject seen for the first time and refuses one that differs from the generation an existing subject is at. Only an observation of a trigger the subject kind lists under new_generation moves the subject to a new value and a new epoch; any other observation is recorded at the generation it names and counts only while the subject is there.",
 );
 const REQUEST_ID: ParamDef = param(
     "request_id",
@@ -146,7 +146,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "charter.publish",
-        description: "Compile and store a charter version. Republishing identical source is a no-op; a different definition under a published version is refused. Every performed charter must already be published.",
+        description: "Compile and store a charter version. Republishing identical source is a no-op; a different definition under a published version is refused. Every performed charter must already be published, on the same subject kind.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[SOURCE, DOMAIN, REQUEST_ID],
@@ -186,8 +186,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 12] = [
             param("outcome", "string", false, "One of the entry's outcomes; may be omitted when the entry has exactly one."),
             param("args", "object", false, "Arguments the entry declares, e.g. {\"branch\": \"main\"}."),
             param("detail", "object", false, "Free-form detail stored with the observation."),
-            param("producer", "string", false, "Who observed it; default the caller's actor."),
-            param("event_id", "string", false, "Source event id; a repeat with the same producer, kind and event id is recorded once."),
+            param("event_id", "string", false, "Source event id; a repeat from the same caller with the same kind and event id is recorded once. The caller's actor is the observation's producer."),
             GENERATION,
             param("charter", "string", false, "Only advance this charter's open run on the subject."),
             DOMAIN,
@@ -321,7 +320,7 @@ impl CharterPack {
             .reader()
             .await?
             .query_row(stmt(
-                include_str!("../sql/engine/subject-get.sql"),
+                include_str!("../sql/subject-get.sql"),
                 vec![text(&subject_kind), text(&subject_ref)],
             ))
             .await?
@@ -367,7 +366,7 @@ impl CharterPack {
                     .reader()
                     .await?
                     .query_row(stmt(
-                        include_str!("../sql/engine/definition-get.sql"),
+                        include_str!("../sql/definition-get.sql"),
                         vec![
                             text(&scope.domain),
                             text(&charter),
@@ -382,7 +381,7 @@ impl CharterPack {
                     .reader()
                     .await?
                     .query_row(stmt(
-                        include_str!("../sql/engine/definition-latest.sql"),
+                        include_str!("../sql/definition-latest.sql"),
                         vec![text(&scope.domain), text(&charter)],
                     ))
                     .await?
@@ -698,7 +697,7 @@ async fn registry_sources<R: SqlReader + ?Sized>(
 ) -> StorageResult<Vec<String>> {
     let rows = reader
         .query_all(stmt(
-            include_str!("../sql/engine/vocabularies-list.sql"),
+            include_str!("../sql/vocabularies-list.sql"),
             vec![text(domain), text(namespaces)],
         ))
         .await?;
@@ -755,7 +754,7 @@ async fn registry_for_run<R: SqlReader + ?Sized>(
 ) -> StorageResult<Registry> {
     let row = reader
         .query_row(stmt(
-            include_str!("../sql/engine/definition-source-for-run.sql"),
+            include_str!("../sql/definition-source-for-run.sql"),
             vec![text(run_id)],
         ))
         .await?;
@@ -901,7 +900,7 @@ fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
         Box::pin(async move {
             let held = writer
                 .query_row(stmt(
-                    include_str!("../sql/engine/command-get.sql"),
+                    include_str!("../sql/command-get.sql"),
                     vec![
                         text(&command.scope.actor),
                         text(&command.request_id),
@@ -948,7 +947,7 @@ fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
                 .or_else(|| result["cancelled"].as_str());
             writer
                 .execute(stmt(
-                    include_str!("../sql/engine/command-insert.sql"),
+                    include_str!("../sql/command-insert.sql"),
                     vec![
                         text(&command.scope.domain),
                         text(&command.scope.actor),
@@ -974,10 +973,7 @@ async fn run_snapshot<R: SqlReader + ?Sized>(
     run_id: &str,
 ) -> StorageResult<Value> {
     let run = reader
-        .query_row(stmt(
-            include_str!("../sql/engine/run-get.sql"),
-            vec![text(run_id)],
-        ))
+        .query_row(stmt(include_str!("../sql/run-get.sql"), vec![text(run_id)]))
         .await?
         .ok_or_else(|| StorageError::Internal(format!("charter run {run_id} disappeared")))?;
     if col_text(&run, "policy_domain")? != domain || col_text(&run, "namespace")? != namespace {
@@ -987,7 +983,7 @@ async fn run_snapshot<R: SqlReader + ?Sized>(
     }
     let phases = reader
         .query_all(stmt(
-            include_str!("../sql/engine/phases-for-run.sql"),
+            include_str!("../sql/phases-for-run.sql"),
             vec![text(domain), text(run_id)],
         ))
         .await?;
@@ -1047,7 +1043,7 @@ impl CharterPack {
         let mut reader = self.runtime.sql().reader().await?;
         let held = reader
             .query_row(stmt(
-                include_str!("../sql/engine/command-get.sql"),
+                include_str!("../sql/command-get.sql"),
                 vec![
                     text(&command.scope.actor),
                     text(&command.request_id),
@@ -1104,7 +1100,7 @@ impl CharterPack {
                         let subject_row = engine
                             .writer()
                             .query_row(stmt(
-                                include_str!("../sql/engine/subject-get.sql"),
+                                include_str!("../sql/subject-get.sql"),
                                 vec![text(&subject_kind), text(&subject_ref)],
                             ))
                             .await?;
@@ -1314,14 +1310,33 @@ impl CharterPack {
                     let definition = &compiled.definition;
                     let mut engine = Engine::new(writer, scope.clone());
                     for child in definition.phases.iter().flat_map(|p| p.performs.iter()) {
-                        if engine.latest_definition(child).await?.is_none() {
-                            return Err(refuse(
-                                &verb,
-                                Refusal::new(
-                                    "unpublished_perform",
-                                    format!("perform {child}: publish {child} first"),
-                                ),
-                            ));
+                        match engine.latest_definition(child).await? {
+                            None => {
+                                return Err(refuse(
+                                    &verb,
+                                    Refusal::new(
+                                        "unpublished_perform",
+                                        format!("perform {child}: publish {child} first"),
+                                    ),
+                                ));
+                            }
+                            // A child run is attached to its parent's subject, so a child declared
+                            // for another subject kind could never be admitted by `charter.start`.
+                            Some((_, _, child_definition))
+                                if child_definition.subject != definition.subject =>
+                            {
+                                return Err(refuse(
+                                    &verb,
+                                    Refusal::new(
+                                        "perform_subject_mismatch",
+                                        format!(
+                                            "perform {child}: {child} runs on {} subjects, this charter on {}",
+                                            child_definition.subject, definition.subject
+                                        ),
+                                    ),
+                                ));
+                            }
+                            Some(_) => {}
                         }
                     }
                     if let Some(path) = engine.perform_cycle(definition).await? {
@@ -1336,7 +1351,7 @@ impl CharterPack {
                     let held = engine
                         .writer()
                         .query_row(stmt(
-                            include_str!("../sql/engine/definition-get.sql"),
+                            include_str!("../sql/definition-get.sql"),
                             vec![
                                 text(&scope.domain),
                                 text(&definition.id),
@@ -1375,7 +1390,7 @@ impl CharterPack {
                     engine
                         .writer()
                         .execute(stmt(
-                            include_str!("../sql/engine/definition-insert.sql"),
+                            include_str!("../sql/definition-insert.sql"),
                             vec![
                                 text(&scope.domain),
                                 text(&definition.id),
@@ -1425,7 +1440,7 @@ impl CharterPack {
                     })?;
                     let rows = writer
                         .query_all(stmt(
-                            include_str!("../sql/engine/vocabularies-list.sql"),
+                            include_str!("../sql/vocabularies-list.sql"),
                             vec![text(&scope.domain), text(&namespaces)],
                         ))
                         .await?;
@@ -1463,7 +1478,7 @@ impl CharterPack {
                     })?;
                     writer
                         .execute(stmt(
-                            include_str!("../sql/engine/vocabulary-insert.sql"),
+                            include_str!("../sql/vocabulary-insert.sql"),
                             vec![
                                 text(&scope.domain),
                                 text(&parsed.name),
@@ -1518,7 +1533,7 @@ impl CharterPack {
                                 engine
                                     .writer()
                                     .query_row(stmt(
-                                        include_str!("../sql/engine/definition-get.sql"),
+                                        include_str!("../sql/definition-get.sql"),
                                         vec![
                                             text(&scope.domain),
                                             text(&charter_id),
@@ -1531,7 +1546,7 @@ impl CharterPack {
                                 engine
                                     .writer()
                                     .query_row(stmt(
-                                        include_str!("../sql/engine/definition-latest.sql"),
+                                        include_str!("../sql/definition-latest.sql"),
                                         vec![text(&scope.domain), text(&charter_id)],
                                     ))
                                     .await?
@@ -1640,12 +1655,10 @@ impl CharterPack {
         let namespaces = visible_namespaces_json(token);
         let command = params.command(&scope)?;
         let verb = params.verb.clone();
-        let producer = params
-            .opt_str("producer")?
-            .unwrap_or_else(|| scope.actor.clone());
+        let producer = scope.actor.clone();
         if producer == crate::engine::ENGINE_PRODUCER || producer == crate::engine::STORE_PRODUCER {
             return Err(params.invalid(format!(
-                "producer {producer:?} is reserved for observations the charter pack records itself"
+                "actor {producer:?} is reserved for observations the charter pack records itself"
             )));
         }
         let event_id = params
@@ -2034,7 +2047,7 @@ impl CharterPack {
                         let row = engine
                             .writer()
                             .query_row(stmt(
-                                include_str!("../sql/engine/run-get.sql"),
+                                include_str!("../sql/run-get.sql"),
                                 vec![text(&run_id)],
                             ))
                             .await?;
@@ -2096,7 +2109,7 @@ impl CharterPack {
             .reader()
             .await?
             .query_all(stmt(
-                include_str!("../sql/engine/waiting.sql"),
+                include_str!("../sql/waiting.sql"),
                 vec![
                     text(&params.domain()?),
                     text(&visible_namespaces_json(token)),
@@ -2177,7 +2190,7 @@ impl CharterPack {
         let mut reader = self.runtime.sql().reader().await?;
         if let Some(receipt) = reader
             .query_row(stmt(
-                include_str!("../sql/engine/command-get.sql"),
+                include_str!("../sql/command-get.sql"),
                 vec![
                     text(&scope.actor),
                     text(run_id),
@@ -2225,10 +2238,7 @@ impl CharterPack {
     ) -> Result<Value, RuntimeError> {
         let mut reader = self.runtime.sql().reader().await?;
         let run = reader
-            .query_row(stmt(
-                include_str!("../sql/engine/run-get.sql"),
-                vec![text(run_id)],
-            ))
+            .query_row(stmt(include_str!("../sql/run-get.sql"), vec![text(run_id)]))
             .await?;
         let Some(run) = run else {
             return Err(RuntimeError::NotFound(format!("charter run {run_id}")));
@@ -2243,7 +2253,7 @@ impl CharterPack {
         }
         let phases = reader
             .query_all(stmt(
-                include_str!("../sql/engine/phases-for-run.sql"),
+                include_str!("../sql/phases-for-run.sql"),
                 vec![text(domain), text(run_id)],
             ))
             .await?;
@@ -2281,7 +2291,7 @@ impl CharterPack {
         if evidence_limit > 0 {
             let rows = reader
                 .query_all(stmt(
-                    include_str!("../sql/engine/evidence-recent.sql"),
+                    include_str!("../sql/evidence-recent.sql"),
                     vec![
                         text(domain),
                         text(run_id),
@@ -2319,7 +2329,7 @@ impl CharterPack {
             .reader()
             .await?
             .query_all(stmt(
-                include_str!("../sql/engine/runs-list.sql"),
+                include_str!("../sql/runs-list.sql"),
                 vec![
                     text(&params.domain()?),
                     text(&visible_namespaces_json(token)),
@@ -2354,13 +2364,13 @@ impl CharterPack {
         let mut reader = self.runtime.sql().reader().await?;
         let charters = reader
             .query_all(stmt(
-                include_str!("../sql/engine/definitions-list.sql"),
+                include_str!("../sql/definitions-list.sql"),
                 vec![text(&domain), text(&namespaces)],
             ))
             .await?;
         let vocabularies = reader
             .query_all(stmt(
-                include_str!("../sql/engine/vocabularies-list.sql"),
+                include_str!("../sql/vocabularies-list.sql"),
                 vec![text(&domain), text(&namespaces)],
             ))
             .await?;
