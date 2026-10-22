@@ -121,7 +121,9 @@ impl HnswIndex {
         // Initialize RNG - seeded if config.seed is Some, otherwise from entropy
         let rng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
-            None => StdRng::from_entropy(),
+            None => {
+                StdRng::try_from_rng(&mut rand::rngs::SysRng).expect("OS randomness unavailable")
+            }
         };
 
         let dims = config.dimensions;

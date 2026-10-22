@@ -1,12 +1,12 @@
 use khive_vamana::{VamanaConfig, VamanaError, VamanaIndex};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 fn corpus(rows: usize, dimensions: usize) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(0x110a_110a);
     let mut vectors = Vec::with_capacity(rows * dimensions);
     for _ in 0..rows {
         let mut vector: Vec<f32> = (0..dimensions)
-            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .map(|_| rng.random_range(-1.0f32..1.0))
             .collect();
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         for value in &mut vector {

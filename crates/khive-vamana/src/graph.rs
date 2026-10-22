@@ -1099,7 +1099,7 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
             let mut neighbors: Vec<u32> = Vec::with_capacity(count);
             shuffle_swaps.clear();
             for k in 0..count {
-                let j = rng.gen_range(k..available);
+                let j = rng.random_range(k..available);
                 pool.swap(k, j);
                 shuffle_swaps.push((k, j));
                 neighbors.push(pool[k]);

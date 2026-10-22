@@ -178,7 +178,9 @@ fn build_creates_bounded_degree_graph() {
     let mut rng = StdRng::seed_from_u64(42);
     let n = 50usize;
     let dim = 8usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -197,7 +199,9 @@ fn build_is_deterministic_for_same_input() {
     let mut rng = StdRng::seed_from_u64(77);
     let n = 30usize;
     let dim = 4usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -226,7 +230,9 @@ fn build_alpha_one_two_passes_are_not_idempotent_at_scale() {
     let dim = 384usize;
     let n = 250usize;
     let mut rng = StdRng::seed_from_u64(1000);
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -255,7 +261,9 @@ fn build_sq8_alpha_one_two_passes_are_not_idempotent_at_scale() {
     let dim = 384usize;
     let n = 250usize;
     let mut rng = StdRng::seed_from_u64(1000);
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let codec = GsSq8Codec::train_flat(&raw, dim);
@@ -317,7 +325,9 @@ fn build_reverse_adj_consistent_with_forward_adjacency() {
     let mut rng = StdRng::seed_from_u64(0x00AD_C052);
     let n = 60usize;
     let dim = 4usize;
-    let raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
 
     let cfg = VamanaConfig::with_dimensions(dim)
         .with_max_degree(8)
