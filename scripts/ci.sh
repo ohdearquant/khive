@@ -453,16 +453,22 @@ phase_daemon_recovery_flake() {
 }
 
 phase_no_default_features() {
-    echo "=== No-Default-Features Check ==="
-    # Check the package alone: workspace feature unification enables fold's
+    echo "=== No-Default-Features Clippy ==="
+    # Lint the package alone: workspace feature unification enables fold's
     # default serde feature through its runtime/pack dependents (#3341).
     if in_scope khive-fold; then
-        cargo check --locked -p khive-fold --no-default-features --lib
+        cargo clippy --locked -p khive-fold --no-default-features --lib -- -D warnings
         cargo test --locked -p khive-fold --no-default-features --test no_default_checkpoint
     else
         echo "scope: khive-fold is not under test; its no-default-features checks skipped"
     fi
-    cargo check --workspace --no-default-features
+    # Workspace dependents also enable khive-types features, hiding no-default test warnings.
+    if in_scope khive-types; then
+        cargo clippy --locked -p khive-types --no-default-features --all-targets -- -D warnings
+    else
+        echo "scope: khive-types is not under test; its no-default-features checks skipped"
+    fi
+    cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 }
 
 # Single source of truth for where the built kkernel binary lives: KKERNEL_BINARY

@@ -97,5 +97,98 @@ else:
                     self.assertEqual(sum(call[0] == "clippy" for call in calls), expected_calls)
 
 
+class NoDefaultFeatureClippyTests(unittest.TestCase):
+    FOLD_CLIPPY = [
+        "clippy", "--locked", "-p", "khive-fold", "--no-default-features",
+        "--lib", "--", "-D", "warnings",
+    ]
+    FOLD_TEST = [
+        "test", "--locked", "-p", "khive-fold", "--no-default-features",
+        "--test", "no_default_checkpoint",
+    ]
+    TYPES_CLIPPY = [
+        "clippy", "--locked", "-p", "khive-types", "--no-default-features",
+        "--all-targets", "--", "-D", "warnings",
+    ]
+    WORKSPACE_CLIPPY = [
+        "clippy", "--workspace", "--all-targets", "--no-default-features",
+        "--locked", "--", "-D", "warnings",
+    ]
+
+    def run_phase(self, scope=None, *, fail_call=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            cargo = root / "cargo"
+            calls = root / "calls.jsonl"
+            cargo.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+path = pathlib.Path(os.environ["CARGO_CALL_LOG"])
+before = path.read_text().splitlines() if path.exists() else []
+with path.open("a") as log:
+    log.write(json.dumps(args) + "\n")
+number = len(before) + 1
+if number == int(os.environ["FAIL_CALL"]):
+    print("injected Cargo failure", file=sys.stderr)
+    sys.exit(40 + number)
+''')
+            cargo.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "CARGO_CALL_LOG": str(calls),
+                "FAIL_CALL": str(fail_call),
+            }
+            env.pop("TEST_SCOPE", None)
+            env.pop("CI_SH_TEST_FAIL_PHASE", None)
+            if scope is not None:
+                env["TEST_SCOPE"] = scope
+            result = subprocess.run(
+                ["sh", str(REPO_ROOT / "scripts" / "ci.sh"), "no-default-features"],
+                env=env, text=True, capture_output=True, timeout=10,
+            )
+            commands = [json.loads(line) for line in calls.read_text().splitlines()]
+            return result, commands
+
+    def test_full_scope_lints_isolated_crates_and_workspace_without_defaults(self):
+        expected = [
+            self.FOLD_CLIPPY, self.FOLD_TEST, self.TYPES_CLIPPY, self.WORKSPACE_CLIPPY,
+        ]
+        for scope in (None, "", "full"):
+            with self.subTest(scope=scope):
+                result, calls = self.run_phase(scope)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, expected)
+
+    def test_scoped_isolated_legs_preserve_workspace_coverage(self):
+        for scope, expected in (
+            ("khive-fold", [self.FOLD_CLIPPY, self.FOLD_TEST]),
+            ("khive-types", [self.TYPES_CLIPPY]),
+            ("khive-types khive-fold", [self.FOLD_CLIPPY, self.FOLD_TEST, self.TYPES_CLIPPY]),
+        ):
+            with self.subTest(scope=scope):
+                result, calls = self.run_phase(scope)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, [*expected, self.WORKSPACE_CLIPPY])
+
+    def test_unrelated_scope_skips_isolated_legs_only(self):
+        result, calls = self.run_phase("khive-fold-extra khive-types-extra khive-merge")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [self.WORKSPACE_CLIPPY])
+        self.assertIn("khive-fold is not under test", result.stdout)
+        self.assertIn("khive-types is not under test", result.stdout)
+
+    def test_each_cargo_failure_propagates_and_stops_the_phase(self):
+        expected = [
+            self.FOLD_CLIPPY, self.FOLD_TEST, self.TYPES_CLIPPY, self.WORKSPACE_CLIPPY,
+        ]
+        for number in range(1, len(expected) + 1):
+            with self.subTest(failing_call=number):
+                result, calls = self.run_phase(fail_call=number)
+                self.assertEqual(result.returncode, 40 + number, result.stderr)
+                self.assertEqual(calls, expected[:number])
+                self.assertIn("injected Cargo failure", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
