@@ -1582,7 +1582,9 @@ Added arms:
       leaves no staging or run directory and no digest in any receipt. The copy-then-digest case is repeated with clones
       available and a clone that finishes before the deadline in place of the byte copy, the digest crossing the
       deadline by less than the time the clone took: it is refused the same way and leaves no staging or run directory
-      and no digest in any receipt.
+      and no digest in any receipt. In both copy-then-digest cases the refusal is observed while the timing seam still
+      holds the staged digest, before the seam releases it to complete; awaiting the staged digest without a deadline
+      guard and checking expiry only after it completes turns the clone repeat red.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
