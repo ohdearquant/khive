@@ -785,9 +785,9 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
 1. For each row state, the by-id entry run on a unit's writer inside `atomic_unit` and `decide` give
    the same answer, in a fixture where the grant under test is the only one matching its actor and
    tool: granted and live (`true`, and `decide` answers `allow` from `grant` with that row id);
-   revoked; expired at `now`; invalidated by a registry change; re-pinned, meaning the same actor and
-   tool with a registration whose id or definition digest differs. The last four answer `false`, and
-   `decide` answers from policy or default.
+   requested; denied; revoked; expired at `now`; invalidated by a registry change; re-pinned, meaning the
+   same actor and tool with a registration whose id or definition digest differs. Every state after the
+   first answers `false`, and `decide` answers from policy or default.
 2. A selected row with a missing or mistyped required column is an error naming the row id when the id is
    readable, otherwise the existing `<unreadable id>` diagnostic, from both the by-id entry and `decide`;
    neither reads it as no grant. Also place a named grant whose expiry is stored as text that still passes
@@ -820,8 +820,13 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    cites the other. Every one of these cases states one rule: the by-id answer depends on the named row
    alone. For each named-grant state in arms 1 to 3, the answer (`true`, `false`, or the error naming the
    grant) with the named grant alone in its namespace equals the answer with a live matching grant beside it
-   at an earlier, the same, and a later `requested_at`, on either side of it under `id ASC`; an
-   implementation that reads any term or any decoded column from another row turns one of these red.
+   at an earlier, the same, and a later `requested_at`, on either side of it under `id ASC`. A stored text
+   `requested_at` sorts after every integer, so no well-formed live companion can sit at the same or a
+   later `requested_at` beside it; for that state, keep the stored-row placements that exist and run the
+   full placement matrix by corrupting only the named row as the decoder receives it (through a supplied
+   reader), over well-typed stored ordering keys. These repetitions check independence for the listed
+   states; that every predicate term and every selected column is read from the named row alone remains a
+   code-review obligation, since a borrowed column that does not change the answer is invisible to them.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
