@@ -773,6 +773,23 @@ async fn a_repeated_event_is_recorded_once() {
 }
 
 #[tokio::test]
+async fn an_observation_records_the_callers_actor_as_its_producer() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+    f.observe("pull_request.opened", None, json!({})).await;
+    let view = f.run(&run).await;
+    let opened: Vec<&Value> = view["evidence"]
+        .as_array()
+        .expect("evidence")
+        .iter()
+        .filter(|e| e["kind"] == "pull_request.opened")
+        .collect();
+    assert_eq!(opened.len(), 1, "{view}");
+    assert_eq!(opened[0]["producer"], "sample-reader", "{view}");
+}
+
+#[tokio::test]
 async fn observations_and_starts_are_checked_against_the_registry() {
     let f = Fixture::new();
     f.publish_review_set().await;
@@ -805,20 +822,38 @@ async fn observations_and_starts_are_checked_against_the_registry() {
                 p["producer"] = json!("charter");
                 p
             },
-            "reserved",
+            "unknown parameter \"producer\"",
         ),
         (
             {
                 let mut p = base("pull_request.opened");
-                p["producer"] = json!("store");
+                p["producer"] = json!("someone-else");
                 p
             },
-            "reserved",
+            "unknown parameter \"producer\"",
         ),
     ];
     for (params, code) in cases {
         let err = f.refused("charter.observe", params).await;
         assert!(err.contains(code), "{code}: {err}");
+    }
+    for actor in ["charter", "store"] {
+        let error = f
+            .registry
+            .dispatch_with_identity(
+                "charter.observe",
+                base("pull_request.opened"),
+                Some(khive_runtime::RequestIdentity {
+                    namespace: "local".to_owned(),
+                    actor_id: Some(actor.to_owned()),
+                    visible_namespaces: vec![],
+                    process_ref: None,
+                    request_id: None,
+                }),
+            )
+            .await
+            .expect_err("a reserved actor cannot submit an observation");
+        assert!(error_text(&error).contains("reserved"), "{actor}: {error}");
     }
     let start = |charter: &str, kind: &str, bindings: Value| json!({"charter": charter, "subject_kind": kind, "subject_ref": PR, "bindings": bindings});
     for (params, code) in [

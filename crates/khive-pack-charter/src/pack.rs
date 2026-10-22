@@ -186,8 +186,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 12] = [
             param("outcome", "string", false, "One of the entry's outcomes; may be omitted when the entry has exactly one."),
             param("args", "object", false, "Arguments the entry declares, e.g. {\"branch\": \"main\"}."),
             param("detail", "object", false, "Free-form detail stored with the observation."),
-            param("producer", "string", false, "Who observed it; default the caller's actor."),
-            param("event_id", "string", false, "Source event id; a repeat with the same producer, kind and event id is recorded once."),
+            param("event_id", "string", false, "Source event id; a repeat from the same caller with the same kind and event id is recorded once. The caller's actor is the observation's producer."),
             GENERATION,
             param("charter", "string", false, "Only advance this charter's open run on the subject."),
             DOMAIN,
@@ -1656,12 +1655,10 @@ impl CharterPack {
         let namespaces = visible_namespaces_json(token);
         let command = params.command(&scope)?;
         let verb = params.verb.clone();
-        let producer = params
-            .opt_str("producer")?
-            .unwrap_or_else(|| scope.actor.clone());
+        let producer = scope.actor.clone();
         if producer == crate::engine::ENGINE_PRODUCER || producer == crate::engine::STORE_PRODUCER {
             return Err(params.invalid(format!(
-                "producer {producer:?} is reserved for observations the charter pack records itself"
+                "actor {producer:?} is reserved for observations the charter pack records itself"
             )));
         }
         let event_id = params
