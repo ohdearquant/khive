@@ -932,7 +932,11 @@ use config names that no other fixture uses. Each mutation must compile and turn
    backend identity while keeping runtime-local seen sets (two rows for N after D's drain), or intern only
    pending state and drain one entry per distinct name per dispatch, re-arming while entries remain (D's
    drain writes Q). Repeat D and E with E observing Q before N; the same counts hold, so a drain of the
-   longest queue prefix without a repeated name still writes Q during D's drain. In a further pair D2 and E2
+   longest queue prefix without a repeated name still writes Q during D's drain. In each order, D then
+   dispatches once more after its first completed drain and before E drains: their store still holds
+   exactly one row for N and none for Q. Mutation: intern only pending state while keeping runtime-local
+   seen sets, and drain one queued entry per distinct name that the draining runtime has seen (D's second
+   drain writes E's N, two rows before E dispatches). In a further pair D2 and E2
    built the same way, only D2 has a registry bound with `with_runtime_event_store`, and only E2 observes a
    fresh name R. After D2's completed drain their store holds no row for R; after a registry bound to E2
    dispatches and drains, it holds exactly one. Mutation: a backend-shared pending queue drained by whichever
