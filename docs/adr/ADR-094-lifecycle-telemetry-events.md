@@ -969,7 +969,11 @@ value length, name or retry policy, and Decision 2 still forbids a loss or a dup
    through a registry bound to that same runtime, resume the observation, then complete another drain.
    Exactly one row exists; rereading the name and draining adds none. Mutation: publishing the pending flag
    before acquiring that mutex and enqueueing lets the overlapping drain clear the flag too early, and the
-   pair is stranded.
+   pair is stranded. Also observe fresh K on one runtime, pause a bound drain after it takes K and before
+   it finishes its `ConfigLocked` appends, complete the observation of fresh L on that same runtime, resume
+   and complete the first drain, then complete another drain. The store holds exactly one row each for K
+   and L; rereading L and draining adds none. Mutation: clearing the pending flag again after the append
+   loop erases L's publication, and L is stranded.
 4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
    A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
    through the bound registry.
