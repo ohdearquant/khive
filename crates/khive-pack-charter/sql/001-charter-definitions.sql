@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS charter_definitions (
     template_id TEXT NOT NULL CHECK (length(template_id) > 0),
     definition_digest TEXT NOT NULL CHECK (length(definition_digest) > 0),
     definition_bytes BLOB NOT NULL CHECK (typeof(definition_bytes) = 'blob'),
-    source_bytes BLOB CHECK (source_bytes IS NULL OR typeof(source_bytes) = 'blob'),
+    source_bytes TEXT,
     gate_registry_digest TEXT NOT NULL CHECK (length(gate_registry_digest) > 0),
     action_contract_version TEXT NOT NULL CHECK (length(action_contract_version) > 0),
     created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
@@ -33,4 +33,11 @@ CREATE TRIGGER IF NOT EXISTS charter_definitions_no_delete
 BEFORE DELETE ON charter_definitions
 BEGIN
     SELECT RAISE(ABORT, 'charter definitions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS charter_definitions_source_text
+BEFORE INSERT ON charter_definitions
+WHEN NEW.source_bytes IS NOT NULL AND typeof(NEW.source_bytes) != 'text'
+BEGIN
+    SELECT RAISE(ABORT, 'charter definition source must be text');
 END;

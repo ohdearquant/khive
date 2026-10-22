@@ -10,6 +10,8 @@ use super::definition::*;
 use super::registry::{EntryDef, ParamType, Registry, CHILD_RUN_OUTCOMES};
 use super::{canonical_json, digest, Diagnostic};
 
+const MAX_PHASES: usize = 256;
+
 #[derive(Clone, Debug)]
 pub struct CompiledCharter {
     pub definition: Definition,
@@ -201,6 +203,14 @@ pub fn check(
     charter: &CharterSource,
     registry: &Registry,
 ) -> Result<CompiledCharter, Vec<Diagnostic>> {
+    if charter.phases.len() > MAX_PHASES {
+        return Err(vec![Diagnostic::new(
+            charter.phases[MAX_PHASES].line,
+            "too_many_phases",
+            format!("workflow exceeds the {MAX_PHASES} phase limit"),
+        )]);
+    }
+
     let mut c = Checker {
         registry,
         errors: Vec::new(),
@@ -556,14 +566,19 @@ pub fn check(
     });
 
     if c.errors.is_empty() {
-        check_topology(&charter.phases, &phases, &mut c.errors);
+        check_topology(&charter.phases, &phases, registry, &mut c.errors);
     }
     if !c.errors.is_empty() {
         c.errors.sort_by_key(|d| d.line);
         return Err(c.errors);
     }
 
-    let registry_value = Value::Object(c.referenced.clone().into_iter().collect());
+    let registry_value = Value::Object(
+        registry
+            .entries()
+            .map(|entry| (entry.name.clone(), entry.to_json()))
+            .collect(),
+    );
     let gate_registry_digest = digest(&canonical_json(&registry_value));
     let definition = Definition {
         language: LANGUAGE.to_owned(),
@@ -594,24 +609,80 @@ pub fn check(
     })
 }
 
-fn successors(phase: &PhaseDef) -> (Vec<&str>, bool) {
-    let mut out = Vec::new();
+fn reachable_routes<'a>(phase: &'a PhaseDef, registry: &Registry) -> (Vec<&'a str>, bool) {
+    let mut routes = Vec::new();
     let mut terminal = false;
-    for r in phase.whens.iter().map(|w| &w.route).chain([&phase.next]) {
-        match r {
-            Route::Goto { phase } => out.push(phase.as_str()),
+    let mut previous: BTreeMap<(String, Vec<u8>), BTreeSet<String>> = BTreeMap::new();
+    let mut outcomes_by_key: BTreeMap<(String, Vec<u8>), Vec<String>> = BTreeMap::new();
+
+    for when in &phase.whens {
+        let key = (when.name.clone(), canonical_json(&json!(&when.args)));
+        let outcomes = match when.source {
+            WhenSource::Charter => CHILD_RUN_OUTCOMES.iter().map(|s| s.to_string()).collect(),
+            _ => registry
+                .get(&when.name)
+                .map(|entry| entry.outcomes.clone())
+                .unwrap_or_default(),
+        };
+        outcomes_by_key.entry(key.clone()).or_insert(outcomes);
+
+        let shadowed = previous
+            .get(&key)
+            .is_some_and(|labels| labels.contains(&when.label));
+        let earlier_branches_can_miss = previous.iter().all(|(prior_key, labels)| {
+            prior_key == &key
+                || outcomes_by_key
+                    .get(prior_key)
+                    .is_some_and(|outcomes| outcomes.iter().any(|label| !labels.contains(label)))
+        });
+        if !shadowed && earlier_branches_can_miss {
+            match &when.route {
+                Route::Goto { phase } => routes.push(phase.as_str()),
+                Route::Complete | Route::Terminate { .. } => terminal = true,
+            }
+        }
+        previous.entry(key).or_default().insert(when.label.clone());
+    }
+
+    let fallthrough_reachable = previous.iter().all(|(key, labels)| {
+        outcomes_by_key
+            .get(key)
+            .is_some_and(|outcomes| outcomes.iter().any(|label| !labels.contains(label)))
+    });
+    if fallthrough_reachable {
+        match &phase.next {
+            Route::Goto { phase } => routes.push(phase.as_str()),
             Route::Complete | Route::Terminate { .. } => terminal = true,
         }
     }
-    if let Some(bound) = &phase.max_rounds {
-        out.push(bound.then.as_str());
+    (routes, terminal)
+}
+
+fn resolve_exhausted(start: usize, redirects: &[Option<usize>]) -> Result<usize, Vec<usize>> {
+    let mut path = Vec::new();
+    let mut positions = vec![None; redirects.len()];
+    let mut current = start;
+    loop {
+        if let Some(start) = positions[current] {
+            return Err(path[start..].to_vec());
+        }
+        let Some(next) = redirects[current] else {
+            return Ok(current);
+        };
+        positions[current] = Some(path.len());
+        path.push(current);
+        current = next;
     }
-    (out, terminal)
 }
 
 /// Every phase is reachable from the first, every cycle passes a phase bounded by
 /// `max_rounds`, and from every phase `complete` or `terminate` is reachable.
-fn check_topology(sources: &[Phase], phases: &[PhaseDef], errors: &mut Vec<Diagnostic>) {
+fn check_topology(
+    sources: &[Phase],
+    phases: &[PhaseDef],
+    registry: &Registry,
+    errors: &mut Vec<Diagnostic>,
+) {
     if phases.is_empty() {
         errors.push(Diagnostic::new(
             1,
@@ -625,24 +696,31 @@ fn check_topology(sources: &[Phase], phases: &[PhaseDef], errors: &mut Vec<Diagn
         .enumerate()
         .map(|(i, p)| (p.id.as_str(), i))
         .collect();
-    let edges: Vec<(Vec<usize>, bool)> = phases
-        .iter()
-        .map(|p| {
-            let (next, terminal) = successors(p);
-            (
-                next.iter()
-                    .filter_map(|id| index.get(id).copied())
-                    .collect(),
-                terminal,
-            )
-        })
-        .collect();
+    let mut normal_edges = vec![Vec::new(); phases.len()];
+    let mut edges = vec![Vec::new(); phases.len()];
+    let mut terminal = vec![false; phases.len()];
+    let mut redirects = vec![None; phases.len()];
+    for (i, phase) in phases.iter().enumerate() {
+        let (next, has_terminal) = reachable_routes(phase, registry);
+        normal_edges[i] = next
+            .into_iter()
+            .filter_map(|id| index.get(id).copied())
+            .collect();
+        edges[i].clone_from(&normal_edges[i]);
+        terminal[i] = has_terminal;
+        if let Some(bound) = &phase.max_rounds {
+            redirects[i] = index.get(bound.then.as_str()).copied();
+            if let Some(target) = redirects[i] {
+                edges[i].push(target);
+            }
+        }
+    }
 
     let mut reached = vec![false; phases.len()];
     let mut queue = VecDeque::from([0usize]);
     reached[0] = true;
     while let Some(i) = queue.pop_front() {
-        for &j in &edges[i].0 {
+        for &j in &edges[i] {
             if !reached[j] {
                 reached[j] = true;
                 queue.push_back(j);
@@ -662,64 +740,110 @@ fn check_topology(sources: &[Phase], phases: &[PhaseDef], errors: &mut Vec<Diagn
         }
     }
 
-    // A phase carrying max_rounds bounds every cycle through it, so cycles are searched in the
-    // graph without those phases.
     let bounded: Vec<bool> = phases.iter().map(|p| p.max_rounds.is_some()).collect();
-    let mut state = vec![0u8; phases.len()];
-    let mut stack: Vec<usize> = Vec::new();
-    fn visit(
-        i: usize,
-        edges: &[(Vec<usize>, bool)],
-        bounded: &[bool],
-        state: &mut [u8],
-        stack: &mut Vec<usize>,
-    ) -> Option<Vec<usize>> {
-        state[i] = 1;
-        stack.push(i);
-        for &j in &edges[i].0 {
-            if bounded[j] {
-                continue;
+    let mut redirect_cycle = None;
+    for i in 0..phases.len() {
+        if bounded[i] {
+            if let Err(cycle) = resolve_exhausted(i, &redirects) {
+                redirect_cycle = Some(cycle);
+                break;
             }
-            if state[j] == 1 {
-                let start = stack.iter().position(|&k| k == j).unwrap_or(0);
-                return Some(stack[start..].to_vec());
-            }
-            if state[j] == 0 {
-                if let Some(cycle) = visit(j, edges, bounded, state, stack) {
-                    return Some(cycle);
+        }
+    }
+    if let Some(cycle) = redirect_cycle {
+        let names: Vec<&str> = cycle.iter().map(|&i| phases[i].id.as_str()).collect();
+        errors.push(Diagnostic::new(
+            sources[cycle[0]].line,
+            "unbounded_cycle",
+            format!(
+                "exhausted bounds redirect in a cycle: {}",
+                names.join(" -> ")
+            ),
+        ));
+    }
+
+    let mut effective_edges = vec![Vec::new(); phases.len()];
+    for i in 0..phases.len() {
+        if bounded[i] {
+            continue;
+        }
+        for &target in &normal_edges[i] {
+            if let Ok(target) = resolve_exhausted(target, &redirects) {
+                if !bounded[target] {
+                    effective_edges[i].push(target);
                 }
             }
         }
-        stack.pop();
-        state[i] = 2;
-        None
     }
-    for i in 0..phases.len() {
-        if bounded[i] || state[i] != 0 {
+    let mut state = vec![0u8; phases.len()];
+    let mut cycle = None;
+    for start in 0..phases.len() {
+        if bounded[start] || state[start] != 0 {
             continue;
         }
-        if let Some(cycle) = visit(i, &edges, &bounded, &mut state, &mut stack) {
-            let names: Vec<&str> = cycle.iter().map(|&k| phases[k].id.as_str()).collect();
-            errors.push(Diagnostic::new(
-                sources[cycle[0]].line,
-                "unbounded_cycle",
-                format!(
-                    "phases {} form a cycle with no `max_rounds N then <phase>` bound",
-                    names.join(" -> ")
-                ),
-            ));
+        state[start] = 1;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, cursor)) = stack.last_mut() {
+            if *cursor >= effective_edges[*node].len() {
+                state[*node] = 2;
+                stack.pop();
+                continue;
+            }
+            let target = effective_edges[*node][*cursor];
+            *cursor += 1;
+            if state[target] == 1 {
+                let start = stack
+                    .iter()
+                    .position(|(active, _)| *active == target)
+                    .unwrap_or(0);
+                cycle = Some(
+                    stack[start..]
+                        .iter()
+                        .map(|(active, _)| *active)
+                        .collect::<Vec<_>>(),
+                );
+                break;
+            }
+            if state[target] == 0 {
+                state[target] = 1;
+                stack.push((target, 0));
+            }
+        }
+        if cycle.is_some() {
             break;
         }
     }
+    if let Some(cycle) = cycle {
+        let names: Vec<&str> = cycle.iter().map(|&i| phases[i].id.as_str()).collect();
+        errors.push(Diagnostic::new(
+            sources[cycle[0]].line,
+            "unbounded_cycle",
+            format!(
+                "phases {} form a cycle with no effective `max_rounds N then <phase>` bound",
+                names.join(" -> ")
+            ),
+        ));
+    }
 
+    let mut reverse_edges = vec![Vec::new(); phases.len()];
+    for (source, targets) in edges.iter().enumerate() {
+        for &target in targets {
+            reverse_edges[target].push(source);
+        }
+    }
     let mut exits = vec![false; phases.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..phases.len() {
-            if !exits[i] && (edges[i].1 || edges[i].0.iter().any(|&j| exits[j])) {
-                exits[i] = true;
-                changed = true;
+    let mut exit_queue = VecDeque::new();
+    for (i, is_terminal) in terminal.iter().enumerate() {
+        if *is_terminal {
+            exits[i] = true;
+            exit_queue.push_back(i);
+        }
+    }
+    while let Some(i) = exit_queue.pop_front() {
+        for &previous in &reverse_edges[i] {
+            if !exits[previous] {
+                exits[previous] = true;
+                exit_queue.push_back(previous);
             }
         }
     }

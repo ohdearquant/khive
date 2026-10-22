@@ -557,6 +557,7 @@ fn parse_step(
             c.colon()?;
             c.end()?;
             for child in &node.children {
+                no_children(child, errors);
                 let mut g = Cursor::new(child);
                 match (|| {
                     let role = g.ident("a role name")?;
@@ -735,6 +736,7 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
         kind,
         name,
         description,
+        producer_class: None,
         outcomes: None,
         passes: None,
         ceiling: None,
@@ -746,6 +748,16 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
         let mut f = Cursor::new(child);
         let result: Result<(), Diagnostic> = (|| {
             match f.word("an entry field")? {
+                "producer" => {
+                    let producer = f.ident("a producer class")?;
+                    f.end()?;
+                    if entry.producer_class.replace(producer).is_some() {
+                        return Err(f.err(
+                            "duplicate_producer_class",
+                            "an entry declares its producer class twice",
+                        ));
+                    }
+                }
                 "outcomes" => {
                     let mut labels = Vec::new();
                     while !f.done() {
@@ -803,8 +815,8 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
                     return Err(f.err(
                         "unknown_field",
                         format!(
-                            "unknown entry field {other:?}; fields are outcomes, passes, ceiling, \
-                             param, new_generation"
+                            "unknown entry field {other:?}; fields are producer, outcomes, passes, \
+                             ceiling, param, new_generation"
                         ),
                     ))
                 }
@@ -814,6 +826,13 @@ fn parse_entry(node: &Node, errors: &mut Vec<Diagnostic>) -> Result<EntrySource,
         if let Err(e) = result {
             errors.push(e);
         }
+    }
+    if entry.producer_class.is_none() {
+        errors.push(Diagnostic::new(
+            entry.line,
+            "missing_producer_class",
+            "every vocabulary entry declares `producer <class>`",
+        ));
     }
     Ok(entry)
 }

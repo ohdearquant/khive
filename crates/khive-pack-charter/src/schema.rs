@@ -27,6 +27,7 @@ pub(crate) const CHARTER_SCHEMA_STATEMENTS: &[&str] = &[
     include_str!("../sql/006-charter-attempts.sql"),
     include_str!("../sql/007-charter-commands.sql"),
     include_str!("../sql/008-charter-vocabularies.sql"),
+    include_str!("../sql/009-charter-waiting-changes.sql"),
 ];
 
 #[cfg(test)]

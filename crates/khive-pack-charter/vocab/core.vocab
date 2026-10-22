@@ -13,91 +13,144 @@ vocabulary core v1
 # for an older head never moves the subject back.
 
 subject pull_request "a pull request on a forge, referenced as <owner>/<repo>#<number>":
+    producer system
     new_generation pull_request.opened pull_request.head_moved
-subject issue "an issue on a forge"
-subject message "a message or thread in an inbox"
-subject task "a task record"
-subject release "a release of a project, referenced by its version"
-subject session "one working session of an agent or person"
+subject issue "an issue on a forge":
+    producer system
+subject message "a message or thread in an inbox":
+    producer system
+subject task "a task record":
+    producer system
+subject release "a release of a project, referenced by its version":
+    producer system
+subject session "one working session of an agent or person":
+    producer system
 
-trigger pull_request.opened "the pull request was opened or reopened"
-trigger pull_request.head_moved "the pull request head changed"
-trigger pull_request.closed "the pull request was closed"
-trigger review.requested "a review was requested for the current head"
-trigger review.posted "a reviewer posted a verdict for the current head"
-trigger fix.pushed "the author pushed a change answering review findings"
-trigger checks.concluded "the required checks concluded for the current head"
-trigger approval.recorded "an approval was recorded for the current head"
-trigger message.arrived "a message arrived for the subject"
-trigger schedule.fired "a scheduled reminder fired"
-trigger prompt.received "a person sent a prompt"
+trigger pull_request.opened "the pull request was opened or reopened":
+    producer platform
+trigger pull_request.head_moved "the pull request head changed":
+    producer platform
+trigger pull_request.closed "the pull request was closed":
+    producer platform
+trigger review.requested "a review was requested for the current head":
+    producer platform
+trigger review.posted "a reviewer posted a verdict for the current head":
+    producer platform
+trigger fix.pushed "the author pushed a change answering review findings":
+    producer platform
+trigger checks.concluded "the required checks concluded for the current head":
+    producer platform
+trigger approval.recorded "an approval was recorded for the current head":
+    producer platform
+trigger message.arrived "a message arrived for the subject":
+    producer platform
+trigger schedule.fired "a scheduled reminder fired":
+    producer system
+trigger prompt.received "a person sent a prompt":
+    producer actor
 
 phrase pull_request.open "the pull request is open":
+    producer platform
     ceiling hard
 phrase pull_request.ready "the pull request is out of draft":
+    producer platform
     outcomes ready draft
     passes ready
 phrase pull_request.base "the pull request targets the named base branch":
+    producer platform
     param branch string
     ceiling hard
 phrase pull_request.head_unchanged "the head is the one the approval was recorded against":
+    producer platform
     ceiling hard
 phrase pull_request.auto_merge_off "no automatic merge is armed on the pull request":
+    producer platform
     ceiling hard
 phrase pull_request.size "the pull request size class":
+    producer instrument
     outcomes small large oversized
     passes small large
 phrase review.verdict_present "a verdict exists for the current head":
+    producer platform
     ceiling hard
 phrase review.decision "the reviewer's decision for the current head":
+    producer actor
     outcomes approve request_changes blocked
     passes approve
     ceiling hard
 phrase review.reviewer_independent "the reviewer is independent of the author":
+    producer instrument
     ceiling hard
 phrase review.within_words "the verdict stays within a word budget":
+    producer instrument
     param words integer
 phrase review.findings_reproducible "each finding carries a command that reproduces it":
+    producer actor
     ceiling soft
 phrase findings.addressed "every finding is answered at the new head":
+    producer actor
     ceiling soft
 phrase checks.required_green "every required check concluded successfully on the merge ref":
+    producer platform
     param event word optional
     ceiling hard
 phrase gate.result "a named gate's result for the current head":
+    producer instrument
     param name word
     ceiling hard
 phrase approval.present "an approval exists for the current head":
+    producer platform
     param reader_not_author bool optional
     ceiling hard
 phrase approval.approver_not_last_pusher "the approver did not push the current head":
+    producer platform
     ceiling hard
 phrase tree.clean "the working tree is clean and the head unchanged after the work":
+    producer instrument
     ceiling hard
-phrase agent.no_outward_writes "the agent wrote nothing outside its workspace"
+phrase agent.no_outward_writes "the agent wrote nothing outside its workspace":
+    producer actor
 phrase message.kind "the kind of the message":
+    producer actor
     outcomes directive stop_order question report other
     passes
 phrase inbox.unread_older_than "unread messages older than the given age":
+    producer instrument
     param age duration
     outcomes none some
     passes none
-phrase memory.recorded "the decision was recorded where later sessions find it"
-phrase loop.log_written "the session's log entry was written"
+phrase memory.recorded "the decision was recorded where later sessions find it":
+    producer instrument
+phrase loop.log_written "the session's log entry was written":
+    producer instrument
 
 action review.request "start a review of the current head":
+    producer actor
     param reviewer word optional
-action review.write_verdict "write the verdict with its findings"
-action review.return_verdict "deliver the verdict to the requester"
-action review.read_diff "read the diff and every cited site"
-action tests.run_targeted "run the targeted tests"
-action tests.run_mutations "run the mutation probes"
-action fix.push "push a change answering the findings"
-action pull_request.approve "approve the pull request"
-action pull_request.merge "merge the pull request"
-action pull_request.split "split the pull request into reviewable parts"
+action review.write_verdict "write the verdict with its findings":
+    producer actor
+action review.return_verdict "deliver the verdict to the requester":
+    producer actor
+action review.read_diff "read the diff and every cited site":
+    producer actor
+action tests.run_targeted "run the targeted tests":
+    producer actor
+action tests.run_mutations "run the mutation probes":
+    producer actor
+action fix.push "push a change answering the findings":
+    producer actor
+action pull_request.approve "approve the pull request":
+    producer actor
+action pull_request.merge "merge the pull request":
+    producer actor
+action pull_request.split "split the pull request into reviewable parts":
+    producer actor
 action inbox.read "read the inbox":
+    producer actor
     param limit integer optional
-action tasks.list_next "list the next tasks"
-action work.unit "do one reversible unit of work"
-action agents.halt "stop every running agent"
+action tasks.list_next "list the next tasks":
+    producer actor
+action work.unit "do one reversible unit of work":
+    producer actor
+action agents.halt "stop every running agent":
+    producer actor
