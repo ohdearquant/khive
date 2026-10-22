@@ -1602,7 +1602,13 @@ Added arms:
       finalized and checked by the worker in time, and no earlier worker check or completion instant stands in for
       that read. An expiry check that runs only before finalization, with the owner taking a ready result first,
       turns the finalization case red; an owner that takes a ready result first, or that compares a completion
-      instant with the deadline instead of reading the clock at admission, turns the handoff case red.
+      instant with the deadline instead of reading the clock at admission, turns the handoff case red. A boundary
+      case runs in each staging branch: finalization, the worker's last expiry check and a successful result all
+      finish before the original deadline, and the seam holds the deadline-owning wait until the controlled budget
+      clock reaches that deadline, so that success and expiry are both ready at the held instant. The run is refused
+      with `binary_digest_time_limit` before any further advance of the clock and leaves no staging or run directory
+      and no digest in any receipt. An admission check that refuses only when the elapsed time exceeds the cap,
+      rather than when it reaches the deadline, turns this case red.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
