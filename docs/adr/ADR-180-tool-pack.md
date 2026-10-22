@@ -808,7 +808,11 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    each of these term fixtures with the roles reversed, the newer grant failing the term alone and the older
    matching grant kept live: the by-id entry answers `false` for the newer id and `true` for the older id,
    and `decide` cites the older id. This separates a by-id check from one that borrows a term from an
-   earlier grant than the one named.
+   earlier grant than the one named. Repeat the revocation and each term fixture once more with both grants
+   carrying the same `requested_at`, failing each id in turn under the `id ASC` tie order: the by-id entry
+   answers `false` for the failing id and `true` for the other, and `decide` cites the other id. A mutant
+   that correlates through `requested_at` instead of `id` (an equality cutoff, or a filter on the named
+   row's timestamp) turns this arm red, which distinct timestamps alone cannot show.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
@@ -831,5 +835,9 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    mutant that retries only when `is_retryable()` holds turns the retryable case red. Repeat the injection
    once for every `StorageError` variant, `StorageError::Transaction` included: each is returned unchanged
    after exactly one invocation, so a retry keyed on any single variant turns that variant's case red.
+   Exercise every reader-error handling branch the implementation has, including branches that depend on a
+   variant's payload or nested source: each preserves the original error after exactly one invocation. In
+   particular inject `StorageError::CapacityUnavailable` at both a retryable phase (`LockContended`) and a
+   non-retryable one (`Probe`), so a retry keyed on that variant's retryability turns one of the two red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
