@@ -1588,11 +1588,14 @@ Added arms:
       clock: the test holds that clock at the deadline set before the open and requires the refusal before any further
       advance, then advances it to the planned release. A digest guard whose deadline lies anywhere after the original
       one (a grace period for the digest alone) is not ready at the held instant and turns the case red. A third case
-      runs in each staging branch (copy, then clone): the seam holds the final staged read across the original
-      deadline, makes its completion ready only after that deadline, and resumes the deadline-owning wait only once
-      both that completion and the expiry are ready. It is refused with `binary_digest_time_limit` and leaves no
-      staging or run directory and no digest in any receipt; accepting the resulting digest without checking the
-      original deadline on its successful completion path turns it red.
+      runs in each staging branch (copy, then clone), once for each point where the staged digest can be held: the
+      final staged read; and finalization, after every staged read and its own expiry check finished before the
+      original deadline. In each, the seam holds that step across the original deadline, makes its completion ready
+      only after that deadline, and resumes the deadline-owning wait only once both that completion and the expiry
+      are ready. Each is refused with `binary_digest_time_limit` and leaves no staging or run directory and no digest
+      in any receipt. A digest is accepted only when its finalization completed before the original deadline, checked
+      after finalization by the worker or against the completion instant by the deadline owner; an expiry check that
+      runs only before finalization, with the owner taking a ready result first, turns the finalization case red.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
