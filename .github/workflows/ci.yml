@@ -1646,7 +1646,7 @@ jobs:
       - name: Run the library tests with every optional pack
         run: cargo test -p kkernel -p khive-mcp --features pack-agent,pack-telemetry,pack-web --lib --locked
       - name: Run the pack composition tests with every optional pack
-        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mounts
+        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}
