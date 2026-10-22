@@ -79,6 +79,13 @@ Revision `domain-effects-v22` classifies `attach` as `Write`: it writes blob byt
 adds or replaces an existing record's attachment row. Selective hydration through
 `get` remains `Read`.
 
+Revision `domain-effects-v23` classifies the charter verbs. `charter.compile`, `charter.get`,
+`charter.list`, `charter.runs` and `charter.waiting` are `Read`: they compile or query through a
+reader connection and store nothing. `charter.publish`, `charter.vocabulary`, `charter.start`,
+`charter.observe`, `charter.sample`, `charter.claim` and `charter.cancel` are `Write`: each
+stores a definition, a run, an observation or a state change. `charter.claim` stays `Write`
+even where claims are not yet admitted and it refuses without writing.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -119,6 +126,18 @@ adds or replaces an existing record's attachment row. Selective hydration throug
 | `brain.resolve`                   | Read   | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L203)                      |
 | `brain.state`                     | Read   | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L41)                       |
 | `brain.unbind`                    | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L538)                      |
+| `charter.cancel`                  | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L229)                          |
+| `charter.claim`                   | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L222)                          |
+| `charter.compile`                 | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L141)                          |
+| `charter.get`                     | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L255)                          |
+| `charter.list`                    | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L280)                          |
+| `charter.observe`                 | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L178)                          |
+| `charter.publish`                 | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L148)                          |
+| `charter.runs`                    | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L266)                          |
+| `charter.sample`                  | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L198)                          |
+| `charter.start`                   | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L162)                          |
+| `charter.vocabulary`              | Write  | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L155)                          |
+| `charter.waiting`                 | Read   | Verb       | [khive-pack-charter/src/pack.rs](../../../khive-pack-charter/src/pack.rs#L241)                          |
 | `code.deps`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
 | `code.ingest`                     | Write  | Verb       | [khive-pack-code/src/vocab.rs](../../../khive-pack-code/src/vocab.rs#L11)                               |
 | `code.list`                       | Read   | Verb       | [khive-pack-code/src/read_vocab.rs](../../../khive-pack-code/src/read_vocab.rs)                         |
