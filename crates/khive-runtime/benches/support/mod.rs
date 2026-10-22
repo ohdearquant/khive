@@ -87,8 +87,22 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(embeddings: bool) -> Self {
+        Self::with_database(embeddings, None)
+    }
+
+    // Shared by benchmark binaries; only the edge workloads require a real writer queue.
+    #[allow(dead_code)]
+    pub fn file_backed(path: std::path::PathBuf) -> Self {
+        Self::with_database(false, Some(path))
+    }
+
+    fn with_database(embeddings: bool, db_path: Option<std::path::PathBuf>) -> Self {
+        let volume_lock_dir = db_path
+            .as_ref()
+            .map(|path| path.parent().expect("fixture parent").join("volume-locks"));
         let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
+            db_path,
+            volume_lock_dir,
             packs: vec!["kg".into()],
             actor_id: Some("benchmark".into()),
             embedding_model: embeddings.then_some(EmbeddingModel::AllMiniLmL6V2),

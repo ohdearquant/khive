@@ -117,10 +117,14 @@ fn stream_truncation_migration_preserves_rows_and_replays_without_schema_changes
             .unwrap();
         for replay in [false, true] {
             if replay {
+                // Replaying V60 requires rewinding every later ledger entry as well.
                 assert_eq!(
-                    conn.execute("DELETE FROM _schema_migrations WHERE version=60", [])
+                    conn.execute("DELETE FROM _schema_migrations WHERE version>=60", [])
                         .unwrap(),
-                    1
+                    MIGRATIONS
+                        .iter()
+                        .filter(|migration| migration.version >= 60)
+                        .count()
                 );
             }
             run_migrations(&mut conn).unwrap();
