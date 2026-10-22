@@ -566,11 +566,10 @@ fifteen.
 
 **Status**: Accepted (2026-10-22).
 
-This amendment serves the project owner's instruction of 2026-10-22 that charters, the Gate and caller
-privileges are one automated permission system, quoted verbatim: "那其实联起来了，这个charter + gate +
-privilegs, 整套automated permission system已经差不多在khive成型了" ("So they connect: charter + gate +
-privileges, the whole automated permission system has nearly taken shape in khive"). It also supplies
-the registration that acceptance case 5 has required since this record was accepted on 2026-09-22.
+This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect:
+charter + gate + privileges, the whole automated permission system has nearly taken shape in khive". It
+also supplies the registration that acceptance case 5 has required since this record was accepted on
+2026-09-22.
 
 This amendment amends ADR-193 D3, D8, D10, D11 and acceptance case 5; ADR-208 D3, D5 and
 D6; ADR-143's caller-right vocabulary and administration constraints, as specified below. It relates to
