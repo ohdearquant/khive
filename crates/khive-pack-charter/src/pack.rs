@@ -115,7 +115,7 @@ const GENERATION: ParamDef = param(
     "generation",
     "string",
     false,
-    "The subject's current generation (a pull request head, a release candidate). charter.start, or an observation of a trigger the subject kind lists under new_generation, moves the subject to a new value and a new epoch; any other observation is recorded at the generation it names and counts only while the subject is there.",
+    "The subject's current generation (a pull request head, a release candidate). charter.start records it for a subject seen for the first time and refuses one that differs from the generation an existing subject is at. Only an observation of a trigger the subject kind lists under new_generation moves the subject to a new value and a new epoch; any other observation is recorded at the generation it names and counts only while the subject is there.",
 );
 const REQUEST_ID: ParamDef = param(
     "request_id",
