@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "blob-s3")]
 use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_db::{SqliteError, StorageBackend};
 use khive_storage::{
@@ -336,20 +337,47 @@ pub fn resolve_blob_store(
             prefix,
             allow_http,
         }) => {
-            let mut s3_cfg = S3BlobStoreConfig::new(bucket.clone(), region.clone());
-            if let Some(endpoint) = endpoint {
-                s3_cfg = s3_cfg.with_endpoint(endpoint.clone());
-            }
-            if let Some(prefix) = prefix {
-                s3_cfg = s3_cfg.with_prefix(prefix.clone());
-            }
-            if let Some(allow_http) = allow_http {
-                s3_cfg = s3_cfg.with_allow_http(*allow_http);
-            }
-            let store = S3BlobStore::new(s3_cfg)?;
-            Ok(Arc::new(store))
+            s3_blob_store(bucket, region, endpoint.as_deref(), prefix.as_deref(), *allow_http)
         }
     }
+}
+
+/// Build the `[storage.blob] backend = "s3"` store from its non-secret fields
+/// plus environment credentials (`S3BlobStore::new`).
+#[cfg(feature = "blob-s3")]
+fn s3_blob_store(
+    bucket: &str,
+    region: &str,
+    endpoint: Option<&str>,
+    prefix: Option<&str>,
+    allow_http: Option<bool>,
+) -> Result<Arc<dyn BlobStore>, SqliteError> {
+    let mut s3_cfg = S3BlobStoreConfig::new(bucket, region);
+    if let Some(endpoint) = endpoint {
+        s3_cfg = s3_cfg.with_endpoint(endpoint);
+    }
+    if let Some(prefix) = prefix {
+        s3_cfg = s3_cfg.with_prefix(prefix);
+    }
+    if let Some(allow_http) = allow_http {
+        s3_cfg = s3_cfg.with_allow_http(allow_http);
+    }
+    Ok(Arc::new(S3BlobStore::new(s3_cfg)?))
+}
+
+/// A build without the `blob-s3` feature does not link the S3 store, so an S3
+/// configuration is refused rather than silently served by another backend.
+#[cfg(not(feature = "blob-s3"))]
+fn s3_blob_store(
+    _bucket: &str,
+    _region: &str,
+    _endpoint: Option<&str>,
+    _prefix: Option<&str>,
+    _allow_http: Option<bool>,
+) -> Result<Arc<dyn BlobStore>, SqliteError> {
+    Err(SqliteError::InvalidConfig(
+        "[storage.blob] backend = \"s3\" needs a build with the `blob-s3` feature".to_string(),
+    ))
 }
 
 /// Resolve the configured store for one pack runtime's effective access mode.
@@ -381,17 +409,7 @@ pub fn resolve_blob_store_for_mode(
             prefix,
             allow_http,
         }) => {
-            let mut s3_cfg = S3BlobStoreConfig::new(bucket.clone(), region.clone());
-            if let Some(endpoint) = endpoint {
-                s3_cfg = s3_cfg.with_endpoint(endpoint.clone());
-            }
-            if let Some(prefix) = prefix {
-                s3_cfg = s3_cfg.with_prefix(prefix.clone());
-            }
-            if let Some(allow_http) = allow_http {
-                s3_cfg = s3_cfg.with_allow_http(*allow_http);
-            }
-            Arc::new(S3BlobStore::new(s3_cfg)?)
+            s3_blob_store(bucket, region, endpoint.as_deref(), prefix.as_deref(), *allow_http)?
         }
     };
     Ok(Arc::new(ReadOnlyBlobStore { inner }))
