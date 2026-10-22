@@ -48,6 +48,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_schedule::SchedulePack>(),
         declared::<khive_pack_session::SessionPack>(),
         declared::<khive_pack_template::TemplatePack>(),
+        #[cfg(feature = "pack-tool")]
         declared::<khive_pack_tool::ToolPack>(),
         declared::<khive_pack_workspace::WorkspacePack>(),
     ];

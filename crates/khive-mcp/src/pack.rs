@@ -47,6 +47,7 @@ pub use khive_pack_session::SessionPack as _SessionPack;
 #[cfg(feature = "pack-telemetry")]
 #[doc(hidden)]
 pub use khive_pack_telemetry::TelemetryPack as _TelemetryPack;
+#[cfg(feature = "pack-tool")]
 #[doc(hidden)]
 pub use khive_pack_tool::ToolPack as _ToolPack;
 #[cfg(feature = "pack-web")]

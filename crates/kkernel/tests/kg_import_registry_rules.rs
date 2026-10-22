@@ -1,6 +1,10 @@
 //! Archive import preserves registry ownership and loaded pack edge rules.
 
-use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
+#![cfg(any(feature = "pack-code", feature = "pack-tool"))]
+
+#[cfg(feature = "pack-tool")]
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -11,6 +15,7 @@ const CREATED: &str = "2025-01-02T03:04:05.123456Z";
 #[cfg(feature = "pack-code")]
 const CREATED_MICROS: i64 = 1_735_787_045_123_456;
 const EXPORTED: &str = "2026-01-02T03:04:05.654321Z";
+#[cfg(feature = "pack-tool")]
 const TOOL_NAME: &str = "ImportOwnershipFixture";
 
 fn uuid(number: u128) -> Uuid {
@@ -69,6 +74,7 @@ fn assert_insert_counts(report: &Value, entities: u64, edges: u64) {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[derive(Debug, PartialEq)]
 struct RowImage {
     table: &'static str,
@@ -135,6 +141,7 @@ impl Fixture {
             .unwrap()
     }
 
+    #[cfg(feature = "pack-tool")]
     fn register_tool(&self) -> String {
         std::fs::create_dir_all(self.db.parent().unwrap()).unwrap();
         let seed_config = self.directory.path().join("seed.toml");
@@ -207,6 +214,7 @@ impl Fixture {
             .unwrap()
     }
 
+    #[cfg(feature = "pack-tool")]
     fn rows(&self) -> Vec<RowImage> {
         let connection = self.connection();
         ["entities", "graph_edges", "events"]
@@ -232,6 +240,7 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[test]
 fn import_update_refuses_registered_tools_before_any_row_write() {
     for tags in [json!([]), json!(["ordinary-import-tag"])] {
@@ -392,6 +401,7 @@ fn import_accepts_code_pack_function_dependency_without_flags() {
 }
 
 impl Fixture {
+    #[cfg(feature = "pack-tool")]
     fn export(&self) -> Value {
         let target = self.directory.path().join("export.json");
         let output = self
@@ -406,6 +416,7 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "pack-tool")]
 #[test]
 fn exported_registry_rows_and_incident_edges_are_skipped_in_every_import_mode() {
     let source = Fixture::new(&["kg", "tool"]);

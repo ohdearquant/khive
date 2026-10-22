@@ -78,6 +78,7 @@ mod _pack_links {
     use khive_pack_session::SessionPack as _;
     #[cfg(feature = "pack-telemetry")]
     use khive_pack_telemetry::TelemetryPack as _;
+    #[cfg(feature = "pack-tool")]
     use khive_pack_tool::ToolPack as _;
     #[cfg(feature = "pack-web")]
     use khive_pack_web::WebPack as _;

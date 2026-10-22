@@ -33,7 +33,7 @@ khive-pack-comm = { version = "0.14.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.14.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.14.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.14.0", path = "../khive-pack-session" }
-khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool" }
+khive-pack-tool = { version = "0.14.0", path = "../khive-pack-tool", optional = true }
 khive-pack-exec = { version = "0.14.0", path = "../khive-pack-exec" }
 khive-pack-git = { version = "0.14.0", path = "../khive-pack-git", optional = true }
 khive-pack-code = { version = "0.14.0", path = "../khive-pack-code", optional = true }
@@ -73,6 +73,8 @@ blob-s3 = ["khive-runtime/blob-s3"]
 default = ["pack-git", "pack-code"]
 pack-git = ["dep:khive-pack-git", "khive-runtime/pack-git"]
 pack-code = ["dep:khive-pack-code", "khive-runtime/pack-code"]
+# Tool is optional and off by default.
+pack-tool = ["dep:khive-pack-tool", "khive-runtime/pack-tool"]
 # pack-agent, pack-telemetry, pack-web: link the agent, telemetry and web packs.
 # Without one of them the pack is neither linked nor registered, so it is absent
 # from the pack list the server reports and selecting it is refused as unknown.
@@ -139,6 +141,10 @@ required-features = ["pack-telemetry"]
 [[test]]
 name = "web_backend_routing"
 required-features = ["pack-web"]
+
+[[test]]
+name = "tool_request_notification_identity"
+required-features = ["pack-tool"]
 
 [[bench]]
 name = "serve_startup"

@@ -36,6 +36,7 @@ use khive_pack_schedule::SchedulePack;
 use khive_pack_session::SessionPack;
 #[cfg(feature = "pack-telemetry")]
 use khive_pack_telemetry::TelemetryPack;
+#[cfg(feature = "pack-tool")]
 use khive_pack_tool::ToolPack;
 #[cfg(feature = "pack-web")]
 use khive_pack_web::WebPack;
@@ -217,6 +218,7 @@ fn linked_packs() -> Vec<Checked> {
         checked(&MemoryPack::new_with_index_role(rt.clone(), false)),
         checked(&SchedulePack::new(rt.clone())),
         checked(&SessionPack::new(rt.clone())),
+        #[cfg(feature = "pack-tool")]
         checked(&ToolPack::new(rt.clone())),
         checked(&WorkspacePack::new(rt.clone())),
     ];

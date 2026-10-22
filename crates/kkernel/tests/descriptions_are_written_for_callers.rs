@@ -107,6 +107,7 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("memory", khive_pack_memory::MemoryPack::HANDLERS),
         ("schedule", khive_pack_schedule::SchedulePack::HANDLERS),
         ("session", khive_pack_session::SessionPack::HANDLERS),
+        #[cfg(feature = "pack-tool")]
         ("tool", khive_pack_tool::ToolPack::HANDLERS),
         ("workspace", khive_pack_workspace::WorkspacePack::HANDLERS),
     ];

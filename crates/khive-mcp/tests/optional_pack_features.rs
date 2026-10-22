@@ -117,3 +117,50 @@ fn a_selected_code_pack_exposes_its_real_handlers() {
         );
     }
 }
+
+#[test]
+fn tool_factory_and_explicit_selection_follow_the_feature() {
+    assert_eq!(
+        PackRegistry::discovered_names().contains(&"tool"),
+        cfg!(feature = "pack-tool")
+    );
+    let selection = vec!["kg".to_string(), "tool".to_string()];
+    let result = PackRegistry::validate_pack_selection(&selection);
+    if cfg!(feature = "pack-tool") {
+        result.expect("Tool can be selected with its KG prerequisite");
+    } else {
+        assert_eq!(
+            result.expect_err("Tool is unavailable").to_string(),
+            "unknown pack \"tool\""
+        );
+    }
+}
+
+#[test]
+fn an_unselected_tool_pack_contributes_no_handlers_or_vocabulary() {
+    let registry = registry(&["kg"]);
+    assert!(registry.pack_verbs("tool").is_none());
+    assert!(registry.pack_note_kinds("tool").is_none());
+    assert!(registry.pack_entity_kinds("tool").is_none());
+    assert!(!registry.has_verb("tool.check"));
+    assert!(registry
+        .all_handlers_with_names()
+        .iter()
+        .all(|(pack, handler)| { *pack != "tool" && !handler.name.starts_with("tool.") }));
+}
+
+#[cfg(feature = "pack-tool")]
+#[test]
+fn a_selected_tool_pack_exposes_its_real_handlers() {
+    let registry = registry(&["kg", "tool"]);
+    let mut names = registry.pack_names();
+    names.sort_unstable();
+    assert_eq!(names, vec!["kg", "tool"]);
+    let handlers = registry.pack_verbs("tool").expect("selected Tool pack");
+    for expected in ["tool.register", "tool.check", "tool.request", "tool.policy"] {
+        assert!(
+            handlers.iter().any(|handler| handler.name == expected),
+            "{expected}"
+        );
+    }
+}
