@@ -868,11 +868,13 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
    accessor resolves the cached value and then observes `(name, value)` on the ledger of the runtime its
    caller holds. A ledger enqueues a name the first time it observes it and ignores later observations
-   of that name. It keeps every enqueued name until a drain takes it for the existing at-most-once,
-   best-effort append attempt; no capacity limit drops one, and neither does an entry's age. A
-   runtime that reads a value another runtime already cached therefore still gets its own row. Two
-   runtimes constructed over the same database each have a ledger, so that store can hold one row per
-   runtime construction for the same name; this is accepted and is what "per runtime" means.
+   of that name; the first observation is decided by the seen-set insertion's own result, so of two
+   overlapping observations of one name exactly one enqueues it. It keeps every enqueued name until a
+   drain takes it for the existing at-most-once, best-effort append attempt; no capacity limit drops
+   one, and neither does an entry's age. A runtime that reads a value another runtime already cached
+   therefore still gets its own row. Two runtimes constructed over the same database each have a
+   ledger, so that store can hold one row per runtime construction for the same name; this is accepted
+   and is what "per runtime" means.
 
 3. **Runtime-scope producers take the ledger from the runtime they hold.** The five pack-handler
    producers (memory four, kg one) pass the ledger of `self.runtime` (or the runtime the handler was
@@ -973,7 +975,12 @@ value length, name or retry policy, and Decision 2 still forbids a loss or a dup
    it finishes its `ConfigLocked` appends, complete the observation of fresh L on that same runtime, resume
    and complete the first drain, then complete another drain. The store holds exactly one row each for K
    and L; rereading L and draining adds none. Mutation: clearing the pending flag again after the append
-   loop erases L's publication, and L is stranded.
+   loop erases L's publication, and L is stranded. Also pause a first observation of one fresh name just
+   after its seen-set step has released its lock, complete a second observation of that name through a
+   clone of the same runtime, then resume and complete the first. One bound drain completes: exactly one
+   row exists; rereading the name and draining adds none. Mutation: checking the seen set and inserting
+   under separate lock acquisitions, ignoring the insertion's result, lets both observations enqueue and
+   the store holds two rows.
 4. **Binding.** A registry over a clone of A's runtime, bound to it, and A's registry: one row in total.
    A registry with an explicit `with_event_store` sink over A's runtime drains nothing; A's row lands
    through the bound registry.
