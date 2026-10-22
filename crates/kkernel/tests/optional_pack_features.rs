@@ -1,8 +1,8 @@
-//! Git, agent, telemetry and web are optional features of `kkernel` and
+//! Git, Code, agent, telemetry and web are optional features of `kkernel` and
 //! `khive-mcp`: a build links and registers a pack exactly when its feature is on.
 //!
 //! Registry assertions exercise the features compiled into this test binary.
-//! Manifest assertions keep Git default-on, the other three packs default-off,
+//! Manifest assertions keep Git and Code default-on, the other three packs default-off,
 //! and Kernel-to-MCP forwarding explicit. The operator build enables the three
 //! default-off packs without switching on MCP defaults through a dev dependency.
 
@@ -19,7 +19,8 @@ const MAKEFILE: &str = include_str!("../../../Makefile");
 const DEFAULT_OFF_PACKS: [&str; 3] = ["agent", "telemetry", "web"];
 
 /// The optional packs, each paired with whether this build links it.
-const OPTIONAL_PACKS: [(&str, bool); 4] = [
+const OPTIONAL_PACKS: [(&str, bool); 5] = [
+    ("code", cfg!(feature = "pack-code")),
     ("git", cfg!(feature = "pack-git")),
     ("agent", cfg!(feature = "pack-agent")),
     ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -197,4 +198,22 @@ fn git_is_optional_default_on_and_required_by_repository_showcase() {
     assert!(feature(&mcp, "pack-git").contains(&"khive-runtime/pack-git".to_string()));
     let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
     assert!(feature(&runtime, "pack-git").is_empty());
+}
+
+#[test]
+fn code_is_optional_default_on_and_required_by_repository_showcase() {
+    for text in [KKERNEL_MANIFEST, KHIVE_MCP_MANIFEST] {
+        let manifest = manifest(text);
+        assert_eq!(feature(&manifest, "default"), vec!["pack-git", "pack-code"]);
+        assert_eq!(
+            manifest["dependencies"]["khive-pack-code"]["optional"].as_bool(),
+            Some(true)
+        );
+    }
+    let kernel = manifest(KKERNEL_MANIFEST);
+    assert!(feature(&kernel, "repo-showcase").contains(&"pack-code".to_string()));
+    let mcp = manifest(KHIVE_MCP_MANIFEST);
+    assert!(feature(&mcp, "pack-code").contains(&"khive-runtime/pack-code".to_string()));
+    let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
+    assert!(feature(&runtime, "pack-code").is_empty());
 }

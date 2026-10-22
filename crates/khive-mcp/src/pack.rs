@@ -19,6 +19,7 @@ pub use khive_pack_blob::BlobPack as _BlobPack;
 pub use khive_pack_brain::BrainPack as _BrainPack;
 #[doc(hidden)]
 pub use khive_pack_charter::CharterPack as _CharterPack;
+#[cfg(feature = "pack-code")]
 #[doc(hidden)]
 pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]

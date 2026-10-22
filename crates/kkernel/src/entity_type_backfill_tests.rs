@@ -49,7 +49,7 @@ async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity
     let args = EntityTypeBackfillArgs::parse_from(["entity-type-backfill", "--apply"]);
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
-        packs: vec!["kg".into(), "git".into()],
+        packs: vec!["kg".into()],
         ..RuntimeConfig::no_embeddings()
     })
     .unwrap();
@@ -85,7 +85,7 @@ async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity
         mode: "apply",
         namespace: "local".into(),
         source_revision: khive_runtime::BUILD_INFO.source_revision,
-        loaded_packs: vec!["kg".into(), "git".into()],
+        loaded_packs: vec!["kg".into()],
         registry_types: BTreeMap::new(),
         target: PathBuf::from(":memory:"),
         backend: "main".into(),
@@ -167,7 +167,7 @@ fn classifier_uses_composed_types_and_preserves_raw_promotion_for_validation() {
         db_path: None,
         embedding_model: None,
         additional_embedding_models: Vec::new(),
-        packs: vec!["kg".into(), "git".into()],
+        packs: vec!["kg".into()],
         ..RuntimeConfig::default()
     })
     .unwrap();
@@ -175,7 +175,6 @@ fn classifier_uses_composed_types_and_preserves_raw_promotion_for_validation() {
     for (kind, raw, canonical) in [
         ("document", "paper", "paper"),
         ("concept", " ALGO ", "algorithm"),
-        ("document", " Architecture--Decision__Record ", "adr"),
     ] {
         let entity = Entity::new("local", kind, "fixture").with_properties(json!({"type": raw}));
         assert!(
@@ -232,6 +231,29 @@ fn classifier_uses_composed_types_and_preserves_raw_promotion_for_validation() {
         classify(&deleted, &types),
         Classification::Ineligible
     ));
+}
+
+#[cfg(feature = "pack-git")]
+#[test]
+fn classifier_resolves_the_selected_git_document_subtype() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".into(), "git".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let (_registry, types) = compose_registry(&runtime).unwrap();
+    let raw = " Architecture--Decision__Record ";
+    let entity = Entity::new("local", "document", "fixture").with_properties(json!({"type": raw}));
+    assert!(matches!(classify(&entity, &types), Classification::Promote(value) if value == raw));
+    assert_eq!(
+        types
+            .resolve("document".parse().unwrap(), Some(raw))
+            .unwrap()
+            .entity_type
+            .as_deref(),
+        Some("adr")
+    );
 }
 
 /// #2943: `compose_registry` must install the same entity-kind hooks the

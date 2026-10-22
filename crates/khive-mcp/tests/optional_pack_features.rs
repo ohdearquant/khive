@@ -71,3 +71,49 @@ fn a_selected_git_pack_exposes_its_real_handlers() {
         );
     }
 }
+
+#[test]
+fn code_factory_and_explicit_selection_follow_the_feature() {
+    assert_eq!(
+        PackRegistry::discovered_names().contains(&"code"),
+        cfg!(feature = "pack-code")
+    );
+    let selection = vec!["kg".to_string(), "code".to_string()];
+    let result = PackRegistry::validate_pack_selection(&selection);
+    if cfg!(feature = "pack-code") {
+        result.expect("Code can be selected with its KG prerequisite");
+    } else {
+        assert_eq!(
+            result.expect_err("Code is unavailable").to_string(),
+            "unknown pack \"code\""
+        );
+    }
+}
+
+#[test]
+fn an_unselected_code_pack_contributes_no_handlers_or_vocabulary() {
+    let registry = registry(&["kg"]);
+    assert!(registry.pack_verbs("code").is_none());
+    assert!(registry.pack_note_kinds("code").is_none());
+    assert!(!registry.has_verb("code.list"));
+    assert!(registry
+        .all_handlers_with_names()
+        .iter()
+        .all(|(pack, handler)| { *pack != "code" && !handler.name.starts_with("code.") }));
+}
+
+#[cfg(feature = "pack-code")]
+#[test]
+fn a_selected_code_pack_exposes_its_real_handlers() {
+    let registry = registry(&["kg", "code"]);
+    let mut names = registry.pack_names();
+    names.sort_unstable();
+    assert_eq!(names, vec!["code", "kg"]);
+    let handlers = registry.pack_verbs("code").expect("selected Code pack");
+    for expected in ["code.list", "code.search", "code.deps", "code.ingest"] {
+        assert!(
+            handlers.iter().any(|handler| handler.name == expected),
+            "{expected}"
+        );
+    }
+}

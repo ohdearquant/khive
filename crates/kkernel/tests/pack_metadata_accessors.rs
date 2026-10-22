@@ -18,6 +18,7 @@ use khive_pack_agent::AgentPack;
 use khive_pack_blob::BlobPack;
 use khive_pack_brain::BrainPack;
 use khive_pack_charter::CharterPack;
+#[cfg(feature = "pack-code")]
 use khive_pack_code::CodePack;
 use khive_pack_comm::CommPack;
 use khive_pack_exec::ExecPack;
@@ -202,6 +203,7 @@ fn linked_packs() -> Vec<Checked> {
         checked(&BlobPack::new(rt.clone())),
         checked_brain_install(&rt),
         checked(&CharterPack::new(rt.clone())),
+        #[cfg(feature = "pack-code")]
         checked(&CodePack::new(rt.clone())),
         checked(&CommPack::new(rt.clone())),
         checked(&ExecPack::new(rt.clone())),

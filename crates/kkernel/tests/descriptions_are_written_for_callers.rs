@@ -95,6 +95,7 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("blob", khive_pack_blob::BlobPack::HANDLERS),
         ("brain", khive_pack_brain::BrainPack::HANDLERS),
         ("charter", khive_pack_charter::CharterPack::HANDLERS),
+        #[cfg(feature = "pack-code")]
         ("code", khive_pack_code::CodePack::HANDLERS),
         ("comm", khive_pack_comm::CommPack::HANDLERS),
         ("exec", khive_pack_exec::ExecPack::HANDLERS),

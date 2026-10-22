@@ -13,6 +13,7 @@ description = "Composable Service API: entity/note CRUD, graph traversal, hybrid
 
 [features]
 pack-git = []
+pack-code = []
 blob-s3 = ["khive-db/blob-s3"]
 contract-faults = []
 fault-injection = []

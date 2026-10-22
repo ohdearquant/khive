@@ -18,10 +18,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "pack-code")]
+use crate::code_ingest;
 #[cfg(feature = "repo-showcase")]
 use crate::repo;
 use crate::{
-    blob, code_audit, code_ingest,
+    blob, code_audit,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
     engine, exec, kg, pack_introspect, reindex, sync, vector,
 };
@@ -147,6 +149,7 @@ enum Command {
 
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
+    #[cfg(feature = "pack-code")]
     CodeIngest(code_ingest::CodeIngestArgs),
 }
 
@@ -732,6 +735,7 @@ pub async fn cli_main() -> Result<()> {
         Command::GitAnnotationRepair(a) => git_annotation_repair::run(a).await,
         #[cfg(feature = "pack-git")]
         Command::GitDedup(a) => git_dedup::run(a).await,
+        #[cfg(feature = "pack-code")]
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
     }
 }
@@ -1486,6 +1490,31 @@ mod tests {
         assert!(command
             .get_subcommands()
             .any(|entry| entry.get_name() == "exec"));
+    }
+
+    #[test]
+    fn code_ingest_visibility_does_not_remove_core_admin_commands() {
+        let command = Args::command();
+        assert_eq!(
+            command
+                .get_subcommands()
+                .any(|entry| entry.get_name() == "code-ingest"),
+            cfg!(feature = "pack-code")
+        );
+        let error = Args::try_parse_from(["kkernel", "code-ingest", "--help"])
+            .expect_err("help or an unavailable command exits through Clap");
+        let expected = if cfg!(feature = "pack-code") {
+            clap::error::ErrorKind::DisplayHelp
+        } else {
+            clap::error::ErrorKind::InvalidSubcommand
+        };
+        assert_eq!(error.kind(), expected, "{error}");
+        assert!(command
+            .get_subcommands()
+            .any(|entry| entry.get_name() == "code-audit"));
+        let error = Args::try_parse_from(["kkernel", "kg", "entity-type-backfill", "--help"])
+            .expect_err("core backfill help remains available");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     fn write_empty_config(dir: &std::path::Path) -> PathBuf {

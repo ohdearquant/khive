@@ -35,6 +35,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_blob::BlobPack>(),
         declared::<khive_pack_brain::BrainPack>(),
         declared::<khive_pack_charter::CharterPack>(),
+        #[cfg(feature = "pack-code")]
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
         declared::<khive_pack_exec::ExecPack>(),

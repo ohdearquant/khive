@@ -3772,6 +3772,7 @@ fn sqlite_multi_backend_config(main_path: PathBuf, secondary_path: PathBuf) -> K
     }
 }
 
+#[cfg(feature = "pack-code")]
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn code_pack_runtime_receives_every_declared_sqlite_backend_path() {

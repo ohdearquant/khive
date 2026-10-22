@@ -9,9 +9,11 @@ mod atomic_apply;
 pub mod blob;
 pub mod cli;
 pub mod code_audit;
+#[cfg(feature = "pack-code")]
 pub mod code_ingest;
 pub mod compose;
 pub mod coordinator;
+mod db_snapshot;
 pub mod dbpath;
 pub mod engine;
 pub mod entity_type_backfill;
@@ -58,6 +60,7 @@ mod _pack_links {
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_charter::CharterPack as _;
+    #[cfg(feature = "pack-code")]
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
     use khive_pack_exec::ExecPack as _;
