@@ -94,6 +94,7 @@ khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["te
 blake3 = { workspace = true, features = ["std"] }
 
 [features]
+blob-s3 = ["khive-runtime/blob-s3", "khive-mcp/blob-s3"]
 # The default set links every pack this binary has always linked. The agent,
 # telemetry and web packs are optional; formal and moodboard stay off.
 default = ["pack-agent", "pack-telemetry", "pack-web"]
@@ -122,9 +123,6 @@ pack-formal = ["khive-pack-formal"]
 # set — off by default. See khive-mcp/Cargo.toml's pack-moodboard feature
 # for what leaving this off does to the V21 attachment cutover.
 pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
-# Links the S3-compatible blob store (`[storage.blob] backend = "s3"`). Off by
-# default: without it an S3 blob configuration is refused at boot.
-blob-s3 = ["khive-runtime/blob-s3"]
 
 [[bin]]
 name = "kkernel"

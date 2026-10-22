@@ -1537,7 +1537,7 @@ jobs:
           KHIVE_S3_TEST_REGION: us-east-1
           AWS_ACCESS_KEY_ID: khive-ci
           AWS_SECRET_ACCESS_KEY: khive-ci-secret
-        run: cargo test -p khive-db --test blob_conformance
+        run: cargo test -p khive-db --features blob-s3 --test blob_conformance
       # The suite counts only if the server started above served all of it:
       # the same process must still be alive and still own the port.
       - name: Confirm the suite ran against the started server

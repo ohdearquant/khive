@@ -67,6 +67,7 @@ khive-channel-email = { version = "0.14.0", path = "../khive-channel-email", opt
 khive-channel-telegram = { version = "0.14.0", path = "../khive-channel-telegram", optional = true }
 
 [features]
+blob-s3 = ["khive-runtime/blob-s3"]
 # The default set links every pack this crate has always linked. The agent,
 # telemetry and web packs are optional; moodboard stays off.
 default = ["pack-agent", "pack-telemetry", "pack-web"]
@@ -110,7 +111,7 @@ khive-score = { version = "0.14.0", path = "../khive-score" }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
-khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["fault-injection", "test-internals", "blob-s3"] }
+khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
 khive-storage = { version = "0.14.0", path = "../khive-storage", features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }

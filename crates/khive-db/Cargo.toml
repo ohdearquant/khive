@@ -99,8 +99,7 @@ path = "benches/db_edge_mutations.rs"
 # Exposes the task-scoped SQLite progress probe for dependent-crate tests.
 test-support = []
 default = []
-# S3-compatible blob store (stores::blob_s3) and its AWS client.
-blob-s3 = ["dep:object_store"]
+blob-s3 = ["dep:object_store", "object_store/aws"]
 vectors = ["dep:sqlite-vec"]
 # Experimental namespace-bounded FTS5 trigram tokenizer; no schema migration.
 namespace-trigram-proto = []
