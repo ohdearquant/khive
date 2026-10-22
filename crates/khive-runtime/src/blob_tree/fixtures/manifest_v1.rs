@@ -1,0 +1,2 @@
+// The source newline is outside this exact v1 manifest literal.
+pub(super) const BYTES: &[u8] = r#"{"schema":"khive-tree/v1","entries":[{"path":"a\"line\n.txt","ref":"0000000000000000000000000000000000000000000000000000000000000000","mode":644},{"path":"bin/run","ref":"1111111111111111111111111111111111111111111111111111111111111111","mode":755},{"path":"é/link","ref":"2222222222222222222222222222222222222222222222222222222222222222","mode":120000}]}"#.as_bytes();

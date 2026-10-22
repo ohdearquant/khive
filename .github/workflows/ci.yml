@@ -1634,6 +1634,17 @@ jobs:
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
       - name: Compile every target without the optional packs
         run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
+      - name: Keep Git's normal dependency graph independent of Exec and Tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p khive-pack-git --edges normal --target all --prefix none --format '{p}' > "$RUNNER_TEMP/git-normal-deps.txt"
+          awk '{print $1}' "$RUNNER_TEMP/git-normal-deps.txt" > "$RUNNER_TEMP/git-normal-packages.txt"
+          grep -Fxq 'khive-pack-git' "$RUNNER_TEMP/git-normal-packages.txt"
+          if grep -Ex 'khive-pack-exec|khive-pack-tool' "$RUNNER_TEMP/git-normal-packages.txt"; then
+            echo 'Git must not normally depend on Exec or Tool; dev fixtures may use both' >&2
+            exit 1
+          fi
       - name: Run the library tests without the optional packs
         run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
       # These integration tests assert which packs are linked and selectable. Their
