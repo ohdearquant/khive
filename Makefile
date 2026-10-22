@@ -7,8 +7,10 @@
 # so the artifact serves the pack's seven verbs whether or not the list names
 # it. Omitting it did not make the gate lenient about a pack it never built; it
 # made the gate blind to seven verbs the artifact was already shipping, so
-# losing all of them still cleared a floor set below their count.
-FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard,tool,exec
+# losing all of them still cleared a floor set below their count. `agent`,
+# `telemetry` and `web` are here for the same reason: build-local enables
+# pack-agent, pack-telemetry and pack-web now that they are off by default.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard,tool,exec,agent,telemetry,web
 LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
