@@ -868,7 +868,8 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
    accessor resolves the cached value and then observes `(name, value)` on the ledger of the runtime its
    caller holds. A ledger enqueues a name the first time it observes it and ignores later observations
-   of that name. It keeps every enqueued name until a drain writes it; no capacity limit drops one. A
+   of that name. It keeps every enqueued name until a drain takes it for the existing at-most-once,
+   best-effort append attempt; no capacity limit drops one, and neither does an entry's age. A
    runtime that reads a value another runtime already cached therefore still gets its own row. Two
    runtimes constructed over the same database each have a ledger, so that store can hold one row per
    runtime construction for the same name; this is accepted and is what "per runtime" means.
@@ -952,7 +953,13 @@ use config names that no other fixture uses. Each mutation must compile and turn
    exactly one row for each. F then reads all six again and dispatches: no row is added. A producer added
    to the census raises this count with it. Mutation: a pending buffer with any fixed capacity below six
    drops a name after marking it seen, and that name never gets a row. The seeded schedule cannot show this,
-   since lifetime deduplication caps each runtime's pending entries at the size of its pool.
+   since lifetime deduplication caps each runtime's pending entries at the size of its pool. Then a runtime
+   G observes one fresh name and is kept, with no drain, while one second passes (a wait that ages the
+   entry, not one that orders operations; with an injectable clock, an advance of the same length), and its
+   bound registry completes a healthy drain: the store holds exactly one row for that name. G reads the
+   name again and dispatches: no row is added. Mutation: discarding pending entries at least one second old
+   while keeping their names seen leaves that name with no row; no earlier checkpoint needs an entry to
+   wait that long.
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B.
@@ -975,9 +982,12 @@ use config names that no other fixture uses. Each mutation must compile and turn
    `with_runtime_event_store`, and that runtime's store refuses the append through a test seam. The
    failing store is not set with `with_event_store` afterwards, because that setter clears the runtime
    binding (`khive-runtime/src/pack/builder.rs:241-244`). The ported tests show that a `ConfigLocked`
-   append was attempted and refused. Mutations: changing the verb or dropping `value` from the payload
-   turns the successful-drain test red; returning the append's error from the dispatch turns a failure
-   test red.
+   append was attempted and refused. After the refusal the store accepts appends again, the name is read
+   again, and the registry dispatches: no row is written for that name, because the refused attempt was
+   the entry's one attempt and the drain removed it (the removal contract above is unchanged). Mutations:
+   changing the verb or dropping `value` from the payload turns the successful-drain test red; returning
+   the append's error from the dispatch turns a failure test red; keeping a refused entry pending and
+   retrying it on the next drain writes the row and turns the no-retry check red.
 
 ### Sequencing
 
