@@ -285,13 +285,25 @@ pub fn check(
         let mut awaits = Vec::new();
         for (line, line_triggers) in &phase.awaits {
             for name in line_triggers {
-                c.lookup(*line, name, EntryKind::Trigger);
-                if !triggers.is_empty() && !triggers.contains(name) {
-                    c.refuse(
-                        *line,
-                        "undeclared_trigger",
-                        format!("trigger {name:?} is awaited but not listed in `triggers:`"),
-                    );
+                match c.registry.get(name).map(|entry| entry.kind.clone()) {
+                    Some(EntryKind::Trigger) => {
+                        c.lookup(*line, name, EntryKind::Trigger);
+                        if !triggers.is_empty() && !triggers.contains(name) {
+                            c.refuse(
+                                *line,
+                                "undeclared_trigger",
+                                format!(
+                                    "trigger {name:?} is awaited but not listed in `triggers:`"
+                                ),
+                            );
+                        }
+                    }
+                    Some(EntryKind::Phrase) => {
+                        c.lookup(*line, name, EntryKind::Phrase);
+                    }
+                    _ => {
+                        c.lookup(*line, name, EntryKind::Trigger);
+                    }
                 }
             }
             awaits.push(line_triggers.clone());

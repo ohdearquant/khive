@@ -47,6 +47,25 @@ fn core_vocabulary_parses_and_declares_every_kind() {
         .passes
         .is_empty());
     assert_eq!(
+        registry.get("task.status").expect("task.status").outcomes,
+        [
+            "inbox",
+            "next",
+            "waiting",
+            "someday",
+            "active",
+            "done",
+            "cancelled"
+        ]
+    );
+    assert_eq!(
+        registry
+            .get("graph.edge_present")
+            .expect("graph.edge_present")
+            .outcomes,
+        ["present", "absent"]
+    );
+    assert_eq!(
         registry.get("work.unit").expect("work.unit").passes,
         ["done", "skipped"]
     );
@@ -63,6 +82,14 @@ fn the_five_fixture_charters_compile() {
             compiled.gate_registry_digest
         );
     }
+}
+
+#[test]
+fn an_await_can_name_a_registered_phrase() {
+    let source = format!(
+        "{HEADER}workflow:\n    phase wait:\n        await message.kind\n        complete\n"
+    );
+    compile(&source, &Registry::core()).expect("phrases may release an awaited phase");
 }
 
 #[test]
@@ -317,10 +344,6 @@ fn every_refusal_names_its_construct() {
         (
             "workflow:\n    phase a:\n        require pull_request.open hard\n        complete\nbreak_glass:\n    by author\n    on a.review.decision\n",
             "bad_break_glass",
-        ),
-        (
-            "workflow:\n    phase a:\n        await review.decision\n        complete\n",
-            "wrong_entry_kind",
         ),
         (
             "workflow:\n    phase a:\n        grant author may no.such_action\n        complete\n",

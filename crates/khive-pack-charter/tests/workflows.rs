@@ -4,7 +4,9 @@ use khive_pack_charter::CharterPack;
 use khive_runtime::{
     KhiveRuntime, PackRegistry, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::{Edge, EdgeRelation, LinkId, Note};
 use khive_types::Pack;
+use uuid::Uuid;
 
 const PR_REVIEW: &str = include_str!("fixtures/pr_review.charter");
 const PR_FIX: &str = include_str!("fixtures/pr_fix.charter");
@@ -16,7 +18,7 @@ const PR_MERGE_VOCABULARY: &str = include_str!("fixtures/pr_merge.vocab");
 const PR: &str = "acme/widgets#7";
 
 struct Fixture {
-    _runtime: KhiveRuntime,
+    runtime: KhiveRuntime,
     registry: VerbRegistry,
 }
 
@@ -25,11 +27,13 @@ impl Fixture {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             packs: vec![CharterPack::NAME.to_owned()],
+            actor_id: Some("sample-reader".to_owned()),
             ..RuntimeConfig::no_embeddings()
         })
         .expect("isolated runtime without embedding services");
         assert!(!runtime.backend().is_file_backed());
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_actor_id(Some("sample-reader".to_owned()));
         PackRegistry::register_packs(
             &[CharterPack::NAME.to_owned()],
             runtime.clone(),
@@ -40,10 +44,7 @@ impl Fixture {
         registry
             .apply_schema_plans_with_map(&Default::default(), runtime.backend())
             .expect("pack schema installation");
-        Self {
-            _runtime: runtime,
-            registry,
-        }
+        Self { runtime, registry }
     }
 
     async fn call(&self, verb: &str, params: Value) -> Value {
@@ -96,6 +97,94 @@ impl Fixture {
 
     async fn run(&self, run_id: &str) -> Value {
         self.call("charter.get", json!({"run_id": run_id})).await
+    }
+
+    async fn put_note(&self, kind: &str, properties: Value) -> Uuid {
+        self.put_note_at(kind, properties, chrono::Utc::now().timestamp_micros())
+            .await
+    }
+
+    async fn put_note_at(&self, kind: &str, properties: Value, created_at: i64) -> Uuid {
+        let token = self
+            .runtime
+            .authorize(khive_types::Namespace::local())
+            .expect("local namespace authorization");
+        let store = self.runtime.notes(&token).expect("note store");
+        let mut note =
+            Note::new("local", kind, "store instrument fixture").with_properties(properties);
+        note.created_at = created_at;
+        note.updated_at = created_at;
+        let id = note.id;
+        store.upsert_note(note).await.expect("insert note");
+        id
+    }
+
+    async fn sample_run(
+        &self,
+        charter: &str,
+        subject_kind: &str,
+        subject_ref: &str,
+        kind: &str,
+        outcome: &str,
+        args: Value,
+    ) {
+        let trigger = if matches!(kind, "message.arrived" | "schedule.fired") {
+            format!("triggers:\n    {kind}\n\n")
+        } else {
+            String::new()
+        };
+        let source = format!(
+            "charter {charter} v1\nsubject {subject_kind}\n\n{trigger}workflow:\n    phase wait:\n        await {kind}\n        complete\n"
+        );
+        self.call("charter.publish", json!({"source": source}))
+            .await;
+        let run = self
+            .call(
+                "charter.start",
+                json!({
+                    "charter": charter,
+                    "subject_kind": subject_kind,
+                    "subject_ref": subject_ref,
+                    "generation": "g1",
+                }),
+            )
+            .await;
+        let run_id = run["run_id"].as_str().expect("run id").to_owned();
+        let request = json!({
+            "subject_kind": subject_kind,
+            "subject_ref": subject_ref,
+            "kind": kind,
+            "args": args,
+            "request_id": format!("sample-{charter}"),
+        });
+        let sampled = self.call("charter.sample", request.clone()).await;
+        assert_eq!(sampled["outcome"], outcome, "{sampled}");
+        assert_eq!(sampled["producer"], "store", "{sampled}");
+
+        let before = self.run(&run_id).await;
+        assert_eq!(
+            before["state"], "completed",
+            "await was not released: {before}"
+        );
+        let evidence = before["evidence"].as_array().expect("evidence");
+        let observation = evidence
+            .iter()
+            .find(|entry| entry["kind"] == kind)
+            .expect("sample observation");
+        assert_eq!(observation["producer"], "store", "{observation}");
+        assert_eq!(observation["payload"]["outcome"], outcome, "{observation}");
+        assert_eq!(observation["payload"]["generation"], "g1", "{observation}");
+        let evidence_count = evidence.len();
+
+        let replay = self.call("charter.sample", request).await;
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(
+            self.run(&run_id).await["evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            evidence_count
+        );
     }
 
     /// (run state, current phase, that phase's state, that phase's round)
@@ -1190,4 +1279,217 @@ async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
         }])
     );
     assert_eq!(merge["next"], json!({"kind": "complete"}));
+}
+
+#[tokio::test]
+async fn inbox_sample_reports_none_and_some_for_older_unread_messages() {
+    for (suffix, unread) in [("none", false), ("some", true)] {
+        let f = Fixture::new();
+        let subject = format!("inbox-{suffix}");
+        if unread {
+            let created_at = chrono::Utc::now().timestamp_micros() - 120_000_000;
+            f.put_note_at(
+                "message",
+                json!({
+                    "direction": "inbound",
+                    "to_actor": "sample-reader",
+                    "read": false,
+                }),
+                created_at,
+            )
+            .await;
+        }
+        f.sample_run(
+            &format!("inbox_{suffix}"),
+            "message",
+            &subject,
+            "inbox.unread_older_than",
+            suffix,
+            json!({"age": 60}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn task_status_sample_reports_each_stored_status() {
+    for status in [
+        "inbox",
+        "next",
+        "waiting",
+        "someday",
+        "active",
+        "done",
+        "cancelled",
+    ] {
+        let f = Fixture::new();
+        let subject = f
+            .put_note("task", json!({"status": status}))
+            .await
+            .to_string();
+        f.sample_run(
+            &format!("task_{status}"),
+            "task",
+            &subject,
+            "task.status",
+            status,
+            json!({}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn graph_edge_sample_reports_present_and_absent_edges() {
+    for (suffix, present) in [("absent", false), ("present", true)] {
+        let f = Fixture::new();
+        let token = f
+            .runtime
+            .authorize(khive_types::Namespace::local())
+            .expect("local namespace authorization");
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        if present {
+            let now = chrono::Utc::now();
+            f.runtime
+                .graph(&token)
+                .expect("graph store")
+                .upsert_edge(Edge {
+                    id: LinkId(Uuid::new_v4()),
+                    namespace: "local".to_owned(),
+                    source_id: source,
+                    target_id: target,
+                    relation: EdgeRelation::LinksTo,
+                    weight: 1.0,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .expect("insert graph edge");
+        }
+        let args = json!({
+            "source_id": source.to_string(),
+            "target_id": target.to_string(),
+            "relation": "links_to",
+        });
+        f.sample_run(
+            &format!("edge_{suffix}"),
+            "graph_edge",
+            &format!("{source}:{target}"),
+            "graph.edge_present",
+            suffix,
+            args,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn message_arrived_sample_releases_an_awaited_phase() {
+    let f = Fixture::new();
+    let message = f
+        .put_note("message", json!({"direction": "inbound"}))
+        .await
+        .to_string();
+    f.sample_run(
+        "message_arrived",
+        "message",
+        &message,
+        "message.arrived",
+        "observed",
+        json!({}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn schedule_fired_sample_releases_an_awaited_phase() {
+    let f = Fixture::new();
+    let scheduled_event = f
+        .put_note(
+            "scheduled_event",
+            json!({"status": "fired", "fired_at": "2026-10-22T15:00:00Z"}),
+        )
+        .await
+        .to_string();
+    f.sample_run(
+        "schedule_fired",
+        "scheduled_event",
+        &scheduled_event,
+        "schedule.fired",
+        "observed",
+        json!({}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn memory_recorded_sample_reports_present_and_absent_memories() {
+    for (suffix, recorded) in [("absent", false), ("present", true)] {
+        let f = Fixture::new();
+        let memory = Uuid::new_v4();
+        if recorded {
+            let token = f
+                .runtime
+                .authorize(khive_types::Namespace::local())
+                .expect("local namespace authorization");
+            let store = f.runtime.notes(&token).expect("note store");
+            let mut note = Note::new("local", "memory", "store instrument fixture")
+                .with_properties(json!({"memory_type": "decision"}));
+            note.id = memory;
+            store.upsert_note(note).await.expect("insert memory");
+        }
+        f.sample_run(
+            &format!("memory_{suffix}"),
+            "memory",
+            &memory.to_string(),
+            "memory.recorded",
+            if recorded { "pass" } else { "fail" },
+            json!({}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn loop_log_sample_reports_present_and_absent_session_logs() {
+    for (suffix, written) in [("absent", false), ("present", true)] {
+        let f = Fixture::new();
+        let session = if written {
+            f.put_note("session", json!({"provider": "local"}))
+                .await
+                .to_string()
+        } else {
+            Uuid::new_v4().to_string()
+        };
+        f.sample_run(
+            &format!("loop_log_{suffix}"),
+            "session",
+            &session,
+            "loop.log_written",
+            if written { "pass" } else { "fail" },
+            json!({}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn sample_refuses_an_uninstrumented_phrase_by_name() {
+    let f = Fixture::new();
+    let error = f
+        .refused(
+            "charter.sample",
+            json!({
+                "subject_kind": "message",
+                "subject_ref": "message-1",
+                "kind": "message.kind",
+            }),
+        )
+        .await;
+    assert!(error.contains("no_store_instrument"), "{error}");
+    assert!(error.contains("message.kind"), "{error}");
 }

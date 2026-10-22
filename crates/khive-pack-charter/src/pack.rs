@@ -1,12 +1,15 @@
 use std::any::Any;
 use std::borrow::Cow;
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry};
+use khive_storage::note::{FilterOp, PropertyFilter};
 use khive_storage::{
-    AtomicUnitOp, SqlReader, SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult,
+    AtomicUnitOp, EdgeFilter, EdgeRelation, NoteFilter, PageRequest, SqlReader, SqlStatement,
+    SqlValue, StorageCapability, StorageError, StorageResult,
 };
 use khive_types::{
     HandlerDef, IdResolutionMode, Pack, PackSchemaPlan, ParamDef, VerbCategory, Visibility,
@@ -18,6 +21,7 @@ use crate::engine::{
 };
 use crate::lang::ast::EntryKind;
 use crate::lang::definition::LANGUAGE;
+use crate::lang::registry::{EntryDef, ParamType};
 use crate::lang::{canonical_json, compile, digest, parse_vocabulary_source, Diagnostic, Registry};
 
 const DEFAULT_DOMAIN: &str = "default";
@@ -82,7 +86,7 @@ const LIMIT: ParamDef = param(
     "Maximum rows, default 50, at most 500.",
 );
 
-pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
+pub(crate) static CHARTER_HANDLERS: [HandlerDef; 11] = [
     HandlerDef {
         name: "charter.compile",
         description: "Compile a charter source against the phrase registry and report its definition or every refusal, by line. Writes nothing.",
@@ -138,6 +142,30 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             param("charter", "string", false, "Only advance this charter's open run on the subject."),
             DOMAIN,
             REQUEST_ID,
+        ],
+    },
+    HandlerDef {
+        name: "charter.sample",
+        description: "Read a built-in store instrument and record its observation on a subject.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            SUBJECT_KIND,
+            SUBJECT_REF,
+            param(
+                "kind",
+                "string",
+                true,
+                "A phrase or trigger with a built-in store instrument.",
+            ),
+            param(
+                "args",
+                "object",
+                false,
+                "Arguments declared by the instrumented vocabulary entry.",
+            ),
+            REQUEST_ID,
+            DOMAIN,
         ],
     },
     HandlerDef {
@@ -251,6 +279,7 @@ impl PackRuntime for CharterPack {
             "charter.vocabulary" => self.vocabulary(params, token).await,
             "charter.start" => self.start(params, token).await,
             "charter.observe" => self.observe(params, token).await,
+            "charter.sample" => self.sample(params, token).await,
             "charter.cancel" => self.cancel(params, token).await,
             "charter.waiting" => self.waiting(params).await,
             "charter.get" => self.get(params).await,
@@ -373,6 +402,71 @@ fn refusal_text(diagnostics: &[Diagnostic]) -> String {
         .join("; ")
 }
 
+fn validate_instrument_args(
+    params: &Params,
+    entry: &EntryDef,
+    args: &Map<String, Value>,
+) -> Result<(), RuntimeError> {
+    for (name, value) in args {
+        let Some(parameter) = entry
+            .params
+            .iter()
+            .find(|parameter| parameter.name == *name)
+        else {
+            return Err(params.invalid(format!(
+                "unknown_argument: {} declares no argument {name}",
+                entry.name
+            )));
+        };
+        let valid = match parameter.ty {
+            ParamType::String | ParamType::Word => value.is_string(),
+            ParamType::Integer | ParamType::Duration => value.as_i64().is_some(),
+            ParamType::Bool => value.is_boolean(),
+        };
+        if !valid {
+            return Err(params.invalid(format!(
+                "argument_type: {}.{} must be {}, got {value}",
+                entry.name,
+                parameter.name,
+                parameter.ty.as_str()
+            )));
+        }
+    }
+    for parameter in &entry.params {
+        if !parameter.optional && !args.contains_key(&parameter.name) {
+            return Err(params.invalid(format!(
+                "missing_argument: {} needs {}",
+                entry.name, parameter.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_subject_kind(params: &Params, actual: &str, expected: &str) -> Result<(), RuntimeError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(params.invalid(format!(
+            "wrong_subject_kind: {} samples {expected}, got {actual}",
+            params.str("kind")?
+        )))
+    }
+}
+
+fn sample_uuid(
+    params: &Params,
+    args: &Map<String, Value>,
+    name: &str,
+) -> Result<uuid::Uuid, RuntimeError> {
+    let raw = args
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| params.invalid(format!("{name} must be a UUID string")))?;
+    uuid::Uuid::parse_str(raw)
+        .map_err(|error| params.invalid(format!("{name} must be a UUID string: {error}")))
+}
+
 fn stmt(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
     SqlStatement::new(sql, params)
 }
@@ -438,6 +532,31 @@ struct Command {
     request_id: String,
     verb: String,
     request_digest: String,
+}
+
+struct Observation {
+    subject_kind: String,
+    subject_ref: String,
+    kind: String,
+    outcome: String,
+    args: Map<String, Value>,
+    detail: Map<String, Value>,
+    generation: Option<String>,
+    only_charter: Option<String>,
+    producer: String,
+    event_id: String,
+    establishes: bool,
+    sampled: Option<Value>,
+}
+
+struct InstrumentContext<'a> {
+    params: &'a Params,
+    token: &'a NamespaceToken,
+    scope: &'a Scope,
+    subject_kind: &'a str,
+    subject_ref: &'a str,
+    kind: &'a str,
+    args: &'a Map<String, Value>,
 }
 
 /// Run `op` at most once per caller request key. A repeat of the same request returns the stored
@@ -511,6 +630,137 @@ fn boxed(value: Value) -> Box<dyn Any + Send> {
 }
 
 impl CharterPack {
+    async fn replay_receipt(
+        &self,
+        params: &Params,
+        command: Option<&Command>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(command) = command else {
+            return Ok(None);
+        };
+        let mut reader = self.runtime.sql().reader().await?;
+        let held = reader
+            .query_row(stmt(
+                include_str!("../sql/engine/command-get.sql"),
+                vec![text(&command.scope.actor), text(&command.request_id)],
+            ))
+            .await?;
+        let Some(row) = held else {
+            return Ok(None);
+        };
+        if col_text(&row, "request_digest")? != command.request_digest {
+            return Err(params.invalid(format!(
+                "request_id_reused: request_id {} was used for a different request",
+                command.request_id
+            )));
+        }
+        let mut result = col_json(&row, "result_bytes")?;
+        result["replayed"] = json!(true);
+        Ok(Some(result))
+    }
+
+    async fn commit_observation(
+        &self,
+        scope: Scope,
+        command: Option<Command>,
+        observation: Observation,
+    ) -> Result<Value, RuntimeError> {
+        let verb = if observation.sampled.is_some() {
+            "charter.sample"
+        } else {
+            "charter.observe"
+        };
+        let result = self
+            .runtime
+            .sql()
+            .atomic_unit(with_receipt(
+                command,
+                Box::new(move |writer| {
+                    Box::pin(async move {
+                        let Observation {
+                            subject_kind,
+                            subject_ref,
+                            kind,
+                            outcome,
+                            args,
+                            detail,
+                            generation,
+                            only_charter,
+                            producer,
+                            event_id,
+                            establishes,
+                            sampled,
+                        } = observation;
+                        let mut engine = Engine::new(writer, scope.clone());
+                        let exists = engine
+                            .writer()
+                            .query_row(stmt(
+                                include_str!("../sql/engine/subject-get.sql"),
+                                vec![text(&subject_kind), text(&subject_ref)],
+                            ))
+                            .await?
+                            .is_some();
+                        let mut result = if !exists {
+                            json!({"recorded": [], "events": []})
+                        } else {
+                            let (subject_id, epoch, current) = engine
+                                .subject(
+                                    &subject_kind,
+                                    &subject_ref,
+                                    generation.as_deref(),
+                                    establishes,
+                                )
+                                .await?;
+                            let payload = json!({
+                                "outcome": outcome,
+                                "args": args,
+                                "detail": detail,
+                                "epoch": epoch,
+                                "generation": generation.or(current),
+                            });
+                            let mut recorded = Vec::new();
+                            for (run_id, charter_id) in
+                                engine.open_runs_for_subject(&subject_id).await?
+                            {
+                                if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
+                                    continue;
+                                }
+                                let (sequence, fresh) = engine
+                                    .observe(
+                                        &run_id,
+                                        &subject_id,
+                                        epoch,
+                                        &kind,
+                                        &producer,
+                                        &event_id,
+                                        &payload,
+                                    )
+                                    .await?;
+                                recorded.push(json!({
+                                    "run_id": run_id, "charter": charter_id,
+                                    "sequence": sequence, "already_recorded": !fresh,
+                                }));
+                            }
+                            engine.settle().await?;
+                            json!({
+                                "recorded": recorded,
+                                "events": engine.journal.events,
+                            })
+                        };
+                        if let Some(sampled) = sampled {
+                            result["sampled"] = json!(true);
+                            result["kind"] = sampled["kind"].clone();
+                            result["outcome"] = sampled["outcome"].clone();
+                            result["producer"] = sampled["producer"].clone();
+                        }
+                        Ok(boxed(result))
+                    })
+                }),
+            ))
+            .await?;
+        unit_value(result, verb)
+    }
+
     async fn registry(&self, domain: &str) -> Result<Registry, RuntimeError> {
         let mut reader = self.runtime.sql().reader().await?;
         Ok(registry_from(reader.as_mut(), domain).await?)
@@ -878,73 +1128,302 @@ impl CharterPack {
             )));
         }
 
-        let result = self
-            .runtime
-            .sql()
-            .atomic_unit(with_receipt(
-                command,
-                Box::new(move |writer| {
-                    Box::pin(async move {
-                        let mut engine = Engine::new(writer, scope.clone());
-                        let exists = engine
-                            .writer()
-                            .query_row(stmt(
-                                include_str!("../sql/engine/subject-get.sql"),
-                                vec![text(&subject_kind), text(&subject_ref)],
-                            ))
-                            .await?
-                            .is_some();
-                        if !exists {
-                            return Ok(boxed(json!({"recorded": [], "events": []})));
-                        }
-                        let (subject_id, epoch, current) = engine
-                            .subject(
-                                &subject_kind,
-                                &subject_ref,
-                                generation.as_deref(),
-                                establishes,
-                            )
-                            .await?;
-                        let payload = json!({
-                            "outcome": outcome,
-                            "args": args,
-                            "detail": detail,
-                            "epoch": epoch,
-                            "generation": generation.or(current),
-                        });
-                        let mut recorded = Vec::new();
-                        for (run_id, charter_id) in
-                            engine.open_runs_for_subject(&subject_id).await?
-                        {
-                            if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
-                                continue;
-                            }
-                            let (sequence, fresh) = engine
-                                .observe(
-                                    &run_id,
-                                    &subject_id,
-                                    epoch,
-                                    &kind,
-                                    &producer,
-                                    &event_id,
-                                    &payload,
-                                )
-                                .await?;
-                            recorded.push(json!({
-                                "run_id": run_id, "charter": charter_id,
-                                "sequence": sequence, "already_recorded": !fresh,
-                            }));
-                        }
-                        engine.settle().await?;
-                        Ok(boxed(json!({
-                            "recorded": recorded,
-                            "events": engine.journal.events,
-                        })))
-                    })
-                }),
+        self.commit_observation(
+            scope,
+            command,
+            Observation {
+                subject_kind,
+                subject_ref,
+                kind,
+                outcome,
+                args,
+                detail,
+                generation,
+                only_charter,
+                producer,
+                event_id,
+                establishes,
+                sampled: None,
+            },
+        )
+        .await
+    }
+
+    async fn sample(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
+        let subject_kind = params.str("subject_kind")?;
+        let subject_ref = params.str("subject_ref")?;
+        let kind = params.str("kind")?;
+        let args = params.opt_object("args")?;
+        let scope = params.scope(token)?;
+        let command = params.command(&scope)?;
+        if let Some(replay) = self.replay_receipt(&params, command.as_ref()).await? {
+            return Ok(replay);
+        }
+
+        let registry = self.registry(&scope.domain).await?;
+        let subject = registry.get(&subject_kind).ok_or_else(|| {
+            params.invalid(format!("unknown_subject: {subject_kind} is not registered"))
+        })?;
+        if subject.kind != EntryKind::Subject {
+            return Err(params.invalid(format!(
+                "wrong_entry_kind: {subject_kind} is not a subject kind"
+            )));
+        }
+        let entry = registry.get(&kind).ok_or_else(|| {
+            params.invalid(format!(
+                "unknown_kind: {kind} is not a registered trigger or phrase"
             ))
+        })?;
+        if !matches!(entry.kind, EntryKind::Trigger | EntryKind::Phrase) {
+            return Err(params.invalid(format!(
+                "no_store_instrument: {kind} has no built-in store instrument"
+            )));
+        }
+        validate_instrument_args(&params, entry, &args)?;
+        let outcome = self
+            .instrument(InstrumentContext {
+                params: &params,
+                token,
+                scope: &scope,
+                subject_kind: &subject_kind,
+                subject_ref: &subject_ref,
+                kind: &kind,
+                args: &args,
+            })
             .await?;
-        unit_value(result, &params.verb)
+        if !entry.outcomes.contains(&outcome) {
+            return Err(params.invalid(format!(
+                "invalid_instrument_outcome: {kind} produced {outcome}, expected {}",
+                entry.outcomes.join(" ")
+            )));
+        }
+
+        let sampled = json!({"kind": kind, "outcome": outcome, "producer": "store"});
+        let establishes = subject.new_generation.contains(&kind);
+        self.commit_observation(
+            scope,
+            command,
+            Observation {
+                subject_kind,
+                subject_ref,
+                kind,
+                outcome,
+                args,
+                detail: Map::new(),
+                generation: None,
+                only_charter: None,
+                producer: "store".to_owned(),
+                event_id: uuid::Uuid::new_v4().to_string(),
+                establishes,
+                sampled: Some(sampled),
+            },
+        )
+        .await
+    }
+
+    async fn instrument(&self, context: InstrumentContext<'_>) -> Result<String, RuntimeError> {
+        let InstrumentContext {
+            params,
+            token,
+            scope,
+            subject_kind,
+            subject_ref,
+            kind,
+            args,
+        } = context;
+        match kind {
+            "inbox.unread_older_than" => {
+                let age = args
+                    .get("age")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| params.invalid("age must be a duration in seconds"))?;
+                if age < 0 {
+                    return Err(params.invalid("age must be non-negative"));
+                }
+                let cutoff = scope.now_us.saturating_sub(age.saturating_mul(1_000_000));
+                let filter = NoteFilter {
+                    kind: Some("message".to_owned()),
+                    max_created_at: Some(cutoff),
+                    property_filters: vec![
+                        PropertyFilter {
+                            json_path: "$.direction".to_owned(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text("inbound".to_owned()),
+                        },
+                        PropertyFilter {
+                            json_path: "$.read".to_owned(),
+                            op: FilterOp::JsonTypeNeMissing,
+                            value: SqlValue::Text("true".to_owned()),
+                        },
+                        PropertyFilter {
+                            json_path: "$.to_actor".to_owned(),
+                            op: FilterOp::Eq,
+                            value: SqlValue::Text(scope.actor.clone()),
+                        },
+                    ],
+                    ..NoteFilter::default()
+                };
+                let notes = self.runtime.notes(token)?;
+                let counts = notes
+                    .count_notes_filtered_bounded_in_snapshot(
+                        token.namespace().as_str(),
+                        &[filter],
+                        1,
+                    )
+                    .await?;
+                Ok(if counts.first().is_some_and(|count| count.count > 0) {
+                    "some"
+                } else {
+                    "none"
+                }
+                .to_owned())
+            }
+            "task.status" => {
+                require_subject_kind(params, subject_kind, "task")?;
+                let note = self
+                    .note_for_sample(params, token, subject_ref, "task")
+                    .await?;
+                let status = note
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("inbox");
+                if ![
+                    "inbox",
+                    "next",
+                    "waiting",
+                    "someday",
+                    "active",
+                    "done",
+                    "cancelled",
+                ]
+                .contains(&status)
+                {
+                    return Err(params.invalid(format!(
+                        "unknown_store_outcome: task status {status:?} is not registered"
+                    )));
+                }
+                Ok(status.to_owned())
+            }
+            "graph.edge_present" => {
+                require_subject_kind(params, subject_kind, "graph_edge")?;
+                let source = sample_uuid(params, args, "source_id")?;
+                let target = sample_uuid(params, args, "target_id")?;
+                let relation = args
+                    .get("relation")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| params.invalid("relation must be a graph relation"))?;
+                let relation = EdgeRelation::from_str(relation)
+                    .map_err(|error| params.invalid(format!("invalid relation: {error}")))?;
+                let edges = self
+                    .runtime
+                    .graph(token)?
+                    .query_edges(
+                        EdgeFilter {
+                            source_ids: vec![source],
+                            target_ids: vec![target],
+                            relations: vec![relation],
+                            ..EdgeFilter::default()
+                        },
+                        Vec::new(),
+                        PageRequest {
+                            offset: 0,
+                            limit: 1,
+                        },
+                    )
+                    .await?;
+                Ok(if edges.items.is_empty() {
+                    "absent"
+                } else {
+                    "present"
+                }
+                .to_owned())
+            }
+            "message.arrived" => {
+                require_subject_kind(params, subject_kind, "message")?;
+                self.note_for_sample(params, token, subject_ref, "message")
+                    .await?;
+                Ok("observed".to_owned())
+            }
+            "schedule.fired" => {
+                require_subject_kind(params, subject_kind, "scheduled_event")?;
+                let note = self
+                    .note_for_sample(params, token, subject_ref, "scheduled_event")
+                    .await?;
+                let fired = note
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("fired");
+                if !fired {
+                    return Err(params.invalid(format!(
+                        "store_state_not_observed: scheduled event {subject_ref} has not fired"
+                    )));
+                }
+                Ok("observed".to_owned())
+            }
+            "memory.recorded" => {
+                require_subject_kind(params, subject_kind, "memory")?;
+                Ok(if self
+                    .note_for_sample_optional(params, token, subject_ref, "memory")
+                    .await?
+                    .is_some()
+                {
+                    "pass"
+                } else {
+                    "fail"
+                }
+                .to_owned())
+            }
+            "loop.log_written" => {
+                require_subject_kind(params, subject_kind, "session")?;
+                Ok(if self
+                    .note_for_sample_optional(params, token, subject_ref, "session")
+                    .await?
+                    .is_some()
+                {
+                    "pass"
+                } else {
+                    "fail"
+                }
+                .to_owned())
+            }
+            _ => Err(params.invalid(format!(
+                "no_store_instrument: {kind} has no built-in store instrument"
+            ))),
+        }
+    }
+
+    async fn note_for_sample(
+        &self,
+        params: &Params,
+        token: &NamespaceToken,
+        subject_ref: &str,
+        expected_kind: &str,
+    ) -> Result<khive_storage::Note, RuntimeError> {
+        self.note_for_sample_optional(params, token, subject_ref, expected_kind)
+            .await?
+            .ok_or_else(|| {
+                params.invalid(format!(
+                    "no_store_state: {expected_kind} record {subject_ref} was not found"
+                ))
+            })
+    }
+
+    async fn note_for_sample_optional(
+        &self,
+        params: &Params,
+        token: &NamespaceToken,
+        subject_ref: &str,
+        expected_kind: &str,
+    ) -> Result<Option<khive_storage::Note>, RuntimeError> {
+        let id = uuid::Uuid::parse_str(subject_ref).map_err(|error| {
+            params.invalid(format!("subject_ref must be a record UUID: {error}"))
+        })?;
+        let note = self.runtime.notes(token)?.get_note(id).await?;
+        Ok(note.filter(|note| note.kind == expected_kind))
     }
 
     async fn cancel(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {

@@ -17,6 +17,9 @@ subject pull_request "a pull request on a forge, referenced as <owner>/<repo>#<n
 subject issue "an issue on a forge"
 subject message "a message or thread in an inbox"
 subject task "a task record"
+subject memory "a stored memory record"
+subject scheduled_event "a scheduled event record"
+subject graph_edge "a directed graph relation between two records"
 subject release "a release of a project, referenced by its version"
 subject session "one working session of an agent or person"
 
@@ -82,8 +85,22 @@ phrase inbox.unread_older_than "unread messages older than the given age":
     param age duration
     outcomes none some
     passes none
-phrase memory.recorded "the decision was recorded where later sessions find it"
-phrase loop.log_written "the session's log entry was written"
+    ceiling hard
+phrase task.status "the stored status of a task":
+    outcomes inbox next waiting someday active done cancelled
+    passes inbox next waiting someday active
+    ceiling hard
+phrase graph.edge_present "whether the directed graph edge is present":
+    param source_id string
+    param target_id string
+    param relation word
+    outcomes present absent
+    passes present
+    ceiling hard
+phrase memory.recorded "the decision was recorded where later sessions find it":
+    ceiling hard
+phrase loop.log_written "the session's log entry was written":
+    ceiling hard
 
 action review.request "start a review of the current head":
     param reviewer word optional
