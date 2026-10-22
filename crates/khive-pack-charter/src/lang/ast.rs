@@ -162,6 +162,7 @@ pub struct EntrySource {
     pub kind: EntryKind,
     pub name: String,
     pub description: Option<String>,
+    pub producer_class: Option<String>,
     pub outcomes: Option<Vec<String>>,
     pub passes: Option<Vec<String>>,
     pub ceiling: Option<Level>,

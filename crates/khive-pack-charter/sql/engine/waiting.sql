@@ -1,7 +1,31 @@
-SELECT r.run_id, r.charter_id, r.definition_version, r.candidate_bytes, r.parent_run_id, s.subject_kind, s.subject_ref,
-    p.phase_id, p.state, p.round, p.assignee_kind, p.assignee, p.waiting_on, p.updated_at_us
-FROM charter_runs r
-JOIN charter_subjects s ON s.subject_id = r.subject_id
-JOIN charter_phases p ON p.policy_domain = r.policy_domain AND p.run_id = r.run_id AND p.phase_id = r.current_phase_id
-WHERE r.policy_domain = ?1 AND r.state = 'open' AND (?2 IS NULL OR r.charter_id = ?2) AND (?3 IS NULL OR s.subject_kind = ?3)
-ORDER BY p.updated_at_us, r.run_id
+WITH latest AS (
+    SELECT commit_order, policy_domain, namespace, run_id, view_bytes,
+        row_number() OVER (
+            PARTITION BY policy_domain, run_id
+            ORDER BY commit_order DESC
+        ) AS row_rank
+    FROM charter_waiting_changes
+    WHERE policy_domain = ?1
+        AND namespace IN (SELECT value FROM json_each(?2))
+),
+selected AS MATERIALIZED (
+    SELECT commit_order, view_bytes
+    FROM latest
+    WHERE row_rank = 1
+        AND (
+            (?5 IS NULL AND json_extract(view_bytes, '$.state') = 'open')
+            OR (?5 IS NOT NULL AND commit_order > ?5)
+        )
+        AND (?3 IS NULL OR json_extract(view_bytes, '$.charter') = ?3)
+        AND (?4 IS NULL OR json_extract(view_bytes, '$.subject.kind') = ?4)
+),
+cursor AS (
+    SELECT coalesce(max(commit_order), 0) AS commit_order
+    FROM charter_waiting_changes
+)
+SELECT 0 AS cursor_only, selected.view_bytes, cursor.commit_order AS cursor_order
+FROM selected CROSS JOIN cursor
+UNION ALL
+SELECT 1 AS cursor_only, NULL AS view_bytes, cursor.commit_order AS cursor_order
+FROM cursor
+WHERE NOT EXISTS (SELECT 1 FROM selected)

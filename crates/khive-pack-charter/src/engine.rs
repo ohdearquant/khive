@@ -57,6 +57,14 @@ fn corrupt(message: impl Into<String>) -> StorageError {
     StorageError::Internal(format!("charter: {}", message.into()))
 }
 
+fn evidence_conflict(message: impl Into<String>) -> StorageError {
+    StorageError::Conflict {
+        capability: khive_storage::StorageCapability::Sql,
+        operation: "EvidenceConflict".into(),
+        message: message.into(),
+    }
+}
+
 fn stmt(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
     SqlStatement::new(sql, params)
 }
@@ -110,6 +118,9 @@ struct Obs {
     args: Map<String, Value>,
     generation: Option<String>,
     epoch: Option<i64>,
+    child_run_id: Option<String>,
+    phase: Option<String>,
+    round: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +131,7 @@ struct RunRow {
     subject_kind: String,
     subject_ref: String,
     candidate: Value,
+    subject_epoch: i64,
     state: String,
     current_phase_id: Option<String>,
     parent_run_id: Option<String>,
@@ -148,6 +160,7 @@ async fn load_run(w: &mut dyn SqlWriter, run_id: &str) -> StorageResult<Option<R
         subject_kind: col_text(&row, "subject_kind")?,
         subject_ref: col_text(&row, "subject_ref")?,
         candidate: col_json(&row, "candidate_bytes")?,
+        subject_epoch: col_i64(&row, "subject_epoch")?,
         state: col_text(&row, "state")?,
         current_phase_id: col_opt_text(&row, "current_phase_id")?,
         parent_run_id: col_opt_text(&row, "parent_run_id")?,
@@ -255,6 +268,9 @@ async fn observations_since(
             args: payload["args"].as_object().cloned().unwrap_or_default(),
             generation: payload["generation"].as_str().map(str::to_owned),
             epoch: payload["epoch"].as_i64(),
+            child_run_id: payload["child_run_id"].as_str().map(str::to_owned),
+            phase: payload["phase"].as_str().map(str::to_owned),
+            round: payload["round"].as_i64(),
         });
     }
     Ok(out)
@@ -273,6 +289,8 @@ async fn append(
     event_id: &str,
     payload: &Value,
 ) -> StorageResult<(i64, bool)> {
+    let bytes = canonical_json(payload);
+    let payload_digest = digest(&bytes);
     if let Some(row) = w
         .query_row(stmt(
             include_str!("../sql/engine/evidence-find.sql"),
@@ -287,6 +305,11 @@ async fn append(
         ))
         .await?
     {
+        if col_text(&row, "payload_digest")? != payload_digest {
+            return Err(evidence_conflict(
+                "the same evidence source identity was submitted with different bytes",
+            ));
+        }
         return Ok((col_i64(&row, "sequence")?, false));
     }
     let next = w
@@ -297,7 +320,6 @@ async fn append(
         .await?
         .ok_or_else(|| corrupt("evidence sequence"))?;
     let sequence = col_i64(&next, "next")?;
-    let bytes = canonical_json(payload);
     w.execute(stmt(
         include_str!("../sql/engine/evidence-insert.sql"),
         vec![
@@ -309,7 +331,7 @@ async fn append(
             text(producer),
             text(source_identity),
             text(event_id),
-            text(&digest(&bytes)),
+            text(&payload_digest),
             SqlValue::Blob(bytes),
             SqlValue::Integer(scope.now_us),
         ],
@@ -328,6 +350,37 @@ fn newest<'a>(obs: &'a [Obs], kind: &str, args: &BTreeMap<String, Value>) -> Opt
         .find(|o| o.kind == kind && args_match(args, &o.args))
 }
 
+fn performed_child<'a>(obs: &'a [Obs], child: &str, phase_id: &str, round: i64) -> Option<&'a Obs> {
+    let expected = obs
+        .iter()
+        .rev()
+        .find(|o| {
+            o.kind == child && o.phase.as_deref() == Some(phase_id) && o.round == Some(round)
+        })?
+        .child_run_id
+        .as_deref()?;
+    obs.iter().rev().find(|o| {
+        o.kind == child
+            && o.child_run_id.as_deref() == Some(expected)
+            && o.outcome.as_deref() != Some("started")
+    })
+}
+
+fn phase_observation<'a>(
+    phase: &PhaseDef,
+    obs: &'a [Obs],
+    name: &str,
+    args: &BTreeMap<String, Value>,
+    phase_id: &str,
+    round: i64,
+) -> Option<&'a Obs> {
+    if args.is_empty() && phase.performs.iter().any(|child| child == name) {
+        performed_child(obs, name, phase_id, round)
+    } else {
+        newest(obs, name, args)
+    }
+}
+
 #[derive(Debug)]
 enum Eval {
     Wait {
@@ -337,7 +390,7 @@ enum Eval {
     Route(Route),
 }
 
-fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
+fn evaluate(phase: &PhaseDef, phase_id: &str, round: i64, obs: &[Obs]) -> Eval {
     let mut pending = Vec::new();
     let mut waiting_trigger = false;
     let mut waiting_actor = false;
@@ -355,7 +408,7 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
     }
     let none = BTreeMap::new();
     for child in &phase.performs {
-        if newest(obs, child, &none).is_none() {
+        if performed_child(obs, child, phase_id, round).is_none() {
             waiting_actor = true;
             pending.push(json!({"perform": child}));
         }
@@ -368,7 +421,7 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
     let mut seen_when = BTreeSet::new();
     for when in &phase.whens {
         if seen_when.insert((&when.name, canonical_json(&json!(when.args))))
-            && newest(obs, &when.name, &when.args).is_none()
+            && phase_observation(phase, obs, &when.name, &when.args, phase_id, round).is_none()
             && !pending.iter().any(|p| {
                 p["require"] == json!(when.name)
                     || p["action"] == json!(when.name)
@@ -395,7 +448,9 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
     // A failing requirement, action or perform holds the phase unless the `when` that matched
     // routes on that same name; a `when` on another name does not release it.
     let matched = phase.whens.iter().find(|w| {
-        newest(obs, &w.name, &w.args).and_then(|o| o.outcome.as_deref()) == Some(w.label.as_str())
+        phase_observation(phase, obs, &w.name, &w.args, phase_id, round)
+            .and_then(|o| o.outcome.as_deref())
+            == Some(w.label.as_str())
     });
     let routes_on = |name: &str, args: &BTreeMap<String, Value>| {
         matched.is_some_and(|w| w.name == name && &w.args == args)
@@ -405,7 +460,8 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
         if !req.level.holds_phase() || routes_on(&req.phrase, &req.args) {
             continue;
         }
-        let outcome = newest(obs, &req.phrase, &req.args).and_then(|o| o.outcome.clone());
+        let outcome = phase_observation(phase, obs, &req.phrase, &req.args, phase_id, round)
+            .and_then(|o| o.outcome.clone());
         if !outcome.as_ref().is_some_and(|o| req.passes.contains(o)) {
             blocked.push(json!({"require": req.phrase, "args": req.args, "level": req.level, "outcome": outcome}));
         }
@@ -420,7 +476,8 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
         if routes_on(&action.name, &action.args) {
             continue;
         }
-        let outcome = newest(obs, &action.name, &action.args).and_then(|o| o.outcome.clone());
+        let outcome = phase_observation(phase, obs, &action.name, &action.args, phase_id, round)
+            .and_then(|o| o.outcome.clone());
         if !outcome.as_ref().is_some_and(|o| action.passes.contains(o)) {
             blocked.push(json!({"action": action.name, "by": action.by, "outcome": outcome}));
         }
@@ -429,7 +486,7 @@ fn evaluate(phase: &PhaseDef, obs: &[Obs]) -> Eval {
         if routes_on(child, &none) {
             continue;
         }
-        let outcome = newest(obs, child, &none).and_then(|o| o.outcome.clone());
+        let outcome = performed_child(obs, child, phase_id, round).and_then(|o| o.outcome.clone());
         if outcome.as_deref() != Some("completed") {
             blocked.push(json!({"perform": child, "outcome": outcome}));
         }
@@ -489,6 +546,57 @@ impl<'w> Engine<'w> {
         &mut *self.w
     }
 
+    pub async fn record_generation_trigger(
+        &mut self,
+        subject_id: &str,
+        producer: &str,
+        kind: &str,
+        event_id: &str,
+        payload: &Value,
+    ) -> StorageResult<bool> {
+        let bytes = canonical_json(payload);
+        let payload_digest = digest(&bytes);
+        let caller = format!(
+            "charter-generation-event:{}",
+            digest(&canonical_json(&json!([
+                self.scope.domain,
+                subject_id,
+                producer,
+                kind,
+            ])))
+        );
+        if let Some(row) = self
+            .w
+            .query_row(stmt(
+                include_str!("../sql/engine/generation-trigger-find.sql"),
+                vec![text(&self.scope.domain), text(&caller), text(event_id)],
+            ))
+            .await?
+        {
+            if col_text(&row, "request_digest")? != payload_digest {
+                return Err(evidence_conflict(
+                    "the same generation trigger source event was submitted with different bytes",
+                ));
+            }
+            return Ok(true);
+        }
+        self.w
+            .execute(stmt(
+                include_str!("../sql/engine/generation-trigger-insert.sql"),
+                vec![
+                    text(&self.scope.domain),
+                    text(&caller),
+                    text(event_id),
+                    text(&self.scope.namespace),
+                    text(&payload_digest),
+                    SqlValue::Blob(bytes),
+                    SqlValue::Integer(self.scope.now_us),
+                ],
+            ))
+            .await?;
+        Ok(false)
+    }
+
     async fn definition(&mut self, charter_id: &str, version: i64) -> StorageResult<Definition> {
         let key = (charter_id.to_owned(), version);
         if let Some(d) = self.definitions.get(&key) {
@@ -511,6 +619,56 @@ impl<'w> Engine<'w> {
         charter_id: &str,
     ) -> StorageResult<Option<(i64, String, Definition)>> {
         load_definition(&mut *self.w, &self.scope.domain, charter_id, None).await
+    }
+
+    pub async fn pinned_definition(&mut self, run_id: &str) -> StorageResult<Definition> {
+        let run = load_run(&mut *self.w, run_id)
+            .await?
+            .ok_or_else(|| corrupt(format!("unknown run {run_id}")))?;
+        self.definition(&run.charter_id, run.definition_version)
+            .await
+    }
+
+    /// Find a cycle in the effective perform graph after substituting `candidate` for its
+    /// currently published version. Charter references resolve to the latest stored version.
+    pub async fn perform_cycle(
+        &mut self,
+        candidate: &Definition,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let mut stack = Vec::new();
+        for child in candidate
+            .phases
+            .iter()
+            .flat_map(|phase| phase.performs.iter())
+        {
+            stack.push((child.clone(), vec![candidate.id.clone(), child.clone()]));
+        }
+        let mut visited = BTreeSet::new();
+        while let Some((charter_id, path)) = stack.pop() {
+            if path
+                .iter()
+                .take(path.len().saturating_sub(1))
+                .any(|ancestor| ancestor == &charter_id)
+            {
+                return Ok(Some(path));
+            }
+            if !visited.insert(charter_id.clone()) {
+                continue;
+            }
+            let Some((_, _, definition)) = self.latest_definition(&charter_id).await? else {
+                continue;
+            };
+            for child in definition
+                .phases
+                .iter()
+                .flat_map(|phase| phase.performs.iter())
+            {
+                let mut next_path = path.clone();
+                next_path.push(child.clone());
+                stack.push((child.clone(), next_path));
+            }
+        }
+        Ok(None)
     }
 
     /// Find or create the subject row. A subject without a generation takes the first one it is
@@ -557,7 +715,7 @@ impl<'w> Engine<'w> {
             .as_str()
             .map(str::to_owned);
         match generation {
-            Some(g) if held.as_deref() != Some(g) && (establishes || held.is_none()) => {
+            Some(g) if held.as_deref() != Some(g) && establishes => {
                 let affected = self
                     .w
                     .execute(stmt(
@@ -574,7 +732,15 @@ impl<'w> Engine<'w> {
                 if affected != 1 {
                     return Err(corrupt("subject generation update lost its revision"));
                 }
-                Ok((subject_id, epoch + 1, Some(g.to_owned())))
+                let next_epoch = epoch + 1;
+                for (run_id, _) in self.open_runs_for_subject(&subject_id).await? {
+                    self.queue.push_back(Work::End {
+                        run_id,
+                        state: "superseded",
+                        reason: Some(format!("subject generation advanced to {g}")),
+                    });
+                }
+                Ok((subject_id, next_epoch, Some(g.to_owned())))
             }
             _ => Ok((subject_id, epoch, held)),
         }
@@ -847,6 +1013,16 @@ impl<'w> Engine<'w> {
         if run.state != "open" {
             return Ok(());
         }
+        let (current_generation, current_epoch) = self.subject_generation(&run).await?;
+        let run_generation = run.candidate["generation"].as_str().map(str::to_owned);
+        if run.subject_epoch != current_epoch || run_generation != current_generation {
+            self.queue.push_front(Work::End {
+                run_id: run_id.to_owned(),
+                state: "superseded",
+                reason: Some("subject generation no longer matches the run candidate".into()),
+            });
+            return Ok(());
+        }
         let definition = self
             .definition(&run.charter_id, run.definition_version)
             .await?;
@@ -860,7 +1036,8 @@ impl<'w> Engine<'w> {
             .phase(&phase_id)
             .ok_or_else(|| corrupt(format!("unknown phase {phase_id}")))?
             .clone();
-        let (subject_generation, subject_epoch) = self.subject_generation(&run).await?;
+        let subject_generation = run_generation;
+        let subject_epoch = run.subject_epoch;
         // A first visit reads every observation at the current generation and subject epoch
         // (ADR-208 D3, ADR-193 D8); a revisit reads only what arrived after its previous visit
         // ended, so a loop never reuses the evidence that sent it round.
@@ -879,12 +1056,12 @@ impl<'w> Engine<'w> {
         let obs: Vec<Obs> = observations_since(&mut *self.w, &self.scope.domain, run_id, window)
             .await?
             .into_iter()
-            .filter(|o| match (&o.generation, &subject_generation) {
-                (Some(g), Some(current)) => g == current && o.epoch == Some(subject_epoch),
-                _ => true,
+            .filter(|o| {
+                o.generation.as_deref() == subject_generation.as_deref()
+                    && o.epoch == Some(subject_epoch)
             })
             .collect();
-        match evaluate(&def, &obs) {
+        match evaluate(&def, &phase_id, row.round, &obs) {
             Eval::Wait {
                 state,
                 mut waiting_on,
@@ -1037,7 +1214,13 @@ impl<'w> Engine<'w> {
                     ENGINE_PRODUCER,
                     &run.subject_id,
                     run_id,
-                    &json!({"outcome": state, "child_run_id": run_id, "reason": reason}),
+                    &json!({
+                        "outcome": state,
+                        "child_run_id": run_id,
+                        "reason": reason,
+                        "generation": run.candidate["generation"],
+                        "epoch": run.subject_epoch,
+                    }),
                 )
                 .await?;
                 self.queue.push_back(Work::Advance(parent.clone()));
@@ -1052,6 +1235,24 @@ impl<'w> Engine<'w> {
         };
         if parent.state != "open" {
             return Ok(());
+        }
+        let mut ancestor = Some(parent_run_id.to_owned());
+        let mut visited_runs = BTreeSet::new();
+        while let Some(run_id) = ancestor {
+            if !visited_runs.insert(run_id.clone()) {
+                return Err(corrupt("perform_cycle: run ancestry contains a cycle"));
+            }
+            let Some(run) = load_run(&mut *self.w, &run_id).await? else {
+                return Err(corrupt(format!(
+                    "run ancestry references missing run {run_id}"
+                )));
+            };
+            if run.charter_id == charter_id {
+                return Err(corrupt(format!(
+                    "perform_cycle: {charter_id} is already in the parent run ancestry"
+                )));
+            }
+            ancestor = run.parent_run_id;
         }
         let Some((version, definition_digest, definition)) =
             self.latest_definition(charter_id).await?
@@ -1092,13 +1293,41 @@ impl<'w> Engine<'w> {
             .into_iter()
             .filter(|(role, _)| definition.roles.iter().any(|r| &r.name == role))
             .collect();
-        self.start_run(
-            version,
-            &definition_digest,
-            &definition,
-            (&parent.subject_id, subject_epoch, generation.as_deref()),
-            &child_bindings,
-            Some(parent_run_id),
+        let phase_id = parent
+            .current_phase_id
+            .as_deref()
+            .ok_or_else(|| corrupt("open parent run has no current phase"))?;
+        let phases = load_phases(&mut *self.w, &self.scope.domain, parent_run_id).await?;
+        let round = phases
+            .get(phase_id)
+            .ok_or_else(|| corrupt(format!("parent run has no phase {phase_id}")))?
+            .round;
+        let child_run_id = self
+            .start_run(
+                version,
+                &definition_digest,
+                &definition,
+                (&parent.subject_id, subject_epoch, generation.as_deref()),
+                &child_bindings,
+                Some(parent_run_id),
+            )
+            .await?;
+        append(
+            &mut *self.w,
+            &self.scope,
+            parent_run_id,
+            charter_id,
+            ENGINE_PRODUCER,
+            &parent.subject_id,
+            &format!("perform-start:{phase_id}:{round}:{child_run_id}"),
+            &json!({
+                "outcome": "started",
+                "child_run_id": child_run_id,
+                "generation": generation,
+                "epoch": parent.subject_epoch,
+                "phase": phase_id,
+                "round": round,
+            }),
         )
         .await?;
         Ok(())
