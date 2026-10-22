@@ -24,7 +24,7 @@ const REPLY_AFTER_VERIFICATION: &str =
     include_str!("../../tests/fixtures/reply_after_verification.charter");
 const PR_MERGE_AFTER_CI_GATE: &str =
     include_str!("../../tests/fixtures/pr_merge_after_ci_gate.charter");
-const PR_MERGE_VOCAB: &str = include_str!("../../tests/fixtures/pr_merge.vocab");
+const PR_MERGE_VOCAB: &str = include_str!("../../vocab/pr_merge.vocab");
 
 const HEADER: &str = "charter probe v1\nsubject pull_request\nroles:\n    author\n";
 
