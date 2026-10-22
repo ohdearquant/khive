@@ -913,6 +913,8 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
 
 Real `OnceLock` producers run in an isolated process with no earlier read of the name; synthetic tests
 use config names that no other fixture uses. Each mutation must compile and turn its named test red.
+These fixtures discriminate the named mutations; they do not establish correctness for every entry age,
+value length, name or retry policy, and Decision 2 still forbids a loss or a duplicate of that kind.
 
 1. **Destination.** Runtimes A and B with separate stores and distinct namespace and actor, one registry
    each bound with `with_runtime_event_store`. A's handler reads a fresh name; A's dispatch completes;
@@ -987,7 +989,12 @@ use config names that no other fixture uses. Each mutation must compile and turn
    the entry's one attempt and the drain removed it (the removal contract above is unchanged). Mutations:
    changing the verb or dropping `value` from the payload turns the successful-drain test red; returning
    the append's error from the dispatch turns a failure test red; keeping a refused entry pending and
-   retrying it on the next drain writes the row and turns the no-retry check red.
+   retrying it on the next drain writes the row and turns the no-retry check red. A second check holds an
+   admitted `ConfigLocked` append past the caller's admission deadline: the dispatch observes the timeout,
+   the held append is then released and completes, the name is read again and the registry dispatches.
+   Once the append path is idle the store holds exactly one row for the name and the ledger made no second
+   submission. Mutation: re-enqueue the taken entry only when the submission returns
+   `AdmissionDeadlineExpired`; the next drain writes a second event and the check fails.
 
 ### Sequencing
 
