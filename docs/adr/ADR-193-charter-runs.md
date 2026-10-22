@@ -554,3 +554,566 @@ revisions; a run that moved A to B and back to A appears.
 
 With Amendments 1-4, M1 also passes cases 14 and 15 and the refusal arms of case 12; M2 passes all
 fifteen.
+
+## Amendment 5 (2026-10-22): producer registration and evidence eligibility
+
+**Status**: Proposed (2026-10-22).
+
+When accepted, this amendment amends ADR-193 D3, D8, D10, D11 and acceptance case 5; ADR-208 D3, D5 and
+D6; ADR-143's caller-right vocabulary and administration constraints, as specified below. It relates to
+ADR-007 (namespace attribution), ADR-018 (the Gate), ADR-127 (identity assurance and shared authority),
+ADR-180 (tool-use policy), and proposed ADR-209 (root policy exceptions).
+
+### Context
+
+Permission to invoke `charter.observe` is not permission to record every kind
+of evidence. ADR-193 requires the caller to determine the producer and requires
+a registration restricting its observation kinds and repository scope. ADR-208
+adds generic subjects and a producer class to each vocabulary entry. The class
+describes the expected source; it does not enroll a principal.
+
+Three contracts must agree: the Gate's permission to submit, the source contract
+of the pinned vocabulary entry, and the evaluator's decision about which
+recorded evidence remains eligible. Checking only the first leaves role,
+subject and source substitution open. Checking only during evaluation permits
+unauthorized submissions to change generations or release triggers before a
+requirement is evaluated.
+
+The Gate receives the caller, verb and request arguments, not resolved target
+records. ADR-127 separates that check from the transactional discharge of a
+subject-bound obligation. ADR-143 supplies durable caller authority and its
+administration. ADR-180 tool grants do not supply this contract: a grant's scope
+is descriptive, and a grant takes precedence over a deny policy.
+
+The recording milestone still refuses invalid evidence. Its absence of effect
+enforcement is not an exception to producer admission. A deployment whose
+processes share an OS user also needs an explicit limit: checking a configured
+principal against a registration does not authenticate that process against
+another process able to change configuration or open the store.
+
+### Decision
+
+#### D1. Registration is a standing right in shared caller authority
+
+A producer registration is a typed, reusable `RecordObservation` right managed
+by the shared authority service used by the Gate. It specializes ADR-143 caller
+authority. It is not an ADR-180 tool grant and is not a single-use resource or
+exception approval. Recording an observation does not consume the registration.
+This adds a constrained right to the shared service; it does not redefine
+existing caller rights or the purposes of single-use approvals.
+
+The authority service owns the registration records, liveness and administration
+history. The charter pack owns only its evidence and the authority snapshots it
+consumed. No separate `charter.register`, `charter.disable` or charter-local
+issuer is introduced. Registration, disable and bounded listing are operations
+of the shared grant-administration surface, specialized by this right type.
+Their wire names must be declared with that surface before implementation;
+this amendment does not assert that such verbs already exist.
+
+Each immutable registration contains:
+
+- Its identity, schema version, exact structural grantee, issuer and delegation
+  lineage, policy domain, issuance assurance and creation time.
+- A finite, nonempty set of observation permissions. Each permission names an
+  exact entry name and entry-contract digest, its producer class and allowed
+  submission channel, and one typed subject selector from D4.
+- For external instruments and relays, the exact source contract and allowed
+  source identities. Where a kind has authority-relevant arguments, a finite
+  set of exact typed argument bindings is mandatory. For example, permission
+  for `gate.result(name="lint")` does not permit another named check; a floor
+  check also pins the check's producing application identity.
+- For actor reports, the reporting binding specified in D3. For a claim-time
+  platform bundle, the designated executor and bundle purpose.
+- A validity interval: `not_before` is required; `expires_at` is either an
+  explicit instant or explicitly absent for a standing permission.
+
+Selectors are closed data with exact equality and bounded collections. There
+are no patterns, predicates or expressions in registrations. One complete
+permission must match; the service cannot combine the kind from one permission
+with the repository, arguments or source identity from another. If several
+complete permissions match, choose the lexicographically smallest registration
+identity and permission index, and retain that choice in the receipt.
+
+The shared administration rule is attenuation: granting requires both the
+ordinary right being delegated and administration over its entire constrained
+scope. Possessing an observation right alone confers no administration. A
+multi-permission change is all-or-nothing. Disable authority is checked against
+the stored permission set, not a smaller set asserted by its requester.
+ADR-143's structural identity, parent restrictions, lineage validation and
+transactional change history apply. Publishing a vocabulary or starting a run
+confers no observation right.
+
+Durable capabilities are minted through narrowing delegation and verified on
+load, including their seals and live root anchor. A missing verification key
+is unavailable, not permission. A local service-held seal authenticates that
+service's record within its declared boundary; it does not establish
+`ActorSignature` or distinguish peers who can read the same key material.
+
+Disable appends a terminal lifecycle record for that registration. Replacing or
+renewing permission creates a new identity; there is no in-place widening or
+reactivation. Registration and lifecycle changes, their authorizing context and
+reason, and the shared authority revision commit together. Failed history
+persistence aborts the change. A generic record or stream write cannot create,
+alter or disable this authority.
+
+This requires the minimum shared standing-right service and its Gate integration.
+It is not satisfied by the presence of accepted ADRs. The cooperative recording
+profile in D7 is an explicitly weaker identity profile; it does not claim the
+complete ADR-127/143 authenticated implementation or substitute a second store
+for it.
+
+#### D2. The caller fixes the producer; the source is a different identity
+
+For every external observation, `producer` is the structural principal from the
+sealed dispatch context. Remove the top-level `producer` request parameter and
+refuse it whenever present, including when it equals the caller. Do not silently
+ignore it or reinterpret it as a source label. An entry's declared argument
+named `producer`, such as a floor check's application identity, remains an
+argument of that entry and never controls the observation's producer.
+
+The envelope records source identity separately: the instrument or platform,
+source event or attempt, observed interval, completeness, source payload digest,
+and server receipt time. Source assertions are checked against the registration
+and the kind's versioned schema. Free-form detail carries no producer,
+authorization, completeness or assurance semantics. Assurance and receipt time
+are derived by the service, never accepted from the request.
+
+A relay is the authenticated submitting principal, not a second caller-selected
+producer. A platform observation carries the platform response identity, such
+as a request identifier or entity tag with response time, and a retained
+response digest bound to the subject and candidate. Such an identifier is a
+correlation value, not a cryptographic platform attestation. Trust comes from
+the authenticated, authorized relay and its verified collection path. A relay
+can still lie within its authority; registration alone cannot detect that.
+This qualifies ADR-193 Amendment 2's statement that the platform attests the
+facts: a plain response identifier does not prove their origin independently.
+
+The claim-time bundle remains restricted to the designated executor's relay
+registration. Another registered platform relay cannot substitute for it.
+Caller identity assurance, source assurance, and the run's `recording_only`
+assurance are separate fields and must remain separately visible.
+
+Internal producers use a tagged internal origin with a compiled adapter
+identity and digest. They are not external principals named `store` or
+`charter`. A public request cannot construct this origin. A store sample also
+records `requested_by` from the real caller; the caller is not relabeled as the
+internal producer.
+
+#### D3. Classes constrain the source contract, not a principal's label
+
+The registry accepts exactly `actor`, `instrument`, `platform` and `system`.
+Unknown classes refuse compilation. Each entry also has a versioned submission
+contract specifying its channel and evidence schema. These fields enter its
+contract digest and the registry digest. A class, entry name or channel never
+grants permission by itself. Published vocabulary data cannot install an
+internal adapter or overwrite a compiled entry.
+
+Subject declarations are not observation kinds. Their class does not make
+them admissible through `charter.observe`. Engine-generated lifecycle and
+child-completion names likewise cannot be enrolled as external observation
+kinds.
+
+| Class        | Admission contract                                                                                                                                                                                                   |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `actor`      | An explicitly registered caller reports for one named run and an authorized reporting binding. Action results additionally name the exact action instance and visit.                                                 |
+| `instrument` | An external registered instrument may use `charter.observe` only for its exact kind, source, argument bindings and subject scope. Entries assigned to a built-in store reader are produced only by `charter.sample`. |
+| `platform`   | A registered relay supplies the platform envelope required by D2. A compiled reader of already stored platform-derived data may instead use `charter.sample`, with its store provenance explicit.                    |
+| `system`     | Only a compiled internal transition or a specifically registered built-in store reader produces the observation. Public `charter.observe` always refuses.                                                            |
+
+For actor phrases and triggers, the permission binds an exact definition digest,
+entry and declared reporting role; that role must resolve to the caller in the
+run's immutable bindings. Admission policy must select one reporting role for
+each such entry in a definition. An ambiguous or absent mapping refuses run
+admission rather than inferring the role from the phase owner or accepting any
+run participant. The mapping is fixed policy data, not a charter expression.
+Procedures needing different reporters for the same entry must use distinct
+entries until a separately specified per-use binding exists.
+
+For action results, the expected reporter is the actor bound to the action's
+explicit `by` role, or to the phase owner if `by` is absent. If neither exists,
+use the phase's persisted initiating-principal assignee. An explicitly named
+but unbound role refuses; it does not fall back to the initiator. Results bind
+the run, phase visit, action occurrence and exact arguments. A prior visit's result
+cannot complete a later action. Actor phrases may be recorded ahead of a future
+phase in their named run, preserving ADR-208's first-visit evidence rule.
+They do not fan out to other runs on the subject.
+
+Run creation authorizes its proposed role bindings through the same shared
+policy architecture. Merely writing oneself into `bindings` is not enrollment.
+Role membership and producer permission are intersected, never substituted for
+one another. Changing a reporting assignment requires a new authorized run;
+old evidence retains its original binding.
+
+The compiled store-reader mapping includes `task.status`,
+`graph.edge_present`, `inbox.unread_older_than`, `memory.recorded` and
+`loop.log_written`. It also includes the platform-class `message.arrived`
+and system-class `schedule.fired` on their supported store subjects. These
+exceptions are explicit channel declarations, not permission for every kind in
+either class to use a store reader. `charter.sample` accepts no caller-selected
+outcome and cannot invoke an arbitrary instrument. Its caller still requires
+Gate permission for the sampling operation and scope. Internal lifecycle and
+child-completion observations remain confined to the engine's typed transition
+path.
+
+A sample establishes what the store contained. It does not authenticate the
+earlier write that put that state there. Reading a fabricated message or edited
+task through a trusted reader must not promote it to independently verified
+external evidence. Likewise, registration does not make a self-report
+independent, raise an entry's enforcement ceiling or satisfy an M2 independence
+requirement.
+
+#### D4. Scope is an exact typed subject selection
+
+Every permission names a policy domain, one subject kind, and one selector:
+
+1. A finite set of exact subject identities, using that kind's versioned
+   canonical reference; or
+2. A finite set of exact `(forge identity, immutable repository identity)` pairs,
+   for a subject kind whose registered resolver establishes repository membership;
+   or
+3. Explicit `all_subjects_of_kind` for a kind whose registered contract is
+   repository-independent. This deliberately covers existing and future subjects
+   of that exact kind in the domain. It is a separately authorized broad scope,
+   useful for repeated task or message procedures, never an omitted-field default.
+
+Repository scope and subject kind are conjunctive. Permission on pull requests
+in a repository does not permit issues in it. An exact subject permission is
+narrower than the applicable broad selector. Repository-bearing kinds cannot use
+`all_subjects_of_kind`; an unknown kind contract cannot claim to be
+repository-independent. Omitted scope, wildcard, prefix and regular-expression
+matching are unsupported. A broad selector requires the grantor to hold and
+administer that same breadth; observing one subject cannot authorize its grant.
+
+For an opaque reference without a canonicalizer, exact byte equality is the
+only supported subject matching. A display name or `<owner>/<repo>` prefix is
+not an immutable repository identity. Existing references are not rewritten.
+A resolver may establish an additional immutable identity binding, with its
+own version and provenance. Conflicting, absent or ambiguous bindings refuse
+repository-scoped admission. Until that resolver exists for a kind, use exact
+subject references; do not infer a repository from placeholder columns or
+caller-supplied labels.
+
+The Gate matches request-side permission constraints against a canonical
+observation descriptor. This is still a claim about the request. At the
+transaction seam the shared authority service discharges the Gate's bound
+obligation against the actual run, subject, generation, registry entry and role
+binding before any write. A request naming an allowed repository but another
+repository's subject refuses. A caller cannot substitute `domain`, a namespace
+or a source field for this equality check.
+
+External instrument and relay observations may fan out only to explicitly
+derived eligible runs of that subject. All selected targets are checked before
+any effect. If any selected target is unauthorized, the command refuses whole;
+it must not skip that run silently. If no target runs exist, an ordinary
+observation returns an explicit not-recorded result, with no run evidence or
+progression. A
+generation-establishing source event may update the subject independently of
+open runs only after its own registration and complete source envelope have
+been checked, with its admission receipt and generation-event record committed
+atomically. An empty target set is not an authorization bypass. A run selector
+can narrow target runs, never the subject-wide meaning of a generation change.
+
+Namespace remains attribution and read filtering. No by-ID namespace equality
+check is added. Subject binding verifies the identity of the claimed observation;
+it does not isolate arbitrary stored records or create a tenant boundary.
+
+#### D5. Admission and authority freshness share the evidence transaction
+
+The shared authorization component composes with the configured Gate. An outer
+allow, including `AllowAllGate`, does not manufacture a producer permission.
+Protected evidence-writing paths require an installed component and a sealed
+admission context; direct pack invocation without one refuses. Unknown or
+unavailable authority never becomes permission.
+
+The initial Gate check decides caller and request permission. The same shared
+service then validates its obligation at the evidence transaction, using the
+resolved descriptor and current authority. Handlers do not independently
+resolve principals, maintain permission lists or implement another policy
+engine. This follows ADR-127's Gate/action-seam split without changing
+ADR-007's request-side Gate input contract.
+
+Registration state, lineage, scope, source contract, role binding and validity
+are checked at the serialization point of the append. Evidence, its admission
+receipt, generation change, evaluation, progression and command replay record
+commit atomically. The minimum local implementation places the participating
+authority records in the same transactional store. An external authority
+backend requires an explicit equivalent fencing protocol; a cached check or a
+remote query immediately before the write is not equivalent. No network read
+occurs inside the charter transaction.
+
+Unregistered, disabled, expired, wrong-kind, wrong-source, wrong-role or
+out-of-scope submissions refuse with `ProducerNotAuthorized` and a stable
+reason. Missing verification infrastructure is reported as unavailable and
+also writes nothing. Malformed envelopes and the removed `producer` field
+produce typed input refusals. Refusal appends no charter evidence and changes
+no subject, run, phase or command-success state. Ordinary denial telemetry is
+not charter evidence.
+
+Each evidence admission retains the producer, identity/source assurance,
+registration identity and immutable permission digest, checked authority
+revision and lineage, normalized subject and generation, entry-contract digest,
+source envelope, relevant role/action binding, and server receipt time. The
+receipt embeds the checked values; it does not depend on a best-effort Gate
+audit event remaining available. Payload bytes and the full provenance envelope
+have separately versioned canonical digests.
+
+Within each target run, the source-event conflict key includes the producer,
+source identity, kind, subject and generation. It does not include the
+registration identity: renewal cannot make conflicting bytes for the same source
+event appear new. Compare a canonical content digest over the fact and its
+source envelope, excluding server receipt time and admission metadata. The full
+provenance digest separately binds those server-established fields. Identical
+resubmission returns the existing receipt without refreshing its age or
+registration. Conflicting material bytes refuse as `EvidenceConflict`.
+
+Current submission authorization precedes command replay. In particular, a
+disabled caller's `charter.observe` retry refuses, even for a previously
+successful request. Its committed evidence remains readable through authorized
+history reads. This qualifies ADR-193 D8: an idempotency key does not preserve a
+revoked submission right. While authorized, an exact retry returns its original
+result and performs no sampling, append, fan-out or progression.
+
+#### D6. Disable changes current eligibility, never recorded history
+
+Disable prevents new submissions under that registration. A fresh evaluation
+also checks the continuing liveness, validity and lineage of the registration
+named by each external evidence receipt. A new registration cannot validate
+an old receipt. A missing or unverifiable receipt is ineligible. Internal
+receipts instead verify the pinned internal adapter contract and applicable
+current policy. Reading or replaying evidence never changes it.
+
+Selection retains the subject-generation, completeness, source and phase-visit
+rules. It examines the latest relevant source state before accepting its current
+trust. A disabled or otherwise ineligible later observation cannot be filtered
+away to reveal an earlier passing observation. Partial, unavailable or
+conflicting newer evidence likewise cannot refresh an older pass. The result
+holds with the reason and affected evidence identities until fresh eligible
+evidence or a valid explicit policy exception resolves it. Contradictory
+required sources remain blocking; no caller selects the green member of an
+inventory.
+
+An evaluation is pure over its captured evidence and authority snapshot. Store
+the exact definition and registry/implementation digests, candidate and visit,
+evidence identities and envelope digests, authority snapshot, evaluation time,
+mode and resulting input digest. A diagnostic current evaluation takes a fresh
+snapshot; historical replay uses the original snapshot and time. Disable
+changes the current authority revision and any resulting evaluation input
+digest, not the definition, old evidence, old evaluation or old digest. Missing
+historical inputs or evaluator versions yield `ReplayUnsupported` or an explicit
+unavailable result, never replay with today's authority silently substituted.
+
+Completed historical progress is not undone. Current views identify affected
+historical conclusions, and every future transition checks its required
+evidence against current authority. The waiting view must account for authority
+revision changes as well as evidence changes, so a stale cached ready state
+cannot remain actionable. At M2, current authority checks at claim and start
+invalidate unsent admissions dependent on disabled producers under ADR-193 D10.
+An already dispatched effect is reconciled; disable does not assert its reversal.
+
+Disable and append/transition/claim/start have a defined serialization order.
+If disable commits first, the competing new use refuses. If the use commits
+first, its receipt records that earlier authority snapshot; subsequent use is
+still refused. No positive cache may extend the registration past this boundary.
+
+#### D7. Bootstrap is explicit; M1 still refuses unregistered evidence
+
+The composition root provisions an explicit authority administrator and finite
+authority envelope before external observation admission becomes available.
+It uses the shared service's bootstrap lineage and durable root anchor. This
+does not depend on any charter observation. Registering the first producer is
+therefore possible without already having a producer.
+
+Bootstrap and any optional seed registrations commit with one unique
+initialization marker and their attributed history. An explicit empty seed set
+is valid. Concurrent initializers must agree on the administrator, authority
+envelope and seed digest; divergent initialization refuses, rather than unioning
+two configurations. The marker is independent of the number of live
+registrations. Restart, an empty registry or disabling the last producer never
+reimports seeds or grants authority to the first caller. A post-initialization
+configuration edit is not a registration update.
+
+Administration is independent of producer liveness, so disabling all producers
+does not disable the administrator. Recovery of lost administrative authority
+is an explicit composition-root recovery with a new epoch and retained history.
+It does not fabricate an observation or silently reactivate old permissions.
+Protected recovery must satisfy the separate custody and epoch requirements of
+the protected deployment.
+
+M1 permits an explicitly configured cooperative recording profile. In it, the
+producer is the exact caller principal resolved by dispatch and the receipt
+states `identity_assurance = configured_local`. This marker is neither
+`ActorSignature` nor `DaemonBearer`. It records permission checked against a
+configured identity, not verified process identity. A deployment with an armed
+authenticator records the actual assurance it established instead. No failed
+authentication falls back to a configured label.
+
+This is the bounded M1 qualification to authenticated-producer wording, not a
+claim of the complete ADR-127 authentication path. All registration, scope,
+class, history and refusal rules still apply. `self_reported` remains a source
+assurance available to a registered review reporter, never a permission for an
+unregistered caller. M1 runs remain `recording_only`, and `charter.claim`
+continues to refuse. M2 requires authenticated provenance and the independent
+production paths required for the facts it uses. Neither local enrollment nor
+M1 evidence is promoted on activation.
+
+Existing evidence without admission receipts remains unchanged and is labeled
+legacy, with registration unverified. Do not infer registrations from distinct
+stored producer strings or attach a newly issued registration retroactively.
+Historical displays remain available; new evaluations requiring registered
+evidence need new observations. Preserve old evaluator semantics only as
+explicit historical replay, with their assurance visible.
+
+Where ADR-209 is accepted and implemented, root may accept a specifically
+identified missing or rejected policy fact through its exact exception path.
+The absence does not become evidence. Root exceptions do not authorize forged
+producers, edit a class, enroll a principal or turn rejected evidence into a
+pass. Root may separately administer registrations through authorized shared
+administration. Bootstrap does not depend on the exception facility, and
+accepting this amendment does not activate that proposed facility.
+
+#### D8. Keep the evidence contract in ADR-193
+
+This amendment is the authority for producer admission and history. ADR-208 D3
+references its class/channel and eligibility rules; D5 references its subject
+selectors; D6 states that M1 does not enforce external effects but does enforce
+evidence admission. ADR-143 adds the standing right, constrained administration
+and lifecycle rules in D1 without changing other rights. ADR-018 continues to
+define the Gate, with the transactional obligation discharge supplied by
+ADR-127. ADR-209 references this contract for evidence actually consumed and
+retains its separate exception semantics. These companion edits accompany
+acceptance, so the records do not describe competing registration mechanisms.
+
+### Acceptance
+
+These are required implementation cases, not claims of executed verification.
+Use real dispatch and evidence transactions with paired positive controls.
+
+1. **Registration and administration.** A scoped registered producer records its
+   allowed kind. The same caller without registration refuses. An ordinary
+   producer cannot register itself, widen its scope, disable another registration
+   or delegate administration. A valid constrained administrator can provision
+   the producer. Failure to write change history leaves no authority change.
+2. **Identity.** Every top-level `producer` value refuses, including the caller's
+   own value and reserved internal names. Omitting it records the dispatch
+   principal. Principals with equal display strings but different structural
+   fields remain distinct. Changing an entry's `args.producer` cannot change
+   the authenticated producer and still obeys that argument's permission binding.
+3. **Kind, arguments and channel.** A permitted `gate.result` for one exact
+   `name` refuses another. A store-reader kind refuses public observe even from
+   a registered external instrument; a genuine sample succeeds. An external
+   system observation refuses, while the compiled `schedule.fired` sampler
+   succeeds on actual fired state and refuses otherwise. Unknown classes and
+   data-defined internal adapters refuse, as do attempts to enroll subject
+   declarations or internal lifecycle names for external submission. Changing
+   class/channel/schema changes the entry digest and requires corresponding
+   new permission.
+4. **Actor binding.** The registered reporter bound to the designated role
+   succeeds for its named run. An unbound caller, another bound role, another
+   run and another action visit each refuse. A self-written role binding alone
+   grants nothing. Missing and ambiguous reporting mappings refuse admission of
+   a run that requires them. A phrase recorded before its first consuming phase
+   remains eligible under that run's unchanged binding.
+5. **Platform relay.** A valid registered relay with the correct response
+   envelope succeeds. Missing source identity, wrong source, wrong candidate
+   and wrong claim-time executor refuse. A syntactically plausible response id
+   without verified collection provenance never receives independent-platform
+   assurance. A store sample retains store provenance even if its source row
+   claims an external origin.
+6. **Scope.** An exact subject grant permits that subject and refuses a similar
+   prefix, another kind and another domain. A repository grant permits a subject
+   resolved to its immutable repository and refuses another repository, an
+   unbound display reference and a request that lies about the repository.
+   An explicit repository-independent kind grant covers a newly created subject
+   of that kind but no other kind or domain; the same selector for a
+   repository-bearing kind refuses. No combination of partially matching
+   permissions admits a request. Changing
+   namespace alone neither grants permission nor changes the subject identity.
+7. **Pre-effect refusal.** Failed producer admission changes no evidence,
+   generation, phase, child run or success receipt, including on trigger paths,
+   empty target sets and multi-run fan-out with one unauthorized target. Generic
+   note and stream writes cannot construct evidence or producer authority.
+   Direct pack calls with no sealed admission context refuse. An outer
+   `AllowAllGate` does not bypass the producer component; missing component
+   prevents activation of evidence-writing paths. A permitted generation event
+   can update its subject with no open run only with its admission and
+   generation-event records; the unregistered equivalent refuses without change.
+8. **Disable and races.** Record evidence, disable its registration, and refuse
+   new observations without restart, including through a second serving
+   process. Force both serialization orders of disable versus append and
+   transition. Only an operation ordered before disable may commit its use.
+   Repeat with expiry, revoked lineage and unavailable authority. Where M2 is
+   active, repeat at claim and start; dispatched attempts retain reconciliation.
+9. **History and no resurrection.** A fresh evaluation rejects use of disabled
+   evidence while replay of the original evaluation returns its original result
+   and digest. Disable the producer of a later failure: an older green result
+   must not reappear as a pass. A new registration does not revive old receipts.
+   Fresh valid evidence restores eligibility. Evidence bytes, completed history
+   and pinned definition digests never change during these operations.
+10. **Replay and conflict.** An authorized exact retry returns the original
+    receipt and age without progression or fan-out to a newly opened run.
+    Conflicting bytes under the same event identity refuse even after renewing
+    registration. Disable causes subsequent observe retries to refuse; an
+    authorized history read still returns the original record. Failed append or
+    receipt persistence rolls back the complete command.
+11. **Bootstrap.** A fresh store can provision an administrator and then its
+    first producer. Empty seeds remain empty after restart. Identical concurrent
+    initialization is idempotent; divergent initialization refuses. Disabling
+    the last producer does not reopen bootstrap or remove administration.
+    Unprovisioned administration never authorizes the first incoming caller.
+12. **Milestones and legacy evidence.** M1 refuses unregistered submissions
+    rather than lowering assurance to accept them. A registered self-report is
+    labeled and cannot satisfy an M2 independent-source requirement. Legacy
+    records remain unchanged, unverified and ineligible for new registered-evidence
+    decisions. Same-user configuration impersonation may pass in cooperative
+    mode and must never be reported as detected or contained by registration.
+13. **Exception separation.** Once the ADR-209 exception facility is available,
+    an exact root exception can release a policy hold with no eligible producer
+    for that fact. It records the absence and exceptional disposition. It cannot
+    make a forged observation admissible, enroll its submitter or waive an
+    unavailable authority service. Other unwaived facts still need eligible
+    evidence; M1 release still creates no action admission.
+
+Mutation controls must make the corresponding cases fail when the
+registration check, transactional authority recheck, reporting-role comparison,
+resolved-subject comparison, or no-resurrection rule is removed. A suite that
+refuses every observation does not satisfy the positive controls.
+
+### Alternatives considered
+
+| Choice                                       | Rejected alternatives and reasons                                                                                                                                                                                                      |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shared standing producer right               | A charter-owned issuer/table duplicates caller authority, administration and revocation. Reusing ADR-180 grants supplies neither bound scope nor the required precedence.                                                              |
+| Separate registry and registration           | Embedding principal lists in vocabularies couples live revocation to immutable definitions; inferring authority from a class lets vocabulary publication enroll callers.                                                               |
+| Dispatch-derived producer                    | A caller-selected producer permits impersonation; a second relay-principal field creates another unverified identity when the caller already is the relay.                                                                             |
+| Explicit class and channel contracts         | Banning all instrument observations breaks external instruments; allowing every kind to every registered caller defeats the class; engine-only system production excludes the existing scheduler sampler.                              |
+| Role- and instance-bound reports             | Any bound role may falsely report another role's work; making every actor report subject-wide allows it to complete unrelated runs.                                                                                                    |
+| Exact typed scope with explicit breadth      | String patterns conflate display names and stable identity; implicit kind-wide permission includes unrelated subjects without an administrative decision; exact-subject-only enrollment imposes a new grant for every task or message. |
+| Current eligibility with historical replay   | Ingest-only checks let disabled evidence authorize future decisions; deleting or rewriting evidence destroys the earlier decision's reproducibility.                                                                                   |
+| Explicit shared bootstrap                    | First-caller enrollment is self-authorization; reseeding an empty registry resurrects disabled authority; vocabulary publication is not enrollment.                                                                                    |
+| Evidence amendment with companion references | Putting registration only in ADR-208 leaves the accepted evidence contract incomplete; putting it only in ADR-209 makes ordinary evidence admission depend on optional exception and history capabilities.                             |
+
+### Known limits
+
+- Registration constrains which reports an admitted principal may submit. It
+  does not prove that an authorized instrument, reviewer or relay tells the
+  truth. Store sampling proves stored state, not the legitimacy of every
+  upstream mutation. Independent verification is a source-contract property.
+- A same-user process that can replace caller configuration, credentials,
+  authority state or the verifier can impersonate an enrolled principal or
+  bypass the service. Cooperative recording does not detect or prevent that.
+  Protected operation requires independently established custody and ingress
+  controls; a future hosted deployment also establishes user scope at trusted
+  ingress and an appropriate store boundary, not through namespace equality.
+- Response identifiers and payload hashes are useful bindings, not signatures
+  of a remote service. Source authentication remains only as strong as the
+  registered collection path and its custody.
+- Current disable can make an earlier result unusable for future decisions
+  without declaring the old observation false. Completed history remains
+  history. Restore of an unprotected authority store can resurrect local
+  permission; protected epoch and recovery checks are separate prerequisites.
+- Exact enrollment and digest pinning require administrative updates when a
+  source contract, subject set or reporting assignment changes. The shared
+  service and the per-kind repository resolvers must be implemented and
+  verified; existing schemas and accepted decisions alone provide neither.
+- No new charter expression language, tenant isolation mechanism, effect
+  credential custody or root signing facility is introduced by this amendment.
