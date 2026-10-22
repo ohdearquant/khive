@@ -415,6 +415,12 @@ async fn a_bounded_review_loop_takes_its_then_route_and_the_run_terminates() {
 async fn a_new_generation_retires_observations_made_against_the_old_one() {
     let f = Fixture::new();
     f.publish_review_set().await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
     let run = f.start_review().await;
     let at = |kind: &str, outcome: Option<&str>, args: Value, generation: &str| {
         let mut p = json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind, "args": args, "generation": generation});
@@ -440,15 +446,21 @@ async fn a_new_generation_retires_observations_made_against_the_old_one() {
     .await;
     f.call(
         "charter.observe",
+        at("pull_request.opened", None, json!({}), "h1"),
+    )
+    .await;
+    f.call(
+        "charter.observe",
         at("pull_request.opened", None, json!({}), "h2"),
     )
     .await;
-    let view = f.run(&run).await;
-    let pending = view["phases"][0]["waiting_on"]["pending"].to_string();
-    assert!(
-        pending.contains("pull_request.open") && pending.contains("pull_request.base"),
-        "observations under h1 stop counting at h2: {pending}"
-    );
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let fresh = f.start_review().await;
+    f.call(
+        "charter.observe",
+        at("pull_request.opened", None, json!({}), "h2"),
+    )
+    .await;
     f.call(
         "charter.observe",
         at("pull_request.open", Some("pass"), json!({}), "h2"),
@@ -464,7 +476,7 @@ async fn a_new_generation_retires_observations_made_against_the_old_one() {
         ),
     )
     .await;
-    assert_eq!(f.at(&run).await.1, "review");
+    assert_eq!(f.at(&fresh).await.1, "review");
 }
 
 #[tokio::test]
@@ -754,11 +766,17 @@ async fn a_failing_requirement_holds_unless_the_matched_when_routes_on_it() {
 }
 
 #[tokio::test]
-async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended() {
+async fn a_new_generation_supersedes_a_run_during_a_phase_loop() {
     let f = Fixture::new();
     let source = "charter gate_loop v1\nsubject pull_request\nroles:\n    author\nworkflow:\n    phase gate:\n        require gate.result(name=box) hard\n        when gate.result(name=box) is fail: goto repair\n        max_rounds 3 then give_up\n        goto done\n    phase repair:\n        action fix.push\n        goto gate\n    phase done:\n        complete\n    phase give_up:\n        terminate \"three gate rounds without a pass\"\n";
     let out = f.call("charter.publish", json!({"source": source})).await;
     assert_eq!(out["published"], true, "{out}");
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
     let run = f
         .call(
             "charter.start",
@@ -786,23 +804,23 @@ async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended()
         at("pull_request.head_moved", "observed", json!({}), "h2"),
     )
     .await;
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let fresh = f
+        .call(
+            "charter.start",
+            json!({"charter": "gate_loop", "subject_kind": "pull_request",
+                  "subject_ref": PR, "generation": "h2"}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     f.call(
         "charter.observe",
         at("gate.result", "pass", json!({"name": "box"}), "h2"),
     )
     .await;
-    assert_eq!(
-        f.at(&run).await,
-        tuple("open", "repair", "waiting_actor", 1),
-        "the repair phase reads no gate result"
-    );
-    f.call("charter.observe", at("fix.push", "done", json!({}), "h2"))
-        .await;
-    assert_eq!(
-        f.at(&run).await.0,
-        "completed",
-        "the gate's second visit counts the pass recorded while the run was in repair"
-    );
+    assert_eq!(f.at(&fresh).await.0, "completed");
 }
 
 #[tokio::test]
@@ -895,6 +913,12 @@ async fn a_loop_on_an_unchanged_head_reads_its_gate_result_again_on_the_revisit(
 async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
     let f = Fixture::new();
     f.publish_review_set().await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
     let run = f.start_review().await;
     let at = |kind: &str, outcome: &str, args: Value, generation: &str| {
         json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
@@ -920,17 +944,13 @@ async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
         at("pull_request.base", "pass", json!({"branch": "main"}), "h1"),
     )
     .await;
-    assert_eq!(
-        f.at(&run).await,
-        tuple("open", "intake", "waiting_gate", 1),
-        "the subject is still at h2"
-    );
-    let pending = f.run(&run).await["phases"][0]["waiting_on"]["pending"].to_string();
-    assert!(
-        pending.contains("pull_request.open") && pending.contains("pull_request.base"),
-        "results for h1 arriving after the head moved to h2 neither count nor move the subject \
-         back: {pending}"
-    );
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let fresh = f.start_review().await;
+    f.call(
+        "charter.observe",
+        at("pull_request.opened", "observed", json!({}), "h2"),
+    )
+    .await;
     f.call(
         "charter.observe",
         at("pull_request.open", "pass", json!({}), "h2"),
@@ -941,28 +961,44 @@ async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
         at("pull_request.base", "pass", json!({"branch": "main"}), "h2"),
     )
     .await;
-    assert_eq!(f.at(&run).await.1, "review");
+    assert_eq!(f.at(&fresh).await.1, "review");
 }
 
 #[tokio::test]
 async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_results() {
     let f = Fixture::new();
     f.publish_review_set().await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened"}),
+    )
+    .await;
     let run = f.start_review().await;
     let at = |kind: &str, outcome: &str, args: Value, generation: &str, event: &str| {
         json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
                "outcome": outcome, "args": args, "generation": generation, "event_id": event})
     };
-    for (kind, generation, event) in [
-        ("pull_request.opened", "h1", "opened"),
-        ("pull_request.head_moved", "h2", "moved-h2"),
-    ] {
+    for (kind, generation, event) in [("pull_request.head_moved", "h2", "moved-h2")] {
         f.call(
             "charter.observe",
             at(kind, "observed", json!({}), generation, event),
         )
         .await;
     }
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let h2_run = f.start_review().await;
+    f.call(
+        "charter.observe",
+        at(
+            "pull_request.opened",
+            "observed",
+            json!({}),
+            "h2",
+            "opened-h2-again",
+        ),
+    )
+    .await;
     let first = f
         .call(
             "charter.observe",
@@ -970,6 +1006,7 @@ async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_resu
         )
         .await;
     assert_eq!(first["recorded"][0]["already_recorded"], false, "{first}");
+    assert_eq!(f.at(&h2_run).await.0, "open");
     f.call(
         "charter.observe",
         at(
@@ -981,6 +1018,7 @@ async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_resu
         ),
     )
     .await;
+    assert_eq!(f.at(&h2_run).await.0, "superseded");
     f.call(
         "charter.observe",
         at(
@@ -989,6 +1027,18 @@ async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_resu
             json!({}),
             "h2",
             "moved-h2-again",
+        ),
+    )
+    .await;
+    let latest = f.start_review().await;
+    f.call(
+        "charter.observe",
+        at(
+            "pull_request.opened",
+            "observed",
+            json!({}),
+            "h2",
+            "opened-h2-latest",
         ),
     )
     .await;
@@ -1004,11 +1054,11 @@ async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_resu
     )
     .await;
     assert_eq!(
-        f.at(&run).await,
+        f.at(&latest).await,
         tuple("open", "intake", "waiting_gate", 1),
         "the head went h2, h1, h2: the open result from the first h2 belongs to an earlier epoch"
     );
-    let pending = f.run(&run).await["phases"][0]["waiting_on"]["pending"].to_string();
+    let pending = f.run(&latest).await["phases"][0]["waiting_on"]["pending"].to_string();
     assert!(
         pending.contains("pull_request.open") && !pending.contains("pull_request.base"),
         "{pending}"
@@ -1023,7 +1073,7 @@ async fn a_head_that_returns_to_an_earlier_candidate_counts_none_of_its_old_resu
         again["recorded"][0]["already_recorded"], false,
         "the same event id at a new epoch is a new observation: {again}"
     );
-    assert_eq!(f.at(&run).await.1, "review");
+    assert_eq!(f.at(&latest).await.1, "review");
 }
 
 #[tokio::test]
@@ -1217,4 +1267,471 @@ async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
         }])
     );
     assert_eq!(merge["next"], json!({"kind": "complete"}));
+}
+
+#[tokio::test]
+async fn evidence_source_identity_rejects_changed_payloads() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    f.start_review().await;
+
+    let observation = |outcome: &str, request_id: &str| {
+        json!({
+            "subject_kind": "pull_request",
+            "subject_ref": PR,
+            "kind": "pull_request.open",
+            "outcome": outcome,
+            "event_id": "stable-source-event",
+            "request_id": request_id,
+        })
+    };
+    f.call("charter.observe", observation("pass", "first-request"))
+        .await;
+
+    let error = f
+        .refused("charter.observe", observation("fail", "changed-request"))
+        .await;
+    assert!(error.contains("EvidenceConflict"), "{error}");
+}
+
+#[tokio::test]
+async fn old_generation_evidence_without_generation_metadata_is_not_reused() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
+    let run = f.start_review().await;
+    for (kind, outcome, args) in [
+        ("pull_request.open", "pass", json!({})),
+        ("pull_request.base", "pass", json!({"branch": "main"})),
+    ] {
+        f.call(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR,
+                   "kind": kind, "outcome": outcome, "args": args}),
+        )
+        .await;
+    }
+    for kind in ["pull_request.head_moved", "pull_request.opened"] {
+        f.call(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR,
+                   "kind": kind, "generation": "h2"}),
+        )
+        .await;
+    }
+
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let fresh = f.start_review().await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h2"}),
+    )
+    .await;
+    assert_eq!(
+        f.at(&fresh).await,
+        tuple("open", "intake", "waiting_gate", 1),
+        "generation-less evidence from epoch one cannot satisfy h2 gates"
+    );
+    for (kind, outcome, args) in [
+        ("pull_request.open", "pass", json!({})),
+        ("pull_request.base", "pass", json!({"branch": "main"})),
+    ] {
+        f.call(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR,
+                   "kind": kind, "outcome": outcome, "args": args, "generation": "h2"}),
+        )
+        .await;
+    }
+    assert_eq!(f.at(&fresh).await.1, "review");
+}
+
+#[tokio::test]
+async fn child_terminal_observation_carries_its_generation() {
+    let f = Fixture::new();
+    let child = r#"charter child_flow v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase work by agent:
+        action work.unit by agent
+        complete
+"#;
+    let parent = r#"charter parent_flow v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase coordinate:
+        perform child_flow
+        await pull_request.head_moved
+        complete
+"#;
+    f.call("charter.publish", json!({"source": child})).await;
+    f.call("charter.publish", json!({"source": parent})).await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "parent_flow", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h1", "bindings": {"agent": "worker"}}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "work.unit", "outcome": "done", "generation": "h1"}),
+    )
+    .await;
+    assert_eq!(
+        f.child_of(&run, "child_flow").await[0]["state"],
+        "completed"
+    );
+
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.head_moved", "generation": "h2"}),
+    )
+    .await;
+    assert_eq!(f.at(&run).await.0, "superseded");
+    let fresh = f
+        .call(
+            "charter.start",
+            json!({"charter": "parent_flow", "subject_kind": "pull_request",
+                  "subject_ref": PR, "generation": "h2", "bindings": {"agent": "worker"}}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(f.at(&fresh).await.0, "open");
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.head_moved", "generation": "h2", "event_id": "moved-h2-again"}),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "work.unit", "outcome": "done", "generation": "h2", "event_id": "work-h2"}),
+    )
+    .await;
+    assert_eq!(f.at(&fresh).await.0, "completed");
+}
+
+#[tokio::test]
+async fn replayed_generation_trigger_does_not_restore_old_subject_generation() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    f.start_review().await;
+    let trigger = |generation: &str, event_id: &str| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.head_moved", "generation": generation,
+               "event_id": event_id})
+    };
+    f.call("charter.observe", trigger("h1", "event-h1")).await;
+    f.call("charter.observe", trigger("h2", "event-h2")).await;
+    f.call("charter.observe", trigger("h1", "event-h1")).await;
+
+    let next = f
+        .call(
+            "charter.start",
+            json!({"charter": "pr_review", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h2"}),
+        )
+        .await;
+    assert_eq!(next["started"], true, "{next}");
+    assert_eq!(next["run"]["candidate"]["generation"], "h2");
+    assert_eq!(next["run"]["subject_epoch"], 2);
+    let run = next["run_id"].as_str().unwrap();
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.open", "outcome": "pass", "generation": "h2"}),
+    )
+    .await;
+    f.call("charter.observe", trigger("h2", "event-open-h2"))
+        .await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.base", "outcome": "pass",
+               "args": {"branch": "main"}, "generation": "h2"}),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.opened", "generation": "h2"}),
+    )
+    .await;
+
+    assert_eq!(f.at(run).await.1, "review");
+}
+
+#[tokio::test]
+async fn starting_another_charter_cannot_change_an_existing_subject_generation() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let first = f
+        .call(
+            "charter.start",
+            json!({"charter": "pr_review", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h1"}),
+        )
+        .await;
+    let run = first["run_id"].as_str().unwrap().to_owned();
+    let error = f
+        .refused(
+            "charter.start",
+            json!({"charter": "pr_fix", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h2"}),
+        )
+        .await;
+    assert!(error.contains("generation_mismatch"), "{error}");
+    assert_eq!(f.run(&run).await["subject_epoch"], 0);
+}
+
+#[tokio::test]
+async fn a_new_generation_supersedes_the_open_run_and_allows_a_fresh_start() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let first = f
+        .call(
+            "charter.start",
+            json!({"charter": "pr_review", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h1"}),
+        )
+        .await;
+    let old_run = first["run_id"].as_str().unwrap().to_owned();
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "pull_request.head_moved", "generation": "h2",
+               "event_id": "head-h2"}),
+    )
+    .await;
+    assert_eq!(f.run(&old_run).await["state"], "superseded");
+
+    let next = f
+        .call(
+            "charter.start",
+            json!({"charter": "pr_review", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h2"}),
+        )
+        .await;
+    assert_eq!(next["started"], true, "{next}");
+    assert_ne!(next["run_id"], old_run);
+    assert_eq!(next["run"]["subject_epoch"], 1);
+    assert_eq!(next["run"]["candidate"]["generation"], "h2");
+}
+
+#[tokio::test]
+async fn a_perform_waits_for_the_child_started_on_its_phase_visit() {
+    let f = Fixture::new();
+    let child = r#"charter child_flow v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase work by agent:
+        action work.unit by agent
+        complete
+"#;
+    let parent = r#"charter parent_flow v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase first by agent:
+        perform child_flow
+        await message.arrived
+        goto second
+    phase second by agent:
+        perform child_flow
+        await prompt.received
+        complete
+"#;
+    f.call("charter.publish", json!({"source": child})).await;
+    f.call("charter.publish", json!({"source": parent})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "parent_flow", "subject_kind": "pull_request",
+                   "subject_ref": PR, "generation": "h1", "bindings": {"agent": "worker"}}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "work.unit", "outcome": "done", "generation": "h1"}),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "message.arrived", "generation": "h1"}),
+    )
+    .await;
+    let children = f.child_of(&run, "child_flow").await;
+    assert_eq!(children.len(), 2, "{children:?}");
+    assert!(children.iter().any(|child| child["state"] == "completed"));
+    assert!(children.iter().any(|child| child["state"] == "open"));
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+               "kind": "prompt.received", "generation": "h1"}),
+    )
+    .await;
+
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "second", "waiting_actor", 1)
+    );
+    let children = f.child_of(&run, "child_flow").await;
+    assert!(
+        children.iter().any(|child| child["state"] == "open"),
+        "{children:?}"
+    );
+}
+
+#[tokio::test]
+async fn publication_refuses_perform_cycles_across_versions() {
+    let f = Fixture::new();
+    let a_v1 =
+        "charter a_cycle v1\nsubject pull_request\nworkflow:\n    phase done:\n        complete\n";
+    let b_v1 = "charter b_cycle v1\nsubject pull_request\nworkflow:\n    phase child:\n        perform a_cycle\n        complete\n";
+    let a_v2 = "charter a_cycle v2\nsubject pull_request\nworkflow:\n    phase child:\n        perform b_cycle\n        complete\n";
+    f.call("charter.publish", json!({"source": a_v1})).await;
+    f.call("charter.publish", json!({"source": b_v1})).await;
+
+    let error = f.refused("charter.publish", json!({"source": a_v2})).await;
+    assert!(error.contains("perform_cycle"), "{error}");
+}
+
+#[tokio::test]
+async fn child_start_refuses_a_cycle_in_persisted_definitions() {
+    let f = Fixture::new();
+    let a =
+        "charter a_cycle v1\nsubject pull_request\nworkflow:\n    phase done:\n        complete\n";
+    let b = "charter b_cycle v1\nsubject pull_request\nworkflow:\n    phase child:\n        perform a_cycle\n        complete\n";
+    f.call("charter.publish", json!({"source": a})).await;
+    f.call("charter.publish", json!({"source": b})).await;
+
+    let mut writer = f._runtime.sql().writer().await.unwrap();
+    writer
+        .execute_script("DROP TRIGGER charter_definitions_no_update".to_owned())
+        .await
+        .unwrap();
+    let row = writer
+        .query_row(khive_storage::SqlStatement::new(
+            "SELECT definition_bytes FROM charter_definitions WHERE charter_id = 'a_cycle'",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = match row.get("definition_bytes") {
+        Some(khive_storage::SqlValue::Blob(bytes)) => bytes.clone(),
+        other => panic!("expected definition bytes, got {other:?}"),
+    };
+    let mut definition: Value = serde_json::from_slice(&bytes).unwrap();
+    definition["phases"][0]["performs"] = json!(["b_cycle"]);
+    let bytes = serde_json::to_vec(&definition).unwrap();
+    writer
+        .execute(khive_storage::SqlStatement::new(
+            "UPDATE charter_definitions SET definition_bytes = ?1 WHERE charter_id = 'a_cycle'",
+            vec![khive_storage::SqlValue::Blob(bytes)],
+        ))
+        .await
+        .unwrap();
+    drop(writer);
+
+    let error = f
+        .registry
+        .dispatch(
+            "charter.start",
+            json!({"charter": "a_cycle", "subject_kind": "pull_request", "subject_ref": PR}),
+        )
+        .await
+        .expect_err("an ancestry cycle must stop before another child starts");
+    assert!(
+        format!("{error} {error:?}").contains("perform_cycle"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn observations_use_the_registry_pinned_by_the_target_run() {
+    let f = Fixture::new();
+    let first_vocabulary = "vocabulary acme v1\nphrase acme.result \"the result was recorded\":\n    outcomes pass fail\n    passes pass\n    ceiling hard\n";
+    let second_vocabulary = "vocabulary acme v2\nphrase acme.result \"the result was recorded\":\n    outcomes green red\n    passes green\n    ceiling hard\n";
+    let charter = "charter pinned_result v1\nsubject pull_request\nworkflow:\n    phase gate:\n        require acme.result hard\n        complete\n";
+    f.call("charter.vocabulary", json!({"source": first_vocabulary}))
+        .await;
+    f.call("charter.publish", json!({"source": charter})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "pinned_result", "subject_kind": "pull_request", "subject_ref": PR}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap();
+    f.call("charter.vocabulary", json!({"source": second_vocabulary}))
+        .await;
+
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": "acme.result", "outcome": "pass"}),
+    )
+    .await;
+    assert_eq!(f.run(run).await["state"], "completed");
+}
+
+#[tokio::test]
+async fn observation_arguments_require_declared_fields_and_types() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+    let missing = f
+        .refused(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": "pull_request.base", "outcome": "pass", "args": {}}),
+        )
+        .await;
+    assert!(missing.contains("missing_argument"), "{missing}");
+
+    let wrong_type = f
+        .refused(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": "pull_request.base", "outcome": "pass", "args": {"branch": 123}}),
+        )
+        .await;
+    assert!(wrong_type.contains("argument_type"), "{wrong_type}");
+
+    let mut reader = f._runtime.sql().reader().await.unwrap();
+    let count = reader
+        .count(khive_storage::SqlStatement::new(
+            "SELECT COUNT(*) FROM charter_evidence WHERE run_id = ?1 AND kind = 'pull_request.base'",
+            vec![khive_storage::SqlValue::Text(run)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "invalid arguments must leave no evidence");
 }

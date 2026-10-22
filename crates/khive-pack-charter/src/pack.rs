@@ -9,20 +9,63 @@ use khive_storage::{
     AtomicUnitOp, SqlReader, SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult,
 };
 use khive_types::{
-    HandlerDef, IdResolutionMode, Pack, PackSchemaPlan, ParamDef, VerbCategory, Visibility,
+    HandlerDef, IdResolutionMode, Pack, PackColumnAddition, PackColumnAffinity, PackSchemaPlan,
+    ParamDef, VerbCategory, Visibility,
 };
 
 use crate::engine::{
     col_i64, col_json, col_opt_i64, col_opt_text, col_text, decode_definition, waiting_actors,
     Engine, Refusal, Scope,
 };
-use crate::lang::ast::EntryKind;
 use crate::lang::definition::LANGUAGE;
 use crate::lang::{canonical_json, compile, digest, parse_vocabulary_source, Diagnostic, Registry};
 
 const DEFAULT_DOMAIN: &str = "default";
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
+
+const CHARTER_COLUMN_ADDITIONS: &[PackColumnAddition] = &[
+    PackColumnAddition {
+        table: "charter_definitions",
+        column: "source_bytes",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "charter_subjects",
+        column: "subject_kind",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "charter_subjects",
+        column: "subject_ref",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "charter_runs",
+        column: "parent_run_id",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "charter_runs",
+        column: "terminal_outcome",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "charter_phases",
+        column: "round",
+        affinity: PackColumnAffinity::Integer,
+    },
+    PackColumnAddition {
+        table: "charter_phases",
+        column: "entered_sequence",
+        affinity: PackColumnAffinity::Integer,
+    },
+    PackColumnAddition {
+        table: "charter_phases",
+        column: "waiting_on",
+        affinity: PackColumnAffinity::Text,
+    },
+];
 
 const fn param(
     name: &'static str,
@@ -213,6 +256,7 @@ impl Pack for CharterPack {
         pack: Self::NAME,
         statements: crate::schema::CHARTER_SCHEMA_STATEMENTS,
     });
+    const SCHEMA_COLUMN_ADDITIONS: &'static [PackColumnAddition] = CHARTER_COLUMN_ADDITIONS;
 }
 
 impl CharterPack {
@@ -398,24 +442,9 @@ async fn registry_from<R: SqlReader + ?Sized>(
     reader: &mut R,
     domain: &str,
 ) -> StorageResult<Registry> {
-    let rows = reader
-        .query_all(stmt(
-            include_str!("../sql/engine/vocabularies-list.sql"),
-            vec![text(domain)],
-        ))
-        .await?;
+    let sources = registry_sources(reader, domain).await?;
     let mut registry = Registry::core();
-    for row in rows {
-        let bytes = match row.get("source_bytes") {
-            Some(SqlValue::Blob(b)) => b.clone(),
-            _ => {
-                return Err(StorageError::Internal(
-                    "charter: vocabulary source bytes".into(),
-                ))
-            }
-        };
-        let source = String::from_utf8(bytes)
-            .map_err(|e| StorageError::Internal(format!("charter: vocabulary source: {e}")))?;
+    for source in sources {
         let parsed = parse_vocabulary_source(&source).map_err(|d| {
             StorageError::Internal(format!(
                 "charter: stored vocabulary does not parse: {}",
@@ -430,6 +459,174 @@ async fn registry_from<R: SqlReader + ?Sized>(
         })?;
     }
     Ok(registry)
+}
+
+async fn registry_sources<R: SqlReader + ?Sized>(
+    reader: &mut R,
+    domain: &str,
+) -> StorageResult<Vec<String>> {
+    let rows = reader
+        .query_all(stmt(
+            include_str!("../sql/engine/vocabularies-list.sql"),
+            vec![text(domain)],
+        ))
+        .await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes = match row.get("source_bytes") {
+            Some(SqlValue::Blob(b)) => b.clone(),
+            _ => {
+                return Err(StorageError::Internal(
+                    "charter: vocabulary source bytes".into(),
+                ))
+            }
+        };
+        let source = String::from_utf8(bytes)
+            .map_err(|e| StorageError::Internal(format!("charter: vocabulary source: {e}")))?;
+        sources.push(source);
+    }
+    Ok(sources)
+}
+
+fn registry_from_snapshot(snapshot: Option<String>) -> StorageResult<Registry> {
+    let mut registry = Registry::core();
+    let Some(snapshot) = snapshot else {
+        return Ok(registry);
+    };
+    let snapshot: Value = serde_json::from_str(&snapshot)
+        .map_err(|e| StorageError::Internal(format!("charter: registry snapshot: {e}")))?;
+    let sources = snapshot["vocabularies"]
+        .as_array()
+        .ok_or_else(|| StorageError::Internal("charter: registry snapshot vocabularies".into()))?;
+    for source in sources {
+        let source = source
+            .as_str()
+            .ok_or_else(|| StorageError::Internal("charter: registry snapshot source".into()))?;
+        let parsed = parse_vocabulary_source(source).map_err(|d| {
+            StorageError::Internal(format!(
+                "charter: pinned vocabulary does not parse: {}",
+                refusal_text(&d)
+            ))
+        })?;
+        registry.add(&parsed).map_err(|d| {
+            StorageError::Internal(format!(
+                "charter: pinned vocabulary does not load: {}",
+                refusal_text(&d)
+            ))
+        })?;
+    }
+    Ok(registry)
+}
+
+async fn registry_for_run<R: SqlReader + ?Sized>(
+    reader: &mut R,
+    run_id: &str,
+) -> StorageResult<Registry> {
+    let row = reader
+        .query_row(stmt(
+            include_str!("../sql/engine/definition-source-for-run.sql"),
+            vec![text(run_id)],
+        ))
+        .await?;
+    let source = row
+        .as_ref()
+        .map(|row| col_opt_text(row, "source_bytes"))
+        .transpose()?
+        .flatten();
+    registry_from_snapshot(source)
+}
+
+fn validate_observation(
+    params: &Params,
+    kind: &str,
+    entry: Option<&Value>,
+    requested_outcome: Option<&str>,
+    args: &Map<String, Value>,
+) -> StorageResult<String> {
+    let invalid =
+        |code: &'static str, message: String| refuse(&params.verb, Refusal::new(code, message));
+    let entry = entry.ok_or_else(|| {
+        invalid(
+            "unknown_kind",
+            format!("{kind} is not registered for the target run"),
+        )
+    })?;
+    if entry["kind"] == "subject" {
+        return Err(invalid(
+            "wrong_entry_kind",
+            format!("{kind} is a subject, not an observation"),
+        ));
+    }
+    let outcomes = entry["outcomes"]
+        .as_array()
+        .ok_or_else(|| StorageError::Internal(format!("charter: {kind} has no outcomes")))?;
+    let outcome = match requested_outcome {
+        Some(outcome) if outcomes.iter().any(|v| v.as_str() == Some(outcome)) => outcome.to_owned(),
+        Some(outcome) => {
+            let choices = outcomes
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(invalid(
+                "unknown_outcome",
+                format!("{kind} has outcomes {choices}, not {outcome}"),
+            ));
+        }
+        None if outcomes.len() == 1 => outcomes[0]
+            .as_str()
+            .ok_or_else(|| StorageError::Internal(format!("charter: {kind} outcome")))?
+            .to_owned(),
+        None => {
+            let choices = outcomes
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(invalid(
+                "missing_outcome",
+                format!("{kind} needs one of {choices}"),
+            ));
+        }
+    };
+    let definitions = entry["params"]
+        .as_array()
+        .ok_or_else(|| StorageError::Internal(format!("charter: {kind} has no parameters")))?;
+    for name in args.keys() {
+        if !definitions.iter().any(|param| param["name"] == *name) {
+            return Err(invalid(
+                "unknown_argument",
+                format!("{kind} declares no argument {name}"),
+            ));
+        }
+    }
+    for definition in definitions {
+        let name = definition["name"]
+            .as_str()
+            .ok_or_else(|| StorageError::Internal(format!("charter: {kind} parameter name")))?;
+        let Some(value) = args.get(name) else {
+            if definition["optional"] == false {
+                return Err(invalid(
+                    "missing_argument",
+                    format!("{kind} needs argument {name}"),
+                ));
+            }
+            continue;
+        };
+        let valid = match definition["type"].as_str() {
+            Some("string" | "word") => value.is_string(),
+            Some("integer" | "duration") => value.as_i64().is_some() || value.as_u64().is_some(),
+            Some("bool") => value.is_boolean(),
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid(
+                "argument_type",
+                format!("{kind}.{name} has the wrong value type"),
+            ));
+        }
+    }
+    Ok(outcome)
 }
 
 /// A caller-scoped request key (ADR-193 D8).
@@ -555,6 +752,15 @@ impl CharterPack {
                             ));
                         }
                     }
+                    if let Some(path) = engine.perform_cycle(definition).await? {
+                        return Err(refuse(
+                            &verb,
+                            Refusal::new(
+                                "perform_cycle",
+                                format!("perform dependency cycle: {}", path.join(" -> ")),
+                            ),
+                        ));
+                    }
                     let held = engine
                         .writer()
                         .query_row(stmt(
@@ -586,6 +792,13 @@ impl CharterPack {
                             "charter": compiled.summary(),
                         })));
                     }
+                    let vocabularies =
+                        registry_sources(&mut *engine.writer(), &scope.domain).await?;
+                    let source_snapshot = String::from_utf8(canonical_json(&json!({
+                        "charter_source": source,
+                        "vocabularies": vocabularies,
+                    })))
+                    .map_err(|e| StorageError::Internal(format!("charter: source snapshot: {e}")))?;
                     engine
                         .writer()
                         .execute(stmt(
@@ -598,7 +811,7 @@ impl CharterPack {
                                 text(LANGUAGE),
                                 text(&compiled.definition_digest),
                                 SqlValue::Blob(compiled.definition_bytes.clone()),
-                                SqlValue::Blob(source.into_bytes()),
+                                text(&source_snapshot),
                                 text(&compiled.gate_registry_digest),
                                 SqlValue::Integer(scope.now_us),
                             ],
@@ -782,8 +995,23 @@ impl CharterPack {
                             ));
                         }
                         let (subject_id, epoch, current) = engine
-                            .subject(&subject_kind, &subject_ref, generation.as_deref(), true)
+                            .subject(&subject_kind, &subject_ref, generation.as_deref(), false)
                             .await?;
+                        if generation
+                            .as_deref()
+                            .is_some_and(|requested| current.as_deref() != Some(requested))
+                        {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new(
+                                    "generation_mismatch",
+                                    format!(
+                                        "subject {subject_kind}:{subject_ref} is at generation {current:?}, not {:?}",
+                                        generation.as_deref().unwrap_or_default()
+                                    ),
+                                ),
+                            ));
+                        }
                         if let Some(run_id) = engine
                             .open_run_for_charter(&charter_id, &subject_id)
                             .await?
@@ -823,10 +1051,12 @@ impl CharterPack {
         let kind = params.str("kind")?;
         let args = params.opt_object("args")?;
         let detail = params.opt_object("detail")?;
+        let requested_outcome = params.opt_str("outcome")?;
         let generation = params.opt_str("generation")?;
         let only_charter = params.opt_str("charter")?;
         let scope = params.scope(token)?;
         let command = params.command(&scope)?;
+        let verb = params.verb.clone();
         let producer = params
             .opt_str("producer")?
             .unwrap_or_else(|| scope.actor.clone());
@@ -839,45 +1069,6 @@ impl CharterPack {
             .opt_str("event_id")?
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let registry = self.registry(&scope.domain).await?;
-        let entry = registry.get(&kind).ok_or_else(|| {
-            params.invalid(format!(
-                "unknown_kind: {kind} is not a registered trigger, phrase or action"
-            ))
-        })?;
-        if entry.kind == EntryKind::Subject {
-            return Err(params.invalid(format!(
-                "wrong_entry_kind: {kind} is a subject, not an observation"
-            )));
-        }
-        let establishes = registry
-            .get(&subject_kind)
-            .is_some_and(|s| s.new_generation.contains(&kind));
-        let outcome = match params.opt_str("outcome")? {
-            Some(o) if entry.outcomes.contains(&o) => o,
-            Some(o) => {
-                return Err(params.invalid(format!(
-                    "unknown_outcome: {kind} has outcomes {}, not {o}",
-                    entry.outcomes.join(" ")
-                )))
-            }
-            None if entry.outcomes.len() == 1 => entry.outcomes[0].clone(),
-            None => {
-                return Err(params.invalid(format!(
-                    "missing_outcome: {kind} needs one of {}",
-                    entry.outcomes.join(" ")
-                )))
-            }
-        };
-        if let Some(name) = args
-            .keys()
-            .find(|name| !entry.params.iter().any(|p| &p.name == *name))
-        {
-            return Err(params.invalid(format!(
-                "unknown_argument: {kind} declares no argument {name}"
-            )));
-        }
-
         let result = self
             .runtime
             .sql()
@@ -886,23 +1077,116 @@ impl CharterPack {
                 Box::new(move |writer| {
                     Box::pin(async move {
                         let mut engine = Engine::new(writer, scope.clone());
-                        let exists = engine
+                        let subject_row = engine
                             .writer()
                             .query_row(stmt(
                                 include_str!("../sql/engine/subject-get.sql"),
                                 vec![text(&subject_kind), text(&subject_ref)],
                             ))
-                            .await?
-                            .is_some();
-                        if !exists {
+                            .await?;
+                        let Some(subject_row) = subject_row else {
+                            let registry =
+                                registry_from(&mut *engine.writer(), &scope.domain).await?;
+                            let entry = registry.get(&kind).map(|entry| entry.to_json());
+                            validate_observation(
+                                &params,
+                                &kind,
+                                entry.as_ref(),
+                                requested_outcome.as_deref(),
+                                &args,
+                            )?;
                             return Ok(boxed(json!({"recorded": [], "events": []})));
+                        };
+                        let subject_id = col_text(&subject_row, "subject_id")?;
+                        let mut targets = Vec::new();
+                        let mut resolved_outcome: Option<String> = None;
+                        let mut establishes = false;
+                        for (run_id, charter_id) in
+                            engine.open_runs_for_subject(&subject_id).await?
+                        {
+                            if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
+                                continue;
+                            }
+                            let definition = engine.pinned_definition(&run_id).await?;
+                            let pinned_registry =
+                                registry_for_run(&mut *engine.writer(), &run_id).await?;
+                            let pinned_entry =
+                                definition.registry.get(&kind).cloned().or_else(|| {
+                                    pinned_registry.get(&kind).map(|entry| entry.to_json())
+                                });
+                            let outcome = validate_observation(
+                                &params,
+                                &kind,
+                                pinned_entry.as_ref(),
+                                requested_outcome.as_deref(),
+                                &args,
+                            )?;
+                            if resolved_outcome
+                                .as_ref()
+                                .is_some_and(|held| held != &outcome)
+                            {
+                                return Err(refuse(
+                                    &params.verb,
+                                    Refusal::new(
+                                        "ambiguous_outcome",
+                                        format!("{kind} resolves differently for open runs"),
+                                    ),
+                                ));
+                            }
+                            resolved_outcome.get_or_insert(outcome);
+                            establishes |= definition
+                                .registry
+                                .get(&subject_kind)
+                                .and_then(|subject| subject["new_generation"].as_array())
+                                .is_some_and(|names| names.iter().any(|name| name == &kind))
+                                || pinned_registry
+                                    .get(&subject_kind)
+                                    .is_some_and(|subject| subject.new_generation.contains(&kind));
+                            targets.push((run_id, charter_id));
                         }
+                        if targets.is_empty() {
+                            let registry =
+                                registry_from(&mut *engine.writer(), &scope.domain).await?;
+                            let entry = registry.get(&kind).map(|entry| entry.to_json());
+                            resolved_outcome = Some(validate_observation(
+                                &params,
+                                &kind,
+                                entry.as_ref(),
+                                requested_outcome.as_deref(),
+                                &args,
+                            )?);
+                            establishes = registry
+                                .get(&subject_kind)
+                                .is_some_and(|subject| subject.new_generation.contains(&kind));
+                        }
+                        let outcome = resolved_outcome.ok_or_else(|| {
+                            StorageError::Internal("charter: missing outcome".into())
+                        })?;
+                        let replayed_trigger = if establishes {
+                            let trigger_payload = json!({
+                                "outcome": outcome,
+                                "args": args,
+                                "detail": detail,
+                                "generation": generation,
+                            });
+                            engine
+                                .record_generation_trigger(
+                                    &subject_id,
+                                    &producer,
+                                    &kind,
+                                    &event_id,
+                                    &trigger_payload,
+                                )
+                                .await?
+                        } else {
+                            false
+                        };
                         let (subject_id, epoch, current) = engine
                             .subject(
                                 &subject_kind,
                                 &subject_ref,
                                 generation.as_deref(),
-                                establishes,
+                                establishes && !replayed_trigger,
                             )
                             .await?;
                         let payload = json!({
@@ -913,12 +1197,7 @@ impl CharterPack {
                             "generation": generation.or(current),
                         });
                         let mut recorded = Vec::new();
-                        for (run_id, charter_id) in
-                            engine.open_runs_for_subject(&subject_id).await?
-                        {
-                            if only_charter.as_ref().is_some_and(|c| c != &charter_id) {
-                                continue;
-                            }
+                        for (run_id, charter_id) in targets {
                             let (sequence, fresh) = engine
                                 .observe(
                                     &run_id,
@@ -944,7 +1223,7 @@ impl CharterPack {
                 }),
             ))
             .await?;
-        unit_value(result, &params.verb)
+        unit_value(result, &verb)
     }
 
     async fn cancel(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
