@@ -7,6 +7,7 @@
 use std::num::NonZeroUsize;
 
 use chrono::DateTime;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_score::rrf_score_one_based;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
@@ -162,8 +163,9 @@ fn validate(params: Value) -> Result<ValidatedSearch, RuntimeError> {
     if let Some(source) = p.source.as_deref() {
         if !VALID_SOURCES.contains(&source) {
             return Err(RuntimeError::InvalidInput(format!(
-                "{VERB}: source must be one of {}; got {source:?}",
-                VALID_SOURCES.join(", ")
+                "{VERB}: source must be one of {}; got {:?}",
+                VALID_SOURCES.join(", "),
+                mask_for_redaction_surface(RedactionSurface::GateProbe, source)
             )));
         }
     }
@@ -186,7 +188,8 @@ fn validate(params: Value) -> Result<ValidatedSearch, RuntimeError> {
                 })
                 .map_err(|_| {
                     RuntimeError::InvalidInput(format!(
-                        "{VERB}: since must be an RFC 3339 timestamp; got {raw:?}"
+                        "{VERB}: since must be an RFC 3339 timestamp; got {:?}",
+                        mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
                     ))
                 })
         })

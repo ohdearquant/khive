@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
 
 use crate::recall_feedback::on_explicit_feedback;
@@ -76,8 +77,9 @@ fn validate_feedback_signal(signal: &str) -> Result<(), RuntimeError> {
         Ok(())
     } else {
         Err(RuntimeError::InvalidInput(format!(
-            "memory.feedback: invalid signal {signal:?}; valid: useful | not_useful | wrong | \
-             explicit_positive | explicit_negative | implicit_positive | implicit_negative | correction"
+            "memory.feedback: invalid signal {:?}; valid: useful | not_useful | wrong | \
+             explicit_positive | explicit_negative | implicit_positive | implicit_negative | correction",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, signal)
         )))
     }
 }

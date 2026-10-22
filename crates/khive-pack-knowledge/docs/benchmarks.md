@@ -268,10 +268,20 @@ cargo test -p khive-pack-knowledge --bench knowledge_namespace
 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
 # Explicit larger reference scene; exclude this setting from scheduled CI.
 KHIVE_BENCH_COMPOSE_STORE_SIZE=1 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+# Change only the ordinary local-atom count for a scaling comparison.
+KHIVE_BENCH_COMPOSE_STORE_SIZE=1 KHIVE_BENCH_COMPOSE_LOCAL_ATOMS=60000 \
+  cargo bench -p khive-pack-knowledge --bench knowledge_namespace
 ```
 
-The opt-in scene adds exactly 180,474 ordinary local atoms and 25,504 local
-domains with their mirror rows. `knowledge.stats` verifies those counts before
+The opt-in scene defaults to exactly 180,474 ordinary local atoms and 25,504
+local domains with their mirror rows. `KHIVE_BENCH_COMPOSE_LOCAL_ATOMS` selects
+a positive integer local-atom count when the scene is enabled; for example,
+use 60,000 and 360,000 for the scaling comparison. An empty, malformed,
+non-Unicode, zero or overflowing value exits with an error before any seeding.
+The domain count stays at 25,504, so changing the atom count isolates that
+variable; domain members still refer to live atoms. Each measurement reports
+the actual `local_atoms` and `local_domains`. Listing, smoke mode and ordinary
+runs without the opt-in scene ignore this variable. `knowledge.stats` verifies those counts before
 measurement; domain mirrors are excluded from its ordinary atom count. It then
 runs three automatic `knowledge.compose` calls with a 17-word query,
 `max_tokens=1500`, and no pinned atoms or domains. Each response must be
@@ -289,8 +299,11 @@ places the ordinary atoms before the domain mirrors, exercising recovery beyond
 the bounded initial candidate window. No production-latency or six-second
 success claim follows from the source change. Record the three observations,
 commit, toolchain, hardware and concurrent load, and compare with a disposable
-copy using both original FTS-first statements. Keep fixture bytes and all other
-code identical. Qualified-host baseline and acceptance results are not recorded
+copy using both original FTS-first statements. Keep fixture bytes, both size settings and all other
+code identical. Both builds must contain the same local-count option; vary only
+the two SQL statements between arms. At each size, run the builds in the order
+new, previous, previous, new, retaining all three compose observations from
+each invocation. Qualified-host baseline and acceptance results are not recorded
 in this ledger yet.
 
 ## Performance guarantees

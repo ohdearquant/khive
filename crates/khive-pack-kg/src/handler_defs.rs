@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (31 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (32 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,19 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 31] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
+    HandlerDef {
+        name: "attach",
+        description: "Add or replace one role-keyed blob rendition on an existing live main-backend entity or note. Bytes are base64. Returns id, role, content_ref, size, media_type and replaced. Authenticated pack-owned roles require their owning pack's publication verbs; local file paths are not accepted.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "id", param_type: "uuid", required: true, description: "Existing entity or note UUID, unique hexadecimal prefix or entity name under normal KG resolution.", resolution_mode: IdResolutionMode::UnscopedById },
+            ParamDef { name: "role", param_type: "string", required: true, description: "Nonempty rendition role without control characters, for example markdown, pdf or content. One attachment per role per record.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "bytes", param_type: "string", required: true, description: "Standard base64-encoded bytes to publish before the attachment row commits.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "media_type", param_type: "string", required: false, description: "Optional caller-declared MIME type, for example text/markdown.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     HandlerDef {
         name: "kg.proposal_cleanup",
         description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
@@ -275,6 +287,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 31] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "hydrate", param_type: "array of string", required: false, description: "Entity/note attachment roles whose bytes should be included as base64 in the role-keyed attachments map. Default get includes metadata only; an unknown requested role is an error. Records without attachments omit the map.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "parse_content",
                 param_type: "boolean",

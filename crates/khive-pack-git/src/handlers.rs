@@ -357,26 +357,33 @@ impl GitPack {
 }
 
 fn parse_include(v: &Value) -> Result<IngestInclude, RuntimeError> {
-    let arr = v
-        .as_array()
-        .ok_or_else(|| RuntimeError::InvalidInput("include must be an array of strings".into()))?;
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
+    let arr = v.as_array().ok_or_else(|| {
+        let raw = v.to_string();
+        let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &raw);
+        RuntimeError::InvalidInput(format!("include must be an array of strings; got {shown}"))
+    })?;
     let mut include = IngestInclude {
         commits: false,
         issues: false,
         pull_requests: false,
     };
     for entry in arr {
-        let s = entry
-            .as_str()
-            .ok_or_else(|| RuntimeError::InvalidInput("include entries must be strings".into()))?;
+        let s = entry.as_str().ok_or_else(|| {
+            let raw = entry.to_string();
+            let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &raw);
+            RuntimeError::InvalidInput(format!("include entries must be strings; got {shown}"))
+        })?;
         match s {
             "commits" => include.commits = true,
             "issues" => include.issues = true,
             "pull_requests" => include.pull_requests = true,
             other => {
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, other);
                 return Err(RuntimeError::InvalidInput(format!(
-                    "unknown include kind {other:?}; valid: commits | issues | pull_requests"
-                )))
+                    "unknown include kind {shown:?}; valid: commits | issues | pull_requests"
+                )));
             }
         }
     }

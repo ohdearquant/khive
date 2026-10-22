@@ -8,6 +8,7 @@ use khive_fs::tree_discovery::{walk_tree_reported, ReportedWalkLimits, WalkFailu
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{StorageCapability, StorageError};
@@ -1220,13 +1221,14 @@ impl KnowledgeHandlers {
         if !["section", "atom"].contains(&chunk_strategy.as_str()) {
             return Err(RuntimeError::InvalidInput(format!(
                 "unknown chunk_strategy {:?}; valid: section | atom",
-                chunk_strategy
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &chunk_strategy)
             )));
         }
         let format = p.format.as_deref().unwrap_or("atlas_md");
         if format != "atlas_md" {
             return Err(RuntimeError::InvalidInput(format!(
-                "unknown format {format:?}; only \"atlas_md\" is supported"
+                "unknown format {:?}; only \"atlas_md\" is supported",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, format)
             )));
         }
 

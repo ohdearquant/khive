@@ -224,6 +224,7 @@ impl PackRuntime for KgPack {
             "merge" => self.handle_merge(graph_token, params, registry).await,
             // UUID-based: entities/edges use graph token, notes/events use caller token.
             "get" => self.handle_get(token, graph_token, params, registry).await,
+            "attach" => self.handle_attach(token, params).await,
             "update" => self.handle_update(graph_token, params, registry).await,
             "delete" => self.handle_delete(graph_token, params, registry).await,
             "restore" => self.handle_restore(graph_token, params, registry).await,

@@ -95,3 +95,7 @@ harness = false
 [[bench]]
 name = "runtime_writes"
 harness = false
+
+[[bench]]
+name = "runtime_edge_mutations"
+harness = false
