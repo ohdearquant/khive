@@ -16,8 +16,8 @@ workflow:
         require pr_merge.candidate_supported hard
         require pr_merge.evidence_complete_trusted hard
         require pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) hard
-        require pr_merge.floor_check(name="CI gate") hard
-        require pr_merge.floor_check(name="Secret scan (gitleaks)") hard
+        require pr_merge.floor_check(name="CI gate", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
+        require pr_merge.floor_check(name="Secret scan (gitleaks)", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
 
     phase approve by independent_reviewer:
         require pr_merge.review_at_head hard

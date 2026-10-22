@@ -156,7 +156,7 @@ impl Registry {
         self.add_inner(source, false)
     }
 
-    fn add_compiled(
+    pub(super) fn add_compiled(
         &mut self,
         source: &VocabularySource,
     ) -> Result<Vec<EntryDef>, Vec<Diagnostic>> {

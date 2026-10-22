@@ -546,3 +546,31 @@ fn a_bounded_cycle_compiles() {
     );
     compile(&source, &Registry::core()).expect("bounded loop");
 }
+
+#[test]
+fn a_ceiling_change_changes_the_gate_registry_digest() {
+    let base = compile(PR_REVIEW, &Registry::core()).unwrap();
+    let from = "phrase review.within_words \"the verdict stays within a word budget\":\n    producer instrument\n    param words integer\n";
+    assert!(super::registry::CORE_VOCABULARY.contains(from));
+    let changed_source =
+        super::registry::CORE_VOCABULARY.replace(from, &format!("{from}    ceiling hard\n"));
+    let build = |core: &str| {
+        let mut registry = Registry::default();
+        registry
+            .add_compiled(&parse_vocabulary_source(core).unwrap())
+            .unwrap();
+        registry
+            .add_compiled(&parse_vocabulary_source(super::registry::PR_MERGE_VOCABULARY).unwrap())
+            .unwrap();
+        registry
+    };
+    let rebuilt = compile(PR_REVIEW, &build(super::registry::CORE_VOCABULARY)).unwrap();
+    assert_eq!(base.gate_registry_digest, rebuilt.gate_registry_digest);
+    let registry = build(&changed_source);
+    assert_eq!(
+        registry.get("review.within_words").unwrap().ceiling,
+        super::ast::Level::Hard
+    );
+    let changed = compile(PR_REVIEW, &registry).unwrap();
+    assert_ne!(base.gate_registry_digest, changed.gate_registry_digest);
+}

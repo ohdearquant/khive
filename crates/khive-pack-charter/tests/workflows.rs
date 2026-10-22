@@ -1216,6 +1216,12 @@ async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
         let requires = phase["requires"].as_array().unwrap();
         for r in requires {
             assert_eq!(r["level"], "hard", "{id}: {r}");
+            let want_passes = if r["phrase"] == "pr_merge.adr_scope_approved" {
+                json!(["pass", "not_applicable"])
+            } else {
+                json!(["pass"])
+            };
+            assert_eq!(r["passes"], want_passes, "{id}: {r}");
         }
         let gates: std::collections::BTreeSet<String> = requires
             .iter()
@@ -1248,14 +1254,9 @@ async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
     let floor: Vec<&Value> = validate
         .iter()
         .filter(|r| r["phrase"] == "pr_merge.floor_check")
-        .map(|r| &r["args"]["name"])
+        .map(|r| &r["args"])
         .collect();
-    let want_floor: Vec<&Value> = policy["floor"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| &c["name"])
-        .collect();
+    let want_floor: Vec<&Value> = policy["floor"].as_array().unwrap().iter().collect();
     assert_eq!(floor, want_floor);
     let checks = validate
         .iter()
@@ -2247,4 +2248,37 @@ async fn charter_waiting_cursor_returns_a_run_that_moves_back_to_its_prior_view(
     assert_eq!(changed["waiting"][0]["run_id"], run_id);
     assert_eq!(changed["waiting"][0]["phase"], "work");
     assert_eq!(changed["waiting"][0]["round"], 2);
+}
+
+#[tokio::test]
+async fn cancelling_a_run_cancels_its_grandchild() {
+    let f = Fixture::new();
+    for source in [
+        PR_SPLIT,
+        "charter middle v1\nsubject pull_request\nworkflow:\n    phase wait:\n        perform pr_split\n        complete\n",
+        "charter root v1\nsubject pull_request\nworkflow:\n    phase wait:\n        perform middle\n        complete\n",
+    ] {
+        f.call("charter.publish", json!({"source": source})).await;
+    }
+    let root = f
+        .call(
+            "charter.start",
+            json!({"charter": "root", "subject_kind": "pull_request", "subject_ref": PR}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let children = f.child_of(&root, "middle").await;
+    assert_eq!(children.len(), 1);
+    let child = children[0]["run_id"].as_str().unwrap().to_owned();
+    let grandchildren = f.child_of(&child, "pr_split").await;
+    assert_eq!(grandchildren.len(), 1);
+    let grandchild = grandchildren[0]["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(f.at(&grandchild).await.0, "open");
+
+    f.call("charter.cancel", json!({"run_id": root})).await;
+    assert_eq!(f.at(&root).await.0, "cancelled");
+    assert_eq!(f.at(&child).await.0, "cancelled");
+    assert_eq!(f.at(&grandchild).await.0, "cancelled");
 }

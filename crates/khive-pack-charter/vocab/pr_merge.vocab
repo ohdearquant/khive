@@ -19,6 +19,7 @@ phrase pr_merge.required_checks "every required check, the platform's rules unit
 phrase pr_merge.floor_check "a check on the definition's floor succeeded at the tested revision":
     producer instrument
     param name string
+    param producer string
     ceiling hard
 phrase pr_merge.review_at_head "an authorised approve verdict is bound to the head and the scope digest":
     producer platform
