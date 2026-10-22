@@ -924,12 +924,14 @@ use config names that no other fixture uses. Each mutation must compile and turn
    holds exactly one row for each of K, L and M. Mutations: replace the ledger's set of seen names with one
    seen-anything flag (the rows for L and M are absent); drain only one entry per dispatch and re-arm the
    flag while entries remain (after the first drain, K or L has no row). Runtimes D and E are constructed
-   independently with
-   `KhiveRuntime::from_backend` over the same prepared `Arc<StorageBackend>`, with the same namespace and
-   actor. D observes a fresh name; E observes that cached name before either drains. After D's completed
-   drain their shared store holds exactly one row for that name; after E's completed drain it holds exactly
-   two. Mutations: intern ledgers by backend identity (one row in total), or intern only pending state by
-   backend identity while keeping runtime-local seen sets (two rows after D's drain).
+   independently with `KhiveRuntime::from_backend` over the same prepared `Arc<StorageBackend>`, with the
+   same namespace and actor. D observes a fresh name N; E observes that cached name, and a second fresh name
+   Q that D never reads, before either drains. After D's completed drain their shared store holds exactly
+   one row for N and none for Q; after E's completed drain it holds exactly two rows for N and one for Q.
+   Mutations: intern ledgers by backend identity (one row for N in total), intern only pending state by
+   backend identity while keeping runtime-local seen sets (two rows for N after D's drain), or intern only
+   pending state and drain one entry per distinct name per dispatch, re-arming while entries remain (D's
+   drain writes Q).
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B.
