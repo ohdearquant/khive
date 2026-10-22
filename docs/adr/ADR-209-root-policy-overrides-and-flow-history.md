@@ -803,9 +803,11 @@ exercise these seams or their direct replacements, not a separate authorization-
   against a resource enforcing required review yields a recorded remote refusal and no successful
   merge. A head move between local check and remote CAS refuses. A retarget that keeps the head and
   lands after the subject read, against a resource that permits the merge, reconciles as
-  `merged_target_mismatch`, never as success, and the case claims no prevention. Proven non-effect
-  still does not reopen a grant. Never claim automatic exactly-once behavior without a provider
-  contract.
+  `merged_target_mismatch`, never as success, and the case claims no prevention. Its control runs
+  through the same recovery path: an uncertain receipt whose confirmed remote merge kept the head and
+  the signed target reconciles as success, never `merged_target_mismatch`, with one effect, no resend
+  and the approvals consumed. Proven non-effect still does not reopen a grant. Never claim automatic
+  exactly-once behavior without a provider contract.
 - **A13 — attribution (D6).** Concurrent flows, nested/child runs, late flushes, retries, denials,
   releases and resumed work keep their own typed context captured before queueing. Spoofed incoming
   flow/run fields do not become authoritative association. Initial association is still only as
