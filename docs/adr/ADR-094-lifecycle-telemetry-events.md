@@ -868,9 +868,10 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
    accessor resolves the cached value and then observes `(name, value)` on the ledger of the runtime its
    caller holds. A ledger enqueues a name the first time it observes it and ignores later observations
-   of that name. A runtime that reads a value another runtime already cached therefore still gets its
-   own row. Two runtimes constructed over the same database each have a ledger, so that store can hold
-   one row per runtime construction for the same name; this is accepted and is what "per runtime" means.
+   of that name. It keeps every enqueued name until a drain writes it; no capacity limit drops one. A
+   runtime that reads a value another runtime already cached therefore still gets its own row. Two
+   runtimes constructed over the same database each have a ledger, so that store can hold one row per
+   runtime construction for the same name; this is accepted and is what "per runtime" means.
 
 3. **Runtime-scope producers take the ledger from the runtime they hold.** The five pack-handler
    producers (memory four, kg one) pass the ledger of `self.runtime` (or the runtime the handler was
@@ -945,8 +946,13 @@ use config names that no other fixture uses. Each mutation must compile and turn
    four fresh names, or D3 or E3 dispatches once. After every completed drain, the store's row count for
    each name equals the count from a reference model in which each runtime keeps its own seen set and its
    own pending entries and a drain writes only the draining runtime's entries; a failure reports the seed
-   and the step. Mutation: each pending-state mutation named in this arm diverges from the model at some
-   step of the fixed seed.
+   and the step. Mutation: each pending-state mutation named before this case diverges from the model at
+   some step of the fixed seed. Finally, a runtime F observes six fresh distinct names, one more than the
+   five runtime-scope names in the census, before any dispatch, and completes one drain: its store holds
+   exactly one row for each. F then reads all six again and dispatches: no row is added. A producer added
+   to the census raises this count with it. Mutation: a pending buffer with any fixed capacity below six
+   drops a name after marking it seen, and that name never gets a row. The seeded schedule cannot show this,
+   since lifetime deduplication caps each runtime's pending entries at the size of its pool.
 3. **Interleaving.** A and B producers interleaved with barriers (no sleeps as ordering), B drained while
    A is pending, then A. Both stores hold exactly their own rows. Mutation: one shared pending flag
    cleared by either registry; A's row is lost or lands in B.
