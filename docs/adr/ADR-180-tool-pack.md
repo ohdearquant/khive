@@ -804,7 +804,11 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    pin columns null; and with its stored actor pattern, then its tool pattern, not
    matching the supplied actor or tool. In each, the by-id entry answers `false` for the older id and `true`
    for the newer id, and `decide` still cites the newer id. This separates a by-id check from one that
-   applies any activity or match term to a different grant than the one named.
+   applies any activity or match term to a different grant than the one named. Repeat the revocation and
+   each of these term fixtures with the roles reversed, the newer grant failing the term alone and the older
+   matching grant kept live: the by-id entry answers `false` for the newer id and `true` for the older id,
+   and `decide` cites the older id. This separates a by-id check from one that borrows a term from an
+   earlier grant than the one named.
 4. The by-id entry answers `false` for an actor or a tool that the row's patterns do not match, and
    follows `pattern_match_sql` for a wildcard pattern exactly as the by-actor lookup does.
 5. A revocation committed before a unit opens is seen by the check inside that unit (`false`).
@@ -824,6 +828,8 @@ caller's unit closes the window but gives the predicate two homes. Issue #5906.
    query: exactly one query invocation occurs, the entry returns that error, and a mutant that retries the
    query after a reader error turns this arm red. Inject a retryable error (`StorageError::Timeout`) and a
    non-retryable one (`StorageError::Driver`) in turn: each is returned after exactly one invocation, and a
-   mutant that retries only when `is_retryable()` holds turns the retryable case red.
+   mutant that retries only when `is_retryable()` holds turns the retryable case red. Repeat the injection
+   once for every `StorageError` variant, `StorageError::Transaction` included: each is returned unchanged
+   after exactly one invocation, so a retry keyed on any single variant turns that variant's case red.
 
 Refs: #5906, ADR-007, ADR-091, ADR-180 Amendment 1, ADR-180 Amendment 6.
