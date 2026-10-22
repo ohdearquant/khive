@@ -363,6 +363,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::install(&[])
+    }
+
+    fn upgraded() -> Self {
+        Self::install(OLD_SCHEMA)
+    }
+
+    fn install(previous: &'static [&'static str]) -> Self {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             wal_ceiling_bytes: 0,
@@ -386,6 +394,12 @@ impl Fixture {
         .expect("isolated runtime without embedding services");
         assert!(!runtime.backend().is_file_backed());
         assert!(runtime.registered_embedding_model_names().is_empty());
+        if !previous.is_empty() {
+            runtime
+                .backend()
+                .apply_pack_ddl_statements(previous)
+                .expect("install the previous charter schema");
+        }
         let mut builder = VerbRegistryBuilder::new();
         PackRegistry::register_packs(
             &[CharterPack::NAME.to_owned()],
@@ -940,6 +954,114 @@ async fn main_schema_upgrades_in_place_and_keeps_a_waiting_run_readable() {
     assert_eq!(run["phases"][0]["state"], "waiting_gate");
     assert_eq!(run["phases"][0]["round"], 1);
     assert_eq!(run["subject"]["kind"], "pull_request");
+}
+
+fn run_with(id: &str, key: &str, state: &str, parent: Option<&str>) -> SqlStatement {
+    sql(
+        "INSERT INTO charter_runs (policy_domain, run_id, namespace, run_key, subject_id, subject_epoch, charter_id, definition_version, definition_digest, candidate_digest, candidate_bytes, state, parent_run_id, created_at_us, updated_at_us) VALUES ('policy-a', ?1, 'test', ?2, 'subject-a', 0, 'merge', 1, 'merge-1', 'candidate-a', X'7B7D', ?3, ?4, 1, 1)",
+        vec![text(id), text(key), text(state), SqlValue::from_opt_text(parent)],
+    )
+}
+
+fn definition_with_source(version: i64, source: SqlValue) -> SqlStatement {
+    sql(
+        "INSERT INTO charter_definitions (policy_domain, charter_id, version, namespace, schema_version, template_id, definition_digest, definition_bytes, source_bytes, gate_registry_digest, action_contract_version, created_at_us) VALUES ('policy-a', 'merge', ?1, 'test', 1, 'pr_merge/v1', ?2, X'7B7D', ?3, 'registry-v1', 'git_pr_merge/v1', 1)",
+        vec![SqlValue::Integer(version), text(&format!("merge-{version}")), source],
+    )
+}
+
+#[tokio::test]
+async fn fresh_and_upgraded_schemas_refuse_the_same_direct_writes() {
+    for (shape, f) in [("fresh", Fixture::new()), ("upgraded", Fixture::upgraded())] {
+        for statement in [
+            definition("policy-a", "merge", 1),
+            sql(
+                "INSERT INTO charter_subjects (policy_domain, subject_id, namespace, subject_kind, subject_ref, forge, repository_id, pull_request_id, target, candidate_digest, candidate_bytes, created_at_us, updated_at_us) VALUES ('policy-a', 'subject-a', 'test', 'pull_request', 'pr-1', 'charter', 'pull_request', 'pr-1', 'current', 'candidate-a', X'7B7D', 1, 1)",
+                vec![],
+            ),
+            run_with("run-a", "key-a", "open", None),
+            run_with("run-child", "key-child", "open", Some("run-a")),
+            definition_with_source(2, text("charter merge v2")),
+        ] {
+            assert_eq!(f.execute(statement).await.expect(shape), 1, "{shape}");
+        }
+        for (statement, expected) in [
+            (
+                run_with("run-b", "key-b", "terminated", None),
+                "CHECK constraint failed",
+            ),
+            (
+                run_with("run-c", "key-c", "open", Some("missing")),
+                "charter run parent must exist",
+            ),
+            (
+                definition_with_source(3, SqlValue::Blob(vec![0x63])),
+                "charter definition source must be text",
+            ),
+        ] {
+            let error = f
+                .execute(statement)
+                .await
+                .expect_err(&format!("{shape} schema must refuse {expected}"));
+            assert!(error.to_string().contains(expected), "{shape}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_upgraded_store_starts_and_ends_new_runs_through_the_verbs() {
+    let f = Fixture::upgraded();
+    let child = "charter upgrade_child v1\nsubject pull_request\nroles:\n    agent\ntriggers:\n    fix.pushed\nworkflow:\n    phase answer by agent:\n        await fix.pushed\n        require findings.addressed soft\n        when findings.addressed is fail: terminate \"findings left unanswered\"\n        complete\n";
+    let parent = "charter upgrade_parent v1\nsubject pull_request\nroles:\n    agent\nworkflow:\n    phase delegate by agent:\n        perform upgrade_child\n        when upgrade_child is completed: goto done\n        when upgrade_child is terminated: goto stop\n        when upgrade_child is cancelled: goto stop\n    phase done:\n        complete\n    phase stop:\n        terminate \"the child ended without completing\"\n";
+    for source in [child, parent] {
+        let out = f
+            .registry
+            .dispatch("charter.publish", json!({"source": source}))
+            .await
+            .expect("publish on the upgraded schema");
+        assert_eq!(out["published"], true, "{out}");
+    }
+    let started = f
+        .registry
+        .dispatch(
+            "charter.start",
+            json!({"charter": "upgrade_parent", "subject_kind": "pull_request",
+                   "subject_ref": "acme/widgets#8", "bindings": {"agent": "worker"}}),
+        )
+        .await
+        .expect("start a run on a new subject");
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    for (kind, outcome) in [("fix.pushed", None), ("findings.addressed", Some("fail"))] {
+        let mut params =
+            json!({"subject_kind": "pull_request", "subject_ref": "acme/widgets#8", "kind": kind});
+        if let Some(outcome) = outcome {
+            params["outcome"] = json!(outcome);
+        }
+        f.registry
+            .dispatch("charter.observe", params)
+            .await
+            .expect("observe on the upgraded schema");
+    }
+
+    let runs = f
+        .registry
+        .dispatch(
+            "charter.runs",
+            json!({"charter": "upgrade_child", "subject_ref": "acme/widgets#8"}),
+        )
+        .await
+        .expect("list child runs");
+    let children = runs["runs"].as_array().expect("runs");
+    assert_eq!(children.len(), 1, "{runs}");
+    assert_eq!(children[0]["parent_run_id"], run_id.as_str());
+    assert_eq!(children[0]["state"], "terminated");
+    let parent_run = f
+        .registry
+        .dispatch("charter.get", json!({"run_id": run_id}))
+        .await
+        .expect("read the parent");
+    assert_eq!(parent_run["state"], "terminated", "{parent_run}");
+    assert_eq!(parent_run["subject"]["ref"], "acme/widgets#8");
 }
 
 #[tokio::test]
