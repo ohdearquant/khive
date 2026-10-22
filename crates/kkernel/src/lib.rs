@@ -16,8 +16,11 @@ pub mod dbpath;
 pub mod engine;
 pub mod entity_type_backfill;
 pub mod exec;
+#[cfg(feature = "pack-git")]
 pub mod git_annotation_repair;
+#[cfg(feature = "pack-git")]
 pub mod git_dedup;
+#[cfg(feature = "pack-git")]
 pub mod git_ingest;
 pub mod kg;
 pub mod mount;
@@ -60,6 +63,7 @@ mod _pack_links {
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
+    #[cfg(feature = "pack-git")]
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;

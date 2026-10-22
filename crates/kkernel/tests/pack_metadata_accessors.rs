@@ -23,6 +23,7 @@ use khive_pack_comm::CommPack;
 use khive_pack_exec::ExecPack;
 #[cfg(feature = "pack-formal")]
 use khive_pack_formal::FormalPack;
+#[cfg(feature = "pack-git")]
 use khive_pack_git::GitPack;
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
@@ -204,6 +205,7 @@ fn linked_packs() -> Vec<Checked> {
         checked(&CodePack::new(rt.clone())),
         checked(&CommPack::new(rt.clone())),
         checked(&ExecPack::new(rt.clone())),
+        #[cfg(feature = "pack-git")]
         checked(&GitPack::new(rt.clone())),
         checked(&GtdPack::new(rt.clone())),
         checked(&KgPack::new(rt.clone())),

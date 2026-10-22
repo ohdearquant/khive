@@ -25,6 +25,7 @@ pub use khive_pack_code::CodePack as _CodePack;
 pub use khive_pack_comm::CommPack as _CommPack;
 #[doc(hidden)]
 pub use khive_pack_exec::ExecPack as _ExecPack;
+#[cfg(feature = "pack-git")]
 #[doc(hidden)]
 pub use khive_pack_git::GitPack as _GitPack;
 #[doc(hidden)]

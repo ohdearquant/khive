@@ -98,6 +98,7 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("code", khive_pack_code::CodePack::HANDLERS),
         ("comm", khive_pack_comm::CommPack::HANDLERS),
         ("exec", khive_pack_exec::ExecPack::HANDLERS),
+        #[cfg(feature = "pack-git")]
         ("git", khive_pack_git::GitPack::HANDLERS),
         ("gtd", khive_pack_gtd::GtdPack::HANDLERS),
         ("kg", khive_pack_kg::KgPack::HANDLERS),

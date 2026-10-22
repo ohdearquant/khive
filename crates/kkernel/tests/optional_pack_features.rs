@@ -1,13 +1,10 @@
-//! The agent, telemetry and web packs are optional features of `kkernel` and
+//! Git, agent, telemetry and web are optional features of `kkernel` and
 //! `khive-mcp`: a build links and registers a pack exactly when its feature is on.
 //!
-//! The first two tests read the registry this binary actually linked and compare it
-//! with the features the binary was built with. The last three pin the manifests and
-//! the operator build: the default feature set leaves the three packs out, the
-//! operator build (`make build-local`) turns all three on, and `kkernel` must not
-//! let its `khive-mcp` dependency switch them back on when defaults are off. Any slip
-//! changes which packs a plain or an operator build links without failing any other
-//! test.
+//! Registry assertions exercise the features compiled into this test binary.
+//! Manifest assertions keep Git default-on, the other three packs default-off,
+//! and Kernel-to-MCP forwarding explicit. The operator build enables the three
+//! default-off packs without switching on MCP defaults through a dev dependency.
 
 use std::collections::BTreeSet;
 
@@ -19,9 +16,11 @@ use kkernel as _;
 const KKERNEL_MANIFEST: &str = include_str!("../Cargo.toml");
 const KHIVE_MCP_MANIFEST: &str = include_str!("../../khive-mcp/Cargo.toml");
 const MAKEFILE: &str = include_str!("../../../Makefile");
+const DEFAULT_OFF_PACKS: [&str; 3] = ["agent", "telemetry", "web"];
 
 /// The optional packs, each paired with whether this build links it.
-const OPTIONAL_PACKS: [(&str, bool); 3] = [
+const OPTIONAL_PACKS: [(&str, bool); 4] = [
+    ("git", cfg!(feature = "pack-git")),
     ("agent", cfg!(feature = "pack-agent")),
     ("telemetry", cfg!(feature = "pack-telemetry")),
     ("web", cfg!(feature = "pack-web")),
@@ -107,7 +106,7 @@ fn default_features_leave_the_three_optional_packs_out() {
     ] {
         let manifest = manifest(text);
         let default = feature(&manifest, "default");
-        for (name, _) in OPTIONAL_PACKS {
+        for name in DEFAULT_OFF_PACKS {
             let pack_feature = format!("pack-{name}");
             assert!(
                 !default.contains(&pack_feature),
@@ -145,7 +144,7 @@ fn the_operator_build_links_the_three_optional_packs() {
         !features.is_empty(),
         "the build-local recipe names no --features list: {recipe:?}"
     );
-    for (name, _) in OPTIONAL_PACKS {
+    for name in DEFAULT_OFF_PACKS {
         let pack_feature = format!("pack-{name}");
         assert!(
             features.contains(&pack_feature.as_str()),
@@ -159,15 +158,16 @@ fn kkernel_forwards_each_pack_feature_and_keeps_khive_mcp_defaults_off() {
     let kkernel = manifest(KKERNEL_MANIFEST);
     for (name, _) in OPTIONAL_PACKS {
         let forwarded = feature(&kkernel, &format!("pack-{name}"));
-        for expected in [
-            format!("khive-mcp/pack-{name}"),
-            format!("khive-pack-{name}"),
-        ] {
-            assert!(
-                forwarded.contains(&expected),
-                "pack-{name} must enable {expected}, it enables {forwarded:?}"
-            );
-        }
+        let expected_forward = format!("khive-mcp/pack-{name}");
+        assert!(
+            forwarded.contains(&expected_forward),
+            "pack-{name} must enable {expected_forward}"
+        );
+        let dependency = format!("khive-pack-{name}");
+        assert!(
+            forwarded.contains(&dependency) || forwarded.contains(&format!("dep:{dependency}")),
+            "pack-{name} must enable its local optional dependency"
+        );
     }
     for section in ["dependencies", "dev-dependencies"] {
         let defaults = kkernel[section]["khive-mcp"]
@@ -179,4 +179,22 @@ fn kkernel_forwards_each_pack_feature_and_keeps_khive_mcp_defaults_off() {
             "kkernel [{section}] must not enable khive-mcp's default features"
         );
     }
+}
+
+#[test]
+fn git_is_optional_default_on_and_required_by_repository_showcase() {
+    for text in [KKERNEL_MANIFEST, KHIVE_MCP_MANIFEST] {
+        let manifest = manifest(text);
+        assert!(feature(&manifest, "default").contains(&"pack-git".to_string()));
+        assert_eq!(
+            manifest["dependencies"]["khive-pack-git"]["optional"].as_bool(),
+            Some(true)
+        );
+    }
+    let kernel = manifest(KKERNEL_MANIFEST);
+    assert!(feature(&kernel, "repo-showcase").contains(&"pack-git".to_string()));
+    let mcp = manifest(KHIVE_MCP_MANIFEST);
+    assert!(feature(&mcp, "pack-git").contains(&"khive-runtime/pack-git".to_string()));
+    let runtime = manifest(include_str!("../../khive-runtime/Cargo.toml"));
+    assert!(feature(&runtime, "pack-git").is_empty());
 }

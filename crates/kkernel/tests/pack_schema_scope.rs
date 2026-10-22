@@ -38,6 +38,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
         declared::<khive_pack_exec::ExecPack>(),
+        #[cfg(feature = "pack-git")]
         declared::<khive_pack_git::GitPack>(),
         declared::<khive_pack_gtd::GtdPack>(),
         declared::<khive_pack_kg::KgPack>(),

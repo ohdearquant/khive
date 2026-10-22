@@ -84,6 +84,7 @@ fn every_production_handler_has_an_explicit_reviewed_access_class() {
         .iter()
         .map(|(name, _)| *name)
         .filter(|name| !matches!(*name, "authorize" | "authorize.visible"))
+        .filter(|name| cfg!(feature = "pack-git") || !name.starts_with("git."))
         .filter(|name| cfg!(feature = "pack-agent") || !name.starts_with("agent."))
         .filter(|name| cfg!(feature = "pack-telemetry") || !name.starts_with("telemetry."))
         .filter(|name| cfg!(feature = "pack-web") || !name.starts_with("web."))
