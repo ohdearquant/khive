@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 use khive_pack_charter::CharterPack;
 use khive_runtime::{
     KhiveRuntime, PackRegistry, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::SqlStatement;
 use khive_types::Pack;
 
 const PR_REVIEW: &str = include_str!("fixtures/pr_review.charter");
@@ -16,7 +19,7 @@ const PR_MERGE_VOCABULARY: &str = include_str!("fixtures/pr_merge.vocab");
 const PR: &str = "acme/widgets#7";
 
 struct Fixture {
-    _runtime: KhiveRuntime,
+    runtime: KhiveRuntime,
     registry: VerbRegistry,
 }
 
@@ -40,10 +43,7 @@ impl Fixture {
         registry
             .apply_schema_plans_with_map(&Default::default(), runtime.backend())
             .expect("pack schema installation");
-        Self {
-            _runtime: runtime,
-            registry,
-        }
+        Self { runtime, registry }
     }
 
     async fn call(&self, verb: &str, params: Value) -> Value {
@@ -51,6 +51,30 @@ impl Fixture {
             .dispatch(verb, params.clone())
             .await
             .unwrap_or_else(|e| panic!("{verb} {params}: {e}"))
+    }
+
+    async fn charter_table_counts(&self) -> BTreeMap<String, u64> {
+        let mut reader = self.runtime.sql().reader().await.expect("reader");
+        let tables = reader
+            .query_all(SqlStatement::new(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 'charter_%' ORDER BY name",
+                vec![],
+            ))
+            .await
+            .expect("charter tables");
+        let mut counts = BTreeMap::new();
+        for row in tables {
+            let name = row.text("name").expect("table name").to_owned();
+            let count = reader
+                .count(SqlStatement::new(
+                    format!("SELECT COUNT(*) FROM {name}"),
+                    vec![],
+                ))
+                .await
+                .expect("charter table row count");
+            counts.insert(name, count);
+        }
+        counts
     }
 
     async fn refused(&self, verb: &str, params: Value) -> String {
@@ -166,6 +190,148 @@ impl Fixture {
 
 fn error_text(e: &RuntimeError) -> String {
     format!("{e} {e:?}")
+}
+
+fn claim_params(run_id: &str) -> Value {
+    json!({
+        "run_id": run_id,
+        "descriptor": {
+            "repository_id": "repo-42",
+            "pull_request_id": "7",
+            "expected_head": "abc123",
+            "method": "squash",
+            "target": "main",
+            "subject_digest": "subject-digest",
+            "body_digest": "body-digest",
+        }
+    })
+}
+
+#[tokio::test]
+async fn charter_claim_refuses_an_open_run_without_changing_any_charter_table() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+
+    let run_view = f.run(&run).await;
+    assert_eq!(run_view["assurance"], "recording_only", "{run_view}");
+    let listed = f.call("charter.runs", json!({})).await;
+    assert_eq!(listed["runs"][0]["assurance"], "recording_only", "{listed}");
+    let waiting = f.call("charter.waiting", json!({})).await;
+    assert_eq!(
+        waiting["waiting"][0]["assurance"], "recording_only",
+        "{waiting}"
+    );
+
+    let before = f.charter_table_counts().await;
+    assert_eq!(
+        before.len(),
+        8,
+        "all charter tables must be counted: {before:?}"
+    );
+    let err = f.refused("charter.claim", claim_params(&run)).await;
+    assert!(err.contains("AssuranceInsufficient"), "{err}");
+    assert!(err.contains("recording milestone"), "{err}");
+    assert!(err.contains("claims are not admitted"), "{err}");
+    assert!(err.contains("action_admitted=false"), "{err}");
+    assert!(
+        err.contains("diagnostic_evaluation_committed=false"),
+        "{err}"
+    );
+    assert_eq!(f.charter_table_counts().await, before);
+}
+
+#[tokio::test]
+async fn charter_claim_rejects_malformed_parameters_before_the_m1_refusal() {
+    let f = Fixture::new();
+    let valid = claim_params("run-1");
+
+    let mut unknown = valid.clone();
+    unknown["unexpected"] = json!(true);
+    let err = f.refused("charter.claim", unknown).await;
+    assert!(err.contains("unknown parameter: unexpected"), "{err}");
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+
+    let err = f.refused("charter.claim", json!({"run_id": "run-1"})).await;
+    assert!(err.contains("descriptor is required"), "{err}");
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+
+    let mut missing = valid.clone();
+    missing["descriptor"]
+        .as_object_mut()
+        .unwrap()
+        .remove("body_digest");
+    let err = f.refused("charter.claim", missing).await;
+    assert!(err.contains("descriptor.body_digest is required"), "{err}");
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+
+    let mut unknown_descriptor_field = valid.clone();
+    unknown_descriptor_field["descriptor"]["pull_request"] = json!("7");
+    let err = f.refused("charter.claim", unknown_descriptor_field).await;
+    assert!(
+        err.contains("unknown descriptor field: pull_request"),
+        "{err}"
+    );
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+
+    let mut wrong_run_type = valid.clone();
+    wrong_run_type["run_id"] = json!(7);
+    let err = f.refused("charter.claim", wrong_run_type).await;
+    assert!(err.contains("run_id must be a string"), "{err}");
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+
+    let mut wrong_type = valid;
+    wrong_type["descriptor"]["expected_head"] = json!(123);
+    let err = f.refused("charter.claim", wrong_type).await;
+    assert!(
+        err.contains("descriptor.expected_head must be a string"),
+        "{err}"
+    );
+    assert!(!err.contains("AssuranceInsufficient"), "{err}");
+}
+
+#[tokio::test]
+async fn charter_claim_is_registered_with_help_for_the_run_and_action_descriptor() {
+    let f = Fixture::new();
+    let help = f
+        .registry
+        .dispatch("charter.claim", json!({"help": true}))
+        .await
+        .expect("claim help");
+
+    assert_eq!(help["verb"], "charter.claim", "{help}");
+    assert_eq!(help["pack"], "charter", "{help}");
+    assert!(
+        help["description"].as_str().is_some_and(
+            |s| s.contains("recording milestone") && s.contains("claims are not admitted")
+        ),
+        "{help}"
+    );
+    let params = help["params"].as_array().expect("parameter schema");
+    let run_id = params
+        .iter()
+        .find(|p| p["name"] == "run_id")
+        .expect("run_id param");
+    assert_eq!(run_id["type"], "string");
+    assert_eq!(run_id["required"], true);
+    let descriptor = params
+        .iter()
+        .find(|p| p["name"] == "descriptor")
+        .expect("descriptor param");
+    assert_eq!(descriptor["type"], "object");
+    assert_eq!(descriptor["required"], true);
+    let description = descriptor["description"].as_str().unwrap();
+    for field in [
+        "repository_id",
+        "pull_request_id",
+        "expected_head",
+        "method",
+        "target",
+        "subject_digest",
+        "body_digest",
+    ] {
+        assert!(description.contains(field), "{field}: {description}");
+    }
 }
 
 fn tuple(state: &str, phase: &str, phase_state: &str, round: i64) -> (String, String, String, i64) {

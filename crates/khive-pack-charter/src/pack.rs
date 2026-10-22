@@ -21,6 +21,7 @@ use crate::lang::definition::LANGUAGE;
 use crate::lang::{canonical_json, compile, digest, parse_vocabulary_source, Diagnostic, Registry};
 
 const DEFAULT_DOMAIN: &str = "default";
+const RECORDING_ASSURANCE: &str = "recording_only";
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 
@@ -75,6 +76,12 @@ const REQUEST_ID: ParamDef = param(
     false,
     "Caller-scoped key for a retry. The same key with the same parameters returns the stored result with replayed=true; the same key with different parameters is refused.",
 );
+const CLAIM_DESCRIPTOR: ParamDef = param(
+    "descriptor",
+    "object",
+    true,
+    "Exact action descriptor with required string fields repository_id, pull_request_id, expected_head, method, target, subject_digest and body_digest.",
+);
 const LIMIT: ParamDef = param(
     "limit",
     "integer",
@@ -82,7 +89,7 @@ const LIMIT: ParamDef = param(
     "Maximum rows, default 50, at most 500.",
 );
 
-pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
+pub(crate) static CHARTER_HANDLERS: [HandlerDef; 11] = [
     HandlerDef {
         name: "charter.compile",
         description: "Compile a charter source against the phrase registry and report its definition or every refusal, by line. Writes nothing.",
@@ -139,6 +146,13 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             DOMAIN,
             REQUEST_ID,
         ],
+    },
+    HandlerDef {
+        name: "charter.claim",
+        description: "Claim an exact action descriptor for a run. At the recording milestone, claims are not admitted and this verb refuses without writing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[param("run_id", "string", true, "The run the action claims admission for."), CLAIM_DESCRIPTOR, DOMAIN, REQUEST_ID],
     },
     HandlerDef {
         name: "charter.cancel",
@@ -251,6 +265,7 @@ impl PackRuntime for CharterPack {
             "charter.vocabulary" => self.vocabulary(params, token).await,
             "charter.start" => self.start(params, token).await,
             "charter.observe" => self.observe(params, token).await,
+            "charter.claim" => self.claim(params).await,
             "charter.cancel" => self.cancel(params, token).await,
             "charter.waiting" => self.waiting(params).await,
             "charter.get" => self.get(params).await,
@@ -947,6 +962,65 @@ impl CharterPack {
         unit_value(result, &params.verb)
     }
 
+    async fn claim(&self, params: Params) -> Result<Value, RuntimeError> {
+        if let Some(name) = params
+            .map
+            .keys()
+            .find(|name| !["run_id", "descriptor", "domain", "request_id"].contains(&name.as_str()))
+        {
+            return Err(params.invalid(format!("unknown parameter: {name}")));
+        }
+        let _run_id = params.str("run_id")?;
+        let descriptor = match params.map.get("descriptor") {
+            Some(Value::Object(fields)) => fields.clone(),
+            None => return Err(params.invalid("descriptor is required")),
+            Some(other) => {
+                return Err(params.invalid(format!("descriptor must be an object, got {other}")))
+            }
+        };
+        if let Some(name) = descriptor.keys().find(|name| {
+            ![
+                "repository_id",
+                "pull_request_id",
+                "expected_head",
+                "method",
+                "target",
+                "subject_digest",
+                "body_digest",
+            ]
+            .contains(&name.as_str())
+        }) {
+            return Err(params.invalid(format!("unknown descriptor field: {name}")));
+        }
+        for name in [
+            "repository_id",
+            "pull_request_id",
+            "expected_head",
+            "method",
+            "target",
+            "subject_digest",
+            "body_digest",
+        ] {
+            match descriptor.get(name) {
+                Some(Value::String(value)) if !value.is_empty() => {}
+                Some(Value::String(_)) => {
+                    return Err(params.invalid(format!("descriptor.{name} must not be empty")))
+                }
+                Some(other) => {
+                    return Err(
+                        params.invalid(format!("descriptor.{name} must be a string, got {other}"))
+                    )
+                }
+                None => return Err(params.invalid(format!("descriptor.{name} is required"))),
+            }
+        }
+        let _domain = params.domain()?;
+        let _request_id = params.opt_str("request_id")?;
+        Err(params.invalid(
+            "AssuranceInsufficient: action_admitted=false, diagnostic_evaluation_committed=false; the charter pack is at the recording milestone and claims are not admitted",
+        ))
+    }
+
     async fn cancel(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let run_id = params.str("run_id")?;
         let reason = params.opt_str("reason")?;
@@ -1049,6 +1123,7 @@ impl CharterPack {
                 "run_id": col_text(&row, "run_id")?,
                 "charter": col_text(&row, "charter_id")?,
                 "version": col_i64(&row, "definition_version")?,
+                "assurance": RECORDING_ASSURANCE,
                 "parent_run_id": col_opt_text(&row, "parent_run_id")?,
                 "subject": {"kind": col_text(&row, "subject_kind")?, "ref": col_text(&row, "subject_ref")?},
                 "phase": col_text(&row, "phase_id")?,
@@ -1105,6 +1180,7 @@ impl CharterPack {
             "run_id": col_text(&run, "run_id")?,
             "charter": col_text(&run, "charter_id")?,
             "version": col_i64(&run, "definition_version")?,
+            "assurance": RECORDING_ASSURANCE,
             "state": col_text(&run, "state")?,
             "current_phase": col_opt_text(&run, "current_phase_id")?,
             "parent_run_id": col_opt_text(&run, "parent_run_id")?,
@@ -1172,6 +1248,7 @@ impl CharterPack {
                 "run_id": col_text(r, "run_id")?,
                 "charter": col_text(r, "charter_id")?,
                 "version": col_i64(r, "definition_version")?,
+                "assurance": RECORDING_ASSURANCE,
                 "state": col_text(r, "state")?,
                 "current_phase": col_opt_text(r, "current_phase_id")?,
                 "parent_run_id": col_opt_text(r, "parent_run_id")?,
