@@ -863,10 +863,11 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    A registry configured with an explicit `with_event_store` sink, or with no sink, drains no ledger.
    Two registries bound to one runtime share its ledger, and either may drain it; they write to the same
    runtime's store. A runtime handle that `KhiveRuntime::core()` returns over a different backend is not a
-   clone and does not share its source's ledger: a runtime with a core backend creates one core ledger
-   when it is constructed, shares it with its clones, and gives it to every such handle, so a value read
-   through those handles is written to the core store, once per name, and only by a registry bound to one
-   of them.
+   clone and does not share its source's ledger: a runtime keeps one core ledger while its core-backend
+   binding is unchanged, shares it with the clones that retain that binding, and gives it to every such
+   handle, so a value read through those handles is written to the core store, once per name, and only by
+   a registry bound to one of them. Changing the binding with `with_core_backend` creates a fresh core
+   ledger; handles taken before the change keep the old ledger and its pending entries.
 
 2. **One row per config name per runtime.** The resolved value stays in the process-wide `OnceLock`, so
    when a changed environment takes effect is unchanged. Observation moves out of `get_or_init`: each
@@ -922,7 +923,8 @@ Decision 7(a)'s claim that every producer runs inside a pack handler no longer h
    nothing when it is false; otherwise, in one critical section, it takes every pending entry and clears
    the flag. Nothing else writes the flag. Acquiring the mutex waits; neither operation skips on
    contention. The taken entries belong to that drain alone and are appended to its own registry's store
-   with no ledger lock held, so two drains of one ledger never share a batch or a destination.
+   with no ledger lock held, so two drains of one ledger never share a batch or overwrite one another's
+   destination.
 
 ### Test list (acceptance)
 
@@ -932,8 +934,8 @@ These fixtures discriminate the named mutations; they do not establish correctne
 value length, name or retry policy, and Decision 2 still forbids a loss or a duplicate of that kind. Nor
 do they establish Decision 8: an implementation that splits a critical section, skips on contention or
 shares a batch between drains can pass every arm below. Decision 8 is checked by reading the ledger
-module, which holds the seen set, the pending entries, the flag and the two operations and nothing else,
-and every change to that module is read against it. The schedules in arm 3 remain regression checks for
+module. The implementation puts the seen set, the pending entries, the flag and the two production
+operations in that module, and every later change to the module is reviewed against Decision 8. The schedules in arm 3 remain regression checks for
 the mutations they name.
 
 1. **Destination.** Runtimes A and B with separate stores and distinct namespace and actor, one registry
@@ -1004,10 +1006,11 @@ the mutations they name.
    through the bound registry. A secondary runtime S over one store and its `core()` handle over a
    different main store each get a bound registry. A fresh name read only through S: the core registry
    drains first and the main store gains no row, then S's registry drains and S's store holds exactly one.
-   A second fresh name read through two separate `core()` handles of S, and never through S: after the
-   core registry drains, the main store holds exactly one row for it and S's store none. Mutations: give
-   the core handle S's own ledger (the first name lands in the main store); give each `core()` call a
-   fresh ledger (the second name gets two rows).
+   A second fresh name read first through that bound core handle and then through a second `core()`
+   handle of S that gets its own bound registry, and never through S: after both core registries drain,
+   the main store holds exactly one row for it and S's store none. Mutations: give the core handle S's
+   own ledger (the first name lands in the main store); give each `core()` call a fresh ledger (the second
+   name gets two rows).
 5. **Process scope.** In a process with one bound registry, a coordinated search and a bridge request
    exercise all three process-scope accessors. Neither drains a ledger itself (the coordinated path,
    `dispatch.rs:268`, has no drain, and a forwarded bridge request returns at `bridge.rs:542-557` without a
