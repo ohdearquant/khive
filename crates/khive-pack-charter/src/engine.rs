@@ -1273,6 +1273,19 @@ impl<'w> Engine<'w> {
                 .push_back(Work::Advance(parent_run_id.to_owned()));
             return Ok(());
         };
+        // Publication compares subject kinds against the child's version at that time; a later
+        // child version can declare another kind, and the child run would take the parent's
+        // subject. Refusing leaves the command that reached this phase unwritten.
+        if definition.subject != parent.subject_kind {
+            return Err(StorageError::Conflict {
+                capability: khive_storage::StorageCapability::Sql,
+                operation: "PerformSubjectMismatch".into(),
+                message: format!(
+                    "perform {charter_id}: version {version} runs on {} subjects, the parent run on {}",
+                    definition.subject, parent.subject_kind
+                ),
+            });
+        }
         let bindings = parent.candidate["bindings"]
             .as_object()
             .cloned()

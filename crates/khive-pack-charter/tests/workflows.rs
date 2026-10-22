@@ -2177,6 +2177,93 @@ async fn child_start_refuses_a_cycle_in_persisted_definitions() {
 }
 
 #[tokio::test]
+async fn publication_refuses_a_perform_of_a_charter_on_another_subject_kind() {
+    let f = Fixture::new();
+    let child =
+        "charter task_child v1\nsubject task\nworkflow:\n    phase done:\n        complete\n";
+    let parent = "charter pr_parent v1\nsubject pull_request\nworkflow:\n    phase child:\n        perform task_child\n        complete\n";
+    f.call("charter.publish", json!({"source": child})).await;
+
+    let error = f
+        .refused("charter.publish", json!({"source": parent}))
+        .await;
+    assert!(error.contains("perform_subject_mismatch"), "{error}");
+    assert!(
+        error.contains("task_child runs on task subjects, this charter on pull_request"),
+        "{error}"
+    );
+    let listed = f.call("charter.list", json!({})).await;
+    assert_eq!(listed["charters"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+#[tokio::test]
+async fn a_child_republished_on_another_subject_kind_is_refused_when_performed() {
+    let f = Fixture::new();
+    let child = |version: u32, subject: &str| {
+        format!("charter swap_child v{version}\nsubject {subject}\nworkflow:\n    phase done:\n        complete\n")
+    };
+    let parent = r#"charter swap_parent v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase first by agent:
+        await message.arrived
+        goto second
+    phase second by agent:
+        perform swap_child
+        complete
+"#;
+    f.call(
+        "charter.publish",
+        json!({"source": child(1, "pull_request")}),
+    )
+    .await;
+    f.call("charter.publish", json!({"source": parent})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "swap_parent", "subject_kind": "pull_request",
+                   "subject_ref": PR, "bindings": {"agent": "worker"}}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
+    let published = f
+        .call("charter.publish", json!({"source": child(2, "task")}))
+        .await;
+    assert_eq!(published["published"], true, "{published}");
+    let before = f.at(&run).await;
+    assert_eq!(before.1, "first", "{before:?}");
+    let arrived = json!({"subject_kind": "pull_request", "subject_ref": PR,
+                         "kind": "message.arrived"});
+
+    let error = f
+        .registry
+        .dispatch("charter.observe", arrived.clone())
+        .await
+        .expect_err("a child declared for another subject kind must not start");
+    let text = format!("{error} {error:?}");
+    assert!(text.contains("PerformSubjectMismatch"), "{text}");
+    assert!(
+        text.contains("version 2 runs on task subjects, the parent run on pull_request"),
+        "{text}"
+    );
+    assert_eq!(f.at(&run).await, before);
+    assert!(f.child_of(&run, "swap_child").await.is_empty());
+
+    f.call(
+        "charter.publish",
+        json!({"source": child(3, "pull_request")}),
+    )
+    .await;
+    f.call("charter.observe", arrived).await;
+    let children = f.child_of(&run, "swap_child").await;
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0]["state"], "completed", "{children:?}");
+    assert_eq!(f.at(&run).await.0, "completed");
+}
+
+#[tokio::test]
 async fn observations_use_the_registry_pinned_by_the_target_run() {
     let f = Fixture::new();
     let first_vocabulary = "vocabulary acme v1\nphrase acme.result \"the result was recorded\":\n    producer instrument\n    outcomes pass fail\n    passes pass\n";

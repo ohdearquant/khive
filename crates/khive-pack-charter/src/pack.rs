@@ -146,7 +146,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "charter.publish",
-        description: "Compile and store a charter version. Republishing identical source is a no-op; a different definition under a published version is refused. Every performed charter must already be published.",
+        description: "Compile and store a charter version. Republishing identical source is a no-op; a different definition under a published version is refused. Every performed charter must already be published, on the same subject kind.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[SOURCE, DOMAIN, REQUEST_ID],
@@ -1311,14 +1311,33 @@ impl CharterPack {
                     let definition = &compiled.definition;
                     let mut engine = Engine::new(writer, scope.clone());
                     for child in definition.phases.iter().flat_map(|p| p.performs.iter()) {
-                        if engine.latest_definition(child).await?.is_none() {
-                            return Err(refuse(
-                                &verb,
-                                Refusal::new(
-                                    "unpublished_perform",
-                                    format!("perform {child}: publish {child} first"),
-                                ),
-                            ));
+                        match engine.latest_definition(child).await? {
+                            None => {
+                                return Err(refuse(
+                                    &verb,
+                                    Refusal::new(
+                                        "unpublished_perform",
+                                        format!("perform {child}: publish {child} first"),
+                                    ),
+                                ));
+                            }
+                            // A child run is attached to its parent's subject, so a child declared
+                            // for another subject kind could never be admitted by `charter.start`.
+                            Some((_, _, child_definition))
+                                if child_definition.subject != definition.subject =>
+                            {
+                                return Err(refuse(
+                                    &verb,
+                                    Refusal::new(
+                                        "perform_subject_mismatch",
+                                        format!(
+                                            "perform {child}: {child} runs on {} subjects, this charter on {}",
+                                            child_definition.subject, definition.subject
+                                        ),
+                                    ),
+                                ));
+                            }
+                            Some(_) => {}
                         }
                     }
                     if let Some(path) = engine.perform_cycle(definition).await? {
