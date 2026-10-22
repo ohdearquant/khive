@@ -22,8 +22,8 @@ workflow:
     phase checks by merge_recovery:
         await checks.concluded
         require pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) hard
-        require pr_merge.floor_check(name="CI gate") hard
-        require pr_merge.floor_check(name="Secret scan (gitleaks)") hard
+        require pr_merge.floor_check(name="CI gate", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
+        require pr_merge.floor_check(name="Secret scan (gitleaks)", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
         when pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) is pass: goto approval
         when pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) is fail: goto checks
         max_rounds 3 then hold
