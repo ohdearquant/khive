@@ -1,0 +1,57 @@
+charter pr_merge_after_ci_gate v1
+title "Merge a pull request after its checks pass"
+subject pull_request
+
+roles:
+    merge_recovery "checks the candidate and its evidence"
+    approver "records approval at the candidate head"
+    merge_chair "starts the merge"
+
+triggers:
+    pr_merge.candidate_observed
+    checks.concluded
+    approval.recorded
+
+workflow:
+    phase intake by merge_recovery:
+        await pr_merge.candidate_observed
+        require pr_merge.candidate_supported hard
+        require pr_merge.evidence_complete_trusted hard
+        goto checks
+
+    phase checks by merge_recovery:
+        await checks.concluded
+        require pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) hard
+        require pr_merge.floor_check(name="CI gate") hard
+        require pr_merge.floor_check(name="Secret scan (gitleaks)") hard
+        when pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) is pass: goto approval
+        when pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) is fail: goto checks
+        max_rounds 3 then hold
+
+    phase approval by approver:
+        await approval.recorded
+        require pr_merge.review_at_head hard
+        require pr_merge.family_independent hard
+        require pr_merge.no_self_approval(controller=required) hard
+        require pr_merge.adr_scope_approved hard
+        require pr_merge.scope_and_policy_paths_approved hard
+        when pr_merge.adr_scope_approved is pass: goto merge
+        when pr_merge.adr_scope_approved is not_applicable: goto merge
+        when pr_merge.adr_scope_approved is fail: goto hold
+
+    phase merge by merge_chair:
+        require pr_merge.all_merge_requirements_current hard
+        require pr_merge.exact_action_authorized hard
+        require pr_merge.platform_enforcement_verified hard
+        action pr_merge.git_pr_merge(method=squash, expected_head=candidate_head) by merge_chair
+        goto verify
+
+    phase verify by merge_chair:
+        goto record
+
+    phase record by merge_chair:
+        require loop.log_written advisory
+        complete
+
+    phase hold by merge_recovery:
+        terminate "a required merge condition did not pass"

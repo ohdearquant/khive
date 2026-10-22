@@ -8,6 +8,23 @@ const PR_FIX: &str = include_str!("../../tests/fixtures/pr_fix.charter");
 const PR_SPLIT: &str = include_str!("../../tests/fixtures/pr_split.charter");
 const REVIEW_ROUND: &str = include_str!("../../tests/fixtures/review_round.charter");
 const INBOX_TRIAGE: &str = include_str!("../../tests/fixtures/inbox_triage.charter");
+const STALE_TASK_TRIAGE: &str = include_str!("../../tests/fixtures/stale_task_triage.charter");
+const ISSUE_READONLY_INVESTIGATION: &str =
+    include_str!("../../tests/fixtures/issue_readonly_investigation.charter");
+const CODE_FIX_WITH_PROBE_TEST: &str =
+    include_str!("../../tests/fixtures/code_fix_with_probe_test.charter");
+const INBOX_SWEEP: &str = include_str!("../../tests/fixtures/inbox_sweep.charter");
+const PR_MERGE_DECISION_HANDOFF: &str =
+    include_str!("../../tests/fixtures/pr_merge_decision_handoff.charter");
+const PR_REVIEW_VERDICT_ESCALATION: &str =
+    include_str!("../../tests/fixtures/pr_review_verdict_escalation.charter");
+const DIRECTIVE_RELAY: &str = include_str!("../../tests/fixtures/directive_relay.charter");
+const PR_GATE_JOB_LAUNCH: &str = include_str!("../../tests/fixtures/pr_gate_job_launch.charter");
+const REPLY_AFTER_VERIFICATION: &str =
+    include_str!("../../tests/fixtures/reply_after_verification.charter");
+const PR_MERGE_AFTER_CI_GATE: &str =
+    include_str!("../../tests/fixtures/pr_merge_after_ci_gate.charter");
+const PR_MERGE_VOCAB: &str = include_str!("../../vocab/pr_merge.vocab");
 
 const HEADER: &str = "charter probe v1\nsubject pull_request\nroles:\n    author\n";
 
@@ -116,6 +133,42 @@ fn an_await_can_name_a_registered_phrase() {
         "{HEADER}workflow:\n    phase wait:\n        await message.kind\n        complete\n"
     );
     compile(&source, &Registry::core()).expect("phrases may release an awaited phase");
+}
+
+#[test]
+fn the_workflow_fixtures_compile() {
+    let registry = Registry::core();
+    for source in [
+        STALE_TASK_TRIAGE,
+        ISSUE_READONLY_INVESTIGATION,
+        CODE_FIX_WITH_PROBE_TEST,
+        INBOX_SWEEP,
+        PR_MERGE_DECISION_HANDOFF,
+        PR_REVIEW_VERDICT_ESCALATION,
+        DIRECTIVE_RELAY,
+        PR_GATE_JOB_LAUNCH,
+        REPLY_AFTER_VERIFICATION,
+    ] {
+        let compiled = compile(source, &registry).unwrap_or_else(|e| panic!("{e:?}\n{source}"));
+        assert!(compiled.definition_digest.starts_with("blake3:"));
+        assert_eq!(
+            compiled.definition.gate_registry_digest,
+            compiled.gate_registry_digest
+        );
+    }
+
+    let mut registry = Registry::core();
+    let vocabulary = parse_vocabulary_source(PR_MERGE_VOCAB).expect("pr_merge vocabulary");
+    registry
+        .add(&vocabulary)
+        .expect("register pr_merge vocabulary");
+    let compiled = compile(PR_MERGE_AFTER_CI_GATE, &registry)
+        .unwrap_or_else(|e| panic!("{e:?}\n{PR_MERGE_AFTER_CI_GATE}"));
+    assert!(compiled.definition_digest.starts_with("blake3:"));
+    assert_eq!(
+        compiled.definition.gate_registry_digest,
+        compiled.gate_registry_digest
+    );
 }
 
 #[test]

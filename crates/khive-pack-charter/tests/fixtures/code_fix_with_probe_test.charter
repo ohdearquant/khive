@@ -1,0 +1,39 @@
+charter code_fix_with_probe_test v1
+title "Fix a pull request with a probe and bounded rework"
+subject pull_request
+
+roles:
+    author "updates the pull request"
+    maintainer "splits work that remains blocked"
+
+triggers:
+    review.posted
+    fix.pushed
+    pull_request.head_moved
+
+workflow:
+    phase review by maintainer:
+        await review.posted
+        require review.decision hard
+        when review.decision is approve: complete
+        when review.decision is request_changes: goto probe
+        when review.decision is blocked: goto split
+
+    phase probe by author:
+        action tests.run_targeted by author
+        goto fix
+
+    phase fix by author:
+        action work.unit by author
+        action tests.run_targeted by author
+        action tests.run_mutations by author
+        action fix.push by author
+        await fix.pushed or pull_request.head_moved
+        require findings.addressed soft
+        when findings.addressed is pass: goto review
+        when findings.addressed is fail: goto fix
+        max_rounds 3 then split
+
+    phase split by maintainer:
+        action pull_request.split by maintainer
+        terminate "the change remains blocked after bounded rework"
