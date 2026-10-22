@@ -450,7 +450,7 @@ fn assert_revision_conflict(error: &StorageError) {
 }
 
 #[tokio::test]
-async fn inventory_loading_installs_eight_tables_and_reapplying_preserves_rows() {
+async fn inventory_loading_installs_nine_tables_and_reapplying_preserves_rows() {
     let fixture = Fixture::new();
     let mut reader = fixture.runtime.sql().reader().await.expect("reader");
     let rows = reader
@@ -472,6 +472,7 @@ async fn inventory_loading_installs_eight_tables_and_reapplying_preserves_rows()
             "charter_runs",
             "charter_subjects",
             "charter_vocabularies",
+            "charter_waiting_changes",
         ]
     );
     drop(reader);
@@ -878,7 +879,7 @@ async fn main_schema_upgrades_in_place_and_keeps_a_waiting_run_readable() {
     let mut writer = runtime.sql().writer().await.expect("writer");
     writer
         .execute(sql(
-            "INSERT INTO charter_definitions (policy_domain, charter_id, version, namespace, schema_version, template_id, definition_digest, definition_bytes, gate_registry_digest, action_contract_version, created_at_us) VALUES ('default', 'upgrade_wait', 1, 'old', 1, 'charter/1', ?1, ?2, ?3, 'recording/1', 1)",
+            "INSERT INTO charter_definitions (policy_domain, charter_id, version, namespace, schema_version, template_id, definition_digest, definition_bytes, gate_registry_digest, action_contract_version, created_at_us) VALUES ('default', 'upgrade_wait', 1, 'local', 1, 'charter/1', ?1, ?2, ?3, 'recording/1', 1)",
             vec![
                 text(&compiled.definition_digest),
                 SqlValue::Blob(compiled.definition_bytes.clone()),
@@ -889,21 +890,21 @@ async fn main_schema_upgrades_in_place_and_keeps_a_waiting_run_readable() {
         .expect("insert the pinned definition");
     writer
         .execute(sql(
-            "INSERT INTO charter_subjects (policy_domain, subject_id, namespace, forge, repository_id, pull_request_id, target, candidate_digest, candidate_bytes, created_at_us, updated_at_us) VALUES ('default', 'subject-old', 'old', 'github', 'acme/widgets', '7', 'main', 'candidate-old', X'7B7D', 1, 1)",
+            "INSERT INTO charter_subjects (policy_domain, subject_id, namespace, forge, repository_id, pull_request_id, target, candidate_digest, candidate_bytes, created_at_us, updated_at_us) VALUES ('default', 'subject-old', 'local', 'github', 'acme/widgets', '7', 'main', 'candidate-old', X'7B7D', 1, 1)",
             vec![],
         ))
         .await
         .expect("insert the old subject row");
     writer
         .execute(sql(
-            "INSERT INTO charter_runs (policy_domain, run_id, namespace, run_key, subject_id, subject_epoch, charter_id, definition_version, definition_digest, candidate_digest, candidate_bytes, state, current_phase_id, created_at_us, updated_at_us) VALUES ('default', 'run-old', 'old', 'old-run-key', 'subject-old', 0, 'upgrade_wait', 1, ?1, 'candidate-old', X'7B2267656E65726174696F6E223A6E756C6C7D', 'open', NULL, 1, 1)",
+            "INSERT INTO charter_runs (policy_domain, run_id, namespace, run_key, subject_id, subject_epoch, charter_id, definition_version, definition_digest, candidate_digest, candidate_bytes, state, current_phase_id, created_at_us, updated_at_us) VALUES ('default', 'run-old', 'local', 'old-run-key', 'subject-old', 0, 'upgrade_wait', 1, ?1, 'candidate-old', X'7B2267656E65726174696F6E223A6E756C6C7D', 'open', NULL, 1, 1)",
             vec![text(&compiled.definition_digest)],
         ))
         .await
         .expect("insert the waiting run");
     writer
         .execute(sql(
-            "INSERT INTO charter_phases (policy_domain, run_id, phase_id, namespace, ordinal, state, assignee_kind, assignee, created_at_us, updated_at_us) VALUES ('default', 'run-old', 'gate', 'old', 1, 'waiting_gate', 'role', 'reviewer', 1, 1)",
+            "INSERT INTO charter_phases (policy_domain, run_id, phase_id, namespace, ordinal, state, assignee_kind, assignee, created_at_us, updated_at_us) VALUES ('default', 'run-old', 'gate', 'local', 1, 'waiting_gate', 'role', 'reviewer', 1, 1)",
             vec![],
         ))
         .await

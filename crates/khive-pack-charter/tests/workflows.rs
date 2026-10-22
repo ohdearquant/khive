@@ -271,30 +271,49 @@ async fn a_failing_hard_requirement_holds_the_phase_until_it_passes() {
 async fn the_waiting_view_answers_who_owes_each_open_phase() {
     let f = Fixture::new();
     f.publish_review_set().await;
-    let run = f.start_review().await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_review",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "bindings": {
+                    "author": "actor-1",
+                    "reviewer": "actor-2",
+                    "approver": "actor-3",
+                    "maintainer": "actor-4",
+                },
+            }),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
     f.pass_intake().await;
 
-    let rita = f.call("charter.waiting", json!({"actor": "rita"})).await;
-    assert_eq!(rita["count"], 1, "{rita}");
-    assert_eq!(rita["waiting"][0]["run_id"], run.as_str());
-    assert_eq!(rita["waiting"][0]["phase"], "review");
-    let reviewer = f.call("charter.waiting", json!({"role": "reviewer"})).await;
+    let reviewer = waiting_as(&f, "actor-2", json!({"actor": "actor-2"})).await;
     assert_eq!(reviewer["count"], 1, "{reviewer}");
-    let alice = f.call("charter.waiting", json!({"actor": "alice"})).await;
-    assert_eq!(alice["count"], 1, "the author owes review.request: {alice}");
+    assert_eq!(reviewer["waiting"][0]["run_id"], run.as_str());
+    assert_eq!(reviewer["waiting"][0]["phase"], "review");
+    let role_holder = waiting_as(&f, "actor-2", json!({"role": "reviewer"})).await;
+    assert_eq!(role_holder["count"], 1, "{role_holder}");
+    let author = waiting_as(&f, "actor-1", json!({"actor": "actor-1"})).await;
     assert_eq!(
-        f.call("charter.waiting", json!({"role": "approver"})).await["count"],
+        author["count"], 1,
+        "the author owes review.request: {author}"
+    );
+    assert_eq!(
+        waiting_as(&f, "actor-2", json!({"role": "approver"})).await["count"],
         0
     );
 
     f.observe("review.request", Some("done"), json!({})).await;
     assert_eq!(
-        f.call("charter.waiting", json!({"actor": "alice"})).await["count"],
+        waiting_as(&f, "actor-1", json!({"actor": "actor-1"})).await["count"],
         0,
         "once the author's action is recorded the author owes nothing"
     );
     assert_eq!(
-        f.call("charter.waiting", json!({"actor": "rita"})).await["count"],
+        waiting_as(&f, "actor-2", json!({"actor": "actor-2"})).await["count"],
         1
     );
 }
@@ -1680,9 +1699,9 @@ async fn child_start_refuses_a_cycle_in_persisted_definitions() {
 #[tokio::test]
 async fn observations_use_the_registry_pinned_by_the_target_run() {
     let f = Fixture::new();
-    let first_vocabulary = "vocabulary acme v1\nphrase acme.result \"the result was recorded\":\n    outcomes pass fail\n    passes pass\n    ceiling hard\n";
-    let second_vocabulary = "vocabulary acme v2\nphrase acme.result \"the result was recorded\":\n    outcomes green red\n    passes green\n    ceiling hard\n";
-    let charter = "charter pinned_result v1\nsubject pull_request\nworkflow:\n    phase gate:\n        require acme.result hard\n        complete\n";
+    let first_vocabulary = "vocabulary acme v1\nphrase acme.result \"the result was recorded\":\n    producer instrument\n    outcomes pass fail\n    passes pass\n";
+    let second_vocabulary = "vocabulary acme v2\nphrase acme.result \"the result was recorded\":\n    producer instrument\n    outcomes green red\n    passes green\n";
+    let charter = "charter pinned_result v1\nsubject pull_request\nworkflow:\n    phase gate:\n        require acme.result advisory\n        require review.decision hard\n        complete\n";
     f.call("charter.vocabulary", json!({"source": first_vocabulary}))
         .await;
     f.call("charter.publish", json!({"source": charter})).await;
@@ -1701,7 +1720,26 @@ async fn observations_use_the_registry_pinned_by_the_target_run() {
         json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": "acme.result", "outcome": "pass"}),
     )
     .await;
-    assert_eq!(f.run(run).await["state"], "completed");
+    let newer = f
+        .refused(
+            "charter.observe",
+            json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": "acme.result", "outcome": "green"}),
+        )
+        .await;
+    assert!(newer.contains("unknown_outcome"), "{newer}");
+
+    let mut reader = f._runtime.sql().reader().await.unwrap();
+    let count = reader
+        .count(khive_storage::SqlStatement::new(
+            "SELECT COUNT(*) FROM charter_evidence WHERE run_id = ?1 AND kind = 'acme.result'",
+            vec![khive_storage::SqlValue::Text(run.to_owned())],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "the observation is checked against the run's own vocabulary"
+    );
 }
 
 #[tokio::test]
@@ -1734,4 +1772,479 @@ async fn observation_arguments_require_declared_fields_and_types() {
         .await
         .unwrap();
     assert_eq!(count, 0, "invalid arguments must leave no evidence");
+}
+
+#[tokio::test]
+async fn charter_publish_rejects_unknown_top_level_parameters_before_write() {
+    let f = Fixture::new();
+    let error = f
+        .refused(
+            "charter.publish",
+            json!({"source": PR_FIX, "request_id": "unknown-field", "unexpected": true}),
+        )
+        .await;
+
+    assert!(error.contains("unexpected"), "{error}");
+    assert_eq!(
+        f.call("charter.list", json!({})).await["charters"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn charter_get_does_not_return_a_run_from_another_policy_domain() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+
+    let error = f
+        .refused(
+            "charter.get",
+            json!({"run_id": run_id, "domain": "another-domain"}),
+        )
+        .await;
+    assert!(
+        error.contains("run") || error.contains("permission"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn charter_get_does_not_return_a_run_outside_visible_namespaces() {
+    let f = Fixture::new();
+    f.call(
+        "charter.publish",
+        json!({"source": PR_FIX, "namespace": "team_a"}),
+    )
+    .await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "namespace": "team_a",
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+
+    let error = f.refused("charter.get", json!({"run_id": run_id})).await;
+    assert!(
+        error.contains("run") || error.contains("permission"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn charter_waiting_only_returns_phases_owed_to_the_caller() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    f.start_review().await;
+    let identity = khive_runtime::RequestIdentity {
+        namespace: "local".to_owned(),
+        actor_id: Some("actor-5".to_owned()),
+        visible_namespaces: vec![],
+        process_ref: None,
+        request_id: None,
+    };
+
+    let unfiltered = f
+        .registry
+        .dispatch_with_identity("charter.waiting", json!({}), Some(identity.clone()))
+        .await
+        .unwrap();
+    let requested_actor = f
+        .registry
+        .dispatch_with_identity(
+            "charter.waiting",
+            json!({"actor": "actor-1"}),
+            Some(identity.clone()),
+        )
+        .await
+        .unwrap();
+    let requested_role = f
+        .registry
+        .dispatch_with_identity("charter.waiting", json!({"role": "author"}), Some(identity))
+        .await
+        .unwrap();
+
+    assert_eq!(unfiltered["count"], 0, "{unfiltered}");
+    assert_eq!(requested_actor["count"], 0, "{requested_actor}");
+    assert_eq!(requested_role["count"], 0, "{requested_role}");
+}
+
+#[tokio::test]
+async fn charter_cancel_cannot_mutate_a_run_outside_visible_namespaces() {
+    let f = Fixture::new();
+    f.call(
+        "charter.publish",
+        json!({"source": PR_FIX, "namespace": "team_a"}),
+    )
+    .await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "namespace": "team_a",
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+
+    let error = f.refused("charter.cancel", json!({"run_id": run_id})).await;
+    assert!(
+        error.contains("run") || error.contains("permission"),
+        "{error}"
+    );
+    let owner = f
+        .call(
+            "charter.get",
+            json!({"run_id": run_id, "namespace": "team_a"}),
+        )
+        .await;
+    assert_eq!(owner["state"], "open");
+}
+
+#[tokio::test]
+async fn charter_start_rejects_a_subject_owned_by_an_unseen_namespace() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    f.call(
+        "charter.start",
+        json!({
+            "charter": "pr_fix",
+            "subject_kind": "pull_request",
+            "subject_ref": PR,
+        }),
+    )
+    .await;
+    f.call(
+        "charter.publish",
+        json!({"source": PR_SPLIT, "namespace": "team_a"}),
+    )
+    .await;
+    let identity = khive_runtime::RequestIdentity {
+        namespace: "team_a".to_owned(),
+        actor_id: Some("actor-1".to_owned()),
+        visible_namespaces: vec![],
+        process_ref: None,
+        request_id: None,
+    };
+
+    let result = f
+        .registry
+        .dispatch_with_identity(
+            "charter.start",
+            json!({
+                "charter": "pr_split",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "namespace": "team_a",
+            }),
+            Some(identity),
+        )
+        .await;
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[tokio::test]
+async fn charter_observe_rejects_a_subject_outside_visible_namespaces() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap().to_owned();
+    let identity = khive_runtime::RequestIdentity {
+        namespace: "team_a".to_owned(),
+        actor_id: Some("actor-1".to_owned()),
+        visible_namespaces: vec![],
+        process_ref: None,
+        request_id: None,
+    };
+
+    let result = f
+        .registry
+        .dispatch_with_identity(
+            "charter.observe",
+            json!({
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "kind": "fix.pushed",
+                "namespace": "team_a",
+            }),
+            Some(identity),
+        )
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    let run = f.call("charter.get", json!({"run_id": run_id})).await;
+    assert_eq!(run["evidence"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_run_view_reports_recording_only_assurance() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "bindings": {"author": "actor-1"},
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+    let fetched = f.call("charter.get", json!({"run_id": run_id})).await;
+    let listed = f.call("charter.runs", json!({})).await;
+    let waiting = waiting_as(&f, "actor-1", json!({})).await;
+
+    assert_eq!(started["run"]["assurance"], "recording_only", "{started}");
+    assert_eq!(fetched["assurance"], "recording_only", "{fetched}");
+    assert_eq!(listed["runs"][0]["assurance"], "recording_only", "{listed}");
+    assert_eq!(
+        waiting["waiting"][0]["assurance"], "recording_only",
+        "{waiting}"
+    );
+}
+
+#[tokio::test]
+async fn charter_request_id_reuse_in_another_namespace_is_a_conflict() {
+    let f = Fixture::new();
+    let identity = |namespace: &str| khive_runtime::RequestIdentity {
+        namespace: namespace.to_owned(),
+        actor_id: Some("actor-1".to_owned()),
+        visible_namespaces: vec![],
+        process_ref: None,
+        request_id: None,
+    };
+    let first = f
+        .registry
+        .dispatch_with_identity(
+            "charter.publish",
+            json!({"source": PR_FIX, "namespace": "local", "request_id": "namespace-replay"}),
+            Some(identity("local")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["published"], true, "{first}");
+
+    let error = f
+        .registry
+        .dispatch_with_identity(
+            "charter.publish",
+            json!({"source": PR_FIX, "namespace": "team_a", "request_id": "namespace-replay"}),
+            Some(identity("team_a")),
+        )
+        .await
+        .expect_err("the same caller key cannot replay across namespaces");
+    assert!(error_text(&error).contains("request_id_reused"), "{error}");
+}
+
+async fn waiting_as(f: &Fixture, actor: &str, params: Value) -> Value {
+    f.registry
+        .dispatch_with_identity(
+            "charter.waiting",
+            params,
+            Some(khive_runtime::RequestIdentity {
+                namespace: "local".to_owned(),
+                actor_id: Some(actor.to_owned()),
+                visible_namespaces: vec![],
+                process_ref: None,
+                request_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn charter_publish_replay_precedes_changed_vocabulary_validation() {
+    let f = Fixture::new();
+    let vocabulary = "vocabulary acme v1\nphrase acme.gate \"a gate\":\n    producer instrument\n";
+    f.call("charter.vocabulary", json!({"source": vocabulary}))
+        .await;
+    let charter = "charter acme_flow v1\nsubject pull_request\nworkflow:\n    phase a:\n        require acme.gate advisory\n        complete\n";
+    let request = json!({"source": charter, "request_id": "publish-before-vocabulary-change"});
+    let first = f.call("charter.publish", request.clone()).await;
+    assert_eq!(first["published"], true, "{first}");
+
+    let restrictive = vocabulary
+        .replace("vocabulary acme v1", "vocabulary acme v2")
+        .replace(
+            "producer instrument\n",
+            "producer instrument\n    param name word\n",
+        );
+    f.call("charter.vocabulary", json!({"source": restrictive}))
+        .await;
+    let fresh = f.call("charter.compile", json!({"source": charter})).await;
+    assert_eq!(fresh["valid"], false, "{fresh}");
+
+    let replay = f.call("charter.publish", request).await;
+    assert_eq!(replay["replayed"], true, "{replay}");
+    assert_eq!(replay["charter"], first["charter"]);
+}
+
+#[tokio::test]
+async fn charter_vocabulary_reused_request_id_is_checked_before_source_validation() {
+    let f = Fixture::new();
+    let valid = json!({
+        "source": "vocabulary acme v1\nphrase acme.gate \"a gate\":\n    producer instrument\n",
+        "request_id": "vocabulary-invalid-replay",
+    });
+    f.call("charter.vocabulary", valid).await;
+
+    let error = f
+        .refused(
+            "charter.vocabulary",
+            json!({"source": "not a vocabulary", "request_id": "vocabulary-invalid-replay"}),
+        )
+        .await;
+    assert!(error.contains("request_id_reused"), "{error}");
+}
+
+#[tokio::test]
+async fn charter_start_replay_returns_the_original_run_snapshot() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    let request = json!({
+        "charter": "pr_fix",
+        "subject_kind": "pull_request",
+        "subject_ref": PR,
+        "bindings": {"author": "actor-1"},
+        "request_id": "start-snapshot-replay",
+    });
+    let first = f.call("charter.start", request.clone()).await;
+    let run_id = first["run_id"].as_str().unwrap();
+    f.call("charter.cancel", json!({"run_id": run_id})).await;
+
+    let replay = f.call("charter.start", request).await;
+    assert_eq!(replay["replayed"], true, "{replay}");
+    let mut without_replay_marker = replay.clone();
+    without_replay_marker
+        .as_object_mut()
+        .unwrap()
+        .remove("replayed");
+    assert_eq!(without_replay_marker, first);
+    assert_eq!(replay["run"]["state"], "open", "{replay}");
+}
+
+#[tokio::test]
+async fn charter_waiting_cursor_tracks_run_changes_and_validates_inputs() {
+    let f = Fixture::new();
+    f.call("charter.publish", json!({"source": PR_FIX})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "pr_fix",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "bindings": {"author": "actor-1"},
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+    let first = waiting_as(&f, "actor-1", json!({})).await;
+    let cursor = first["cursor"].as_str().expect("server cursor").to_owned();
+    let original = &first["waiting"][0];
+    let revision = original["revision"].as_i64().expect("run revision");
+    assert!(original["evaluation"].is_object(), "{original}");
+
+    let unchanged = waiting_as(&f, "actor-1", json!({"changed_since": cursor})).await;
+    assert_eq!(unchanged["waiting"], json!([]), "{unchanged}");
+
+    f.call("charter.cancel", json!({"run_id": run_id})).await;
+    let changed = waiting_as(&f, "actor-1", json!({"changed_since": cursor})).await;
+    assert_eq!(changed["waiting"].as_array().unwrap().len(), 1, "{changed}");
+    assert_eq!(changed["waiting"][0]["state"], "cancelled", "{changed}");
+    assert!(changed["waiting"][0]["revision"].as_i64().unwrap() > revision);
+    assert_eq!(changed["waiting"][0]["evaluation"]["status"], "cancelled");
+    assert!(changed["waiting"][0]["evaluation"]["failing_gate_ids"].is_array());
+
+    let future = format!("cc1:{:x}", i64::MAX);
+    let error = f
+        .refused("charter.waiting", json!({"changed_since": future}))
+        .await;
+    assert!(error.contains("changed_since"), "{error}");
+}
+
+#[tokio::test]
+async fn charter_waiting_cursor_returns_a_run_that_moves_back_to_its_prior_view() {
+    let f = Fixture::new();
+    let source = "charter cursor_loop v1\nsubject pull_request\nroles:\n    author\nworkflow:\n    phase work by author:\n        require gate.result(name=box) hard\n        when gate.result(name=box) is pass: goto fix\n        max_rounds 3 then give_up\n        goto done\n    phase fix by author:\n        action fix.push by author\n        goto work\n    phase done by author:\n        complete\n    phase give_up by author:\n        terminate \"iteration limit reached\"\n";
+    f.call("charter.publish", json!({"source": source})).await;
+    f.call(
+        "charter.observe",
+        json!({"subject_kind": "pull_request", "subject_ref": PR,
+              "kind": "pull_request.opened", "generation": "h1", "event_id": "opened-h1"}),
+    )
+    .await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({
+                "charter": "cursor_loop",
+                "subject_kind": "pull_request",
+                "subject_ref": PR,
+                "generation": "h1",
+                "bindings": {"author": "actor-1"},
+            }),
+        )
+        .await;
+    let run_id = started["run_id"].as_str().unwrap();
+    let cursor = waiting_as(&f, "actor-1", json!({})).await["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let observe = |kind: &str, outcome: &str, args: Value| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
+               "outcome": outcome, "args": args, "generation": "h1"})
+    };
+    f.call(
+        "charter.observe",
+        observe("gate.result", "pass", json!({"name": "box"})),
+    )
+    .await;
+    f.call("charter.observe", observe("fix.push", "done", json!({})))
+        .await;
+
+    let current = f.run(run_id).await;
+    assert_eq!(current["state"], "open", "{current}");
+    assert_eq!(current["current_phase"], "work", "{current}");
+    assert_eq!(
+        current["candidate"]["bindings"]["author"], "actor-1",
+        "{current}"
+    );
+    let live = waiting_as(&f, "actor-1", json!({})).await;
+    assert_eq!(live["waiting"][0]["round"], 2, "{live}");
+    let changed = waiting_as(&f, "actor-1", json!({"changed_since": cursor})).await;
+    assert_eq!(changed["waiting"].as_array().unwrap().len(), 1, "{changed}");
+    assert_eq!(changed["waiting"][0]["run_id"], run_id);
+    assert_eq!(changed["waiting"][0]["phase"], "work");
+    assert_eq!(changed["waiting"][0]["round"], 2);
 }

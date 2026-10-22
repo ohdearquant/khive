@@ -197,7 +197,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "charter.waiting",
-        description: "Every open run's current phase and what it waits on: the pending observations, the holding requirements and the role or actor who owes them.",
+        description: "Phases owed to the caller, with a commit-order cursor and the last evaluation summary.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -205,6 +205,7 @@ pub(crate) static CHARTER_HANDLERS: [HandlerDef; 10] = [
             param("actor", "string", false, "Only phases owed by this actor, directly or through a role binding."),
             param("charter", "string", false, "Only runs of this charter."),
             param("subject_kind", "string", false, "Only runs on this subject kind."),
+            param("changed_since", "string", false, "Opaque cursor returned by a prior waiting read."),
             DOMAIN,
         ],
     },
@@ -263,6 +264,96 @@ impl CharterPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
+
+    async fn check_subject_scope(
+        &self,
+        params: &Params,
+        token: &NamespaceToken,
+    ) -> Result<(), RuntimeError> {
+        let subject_kind = params.str("subject_kind")?;
+        let subject_ref = params.str("subject_ref")?;
+        let scope = params.scope(token)?;
+        let Some(subject) = self
+            .runtime
+            .sql()
+            .reader()
+            .await?
+            .query_row(stmt(
+                include_str!("../sql/engine/subject-get.sql"),
+                vec![text(&subject_kind), text(&subject_ref)],
+            ))
+            .await?
+        else {
+            return Ok(());
+        };
+        let visible = token.visible_namespace_strs();
+        let namespace = col_text(&subject, "namespace")?;
+        if col_text(&subject, "policy_domain")? != scope.domain
+            || !visible.contains(&namespace.as_str())
+        {
+            return Err(RuntimeError::NotFound(format!(
+                "charter subject {subject_kind}:{subject_ref}"
+            )));
+        }
+        let run_scopes = col_opt_text(&subject, "run_scopes")?.unwrap_or_else(|| "[]".to_owned());
+        let run_scopes: Vec<Value> = serde_json::from_str(&run_scopes)
+            .map_err(|e| RuntimeError::Internal(format!("charter subject run scopes: {e}")))?;
+        if run_scopes.iter().any(|run| {
+            run["policy_domain"].as_str() != Some(scope.domain.as_str())
+                || run["namespace"]
+                    .as_str()
+                    .is_none_or(|namespace| !visible.contains(&namespace))
+        }) {
+            return Err(RuntimeError::NotFound(format!(
+                "charter subject {subject_kind}:{subject_ref}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn check_definition_scope(
+        &self,
+        params: &Params,
+        token: &NamespaceToken,
+    ) -> Result<(), RuntimeError> {
+        let scope = params.scope(token)?;
+        let charter = params.str("charter")?;
+        let row = match params.opt_i64("version")? {
+            Some(version) => {
+                self.runtime
+                    .sql()
+                    .reader()
+                    .await?
+                    .query_row(stmt(
+                        include_str!("../sql/engine/definition-get.sql"),
+                        vec![
+                            text(&scope.domain),
+                            text(&charter),
+                            SqlValue::Integer(version),
+                        ],
+                    ))
+                    .await?
+            }
+            None => {
+                self.runtime
+                    .sql()
+                    .reader()
+                    .await?
+                    .query_row(stmt(
+                        include_str!("../sql/engine/definition-latest.sql"),
+                        vec![text(&scope.domain), text(&charter)],
+                    ))
+                    .await?
+            }
+        };
+        if let Some(row) = row {
+            let namespace = col_text(&row, "namespace")?;
+            if !token.visible_namespace_strs().contains(&namespace.as_str()) {
+                return Err(RuntimeError::NotFound(format!("charter {charter}")));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct CharterPackFactory;
@@ -289,17 +380,23 @@ impl PackRuntime for CharterPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         let params = Params::new(verb, params)?;
+        if matches!(verb, "charter.start" | "charter.observe") {
+            self.check_subject_scope(&params, token).await?;
+        }
+        if verb == "charter.start" {
+            self.check_definition_scope(&params, token).await?;
+        }
         match verb {
-            "charter.compile" => self.compile(params).await,
+            "charter.compile" => self.compile(params, token).await,
             "charter.publish" => self.publish(params, token).await,
             "charter.vocabulary" => self.vocabulary(params, token).await,
             "charter.start" => self.start(params, token).await,
             "charter.observe" => self.observe(params, token).await,
             "charter.cancel" => self.cancel(params, token).await,
-            "charter.waiting" => self.waiting(params).await,
-            "charter.get" => self.get(params).await,
-            "charter.runs" => self.runs(params).await,
-            "charter.list" => self.list(params).await,
+            "charter.waiting" => self.waiting(params, token).await,
+            "charter.get" => self.get(params, token).await,
+            "charter.runs" => self.runs(params, token).await,
+            "charter.list" => self.list(params, token).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "charter pack does not handle verb {verb:?}"
             ))),
@@ -323,6 +420,18 @@ impl Params {
                 )))
             }
         };
+        if let Some(handler) = CHARTER_HANDLERS.iter().find(|handler| handler.name == verb) {
+            if let Some(name) = map.keys().find(|name| {
+                !handler
+                    .params
+                    .iter()
+                    .any(|param| param.name == name.as_str())
+            }) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{verb}: unknown parameter {name:?}"
+                )));
+            }
+        }
         Ok(Self {
             verb: verb.to_owned(),
             map,
@@ -389,6 +498,7 @@ impl Params {
         };
         let mut asked = self.map.clone();
         asked.insert("domain".to_owned(), json!(scope.domain));
+        asked.insert("namespace".to_owned(), json!(scope.namespace));
         Ok(Some(Command {
             scope: scope.clone(),
             request_id,
@@ -425,6 +535,16 @@ fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.to_owned())
 }
 
+fn visible_namespaces_json(token: &NamespaceToken) -> String {
+    json!(token.visible_namespace_strs()).to_string()
+}
+
+fn parse_waiting_cursor(cursor: &str) -> Option<i64> {
+    let hex = cursor.strip_prefix("cc1:")?;
+    let sequence = i64::from_str_radix(hex, 16).ok()?;
+    (sequence >= 0 && cursor == format!("cc1:{sequence:x}")).then_some(sequence)
+}
+
 fn opt_text(value: &Option<String>) -> SqlValue {
     SqlValue::from_opt_text(value.as_deref())
 }
@@ -441,8 +561,9 @@ fn refuse(verb: &str, refusal: Refusal) -> StorageError {
 async fn registry_from<R: SqlReader + ?Sized>(
     reader: &mut R,
     domain: &str,
+    namespaces: &str,
 ) -> StorageResult<Registry> {
-    let sources = registry_sources(reader, domain).await?;
+    let sources = registry_sources(reader, domain, namespaces).await?;
     let mut registry = Registry::core();
     for source in sources {
         let parsed = parse_vocabulary_source(&source).map_err(|d| {
@@ -464,11 +585,12 @@ async fn registry_from<R: SqlReader + ?Sized>(
 async fn registry_sources<R: SqlReader + ?Sized>(
     reader: &mut R,
     domain: &str,
+    namespaces: &str,
 ) -> StorageResult<Vec<String>> {
     let rows = reader
         .query_all(stmt(
             include_str!("../sql/engine/vocabularies-list.sql"),
-            vec![text(domain)],
+            vec![text(domain), text(namespaces)],
         ))
         .await?;
     let mut sources = Vec::with_capacity(rows.len());
@@ -648,7 +770,13 @@ fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
             let held = writer
                 .query_row(stmt(
                     include_str!("../sql/engine/command-get.sql"),
-                    vec![text(&command.scope.actor), text(&command.request_id)],
+                    vec![
+                        text(&command.scope.actor),
+                        text(&command.request_id),
+                        SqlValue::Integer(0),
+                        SqlValue::Null,
+                        SqlValue::Null,
+                    ],
                 ))
                 .await?;
             if let Some(row) = held {
@@ -669,9 +797,20 @@ fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
                 return Ok(boxed(stored));
             }
             let out = op(&mut *writer).await?;
-            let result = out.downcast_ref::<Value>().ok_or_else(|| {
+            let mut result = out.downcast_ref::<Value>().cloned().ok_or_else(|| {
                 refuse(&command.verb, Refusal::new("invalid_outcome", "not JSON"))
             })?;
+            if command.verb == "charter.start" {
+                if let Some(run_id) = result["run_id"].as_str() {
+                    result["run"] = run_snapshot(
+                        &mut *writer,
+                        &command.scope.domain,
+                        &command.scope.namespace,
+                        run_id,
+                    )
+                    .await?;
+                }
+            }
             let run_id = result["run_id"]
                 .as_str()
                 .or_else(|| result["cancelled"].as_str());
@@ -685,15 +824,72 @@ fn with_receipt(command: Option<Command>, op: AtomicUnitOp) -> AtomicUnitOp {
                         text(&command.scope.namespace),
                         text(&command.verb),
                         text(&command.request_digest),
-                        SqlValue::Blob(canonical_json(result)),
+                        SqlValue::Blob(canonical_json(&result)),
                         SqlValue::from_opt_text(run_id),
                         SqlValue::Integer(command.scope.now_us),
                     ],
                 ))
                 .await?;
-            Ok(out)
+            Ok(boxed(result))
         })
     })
+}
+
+async fn run_snapshot<R: SqlReader + ?Sized>(
+    reader: &mut R,
+    domain: &str,
+    namespace: &str,
+    run_id: &str,
+) -> StorageResult<Value> {
+    let run = reader
+        .query_row(stmt(
+            include_str!("../sql/engine/run-get.sql"),
+            vec![text(run_id)],
+        ))
+        .await?
+        .ok_or_else(|| StorageError::Internal(format!("charter run {run_id} disappeared")))?;
+    if col_text(&run, "policy_domain")? != domain || col_text(&run, "namespace")? != namespace {
+        return Err(StorageError::Internal(format!(
+            "charter run {run_id} is outside its start scope"
+        )));
+    }
+    let phases = reader
+        .query_all(stmt(
+            include_str!("../sql/engine/phases-for-run.sql"),
+            vec![text(domain), text(run_id)],
+        ))
+        .await?;
+    let mut phase_views = Vec::new();
+    for phase in &phases {
+        let waiting_on: Value = match col_opt_text(phase, "waiting_on")? {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|error| StorageError::Internal(format!("charter: waiting_on: {error}")))?,
+            None => Value::Null,
+        };
+        phase_views.push(json!({
+            "phase": col_text(phase, "phase_id")?,
+            "state": col_text(phase, "state")?,
+            "round": col_i64(phase, "round")?,
+            "assignee": {"kind": col_text(phase, "assignee_kind")?, "id": col_text(phase, "assignee")?},
+            "entered_sequence": col_opt_i64(phase, "entered_sequence")?,
+            "waiting_on": waiting_on,
+        }));
+    }
+    Ok(json!({
+        "run_id": col_text(&run, "run_id")?,
+        "charter": col_text(&run, "charter_id")?,
+        "version": col_i64(&run, "definition_version")?,
+        "assurance": col_text(&run, "assurance")?,
+        "state": col_text(&run, "state")?,
+        "current_phase": col_opt_text(&run, "current_phase_id")?,
+        "parent_run_id": col_opt_text(&run, "parent_run_id")?,
+        "subject": {"kind": col_text(&run, "subject_kind")?, "ref": col_text(&run, "subject_ref")?},
+        "subject_epoch": col_i64(&run, "subject_epoch")?,
+        "candidate": col_json(&run, "candidate_bytes")?,
+        "phases": phase_views,
+        "created_at_us": col_i64(&run, "created_at_us")?,
+        "updated_at_us": col_i64(&run, "updated_at_us")?,
+    }))
 }
 
 fn unit_value(result: Box<dyn Any + Send>, verb: &str) -> Result<Value, RuntimeError> {
@@ -708,14 +904,19 @@ fn boxed(value: Value) -> Box<dyn Any + Send> {
 }
 
 impl CharterPack {
-    async fn registry(&self, domain: &str) -> Result<Registry, RuntimeError> {
+    async fn registry(
+        &self,
+        domain: &str,
+        token: &NamespaceToken,
+    ) -> Result<Registry, RuntimeError> {
         let mut reader = self.runtime.sql().reader().await?;
-        Ok(registry_from(reader.as_mut(), domain).await?)
+        let namespaces = visible_namespaces_json(token);
+        Ok(registry_from(reader.as_mut(), domain, &namespaces).await?)
     }
 
-    async fn compile(&self, params: Params) -> Result<Value, RuntimeError> {
+    async fn compile(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let source = params.str("source")?;
-        let registry = self.registry(&params.domain()?).await?;
+        let registry = self.registry(&params.domain()?, token).await?;
         Ok(match compile(&source, &registry) {
             Ok(compiled) => json!({
                 "valid": true,
@@ -730,15 +931,24 @@ impl CharterPack {
         let source = params.str("source")?;
         let scope = params.scope(token)?;
         let command = params.command(&scope)?;
-        let registry = self.registry(&scope.domain).await?;
-        let compiled = compile(&source, &registry)
-            .map_err(|d| params.invalid(format!("charter source refused: {}", refusal_text(&d))))?;
+        let namespaces = visible_namespaces_json(token);
         let verb = params.verb.clone();
         let result = self
             .runtime
             .sql()
             .atomic_unit(with_receipt(command, Box::new(move |writer| {
                 Box::pin(async move {
+                    let registry = registry_from(&mut *writer, &scope.domain, &namespaces).await?;
+                    let compiled = compile(&source, &registry).map_err(|d| {
+                        StorageError::InvalidInput {
+                            capability: StorageCapability::Sql,
+                            operation: Cow::Owned(verb.clone()),
+                            message: format!(
+                                "{verb}: charter source refused: {}",
+                                refusal_text(&d)
+                            ),
+                        }
+                    })?;
                     let definition = &compiled.definition;
                     let mut engine = Engine::new(writer, scope.clone());
                     for child in definition.phases.iter().flat_map(|p| p.performs.iter()) {
@@ -769,6 +979,7 @@ impl CharterPack {
                                 text(&scope.domain),
                                 text(&definition.id),
                                 SqlValue::Integer(definition.version),
+                                text(&namespaces),
                             ],
                         ))
                         .await?;
@@ -793,7 +1004,7 @@ impl CharterPack {
                         })));
                     }
                     let vocabularies =
-                        registry_sources(&mut *engine.writer(), &scope.domain).await?;
+                        registry_sources(&mut *engine.writer(), &scope.domain, &namespaces).await?;
                     let source_snapshot = String::from_utf8(canonical_json(&json!({
                         "charter_source": source,
                         "vocabularies": vocabularies,
@@ -832,20 +1043,28 @@ impl CharterPack {
         let source = params.str("source")?;
         let scope = params.scope(token)?;
         let command = params.command(&scope)?;
-        let parsed = parse_vocabulary_source(&source).map_err(|d| {
-            params.invalid(format!("vocabulary source refused: {}", refusal_text(&d)))
-        })?;
         let source_digest = digest(source.as_bytes());
+        let namespaces = visible_namespaces_json(token);
         let verb = params.verb.clone();
         let result = self
             .runtime
             .sql()
             .atomic_unit(with_receipt(command, Box::new(move |writer| {
                 Box::pin(async move {
+                    let parsed = parse_vocabulary_source(&source).map_err(|d| {
+                        StorageError::InvalidInput {
+                            capability: StorageCapability::Sql,
+                            operation: Cow::Owned(verb.clone()),
+                            message: format!(
+                                "{verb}: vocabulary source refused: {}",
+                                refusal_text(&d)
+                            ),
+                        }
+                    })?;
                     let rows = writer
                         .query_all(stmt(
                             include_str!("../sql/engine/vocabularies-list.sql"),
-                            vec![text(&scope.domain)],
+                            vec![text(&scope.domain), text(&namespaces)],
                         ))
                         .await?;
                     for row in &rows {
@@ -873,7 +1092,7 @@ impl CharterPack {
                             })));
                         }
                     }
-                    let mut registry = registry_from(&mut *writer, &scope.domain).await?;
+                    let mut registry = registry_from(&mut *writer, &scope.domain, &namespaces).await?;
                     let added = registry.add(&parsed).map_err(|d| {
                         refuse(
                             &verb,
@@ -923,6 +1142,7 @@ impl CharterPack {
         let scope = params.scope(token)?;
         let command = params.command(&scope)?;
         let verb = params.verb.clone();
+        let view_scope = scope.clone();
         let result = self
             .runtime
             .sql()
@@ -1040,7 +1260,7 @@ impl CharterPack {
             .await?;
         let mut out = unit_value(result, &params.verb)?;
         if let Some(run_id) = out["run_id"].as_str().map(str::to_owned) {
-            out["run"] = self.run_view(&params.domain()?, &run_id, 0).await?;
+            out["run"] = self.run_view_for_start(&view_scope, &run_id, 0).await?;
         }
         Ok(out)
     }
@@ -1055,6 +1275,7 @@ impl CharterPack {
         let generation = params.opt_str("generation")?;
         let only_charter = params.opt_str("charter")?;
         let scope = params.scope(token)?;
+        let namespaces = visible_namespaces_json(token);
         let command = params.command(&scope)?;
         let verb = params.verb.clone();
         let producer = params
@@ -1086,7 +1307,8 @@ impl CharterPack {
                             .await?;
                         let Some(subject_row) = subject_row else {
                             let registry =
-                                registry_from(&mut *engine.writer(), &scope.domain).await?;
+                                registry_from(&mut *engine.writer(), &scope.domain, &namespaces)
+                                    .await?;
                             let entry = registry.get(&kind).map(|entry| entry.to_json());
                             validate_observation(
                                 &params,
@@ -1146,7 +1368,8 @@ impl CharterPack {
                         }
                         if targets.is_empty() {
                             let registry =
-                                registry_from(&mut *engine.writer(), &scope.domain).await?;
+                                registry_from(&mut *engine.writer(), &scope.domain, &namespaces)
+                                    .await?;
                             let entry = registry.get(&kind).map(|entry| entry.to_json());
                             resolved_outcome = Some(validate_observation(
                                 &params,
@@ -1231,6 +1454,11 @@ impl CharterPack {
         let reason = params.opt_str("reason")?;
         let scope = params.scope(token)?;
         let command = params.command(&scope)?;
+        let visible_namespaces = token
+            .visible_namespace_strs()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let verb = params.verb.clone();
         let result = self
             .runtime
@@ -1254,7 +1482,18 @@ impl CharterPack {
                             ));
                         };
                         let state = col_text(&row, "state")?;
-                        if state != "open" || col_text(&row, "policy_domain")? != scope.domain {
+                        let namespace = col_text(&row, "namespace")?;
+                        if col_text(&row, "policy_domain")? != scope.domain
+                            || !visible_namespaces
+                                .iter()
+                                .any(|visible| visible == &namespace)
+                        {
+                            return Err(refuse(
+                                &verb,
+                                Refusal::new("unknown_run", format!("no visible run {run_id}")),
+                            ));
+                        }
+                        if state != "open" {
                             return Err(refuse(
                                 &verb,
                                 Refusal::new(
@@ -1278,9 +1517,16 @@ impl CharterPack {
         unit_value(result, &params.verb)
     }
 
-    async fn waiting(&self, params: Params) -> Result<Value, RuntimeError> {
+    async fn waiting(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let role = params.opt_str("role")?;
         let actor = params.opt_str("actor")?;
+        let changed_since = params.opt_str("changed_since")?;
+        let sequence = match changed_since.as_deref() {
+            Some(cursor) => Some(parse_waiting_cursor(cursor).ok_or_else(|| {
+                params.invalid("changed_since must be a cursor returned by charter.waiting")
+            })?),
+            None => None,
+        };
         let rows = self
             .runtime
             .sql()
@@ -1290,34 +1536,41 @@ impl CharterPack {
                 include_str!("../sql/engine/waiting.sql"),
                 vec![
                     text(&params.domain()?),
+                    text(&visible_namespaces_json(token)),
                     opt_text(&params.opt_str("charter")?),
                     opt_text(&params.opt_str("subject_kind")?),
+                    SqlValue::from_opt_i64(sequence),
                 ],
             ))
             .await?;
         let mut items = Vec::new();
+        let mut cursor_order = 0;
         for row in rows {
-            let candidate = col_json(&row, "candidate_bytes")?;
+            cursor_order = col_i64(&row, "cursor_order")?;
+            if col_i64(&row, "cursor_only")? == 1 {
+                continue;
+            }
+            let view = col_json(&row, "view_bytes")?;
+            let candidate = view["candidate"].clone();
             let bindings = candidate["bindings"]
                 .as_object()
                 .cloned()
                 .unwrap_or_default();
-            let waiting_on: Value = match col_opt_text(&row, "waiting_on")? {
-                Some(raw) => serde_json::from_str(&raw).map_err(|e| {
-                    RuntimeError::Internal(format!("charter.waiting: waiting_on: {e}"))
-                })?,
-                None => Value::Null,
-            };
-            let assignee_kind = col_text(&row, "assignee_kind")?;
-            let assignee = col_text(&row, "assignee")?;
-            let owner = (assignee_kind == "role").then_some(assignee.as_str());
+            let waiting_on = view["waiting_on"].clone();
+            let assignee_kind = view["assignee_kind"].as_str().unwrap_or("");
+            let assignee = view["assignee"].as_str().unwrap_or("");
+            let owner = (assignee_kind == "role").then_some(assignee);
             let mut owed_by = waiting_actors(&waiting_on, owner, &bindings);
             if assignee_kind == "actor" {
                 owed_by.push(format!("actor:{assignee}"));
             }
-            if role
-                .as_ref()
-                .is_some_and(|r| !owed_by.contains(&format!("role:{r}")))
+            let Some(caller) = token.actor().binding_id() else {
+                continue;
+            };
+            if !owed_by.contains(&format!("actor:{caller}"))
+                || role
+                    .as_ref()
+                    .is_some_and(|r| !owed_by.contains(&format!("role:{r}")))
                 || actor
                     .as_ref()
                     .is_some_and(|a| !owed_by.contains(&format!("actor:{a}")))
@@ -1325,39 +1578,106 @@ impl CharterPack {
                 continue;
             }
             items.push(json!({
-                "run_id": col_text(&row, "run_id")?,
-                "charter": col_text(&row, "charter_id")?,
-                "version": col_i64(&row, "definition_version")?,
-                "parent_run_id": col_opt_text(&row, "parent_run_id")?,
-                "subject": {"kind": col_text(&row, "subject_kind")?, "ref": col_text(&row, "subject_ref")?},
-                "phase": col_text(&row, "phase_id")?,
-                "state": col_text(&row, "state")?,
-                "round": col_i64(&row, "round")?,
+                "run_id": view["run_id"],
+                "charter": view["charter"],
+                "version": view["version"],
+                "assurance": view["assurance"],
+                "parent_run_id": view["parent_run_id"],
+                "subject": view["subject"],
+                "phase": view["phase"],
+                "state": view["state"],
+                "round": view["round"],
                 "assignee": {"kind": assignee_kind, "id": assignee},
                 "owed_by": owed_by,
                 "waiting_on": waiting_on,
-                "since_us": col_i64(&row, "updated_at_us")?,
+                "since_us": view["since_us"],
+                "revision": view["revision"],
+                "evaluation": view["evaluation"],
             }));
         }
-        Ok(json!({"count": items.len(), "waiting": items}))
+        if sequence.is_some_and(|sequence| sequence > cursor_order) {
+            return Err(params.invalid("changed_since is not a cursor issued by this store"));
+        }
+        Ok(json!({
+            "count": items.len(),
+            "waiting": items,
+            "cursor": format!("cc1:{cursor_order:x}"),
+        }))
     }
 
-    async fn run_view(
+    async fn run_view_for_start(
         &self,
-        domain: &str,
+        scope: &Scope,
         run_id: &str,
         evidence_limit: i64,
     ) -> Result<Value, RuntimeError> {
         let mut reader = self.runtime.sql().reader().await?;
-        let Some(run) = reader
+        if let Some(receipt) = reader
+            .query_row(stmt(
+                include_str!("../sql/engine/command-get.sql"),
+                vec![
+                    text(&scope.actor),
+                    text(run_id),
+                    SqlValue::Integer(1),
+                    text(&scope.domain),
+                    text(&json!([scope.namespace]).to_string()),
+                ],
+            ))
+            .await?
+        {
+            if col_text(&receipt, "verb")? == "charter.start" {
+                let stored = col_json(&receipt, "result_bytes")?;
+                if let Some(snapshot) = stored.get("run") {
+                    return Ok(snapshot.clone());
+                }
+            }
+        }
+        let visible = vec![scope.namespace.clone()];
+        self.run_view_with_visible(&scope.domain, run_id, evidence_limit, Some(&visible))
+            .await
+    }
+
+    async fn run_view_scoped(
+        &self,
+        domain: &str,
+        run_id: &str,
+        evidence_limit: i64,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        let visible = token
+            .visible_namespace_strs()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.run_view_with_visible(domain, run_id, evidence_limit, Some(&visible))
+            .await
+    }
+
+    async fn run_view_with_visible(
+        &self,
+        domain: &str,
+        run_id: &str,
+        evidence_limit: i64,
+        visible_namespaces: Option<&[String]>,
+    ) -> Result<Value, RuntimeError> {
+        let mut reader = self.runtime.sql().reader().await?;
+        let run = reader
             .query_row(stmt(
                 include_str!("../sql/engine/run-get.sql"),
                 vec![text(run_id)],
             ))
-            .await?
-        else {
+            .await?;
+        let Some(run) = run else {
             return Err(RuntimeError::NotFound(format!("charter run {run_id}")));
         };
+        let row_domain = col_text(&run, "policy_domain")?;
+        let run_namespace = col_text(&run, "namespace")?;
+        if row_domain != domain
+            || visible_namespaces
+                .is_some_and(|visible| !visible.iter().any(|namespace| namespace == &run_namespace))
+        {
+            return Err(RuntimeError::NotFound(format!("charter run {run_id}")));
+        }
         let phases = reader
             .query_all(stmt(
                 include_str!("../sql/engine/phases-for-run.sql"),
@@ -1384,6 +1704,7 @@ impl CharterPack {
             "run_id": col_text(&run, "run_id")?,
             "charter": col_text(&run, "charter_id")?,
             "version": col_i64(&run, "definition_version")?,
+                "assurance": col_text(&run, "assurance")?,
             "state": col_text(&run, "state")?,
             "current_phase": col_opt_text(&run, "current_phase_id")?,
             "parent_run_id": col_opt_text(&run, "parent_run_id")?,
@@ -1421,13 +1742,14 @@ impl CharterPack {
         Ok(view)
     }
 
-    async fn get(&self, params: Params) -> Result<Value, RuntimeError> {
+    async fn get(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let run_id = params.str("run_id")?;
         let limit = params.limit("evidence_limit")?;
-        self.run_view(&params.domain()?, &run_id, limit).await
+        self.run_view_scoped(&params.domain()?, &run_id, limit, token)
+            .await
     }
 
-    async fn runs(&self, params: Params) -> Result<Value, RuntimeError> {
+    async fn runs(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let rows = self
             .runtime
             .sql()
@@ -1437,6 +1759,7 @@ impl CharterPack {
                 include_str!("../sql/engine/runs-list.sql"),
                 vec![
                     text(&params.domain()?),
+                    text(&visible_namespaces_json(token)),
                     opt_text(&params.opt_str("charter")?),
                     opt_text(&params.opt_str("subject_kind")?),
                     opt_text(&params.opt_str("subject_ref")?),
@@ -1451,6 +1774,7 @@ impl CharterPack {
                 "run_id": col_text(r, "run_id")?,
                 "charter": col_text(r, "charter_id")?,
                 "version": col_i64(r, "definition_version")?,
+                "assurance": col_text(r, "assurance")?,
                 "state": col_text(r, "state")?,
                 "current_phase": col_opt_text(r, "current_phase_id")?,
                 "parent_run_id": col_opt_text(r, "parent_run_id")?,
@@ -1461,19 +1785,20 @@ impl CharterPack {
         Ok(json!({"count": runs.len(), "runs": runs}))
     }
 
-    async fn list(&self, params: Params) -> Result<Value, RuntimeError> {
+    async fn list(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
         let domain = params.domain()?;
+        let namespaces = visible_namespaces_json(token);
         let mut reader = self.runtime.sql().reader().await?;
         let charters = reader
             .query_all(stmt(
                 include_str!("../sql/engine/definitions-list.sql"),
-                vec![text(&domain)],
+                vec![text(&domain), text(&namespaces)],
             ))
             .await?;
         let vocabularies = reader
             .query_all(stmt(
                 include_str!("../sql/engine/vocabularies-list.sql"),
-                vec![text(&domain)],
+                vec![text(&domain), text(&namespaces)],
             ))
             .await?;
         let mut charter_rows = Vec::new();
