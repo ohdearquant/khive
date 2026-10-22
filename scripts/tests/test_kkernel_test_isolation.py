@@ -46,8 +46,11 @@ def module_functions(filename):
     return functions((SOURCE / filename).read_text(), indent)
 
 
-def isolation(filename):
-    return ISOLATION.replace("\n    ", "\n") if filename in COLUMN_ZERO else ISOLATION
+def isolation(filename, name=None):
+    prologue = ISOLATION
+    if (filename, name) == ("exec_tests.rs", "atomic_update_null_and_type_semantics_match_canonical_behavior"):
+        prologue = prologue.replace("run_in_child()", "run_in_child_with_stack_size(4 * 1024 * 1024)")
+    return prologue.replace("\n    ", "\n") if filename in COLUMN_ZERO else prologue
 
 
 def function(filename, name):
@@ -71,7 +74,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
                 if not any(trigger in body for trigger in TRIGGERS):
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(isolation(filename)),
+                self.assertTrue(body.strip().startswith(isolation(filename, name)),
                                 f"{filename}:{name} must enter exact child before fixture setup")
         self.assertGreaterEqual(count, 89, "fixture census must not become vacuous")
 
@@ -84,7 +87,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
                 if "#[tokio::test" not in attributes or "execute_atomic_ops_file(" not in body:
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(isolation(filename)),
+                self.assertTrue(body.strip().startswith(isolation(filename, name)),
                                 f"{filename}:{name} atomic caller must enter exact child")
         self.assertEqual(count, 25, "all direct atomic execution witnesses must be counted")
 
