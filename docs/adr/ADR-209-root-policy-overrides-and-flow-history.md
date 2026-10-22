@@ -23,6 +23,23 @@
   [ADR-206](ADR-206-crate-performance-guarantees.md), and
   [ADR-207](ADR-207-runtime-actor-registry.md).
 
+## Requirement
+
+This record serves four product requirements. Each maps to the decision that delivers it, and each
+departure from the requirement as stated is named beside it.
+
+1. **The root human can break glass at any time.** D1: root may request a policy exception whenever an
+   identified policy hold exists, with no waiting period. Departure: the exception binds to an
+   enrolled root key, so break glass exists only once root enrollment exists (D2), and in M1 it
+   releases recorded workflow progress, not effects, except an enrolled merge (D4, D11).
+2. **Special resources are reached through just-in-time grants.** D3 and D4: an exact, single-use,
+   expiring and revocable grant per resource action, through one shared grant service. Departure:
+   the merge adapter comes first; other resource kinds are staged to S3 (D11).
+3. **Events are indexed by the flow or run they belong to.** D6: typed flow attribution, indexes,
+   and one bounded history query.
+4. **Recorded history is hash-chained.** D7: one integrity chain per physical store, including
+   authority commitments; D8 states which history independent checkpoints make tamper-evident.
+
 ## Context
 
 Charters record policy decisions and workflow progress. ADR-193 distinguishes hard, soft and
