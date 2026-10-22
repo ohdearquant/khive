@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rand::rngs::StdRng;
+use rand::rngs::ChaCha12Rng;
 use rand::SeedableRng;
 
 use crate::metrics::MetricsSink;
@@ -49,7 +49,7 @@ pub struct HnswIndex {
 
     /// Random number generator for level generation.
     /// If config.seed is Some, this is a seeded RNG for reproducibility.
-    pub(crate) rng: StdRng,
+    pub(crate) rng: ChaCha12Rng,
 
     /// Optional metrics sink for observability.
     pub(crate) metrics: Option<Arc<dyn MetricsSink>>,
@@ -76,7 +76,8 @@ impl Clone for HnswIndex {
             tombstones: self.tombstones.clone(),
             tombstone_count: self.tombstone_count,
             additions_since_rebuild: self.additions_since_rebuild,
-            rng: self.rng.clone(),
+            // Preserve the seed, stream and cursor, including a partially consumed block.
+            rng: ChaCha12Rng::deserialize_state(&self.rng.serialize_state()),
             metrics: self.metrics.clone(),
             quantized: self.quantized.clone(),
             use_quantized: self.use_quantized,
@@ -120,10 +121,9 @@ impl HnswIndex {
     fn build_from_config(config: HnswConfig) -> Self {
         // Initialize RNG - seeded if config.seed is Some, otherwise from entropy
         let rng = match config.seed {
-            Some(seed) => StdRng::seed_from_u64(seed),
-            None => {
-                StdRng::try_from_rng(&mut rand::rngs::SysRng).expect("OS randomness unavailable")
-            }
+            Some(seed) => ChaCha12Rng::seed_from_u64(seed),
+            None => ChaCha12Rng::try_from_rng(&mut rand::rngs::SysRng)
+                .expect("OS randomness unavailable"),
         };
 
         let dims = config.dimensions;
@@ -492,3 +492,7 @@ impl HnswIndex {
         level
     }
 }
+
+#[cfg(test)]
+#[path = "index_impl/rng_tests.rs"]
+mod rng_tests;
