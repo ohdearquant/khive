@@ -11,7 +11,6 @@ const PR_FIX: &str = include_str!("fixtures/pr_fix.charter");
 const PR_SPLIT: &str = include_str!("fixtures/pr_split.charter");
 const INBOX_TRIAGE: &str = include_str!("fixtures/inbox_triage.charter");
 const PR_MERGE: &str = include_str!("fixtures/pr_merge.charter");
-const PR_MERGE_VOCABULARY: &str = include_str!("fixtures/pr_merge.vocab");
 
 const PR: &str = "acme/widgets#7";
 
@@ -559,12 +558,22 @@ async fn a_second_start_returns_the_open_run() {
 }
 
 #[tokio::test]
-async fn a_published_vocabulary_extends_what_charters_and_observations_may_name() {
+async fn published_vocabularies_allow_advisory_phrases_but_reject_enforcement_ceilings() {
     let f = Fixture::new();
-    let vocab = "vocabulary acme v1\nphrase acme.deploy_gate \"the deployment gate passed\":\n    ceiling hard\n";
+    for (name, ceiling) in [("hard_gate", "hard"), ("soft_gate", "soft")] {
+        let source = format!(
+            "vocabulary {name} v1\nphrase {name}.gate \"a deployment gate\":\n    producer instrument\n    ceiling {ceiling}\n"
+        );
+        let err = f
+            .refused("charter.vocabulary", json!({"source": source}))
+            .await;
+        assert!(err.contains("published_ceiling"), "{err}");
+    }
+
+    let vocab = "vocabulary acme v1\nphrase acme.deploy_gate \"the deployment gate passed\":\n    producer instrument\n    ceiling advisory\n";
     let out = f.call("charter.vocabulary", json!({"source": vocab})).await;
     assert_eq!(out["published"], true, "{out}");
-    let charter = "charter ship v1\nsubject release\nroles:\n    operator\nworkflow:\n    phase gate by operator:\n        require acme.deploy_gate hard\n        complete\n";
+    let charter = "charter ship v1\nsubject release\nroles:\n    operator\nworkflow:\n    phase gate by operator:\n        require acme.deploy_gate advisory\n        complete\n";
     let compiled = f.call("charter.compile", json!({"source": charter})).await;
     assert_eq!(compiled["valid"], true, "{compiled}");
     f.call("charter.publish", json!({"source": charter})).await;
@@ -583,11 +592,31 @@ async fn a_published_vocabulary_extends_what_charters_and_observations_may_name(
     assert_eq!(f.at(&run).await.0, "completed");
     let again = f.call("charter.vocabulary", json!({"source": vocab})).await;
     assert_eq!(again["already_published"], true, "{again}");
-    let shadow = "vocabulary other v1\nphrase acme.deploy_gate \"shadow\":\n    ceiling hard\n";
+    let shadow =
+        "vocabulary other v1\nphrase acme.deploy_gate \"shadow\":\n    producer instrument\n";
     let err = f
         .refused("charter.vocabulary", json!({"source": shadow}))
         .await;
     assert!(err.contains("entry_conflict"), "{err}");
+}
+
+#[tokio::test]
+async fn published_vocabularies_cannot_claim_compiled_names_or_entries() {
+    let f = Fixture::new();
+    for name in ["core", "pr_merge"] {
+        let source = format!(
+            "vocabulary {name} v2\nphrase acme.shadow \"a shadow phrase\":\n    producer instrument\n"
+        );
+        let err = f
+            .refused("charter.vocabulary", json!({"source": source}))
+            .await;
+        assert!(err.contains("compiled_vocabulary"), "{err}");
+    }
+    let shadow = "vocabulary acme v1\nphrase review.decision \"a replacement decision\":\n    producer instrument\n";
+    let err = f
+        .refused("charter.vocabulary", json!({"source": shadow}))
+        .await;
+    assert!(err.contains("compiled_entry"), "{err}");
 }
 
 #[tokio::test]
@@ -1074,7 +1103,7 @@ async fn a_request_id_runs_a_command_once_and_refuses_a_different_request() {
         "a retried cancel returns its receipt instead of refusing a closed run: {replayed}"
     );
     let vocab = |name: &str| {
-        json!({"source": format!("vocabulary {name} v1\nphrase {name}.gate \"a gate\":\n    ceiling hard\n"),
+        json!({"source": format!("vocabulary {name} v1\nphrase {name}.gate \"a gate\":\n    producer instrument\n"),
                "request_id": "vocab-1"})
     };
     f.call("charter.vocabulary", vocab("acme")).await;
@@ -1103,8 +1132,6 @@ fn pr_merge_template() -> Value {
 #[tokio::test]
 async fn the_pr_merge_charter_carries_the_template_gates_floor_and_levels() {
     let f = Fixture::new();
-    f.call("charter.vocabulary", json!({"source": PR_MERGE_VOCABULARY}))
-        .await;
     let out = f.call("charter.compile", json!({"source": PR_MERGE})).await;
     assert_eq!(out["valid"], true, "{out}");
     let phases = out["definition"]["phases"].as_array().unwrap();

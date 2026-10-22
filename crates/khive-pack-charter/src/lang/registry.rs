@@ -4,7 +4,8 @@
 //! outcomes that satisfy a `require`, an enforcement ceiling and an argument schema. The core
 //! vocabulary is compiled into the pack; further vocabularies are published as data.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
@@ -12,6 +13,24 @@ use super::ast::{EntryKind, Level, VocabularySource};
 use super::Diagnostic;
 
 pub const CORE_VOCABULARY: &str = include_str!("../../vocab/core.vocab");
+pub const PR_MERGE_VOCABULARY: &str = include_str!("../../vocab/pr_merge.vocab");
+
+const COMPILED_VOCABULARY_NAMES: &[&str] = &["core", "pr_merge"];
+
+fn compiled_entry_names() -> &'static BTreeSet<String> {
+    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        [CORE_VOCABULARY, PR_MERGE_VOCABULARY]
+            .into_iter()
+            .flat_map(|source| {
+                super::parse_vocabulary_source(source)
+                    .expect("compiled vocabularies parse")
+                    .entries
+            })
+            .map(|entry| entry.name)
+            .collect()
+    })
+}
 
 /// Outcomes a `perform <charter>` step records in its parent run.
 pub const CHILD_RUN_OUTCOMES: &[&str] = &["completed", "terminated", "cancelled"];
@@ -60,6 +79,7 @@ pub struct EntryDef {
     pub kind: EntryKind,
     pub name: String,
     pub description: Option<String>,
+    pub producer_class: String,
     pub outcomes: Vec<String>,
     pub passes: Vec<String>,
     pub ceiling: Level,
@@ -76,6 +96,7 @@ impl EntryDef {
             "kind": self.kind.as_str(),
             "name": self.name,
             "description": self.description,
+            "producer_class": self.producer_class,
             "outcomes": self.outcomes,
             "passes": self.passes,
             "ceiling": self.ceiling.as_str(),
@@ -103,8 +124,13 @@ impl Registry {
         let source = super::parse_vocabulary_source(CORE_VOCABULARY)
             .expect("the compiled core vocabulary parses");
         registry
-            .add(&source)
+            .add_compiled(&source)
             .expect("the compiled core vocabulary is consistent");
+        let source = super::parse_vocabulary_source(PR_MERGE_VOCABULARY)
+            .expect("the compiled pull-request merge vocabulary parses");
+        registry
+            .add_compiled(&source)
+            .expect("the compiled pull-request merge vocabulary is consistent");
         registry
     }
 
@@ -127,6 +153,61 @@ impl Registry {
     /// Resolve a vocabulary into entries and add them. A name already held by a different
     /// vocabulary is refused; a newer version of the same vocabulary replaces its own entries.
     pub fn add(&mut self, source: &VocabularySource) -> Result<Vec<EntryDef>, Vec<Diagnostic>> {
+        self.add_inner(source, false)
+    }
+
+    fn add_compiled(
+        &mut self,
+        source: &VocabularySource,
+    ) -> Result<Vec<EntryDef>, Vec<Diagnostic>> {
+        self.add_inner(source, true)
+    }
+
+    fn add_inner(
+        &mut self,
+        source: &VocabularySource,
+        compiled: bool,
+    ) -> Result<Vec<EntryDef>, Vec<Diagnostic>> {
+        if !compiled {
+            let mut errors = Vec::new();
+            if COMPILED_VOCABULARY_NAMES.contains(&source.name.as_str()) {
+                errors.push(Diagnostic::new(
+                    1,
+                    "compiled_vocabulary",
+                    format!(
+                        "vocabulary {:?} is compiled into the registry and cannot be published as data",
+                        source.name
+                    ),
+                ));
+            }
+            let compiled_entries = compiled_entry_names();
+            for entry in &source.entries {
+                if compiled_entries.contains(&entry.name) {
+                    errors.push(Diagnostic::new(
+                        entry.line,
+                        "compiled_entry",
+                        format!(
+                            "entry {:?} is defined by a compiled vocabulary and cannot be published as data",
+                            entry.name
+                        ),
+                    ));
+                }
+                if entry
+                    .ceiling
+                    .is_some_and(|ceiling| ceiling != Level::Advisory)
+                {
+                    errors.push(Diagnostic::new(
+                        entry.line,
+                        "published_ceiling",
+                        "a published vocabulary may declare only the advisory ceiling",
+                    ));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+        }
+
         let mut errors = Vec::new();
         let mut resolved: BTreeMap<String, EntryDef> = BTreeMap::new();
         for entry in &source.entries {
@@ -162,6 +243,14 @@ impl Registry {
                     continue;
                 }
             }
+            let Some(producer_class) = entry.producer_class.clone() else {
+                errors.push(Diagnostic::new(
+                    entry.line,
+                    "missing_producer_class",
+                    "every vocabulary entry declares `producer <class>`",
+                ));
+                continue;
+            };
             let (default_outcomes, default_passes): (&[&str], &[&str]) = match entry.kind {
                 EntryKind::Subject => (&[], &[]),
                 EntryKind::Trigger => (&["observed"], &["observed"]),
@@ -265,6 +354,7 @@ impl Registry {
                     kind: entry.kind.clone(),
                     name: entry.name.clone(),
                     description: entry.description.clone(),
+                    producer_class,
                     outcomes,
                     passes,
                     ceiling: match entry.kind {
