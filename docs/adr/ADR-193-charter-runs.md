@@ -91,7 +91,8 @@ source identity, source event or attempt identity, observation interval, complet
 fields never set the producer, assurance, receipt time or an internal kind. Selection is by source
 generation and complete inventory, never "newest green". A later relevant failure invalidates an
 earlier pass. The same source identity with different bytes is an `EvidenceConflict`. A failed poll
-never refreshes the last good sample.
+never refreshes the last good sample. Amendment 5 specifies the producer registration, the producer
+classes and submission channels, and which recorded evidence remains eligible.
 
 ### D4. Evidence is a pack-owned ledger committed with the transition
 
@@ -168,7 +169,9 @@ never converted into a compliant completion.
   generation supersedes the old run; phases are never reset.
 - Every mutating verb takes a caller-scoped `request_id`. The same key with the same bytes returns the
   stored result; the same key with different bytes refuses. Reading back a consumed admission is
-  history, never a renewed right to send.
+  history, never a renewed right to send. Idempotency does not preserve a disabled producer
+  registration: after the disable, a retry of the same observation refuses, and the stored record
+  stays readable as history (Amendment 5 D5).
 
 ### D9. Authority comes from the accepted grant seams, not from tool grants
 
@@ -198,13 +201,16 @@ contract version and each evaluation's inputs and time. New definition versions 
 generations. Revoking a definition, a producer or a grant, or raising the minimum policy epoch,
 invalidates every unconsumed admission under it in the same serialisation order as claims. Migration
 means superseding the run, never mutating it. Historical replay reports `ReplayUnsupported` rather
-than silently using today's gate code.
+than silently using today's gate code. Revoking a producer is the disable of its Amendment 5
+registration; under M2 it is rechecked at claim and at start (Amendment 5 D6).
 
 ### D11. Two milestones, and only the second is enforcement
 
 - **M1, recording.** Definitions, runs, observations, pure evaluation with replay, the waiting view,
   and the transition matrix. Every run reports `assurance = recording_only` and `charter.claim` refuses.
-  M1 makes the procedure visible and measurable; it does not enforce `pr_merge`.
+  M1 makes the procedure visible and measurable; it does not enforce `pr_merge`. M1 still refuses
+  unregistered evidence; Amendment 5 D7 states its cooperative recording profile and implementation
+  order.
 - **M2, enforced `pr_merge`.** M1 plus: the minimum ADR-127/143 authenticated grant path for merge
   initiation and approval; the `git.pr_merge` admission binding and executor credential (ADR-182
   amendment); verified platform protection for enrolled repositories (required checks pinned to their
@@ -405,7 +411,8 @@ Paired positive and negative cases, each run against the real verbs:
    same-count different-file scope each block. The same one-controller fixture under a definition with
    `independence.controller` set to `not_required` admits, which proves the datum is read.
 5. An unregistered producer, a forged producer field and a disabled producer refuse; generic note and
-   stream writes cannot create charter evidence.
+   stream writes cannot create charter evidence. Amendment 5 states the registration contract and the
+   paired controls for this case.
 6. A tool-level allow does not bypass a failed gate; an expired or revoked grant refuses; two
    concurrent claims yield one admission.
 7. A failed evidence or claim insert commits nothing; a CAS loser commits no transition; a response lost
@@ -557,9 +564,15 @@ fifteen.
 
 ## Amendment 5 (2026-10-22): producer registration and evidence eligibility
 
-**Status**: Proposed (2026-10-22).
+**Status**: Accepted (2026-10-22).
 
-When accepted, this amendment amends ADR-193 D3, D8, D10, D11 and acceptance case 5; ADR-208 D3, D5 and
+This amendment serves the project owner's instruction of 2026-10-22 that charters, the Gate and caller
+privileges are one automated permission system, quoted verbatim: "那其实联起来了，这个charter + gate +
+privilegs, 整套automated permission system已经差不多在khive成型了" ("So they connect: charter + gate +
+privileges, the whole automated permission system has nearly taken shape in khive"). It also supplies
+the registration that acceptance case 5 has required since this record was accepted on 2026-09-22.
+
+This amendment amends ADR-193 D3, D8, D10, D11 and acceptance case 5; ADR-208 D3, D5 and
 D6; ADR-143's caller-right vocabulary and administration constraints, as specified below. It relates to
 ADR-007 (namespace attribution), ADR-018 (the Gate), ADR-127 (identity assurance and shared authority),
 ADR-180 (tool-use policy), and proposed ADR-209 (root policy exceptions).
@@ -955,6 +968,13 @@ unregistered caller. M1 runs remain `recording_only`, and `charter.claim`
 continues to refuse. M2 requires authenticated provenance and the independent
 production paths required for the facts it uses. Neither local enrollment nor
 M1 evidence is promoted on activation.
+
+Implementation order: until the minimum standing-right service of D1 exists,
+`charter.observe` for external kinds returns unavailable and writes nothing,
+while `charter.sample` store readers and internal transitions run. Acceptance
+case 5 is gated on that service. Its control is the D5 arm in which missing
+verification infrastructure is reported as unavailable and writes nothing; its
+positive control is a registered producer admitted once the service exists.
 
 Existing evidence without admission receipts remains unchanged and is labeled
 legacy, with registration unverified. Do not infer registrations from distinct
