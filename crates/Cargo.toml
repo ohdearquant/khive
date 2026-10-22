@@ -171,5 +171,13 @@ codegen-units = 1
 # post-hoc analysis of a stall or contention window impossible.
 strip = "debuginfo"
 
+# Binaries published by the release workflow. Same code generation as release,
+# with the symbol table removed as well (about 10 MiB). Panic messages keep their
+# file and line; only backtrace frame names are lost. Builds used for profiling
+# keep the release profile.
+[profile.dist]
+inherits = "release"
+strip = "symbols"
+
 # lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.
