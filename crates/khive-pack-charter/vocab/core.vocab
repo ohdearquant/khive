@@ -8,9 +8,10 @@ vocabulary core v1
 #   action   outcomes done failed skipped    passes done skipped
 # Self-reported and undecidable phrases keep the advisory ceiling.
 #
-# A subject's generation moves only on the triggers its kind lists under new_generation (or on
-# charter.start). Any other observation is recorded at the generation it names, so a late result
-# for an older head never moves the subject back.
+# A subject's generation moves only on the triggers its kind lists under new_generation.
+# charter.start records a generation only for a subject seen for the first time. Any other
+# observation is recorded at the generation it names, so a late result for an older head never
+# moves the subject back.
 
 subject pull_request "a pull request on a forge, referenced as <owner>/<repo>#<number>":
     producer system

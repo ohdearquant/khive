@@ -773,6 +773,23 @@ async fn a_repeated_event_is_recorded_once() {
 }
 
 #[tokio::test]
+async fn an_observation_records_the_callers_actor_as_its_producer() {
+    let f = Fixture::new();
+    f.publish_review_set().await;
+    let run = f.start_review().await;
+    f.observe("pull_request.opened", None, json!({})).await;
+    let view = f.run(&run).await;
+    let opened: Vec<&Value> = view["evidence"]
+        .as_array()
+        .expect("evidence")
+        .iter()
+        .filter(|e| e["kind"] == "pull_request.opened")
+        .collect();
+    assert_eq!(opened.len(), 1, "{view}");
+    assert_eq!(opened[0]["producer"], "sample-reader", "{view}");
+}
+
+#[tokio::test]
 async fn observations_and_starts_are_checked_against_the_registry() {
     let f = Fixture::new();
     f.publish_review_set().await;
@@ -805,20 +822,38 @@ async fn observations_and_starts_are_checked_against_the_registry() {
                 p["producer"] = json!("charter");
                 p
             },
-            "reserved",
+            "unknown parameter \"producer\"",
         ),
         (
             {
                 let mut p = base("pull_request.opened");
-                p["producer"] = json!("store");
+                p["producer"] = json!("someone-else");
                 p
             },
-            "reserved",
+            "unknown parameter \"producer\"",
         ),
     ];
     for (params, code) in cases {
         let err = f.refused("charter.observe", params).await;
         assert!(err.contains(code), "{code}: {err}");
+    }
+    for actor in ["charter", "store"] {
+        let error = f
+            .registry
+            .dispatch_with_identity(
+                "charter.observe",
+                base("pull_request.opened"),
+                Some(khive_runtime::RequestIdentity {
+                    namespace: "local".to_owned(),
+                    actor_id: Some(actor.to_owned()),
+                    visible_namespaces: vec![],
+                    process_ref: None,
+                    request_id: None,
+                }),
+            )
+            .await
+            .expect_err("a reserved actor cannot submit an observation");
+        assert!(error_text(&error).contains("reserved"), "{actor}: {error}");
     }
     let start = |charter: &str, kind: &str, bindings: Value| json!({"charter": charter, "subject_kind": kind, "subject_ref": PR, "bindings": bindings});
     for (params, code) in [
@@ -2174,6 +2209,93 @@ async fn child_start_refuses_a_cycle_in_persisted_definitions() {
         format!("{error} {error:?}").contains("perform_cycle"),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn publication_refuses_a_perform_of_a_charter_on_another_subject_kind() {
+    let f = Fixture::new();
+    let child =
+        "charter task_child v1\nsubject task\nworkflow:\n    phase done:\n        complete\n";
+    let parent = "charter pr_parent v1\nsubject pull_request\nworkflow:\n    phase child:\n        perform task_child\n        complete\n";
+    f.call("charter.publish", json!({"source": child})).await;
+
+    let error = f
+        .refused("charter.publish", json!({"source": parent}))
+        .await;
+    assert!(error.contains("perform_subject_mismatch"), "{error}");
+    assert!(
+        error.contains("task_child runs on task subjects, this charter on pull_request"),
+        "{error}"
+    );
+    let listed = f.call("charter.list", json!({})).await;
+    assert_eq!(listed["charters"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+#[tokio::test]
+async fn a_child_republished_on_another_subject_kind_is_refused_when_performed() {
+    let f = Fixture::new();
+    let child = |version: u32, subject: &str| {
+        format!("charter swap_child v{version}\nsubject {subject}\nworkflow:\n    phase done:\n        complete\n")
+    };
+    let parent = r#"charter swap_parent v1
+subject pull_request
+roles:
+    agent "the person doing the work"
+workflow:
+    phase first by agent:
+        await message.arrived
+        goto second
+    phase second by agent:
+        perform swap_child
+        complete
+"#;
+    f.call(
+        "charter.publish",
+        json!({"source": child(1, "pull_request")}),
+    )
+    .await;
+    f.call("charter.publish", json!({"source": parent})).await;
+    let started = f
+        .call(
+            "charter.start",
+            json!({"charter": "swap_parent", "subject_kind": "pull_request",
+                   "subject_ref": PR, "bindings": {"agent": "worker"}}),
+        )
+        .await;
+    let run = started["run_id"].as_str().unwrap().to_owned();
+    let published = f
+        .call("charter.publish", json!({"source": child(2, "task")}))
+        .await;
+    assert_eq!(published["published"], true, "{published}");
+    let before = f.at(&run).await;
+    assert_eq!(before.1, "first", "{before:?}");
+    let arrived = json!({"subject_kind": "pull_request", "subject_ref": PR,
+                         "kind": "message.arrived"});
+
+    let error = f
+        .registry
+        .dispatch("charter.observe", arrived.clone())
+        .await
+        .expect_err("a child declared for another subject kind must not start");
+    let text = format!("{error} {error:?}");
+    assert!(text.contains("PerformSubjectMismatch"), "{text}");
+    assert!(
+        text.contains("version 2 runs on task subjects, the parent run on pull_request"),
+        "{text}"
+    );
+    assert_eq!(f.at(&run).await, before);
+    assert!(f.child_of(&run, "swap_child").await.is_empty());
+
+    f.call(
+        "charter.publish",
+        json!({"source": child(3, "pull_request")}),
+    )
+    .await;
+    f.call("charter.observe", arrived).await;
+    let children = f.child_of(&run, "swap_child").await;
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0]["state"], "completed", "{children:?}");
+    assert_eq!(f.at(&run).await.0, "completed");
 }
 
 #[tokio::test]
