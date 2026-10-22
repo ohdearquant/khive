@@ -55,7 +55,7 @@ async fn scoped_references_cannot_attach_phases_or_attempts_to_another_run() {
 }
 
 #[tokio::test]
-async fn foundation_records_only_recording_assurance_and_exposes_no_claim() {
+async fn foundation_records_only_recording_assurance_and_exposes_claim() {
     let f = Fixture::new();
     f.seed().await;
     assert_eq!(
@@ -69,8 +69,11 @@ async fn foundation_records_only_recording_assurance_and_exposes_no_claim() {
     ), "CHECK").await;
     assert!(CharterPack::HANDLERS
         .iter()
-        .all(|h| h.name != "charter.claim"));
-    assert!(f.registry.describe_verb("charter.claim").is_err());
+        .any(|h| h.name == "charter.claim"));
+    assert_eq!(
+        f.registry.describe_verb("charter.claim").unwrap()["verb"],
+        "charter.claim"
+    );
     assert!(f
         .registry
         .dispatch("charter.claim", serde_json::json!({}))
