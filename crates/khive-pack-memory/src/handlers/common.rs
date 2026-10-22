@@ -313,8 +313,14 @@ pub(super) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError>
     serde_json::to_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
 }
 
+pub(super) fn decode_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
+    serde_json::from_value(params).map_err(|error| {
+        mask_for_redaction_surface(RedactionSurface::GateProbe, &error.to_string()).into_owned()
+    })
+}
+
 pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
+    decode_params(params).map_err(RuntimeError::InvalidInput)
 }
 
 pub(crate) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
