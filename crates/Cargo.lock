@@ -2033,7 +2033,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2125,7 +2124,6 @@ dependencies = [
 name = "khive-fold"
 version = "0.14.0"
 dependencies = [
- "blake3",
  "chrono",
  "criterion",
  "khive-score",
@@ -2295,7 +2293,6 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "rmcp",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2315,7 +2312,6 @@ dependencies = [
  "khive-types",
  "serde_json",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -2392,7 +2388,6 @@ dependencies = [
 name = "khive-pack-code"
 version = "0.14.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
@@ -2404,7 +2399,6 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
- "libc",
  "quote",
  "regex",
  "rusqlite",
@@ -2467,7 +2461,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2493,7 +2486,6 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "chrono",
- "clap",
  "encoding_rs",
  "inventory",
  "khive-db",
@@ -2696,7 +2688,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2771,12 +2762,10 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
- "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2869,7 +2858,6 @@ version = "0.14.0"
 dependencies = [
  "criterion",
  "khive-types",
- "serde",
  "serde_json",
  "syn",
 ]
