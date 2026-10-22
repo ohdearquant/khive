@@ -3,6 +3,7 @@ use super::{
     NamespaceToken, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlValue, Utc,
     Uuid, Value,
 };
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
 pub(super) fn validate_actor_label(
@@ -30,6 +31,7 @@ pub(super) fn validate_actor_label(
 
 pub(super) fn parse_inbox_timestamp(field: &str, raw: &str) -> Result<i64, RuntimeError> {
     khive_runtime::rfc3339_to_utc_micros(raw).map_err(|e| {
+        let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
         RuntimeError::InvalidInput(format!(
             "inbox: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {e}"
         ))
@@ -46,6 +48,7 @@ pub(super) fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, Ru
         .parse::<Uuid>()
         .map(|id| id.as_hyphenated().to_string())
         .map_err(|_| {
+            let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
             RuntimeError::InvalidInput(format!(
                 "{verb}: `thread_id` must be a full UUID because a short prefix would require \
                  scoped resolution and a thread root is an explicit stable reference; got \
@@ -245,6 +248,7 @@ pub(super) fn parse_supplied_timestamp(
     raw: &str,
 ) -> Result<DateTime<chrono::FixedOffset>, RuntimeError> {
     DateTime::parse_from_rfc3339(raw.trim()).map_err(|error| {
+        let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
         RuntimeError::InvalidInput(format!(
             "{verb}: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
         ))
