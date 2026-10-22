@@ -1637,10 +1637,16 @@ jobs:
       - name: Run the library tests without the optional packs
         run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
       # These integration tests assert which packs are linked and selectable. Their
-      # feature-off branches are what catch a core crate linking an optional pack,
-      # and the ci job runs them only with every feature on.
+      # feature-off branches are what catch a core crate linking an optional pack.
       - name: Run the pack composition tests without the optional packs
         run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
+      # The default features leave the agent, telemetry and web packs out, so the ci
+      # job runs only their feature-off branches. These two steps run the
+      # feature-on branches and the suites that need the agent pack.
+      - name: Run the library tests with every optional pack
+        run: cargo test -p kkernel -p khive-mcp --features pack-agent,pack-telemetry,pack-web --lib --locked
+      - name: Run the pack composition tests with every optional pack
+        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mounts
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}

@@ -95,9 +95,10 @@ blake3 = { workspace = true, features = ["std"] }
 
 [features]
 blob-s3 = ["khive-runtime/blob-s3", "khive-mcp/blob-s3"]
-# The default set links every pack this binary has always linked. The agent,
-# telemetry and web packs are optional; formal and moodboard stay off.
-default = ["pack-agent", "pack-telemetry", "pack-web"]
+# The default set links only the core packs. The agent, telemetry and web packs
+# are optional and off by default, like formal and moodboard; the operator build
+# (`make build-local`) enables all three.
+default = []
 # Pass-through, plus links kkernel's own force-link reference: enables the agent
 # pack. A build without it does not link or register the pack, so it is absent
 # from the pack list the server reports and `--pack agent` is an unknown pack.

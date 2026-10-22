@@ -82,7 +82,7 @@ The Phase-4b boot APIs are async source changes:
 every first-party pack crate (`khive-pack-kg`, `-gtd`, `-memory`, `-brain`, `-comm`,
 `-schedule`, `-knowledge`, `-session`) so their `inventory::submit!` verb registrations link
 into any binary that depends on this crate. The agent, telemetry and web packs are optional
-features (`pack-agent`, `pack-telemetry`, `pack-web`) that are on by default. `kkernel` is that
+features (`pack-agent`, `pack-telemetry`, `pack-web`) that are off by default. `kkernel` is that
 binary: its `mcp` subcommand
 parses `khive_mcp::args::Args`, builds the runtime and pack registry, and calls into
 `khive_mcp::serve::run`.

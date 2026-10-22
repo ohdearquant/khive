@@ -2,10 +2,12 @@
 //! `khive-mcp`: a build links and registers a pack exactly when its feature is on.
 //!
 //! The first two tests read the registry this binary actually linked and compare it
-//! with the features the binary was built with. The last two pin the manifests: the
-//! default feature set must keep naming the three packs, and `kkernel` must not let
-//! its `khive-mcp` dependency switch them back on when defaults are off. Either slip
-//! changes which packs a plain build links without failing any other test.
+//! with the features the binary was built with. The last three pin the manifests and
+//! the operator build: the default feature set leaves the three packs out, the
+//! operator build (`make build-local`) turns all three on, and `kkernel` must not
+//! let its `khive-mcp` dependency switch them back on when defaults are off. Any slip
+//! changes which packs a plain or an operator build links without failing any other
+//! test.
 
 use std::collections::BTreeSet;
 
@@ -16,6 +18,7 @@ use kkernel as _;
 
 const KKERNEL_MANIFEST: &str = include_str!("../Cargo.toml");
 const KHIVE_MCP_MANIFEST: &str = include_str!("../../khive-mcp/Cargo.toml");
+const MAKEFILE: &str = include_str!("../../../Makefile");
 
 /// The optional packs, each paired with whether this build links it.
 const OPTIONAL_PACKS: [(&str, bool); 3] = [
@@ -97,19 +100,20 @@ fn a_pack_whose_feature_is_off_is_neither_discovered_nor_selectable() {
 }
 
 #[test]
-fn default_features_keep_linking_the_three_optional_packs() {
+fn default_features_leave_the_three_optional_packs_out() {
     for (crate_name, text) in [
         ("kkernel", KKERNEL_MANIFEST),
         ("khive-mcp", KHIVE_MCP_MANIFEST),
     ] {
         let manifest = manifest(text);
-        let mut default = feature(&manifest, "default");
-        default.sort();
-        assert_eq!(
-            default,
-            ["pack-agent", "pack-telemetry", "pack-web"],
-            "{crate_name}: the default features must keep linking the three optional packs"
-        );
+        let default = feature(&manifest, "default");
+        for (name, _) in OPTIONAL_PACKS {
+            let pack_feature = format!("pack-{name}");
+            assert!(
+                !default.contains(&pack_feature),
+                "{crate_name}: the default features must not link the {name} pack, they are {default:?}"
+            );
+        }
         for (name, _) in OPTIONAL_PACKS {
             let dependency = format!("khive-pack-{name}");
             let optional = manifest["dependencies"][dependency.as_str()]
@@ -121,6 +125,32 @@ fn default_features_keep_linking_the_three_optional_packs() {
                 "{crate_name}: {dependency} must be an optional dependency"
             );
         }
+    }
+}
+
+#[test]
+fn the_operator_build_links_the_three_optional_packs() {
+    let recipe: Vec<&str> = MAKEFILE
+        .lines()
+        .skip_while(|line| !line.starts_with("build-local:"))
+        .skip(1)
+        .take_while(|line| line.starts_with('\t'))
+        .collect();
+    let features: Vec<&str> = recipe
+        .iter()
+        .filter_map(|line| line.trim().strip_prefix("--features "))
+        .flat_map(|list| list.trim_end_matches(" \\").trim().split(','))
+        .collect();
+    assert!(
+        !features.is_empty(),
+        "the build-local recipe names no --features list: {recipe:?}"
+    );
+    for (name, _) in OPTIONAL_PACKS {
+        let pack_feature = format!("pack-{name}");
+        assert!(
+            features.contains(&pack_feature.as_str()),
+            "make build-local must enable {pack_feature}, it enables {features:?}"
+        );
     }
 }
 
