@@ -12,6 +12,10 @@ mod admission;
 mod atom_weights;
 #[path = "migrations_tests/comm_legacy_quarantine.rs"]
 mod comm_legacy_quarantine;
+#[path = "migrations_tests/edge_governance_invalidation_tests.rs"]
+mod edge_governance_invalidation;
+#[path = "migrations_tests/edge_governance_schema_tests.rs"]
+mod edge_governance_schema;
 #[path = "migrations_tests/page_accounting.rs"]
 mod page_accounting;
 #[path = "migrations_tests/proposal_archive.rs"]

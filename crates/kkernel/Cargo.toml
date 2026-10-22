@@ -122,6 +122,9 @@ pack-formal = ["khive-pack-formal"]
 # set — off by default. See khive-mcp/Cargo.toml's pack-moodboard feature
 # for what leaving this off does to the V21 attachment cutover.
 pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
+# Links the S3-compatible blob store (`[storage.blob] backend = "s3"`). Off by
+# default: without it an S3 blob configuration is refused at boot.
+blob-s3 = ["khive-runtime/blob-s3"]
 
 [[bin]]
 name = "kkernel"

@@ -110,7 +110,7 @@ khive-score = { version = "0.14.0", path = "../khive-score" }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
-khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
+khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["fault-injection", "test-internals", "blob-s3"] }
 khive-storage = { version = "0.14.0", path = "../khive-storage", features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }

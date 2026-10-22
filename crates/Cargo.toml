@@ -86,7 +86,9 @@ serde_json = "1.0"
 encoding_rs = "0.8.35"
 serde_yaml = "0.9"
 schemars = "1.2"
-jsonschema = "0.46.10"
+# Schemas are validated with local references only (khive-mounts/src/catalog.rs),
+# so the HTTP and file resolvers and their TLS stack are left out.
+jsonschema = { version = "0.46.10", default-features = false }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "pool"] }
@@ -170,6 +172,14 @@ codegen-units = 1
 # strip = "symbols" a live-process sample yields anonymous offsets, which makes
 # post-hoc analysis of a stall or contention window impossible.
 strip = "debuginfo"
+
+# Binaries published by the release workflow. Same code generation as release,
+# with the symbol table removed as well (about 10 MiB). Panic messages keep their
+# file and line; only backtrace frame names are lost. Builds used for profiling
+# keep the release profile.
+[profile.dist]
+inherits = "release"
+strip = "symbols"
 
 # lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.

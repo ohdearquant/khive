@@ -455,7 +455,7 @@ async fn register_one(
             .await?
             {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "registry name {:?} is soft-deleted at entity {id}; restore it explicitly",
+                    "registry name {:?} is soft-deleted at entity {id}; the name stays retired; register a new name",
                     spec.name
                 )));
             }

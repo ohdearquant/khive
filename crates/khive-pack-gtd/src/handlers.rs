@@ -628,7 +628,8 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
             });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
+        "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, value)
     )))
 }
 
