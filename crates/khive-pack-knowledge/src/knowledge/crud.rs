@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     micros_to_iso, uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError,
 };
@@ -105,10 +106,16 @@ fn parse_list_after(raw: &str) -> Result<Option<Uuid>, RuntimeError> {
         return Ok(None);
     }
     Uuid::parse_str(raw).map(Some).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "knowledge.list: `after` must be a full UUID returned as `next_after`; \
-             prefixes are unsafe for keyset pagination; got {raw:?}: {error}"
-        ))
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                    "knowledge.list: `after` must be a full UUID returned as `next_after`; \
+                     prefixes are unsafe for keyset pagination; got {raw:?}: {error}"
+                ),
+            )
+            .into_owned(),
+        )
     })
 }
 
@@ -128,11 +135,17 @@ fn validate_list_fields(
         .iter()
         .find(|field| !kind.projection_fields().contains(&field.as_str()))
     {
-        return Err(RuntimeError::InvalidInput(format!(
-            "knowledge.list: unknown {} projection field {unknown:?}; expected one of: {}",
-            kind.name(),
-            kind.projection_fields().join(", ")
-        )));
+        return Err(RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                    "knowledge.list: unknown {} projection field {unknown:?}; expected one of: {}",
+                    kind.name(),
+                    kind.projection_fields().join(", ")
+                ),
+            )
+            .into_owned(),
+        ));
     }
     Ok(())
 }
@@ -938,9 +951,13 @@ impl KnowledgeHandlers {
             Some("domain") => KnowledgeListKind::Domain,
             Some("atom") | None => KnowledgeListKind::Atom,
             Some(other) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unknown type {other:?}; valid: atom | domain"
-                )))
+                return Err(RuntimeError::InvalidInput(
+                    mask_for_redaction_surface(
+                        RedactionSurface::GateProbe,
+                        &format!("unknown type {other:?}; valid: atom | domain"),
+                    )
+                    .into_owned(),
+                ))
             }
         };
         let cursor_mode = p.after.is_some();

@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 impl KhiveRuntime {
     /// Parse a full UUID or resolve a compact hexadecimal prefix in the caller's
@@ -47,12 +48,16 @@ impl KhiveRuntime {
         if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
             return match self.resolve_prefix(token, s).await? {
                 Some(uuid) => Ok(uuid),
-                None => Err(RuntimeError::InvalidInput(match verb {
-                    Some(verb) => format!("{verb}: no record matches prefix: {s:?}"),
-                    None => format!("no record matches prefix: {s:?}"),
-                })),
+                None => {
+                    let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
+                    Err(RuntimeError::InvalidInput(match verb {
+                        Some(verb) => format!("{verb}: no record matches prefix: {s:?}"),
+                        None => format!("no record matches prefix: {s:?}"),
+                    }))
+                }
             };
         }
+        let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
         Err(RuntimeError::InvalidInput(match verb {
             Some(verb) => {
                 format!("{verb}: invalid id {s:?}; expected full UUID or 8-char hex prefix")

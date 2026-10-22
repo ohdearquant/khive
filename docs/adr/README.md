@@ -235,6 +235,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-205](ADR-205-dependency-scoped-pull-request-ci.md)                 | Dependency-Scoped Pull-Request CI from the Code Map                                                        |
 | [ADR-206](ADR-206-crate-performance-guarantees.md)                      | Crate Performance Guarantees                                                                               |
 | [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
+| [ADR-208](ADR-208-charter-workflows.md)                                 | Charter Workflows — Declared Topologies over Registered Phrases                                            |
 | [ADR-209](ADR-209-root-policy-overrides-and-flow-history.md)            | Root Policy Overrides, Resource Grants, and Verifiable Flow History                                        |
 
 <!-- END GENERATED ADR CATALOG -->
@@ -328,6 +329,7 @@ Amendments to accepted records:
 - [ADR-144 Amendment 3](ADR-144-memory-write-visibility-fence.md#amendment-3-2026-10-04-partitioned-moves-carry-memory-vectors-with-receipts) (2026-10-04): partitioned memory vector carry with receipts and exact destination fences (#3696).
 - [ADR-144 Amendment 4](ADR-144-memory-write-visibility-fence.md#amendment-4-2026-10-04-unknown-write-epochs-at-the-sealed-receipt-cutover) (2026-10-04): Accepted unknown-epoch refusal and durable provenance at the sealed-receipt cutover (#3619).
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
+- [ADR-180 Amendment 7](ADR-180-tool-pack.md#amendment-7-2026-10-21-a-unit-checks-the-grant-it-holds-by-id-on-the-writer-it-was-handed) (2026-10-21): proposed by-id live-grant check on a caller-supplied reader, so a unit can check the grant it holds and consume in one transaction; the by-id check and `decide` share one predicate and one row parse.
 - [ADR-181 Amendment 11](ADR-181-exec-verb-sandboxed-run.md#amendment-11-2026-09-29-timeout-residual-for-detached-descendants) (2026-09-29): timeout residual for detached descendants.
 - [ADR-181 Amendment 13](ADR-181-exec-verb-sandboxed-run.md#amendment-13-2026-10-21-an-outbound-network-declaration-on-exec-registrations) (2026-10-21): proposed outbound network declaration on exec registrations: a pin input only when declared, honoured only by an exact-name grant to an authenticated caller, refused rather than run without network, outbound-only rules under their own template digest; amends ADR-180 Amendment 1 item 1 for one property.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.

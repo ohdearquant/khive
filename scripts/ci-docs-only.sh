@@ -95,8 +95,13 @@ while IFS= read -r -d '' inert_path; do
     name_paths+=(":(top,exclude,literal)$inert_path")
 done < "$inert"
 
-count=0
+paths=()
 while IFS= read -r -d '' path; do
+    paths+=("$path")
+done < "$list"
+
+count=0
+for path in "${paths[@]}"; do
     count=$((count + 1))
     case "$path" in
         *.md) ;;
@@ -119,7 +124,7 @@ while IFS= read -r -d '' path; do
         1) ;;
         *) full "symlink target search for $name failed (rc $rc)" ;;
     esac
-    python3 "$scanner" --published-markdown "$path" < /dev/null
+    python3 -P "$scanner" --published-markdown "$path" < /dev/null
     rc=$?
     case $rc in
         0) full "$path carries verb or pack counts the smoke tests check against the live registry" ;;
@@ -127,7 +132,7 @@ while IFS= read -r -d '' path; do
         *) full "count scanner failed for $path (rc $rc)" ;;
     esac
     printf 'documentation only: %s\n' "$path" >&2
-done < "$list"
+done
 
 [ "$count" -gt 0 ] || full "no paths read from the diff"
 echo true

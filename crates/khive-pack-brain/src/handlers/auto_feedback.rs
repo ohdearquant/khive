@@ -1,4 +1,5 @@
 use super::*;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 
 struct UnjudgedServe<'a> {
     profile_id: Option<&'a str>,
@@ -149,19 +150,22 @@ impl BrainPack {
         });
         let selected = matching_results.next().ok_or_else(|| {
             RuntimeError::InvalidInput(format!(
-                "auto_feedback: target_id {selected_id:?} does not match any results[].id or results[].full_id"
+                "auto_feedback: target_id {:?} does not match any results[].id or results[].full_id",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, selected_id)
             ))
         })?;
         if matching_results.next().is_some() {
             return Err(RuntimeError::InvalidInput(format!(
-                "auto_feedback: target_id {selected_id:?} matches more than one result; the judged result must be unique"
+                "auto_feedback: target_id {:?} matches more than one result; the judged result must be unique",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, selected_id)
             )));
         }
 
         let target = match selected.full_id.as_deref() {
             Some(full_id) => full_id.parse::<uuid::Uuid>().map_err(|_| {
                 RuntimeError::InvalidInput(format!(
-                    "auto_feedback: invalid full_id {full_id:?}; expected full UUID"
+                    "auto_feedback: invalid full_id {:?}; expected full UUID",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, full_id)
                 ))
             })?,
             None => {

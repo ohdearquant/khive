@@ -226,5 +226,10 @@ a separate Latin word.
 For example, `如何提升中文检索质量` has ten CJK letters and is admitted;
 `如何提升中文检索质` has nine and is refused. `如何提升中文检索质 retrieval`
 has four CJK-derived words plus one whitespace word and is admitted. Short queries
-can use `knowledge.search`. This admission rule does not change retrieval ranking,
-embedding-model selection, or auto-`knowledge.compose`'s ten-whitespace-word gate.
+can use `knowledge.search`.
+
+Auto-`knowledge.compose` uses the same counting rule with a ten-word minimum, so
+an unspaced query needs twenty CJK letters. Providing explicit `domain_ids` or
+`atom_ids` bypasses that minimum; a nonempty query is still required. The thresholds
+remain five words for suggest and ten for auto-compose. Retrieval ranking and
+embedding-model selection are unchanged.

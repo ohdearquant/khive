@@ -315,6 +315,7 @@ pub(crate) async fn handle_thread(
                     .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
                     .filter(|note| note.kind == "message")
                     .ok_or_else(|| {
+                        let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
                         RuntimeError::InvalidInput(format!(
                             "thread: `after` cursor {raw:?} does not resolve to a message"
                         ))
@@ -325,6 +326,7 @@ pub(crate) async fn handle_thread(
                 })
             } else {
                 let micros = khive_runtime::rfc3339_to_utc_micros(raw).map_err(|e| {
+                    let raw = mask_for_redaction_surface(RedactionSurface::GateProbe, raw);
                     RuntimeError::InvalidInput(format!(
                         "thread: `after` cursor {raw:?} is neither a resolvable message id \
                              nor a valid RFC 3339 timestamp: {e}"

@@ -137,10 +137,10 @@ async fn kana_and_hangul_use_the_same_ten_letter_boundary() {
 }
 
 #[tokio::test]
-async fn auto_compose_retains_its_whitespace_word_gate() {
+async fn auto_compose_retains_its_ten_word_threshold() {
     let registry = fixture().await;
     for (query, count) in [
-        (CHINESE, 1),
+        (CHINESE, 5),
         (
             "dense sparse retrieval ranking quality across languages and domains",
             9,
@@ -149,7 +149,7 @@ async fn auto_compose_retains_its_whitespace_word_gate() {
         let error = registry
             .dispatch("knowledge.compose", json!({"query": query}))
             .await
-            .expect_err("auto-compose gate is unchanged");
+            .expect_err("auto-compose still requires ten counted words");
         let RuntimeError::InvalidInput(message) = error else {
             panic!("{error:?}")
         };
