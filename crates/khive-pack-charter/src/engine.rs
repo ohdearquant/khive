@@ -147,10 +147,7 @@ struct PhaseRow {
 
 async fn load_run(w: &mut dyn SqlWriter, run_id: &str) -> StorageResult<Option<RunRow>> {
     let Some(row) = w
-        .query_row(stmt(
-            include_str!("../sql/engine/run-get.sql"),
-            vec![text(run_id)],
-        ))
+        .query_row(stmt(include_str!("../sql/run-get.sql"), vec![text(run_id)]))
         .await?
     else {
         return Ok(None);
@@ -178,14 +175,14 @@ async fn load_definition(
     let row = match version {
         Some(v) => {
             w.query_row(stmt(
-                include_str!("../sql/engine/definition-get.sql"),
+                include_str!("../sql/definition-get.sql"),
                 vec![text(domain), text(charter_id), SqlValue::Integer(v)],
             ))
             .await?
         }
         None => {
             w.query_row(stmt(
-                include_str!("../sql/engine/definition-latest.sql"),
+                include_str!("../sql/definition-latest.sql"),
                 vec![text(domain), text(charter_id)],
             ))
             .await?
@@ -206,7 +203,7 @@ async fn load_phases(
 ) -> StorageResult<BTreeMap<String, PhaseRow>> {
     let rows = w
         .query_all(stmt(
-            include_str!("../sql/engine/phases-for-run.sql"),
+            include_str!("../sql/phases-for-run.sql"),
             vec![text(domain), text(run_id)],
         ))
         .await?;
@@ -232,7 +229,7 @@ async fn previous_visit_end(
 ) -> StorageResult<i64> {
     let rows = w
         .query_all(stmt(
-            include_str!("../sql/engine/entries-for-run.sql"),
+            include_str!("../sql/entries-for-run.sql"),
             vec![text(domain), text(run_id)],
         ))
         .await?;
@@ -257,7 +254,7 @@ async fn observations_since(
 ) -> StorageResult<Vec<Obs>> {
     let rows = w
         .query_all(stmt(
-            include_str!("../sql/engine/evidence-since.sql"),
+            include_str!("../sql/evidence-since.sql"),
             vec![text(domain), text(run_id), SqlValue::Integer(after)],
         ))
         .await?;
@@ -295,7 +292,7 @@ async fn append(
     let payload_digest = digest(&bytes);
     if let Some(row) = w
         .query_row(stmt(
-            include_str!("../sql/engine/evidence-find.sql"),
+            include_str!("../sql/evidence-find.sql"),
             vec![
                 text(&scope.domain),
                 text(run_id),
@@ -316,14 +313,14 @@ async fn append(
     }
     let next = w
         .query_row(stmt(
-            include_str!("../sql/engine/evidence-next.sql"),
+            include_str!("../sql/evidence-next.sql"),
             vec![text(&scope.domain), text(run_id)],
         ))
         .await?
         .ok_or_else(|| corrupt("evidence sequence"))?;
     let sequence = col_i64(&next, "next")?;
     w.execute(stmt(
-        include_str!("../sql/engine/evidence-insert.sql"),
+        include_str!("../sql/evidence-insert.sql"),
         vec![
             text(&scope.domain),
             text(run_id),
@@ -570,7 +567,7 @@ impl<'w> Engine<'w> {
         if let Some(row) = self
             .w
             .query_row(stmt(
-                include_str!("../sql/engine/generation-trigger-find.sql"),
+                include_str!("../sql/generation-trigger-find.sql"),
                 vec![text(&self.scope.domain), text(&caller), text(event_id)],
             ))
             .await?
@@ -584,7 +581,7 @@ impl<'w> Engine<'w> {
         }
         self.w
             .execute(stmt(
-                include_str!("../sql/engine/generation-trigger-insert.sql"),
+                include_str!("../sql/generation-trigger-insert.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(&caller),
@@ -686,7 +683,7 @@ impl<'w> Engine<'w> {
         let found = self
             .w
             .query_row(stmt(
-                include_str!("../sql/engine/subject-get.sql"),
+                include_str!("../sql/subject-get.sql"),
                 vec![text(kind), text(reference)],
             ))
             .await?;
@@ -696,7 +693,7 @@ impl<'w> Engine<'w> {
             let subject_id = format!("{kind}:{reference}");
             self.w
                 .execute(stmt(
-                    include_str!("../sql/engine/subject-insert.sql"),
+                    include_str!("../sql/subject-insert.sql"),
                     vec![
                         text(&self.scope.domain),
                         text(&subject_id),
@@ -721,7 +718,7 @@ impl<'w> Engine<'w> {
                 let affected = self
                     .w
                     .execute(stmt(
-                        include_str!("../sql/engine/subject-generation.sql"),
+                        include_str!("../sql/subject-generation.sql"),
                         vec![
                             text(&subject_id),
                             text(&digest(&bytes)),
@@ -755,7 +752,7 @@ impl<'w> Engine<'w> {
         let rows = self
             .w
             .query_all(stmt(
-                include_str!("../sql/engine/runs-open-for-subject.sql"),
+                include_str!("../sql/runs-open-for-subject.sql"),
                 vec![text(&self.scope.domain), text(subject_id)],
             ))
             .await?;
@@ -772,7 +769,7 @@ impl<'w> Engine<'w> {
         let row = self
             .w
             .query_row(stmt(
-                include_str!("../sql/engine/run-open-for-charter.sql"),
+                include_str!("../sql/run-open-for-charter.sql"),
                 vec![text(&self.scope.domain), text(charter_id), text(subject_id)],
             ))
             .await?;
@@ -799,7 +796,7 @@ impl<'w> Engine<'w> {
         let bytes = canonical_json(&candidate);
         self.w
             .execute(stmt(
-                include_str!("../sql/engine/run-insert.sql"),
+                include_str!("../sql/run-insert.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(&run_id),
@@ -827,7 +824,7 @@ impl<'w> Engine<'w> {
             };
             self.w
                 .execute(stmt(
-                    include_str!("../sql/engine/phase-insert.sql"),
+                    include_str!("../sql/phase-insert.sql"),
                     vec![
                         text(&self.scope.domain),
                         text(&run_id),
@@ -970,7 +967,7 @@ impl<'w> Engine<'w> {
         .await?;
         self.w
             .execute(stmt(
-                include_str!("../sql/engine/phase-enter.sql"),
+                include_str!("../sql/phase-enter.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(run_id),
@@ -983,7 +980,7 @@ impl<'w> Engine<'w> {
         let affected = self
             .w
             .execute(stmt(
-                include_str!("../sql/engine/run-set-phase.sql"),
+                include_str!("../sql/run-set-phase.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(run_id),
@@ -1072,7 +1069,7 @@ impl<'w> Engine<'w> {
                 waiting_on["owner"] = json!(def.owner);
                 self.w
                     .execute(stmt(
-                        include_str!("../sql/engine/phase-state.sql"),
+                        include_str!("../sql/phase-state.sql"),
                         vec![
                             text(&self.scope.domain),
                             text(run_id),
@@ -1117,7 +1114,7 @@ impl<'w> Engine<'w> {
         let row = self
             .w
             .query_row(stmt(
-                include_str!("../sql/engine/subject-get.sql"),
+                include_str!("../sql/subject-get.sql"),
                 vec![text(&run.subject_kind), text(&run.subject_ref)],
             ))
             .await?
@@ -1131,7 +1128,7 @@ impl<'w> Engine<'w> {
     async fn leave(&mut self, run_id: &str, phase_id: &str) -> StorageResult<()> {
         self.w
             .execute(stmt(
-                include_str!("../sql/engine/phase-state.sql"),
+                include_str!("../sql/phase-state.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(run_id),
@@ -1174,7 +1171,7 @@ impl<'w> Engine<'w> {
         let affected = self
             .w
             .execute(stmt(
-                include_str!("../sql/engine/run-end.sql"),
+                include_str!("../sql/run-end.sql"),
                 vec![
                     text(&self.scope.domain),
                     text(run_id),
@@ -1192,7 +1189,7 @@ impl<'w> Engine<'w> {
         let children = self
             .w
             .query_all(stmt(
-                include_str!("../sql/engine/runs-open-children.sql"),
+                include_str!("../sql/runs-open-children.sql"),
                 vec![text(&self.scope.domain), text(run_id)],
             ))
             .await?;
@@ -1284,7 +1281,7 @@ impl<'w> Engine<'w> {
         let subject_epoch = self
             .w
             .query_row(stmt(
-                include_str!("../sql/engine/subject-get.sql"),
+                include_str!("../sql/subject-get.sql"),
                 vec![text(&parent.subject_kind), text(&parent.subject_ref)],
             ))
             .await?
