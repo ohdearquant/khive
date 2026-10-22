@@ -1058,6 +1058,7 @@ mod tests {
     // `JsonFormatAdapter::new_with_valid_kinds`, so pack-registered granular
     // kinds like `resource` are accepted at this layer too.
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_accepts_resource_kind() {
         if crate::test_process::run_in_child() {
@@ -1105,6 +1106,7 @@ mod tests {
         assert_eq!(entity.name, "JsonResource");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_ndjson_adapter_accepts_resource_kind() {
         if crate::test_process::run_in_child() {
@@ -1152,6 +1154,7 @@ mod tests {
         assert_eq!(entity.name, "NdjsonResource");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_rejects_unregistered_entity_kind() {
         if crate::test_process::run_in_child() {
@@ -1186,6 +1189,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_imports_entities() {
         if crate::test_process::run_in_child() {
@@ -1232,6 +1236,7 @@ mod tests {
         assert_eq!(entity.name, "Entity1");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_ndjson_adapter_imports_entity() {
         if crate::test_process::run_in_child() {
@@ -1392,6 +1397,7 @@ mod tests {
     /// #472: importing adapter JSON with `entity_type`/timestamps end-to-end
     /// through `cmd_import` must land those fields in the runtime, not `None`
     /// + import-time `Utc::now()`.
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_preserves_entity_type_and_timestamps() {
         if crate::test_process::run_in_child() {
@@ -1450,6 +1456,7 @@ mod tests {
     /// abort the whole import — including entities before AND after it in the
     /// array — before anything is written to the target DB. Previously this
     /// was a warning that skipped just the bad element and kept going.
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
         if crate::test_process::run_in_child() {
@@ -1536,6 +1543,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_rejects_malformed_timestamp_without_db_write() {
         if crate::test_process::run_in_child() {
