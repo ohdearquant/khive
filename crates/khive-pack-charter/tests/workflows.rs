@@ -777,6 +777,92 @@ async fn a_revisit_counts_evidence_that_arrived_after_its_previous_visit_ended()
 }
 
 #[tokio::test]
+async fn a_loop_on_an_unchanged_head_reads_its_gate_result_again_on_the_revisit() {
+    // A fix that does not move the generation (a comment-only answer, say) sends the run back to review on the same
+    // head. The revisit reads only observations recorded after the previous visit ended, so the gate result recorded
+    // in the first visit is not read again, although nothing it describes has changed: it has to be observed again.
+    let f = Fixture::new();
+    let source = "charter same_head_loop v1\nsubject pull_request\nroles:\n    author\nworkflow:\n    phase review:\n        require gate.result(name=box) hard\n        when review.decision is request_changes: goto fix\n        max_rounds 3 then give_up\n        goto done\n    phase fix:\n        action fix.push\n        goto review\n    phase done:\n        complete\n    phase give_up:\n        terminate \"three review rounds without an approval\"\n";
+    let out = f.call("charter.publish", json!({"source": source})).await;
+    assert_eq!(out["published"], true, "{out}");
+    let run = f
+        .call(
+            "charter.start",
+            json!({"charter": "same_head_loop", "subject_kind": "pull_request", "subject_ref": PR, "generation": "h1"}),
+        )
+        .await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let at = |kind: &str, outcome: &str, args: Value| {
+        json!({"subject_kind": "pull_request", "subject_ref": PR, "kind": kind,
+               "outcome": outcome, "args": args, "generation": "h1"})
+    };
+    let pending = |run: &Value| -> Vec<String> {
+        let phase = run["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["phase"] == run["current_phase"])
+            .cloned()
+            .unwrap_or(Value::Null);
+        phase["waiting_on"]["pending"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|p| {
+                        p["require"]
+                            .as_str()
+                            .or(p["when"].as_str())
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    f.call(
+        "charter.observe",
+        at("gate.result", "pass", json!({"name": "box"})),
+    )
+    .await;
+    f.call(
+        "charter.observe",
+        at("review.decision", "request_changes", json!({})),
+    )
+    .await;
+    assert_eq!(f.at(&run).await, tuple("open", "fix", "waiting_actor", 1));
+    f.call("charter.observe", at("fix.push", "done", json!({})))
+        .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "review", "waiting_gate", 2),
+        "the first visit's decision does not send the loop round again"
+    );
+
+    f.call(
+        "charter.observe",
+        at("review.decision", "approve", json!({})),
+    )
+    .await;
+    assert_eq!(
+        f.at(&run).await,
+        tuple("open", "review", "waiting_gate", 2),
+        "the gate result from the first visit is not read on the same head"
+    );
+    assert_eq!(pending(&f.run(&run).await), vec!["gate.result".to_owned()]);
+
+    f.call(
+        "charter.observe",
+        at("gate.result", "pass", json!({"name": "box"})),
+    )
+    .await;
+    assert_eq!(f.at(&run).await.0, "completed");
+}
+
+#[tokio::test]
 async fn a_late_observation_for_an_older_head_never_moves_the_subject_back() {
     let f = Fixture::new();
     f.publish_review_set().await;
