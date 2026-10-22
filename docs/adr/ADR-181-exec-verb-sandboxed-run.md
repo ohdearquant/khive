@@ -1318,7 +1318,9 @@ item 8).
    and temporary directory included, and copies the registered file into it: as an APFS clone where the source file
    and the staging directory are on one volume that supports clones, otherwise as a byte copy. Opening the source,
    the clone or copy, and the digest of the staged copy spend one Amendment 10 budget: its deadline starts before the
-   source is opened, and its byte cap bounds the copy as it bounds the digest. A byte copy reads at most the cap plus
+   source is opened, and its byte cap bounds the copy as it bounds the digest. The deadline also bounds admission:
+   the deadline-owning wait admits a successful digest only when its own read of the budget clock is before the
+   deadline, however early the digest finished. A byte copy reads at most the cap plus
    one byte and stops there, so an over-limit or growing source is refused with `binary_digest_byte_limit` without
    being copied to its end, and a copy unfinished at the deadline is refused with `binary_digest_time_limit`, as a
    stalled digest read is today. The staged copy is made read-only and executable (mode `0500`). The binary digest is
@@ -1589,13 +1591,18 @@ Added arms:
       advance, then advances it to the planned release. A digest guard whose deadline lies anywhere after the original
       one (a grace period for the digest alone) is not ready at the held instant and turns the case red. A third case
       runs in each staging branch (copy, then clone), once for each point where the staged digest can be held: the
-      final staged read; and finalization, after every staged read and its own expiry check finished before the
-      original deadline. In each, the seam holds that step across the original deadline, makes its completion ready
+      final staged read; finalization, after every staged read and its own expiry check finished before the
+      original deadline; and the handoff of a successful result to the deadline owner, after finalization and the
+      worker's last expiry check both finished before the original deadline. In each, the seam holds that step
+      across the original deadline, makes its completion ready
       only after that deadline, and resumes the deadline-owning wait only once both that completion and the expiry
       are ready. Each is refused with `binary_digest_time_limit` and leaves no staging or run directory and no digest
-      in any receipt. A digest is accepted only when its finalization completed before the original deadline, checked
-      after finalization by the worker or against the completion instant by the deadline owner; an expiry check that
-      runs only before finalization, with the owner taking a ready result first, turns the finalization case red.
+      in any receipt. A digest is accepted only when the deadline owner, admitting it, reads the controlled budget
+      clock before the original deadline; at or after that deadline the owner refuses even a ready digest that was
+      finalized and checked by the worker in time, and no earlier worker check or completion instant stands in for
+      that read. An expiry check that runs only before finalization, with the owner taking a ready result first,
+      turns the finalization case red; an owner that takes a ready result first, or that compares a completion
+      instant with the deadline instead of reading the clock at admission, turns the handoff case red.
     - **Cleanup on later returns.** A matching digest followed by a `tree_in` that the tree load refuses, a spawn
       failure (a test seam), a run that times out and a cancelled run each leave no staging directory. The honoured run
       repeated with `[exec] keep = true` keeps its run directory and leaves no staging directory.
