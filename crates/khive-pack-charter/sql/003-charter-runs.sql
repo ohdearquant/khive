@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     candidate_digest TEXT NOT NULL CHECK (length(candidate_digest) > 0),
     candidate_bytes BLOB NOT NULL CHECK (typeof(candidate_bytes) = 'blob'),
     assurance TEXT NOT NULL DEFAULT 'recording_only' CHECK (assurance = 'recording_only'),
-    state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'terminated', 'cancelled', 'superseded', 'invalidated', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'cancelled', 'superseded', 'invalidated', 'failed')),
     parent_run_id TEXT,
     terminal_outcome TEXT,
     current_phase_id TEXT,
@@ -24,8 +24,6 @@ CREATE TABLE IF NOT EXISTS charter_runs (
     UNIQUE (policy_domain, subject_id, run_id),
     FOREIGN KEY (subject_id)
         REFERENCES charter_subjects (subject_id),
-    FOREIGN KEY (policy_domain, parent_run_id)
-        REFERENCES charter_runs (policy_domain, run_id),
     FOREIGN KEY (policy_domain, charter_id, definition_version, definition_digest)
         REFERENCES charter_definitions (policy_domain, charter_id, version, definition_digest),
     FOREIGN KEY (policy_domain, run_id, current_phase_id)
@@ -65,4 +63,12 @@ BEFORE UPDATE ON charter_runs
 WHEN NEW.parent_run_id IS NOT OLD.parent_run_id
 BEGIN
     SELECT RAISE(ABORT, 'charter run parent is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS charter_runs_parent_exists
+BEFORE INSERT ON charter_runs
+WHEN NEW.parent_run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM charter_runs
+    WHERE policy_domain = NEW.policy_domain AND run_id = NEW.parent_run_id)
+BEGIN
+    SELECT RAISE(ABORT, 'charter run parent must exist');
 END;
