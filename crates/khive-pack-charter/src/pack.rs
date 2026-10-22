@@ -97,7 +97,7 @@ const SOURCE: ParamDef = param(
     "source",
     "string",
     true,
-    "Charter or vocabulary source text (ADR-208).",
+    "Charter or vocabulary source text.",
 );
 const SUBJECT_KIND: ParamDef = param(
     "subject_kind",
@@ -109,7 +109,7 @@ const SUBJECT_REF: ParamDef = param(
     "subject_ref",
     "string",
     true,
-    "The subject's reference, e.g. \"owner/repo#123\".",
+    "The subject's reference, e.g. \"acme/widgets#8\" for a pull request.",
 );
 const GENERATION: ParamDef = param(
     "generation",
