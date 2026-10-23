@@ -237,6 +237,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
 | [ADR-208](ADR-208-charter-workflows.md)                                 | Charter Workflows — Declared Topologies over Registered Phrases                                            |
 | [ADR-209](ADR-209-root-policy-overrides-and-flow-history.md)            | Root Policy Overrides, Resource Grants, and Verifiable Flow History                                        |
+| [ADR-210](ADR-210-scheduled-host-commands.md)                           | Scheduled Host Commands with Explicit Authority and Durable Outcomes                                       |
 
 <!-- END GENERATED ADR CATALOG -->
 
