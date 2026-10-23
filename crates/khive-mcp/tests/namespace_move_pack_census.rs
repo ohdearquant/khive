@@ -44,6 +44,12 @@ async fn every_built_in_pack_table_has_a_move_disposition_or_an_exclusion() {
         "tool_grants",
         "gtd_lifecycle_audit",
         "knowledge_eval_runs",
+        "scheduled_definitions_v3",
+        "scheduled_series_v3",
+        "scheduled_occurrences_v3",
+        "scheduled_attempts_v3",
+        "scheduled_receipts_v3",
+        "scheduled_notice_outbox_v3",
     ] {
         assert!(
             inventory.tables.iter().any(|table| table.name == name),

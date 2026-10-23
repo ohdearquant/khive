@@ -11,9 +11,9 @@
 #                   database. Other directories each load their fragments in sorted
 #                   filename order into one fresh database, so indexes see tables
 #                   declared by earlier fragments. One-file directories stand alone.
-#                   The tool pack's registry trigger and Git pack's live-note
-#                   indexes additionally use the core migration chain as their
-#                   schema fixture.
+#                   The tool registry, Git live-note indexes and schedule
+#                   lifecycle triggers additionally use the core migration chain
+#                   as their schema fixture.
 #   1b. preparation — a QUERY file (one that does not start with DDL) is prepared,
 #                   not executed, against a database carrying the migration chain
 #                   plus every DDL fragment in the tree. Preparation is what
@@ -399,7 +399,7 @@ finally:
 
 # Related fragments share a database only within their own directory. A pack's
 # sorted table/index fragments see prior DDL; unrelated packs never see each other.
-# The tool-pack trigger requires core entities; its own fragments create grants.
+# Tool, Git and schedule fragments also reference core entities or notes.
 fragment_groups = {}
 for path in ddl_files:
     fragment_groups.setdefault(os.path.dirname(path), []).append(path)
@@ -408,7 +408,7 @@ for directory in sorted(fragment_groups):
     try:
         fixtures = []
         if directory.replace(os.sep, "/").endswith(
-            ("/khive-pack-tool/sql", "/khive-pack-git/sql")
+            ("/khive-pack-tool/sql", "/khive-pack-git/sql", "/khive-pack-schedule/sql")
         ):
             fixtures = chain
         for path in fixtures + sorted(fragment_groups[directory]):
@@ -431,6 +431,7 @@ if query_files:
     try:
         # EXPLAIN resolves runtime function names and arity without evaluating
         # their bodies. Keep this stub out of the DDL validation connections.
+        con.create_function("khive_now_micros", 0, lambda: None)
         con.create_function("khive_tag_contains", 2, lambda tags, marker: None,
                             deterministic=True)
         con.create_function("code_name_score", 2, lambda name, query: None,

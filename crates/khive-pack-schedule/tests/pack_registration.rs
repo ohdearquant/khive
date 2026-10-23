@@ -12,13 +12,15 @@ fn schedule_pack_declares_scheduled_event_note_kind() {
 }
 
 #[test]
-fn schedule_pack_declares_four_handlers() {
-    assert_eq!(SchedulePack::HANDLERS.len(), 4);
+fn schedule_pack_declares_six_handlers() {
+    assert_eq!(SchedulePack::HANDLERS.len(), 6);
     let names: Vec<&str> = SchedulePack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"schedule.remind"));
     assert!(names.contains(&"schedule.schedule"));
     assert!(names.contains(&"schedule.agenda"));
     assert!(names.contains(&"schedule.cancel"));
+    assert!(names.contains(&"schedule.occurrences"));
+    assert!(names.contains(&"schedule.receipts"));
 }
 
 #[test]
@@ -75,18 +77,20 @@ async fn schedule_pack_registry_with_comm_dispatches_remind() {
 }
 
 #[tokio::test]
-async fn schedule_pack_has_no_auxiliary_schema() {
+async fn schedule_pack_declares_exact_occurrence_schema() {
     use khive_runtime::PackRuntime;
+    let expected = include_str!("../sql/occurrence-schema.sql");
+    let declared = <SchedulePack as Pack>::SCHEMA_PLAN.expect("schedule owns occurrence DDL");
+    assert_eq!(declared.pack, "schedule");
+    assert_eq!(declared.statements, &[expected]);
     let pack = SchedulePack::new(support::memory_runtime());
-    assert!(
-        pack.schema_plan().is_empty(),
-        "schedule indexes on core tables belong to migration V51"
-    );
-    assert!(<SchedulePack as Pack>::SCHEMA_PLAN.is_none());
+    let actual = pack.schema_plan();
+    assert_eq!(actual.pack, "schedule");
+    assert_eq!(actual.statements, declared.statements);
 }
 
 #[tokio::test]
-async fn registry_includes_schedule_without_core_table_ddl() {
+async fn registry_includes_schedule_auxiliary_schema_and_keeps_kg_empty() {
     let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
@@ -97,8 +101,16 @@ async fn registry_includes_schedule_without_core_table_ddl() {
     assert_eq!(names, ["kg", "schedule"]);
     let plans = registry.all_schema_plans();
     assert_eq!(plans.len(), 2, "both registered packs contribute a plan");
-    assert!(
-        plans.iter().all(|plan| plan.is_empty()),
-        "kg and schedule need no auxiliary DDL; core indexes come from migrations"
+    assert!(<khive_pack_kg::KgPack as Pack>::SCHEMA_PLAN.is_none());
+    assert_eq!(
+        plans.iter().filter(|plan| plan.is_empty()).count(),
+        1,
+        "core KG tables stay migration-owned"
     );
+    let schedule = plans.iter().find(|plan| plan.pack == "schedule").unwrap();
+    assert_eq!(
+        schedule.statements,
+        &[include_str!("../sql/occurrence-schema.sql")]
+    );
+    assert_eq!(plans.iter().filter(|plan| !plan.is_empty()).count(), 1);
 }

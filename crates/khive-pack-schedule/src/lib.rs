@@ -7,6 +7,8 @@
 //! property is display metadata only and is never an authorization source.
 pub mod handlers;
 pub mod misfire;
+pub mod occurrence;
+pub mod occurrence_store;
 mod pack;
 pub mod repeat;
 mod tests;
@@ -22,3 +24,6 @@ pub const CREATOR_PROVENANCE_VERB: &str = "schedule.creator_provenance";
 
 /// Payload marker for the current creator-provenance event schema.
 pub const CREATOR_PROVENANCE_MARKER_V1: &str = "schedule_creator_v1";
+
+#[cfg(test)]
+mod occurrence_tests;
