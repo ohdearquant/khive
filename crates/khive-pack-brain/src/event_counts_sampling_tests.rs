@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use khive_pack_kg::KgPack;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{Event, EventFilter};
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use serde_json::{json, Value};
@@ -465,4 +465,54 @@ fn event_counts_sampling_population_excludes_counterfeit_sampling() {
         assert_eq!(result["counts_by_verb"][verb], 1);
         assert_eq!(result["total_cost_unit"], 1);
     }
+}
+
+// The grouping names the sampled verbs as literals; this pins them to the runtime's policy table,
+// so a sampled verb added there is reported here too, and an omitted verb never is.
+#[tokio::test]
+async fn event_counts_sampling_metadata_covers_exactly_the_sampled_policy_verbs() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        brain_profile: None,
+        actor_id: Some(CALLER.into()),
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(CALLER.into()));
+    builder
+        .register(KgPack::new(runtime.clone()))
+        .register(BrainPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    let mut sampled: Vec<&str> = VerbRegistry::AUDIT_SUCCESS_ROW_SAMPLED_VERBS
+        .iter()
+        .map(|(_, verb, _, _)| *verb)
+        .collect();
+    let omitted = VerbRegistry::AUDIT_SUCCESS_ROW_OMITTED_VERBS
+        .iter()
+        .map(|(_, verb)| *verb);
+    let store = runtime.backend().events_for_namespace("local").unwrap();
+    for (i, verb) in sampled.iter().copied().chain(omitted).enumerate() {
+        let mut event = row(
+            verb,
+            EventKind::Audit,
+            EventOutcome::Success,
+            Some(sampling(10, 0, "sample")),
+            SINCE + i as i64,
+        );
+        event.id = Uuid::from_u128(i as u128 + 1);
+        store.append_event(event).await.unwrap();
+    }
+    let result = registry
+        .dispatch("brain.event_counts", window(json!({})))
+        .await
+        .unwrap();
+    let reported: Vec<&str> = result["sampled_success_rows"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    sampled.sort_unstable();
+    assert_eq!(reported, sampled);
 }
