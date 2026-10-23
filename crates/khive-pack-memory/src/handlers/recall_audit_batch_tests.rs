@@ -1018,7 +1018,21 @@ async fn full_queue_refuses_real_handler_row_without_extra_writer_or_fallback() 
         .events_for_namespace(REQUEST_NS)
         .unwrap();
     for expected in [sentinel_event, filler_event] {
-        assert_eq!(f.spy.get_event(expected.id).await.unwrap(), None);
+        let recorded: Vec<Event> = f
+            .spy
+            .batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|event| event.id == expected.id)
+            .cloned()
+            .collect();
+        assert_eq!(recorded, vec![expected.clone()]);
+        // Both handles share SQLite: by-ID reads retain the row's request namespace.
+        let stored = f.spy.get_event(expected.id).await.unwrap().unwrap();
+        assert_eq!(stored.namespace, REQUEST_NS);
+        assert_eq!(stored, expected);
         assert_eq!(
             request_events.get_event(expected.id).await.unwrap(),
             Some(expected)

@@ -108,3 +108,35 @@ async fn test_outcome_roundtrip() {
     let fetched = store.get_event(denied_id).await.unwrap().unwrap();
     assert_eq!(fetched.outcome, EventOutcome::Denied);
 }
+
+#[tokio::test]
+async fn get_event_by_id_is_namespace_agnostic() {
+    let source = setup_memory_store();
+    let target = SqlEventStore::new_scoped(Arc::clone(&source.pool), false, "target");
+    let event = make_event("default").with_payload(json!({
+        "result_kind": "note",
+        "text": "the source event survives a lookup through the target handle",
+    }));
+    source.append_event(event.clone()).await.unwrap();
+
+    assert_eq!(
+        source.get_event(event.id).await.unwrap(),
+        Some(event.clone())
+    );
+    assert_eq!(target.get_event(event.id).await.unwrap(), Some(event));
+    assert!(target.get_event(Uuid::new_v4()).await.unwrap().is_none());
+    // Multi-record queries retain the namespace bound to their store handle.
+    let target_page = target
+        .query_events(EventFilter::default(), PageRequest::default())
+        .await
+        .unwrap();
+    assert!(target_page.items.is_empty());
+    assert_eq!(
+        target.count_events(EventFilter::default()).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        source.count_events(EventFilter::default()).await.unwrap(),
+        1
+    );
+}
