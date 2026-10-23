@@ -28,6 +28,7 @@ blake3 = { workspace = true, features = ["std"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+khive-runtime = { version = "0.14.0", path = "../khive-runtime", features = ["test-internals"] }
 tokio = { workspace = true, features = ["test-util"] }
 khive-db = { version = "0.14.0", path = "../khive-db" }
 khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
