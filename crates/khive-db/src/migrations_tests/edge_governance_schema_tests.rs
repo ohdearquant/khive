@@ -297,7 +297,7 @@ fn edge_governance_upgrade_reopen_and_replay_preserve_existing_rows() {
     let history = rows(&conn, "SELECT * FROM _schema_migrations ORDER BY version");
     run_migrations(&mut conn).unwrap();
     assert!(table_exists(&conn, "edge_governance_active"));
-    assert_eq!(read_schema_version(&conn).unwrap(), 61);
+    assert_eq!(read_schema_version(&conn).unwrap(), latest_schema_version());
     assert_eq!(rows(&conn, "SELECT rowid,* FROM notes ORDER BY id"), notes);
     assert_eq!(
         rows(&conn, "SELECT rowid,* FROM graph_edges ORDER BY id"),
@@ -336,7 +336,7 @@ fn edge_governance_upgrade_reopen_and_replay_preserve_existing_rows() {
     // Rewind only the migration ledger, as older-tail replay tests do; the
     // installed schema and governance rows already exist when V61 runs again.
     reopened
-        .execute("DELETE FROM _schema_migrations WHERE version=61", [])
+        .execute("DELETE FROM _schema_migrations WHERE version >= 61", [])
         .unwrap();
     let schema_version: i64 = reopened
         .pragma_query_value(None, "schema_version", |row| row.get(0))

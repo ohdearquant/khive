@@ -86,7 +86,7 @@ impl EventSink {
     }
 }
 
-/// Discriminant for the 42 typed event variants produced by the verb dispatch path
+/// Discriminant for the 43 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -177,11 +177,13 @@ pub enum EventKind {
     PhaseCancelled,
     /// An attempted operation was refused while retaining its existing subject.
     Refusal,
+    /// An authority record changed with its attributable transactional history.
+    GrantChange,
 }
 
 impl EventKind {
-    /// All 42 event kind variants in declaration order.
-    pub const ALL: [Self; 42] = [
+    /// All 43 event kind variants in declaration order.
+    pub const ALL: [Self; 43] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -224,6 +226,7 @@ impl EventKind {
         Self::PhaseCompleted,
         Self::PhaseCancelled,
         Self::Refusal,
+        Self::GrantChange,
     ];
 
     /// Return this class's explicitly declared persistence destination.
@@ -274,6 +277,7 @@ impl EventKind {
             Self::PhaseCompleted => EventSink::CallerEventStore,
             Self::PhaseCancelled => EventSink::CallerEventStore,
             Self::Refusal => EventSink::CallerEventStore,
+            Self::GrantChange => EventSink::CallerEventStore,
         }
     }
 
@@ -322,6 +326,7 @@ impl EventKind {
             Self::PhaseCompleted => "phase_completed",
             Self::PhaseCancelled => "phase_cancelled",
             Self::Refusal => "refusal",
+            Self::GrantChange => "grant_change",
         }
     }
 }
@@ -375,6 +380,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "phase_completed",
     "phase_cancelled",
     "refusal",
+    "grant_change",
 ];
 
 impl core::str::FromStr for EventKind {
@@ -424,6 +430,7 @@ impl core::str::FromStr for EventKind {
             "phase_completed" => Ok(Self::PhaseCompleted),
             "phase_cancelled" => Ok(Self::PhaseCancelled),
             "refusal" => Ok(Self::Refusal),
+            "grant_change" => Ok(Self::GrantChange),
             other => Err(crate::error::UnknownVariant::new(
                 "event_kind",
                 other,
