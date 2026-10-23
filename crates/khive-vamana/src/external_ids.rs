@@ -163,33 +163,23 @@ pub(crate) fn verify_original_dir_identity(
     dir: &std::path::Path,
     canonical_dir: &std::fs::File,
 ) -> Result<(), ExternalIdsWriteError> {
+    use khive_fs::directory_walk::open_dir_nofollow;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::io::FromRawFd as _;
 
-    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
+    // Keep the caller's typed NUL-path error before the shared open's I/O mapping.
+    std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
         ExternalIdsWriteError::InvalidPath {
             context: "segment dir path",
             detail: e.to_string(),
         }
     })?;
-    // SAFETY: `c_dir` is NUL-terminated for the call; the returned fd is
-    // uniquely owned and wrapped immediately below.
-    let original_fd = unsafe {
-        libc::open(
-            c_dir.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if original_fd < 0 {
-        return Err(ExternalIdsWriteError::io(
+    let original_dir = std::fs::File::from(open_dir_nofollow(dir).map_err(|error| {
+        ExternalIdsWriteError::io(
             "open original segment dir without following final component",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `original_fd` was returned by the successful `open` above and
-    // is uniquely owned by this `File`.
-    let original_dir = unsafe { std::fs::File::from_raw_fd(original_fd) };
+            error,
+        )
+    })?);
     let original_meta = original_dir
         .metadata()
         .map_err(|e| ExternalIdsWriteError::io("stat original segment dir", e))?;
@@ -492,6 +482,59 @@ pub fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn original_directory_verification_refuses_replacement_and_final_symlink() {
+        let root = tempdir();
+        let original_path = root.path().join("segment");
+        let moved_path = root.path().join("moved");
+        std::fs::create_dir(&original_path).unwrap();
+        let original = std::fs::File::open(&original_path).unwrap();
+        verify_original_dir_identity(&original_path, &original).unwrap();
+
+        std::fs::rename(&original_path, &moved_path).unwrap();
+        std::fs::create_dir(&original_path).unwrap();
+        assert!(matches!(
+            verify_original_dir_identity(&original_path, &original),
+            Err(ExternalIdsWriteError::DirectoryIdentityChanged)
+        ));
+
+        std::fs::remove_dir(&original_path).unwrap();
+        std::os::unix::fs::symlink(&moved_path, &original_path).unwrap();
+        let error = verify_original_dir_identity(&original_path, &original).unwrap_err();
+        let ExternalIdsWriteError::Io { context, source } = error else {
+            panic!("expected final-component open refusal, got {error}");
+        };
+        assert_eq!(
+            context,
+            "open original segment dir without following final component"
+        );
+        assert!(source.raw_os_error().is_some());
+        assert_eq!(std::fs::read_link(&original_path).unwrap(), moved_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn original_directory_verification_preserves_nul_path_error() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempdir();
+        let original = std::fs::File::open(root.path()).unwrap();
+        let bytes = b"segment\0suffix";
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(bytes));
+        let error = verify_original_dir_identity(path, &original).unwrap_err();
+        let ExternalIdsWriteError::InvalidPath { context, detail } = error else {
+            panic!("expected typed path refusal, got {error}");
+        };
+        assert_eq!(context, "segment dir path");
+        assert_eq!(
+            detail,
+            std::ffi::CString::new(bytes.as_slice())
+                .unwrap_err()
+                .to_string()
+        );
+    }
 
     fn tempdir() -> tempfile::TempDir {
         let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
