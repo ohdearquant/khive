@@ -98,7 +98,7 @@ impl Category {
         while node < self.leaves {
             work();
             node *= 2;
-            if !self.tree[node].is_some_and(|index| keys[index].size <= budget) {
+            if self.tree[node].is_none_or(|index| keys[index].size > budget) {
                 node += 1;
             }
         }

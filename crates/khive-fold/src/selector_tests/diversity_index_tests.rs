@@ -321,9 +321,9 @@ fn seeded_diversity_selection_matches_frozen_reference() {
             let id = format!("id-{}", next_random(&mut state) % 5);
             let mut item = candidate(ordinal, &id, size, 0.0, category.as_deref());
             item.score = scores[(next_random(&mut state) % scores.len() as u64) as usize];
-            item.rank_score = (next_random(&mut state) % 4 != 0)
+            item.rank_score = (!next_random(&mut state).is_multiple_of(4))
                 .then(|| ranks[(next_random(&mut state) % ranks.len() as u64) as usize]);
-            item.information_gain = (next_random(&mut state) % 3 != 0)
+            item.information_gain = (!next_random(&mut state).is_multiple_of(3))
                 .then(|| gains[(next_random(&mut state) % gains.len() as u64) as usize]);
             inputs.push(item);
         }
