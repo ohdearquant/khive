@@ -233,11 +233,11 @@ impl Fixture {
     }
 
     fn write_schema(&self, value: &Value) {
-        fs::write(self.schema_path(), serde_yaml::to_string(value).unwrap()).unwrap();
+        fs::write(self.schema_path(), yaml_serde::to_string(value).unwrap()).unwrap();
     }
 
     fn read_schema(&self) -> Value {
-        serde_yaml::from_slice(&fs::read(self.schema_path()).unwrap()).unwrap()
+        yaml_serde::from_slice(&fs::read(self.schema_path()).unwrap()).unwrap()
     }
 
     fn command(&self) -> Command {
@@ -408,7 +408,7 @@ fn repeated_and_case_equivalent_commits_leave_exact_yaml_bytes_untouched() {
         schema["remotes"][1]["commit"] = json!(previous);
         let bytes = format!(
             "# keep this exact no-op comment\n{}\n# trailing comment\n",
-            serde_yaml::to_string(&schema).unwrap()
+            yaml_serde::to_string(&schema).unwrap()
         );
         fs::write(fixture.schema_path(), &bytes).unwrap();
         let protected = fixture.protected();
@@ -469,7 +469,7 @@ fn malformed_schema_and_remote_fields_refuse_without_mutation() {
     let mut documents = vec![
         "[broken".to_owned(),
         "[]\n".to_owned(),
-        format!("{}---\n{{}}\n", serde_yaml::to_string(&base).unwrap()),
+        format!("{}---\n{{}}\n", yaml_serde::to_string(&base).unwrap()),
     ];
     for version in [
         Value::Null,
@@ -480,22 +480,22 @@ fn malformed_schema_and_remote_fields_refuse_without_mutation() {
     ] {
         let mut schema = base.clone();
         schema["format_version"] = version;
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     for field in ["format_version", "remotes"] {
         let mut schema = base.clone();
         schema.as_object_mut().unwrap().remove(field);
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     for remotes in [json!({}), json!([false]), json!([])] {
         let mut schema = base.clone();
         schema["remotes"] = remotes;
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     let mut duplicate = base.clone();
     let selected = duplicate["remotes"][1].clone();
     duplicate["remotes"].as_array_mut().unwrap().push(selected);
-    documents.push(serde_yaml::to_string(&duplicate).unwrap());
+    documents.push(yaml_serde::to_string(&duplicate).unwrap());
     for (field, value) in [
         ("name", json!(7)),
         ("commit", Value::Null),
@@ -512,18 +512,18 @@ fn malformed_schema_and_remote_fields_refuse_without_mutation() {
     ] {
         let mut schema = base.clone();
         schema["remotes"][1][field] = value;
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     for field in ["name", "commit", "url"] {
         let mut schema = base.clone();
         schema["remotes"][1].as_object_mut().unwrap().remove(field);
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     for repository in ["../owner", "owner/../repo", "owner", "/repo", "owner/"] {
         let mut schema = base.clone();
         schema["remotes"][1].as_object_mut().unwrap().remove("url");
         schema["remotes"][1]["repo"] = json!(repository);
-        documents.push(serde_yaml::to_string(&schema).unwrap());
+        documents.push(yaml_serde::to_string(&schema).unwrap());
     }
     for document in documents {
         fs::write(fixture.schema_path(), document).unwrap();
@@ -635,7 +635,7 @@ fn missing_schema_and_nonregular_schema_are_not_fabricated_or_replaced() {
 fn schema_symlink_is_refused_without_writing_its_target() {
     let fixture = Fixture::new();
     let target = fixture.root.path().join("outside-schema.yaml");
-    let bytes = serde_yaml::to_string(&fixture.schema()).unwrap();
+    let bytes = yaml_serde::to_string(&fixture.schema()).unwrap();
     fs::write(&target, &bytes).unwrap();
     std::os::unix::fs::symlink(&target, fixture.schema_path()).unwrap();
     let output = fixture.update("origin", Some("v2")).output().unwrap();
