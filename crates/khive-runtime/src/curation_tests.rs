@@ -10330,7 +10330,16 @@ async fn committed_entity_update_records_event_before_reindex_failure() {
         )
         .await
         .expect_err("the injected reindex error must be surfaced");
-    assert!(error.to_string().contains("injected FTS failure"));
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected committed-update diagnostic");
+    };
+    let details = error.details().unwrap();
+    assert_eq!(details.get("committed"), Some("true"));
+    assert_eq!(details.get("retryable"), Some("false"));
+    assert!(details
+        .get("post_commit_degradations")
+        .unwrap()
+        .contains("fts_prepare"));
     assert_eq!(rt.get_entity(&tok, entity.id).await.unwrap().name, "After");
     let events = rt
         .events(&tok)
