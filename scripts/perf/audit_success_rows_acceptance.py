@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -156,9 +157,13 @@ def run_live(binary, case, receipt):
     config = work / "config.toml"
     config.write_text("")
     db, sock, pid = (work / name for name in ("data.db", "s", "p"))
+    # A scratch home, as the other perf drivers give the binary: it holds the SQLite volume-lock
+    # directory, which the binary refuses to open a database without, and keeps state out of the real one.
+    home = work / "home"
+    home.mkdir()
     mbc.assert_not_live_db(db)
     env = {key: value for key, value in os.environ.items() if key in ("PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH")}
-    env.update({"KHIVE_DB": str(db), "KHIVE_SOCKET": str(sock), "KHIVE_PID": str(pid), "KHIVE_LOCK": str(work / "l"), "KHIVE_RECOVERER_LOCK": str(work / "r"), "KHIVE_CONFIG": str(config), "KHIVE_PACKS": "kg,brain,comm", "KHIVE_ACTOR": "audit-acceptance", "KHIVE_AUDIT_SUCCESS_ROWS": mode, "KHIVE_EVENTS_SPLIT": "0", "KHIVE_DAEMON_STRICT": "1", "XDG_CONFIG_HOME": str(work / "config"), "XDG_CACHE_HOME": str(work / "cache")})
+    env.update({"HOME": str(home), "KHIVE_DB": str(db), "KHIVE_SOCKET": str(sock), "KHIVE_PID": str(pid), "KHIVE_LOCK": str(work / "l"), "KHIVE_RECOVERER_LOCK": str(work / "r"), "KHIVE_CONFIG": str(config), "KHIVE_PACKS": "kg,brain,comm", "KHIVE_ACTOR": "audit-acceptance", "KHIVE_AUDIT_SUCCESS_ROWS": mode, "KHIVE_EVENTS_SPLIT": "0", "KHIVE_DAEMON_STRICT": "1", "XDG_CONFIG_HOME": str(work / "config"), "XDG_CACHE_HOME": str(work / "cache")})
     command = [str(binary), "mcp", "--log", "warn"]
     report = {"case": case, "mode": mode, "status": "FAIL", "command": command, "environment": env, "binary_sha256": digest(binary), "source_sha256": digest(__file__), "lock_sha256": digest(source_lock_path()), "config_sha256": digest(config), "protocol_version": mbc.PROTOCOL_VERSION, "samples": [], "replies": [], "rows": [], "teardown": "pending"}
     proc = None
@@ -233,7 +238,13 @@ def run_live(binary, case, receipt):
         report["stderr"] = (work / "stderr").read_text(errors="replace")
         daemon_pid, _ = mbc.read_pid_file(str(pid))
         mbc.teardown_daemon(str(pid), scratch)
+        # The shared helper waits two seconds after SIGTERM, and the daemon's graceful shutdown can take longer and
+        # rewrites its lock file on the way out: wait for the exit before judging, then remove the scratch tree again.
+        deadline = time.monotonic() + 30
+        while daemon_pid is not None and mbc.pid_alive(daemon_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
         gone = daemon_pid is None or not mbc.pid_alive(daemon_pid)
+        shutil.rmtree(scratch, ignore_errors=True)
         report["teardown"] = "PASS" if gone else "FAIL"
         if not gone:
             report["status"] = "FAIL"
