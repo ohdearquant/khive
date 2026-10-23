@@ -254,28 +254,16 @@ fn compiled_handler_metadata_matches_shrink_only_legacy_baseline() {
         names.len(),
         "duplicate pack factories"
     );
-    for required in [
-        "kg",
-        "gtd",
-        "memory",
-        "brain",
-        "comm",
-        "schedule",
-        "knowledge",
-        "session",
-        "tool",
-        "exec",
-        "git",
-        "code",
-        "workspace",
-        "blob",
-        "charter",
-    ] {
+    for required in RuntimeConfig::built_in_packs() {
         assert!(
-            names.iter().any(|name| name == required),
+            names.contains(&required),
             "missing default-linked pack {required}"
         );
     }
+    assert!(
+        names.iter().any(|name| name == "charter"),
+        "missing linked charter pack"
+    );
     for (name, enabled) in [
         ("agent", cfg!(feature = "pack-agent")),
         ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -309,7 +297,8 @@ fn compiled_handler_metadata_matches_shrink_only_legacy_baseline() {
     let handlers = metadata.all_handlers_with_names();
     assert!(!handlers.is_empty(), "handler census must not be vacuous");
     let mut params = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors =
+        handler_name_diagnostics(handlers.iter().map(|(pack, handler)| (*pack, handler.name)));
     for (pack, handler) in &handlers {
         if handler.description.trim().is_empty() {
             errors.push(format!("EMPTY_DESCRIPTION: {pack}.{}", handler.name));
@@ -583,4 +572,40 @@ fn active_baseline_is_duplicate_free_and_preserves_owner_issue() {
         &mismatch,
         "BASELINE_ISSUE_MISMATCH: neighbors.node_id"
     ));
+}
+
+fn handler_name_diagnostics<'a>(
+    handlers: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<String> {
+    let mut first_packs = BTreeMap::new();
+    let mut errors = Vec::new();
+    for (pack, name) in handlers {
+        if let Some(first_pack) = first_packs.get(name) {
+            errors.push(format!(
+                "DUPLICATE_HANDLER_NAME: {name} ({first_pack}, {pack})"
+            ));
+        } else {
+            first_packs.insert(name, pack);
+        }
+    }
+    errors
+}
+
+#[test]
+fn handler_name_diagnostics_reject_duplicates_and_accept_distinct_names() {
+    assert!(handler_name_diagnostics([
+        ("alpha", "alpha.one"),
+        ("alpha", "alpha.two"),
+        ("beta", "beta.one"),
+    ])
+    .is_empty());
+    assert_eq!(
+        handler_name_diagnostics([("alpha", "internal.shared"), ("beta", "internal.shared"),]),
+        vec!["DUPLICATE_HANDLER_NAME: internal.shared (alpha, beta)".to_owned()],
+        "duplicate handler names must be reported"
+    );
+    assert_eq!(
+        handler_name_diagnostics([("alpha", "internal.shared"), ("alpha", "internal.shared"),]),
+        vec!["DUPLICATE_HANDLER_NAME: internal.shared (alpha, alpha)".to_owned()]
+    );
 }
