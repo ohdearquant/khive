@@ -1223,8 +1223,8 @@ without removing the row (`crates/khive-runtime/src/audit_batch.rs:911-920`). Th
 an unconfirmed audit write from a failed domain operation, and explain the retained read wait in #3730.
 
 Source line references in this amendment and the in-place citation corrections refer to repository revision
-`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`. Section and decision references identify the amended text independently
-of line movement.
+`7d6ff8fde3a801afdc16d3cd13b6410731cb03ae`, except line references to this record itself, which refer to this file as
+amended here. Section and decision references identify the amended text independently of line movement.
 
 ### Decision 1 -- One release table for D1, INV-1 and INV-4
 
