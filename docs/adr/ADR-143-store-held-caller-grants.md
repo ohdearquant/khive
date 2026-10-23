@@ -656,6 +656,8 @@ and bootstrap are stated in ADR-193 Amendment 5 D1, D4, D6 and D7. No other righ
 
 Status: Proposed.
 
+This amendment serves the project owner's instruction of 2026-10-22, rendered: "So they connect: charter + gate + privileges, the whole automated permission system has nearly taken shape in khive". ADR-193 Amendment 5 serves the same instruction and states it in its opening paragraph; this amendment supplies the administration surface that amendment's D1 requires.
+
 This amendment defines the administration wire contract required by ADR-193 Amendment 5 D1. Sections M3.1–7 are proposed requirements; M3.8 states their verification obligations. ADR-193 Amendment 5 remains the sole definition of observation permission fields, matching, source contracts, receipts and evidence eligibility.
 
 **Explicit amendment to staging:** the minimum standing-right profile below may operate before completion of ADR-129 Stage 1b/1c. For this profile, ADR-143 §2's one-instance boot construction is satisfied by one boot-assembled gate composition owning one shared authority service. It does not require that composition already implement general `CapabilityGate` dispatch. This qualifies construction order only for this profile; it neither completes those stages nor changes the requirements for the Stage 2 default flip.
