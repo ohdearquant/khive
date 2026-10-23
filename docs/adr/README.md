@@ -236,6 +236,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-206](ADR-206-crate-performance-guarantees.md)                      | Crate Performance Guarantees                                                                               |
 | [ADR-207](ADR-207-runtime-actor-registry.md)                            | Runtime Actor Registry and Authenticated Operation Context                                                 |
 | [ADR-208](ADR-208-charter-workflows.md)                                 | Charter Workflows — Declared Topologies over Registered Phrases                                            |
+| [ADR-209](ADR-209-root-policy-overrides-and-flow-history.md)            | Root Policy Overrides, Resource Grants, and Verifiable Flow History                                        |
 
 <!-- END GENERATED ADR CATALOG -->
 
