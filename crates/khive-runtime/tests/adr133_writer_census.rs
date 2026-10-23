@@ -155,15 +155,20 @@ fn writer_census_is_revision_and_pack_pinned() {
 fn writer_census_active_profile_projects_historical_population() {
     // Only the active population is projected. The manifest entries and their
     // classifications still describe the exact historical fourteen-pack set.
+    let optional_pack_features = [
+        ("git", cfg!(feature = "pack-git")),
+        ("code", cfg!(feature = "pack-code")),
+        ("tool", cfg!(feature = "pack-tool")),
+        ("exec", cfg!(feature = "pack-exec")),
+        ("workspace", cfg!(feature = "pack-workspace")),
+    ];
     let mut projected: Vec<String> = HISTORICAL_PACK_SET
         .into_iter()
-        .filter(|pack| match *pack {
-            "git" => cfg!(feature = "pack-git"),
-            "code" => cfg!(feature = "pack-code"),
-            "tool" => cfg!(feature = "pack-tool"),
-            "exec" => cfg!(feature = "pack-exec"),
-            "workspace" => cfg!(feature = "pack-workspace"),
-            _ => true,
+        .filter(|pack| {
+            optional_pack_features
+                .iter()
+                .find(|(name, _)| name == pack)
+                .is_none_or(|(_, enabled)| *enabled)
         })
         .map(str::to_owned)
         .collect();
