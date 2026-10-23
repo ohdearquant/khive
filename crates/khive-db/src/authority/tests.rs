@@ -1,5 +1,6 @@
 use super::*;
 use crate::{ConnectionPool, SqlBridge, StorageBackend};
+use khive_storage::WriterTaskRequestState;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -10,6 +11,24 @@ struct Fixture {
     changes: [AuthorityChange; 2],
     replay_key: ReplayKey,
     replay: AuthorityReplay,
+}
+
+// A write refused inside `transaction` rolls the transaction back, so the
+// bound refusal arrives wrapped in the writer's rolled-back request error.
+fn rolled_back_input(result: StorageResult<()>) -> String {
+    match result {
+        Err(StorageError::WriterTaskRequestFailed {
+            request_state,
+            source,
+        }) => {
+            assert_eq!(request_state, WriterTaskRequestState::TransactionRolledBack);
+            match *source {
+                StorageError::InvalidInput { message, .. } => message,
+                other => panic!("expected an input refusal, got {other:?}"),
+            }
+        }
+        other => panic!("expected a rolled-back write, got {other:?}"),
+    }
 }
 
 fn fixture() -> Fixture {
@@ -434,8 +453,12 @@ async fn record_body_bound_is_independent_of_request_replay_and_manifest_bounds(
         Box::pin(async move { tx.insert_record(&oversized_record).await })
     })
     .await;
+    let message = rolled_back_input(result);
     assert!(
-        matches!(result, Err(StorageError::InvalidInput { message, .. }) if message.contains("record body") && message.contains("2097153") && message.contains("1..=2097152"))
+        message.contains("record body")
+            && message.contains("2097153")
+            && message.contains("1..=2097152"),
+        "{message}"
     );
     transaction(&bridge, move |mut tx| {
         Box::pin(async move {
@@ -463,8 +486,12 @@ async fn record_body_bound_is_independent_of_request_replay_and_manifest_bounds(
             Box::pin(async move { tx.insert_replay(&key, &replay).await })
         })
         .await;
+        let message = rolled_back_input(result);
         assert!(
-            matches!(result, Err(StorageError::InvalidInput { message, .. }) if message.contains(expected_field) && message.contains("1048577") && message.contains("1..=1048576"))
+            message.contains(expected_field)
+                && message.contains("1048577")
+                && message.contains("1..=1048576"),
+            "{message}"
         );
         assert_eq!(
             transaction(&bridge, move |mut tx| Box::pin(async move {
@@ -482,8 +509,12 @@ async fn record_body_bound_is_independent_of_request_replay_and_manifest_bounds(
         Box::pin(async move { tx.insert_epoch(&manifest).await })
     })
     .await;
+    let message = rolled_back_input(result);
     assert!(
-        matches!(result, Err(StorageError::InvalidInput { message, .. }) if message.contains("manifest") && message.contains("1048577") && message.contains("1..=1048576"))
+        message.contains("manifest")
+            && message.contains("1048577")
+            && message.contains("1..=1048576"),
+        "{message}"
     );
     assert_eq!(
         transaction(&fresh, |mut tx| Box::pin(async move { tx.epoch().await }))
