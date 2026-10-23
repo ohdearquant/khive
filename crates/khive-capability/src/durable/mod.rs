@@ -106,3 +106,13 @@ mod tests;
 
 #[cfg(test)]
 mod fixtures;
+
+#[cfg(feature = "authority-store")]
+pub(crate) fn canonical_principal(value: &Principal) -> EnvelopeResult<Vec<u8>> {
+    codec::encode(value)
+}
+
+#[cfg(feature = "authority-store")]
+pub(crate) fn canonical_rights(value: &[RightSpec]) -> EnvelopeResult<Vec<u8>> {
+    codec::encode(&value.to_vec())
+}

@@ -312,3 +312,71 @@ pub(super) fn transition(row: SqlRow) -> StorageResult<AuthorityTransition> {
         body: blob(&row, "body")?,
     })
 }
+
+pub(super) fn change_event(
+    row: SqlRow,
+) -> StorageResult<(AuthorityChange, khive_storage::event::Event)> {
+    use khive_types::{EventKind, EventOutcome, RefResolution, SubstrateKind};
+    if text(&row, "kind")? != EventKind::GrantChange.to_string()
+        || text(&row, "substrate")? != SubstrateKind::Event.to_string()
+        || text(&row, "outcome")? != EventOutcome::Success.to_string()
+        || integer(&row, "payload_schema_version")? != 1
+    {
+        return Err(invalid(
+            "authority history requires successful schema1 GrantChange Event",
+        ));
+    }
+    fn optional_integer(row: &SqlRow, name: &str) -> StorageResult<Option<i64>> {
+        match row.get(name) {
+            Some(SqlValue::Null) => Ok(None),
+            Some(SqlValue::Integer(value)) => Ok(Some(*value)),
+            _ => Err(invalid(format!("expected nullable integer column {name}"))),
+        }
+    }
+    let profile_state_version = optional_integer(&row, "profile_state_version")?
+        .map(|value| u64::try_from(value).map_err(|_| invalid("negative profile state version")))
+        .transpose()?;
+    let op_index = optional_integer(&row, "op_index")?
+        .map(|value| u32::try_from(value).map_err(|_| invalid("operation index outside u32 range")))
+        .transpose()?;
+    let ref_resolution = optional_text(&row, "ref_resolution")?
+        .map(|value| {
+            value
+                .parse::<RefResolution>()
+                .map_err(|_| invalid("invalid reference resolution"))
+        })
+        .transpose()?;
+    if op_index.is_some() != ref_resolution.is_some() {
+        return Err(invalid(
+            "event operation attribution must be present or absent together",
+        ));
+    }
+    let event = khive_storage::event::Event {
+        id: row_id(&row, "id")?,
+        namespace: text(&row, "namespace")?,
+        verb: text(&row, "verb")?,
+        substrate: SubstrateKind::Event,
+        actor: text(&row, "actor")?,
+        kind: EventKind::GrantChange,
+        outcome: EventOutcome::Success,
+        payload: serde_json::from_str(&text(&row, "payload")?)
+            .map_err(|_| invalid("invalid authority event JSON"))?,
+        payload_schema_version: 1,
+        profile_state_version,
+        duration_us: integer(&row, "duration_us")?,
+        target_id: optional_row_id(&row, "target_id")?,
+        session_id: optional_row_id(&row, "session_id")?,
+        aggregate_kind: optional_text(&row, "aggregate_kind")?,
+        aggregate_id: optional_row_id(&row, "aggregate_id")?,
+        created_at: integer(&row, "created_at")?,
+        op_index,
+        ref_resolution,
+    };
+    let change = change(row)?;
+    if event.id != change.event_id {
+        return Err(invalid(
+            "event and authority association identities disagree",
+        ));
+    }
+    Ok((change, event))
+}

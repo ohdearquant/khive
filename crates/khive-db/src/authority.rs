@@ -333,6 +333,24 @@ impl AuthorityTransaction<'_> {
         Ok(page(values, limit, |value| value.event_id))
     }
 
+    /// Exact immutable history read on the owning writer. The caller establishes
+    /// read visibility; this helper is not a public paging or authorization API.
+    pub async fn change_event(
+        &mut self,
+        epoch_id: Uuid,
+        event_id: Uuid,
+    ) -> StorageResult<Option<(AuthorityChange, Event)>> {
+        self.writer
+            .query_row(statement(
+                "authority.change-event",
+                include_str!("../sql/authority-change-event.sql"),
+                vec![id(epoch_id), id(event_id)],
+            ))
+            .await?
+            .map(rows::change_event)
+            .transpose()
+    }
+
     /// The service must recheck current authorization before calling this method.
     pub async fn replay(&mut self, key: &ReplayKey) -> StorageResult<Option<AuthorityReplay>> {
         self.writer
