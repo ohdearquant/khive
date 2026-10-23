@@ -173,7 +173,8 @@ fn exec_factory_and_explicit_selection_follow_the_feature() {
     );
     let mut selection = vec!["kg".to_string(), "exec".to_string()];
     if cfg!(feature = "pack-exec") {
-        assert!(cfg!(feature = "pack-tool"));
+        #[cfg(feature = "pack-exec")]
+        const _: () = assert!(cfg!(feature = "pack-tool"));
         selection.extend(["blob".to_string(), "tool".to_string()]);
     }
     let result = PackRegistry::validate_pack_selection(&selection);
@@ -244,7 +245,8 @@ fn workspace_factory_and_explicit_selection_follow_the_feature() {
     );
     let mut selection = vec!["kg".to_string(), "workspace".to_string()];
     if cfg!(feature = "pack-workspace") {
-        assert!(cfg!(feature = "pack-git"));
+        #[cfg(feature = "pack-workspace")]
+        const _: () = assert!(cfg!(feature = "pack-git"));
         selection.extend(["git".to_string(), "gtd".to_string(), "session".to_string()]);
     }
     let result = PackRegistry::validate_pack_selection(&selection);
