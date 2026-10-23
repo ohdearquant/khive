@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chacha20poly1305::{AeadInPlace, KeyInit, Tag, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use rand::{rngs::SysRng, TryRng};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -125,10 +125,10 @@ impl ReceiptSealer {
             entry.id.len(),
         )?;
         let tag = cipher
-            .encrypt_in_place_detached(
-                XNonce::from_slice(&nonce),
+            .encrypt_inout_detached(
+                &XNonce::from(nonce),
                 &associated_data(&entry.id),
-                plaintext.as_mut_slice(),
+                plaintext.as_mut_slice().into(),
             )
             .map_err(|_| ReceiptSealError::InvalidReceipt)?;
         let mut envelope =
@@ -153,13 +153,19 @@ impl ReceiptSealer {
         let cipher = self.cipher(id)?;
         let nonce_end = header_end + NONCE_BYTES;
         let tag_start = envelope.len() - TAG_BYTES;
+        let nonce: &XNonce = (&envelope[header_end..nonce_end])
+            .try_into()
+            .map_err(|_| ReceiptSealError::InvalidReceipt)?;
+        let tag: &Tag = (&envelope[tag_start..])
+            .try_into()
+            .map_err(|_| ReceiptSealError::InvalidReceipt)?;
         let mut plaintext = Zeroizing::new(envelope[nonce_end..tag_start].to_vec());
         cipher
-            .decrypt_in_place_detached(
-                XNonce::from_slice(&envelope[header_end..nonce_end]),
+            .decrypt_inout_detached(
+                nonce,
                 &associated_data(id),
-                plaintext.as_mut_slice(),
-                Tag::from_slice(&envelope[tag_start..]),
+                plaintext.as_mut_slice().into(),
+                tag,
             )
             .map_err(|_| ReceiptSealError::InvalidReceipt)?;
         decode_plaintext(&plaintext)

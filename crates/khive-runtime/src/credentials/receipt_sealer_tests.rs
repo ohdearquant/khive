@@ -234,7 +234,7 @@ fn authenticated_token(plaintext: &[u8], aad: &[u8]) -> String {
     let nonce = [31_u8; 24];
     let mut body = plaintext.to_vec();
     let tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut body)
+        .encrypt_inout_detached(&XNonce::from(nonce), aad, body.as_mut_slice().into())
         .unwrap();
     let mut envelope = vec![2, 3, b'n', b'e', b'w'];
     envelope.extend_from_slice(&nonce);
