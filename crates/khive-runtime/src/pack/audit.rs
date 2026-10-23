@@ -77,7 +77,81 @@ pub(super) fn build_audit_storage_event(
     if let Some(target_id) = target_id_from_args(&gate_req.verb, &gate_req.args) {
         storage_event = storage_event.with_target(target_id);
     }
+    if outcome == EventOutcome::Denied {
+        stamp_error_class(
+            &mut storage_event,
+            crate::audit_error::AuditErrorClass::GateRefusal,
+        );
+    }
     storage_event
+}
+
+/// Add one closed failure token; never copy error text or stamp success rows.
+pub(super) fn stamp_error_class(event: &mut Event, class: crate::audit_error::AuditErrorClass) {
+    if event.outcome != EventOutcome::Success {
+        if let Value::Object(ref mut payload) = event.payload {
+            payload.insert("error_class".into(), Value::from(class.as_str()));
+        }
+    }
+}
+
+/// Add the three ADR-174 truncation facts to the existing successful audit.
+/// Other verbs, the resource payload and the event envelope are untouched.
+pub(super) fn enrich_stream_truncate_success(
+    event: &mut Event,
+    gate_req: &GateRequest,
+    result: &Value,
+) {
+    if gate_req.verb != "stream.truncate" {
+        return;
+    }
+    let (Some(stream), Some(before_seq), Some(removed)) = (
+        gate_req.args.get("stream").and_then(Value::as_str),
+        gate_req.args.get("before_seq").and_then(Value::as_i64),
+        result.get("removed").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    if let Value::Object(ref mut payload) = event.payload {
+        payload.insert("stream".into(), Value::String(stream.into()));
+        payload.insert("before_seq".into(), Value::from(before_seq));
+        payload.insert("removed".into(), Value::from(removed));
+    }
+}
+
+/// Content-free query shape on successful search dispatch rows only.
+/// Arm facts come from execution, never from hit provenance or hit counts.
+/// `effective_limit` is the effective public limit (default 10, maximum 100), not the
+/// larger candidate window used internally before filtering.
+pub(super) fn enrich_search_success(
+    event: &mut Event,
+    gate_req: &GateRequest,
+    result: &Value,
+    arms: crate::search_audit::SearchArms,
+) {
+    if gate_req.verb != "search" {
+        return;
+    }
+    let Some(rows) = result.as_array() else {
+        return;
+    };
+    let match_mode = match gate_req.args.get("text_mode").and_then(Value::as_str) {
+        None | Some("all_terms") => "all_terms",
+        Some("any_term") => "any_term",
+        Some(_) => return,
+    };
+    let limit = gate_req
+        .args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .min(100);
+    if let Value::Object(ref mut payload) = event.payload {
+        payload.insert("match_mode".into(), Value::from(match_mode));
+        payload.insert("arms".into(), Value::from(arms.as_str()));
+        payload.insert("effective_limit".into(), Value::from(limit));
+        payload.insert("result_count".into(), Value::from(rows.len()));
+    }
 }
 
 /// Process-wide pure-observability audit appends whose errors were logged
@@ -728,3 +802,7 @@ pub fn resolve_explicit_namespace(
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "stream_truncate_audit_tests.rs"]
+mod stream_truncate_tests;

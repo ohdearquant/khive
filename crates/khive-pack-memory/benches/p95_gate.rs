@@ -570,12 +570,14 @@ fn main() {
     if mode == p95_args::Mode::ReportContract {
         // Exercises the actual emitter with known values, not a timing claim.
         for id in ids {
-            report::emit(id, "p95_ns", 250_000.0, RECALL_ITERS);
+            report::emit(id, "report_contract_probe", 250_000.0, RECALL_ITERS);
         }
         return;
     }
     let executor = if synthetic {
         fixture::reject_fts_overrides();
+        // SAFETY: this main branch has not created an executor or any threads.
+        unsafe { fixture::configure_synthetic_ann_debounce() };
         fixture::executor()
     } else {
         // Equivalent to the original #[tokio::main] multi-thread executor.

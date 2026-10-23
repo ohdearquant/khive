@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 
 use super::{
@@ -21,7 +22,8 @@ pub(crate) async fn handle_export(
     let format = p.format.as_deref().unwrap_or("json");
     if !VALID_EXPORT_FORMATS.contains(&format) {
         return Err(RuntimeError::InvalidInput(format!(
-            "{VERB}: format must be one of {VALID_EXPORT_FORMATS:?}; got {format}"
+            "{VERB}: format must be one of {VALID_EXPORT_FORMATS:?}; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, format)
         )));
     }
 

@@ -34,6 +34,14 @@ mod fts_partition_sweep;
 mod progress;
 mod record_repair;
 
+#[cfg(test)]
+#[path = "reindex/batch_config_tests.rs"]
+mod batch_config_tests;
+
+#[cfg(test)]
+#[path = "reindex/clamp_warning_tests.rs"]
+mod clamp_warning_tests;
+
 use fts_partition_sweep::sweep_stale_fts_partitions;
 use progress::ProgressBar;
 
@@ -71,10 +79,10 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Records embedded per batch — also the DB page and write batch (default
-    /// 128, max 500). One `embed_document_batch` call processes this many records.
-    #[arg(long, default_value_t = record_repair::DEFAULT_REINDEX_BATCH_SIZE)]
-    pub batch_size: u32,
+    /// Records embedded per batch — also the DB page and write batch. Overrides
+    /// embed.batch_size in the selected config (default 128, max 500).
+    #[arg(long)]
+    pub batch_size: Option<u32>,
 
     /// Keep existing vectors instead of dropping before re-embedding.
     #[arg(long)]
@@ -135,6 +143,31 @@ pub(crate) fn validate_declared_reindex_target(
     db: Option<&str>,
     config: Option<&std::path::Path>,
 ) -> Result<Option<khive_mcp::serve::ValidatedReindexTarget>> {
+    resolve_reindex_configuration(db, config, None).map(|resolved| resolved.0)
+}
+
+/// Select the batch from the same file used to validate the database target,
+/// before opening a runtime. Explicit CLI presence wins even for zero or 128.
+fn resolve_reindex_configuration(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+    cli_batch: Option<u32>,
+) -> Result<(Option<khive_mcp::serve::ValidatedReindexTarget>, u32)> {
+    let resolved = resolve_reindex_configuration_with_warning(db, config, cli_batch)?;
+    Ok((resolved.target, resolved.batch_size))
+}
+
+struct ResolvedReindexConfiguration {
+    target: Option<khive_mcp::serve::ValidatedReindexTarget>,
+    batch_size: u32,
+    batch_warning: Option<String>,
+}
+
+fn resolve_reindex_configuration_with_warning(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+    cli_batch: Option<u32>,
+) -> Result<ResolvedReindexConfiguration> {
     let discovery_anchor = khive_mcp::serve::config_discovery_db_anchor(db);
     let loaded =
         KhiveConfig::load_with_home_fallback_and_source(config, discovery_anchor.as_deref())
@@ -146,7 +179,30 @@ pub(crate) fn validate_declared_reindex_target(
         .unwrap_or_default();
 
     khive_mcp::serve::validate_effective_backend_alias_modes(backends)?;
-    khive_mcp::serve::validate_reindex_db_target_with_source(db, backends, config_source)
+    let target =
+        khive_mcp::serve::validate_reindex_db_target_with_source(db, backends, config_source)?;
+    let configured_batch = loaded
+        .as_ref()
+        .and_then(|(config, _)| config.embed.batch_size);
+    let batch = cli_batch
+        .map(u64::from)
+        .or(configured_batch)
+        .unwrap_or(u64::from(record_repair::DEFAULT_REINDEX_BATCH_SIZE))
+        .clamp(1, 500) as u32;
+    let batch_warning = configured_batch
+        .zip(config_source)
+        .filter(|(configured, _)| cli_batch.is_none() && *configured > 500)
+        .map(|(configured, path)| {
+            format!(
+                "warning: {}: configured embed.batch_size={configured} exceeds 500; using {batch}",
+                path.display()
+            )
+        });
+    Ok(ResolvedReindexConfiguration {
+        target,
+        batch_size: batch,
+        batch_warning,
+    })
 }
 
 /// Open the runtime `kkernel reindex` writes to, binding the open to the
@@ -523,8 +579,15 @@ async fn run_reindex_with_setup(
     runtime_setup: impl FnOnce(&KhiveRuntime) -> Result<()>,
 ) -> Result<()> {
     record_repair::validate_args(&args)?;
-    let validated_target =
-        validate_declared_reindex_target(args.db.as_deref(), args.config.as_deref())?;
+    let ResolvedReindexConfiguration {
+        target: validated_target,
+        batch_size,
+        batch_warning,
+    } = resolve_reindex_configuration_with_warning(
+        args.db.as_deref(),
+        args.config.as_deref(),
+        args.batch_size,
+    )?;
 
     // Namespace precedence mirrors `kkernel mcp`:
     //   1. --namespace / KHIVE_NAMESPACE (explicit CLI/env) — skips config tier
@@ -568,6 +631,10 @@ async fn run_reindex_with_setup(
         return record_repair::run(&rt, &token, id, args.human, args.best_effort).await;
     }
 
+    if let Some(warning) = batch_warning {
+        eprintln!("{warning}");
+    }
+
     // `--sections-only` is the narrowest scope: knowledge sections alone.
     let do_graph = !args.knowledge_only && !args.sections_only; // entities + notes
     let do_knowledge = !args.no_knowledge; // knowledge corpus
@@ -598,7 +665,6 @@ async fn run_reindex_with_setup(
         }
     };
 
-    let batch_size = args.batch_size.clamp(1, 500);
     let drop_existing = !args.keep_existing;
     let ns_str = token.namespace().as_str().to_owned();
     let start = std::time::Instant::now();

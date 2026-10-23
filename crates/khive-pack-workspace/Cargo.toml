@@ -17,9 +17,9 @@ khive-storage = { version = "0.14.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.14.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.14.0", path = "../khive-pack-gtd" }

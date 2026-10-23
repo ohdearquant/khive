@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use khive_pack_blob::BlobPack;
-use khive_pack_exec::{tree, ExecPack};
+use khive_pack_exec::ExecPack;
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
+use khive_runtime::blob_tree as tree;
 use khive_runtime::engine_config::{
     GitWriteActorConfig, GitWriteEntryConfig, GitWriteSectionConfig,
 };

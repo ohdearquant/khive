@@ -20,6 +20,22 @@ pub const ACTOR: &str = "benchmark:kg";
 pub const MICROS: i64 = 1_700_000_000_000_000;
 pub const REPORT_SAMPLES: usize = 21;
 
+pub fn reports_enabled() -> bool {
+    let mut bench = false;
+    for arg in std::env::args_os().skip(1).take_while(|arg| arg != "--") {
+        if arg == "--test"
+            || arg == "--profile-time"
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--profile-time="))
+        {
+            return false;
+        }
+        bench |= arg == "--bench";
+    }
+    bench
+}
+
 pub fn executor() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

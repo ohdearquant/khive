@@ -1713,7 +1713,7 @@ impl Fts5TextSearch {
         .await
     }
 
-    /// Two-stage gather: cheap unranked LIMIT gather_limit, then BM25-rank the subset.
+    /// Score a bounded unranked gather, then sort only those materialized rows.
     async fn search_rank_within_cap(
         &self,
         request: TextSearchRequest,
@@ -1733,67 +1733,40 @@ impl Fts5TextSearch {
             };
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
-                build_filter_clause(filter, &table, 3)
+                build_filter_clause(filter, &table, 4)
             } else {
                 (String::new(), Vec::new())
             };
 
-            // Stage 1: cheap unranked gather of rowids.
-            let gather_sql = format!(
-                "SELECT subject_id FROM {table} WHERE {table} MATCH ?1{filter_clause} LIMIT ?2"
-            );
-
-            let mut stmt = conn.prepare(&gather_sql)?;
-            count_fts_pass(usage.as_ref());
-            stmt.raw_bind_parameter(1, &match_expr)?;
-            stmt.raw_bind_parameter(2, gather_limit as i64)?;
-            for (i, param) in filter_params.iter().enumerate() {
-                param
-                    .to_sql()
-                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
-            }
-
-            let mut gathered_ids: Vec<String> = Vec::new();
-            let mut rows = stmt.raw_query();
-            while let Some(row) = rows.next()? {
-                gathered_ids.push(row.get::<_, String>(0)?);
-            }
-
-            if gathered_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            // Stage 2: BM25-rank only the gathered subset via subject_id IN (...).
             let snippet_expr = if request.snippet_chars == 0 {
                 "NULL AS snippet".to_string()
             } else {
                 let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
-                format!("snippet({table}, 3, '', '', '...', {chars})")
+                format!("snippet({table}, 3, '', '', '...', {chars}) AS snippet")
             };
 
-            // Build IN clause for the gathered IDs.
-            let id_placeholders: Vec<String> = gathered_ids
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", 3 + i))
-                .collect();
-            let in_clause = id_placeholders.join(", ");
-
-            let rank_sql = format!(
-                "SELECT subject_id, rank, title, {snippet_expr} \
+            // Materialization fences the unranked LIMIT from the outer sort.
+            // Cache rank/snippet on the same filtered physical rows: looking up
+            // subject IDs again can admit a same-ID row from another namespace.
+            let sql = format!(
+                "WITH gathered AS MATERIALIZED (\
+                 SELECT subject_id, rank AS raw_rank, title, {snippet_expr} \
                  FROM {table} WHERE {table} MATCH ?1 \
-                 AND rank MATCH '{LEXICAL_BM25_RANK}' \
-                 AND subject_id IN ({in_clause}) \
-                 ORDER BY rank LIMIT ?2",
+                 AND rank MATCH '{LEXICAL_BM25_RANK}'{filter_clause} LIMIT ?2) \
+                 SELECT subject_id, raw_rank, title, snippet FROM gathered \
+                 ORDER BY raw_rank LIMIT ?3",
             );
 
-            let mut stmt2 = conn.prepare(&rank_sql)?;
+            let mut stmt2 = conn.prepare(&sql)?;
             count_fts_pass(usage.as_ref());
             stmt2.raw_bind_parameter(1, &match_expr)?;
-            stmt2.raw_bind_parameter(2, request.top_k as i64)?;
-            for (i, id_str) in gathered_ids.iter().enumerate() {
-                stmt2.raw_bind_parameter(3 + i, id_str.as_str())?;
+            stmt2.raw_bind_parameter(2, gather_limit as i64)?;
+            stmt2.raw_bind_parameter(3, request.top_k as i64)?;
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt2.raw_bind_parameter(4 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
             }
 
             let mut hits = Vec::new();

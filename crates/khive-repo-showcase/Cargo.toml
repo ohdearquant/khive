@@ -12,18 +12,44 @@ categories.workspace = true
 description = "Deterministic khive.repo.v1 repository showcase bundle exporter"
 
 [dependencies]
-khive-types = { version = "0.14.0", path = "../khive-types", default-features = false }
-chrono = { workspace = true }
-hex = { workspace = true }
-rusqlite = { workspace = true }
-schemars = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-tempfile = { workspace = true }
-thiserror = { workspace = true }
-toml = { workspace = true }
+khive-types = { version = "0.14.0", path = "../khive-types", default-features = false, optional = true }
+chrono = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[features]
+# The bundle exporter and its model. Without it the crate is only the hardened
+# Git command helpers in `git_safety`, which use the standard library alone.
+default = ["export"]
+export = [
+    "dep:khive-types",
+    "dep:chrono",
+    "dep:hex",
+    "dep:rusqlite",
+    "dep:schemars",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:toml",
+]
 
 [dev-dependencies]
 jsonschema = { workspace = true }
 tempfile = { workspace = true }
+
+[[example]]
+name = "generate_schema"
+required-features = ["export"]
+
+[[test]]
+name = "export_contract"
+required-features = ["export"]

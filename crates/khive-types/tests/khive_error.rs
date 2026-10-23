@@ -3,9 +3,7 @@
 //! Covers: Display, Error trait, serde wire shape stability, RetryHint,
 //! Details, and the ErrorCode domain-scoped code model.
 
-use khive_types::khive_error::{
-    Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint, DETAILS_TRUNCATED_KEY,
-};
+use khive_types::khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 
 // ---- ErrorKind Display ----
 
@@ -164,6 +162,7 @@ fn details_new_owned_roundtrip() {
 #[cfg(feature = "serde")]
 mod serde_tests {
     use super::*;
+    use khive_types::khive_error::DETAILS_TRUNCATED_KEY;
     use serde_json::json;
 
     #[test]

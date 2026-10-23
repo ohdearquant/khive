@@ -49,7 +49,11 @@ This also amends ADR-196 D1, which kept `located_in` to one base row.
 the tenth category (Ownership), and the base pairs `Person owns Org` and
 `Org owns Org`, expanding the closed set from 19 → 20. ADR-197 keeps its
 own status.
-**Amendment 2026-10-19 (Proposed)**: a `depends_on` edge whose endpoint pair has no inference
+**Amended 2026-10-22**: base endpoint contract gains one implementation pair, `Artifact implements Concept`,
+so a source file, script or other code artifact can record the concept it realizes. Category 6 already defines
+`implements` as code or a service realizing a concept; the pair table listed only `Project` and `Service`. See
+"Base endpoint contract" below.
+**Amendment 2026-10-19 (accepted 2026-10-21)**: a `depends_on` edge whose endpoint pair has no inference
 default is accepted without a `dependency_kind` and stored without one; an explicit value is
 validated on every pair. See "Amendment 2026-10-19: an omitted qualifier on a pair with no
 default" under "`depends_on` governed metadata" below and "Why the 2026-10-19 qualifier
@@ -557,10 +561,16 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 
 #### Implementation relation
 
-| Source    | Relation     | Target    |
-| --------- | ------------ | --------- |
-| `Project` | `implements` | `Concept` |
-| `Service` | `implements` | `Concept` |
+| Source     | Relation     | Target    |
+| ---------- | ------------ | --------- |
+| `Project`  | `implements` | `Concept` |
+| `Service`  | `implements` | `Concept` |
+| `Artifact` | `implements` | `Concept` |
+
+> **Amended 2026-10-22**: added `Artifact implements Concept`. A repository or a running service was
+> the only representable source, so a single file that realizes a concept (a script carrying a rule's
+> mechanical check, a module implementing an algorithm) had to point through its project or hang off a
+> note. The pair adds no new relation and keeps the relation's direction and order-like coherence class.
 
 #### Lateral relations
 
@@ -687,7 +697,8 @@ Unknown `dependency_kind` values are rejected. `dependency_kind` is only valid o
 
 #### Amendment 2026-10-19: an omitted qualifier on a pair with no default (#5709)
 
-**Status**: Proposed
+**Status**: Accepted (2026-10-21). The coordinator route applies the same dependency defaults as the
+local route (#5786), and `crates/kkernel/src/coordinator/link_inference_tests.rs` checks both routes.
 
 "Requires" above governs what a stored qualifier may say, and inference supplies one where the
 endpoint pair has a default. When `dependency_kind` is omitted and the pair has no default (the

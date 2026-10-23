@@ -13,6 +13,7 @@ use khive_runtime::{
 };
 use khive_storage::EdgeRelation;
 use khive_types::ImportKindPolicy;
+#[cfg(feature = "kg-adapters")]
 use khive_vcs_adapters::{
     BibtexFormatAdapter, CsvFormatAdapter, DelimitedFormat, EdgeRecord, EntityRecord,
     FormatAdapter, JsonFormatAdapter,
@@ -224,6 +225,9 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             _ => ImportFormat::Archive,
         }
     });
+    if format != ImportFormat::Archive && !cfg!(feature = "kg-adapters") {
+        return Err(adapters_not_built(format));
+    }
     let source = if format == ImportFormat::Bibtex {
         String::new()
     } else {
@@ -239,6 +243,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let validation_token = validation_runtime
         .authorize(ns.clone())
         .context("authorize kg import before destination setup")?;
+    #[cfg_attr(not(feature = "kg-adapters"), allow(unused_variables))]
     let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
     if args.default_kind.is_some() && !matches!(format, ImportFormat::Csv | ImportFormat::Tsv) {
         bail!("--default-kind is only supported for CSV/TSV input");
@@ -248,18 +253,31 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             "--continue is only supported for adapter input; use --on-conflict skip for archives"
         );
     }
-    let mut bibtex_stats = None;
-    let archive = match format {
+    let (archive, adapter_summary): (KgArchive, Option<serde_json::Value>) = match format {
+        ImportFormat::Archive => (
+            serde_json::from_str(&source)
+                .with_context(|| format!("parse archive {}", args.source.display()))?,
+            None,
+        ),
+        #[cfg(feature = "kg-adapters")]
         ImportFormat::Bibtex => {
             let file = std::fs::File::open(&args.source)
                 .with_context(|| format!("read {}", args.source.display()))?;
             let adapter = BibtexFormatAdapter::from_reader(std::io::BufReader::new(file))
                 .with_context(|| format!("parse adapter input {}", args.source.display()))?;
-            bibtex_stats = Some(adapter.stats());
-            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+            let stats = adapter.stats();
+            let summary = serde_json::json!({
+                "format": "bibtex",
+                "entries": stats.entries,
+                "skipped": stats.skipped,
+                "warnings": stats.warnings,
+            });
+            (
+                archive_from_adapter(&args.namespace, adapter, args.verbose)?,
+                Some(summary),
+            )
         }
-        ImportFormat::Archive => serde_json::from_str(&source)
-            .with_context(|| format!("parse archive {}", args.source.display()))?,
+        #[cfg(feature = "kg-adapters")]
         ImportFormat::Json | ImportFormat::Ndjson => {
             let input = if format == ImportFormat::Ndjson {
                 ndjson_to_json_array(&source)?
@@ -269,8 +287,12 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             let adapter =
                 JsonFormatAdapter::new_with_kind_policy(&input, &valid_entity_kinds, policy)
                     .with_context(|| format!("parse adapter input {}", args.source.display()))?;
-            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+            (
+                archive_from_adapter(&args.namespace, adapter, args.verbose)?,
+                None,
+            )
         }
+        #[cfg(feature = "kg-adapters")]
         ImportFormat::Csv | ImportFormat::Tsv => {
             let delimiter = if format == ImportFormat::Csv {
                 DelimitedFormat::Csv
@@ -285,8 +307,13 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
                 policy,
             )
             .with_context(|| format!("parse adapter input {}", args.source.display()))?;
-            archive_from_adapter(&args.namespace, adapter, args.verbose)?
+            (
+                archive_from_adapter(&args.namespace, adapter, args.verbose)?,
+                None,
+            )
         }
+        #[cfg(not(feature = "kg-adapters"))]
+        other => return Err(adapters_not_built(other)),
     };
     validation_runtime.validate_kg_import_options(&archive, &validation_token, policy)?;
 
@@ -356,21 +383,29 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         .await
         .with_context(|| format!("import {}", args.source.display()))?;
 
-    let json = if let Some(stats) = bibtex_stats {
+    let json = if let Some(adapter) = adapter_summary {
         let mut value =
             serde_json::to_value(&summary).context("serialize import conflict summary")?;
-        value["adapter"] = serde_json::json!({
-            "format": "bibtex",
-            "entries": stats.entries,
-            "skipped": stats.skipped,
-            "warnings": stats.warnings,
-        });
+        value["adapter"] = adapter;
         serde_json::to_string(&value).context("serialize BibTeX import summary")?
     } else {
         serde_json::to_string(&summary).expect("serialize import conflict summary")
     };
     println!("{json}");
     Ok(())
+}
+
+/// The refusal for a non-native import format in a build without the
+/// `kg-adapters` feature. It is returned before the source is read or any
+/// runtime is built, so a refused import leaves nothing behind.
+fn adapters_not_built(format: ImportFormat) -> anyhow::Error {
+    let name = clap::ValueEnum::to_possible_value(&format)
+        .map(|value| value.get_name().to_owned())
+        .unwrap_or_else(|| format!("{format:?}"));
+    anyhow::anyhow!(
+        "kg import of {name} input needs a kkernel built with the kg-adapters feature; \
+         this build imports native khive-kg archives only"
+    )
 }
 
 /// Resolve the actual selected import policy and guarded one-database target
@@ -452,6 +487,7 @@ fn resolve_import_destination(
     Ok((khive_cfg, destination_config, policy, validated))
 }
 
+#[cfg(feature = "kg-adapters")]
 fn archive_from_adapter(
     namespace: &str,
     mut adapter: impl FormatAdapter,
@@ -471,6 +507,7 @@ fn archive_from_adapter(
     adapter_records_to_archive(namespace, entities, edges)
 }
 
+#[cfg(feature = "kg-adapters")]
 fn ndjson_to_json_array(source: &str) -> Result<String> {
     let mut values = Vec::new();
     for (idx, line) in source.lines().enumerate() {
@@ -485,6 +522,7 @@ fn ndjson_to_json_array(source: &str) -> Result<String> {
     serde_json::to_string(&values).context("serialize NDJSON records as JSON array")
 }
 
+#[cfg(feature = "kg-adapters")]
 fn adapter_records_to_archive(
     namespace: &str,
     entities: Vec<EntityRecord>,
@@ -584,6 +622,7 @@ fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<Vec<String>> {
     Ok(entity_kinds)
 }
 
+#[cfg(feature = "kg-adapters")]
 fn adapter_edge_to_exported(edge: EdgeRecord) -> Result<ExportedEdge> {
     let source = edge
         .source
@@ -1019,6 +1058,7 @@ mod tests {
     // `JsonFormatAdapter::new_with_valid_kinds`, so pack-registered granular
     // kinds like `resource` are accepted at this layer too.
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_accepts_resource_kind() {
         if crate::test_process::run_in_child() {
@@ -1066,6 +1106,7 @@ mod tests {
         assert_eq!(entity.name, "JsonResource");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_ndjson_adapter_accepts_resource_kind() {
         if crate::test_process::run_in_child() {
@@ -1113,6 +1154,7 @@ mod tests {
         assert_eq!(entity.name, "NdjsonResource");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_rejects_unregistered_entity_kind() {
         if crate::test_process::run_in_child() {
@@ -1147,6 +1189,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_imports_entities() {
         if crate::test_process::run_in_child() {
@@ -1193,6 +1236,7 @@ mod tests {
         assert_eq!(entity.name, "Entity1");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_ndjson_adapter_imports_entity() {
         if crate::test_process::run_in_child() {
@@ -1270,6 +1314,7 @@ mod tests {
     /// #472: `adapter_records_to_archive` must preserve ADR-020 `entity_type`
     /// and timestamp fields from adapter-parsed `EntityRecord`s instead of
     /// forcing `entity_type: None` and `Utc::now()`.
+    #[cfg(feature = "kg-adapters")]
     #[test]
     fn adapter_records_to_archive_preserves_entity_adr020_fields() {
         let id = Uuid::new_v4();
@@ -1293,6 +1338,7 @@ mod tests {
         assert_eq!(e.updated_at.to_rfc3339(), "2026-02-02T00:00:00+00:00");
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[test]
     fn adapter_records_to_archive_preserves_edge_adr020_timestamps() {
         let source = Uuid::new_v4();
@@ -1351,6 +1397,7 @@ mod tests {
     /// #472: importing adapter JSON with `entity_type`/timestamps end-to-end
     /// through `cmd_import` must land those fields in the runtime, not `None`
     /// + import-time `Utc::now()`.
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_preserves_entity_type_and_timestamps() {
         if crate::test_process::run_in_child() {
@@ -1409,6 +1456,7 @@ mod tests {
     /// abort the whole import — including entities before AND after it in the
     /// array — before anything is written to the target DB. Previously this
     /// was a warning that skipped just the bad element and kept going.
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_rejects_non_object_array_element_without_db_write() {
         if crate::test_process::run_in_child() {
@@ -1495,6 +1543,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kg-adapters")]
     #[tokio::test]
     async fn import_json_adapter_rejects_malformed_timestamp_without_db_write() {
         if crate::test_process::run_in_child() {

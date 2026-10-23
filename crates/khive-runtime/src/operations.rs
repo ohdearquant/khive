@@ -328,6 +328,7 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
     .into())
 }
 
+mod attachments;
 mod entity_bulk;
 mod entity_create;
 mod entity_indexes;

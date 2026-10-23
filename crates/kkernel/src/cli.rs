@@ -18,11 +18,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "repo-showcase")]
+use crate::repo;
 use crate::{
     blob, code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, pack_introspect, reindex, repo,
-    sync, vector,
+    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, pack_introspect, reindex, sync,
+    vector,
 };
 use khive_runtime::{
     runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
@@ -76,6 +78,7 @@ enum Command {
     Kg(kg::KgCommand),
 
     /// Build and export offline repository showcase bundles (ADR-147).
+    #[cfg(feature = "repo-showcase")]
     #[command(subcommand)]
     Repo(repo::RepoCommand),
 
@@ -454,6 +457,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
+        #[cfg(feature = "repo-showcase")]
         Command::Repo(r) => repo::run_repo(r).await,
         Command::Db(d) => cmd_db(d).await,
         Command::Supervisor(command) => crate::supervisor::run(command, &args.log).await,

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::Note;
 
@@ -168,7 +169,8 @@ pub(crate) async fn resolve_session_uuid(
     }
 
     Err(RuntimeError::InvalidInput(format!(
-        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {raw}"
+        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
     )))
 }
 

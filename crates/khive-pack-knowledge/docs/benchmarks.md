@@ -1,5 +1,25 @@
 # khive-pack-knowledge — Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-knowledge`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                           | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `knowledge_get/by_slug`             | 91.599 µs        | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_learn/concept_create`    | 809.172 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/10`          | 165.499 µs       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/100`         | 223.354 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_search_fts/rerank_false` | 1.174 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_stats/stats_query`       | 215.177 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/1`    | 513.688 µs       | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/10`   | 2.180 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/50`   | 7.180 ms         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite
 
 | Benchmark               | File                         | Description                                                                                   |
@@ -248,10 +268,20 @@ cargo test -p khive-pack-knowledge --bench knowledge_namespace
 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
 # Explicit larger reference scene; exclude this setting from scheduled CI.
 KHIVE_BENCH_COMPOSE_STORE_SIZE=1 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+# Change only the ordinary local-atom count for a scaling comparison.
+KHIVE_BENCH_COMPOSE_STORE_SIZE=1 KHIVE_BENCH_COMPOSE_LOCAL_ATOMS=60000 \
+  cargo bench -p khive-pack-knowledge --bench knowledge_namespace
 ```
 
-The opt-in scene adds exactly 180,474 ordinary local atoms and 25,504 local
-domains with their mirror rows. `knowledge.stats` verifies those counts before
+The opt-in scene defaults to exactly 180,474 ordinary local atoms and 25,504
+local domains with their mirror rows. `KHIVE_BENCH_COMPOSE_LOCAL_ATOMS` selects
+a positive integer local-atom count when the scene is enabled; for example,
+use 60,000 and 360,000 for the scaling comparison. An empty, malformed,
+non-Unicode, zero or overflowing value exits with an error before any seeding.
+The domain count stays at 25,504, so changing the atom count isolates that
+variable; domain members still refer to live atoms. Each measurement reports
+the actual `local_atoms` and `local_domains`. Listing, smoke mode and ordinary
+runs without the opt-in scene ignore this variable. `knowledge.stats` verifies those counts before
 measurement; domain mirrors are excluded from its ordinary atom count. It then
 runs three automatic `knowledge.compose` calls with a 17-word query,
 `max_tokens=1500`, and no pinned atoms or domains. Each response must be
@@ -269,8 +299,11 @@ places the ordinary atoms before the domain mirrors, exercising recovery beyond
 the bounded initial candidate window. No production-latency or six-second
 success claim follows from the source change. Record the three observations,
 commit, toolchain, hardware and concurrent load, and compare with a disposable
-copy using both original FTS-first statements. Keep fixture bytes and all other
-code identical. Qualified-host baseline and acceptance results are not recorded
+copy using both original FTS-first statements. Keep fixture bytes, both size settings and all other
+code identical. Both builds must contain the same local-count option; vary only
+the two SQL statements between arms. At each size, run the builds in the order
+new, previous, previous, new, retaining all three compose observations from
+each invocation. Qualified-host baseline and acceptance results are not recorded
 in this ledger yet.
 
 ## Performance guarantees

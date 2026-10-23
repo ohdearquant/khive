@@ -5,6 +5,23 @@ inputs. They never open an existing map, invoke a compiler, fetch a model, or
 read a git-ignored fixture. Input creation, output checks and destruction are
 outside measured intervals. Missing or incomplete fixtures fail the benchmark.
 
+The two Criterion timing targets create inputs and execute operations only after
+Criterion selects a scene. Listing or an unmatched filter creates no source
+tree, database, executor or findings fixture and performs no ingest/conversion.
+Default and `--test` modes run the selected correctness workload without the
+supplemental timing report; `--test` also wins when combined with `--bench`.
+Each selected ingest scene performs one complete ingest in correctness mode.
+Each selected findings scene retains its identity preflight and one checked
+conversion, so it performs two conversions.
+
+Ordinary `--bench` mode prints one supplemental operation report per selected
+scene, before Criterion's measured iterations. `--profile-time` (both spellings)
+suppresses that report. Lazy setup and the findings identity preflight remain
+outside the returned sample duration, but can appear in a whole-process profile.
+Mode detection stops at `--`, so mode-looking text in a positional filter does
+not change report behavior. The allocation executable has its separate contract
+below.
+
 | Target / group                         | Scenario                       | Input                                                          | Measurement                                      |
 | -------------------------------------- | ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------ |
 | `code_ingest` / `pack_code_ingest`     | `fresh_l1_l15/{10,1000,10000}` | One manifest plus N generated Rust files; new WAL map per call | Whole function wall time and source files/second |

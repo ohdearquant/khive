@@ -1,5 +1,62 @@
 # khive-fusion Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-fusion`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+| Benchmark                                           | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `fuse_dispatcher/KeywordOnly`                       | 162.709 ns       | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/Rrf`                               | 14.004 µs        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/Union`                             | 8.992 µs         | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/VectorOnly`                        | 154.100 ns       | 1.038     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/Weighted`                          | 16.232 µs        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/rrf_topk/10`                       | 48.712 µs        | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/rrf_topk/100`                      | 49.075 µs        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/rrf_topk/50`                       | 48.720 µs        | 1.014     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/2src_500items_top10`  | 64.644 µs        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/2src_500items_top100` | 64.614 µs        | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/2src_500items_top50`  | 64.619 µs        | 1.005     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/3src_500items_top10`  | 95.120 µs        | 1.010     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/3src_500items_top100` | 95.350 µs        | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `fuse_dispatcher/weighted_rrf/3src_500items_top50`  | 95.322 µs        | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `rrf/2src/150items`                                 | 14.292 µs        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `rrf/2src/500items`                                 | 49.295 µs        | 1.008     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `rrf/2src/50items`                                  | 4.584 µs         | 1.019     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `rrf/3src/150items`                                 | 20.882 µs        | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `rrf/3src/500items`                                 | 71.222 µs        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `union/2src/150items`                               | 8.975 µs         | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `union/2src/500items`                               | 32.096 µs        | 1.003     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `union/2src/50items`                                | 2.841 µs         | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `union/3src/150items`                               | 13.259 µs        | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `union/3src/500items`                               | 46.344 µs        | 1.007     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils/is_normalized_false`                  | 2.443 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils/is_normalized_true`                   | 2.072 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils/normalize_2`                          | 15.539 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils/normalize_20`                         | 45.821 ns        | 1.006     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils/normalize_3`                          | 16.970 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/finite_unnormalized/2`       | 17.234 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/finite_unnormalized/20`      | 52.248 ns        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/finite_unnormalized/3`       | 18.929 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/infinity_last/2`             | 1.412 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/infinity_last/20`            | 11.865 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/infinity_last/3`             | 2.047 ns         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/nan_last/2`                  | 1.412 ns         | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/nan_last/20`                 | 11.864 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/nan_last/3`                  | 2.004 ns         | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/normalized/2`                | 17.234 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/normalized/20`               | 52.521 ns        | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weight_utils_fallible/normalized/3`                | 18.928 ns        | 1.000     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weighted/2src/150items`                            | 16.318 µs        | 1.013     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weighted/2src/500items`                            | 56.012 µs        | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weighted/2src/50items`                             | 5.395 µs         | 1.002     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weighted/3src/150items`                            | 24.457 µs        | 1.004     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+| `weighted/3src/500items`                            | 83.200 µs        | 1.001     | `c82766083139abd22f95e9a34cf778c3cd20b95f` | 2026-10-18  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite: `fusion_bench`
 
 **Source:** `crates/khive-fusion/benches/fusion_bench.rs`

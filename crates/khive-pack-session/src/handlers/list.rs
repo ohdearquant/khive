@@ -3,6 +3,7 @@
 use chrono::DateTime;
 use serde_json::Value;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
@@ -68,7 +69,10 @@ pub(crate) async fn handle_list(
             RuntimeError::InvalidInput(format!(
                 "{VERB}: since must be an RFC 3339 timestamp; valid example: \
                  2026-01-01T00:00:00Z; got {:?}",
-                p.since.as_deref().unwrap_or_default()
+                mask_for_redaction_surface(
+                    RedactionSurface::GateProbe,
+                    p.since.as_deref().unwrap_or_default(),
+                )
             ))
         })?;
 

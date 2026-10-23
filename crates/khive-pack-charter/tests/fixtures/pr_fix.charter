@@ -1,0 +1,19 @@
+charter pr_fix v1
+title "Answer review findings on a pull request"
+subject pull_request
+
+roles:
+    author
+
+triggers:
+    fix.pushed
+    pull_request.head_moved
+
+workflow:
+    phase answer by author:
+        action fix.push by author
+        await fix.pushed
+        await pull_request.head_moved
+        require findings.addressed soft
+        when findings.addressed is fail: terminate "findings left unanswered"
+        complete
