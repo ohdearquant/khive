@@ -848,98 +848,108 @@ fn frame_err(error: Option<&str>) -> DaemonResponseFrame {
 #[test]
 #[serial]
 fn map_response_namespace_mismatch_yields_none() {
-    reset_fallback_counters();
-    let resp = DaemonResponseFrame {
-        ok: false,
-        result: None,
-        error: None,
-        error_detail: None,
-        namespace_mismatch: true,
-        config_mismatch: false,
-        served_config_id: Some(CFG.to_string()),
-        version_mismatch: false,
-        daemon_protocol_version: PROTOCOL_VERSION,
-        metrics: None,
-        request_id: None,
-    };
-    assert!(map_response(resp, CFG, NS).is_none());
-    assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
-    assert_eq!(fallback_total(), 1);
+    with_daemon_strict(None, || {
+        reset_fallback_counters();
+        let resp = DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            error_detail: None,
+            namespace_mismatch: true,
+            config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        };
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
+        assert_eq!(fallback_total(), 1);
+    });
 }
 
 #[test]
 #[serial]
 fn map_response_config_mismatch_yields_none() {
-    reset_fallback_counters();
-    let resp = DaemonResponseFrame {
-        ok: false,
-        result: None,
-        error: None,
-        error_detail: None,
-        namespace_mismatch: false,
-        config_mismatch: true,
-        served_config_id: Some(CFG.to_string()),
-        version_mismatch: false,
-        daemon_protocol_version: PROTOCOL_VERSION,
-        metrics: None,
-        request_id: None,
-    };
-    assert!(map_response(resp, CFG, NS).is_none());
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
-    assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
-    assert_eq!(fallback_total(), 1);
+    with_daemon_strict(None, || {
+        reset_fallback_counters();
+        let resp = DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: true,
+            served_config_id: Some(CFG.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        };
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
+        assert_eq!(fallback_total(), 1);
+    });
 }
 
 #[test]
 #[serial]
 fn map_response_legacy_daemon_missing_echo_yields_none() {
-    // A pre-config_id daemon omits served_config_id (→ None). Even on an
-    // ok=true result the client MUST fall back to local dispatch.
-    reset_fallback_counters();
-    let resp = DaemonResponseFrame {
-        ok: true,
-        result: Some("served-by-broad-registry".to_string()),
-        error: None,
-        error_detail: None,
-        namespace_mismatch: false,
-        config_mismatch: false,
-        served_config_id: None,
-        version_mismatch: false,
-        daemon_protocol_version: 0,
-        metrics: None,
-        request_id: None,
-    };
-    assert!(map_response(resp, CFG, NS).is_none());
-    // The served_config_id-echo path is bucketed under config_mismatch —
-    // there is no separate reason for "echo missing/drifted" in the closed
-    // 5-value reason set.
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
-    assert_eq!(fallback_total(), 1);
+    with_daemon_strict(None, || {
+        // A pre-config_id daemon omits served_config_id (→ None). Even on an
+        // ok=true result the client MUST fall back to local dispatch.
+        reset_fallback_counters();
+        let resp = DaemonResponseFrame {
+            ok: true,
+            result: Some("served-by-broad-registry".to_string()),
+            error: None,
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: None,
+            version_mismatch: false,
+            daemon_protocol_version: 0,
+            metrics: None,
+            request_id: None,
+        };
+        assert!(map_response(resp, CFG, NS).is_none());
+        // The served_config_id-echo path is bucketed under config_mismatch —
+        // there is no separate reason for "echo missing/drifted" in the closed
+        // 5-value reason set.
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
+    });
 }
 
 #[test]
 #[serial]
 fn map_response_echo_drift_yields_none() {
-    // A daemon serving under a different config (echo != expected) is not
-    // trusted, even without an explicit config_mismatch flag.
-    reset_fallback_counters();
-    let resp = DaemonResponseFrame {
-        ok: true,
-        result: Some("served-by-other-config".to_string()),
-        error: None,
-        error_detail: None,
-        namespace_mismatch: false,
-        config_mismatch: false,
-        served_config_id: Some("packs=[kg,gtd];db=/x;embed=none;extra=[];backend=main".to_string()),
-        version_mismatch: false,
-        daemon_protocol_version: PROTOCOL_VERSION,
-        metrics: None,
-        request_id: None,
-    };
-    assert!(map_response(resp, CFG, NS).is_none());
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
-    assert_eq!(fallback_total(), 1);
+    with_daemon_strict(None, || {
+        // A daemon serving under a different config (echo != expected) is not
+        // trusted, even without an explicit config_mismatch flag.
+        reset_fallback_counters();
+        let resp = DaemonResponseFrame {
+            ok: true,
+            result: Some("served-by-other-config".to_string()),
+            error: None,
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(
+                "packs=[kg,gtd];db=/x;embed=none;extra=[];backend=main".to_string(),
+            ),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        };
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
+    });
 }
 
 #[test]
@@ -1383,41 +1393,43 @@ fn first_config_mismatch_field_recognizes_read_only_runtime_mode() {
 #[test]
 #[serial]
 fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
-    reset_fallback_counters();
-    let client =
-        "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
-    let daemon =
-        "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
-    let response = DaemonResponseFrame {
-        ok: false,
-        result: None,
-        error: None,
-        error_detail: None,
-        namespace_mismatch: false,
-        config_mismatch: true,
-        served_config_id: Some(daemon.to_string()),
-        version_mismatch: false,
-        daemon_protocol_version: PROTOCOL_VERSION,
-        metrics: None,
-        request_id: None,
-    };
+    with_daemon_strict(None, || {
+        reset_fallback_counters();
+        let client =
+            "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
+                          blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
+        let daemon =
+            "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
+                          blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
+        let response = DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: true,
+            served_config_id: Some(daemon.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        };
 
-    let events = capture_sync_events(|| {
-        assert!(map_response(response, client, NS).is_none());
+        let events = capture_sync_events(|| {
+            assert!(map_response(response, client, NS).is_none());
+        });
+
+        assert!(events.contains("daemon_fallback"), "{events}");
+        assert!(events.contains("config_mismatch_field=\"db\""), "{events}");
+        assert!(events.contains(&opaque_config_id(client)), "{events}");
+        assert!(events.contains(&opaque_config_id(daemon)), "{events}");
+        assert!(!events.contains(client), "{events}");
+        assert!(!events.contains(daemon), "{events}");
+        assert!(!events.contains("client-topology"), "{events}");
+        assert!(!events.contains("daemon-topology"), "{events}");
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
     });
-
-    assert!(events.contains("daemon_fallback"), "{events}");
-    assert!(events.contains("config_mismatch_field=\"db\""), "{events}");
-    assert!(events.contains(&opaque_config_id(client)), "{events}");
-    assert!(events.contains(&opaque_config_id(daemon)), "{events}");
-    assert!(!events.contains(client), "{events}");
-    assert!(!events.contains(daemon), "{events}");
-    assert!(!events.contains("client-topology"), "{events}");
-    assert!(!events.contains("daemon-topology"), "{events}");
-    assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
-    assert_eq!(fallback_total(), 1);
 }
 
 #[test]
