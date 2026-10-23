@@ -168,7 +168,7 @@ async fn t1_vector_failure_commits_entity_and_names_durable_unfinished_target() 
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fts.title, entity.name);
+    assert_eq!(fts.title.as_deref(), Some(entity.name.as_str()));
 }
 
 #[tokio::test]
@@ -222,7 +222,7 @@ async fn t4_success_replaces_vectors_and_fts_and_removes_pending_record() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(doc.title, entity.name);
+    assert_eq!(doc.title.as_deref(), Some(entity.name.as_str()));
     assert_eq!(doc.body, super::super::entity_fts_document(&entity).body);
     let mut reader = rt.sql().reader().await.unwrap();
     assert_eq!(
@@ -289,8 +289,9 @@ async fn t5_live_version_moves_before_publication_and_nothing_is_consumed() {
             .await
             .unwrap()
             .unwrap()
-            .title,
-        before.name
+            .title
+            .as_deref(),
+        Some(before.name.as_str())
     );
 }
 
@@ -397,7 +398,8 @@ async fn lost_publication_ack_remains_unknown_even_when_record_is_absent() {
             .await
             .unwrap()
             .unwrap()
-            .title,
-        entity.name
+            .title
+            .as_deref(),
+        Some(entity.name.as_str())
     );
 }
