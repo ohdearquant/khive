@@ -77,6 +77,7 @@ impl KhiveRuntime {
         let mailbox = crate::MailboxView {
             actor_id: token.actor().id.clone(),
             delegated: false,
+            maintainer_actor: self.config().actor_id.clone().filter(|id| !id.is_empty()),
         }
         .note_scope(token);
         let compiled = khive_query::compile_with_mailbox(
@@ -85,6 +86,7 @@ impl KhiveRuntime {
             &khive_query::QueryMailboxScope {
                 actor_id: mailbox.actor_id,
                 legacy_local: mailbox.legacy_local,
+                maintainer_actor: mailbox.maintainer_actor,
             },
         )?;
         let mut warnings = compiled.warnings;

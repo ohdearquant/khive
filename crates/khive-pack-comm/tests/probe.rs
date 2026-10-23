@@ -1936,3 +1936,203 @@ async fn probe_other_mailbox_uses_the_existing_inbox_grant() {
         .expect("the inbox read grant must also permit registry probe");
     assert_eq!(dispatched["new_messages"], probe["new_messages"]);
 }
+
+async fn am6_probe_as(registry: &VerbRegistry, actor: &str, since: Option<i64>) -> Value {
+    let mut args = json!({"actor":actor,"stale_minutes":1});
+    if let Some(since) = since {
+        args["since_us"] = json!(since);
+    }
+    registry
+        .dispatch_with_identity(
+            "comm.probe",
+            args,
+            Some(RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some(actor.into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("real probe as {actor}: {error}"))
+}
+
+#[tokio::test]
+async fn am6_probe_quarantine_ignores_routing_before_sequence_page_and_count() {
+    let (registry, rt) = build_registry(Some("lambda:maintainer"));
+    let store = rt.backend().notes().unwrap();
+    let mut ids = Vec::new();
+    for index in 0..126 {
+        let id = plant_inbound_message(
+            &rt,
+            "lambda:landing",
+            "sender",
+            1_000_000 - index,
+            Some("Q fixture"),
+            index < 10,
+        )
+        .await;
+        let mut note = store.get_note(id).await.unwrap().unwrap();
+        let p = note.properties.as_mut().unwrap();
+        p["quarantined"] = if index % 2 == 0 {
+            json!(true)
+        } else {
+            json!("true")
+        };
+        match index % 3 {
+            0 => {
+                p["direction"] = json!("outbound");
+            }
+            1 => {
+                p.as_object_mut().unwrap().remove("direction");
+            }
+            _ => {
+                p["direction"] = json!("unknown");
+            }
+        }
+        if index % 2 == 0 {
+            p["to_actor"] = json!(["lambda:landing"]);
+        }
+        p["from_actor"] = if index % 2 == 0 {
+            json!(17)
+        } else {
+            json!(false)
+        };
+        store.upsert_note(note).await.expect("preexisting Q shape");
+        ids.push(id.to_string());
+    }
+    let ordinary = plant_inbound_message(
+        &rt,
+        "lambda:landing",
+        "sender",
+        2_000_000,
+        Some("numeric control"),
+        false,
+    )
+    .await;
+    let mut numeric = store.get_note(ordinary).await.unwrap().unwrap();
+    numeric.properties.as_mut().unwrap()["quarantined"] = json!(1);
+    store.upsert_note(numeric).await.unwrap();
+    let before = serde_json::to_value(
+        store
+            .get_note(Uuid::parse_str(&ids[0]).unwrap())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let first = am6_probe_as(&registry, "lambda:maintainer", None).await;
+    let first_ids: Vec<_> = first["new_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        first_ids,
+        ids[..100].iter().rev().cloned().collect::<Vec<_>>(),
+        "candidate page is first100 durable sequences, then timestamp display order"
+    );
+    assert_eq!(
+        first["stale_unread_count"], 116,
+        "read Q is not counted stale"
+    );
+    for message in first["new_messages"].as_array().unwrap() {
+        assert_eq!(
+            message["from_actor"], "local",
+            "non-text Q sender must not drop an admitted row"
+        );
+    }
+    let first_cursor = first["cursor_us"].as_i64().unwrap();
+    let second = am6_probe_as(&registry, "lambda:maintainer", Some(first_cursor)).await;
+    let second_ids: Vec<_> = second["new_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        second_ids,
+        ids[100..].iter().rev().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(second["stale_unread_count"], 116);
+    let second_cursor = second["cursor_us"].as_i64().unwrap();
+    assert!(second_cursor > first_cursor);
+    let empty = am6_probe_as(&registry, "lambda:maintainer", Some(second_cursor)).await;
+    assert_eq!(empty["new_messages"], json!([]));
+    assert_eq!(
+        empty["cursor_us"], second_cursor,
+        "hidden ordinary tail must not move Q cursor"
+    );
+    let landing = am6_probe_as(&registry, "lambda:landing", None).await;
+    let rows = landing["new_messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "hidden Q cannot consume the100-row page");
+    assert_eq!(rows[0]["id"], ordinary.to_string());
+    assert_eq!(landing["stale_unread_count"], 1);
+    assert_eq!(
+        am6_probe_as(&registry, "lambda:other", None).await["new_messages"],
+        json!([])
+    );
+    let after = serde_json::to_value(
+        store
+            .get_note(Uuid::parse_str(&ids[0]).unwrap())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after, before, "actual configured probe is note-read-only");
+}
+
+#[tokio::test]
+async fn am6_probe_configured_quarantine_stale_count_has_one_global_thousand_limit() {
+    let (registry, rt) = build_registry(Some("lambda:maintainer"));
+    let store = rt.backend().notes().unwrap();
+    let notes: Vec<_> = (0..1_025)
+        .map(|index| {
+            let mut note = Note::new("local", "message", "stale Q count fixture");
+            note.created_at = 1_000_000;
+            note.updated_at = note.created_at;
+            note.properties = Some(json!({
+                "quarantined": if index % 2 == 0 { json!(true) } else { json!("true") },
+                "direction": "outbound", "to_actor":"lambda:landing", "from_actor":7,
+                "read":false,
+            }));
+            note
+        })
+        .collect();
+    store.upsert_notes(notes).await.expect("real Q backlog");
+    let response = am6_probe_as(&registry, "lambda:maintainer", None).await;
+    assert_eq!(response["stale_unread_count"], 1000);
+    assert_eq!(response["new_messages"].as_array().unwrap().len(), 100);
+    let hidden = am6_probe_as(&registry, "lambda:landing", None).await;
+    assert_eq!(hidden["stale_unread_count"], 0);
+    assert_eq!(hidden["new_messages"], json!([]));
+}
+
+#[tokio::test]
+async fn am6_probe_no_config_keeps_stored_recipient_and_original_four_bind_path() {
+    let (registry, rt) = build_registry(None);
+    let id = plant_inbound_message(
+        &rt,
+        "lambda:landing",
+        "sender",
+        1_000_000,
+        Some("legacy quarantine"),
+        false,
+    )
+    .await;
+    let store = rt.backend().notes().unwrap();
+    for q in [json!(true), json!("true")] {
+        let mut note = store.get_note(id).await.unwrap().unwrap();
+        note.properties.as_mut().unwrap()["quarantined"] = q;
+        store.upsert_note(note).await.unwrap();
+        let landing = am6_probe_as(&registry, "lambda:landing", None).await;
+        assert_eq!(landing["new_messages"].as_array().unwrap().len(), 1);
+        assert_eq!(landing["new_messages"][0]["id"], id.to_string());
+        assert_eq!(landing["stale_unread_count"], 1);
+        assert_eq!(
+            am6_probe_as(&registry, "lambda:maintainer", None).await["new_messages"],
+            json!([])
+        );
+    }
+}

@@ -135,6 +135,11 @@ impl VerbRegistry {
         let mailbox = crate::MailboxView {
             actor_id: token.actor().id.clone(),
             delegated: false,
+            maintainer_actor: runtime
+                .config()
+                .actor_id
+                .clone()
+                .filter(|id| !id.is_empty()),
         };
         for (owner, runtime) in capture.owners.iter().enumerate() {
             let mut after = None;

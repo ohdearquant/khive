@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    runtime_error_value, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError,
+    runtime_error_value, DomainDisposition, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::SqlValue;
@@ -20,6 +20,30 @@ use crate::message::{note_to_message_json, short_id};
 const MAX_BULK_READ_IDS: usize = 500;
 
 const BULK_READ_WINDOW: usize = 128;
+
+fn read_mailbox_view(runtime: &KhiveRuntime, token: &NamespaceToken) -> MailboxView {
+    MailboxView {
+        actor_id: token.actor().id.clone(),
+        delegated: false,
+        maintainer_actor: runtime
+            .config()
+            .actor_id
+            .clone()
+            .filter(|id| !id.is_empty()),
+    }
+}
+
+fn quarantine_read_recheck_filter(runtime: &KhiveRuntime, token: &NamespaceToken) -> NoteFilter {
+    let view = read_mailbox_view(runtime, token);
+    let mut filter = read_recheck_filter(token);
+    if view.maintainer_actor.is_some() {
+        filter
+            .property_filters
+            .retain(|property| property.json_path != "$.to_actor");
+        filter.message_addressee = Some(view.note_scope(token));
+    }
+    filter
+}
 
 pub(super) async fn validate_bulk_read_targets(
     runtime: &KhiveRuntime,
@@ -39,6 +63,7 @@ pub(super) async fn validate_bulk_read_targets(
         )));
     }
 
+    let view = read_mailbox_view(runtime, token);
     let requested_count = raw_ids.len();
     let mut seen = HashSet::new();
     let mut targets = Vec::with_capacity(requested_count);
@@ -76,7 +101,7 @@ pub(super) async fn validate_bulk_read_targets(
                     let note = notes.get(id).cloned().ok_or_else(|| {
                         RuntimeError::NotFound(format!("read: message {id} not found"))
                     })?;
-                    let (id, note) = validate_read_note(token, *id, note)?;
+                    let (id, note) = validate_read_note(&view, token, *id, note)?;
                     if seen.insert(id) {
                         targets.push((id, note));
                     }
@@ -213,7 +238,7 @@ pub(super) async fn mark_read_targets_atomic(
         .patch_note_property_atomic(
             ids,
             token.namespace().as_str(),
-            &read_recheck_filter(token),
+            &quarantine_read_recheck_filter(runtime, token),
             "$.read",
             json!(true),
             Utc::now().timestamp_micros(),
@@ -305,10 +330,15 @@ pub(super) async fn validate_read_target(
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("read: message {id} not found")))?;
 
-    validate_read_note(token, id, note)
+    let view = read_mailbox_view(runtime, token);
+    let target = validate_read_note(&view, token, id, note)?;
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::PointValidated(id)).await;
+    Ok(target)
 }
 
 fn validate_read_note(
+    view: &MailboxView,
     token: &NamespaceToken,
     id: Uuid,
     note: Note,
@@ -322,6 +352,14 @@ fn validate_read_note(
         return Err(RuntimeError::InvalidInput(format!(
             "read: note {id} is kind {:?}, expected \"message\"",
             note.kind
+        )));
+    }
+
+    let quarantine_admission = view.quarantine_override(&note);
+    if quarantine_admission == Some(false) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "read: that message is not addressed to caller actor {:?}",
+            token.actor().id
         )));
     }
 
@@ -343,7 +381,7 @@ fn validate_read_note(
         let is_participant = addressed_recipient(properties)
             .is_some_and(|recipient| recipient == caller_actor || from_actor == Some(caller_actor))
             || (caller_inherits_legacy_pool(token) && legacy_recipient(properties));
-        if !is_participant {
+        if quarantine_admission != Some(true) && !is_participant {
             return Err(RuntimeError::InvalidInput(format!(
                 "read: that message is not addressed to caller actor {caller_actor:?}"
             )));
@@ -354,7 +392,7 @@ fn validate_read_note(
     }
 
     let caller_actor = token.actor().id.as_str();
-    if !caller_is_addressee(token, note.properties.as_ref()) {
+    if quarantine_admission != Some(true) && !caller_is_addressee(token, note.properties.as_ref()) {
         return Err(RuntimeError::InvalidInput(format!(
             "read: that message is not addressed to caller actor {caller_actor:?}"
         )));
@@ -461,7 +499,7 @@ pub(super) async fn mark_read_target(
     // the same `UPDATE` — the same eligibility predicate
     // `validate_read_target` already checked, re-evaluated at mutation time
     // rather than trusted from an earlier read.
-    let recheck_filter = read_recheck_filter(token);
+    let recheck_filter = quarantine_read_recheck_filter(runtime, token);
 
     // Best-effort: under multi-client writer contention the pool checkout can
     // time out. Keep the failed or indeterminate mark in the response so the

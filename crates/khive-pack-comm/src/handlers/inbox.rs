@@ -171,6 +171,12 @@ pub(crate) async fn handle_inbox(
         }
     }
 
+    let mut quarantine_filters: Vec<_> = property_filters
+        .iter()
+        .filter(|filter| filter.json_path == "$.read")
+        .cloned()
+        .collect();
+
     if mailbox == "inbox" {
         // Only the anonymous fallback inherits the missing/null partition.
         // Every named/delegated view uses the typed exact-recipient seek.
@@ -191,11 +197,13 @@ pub(crate) async fn handle_inbox(
             });
         }
         if let Some(from_actor) = p.from_actor.as_ref() {
-            property_filters.push(PropertyFilter {
+            let filter = PropertyFilter {
                 json_path: "$.from_actor".to_string(),
                 op: FilterOp::Eq,
                 value: SqlValue::Text(from_actor.clone()),
-            });
+            };
+            property_filters.push(filter.clone());
+            quarantine_filters.push(filter);
         }
     } else {
         property_filters.push(PropertyFilter {
@@ -208,20 +216,38 @@ pub(crate) async fn handle_inbox(
             value: SqlValue::Text(view.actor_id.clone()),
         });
         if let Some(to_actor) = p.to_actor.as_ref() {
-            property_filters.push(PropertyFilter {
+            let filter = PropertyFilter {
                 json_path: "$.to_actor".to_string(),
                 op: FilterOp::Eq,
                 value: SqlValue::Text(to_actor.clone()),
-            });
+            };
+            property_filters.push(filter.clone());
+            quarantine_filters.push(filter);
         }
     }
 
     if let Some(thread_id) = thread_id {
-        property_filters.push(PropertyFilter {
+        let filter = PropertyFilter {
             json_path: "$.thread_id".to_string(),
             op: FilterOp::Eq,
             value: SqlValue::Text(thread_id),
-        });
+        };
+        property_filters.push(filter.clone());
+        quarantine_filters.push(filter);
+    }
+    let quarantine_filter = if view.maintainer_actor.as_deref() == Some(view.actor_id.as_str()) {
+        quarantine_filters.push(quarantine_property_filter());
+        Some(NoteFilter {
+            kind: Some("message".into()),
+            property_filters: quarantine_filters,
+            min_created_at: since_micros,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    if view.maintainer_actor.is_some() {
+        property_filters.extend(non_quarantine_property_filters());
     }
 
     let filter = NoteFilter {
@@ -253,6 +279,7 @@ pub(crate) async fn handle_inbox(
             &view,
             include_legacy,
             &filter,
+            quarantine_filter.as_ref(),
             &p,
             before_micros,
             subject_needle.as_deref(),
@@ -314,6 +341,126 @@ where
     }
 }
 
+struct InboxQueryArm {
+    filter: NoteFilter,
+    buffered: std::collections::VecDeque<Note>,
+    after: Option<khive_storage::note::NoteSeekAfter>,
+    exhausted: bool,
+}
+
+impl InboxQueryArm {
+    fn new(filter: &NoteFilter) -> Self {
+        Self {
+            filter: filter.clone(),
+            buffered: std::collections::VecDeque::new(),
+            after: None,
+            exhausted: false,
+        }
+    }
+
+    async fn fill(
+        &mut self,
+        store: &dyn khive_storage::NoteStore,
+        namespace: &str,
+    ) -> Result<bool, RuntimeError> {
+        if !self.buffered.is_empty() || self.exhausted {
+            return Ok(false);
+        }
+        const PAGE_SIZE: u32 = 200;
+        let mut filter = self.filter.clone();
+        filter.after = self.after;
+        let page = store
+            .query_notes_filtered_count_free(
+                namespace,
+                &filter,
+                PageRequest {
+                    limit: PAGE_SIZE,
+                    offset: 0,
+                },
+            )
+            .await?;
+        self.exhausted = page.items.len() < PAGE_SIZE as usize;
+        self.after = page
+            .items
+            .last()
+            .map(|note| khive_storage::note::NoteSeekAfter {
+                created_at: note.created_at,
+                id: note.id,
+            });
+        self.buffered = page.items.into();
+        Ok(true)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_merged_inbox_rows(
+    store: &dyn khive_storage::NoteStore,
+    namespace: &str,
+    ordinary_filter: &NoteFilter,
+    quarantine_filter: &NoteFilter,
+    params: &InboxParams,
+    before_micros: Option<i64>,
+    subject_needle: Option<&str>,
+    content_needle: Option<&str>,
+    offset: u64,
+    limit: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    let mut ordinary = InboxQueryArm::new(ordinary_filter);
+    let mut quarantine = InboxQueryArm::new(quarantine_filter);
+    let mut matched = 0_u64;
+    let mut messages = Vec::new();
+    loop {
+        let ordinary_fetched = ordinary.fill(store, namespace).await?;
+        #[cfg(not(test))]
+        let _ = ordinary_fetched;
+        #[cfg(test)]
+        if ordinary_fetched {
+            super::read_cluster_tests::observe_phase(
+                super::read_cluster_tests::Phase::InboxOrdinaryPage(
+                    ordinary.buffered.iter().map(|note| note.id).collect(),
+                ),
+            )
+            .await;
+        }
+        quarantine.fill(store, namespace).await?;
+        let (take_ordinary, same_front) =
+            match (ordinary.buffered.front(), quarantine.buffered.front()) {
+                (None, None) => break,
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, false),
+                (Some(left), Some(right)) => (
+                    left.created_at > right.created_at
+                        || (left.created_at == right.created_at && left.id < right.id),
+                    left.created_at == right.created_at && left.id == right.id,
+                ),
+            };
+        // The arms read separate snapshots. A quarantine transition can put the
+        // same immutable order key in both buffers. Consume both once and use
+        // the quarantine image deterministically before offset/lookahead count.
+        if same_front {
+            let _ = ordinary.buffered.pop_front();
+        }
+        let note = (if take_ordinary {
+            ordinary.buffered.pop_front()
+        } else {
+            quarantine.buffered.pop_front()
+        })
+        .expect("selected arm contains a fetched note");
+        if !inbox_note_matches(&note, params, before_micros, subject_needle, content_needle) {
+            continue;
+        }
+        if matched < offset {
+            matched += 1;
+            continue;
+        }
+        messages.push(note_to_message_json(&note));
+        if messages.len() > limit {
+            break;
+        }
+    }
+    Ok(messages)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn query_inbox_response(
     runtime: &KhiveRuntime,
@@ -322,6 +469,7 @@ async fn query_inbox_response(
     view: &MailboxView,
     include_legacy: bool,
     filter: &NoteFilter,
+    quarantine_filter: Option<&NoteFilter>,
     params: &InboxParams,
     before_micros: Option<i64>,
     subject_needle: Option<&str>,
@@ -348,7 +496,21 @@ async fn query_inbox_response(
     // last row's `(created_at, id)` makes each page's fetch cost independent
     // of how many pages came before it. `filter.order_by` is always `None`
     // here (see its construction above), which `after` requires.
-    let mut messages: Vec<Value> = if has_post_filter {
+    let mut messages: Vec<Value> = if let Some(quarantine_filter) = quarantine_filter {
+        query_merged_inbox_rows(
+            store,
+            namespace,
+            filter,
+            quarantine_filter,
+            params,
+            before_micros,
+            subject_needle,
+            content_needle,
+            offset,
+            limit,
+        )
+        .await?
+    } else if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
         let mut matched: u64 = 0;
@@ -454,6 +616,11 @@ pub(crate) async fn handle_unread(
     let view = MailboxView {
         actor_id: caller_actor.clone(),
         delegated: false,
+        maintainer_actor: runtime
+            .config()
+            .actor_id
+            .clone()
+            .filter(|id| !id.is_empty()),
     };
     let unread = count_unread_messages(
         store.as_ref(),
@@ -537,6 +704,27 @@ async fn count_unread_messages(
     let mut filters = vec![count_filter(FilterOp::EqOrMissingIndexed)];
     if include_legacy {
         filters.push(count_filter(FilterOp::JsonTypeMissingOrNullIndexed));
+    }
+    if view.maintainer_actor.is_some() {
+        for filter in &mut filters {
+            filter
+                .property_filters
+                .extend(non_quarantine_property_filters());
+        }
+        if view.maintainer_actor.as_deref() == Some(view.actor_id.as_str()) {
+            filters.push(NoteFilter {
+                kind: Some("message".into()),
+                property_filters: vec![
+                    PropertyFilter {
+                        json_path: "$.read".into(),
+                        op: FilterOp::JsonTypeNeMissing,
+                        value: SqlValue::Text("true".into()),
+                    },
+                    quarantine_property_filter(),
+                ],
+                ..Default::default()
+            });
+        }
     }
     let counts = store
         .count_notes_filtered_bounded_in_snapshot(namespace, &filters, UNREAD_COUNT_CAP)

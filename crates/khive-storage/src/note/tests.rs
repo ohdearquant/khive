@@ -366,3 +366,75 @@ async fn bounded_snapshot_count_default_is_fail_closed_without_query_fallback() 
         "bounded snapshot count must not compose independent page queries"
     );
 }
+
+#[test]
+fn quarantine_message_flag_preserves_typed_json_and_nonmessage_distinctions() {
+    for (value, expected) in [
+        (serde_json::json!(true), true),
+        (serde_json::json!("true"), true),
+        (serde_json::json!(1), false),
+        (serde_json::json!(1.0), false),
+        (serde_json::json!(false), false),
+        (serde_json::json!("True"), false),
+        (serde_json::json!("1"), false),
+        (serde_json::json!(null), false),
+        (serde_json::json!([true]), false),
+        (serde_json::json!({"value": true}), false),
+    ] {
+        let note = Note::new("local", "message", "stored quarantine")
+            .with_properties(serde_json::json!({"quarantined": value.clone()}));
+        let original = note.clone();
+        assert_eq!(is_quarantined_message(&note), expected, "{value:?}");
+        assert_eq!(note, original);
+        let mut ordinary = note;
+        ordinary.kind = "observation".into();
+        assert!(!is_quarantined_message(&ordinary));
+    }
+    for properties in [
+        None,
+        Some(serde_json::json!({})),
+        Some(serde_json::json!(null)),
+    ] {
+        let mut note = Note::new("local", "message", "unflagged");
+        note.properties = properties;
+        assert!(!is_quarantined_message(&note));
+    }
+}
+
+#[test]
+fn mailbox_runtime_maintainer_and_read_guard_cannot_be_deserialized() {
+    let legacy = serde_json::json!({"actor_id": "landing", "legacy_local": false});
+    let decoded: NoteMailboxScope = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(decoded.maintainer_actor, None);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+    let forged: NoteMailboxScope = serde_json::from_value(serde_json::json!({
+        "actor_id": "landing", "legacy_local": false, "maintainer_actor": "landing"
+    }))
+    .unwrap();
+    assert_eq!(forged, decoded);
+    let filter: NoteFilter = serde_json::from_value(serde_json::json!({
+        "mailbox": {"actor_id": "landing", "legacy_local": false,
+                    "maintainer_actor": "landing"},
+        "message_addressee": {"actor_id": "landing", "legacy_local": false,
+                              "maintainer_actor": "landing"}
+    }))
+    .unwrap();
+    assert_eq!(filter.mailbox.unwrap().maintainer_actor, None);
+    assert!(filter.message_addressee.is_none());
+
+    let trusted = NoteFilter {
+        message_addressee: Some(NoteMailboxScope {
+            actor_id: "maintainer".into(),
+            legacy_local: false,
+            maintainer_actor: Some("maintainer".into()),
+        }),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_value(&trusted).unwrap();
+    assert!(encoded.get("message_addressee").is_none());
+    assert!(serde_json::from_value::<NoteFilter>(encoded)
+        .unwrap()
+        .message_addressee
+        .is_none());
+}
