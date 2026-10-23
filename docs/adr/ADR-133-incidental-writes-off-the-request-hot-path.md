@@ -1212,9 +1212,8 @@ passing in `all` mode; and the response's `usage` unchanged.
 
 ## Amendment 11 (2026-10-23) -- Audit release by producer class and terminal reason
 
-**Status**: Proposed 2026-10-23. This draft requires specification approval before dependent implementation lands. It
-does not change the status of the base ADR. The in-place status corrections record the existing acceptance of
-Amendment 3, Amendment 10 and ADR-103 Amendment 7.
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR. The in-place status corrections record
+the existing acceptance of Amendment 3, Amendment 10 and ADR-103 Amendment 7.
 
 **Addresses**: [#3730](https://github.com/ohdearquant/khive/issues/3730).
 
