@@ -12,9 +12,10 @@ pub(super) async fn drain(
     rt: &KhiveRuntime,
     server: &KhiveMcpServer,
     verbose: bool,
+    grace: i64,
     summary: &mut DrainSummary,
 ) -> Result<Option<OccurrenceStore>> {
-    drain_inner(rt, server, verbose, summary).await.map_err(|error| {
+    drain_inner(rt, server, verbose, grace, summary).await.map_err(|error| {
         let message = format!(
             "accounting_blocked: occurrence accounting or admission failed; no further launches in this pass: {error:#}"
         );
@@ -26,6 +27,7 @@ async fn drain_inner(
     rt: &KhiveRuntime,
     server: &KhiveMcpServer,
     verbose: bool,
+    grace: i64,
     summary: &mut DrainSummary,
 ) -> Result<Option<OccurrenceStore>> {
     // Optional legacy availability never swallows a partial schema or storage error.
@@ -33,7 +35,6 @@ async fn drain_inner(
         return Ok(None);
     };
     let mut budget = PassBudget::default();
-    let grace = fire_grace_from_env().num_seconds();
     // Bound discovery separately from materialization. The persisted per-series
     // cursor, rather than this ephemeral keyset, owns every unrecorded instant.
     let work = store

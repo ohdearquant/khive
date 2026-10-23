@@ -14,7 +14,7 @@ const MISFIRE_POLICY_PARAM: ParamDef = ParamDef {
     name: "misfire_policy",
     param_type: "string",
     required: false,
-    description: "Missed-occurrence policy: \"skip\" (default, existing global grace) or \"catch_up_once\" (consider only the latest due occurrence). catch_up_once always requires explicit max_lateness, for both one-shot and repeating events.",
+    description: "Missed-occurrence policy: \"skip\" (default, consider only the original occurrence) or \"catch_up_once\" (consider only the latest due occurrence). catch_up_once requires explicit positive max_lateness for both one-shot and repeating events. With receipt_version=3, skip accepts an explicit nonnegative max_lateness; absence keeps the configured global grace.",
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
@@ -22,7 +22,7 @@ const MAX_LATENESS_PARAM: ParamDef = ParamDef {
     name: "max_lateness",
     param_type: "integer",
     required: false,
-    description: "Required with catch_up_once: a positive, representable integer number of seconds. Equality is admitted. No period-derived default; rejected with skip or omitted misfire_policy.",
+    description: "Representable integer seconds: catch_up_once requires a positive value; skip accepts zero or positive only with receipt_version=3. Absence with skip keeps global grace. No period-derived default. Equality at final admission is allowed. Zero has no tick allowance and normally misses: polling defaults to 60 seconds and is configurable. This is an admission deadline, never a physical process-start guarantee.",
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 

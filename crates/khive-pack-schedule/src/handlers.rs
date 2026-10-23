@@ -832,9 +832,13 @@ pub(crate) async fn handle_remind(
         ));
     }
 
-    let policy =
-        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let use_v3 = version_three(&params)?;
+    let policy = if use_v3 {
+        Some(crate::misfire::parse_v3_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?)
+    } else {
+        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+        None
+    };
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -906,6 +910,8 @@ pub(crate) async fn handle_remind(
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "remind").await?;
     if let Some(store) = &occurrence_store {
+        let policy =
+            policy.ok_or_else(|| RuntimeError::Internal("version-3 policy missing".into()))?;
         let definition = DefinitionV3::from_declaration(
             token,
             note.id,
@@ -944,9 +950,13 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let policy =
-        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let use_v3 = version_three(&params)?;
+    let policy = if use_v3 {
+        Some(crate::misfire::parse_v3_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?)
+    } else {
+        crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
+        None
+    };
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -1028,6 +1038,8 @@ pub(crate) async fn handle_schedule(
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "schedule").await?;
     if let Some(store) = &occurrence_store {
+        let policy =
+            policy.ok_or_else(|| RuntimeError::Internal("version-3 policy missing".into()))?;
         let definition = DefinitionV3::from_declaration(
             token,
             note.id,

@@ -113,10 +113,11 @@ pub(super) async fn run_pending_events_on_with_lease(
     lease: DispatchLeaseConfig,
 ) -> Result<DrainSummary> {
     let now = Utc::now();
-    let grace = fire_grace_from_env();
+    let grace = fire_grace_from_env()?;
     let mut summary = DrainSummary::default();
     // Version-three work is discovered from durable auxiliary rows, even with no live notes.
-    let occurrence_store = super::v3::drain(rt, server, verbose, &mut summary).await?;
+    let occurrence_store =
+        super::v3::drain(rt, server, verbose, grace.num_seconds(), &mut summary).await?;
 
     // ── Step 0: reconcile claims whose renewable lease expired ───────────
     // A durable succeeded/failed outcome is finalized without invoking the

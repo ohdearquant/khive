@@ -643,7 +643,9 @@ impl OccurrenceStore {
             after.horizon = Some(horizon);
             after.selection_at_us = Some(captured_horizon_us);
             after.effective_max_lateness_s = Some(match definition.policy()? {
-                MisfirePolicy::Skip => global_grace_seconds,
+                MisfirePolicy::Skip => definition
+                    .requested_max_lateness_s
+                    .unwrap_or(global_grace_seconds),
                 MisfirePolicy::CatchUpOnce { max_lateness } => max_lateness,
             });
             after.selected = Some(match definition.policy()? {

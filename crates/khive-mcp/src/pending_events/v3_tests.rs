@@ -288,6 +288,42 @@ impl Fixture {
             .unwrap();
         (id, at)
     }
+    async fn declare_skip_bound(
+        &self,
+        label: &str,
+        bound: Option<i64>,
+    ) -> (uuid::Uuid, DateTime<Utc>) {
+        // Exact microsecond alignment lets T+1us mean the same instant in the
+        // captured selection horizon and the stored original schedule.
+        let at = DateTime::<Utc>::from_timestamp_micros(
+            (Utc::now() + Duration::seconds(1)).timestamp_micros(),
+        )
+        .unwrap();
+        let mut args = json!({
+            "action": format!("test.v3_marker(label={})", json!(label)),
+            "at": at.to_rfc3339(),
+            "receipt_version": 3,
+            "misfire_policy": "skip",
+            "namespace": NS,
+        });
+        if let Some(bound) = bound {
+            args["max_lateness"] = json!(bound);
+        }
+        let value = self.request("schedule.schedule", args).await;
+        assert_eq!(value["results"][0]["ok"], true, "{value}");
+        let id = value["results"][0]["result"]["full_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let series = self.store.series(id).await.unwrap().unwrap();
+        let definition = self.store.definition(&series).await.unwrap();
+        assert_eq!(definition.creator.kind, "actor");
+        assert_eq!(definition.creator.id, ACTOR);
+        assert_eq!(definition.namespace, NS);
+        assert_eq!(definition.requested_max_lateness_s, bound);
+        (id, at)
+    }
     async fn due(at: DateTime<Utc>) {
         if let Ok(wait) = (at + Duration::milliseconds(5) - Utc::now()).to_std() {
             tokio::time::sleep(wait).await;
@@ -332,6 +368,210 @@ impl Fixture {
             .await
             .unwrap();
     }
+}
+
+#[test]
+fn configured_global_grace_preserves_fallback_and_checks_duration_range() {
+    for value in [
+        None,
+        Some(""),
+        Some("not-a-number"),
+        Some("-1"),
+        Some("-9223372036854775808"),
+        Some("1.0"),
+        Some(" 7 "),
+        // Text outside i64 remains an unparseable legacy fallback, distinct
+        // from a parsed nonnegative i64 outside Chrono's duration range.
+        Some("9223372036854775808"),
+        Some("18446744073709551615"),
+    ] {
+        assert_eq!(
+            super::super::fire_grace_from_value(value)
+                .unwrap()
+                .num_seconds(),
+            300,
+            "legacy fallback for {value:?}"
+        );
+    }
+    for seconds in [0, 1, 7, 300, 3600, i64::MAX / 1000] {
+        let text = seconds.to_string();
+        let expected = Duration::try_seconds(seconds).expect("representable duration witness");
+        assert_eq!(
+            super::super::fire_grace_from_value(Some(&text)).unwrap(),
+            expected,
+            "preserve configured grace {seconds}"
+        );
+    }
+    assert_eq!(
+        super::super::fire_grace_from_value(Some("+7"))
+            .unwrap()
+            .num_seconds(),
+        7
+    );
+    for seconds in [i64::MAX / 1000 + 1, i64::MAX] {
+        assert!(Duration::try_seconds(seconds).is_none());
+        let text = seconds.to_string();
+        let error = super::super::fire_grace_from_value(Some(&text))
+            .expect_err("parsed duration overflow must refuse");
+        let message = error.to_string();
+        assert!(message.contains("invalid_fire_grace"), "{message}");
+        assert!(message.contains("KHIVE_FIRE_GRACE_SECS"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn explicit_skip_bound_controls_real_creator_effect_under_both_global_graces() {
+    let name = "explicit_skip_bound_controls_real_creator_effect_under_both_global_graces";
+    let Some(root) = isolate(name) else {
+        return;
+    };
+    // child() scrubs KHIVE_*; change only this exact isolated child process.
+    assert_eq!(std::env::var(CASE).as_deref(), Ok(name));
+    let f = Fixture::open(&root);
+    for global in [300_i64, 0] {
+        std::env::set_var("KHIVE_FIRE_GRACE_SECS", global.to_string());
+        let mut schedules = Vec::new();
+        for (suffix, requested) in [
+            ("absent", None),
+            ("zero", Some(0)),
+            ("positive", Some(3600)),
+        ] {
+            let label = format!("skip-bound-global-{global}-{suffix}");
+            let (id, at) = f.declare_skip_bound(&label, requested).await;
+            schedules.push((id, at, label, requested.unwrap_or(global)));
+        }
+        let latest = schedules.iter().map(|(_, at, _, _)| *at).max().unwrap();
+        Fixture::due(latest).await;
+        let horizons = schedules
+            .iter()
+            .map(|(id, at, _, _)| (*id, at.timestamp_micros() + 1))
+            .collect();
+        CAPTURED_HORIZONS
+            .scope(
+                horizons,
+                super::super::run_pending_events_on(&f.rt, &f.server, false),
+            )
+            .await
+            .unwrap();
+        for (id, at, label, effective) in schedules {
+            let inventory = f
+                .store
+                .occurrences(&f.token(), id, None, None, 200)
+                .await
+                .unwrap();
+            assert_eq!(inventory.items.len(), 1, "{label}");
+            let item = &inventory.items[0];
+            assert_eq!(item.key.schedule_id, id, "{label}");
+            assert_eq!(
+                item.key.scheduled_for,
+                khive_pack_schedule::occurrence::OccurrenceInstant::from_datetime(at),
+                "{label}"
+            );
+            assert_eq!(item.selection_at_us, at.timestamp_micros() + 1, "{label}");
+            assert_eq!(item.effective_max_lateness_s, effective, "{label}");
+            let should_fire = effective > 0;
+            let expected_attempts = if should_fire { 1 } else { 0 };
+            assert_eq!(f.counter(&label).await, expected_attempts, "{label}");
+            let terminal = item.terminal.as_ref().expect("one terminal outcome");
+            assert_eq!(
+                terminal["outcome"],
+                if should_fire { "succeeded" } else { "missed" },
+                "{label}: {terminal}"
+            );
+            if should_fire {
+                assert!(
+                    terminal["final_decision_at_us"].as_i64().unwrap() >= item.selection_at_us,
+                    "actual final writer clock remains after captured selection"
+                );
+            }
+            let row = f
+                .rt
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_row(SqlStatement::new(
+                    "SELECT COUNT(*) AS count, COUNT(launch_intent_id) AS intents FROM scheduled_attempts_v3 WHERE occurrence_id=?1",
+                    vec![SqlValue::Text(item.id.to_string())],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.i64("count").unwrap(), expected_attempts, "{label}");
+            assert_eq!(row.i64("intents").unwrap(), expected_attempts, "{label}");
+        }
+    }
+    let observed = f.gate.observed.lock().unwrap();
+    assert!(
+        !observed.is_empty(),
+        "healthy creator effects must actually reach Gate"
+    );
+    assert!(observed
+        .iter()
+        .all(|(kind, actor, ns)| kind == "actor" && actor == ACTOR && ns == NS));
+    assert!(f.gate.identity_denials.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn configured_grace_overflow_refuses_outer_drain_without_writes_then_recovers() {
+    let name = "configured_grace_overflow_refuses_outer_drain_without_writes_then_recovers";
+    let Some(root) = isolate(name) else {
+        return;
+    };
+    assert_eq!(std::env::var(CASE).as_deref(), Ok(name));
+    let f = Fixture::open(&root);
+    std::env::set_var("KHIVE_FIRE_GRACE_SECS", "60");
+    let label = "configured-overflow-healthy-control";
+    let (id, at) = f.declare_skip_bound(label, Some(3600)).await;
+    Fixture::due(at).await;
+    let before = f.stored_rows().await;
+    let observed_before = f.gate.observed.lock().unwrap().clone();
+    std::env::set_var("KHIVE_FIRE_GRACE_SECS", i64::MAX.to_string());
+    let error = super::super::run_pending_events_on(&f.rt, &f.server, false)
+        .await
+        .expect_err("invalid configured grace must refuse before accounting or dispatch");
+    let message = format!("{error:#}");
+    assert!(message.contains("invalid_fire_grace"), "{message}");
+    assert!(message.contains("KHIVE_FIRE_GRACE_SECS"), "{message}");
+    assert_eq!(
+        f.stored_rows().await,
+        before,
+        "all auxiliary, note and event rows unchanged"
+    );
+    assert_eq!(f.counter(label).await, 0);
+    assert_eq!(*f.gate.observed.lock().unwrap(), observed_before);
+
+    // A valid configuration resumes the same original identity and uses the
+    // ordinary real final clock, with no new declaration or fixture bypass.
+    std::env::set_var("KHIVE_FIRE_GRACE_SECS", "60");
+    CAPTURED_HORIZONS
+        .scope(
+            [(id, at.timestamp_micros() + 1)].into_iter().collect(),
+            super::super::run_pending_events_on(&f.rt, &f.server, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.counter(label).await, 1);
+    let inventory = f
+        .store
+        .occurrences(&f.token(), id, None, None, 200)
+        .await
+        .unwrap();
+    assert_eq!(inventory.items.len(), 1);
+    let item = &inventory.items[0];
+    assert_eq!(item.effective_max_lateness_s, 3600);
+    assert_eq!(item.terminal.as_ref().unwrap()["outcome"], "succeeded");
+    {
+        let observed = f.gate.observed.lock().unwrap();
+        assert!(!observed.is_empty(), "healthy effect must reach Gate");
+        assert!(observed
+            .iter()
+            .all(|(kind, actor, ns)| kind == "actor" && actor == ACTOR && ns == NS));
+    }
+    super::super::run_pending_events_on(&f.rt, &f.server, false)
+        .await
+        .unwrap();
+    assert_eq!(f.counter(label).await, 1, "healthy control never replays");
 }
 
 #[test]
