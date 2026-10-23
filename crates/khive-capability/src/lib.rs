@@ -4,6 +4,9 @@
 //! over one keyed capability kernel. It does not install a runtime gate or grant
 //! store. See the README for the trusted management and seal-verification boundary.
 
+#[cfg(feature = "authority-store")]
+pub mod authority_store;
+
 pub mod actor;
 pub mod capability;
 pub mod context;

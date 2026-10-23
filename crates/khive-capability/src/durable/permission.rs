@@ -7,6 +7,7 @@ use lion_core::{Right, Rights};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Principal {
     pub kind: String,
@@ -41,6 +42,7 @@ impl Principal {
     }
 }
 
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContractDigest(pub [u8; 32]);
 impl ContractDigest {
@@ -48,6 +50,7 @@ impl ContractDigest {
         Self(*blake3::hash(bytes).as_bytes())
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContractRef {
     pub name: String,
@@ -59,6 +62,7 @@ impl ContractRef {
         nonempty(&self.name)
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExactBytes(pub Vec<u8>);
 impl ExactBytes {
@@ -70,6 +74,7 @@ impl ExactBytes {
         Ok(())
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RepositoryIdentity {
     pub forge: String,
@@ -81,6 +86,7 @@ impl RepositoryIdentity {
         self.immutable_id.validate()
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Validity {
     pub not_before: Timestamp,
@@ -105,6 +111,7 @@ impl Validity {
             }
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RunRef(pub Uuid);
 impl RunRef {
@@ -117,16 +124,19 @@ impl RunRef {
         Ok(Self(id))
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhaseVisit {
     pub phase_id: String,
     pub round: i64,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ActionOccurrence {
     pub visit: PhaseVisit,
     pub action_name: String,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ArgumentValue {
     String(String),
@@ -135,6 +145,7 @@ pub enum ArgumentValue {
     Bool(bool),
     Word(String),
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ArgumentType {
     String,
@@ -154,18 +165,22 @@ impl ArgumentValue {
         }
     }
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArgumentBinding {
     pub name: String,
     pub value: ArgumentValue,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExactArguments(pub Vec<ArgumentBinding>);
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArgumentSpec {
     pub name: String,
     pub kind: ArgumentType,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProducerClass {
     Actor,
@@ -173,34 +188,40 @@ pub enum ProducerClass {
     Platform,
     System,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SubmissionChannel {
     Observe,
     Sample,
     Internal,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SubjectSelector {
     Exact(Vec<ExactBytes>),
     Repositories(Vec<RepositoryIdentity>),
     AllSubjectsOfKind,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubjectScope {
     pub kind: ContractRef,
     pub selector: SubjectSelector,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceBinding {
     pub contract: ContractRef,
     pub identities: Vec<ExactBytes>,
     pub arguments: Vec<ExactArguments>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReportingBinding {
     Role(String),
     Initiator(Principal),
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SubmissionBinding {
     ActorReport {
@@ -222,6 +243,7 @@ pub enum SubmissionBinding {
     },
     ClaimTimePlatformBundle,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObservationPermission {
     pub policy_domain: String,
@@ -231,10 +253,12 @@ pub struct ObservationPermission {
     pub subject: SubjectScope,
     pub binding: SubmissionBinding,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObservationScope {
     pub permissions: Vec<ObservationPermission>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdminTarget {
     Read,
@@ -244,11 +268,13 @@ pub enum AdminTarget {
     Send,
     RecordObservation(ObservationScope),
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AdminScope {
     pub namespace: String,
     pub target: AdminTarget,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RightSpec {
     Read,
@@ -260,11 +286,13 @@ pub enum RightSpec {
     GrantAdmin(AdminScope),
 }
 
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceFormat {
     Opaque,
     CanonicalUuid,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct SubjectContract {
     pub identity: ContractRef,
@@ -273,12 +301,14 @@ pub struct SubjectContract {
     pub repositories: Vec<RepositoryIdentity>,
     pub membership: Vec<(ExactBytes, RepositoryIdentity)>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct SourceContract {
     pub identity: ContractRef,
     pub reference_format: ReferenceFormat,
     pub identities: Vec<ExactBytes>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct EntryContract {
     pub identity: ContractRef,
@@ -288,6 +318,7 @@ pub struct EntryContract {
     pub response_contract: Option<ContractRef>,
     pub authority_arguments: Vec<ArgumentSpec>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct DeclaredAction {
     pub entry: ContractRef,
@@ -296,12 +327,14 @@ pub struct DeclaredAction {
     pub by: Option<String>,
     pub phase_owner: Option<String>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct DefinitionContract {
     pub digest: ContractDigest,
     pub reporting_roles: Vec<(ContractRef, String)>,
     pub actions: Vec<DeclaredAction>,
 }
+#[cfg_attr(feature = "authority-store", derive(serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct RunContract {
     pub policy_domain: String,
@@ -504,7 +537,7 @@ impl ClosedCatalog {
     }
     // A finite bootstrap source is a bound on future grants, not registration of
     // its owner as the producer. Emitted grants still use validate_rights above.
-    pub(super) fn validate_source_rights(
+    pub(crate) fn validate_source_rights(
         &self,
         rights: &[RightSpec],
         namespace: &str,
@@ -572,6 +605,20 @@ impl ClosedCatalog {
             }
         }
         Ok(carriers)
+    }
+
+    #[cfg(feature = "authority-store")]
+    pub(crate) fn covers_observation_permission(
+        &self,
+        held: &ObservationPermission,
+        wanted: &ObservationPermission,
+    ) -> bool {
+        held.policy_domain == wanted.policy_domain
+            && held.entry == wanted.entry
+            && held.producer_class == wanted.producer_class
+            && held.channel == wanted.channel
+            && self.covers_subject(&held.subject, &wanted.subject)
+            && binding_covers(&held.binding, &wanted.binding)
     }
 
     pub fn covers_rights(&self, parent: &[RightSpec], requested: &[RightSpec]) -> bool {

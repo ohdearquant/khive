@@ -114,8 +114,13 @@ indexes, materialize results or open databases. Selected correctness runs still 
 their full workload and checks; the limits-only scene needs no generated fixture.
 Selected scenes reuse their target's initialized inputs. Initialization remains outside
 recorded operation intervals. Profiling (`--bench --profile-time`, including the `=value`
-form) preserves eager initialization before each group, including for unmatched filters,
-so fixture construction stays outside the external profiler's callback. Criterion rejects
+form) preserves eager initialization of the shared runtimes and generated corpora before
+each group, including for unmatched filters, so only that construction stays outside the
+external profiler's callback. Per-iteration fixtures still run inside it:
+`retrieval_persistence` builds a fresh store in every iteration (and saves the prior
+indexes for the replace and shadow scenes), and `retrieval_ann_registry` builds and seeds
+a memory backend in every iteration. That setup is outside the recorded interval but is
+sampled by the profiler. Criterion rejects
 `--list` combined with `--profile-time`; options after `--` are literal filter text.
 
 - HNSW uses 500 vectors of 384 dimensions, an LCG corpus seed of 42 and HNSW level seed 42,

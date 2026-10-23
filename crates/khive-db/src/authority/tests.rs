@@ -611,3 +611,61 @@ fn fresh_migration_and_reopen_preserve_empty_seed_marker() {
         .unwrap();
     assert_eq!(tables, 7);
 }
+
+#[tokio::test]
+async fn full_change_event_round_trips_on_the_owning_writer() {
+    let (bridge, _) = setup();
+    let data = fixture();
+    transaction(&bridge, move |mut tx| {
+        Box::pin(async move {
+            seed(&mut tx, &data).await?;
+            for change in &data.changes {
+                let (actual, complete) = tx
+                    .change_event(data.epoch.epoch_id, change.event_id)
+                    .await?
+                    .unwrap();
+                assert_eq!(&actual, change);
+                assert_eq!(complete, event(change));
+            }
+            assert!(tx
+                .change_event(data.epoch.epoch_id, Uuid::from_u128(999))
+                .await?
+                .is_none());
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn full_change_event_refuses_malformed_history_metadata() {
+    let (bridge, pool) = setup();
+    let data = fixture();
+    let epoch_id = data.epoch.epoch_id;
+    let event_id = data.changes[0].event_id;
+    transaction(&bridge, move |mut tx| {
+        Box::pin(async move { seed(&mut tx, &data).await })
+    })
+    .await
+    .unwrap();
+    pool.writer()
+        .unwrap()
+        .transaction(|conn| {
+            conn.execute(
+                "UPDATE events SET payload_schema_version=2 WHERE id=?1",
+                [event_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let error = transaction(&bridge, move |mut tx| {
+        Box::pin(async move { tx.change_event(epoch_id, event_id).await })
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::WriterTaskRequestFailed {
+        request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+        source,
+    } if matches!(*source, StorageError::InvalidInput { .. })));
+}
