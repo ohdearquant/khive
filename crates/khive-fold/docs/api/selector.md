@@ -27,6 +27,34 @@ of 10, a size-10 candidate scoring 1.1 ranks before ten size-1 candidates scorin
 the selector admits the large candidate and returns total score 1.1 even though the ten small
 candidates form a feasible selection with total score 10.0.
 
+## Diversity selection cost
+
+The diversity path keeps one candidate index per category. Within each category,
+raw effective bases are sorted once, while a segment tree tracks live candidates
+by size, ID and their current position in the remaining input. A fitting leader
+is found without rescanning the category. Its score is multiplied by the current
+diversity factor and converted through `DeterministicScore`; all candidates in
+that resulting score plateau participate in the size/ID tie-break. Sorting only
+by raw score would miss ties created by multiplication and quantization.
+
+A heap compares the category winners. Selecting an item refreshes its category;
+if the old remaining-vector tail moves into the removed slot, its category is
+also refreshed. This preserves the existing last-equal-candidate behavior when
+IDs, sizes and quantized scores all tie. Items too large for the remaining budget
+cannot become eligible later, but their virtual remaining-vector positions are
+retained because they can affect that tie behavior. Candidates with no category
+always use a zero category count. Negative effective bases are supported: their
+category winner is refreshed even when a diversity penalty improves its score.
+
+The index uses O(N) auxiliary space and O(N log N) total comparison/index work,
+including initialization, for N eligible candidates. A single selection can
+invalidate multiple cached winners after the budget shrinks; the bound is
+amortized over the whole selection, not a strict logarithmic limit on each pick.
+Filtering, category weighting, the zero-diversity fast path and the original
+floating-point expression order are unchanged. This is an algorithmic work bound,
+not a measured latency guarantee; the existing scale benchmark measures the
+1,000- and 5,000-candidate workloads.
+
 ## Rank-score precision (PR #535)
 
 `SelectorInput.rank_score` exists because callers that compute the effective score in `f64`
