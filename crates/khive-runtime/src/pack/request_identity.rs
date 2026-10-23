@@ -65,15 +65,7 @@ pub struct VerbRegistry {
     /// [`VerbRegistry::admission_degrade_safe`].
     pub(super) degrade_safe_verbs: Arc<HashSet<&'static str>>,
     pub(super) audit_success_rows_mode: AuditSuccessRowsMode,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Consumed by the deferred success-row cut")
-    )]
     pub(super) audit_success_row_omitted_verbs: Arc<HashSet<&'static str>>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Consumed by the deferred success-row cut")
-    )]
     pub(super) audit_success_row_sampled_verbs:
         Arc<HashMap<&'static str, (u64, AuditSuccessRowForcingRule)>>,
     /// Trusted canonical public handlers classified Read by the shared effects table.

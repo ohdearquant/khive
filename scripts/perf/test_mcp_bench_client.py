@@ -113,6 +113,68 @@ class StdioMcpTransportTests(unittest.TestCase):
 
 # ── Percentile ────────────────────────────────────────────────────────────────
 
+class AuditSuccessRowsPreflightTests(unittest.TestCase):
+    @staticmethod
+    def response(result):
+        body = {"results": [{"ok": True, "result": result}]}
+        return {"result": {"content": [{"type": "text", "text": json.dumps(body)}]}}
+
+    def test_requires_all_before_sampling(self):
+        unavailable = "no audit-batch control is registered with this runtime instance"
+        no_sink = {"writer_contention": {
+            "audit_batch_flush_failures": None,
+            "audit_batch_flush_failures_unavailable_reason": unavailable,
+            "audit_success_rows_omitted": None,
+            "audit_success_rows_sampled_out": None,
+            "audit_success_rows_forced": None,
+        }}
+        cases = [({"audit_success_rows_mode": "all"}, True),
+                 ({**no_sink, "audit_success_rows_mode": "all"}, True),
+                 ({**no_sink, "audit_success_rows_mode": "reduced"}, False),
+                 ({}, False), ({"audit_success_rows_mode": "unknown"}, False),
+                 ({"audit_success_rows_mode": "ALL"}, False),
+                 ({"audit_success_rows_mode": None}, False),
+                 ({"audit_success_rows_mode": True}, False),
+                 ({"audit_success_rows_mode": ["all"]}, False),
+                 (None, False), ([], False), ("all", False)]
+        for diagnostics, allowed in cases:
+            with self.subTest(diagnostics=diagnostics):
+                proc = _FakeProc([self.response(diagnostics)])
+                samples = []
+                if allowed:
+                    try:
+                        mbc.require_all_audit_success_rows(proc)
+                    except RuntimeError as exc:
+                        self.fail(f"explicit all diagnostics must permit sampling: {exc}")
+                    samples.append("sample")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "requires audit_success_rows_mode='all'"):
+                        mbc.require_all_audit_success_rows(proc)
+                        samples.append("sample")
+                self.assertEqual(samples, ["sample"] if allowed else [])
+                requests = proc.written_requests()
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["method"], "tools/call")
+                self.assertEqual(json.loads(requests[0]["params"]["arguments"]["ops"]),
+                                 [{"tool": "db_diagnostics", "args": {"size_composition": False}}])
+
+    def test_refuses_unreadable_diagnostics(self):
+        responses = [[], [{"error": {"message": "RPC failed"}}],
+                     [{"result": {"isError": True, "content": []}}],
+                     [{"result": {"content": [{"text": "malformed JSON"}]}}],
+                     [{"result": {"content": []}}],
+                     [{"result": {"content": [{"text": json.dumps({"results": []})}]}}],
+                     [{"result": {"content": [{"text": json.dumps({"results": [{"ok": False, "error": "refused"}]})}]}}]]
+        for response in responses:
+            with self.subTest(response=response):
+                proc = _FakeProc(response)
+                samples = []
+                with self.assertRaisesRegex(RuntimeError, "Cannot verify benchmark success-audit mode"):
+                    mbc.require_all_audit_success_rows(proc)
+                    samples.append("sample")
+                self.assertEqual(samples, [])
+
+
 class PercentileTests(unittest.TestCase):
     def test_empty_list_returns_zero(self):
         self.assertEqual(mbc.pct([], 0.5), 0.0)
