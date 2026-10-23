@@ -14,7 +14,7 @@ NO_PROXY=127.0.0.1 cargo bench -p khive-channel-email --benches -- --quick --nop
 NO_PROXY=127.0.0.1 cargo bench -p khive-channel-email --bench email_fetch_suppression -- --noplot
 cargo bench -p khive-channel-email --bench email_routes -- --list
 cargo bench -p khive-channel-email --bench email_allocations -- --list
-cargo bench -p khive-channel-email --bench email_allocations -- route_inbound
+cargo bench -p khive-channel-email --bench email_allocations -- allocations/route_inbound
 cargo test -p khive-channel-email --test email_allocation_observer
 ```
 
@@ -68,6 +68,18 @@ Each timed call starts from a fresh clone, so iteration history does not shift t
 scenario. Jitter is the production RNG, checked only against its valid bounds.
 
 ## Allocation reports
+
+Allocation scenario IDs begin with `allocations/`, so they differ from the
+unchanged timing benchmark IDs. Both `--list` and the JSON `scenario` field use
+these IDs. The 14 allocation scenarios are:
+
+| ID prefix                                   | Suffixes                                         |
+| ------------------------------------------- | ------------------------------------------------ |
+| `allocations/route_inbound/`                | `thread_matched`, `alias_matched`, `unmatched`   |
+| `allocations/external_delivery_marking/`    | `plain`, `withheld_labels`, `maintainer_refused` |
+| `allocations/backoff_record_failure/`       | `first`, `escalating`, `saturated`               |
+| `allocations/single_flight/`                | `uncontended`, `queued/1`, `queued/100`          |
+| `allocations/fetch_remote_suppression_set/` | `1000`, `10000`                                  |
 
 The instrumented binary counts successful Rust global allocator requests:
 `alloc`, `alloc_zeroed` and successful `realloc` each count once. It also reports

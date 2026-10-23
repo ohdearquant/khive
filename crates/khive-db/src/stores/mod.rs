@@ -14,6 +14,7 @@ use crate::pool::ConnectionPool;
 pub mod agents;
 pub mod attachment;
 pub mod blob;
+#[cfg(feature = "blob-s3")]
 pub mod blob_s3;
 pub mod entity;
 pub mod event;

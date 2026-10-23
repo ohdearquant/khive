@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibili
 pub const PACK_NAME: &str = "exec";
 
 /// Manifest schema tag carried by every tree object.
-pub const TREE_SCHEMA: &str = "khive-tree/v1";
+pub use khive_runtime::blob_tree::TREE_SCHEMA;
 
 /// Pack-owned tables, applied idempotently at boot.
 pub static EXEC_SCHEMA_PLAN_STMTS: [&str; 6] = [

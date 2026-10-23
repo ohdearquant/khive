@@ -63,6 +63,7 @@ cd "$SCRIPT_DIR/../crates"
 CRATES=(
     khive-lion-core      # copied kernel; no khive-* dependencies
     khive-types
+    khive-capability
     khive-score
     khive-quant
     khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first

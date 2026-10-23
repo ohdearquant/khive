@@ -20,6 +20,7 @@ pub mod audit_batch;
 pub mod audit_error;
 pub mod backend_handle;
 pub mod blob;
+pub mod blob_tree;
 pub mod bounded_read;
 pub mod build_info;
 mod code_map_runtime;

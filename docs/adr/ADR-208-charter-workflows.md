@@ -54,7 +54,9 @@ only observations recorded after its previous visit ended, so a bounded loop nev
 round. Phrases over the store's own state
 (a task's status, a message present, a graph edge, a schedule fire) are produced by a built-in instrument that reads the
 store and records an observation, so evaluation stays pure. A phrase whose truth cannot be established mechanically,
-or that only the checked actor can report about itself, has an advisory ceiling.
+or that only the checked actor can report about itself, has an advisory ceiling. The producer class is exactly one of
+`actor`, `instrument`, `platform` and `system`, each entry also declares its submission channel, and ADR-193
+Amendment 5 (D3, D6) states which recorded observations are eligible.
 
 ### D4. A trigger is an observation kind
 
@@ -68,13 +70,16 @@ A subject is a registered subject kind plus a reference under the policy domain.
 pull request id, target) is one kind. ADR-193 D8's generation and run-key rules apply per kind, and each kind declares
 what starts a new generation: the triggers whose observation moves the subject to the generation it names. Any other
 observation is recorded at the generation it names and never moves the subject, so a late result for an older candidate
-cannot roll the subject back.
+cannot roll the subject back. A producer's permission to record for a subject uses the exact typed subject selectors of
+ADR-193 Amendment 5 D4.
 
 ### D6. Levels and milestones are unchanged
 
 Levels are hard, soft and advisory as in ADR-193 D6. The recording milestone (ADR-193 D11, M1) applies to every
 charter: levels are recorded, nothing blocks and `charter.claim` refuses. An action becomes enforceable only under the
-M2 terms, and only where every hard phrase it depends on has a producer independent of the actor it checks.
+M2 terms, and only where every hard phrase it depends on has a producer independent of the actor it checks. "Nothing
+blocks" concerns external effects: evidence admission, including producer registration, is enforced at M1 as well
+(ADR-193 Amendment 5 D7).
 
 ### D7. Actions are registered adapters
 

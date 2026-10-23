@@ -1,5 +1,5 @@
 use khive_hnsw::{HnswConfig, HnswIndex, NodeId, RebuildStats};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 pub const ROWS: usize = 5_000;
 pub const DELETED: usize = 500;
@@ -20,7 +20,7 @@ pub fn build() -> HnswIndex {
     let mut index = HnswIndex::with_config(config);
     let mut rng = StdRng::seed_from_u64(SEED);
     for row in 0..ROWS {
-        let mut vector: Vec<f32> = (0..DIMS).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let mut vector: Vec<f32> = (0..DIMS).map(|_| rng.random_range(-1.0..1.0)).collect();
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!(norm > 0.0);
         for value in &mut vector {

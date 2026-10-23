@@ -1601,7 +1601,7 @@ jobs:
           KHIVE_S3_TEST_REGION: us-east-1
           AWS_ACCESS_KEY_ID: khive-ci
           AWS_SECRET_ACCESS_KEY: khive-ci-secret
-        run: cargo test -p khive-db --test blob_conformance
+        run: cargo test -p khive-db --features blob-s3 --test blob_conformance
       # The suite counts only if the server started above served all of it:
       # the same process must still be alive and still own the port.
       - name: Confirm the suite ran against the started server
@@ -1698,13 +1698,42 @@ jobs:
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
       - name: Compile every target without the optional packs
         run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
+      - name: Keep Git's normal dependency graph independent of Exec and Tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p khive-pack-git --edges normal --target all --prefix none --format '{p}' > "$RUNNER_TEMP/git-normal-deps.txt"
+          awk '{print $1}' "$RUNNER_TEMP/git-normal-deps.txt" > "$RUNNER_TEMP/git-normal-packages.txt"
+          grep -Fxq 'khive-pack-git' "$RUNNER_TEMP/git-normal-packages.txt"
+          if grep -Ex 'khive-pack-exec|khive-pack-tool' "$RUNNER_TEMP/git-normal-packages.txt"; then
+            echo 'Git must not normally depend on Exec or Tool; dev fixtures may use both' >&2
+            exit 1
+          fi
       - name: Run the library tests without the optional packs
         run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
       # These integration tests assert which packs are linked and selectable. Their
-      # feature-off branches are what catch a core crate linking an optional pack,
-      # and the ci job runs them only with every feature on.
+      # feature-off branches are what catch a core crate linking an optional pack.
       - name: Run the pack composition tests without the optional packs
         run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
+      # The default features leave the agent, telemetry and web packs out, so the ci
+      # job runs only their feature-off branches. These three steps run the
+      # feature-on branches and the suites that need an optional pack.
+      - name: Run the library tests with every optional pack
+        run: cargo test -p kkernel -p khive-mcp --features pack-agent,pack-telemetry,pack-web --lib --locked
+      - name: Run the pack composition tests with every optional pack
+        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
+      - name: Run the server suites that need an optional pack
+        run: cargo test -p khive-mcp --features pack-agent,pack-telemetry,pack-web --locked --test mcp_mount_fixture --test mounts --test telemetry_activation --test web_backend_routing
+      # kg-adapters and repo-showcase are off by default, so the ci job runs only the
+      # refusal side of kg import and none of the repo commands. This step runs the
+      # import adapter and repository showcase suites with both features on.
+      - name: Run the kg import adapter and repository showcase suites
+        run: cargo test -p kkernel --features kg-adapters,repo-showcase --locked --lib --test kg_import_csv --test kg_import_bibtex --test kg_import_schema --test kg_import_conflicts --test repo_showcase_cli
+      # blob-s3 is off by default, so the ci job runs only the refusal side of an S3
+      # store configuration, and the MinIO job runs only the conformance suite. This
+      # step runs the S3 store, configuration and server library tests.
+      - name: Run the S3 blob store library tests
+        run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}

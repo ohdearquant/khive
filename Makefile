@@ -7,8 +7,10 @@
 # so the artifact serves the pack's seven verbs whether or not the list names
 # it. Omitting it did not make the gate lenient about a pack it never built; it
 # made the gate blind to seven verbs the artifact was already shipping, so
-# losing all of them still cleared a floor set below their count.
-FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard,tool,exec
+# losing all of them still cleared a floor set below their count. `agent`,
+# `telemetry` and `web` are here for the same reason: build-local enables
+# pack-agent, pack-telemetry and pack-web now that they are off by default.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard,tool,exec,agent,telemetry,web
 LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
@@ -107,13 +109,18 @@ build:
 # binary without the pack answers `unknown pack name "formal"` and the
 # verification gate fails.
 # The same applies at runtime to any KHIVE_PACKS naming `formal` or `moodboard`.
+# pack-agent, pack-telemetry and pack-web are off in the default build as well;
+# this recipe enables them so an operator's installed binary keeps every pack it
+# linked before they became optional. kg-adapters and repo-showcase keep the
+# non-native `kg import` formats and the `repo export` / `repo build` commands
+# in the installed binary for the same reason.
 build-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-formal, pack-moodboard)..."
+	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-agent, pack-telemetry, pack-web, pack-formal, pack-moodboard, kg-adapters, repo-showcase)..."
 	@python3 scripts/build_local_artifact.py \
 		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
-		--features channel-email,channel-telegram,pack-formal,pack-moodboard \
+		--features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase \
 		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
 # Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a

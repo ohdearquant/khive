@@ -116,6 +116,15 @@ fn compatibility_wrapper_uses_home_default_namespace() {
             "the raw migration must acquire a lock in the shared default path"
         );
         let captured = MigrationWritePolicy::from_environment().unwrap();
+        assert_eq!(
+            captured.disk_guard_config().guard_deadline_ms,
+            khive_db::EffectiveDiskGuardConfig::default().guard_deadline_ms,
+            "the HOME namespace fixture uses the ordinary bootstrap deadline"
+        );
+        assert_eq!(
+            captured.disk_guard_config().deadline_source,
+            khive_db::DiskGuardConfigSource::Default
+        );
         std::env::set_var("KHIVE_SQLITE_DISK_RESERVE_BYTES", "invalid-after-capture");
         assert_eq!(
             run_migrations_with_policy(&mut conn, &captured).unwrap(),
@@ -144,7 +153,7 @@ fn compatibility_wrapper_uses_home_default_namespace() {
         .env_remove("KHIVE_VOLUME_LOCK_DIR")
         .env_remove("KHIVE_DB_FREE_SPACE_FLOOR_BYTES")
         .env("KHIVE_SQLITE_DISK_RESERVE_BYTES", "0")
-        .env("KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS", "100")
+        .env_remove("KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();

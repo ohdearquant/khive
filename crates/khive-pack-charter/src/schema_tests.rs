@@ -18,5 +18,5 @@ fn every_schema_entry_opens_with_its_one_table() {
     }
     tables.sort_unstable();
     tables.dedup();
-    assert_eq!(tables.len(), 7, "{tables:?}");
+    assert_eq!(tables.len(), 9, "{tables:?}");
 }

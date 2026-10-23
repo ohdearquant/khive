@@ -1,10 +1,10 @@
 use super::{new_visited_set, VISITED_SET_ALLOCATIONS};
 use crate::{VamanaConfig, VamanaError, VamanaIndex};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 fn fixture() -> (VamanaIndex, Vec<f32>) {
     let mut rng = StdRng::seed_from_u64(0x3775);
-    let vectors: Vec<f32> = (0..24 * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let vectors: Vec<f32> = (0..24 * 4).map(|_| rng.random_range(-1.0..1.0)).collect();
     let config = VamanaConfig::with_dimensions(4)
         .with_max_degree(8)
         .with_search_list_size(16);

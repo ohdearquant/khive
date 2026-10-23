@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
 use crate::brain_signal::BrainSignal;
@@ -353,7 +353,7 @@ fn sample_beta_gamma(alpha: f64, beta: f64, rng: &mut impl Rng) -> f64 {
 fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
     if shape < 1.0 {
         let g = sample_gamma_mt(shape + 1.0, rng);
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         return g * u.powf(1.0 / shape);
     }
     let d = shape - 1.0 / 3.0;
@@ -365,7 +365,7 @@ fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
             continue;
         }
         let v = v_raw * v_raw * v_raw;
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         if u < 1.0 - 0.0331 * (x * x) * (x * x) {
             return d * v;
         }
@@ -376,8 +376,8 @@ fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
 }
 
 fn sample_standard_normal_bm(rng: &mut impl Rng) -> f64 {
-    let u1: f64 = rng.gen::<f64>().max(f64::EPSILON);
-    let u2: f64 = rng.gen();
+    let u1: f64 = rng.random::<f64>().max(f64::EPSILON);
+    let u2: f64 = rng.random();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 

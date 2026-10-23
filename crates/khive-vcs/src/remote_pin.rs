@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use crate::sync::{redact_git_stderr, RemoteName};
 
@@ -84,7 +84,7 @@ fn update_remote_pin_with(
     let updated = !selected.previous_commit.eq_ignore_ascii_case(&commit);
     if updated {
         selected.document["remotes"][selected.index]["commit"] = Value::String(commit.clone());
-        let bytes = serde_yaml::to_string(&selected.document).context("serializing KG schema")?;
+        let bytes = yaml_serde::to_string(&selected.document).context("serializing KG schema")?;
         let parent = schema_path
             .parent()
             .context("KG schema has no parent directory")?;
@@ -142,7 +142,7 @@ fn select_remote(
 ) -> Result<Selection> {
     // Do not echo malformed YAML (which may include a credential-bearing URL).
     let document: Value =
-        serde_yaml::from_slice(bytes).map_err(|error| match error.location() {
+        yaml_serde::from_slice(bytes).map_err(|error| match error.location() {
             Some(location) => anyhow!(
                 "invalid KG schema YAML at line {}, column {}",
                 location.line(),

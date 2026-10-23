@@ -1,0 +1,34 @@
+charter review_round v1
+title "One review round on one head"
+subject pull_request
+
+roles:
+    requester "asked for the review"
+    reviewer "the agent doing the review"
+
+triggers:
+    review.requested
+    review.posted
+
+workflow:
+    phase setup by reviewer:
+        await review.requested
+        require agent.no_outward_writes advisory
+        evidence setup_record
+
+    phase read by reviewer:
+        action review.read_diff by reviewer
+
+    phase probe by reviewer:
+        action tests.run_targeted by reviewer
+        action tests.run_mutations by reviewer
+        require tree.clean hard
+        evidence probe_record
+
+    phase verdict by reviewer:
+        action review.write_verdict by reviewer
+        require review.within_words(500) advisory
+        require review.findings_reproducible soft
+        await review.posted
+        action review.return_verdict by reviewer
+        complete

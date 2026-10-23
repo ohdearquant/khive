@@ -2,7 +2,8 @@
 //!
 //! The same behavioral contract exercised against every `BlobStore`
 //! implementation this crate ships. `FsBlobStore` runs unconditionally.
-//! `S3BlobStore` runs only when `KHIVE_S3_TEST_ENDPOINT` (plus bucket/region
+//! `S3BlobStore` requires the `blob-s3` feature and runs only when
+//! `KHIVE_S3_TEST_ENDPOINT` (plus bucket/region
 //! and AWS credential env vars) is set -- normally by the pinned-MinIO CI job
 //! (`.github/workflows/ci.yml`, `minio-blob-compat`) -- and is skipped with an
 //! explicit message everywhere else, since it needs a live S3-compatible
@@ -13,8 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+#[cfg(feature = "blob-s3")]
 use futures::stream::StreamExt;
 use khive_db::stores::blob::FsBlobStore;
+#[cfg(feature = "blob-s3")]
 use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_storage::blob::{BlobOrphanSweepConfig, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES};
 use khive_storage::{StorageCapability, StorageError, StorageResult};
@@ -429,6 +432,7 @@ async fn fs_blob_store_conforms() {
     assert_conforms(store, OrphanSweepExpectation::TypedUnsupported).await;
 }
 
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 async fn s3_blob_store_conforms_against_a_live_endpoint() {
     let Ok(endpoint) = std::env::var("KHIVE_S3_TEST_ENDPOINT") else {
@@ -462,6 +466,7 @@ async fn s3_blob_store_conforms_against_a_live_endpoint() {
 /// `S3BlobStore::orphan_sweep` actually continues past the first page rather
 /// than only ever exercising a single-page listing, as every other test in
 /// this suite does.
+#[cfg(feature = "blob-s3")]
 #[tokio::test]
 async fn s3_blob_store_orphan_sweep_paginates_past_the_1000_key_page_boundary() {
     let Ok(endpoint) = std::env::var("KHIVE_S3_TEST_ENDPOINT") else {

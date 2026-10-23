@@ -230,3 +230,31 @@ fn missing_root_reports_an_unqueryable_path_as_unverified() {
     let (files, _) = walk(&root).expect("the pinned directory still lists");
     assert!(files.is_empty());
 }
+
+#[test]
+fn bounded_symlink_capture_keeps_exact_bytes_digest_and_overflow_evidence() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let run = tempfile::tempdir().unwrap();
+    let mut target = vec![b'x'; 256];
+    target[127] = 0xff;
+    std::os::unix::fs::symlink(OsString::from_vec(target.clone()), run.path().join("link"))
+        .unwrap();
+    let root = CaptureRoot::open(run.path()).unwrap();
+    let (files, skipped) = walk(&root).unwrap();
+    assert!(skipped.is_empty());
+    let found = &files["link"];
+    for (cap, observed) in [(0, 1), (255, 256)] {
+        assert!(matches!(
+            found.read_content_bounded(cap).unwrap(),
+            CaptureRead::TooLarge { observed_at_least } if observed_at_least == observed
+        ));
+    }
+    for cap in [256, u64::MAX] {
+        let CaptureRead::Complete(content) = found.read_content_bounded(cap).unwrap() else {
+            panic!("the exact symlink byte cap must succeed");
+        };
+        assert_eq!(content.bytes, target);
+        assert_eq!(content.digest, blake3::hash(&target).to_hex().to_string());
+    }
+}

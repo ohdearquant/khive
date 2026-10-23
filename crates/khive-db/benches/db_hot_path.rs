@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tempfile::TempDir;
 
 use khive_db::backend::StorageBackend;
@@ -61,9 +61,9 @@ fn gen_body(rng: &mut StdRng, i: usize) -> String {
         "stream",
         "cursor",
     ];
-    let n_words = rng.gen_range(20..35usize);
+    let n_words = rng.random_range(20..35usize);
     let mut words: Vec<&str> = (0..n_words)
-        .map(|_| WORDS[rng.gen_range(0..WORDS.len())])
+        .map(|_| WORDS[rng.random_range(0..WORDS.len())])
         .collect();
     words.push(Box::leak(format!("doc_{i}").into_boxed_str()));
     words.join(" ")
@@ -74,7 +74,7 @@ fn gen_title(i: usize) -> String {
 }
 
 fn gen_vector(rng: &mut StdRng, dims: usize) -> Vec<f32> {
-    let raw: Vec<f32> = (0..dims).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let raw: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0f32..1.0)).collect();
     let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
     raw.into_iter().map(|v| v / norm).collect()
 }
