@@ -1,5 +1,5 @@
 -- ADR-014 Amendment 7: one obligation per entity in the domain store.
-CREATE TABLE pending_entity_indexes (
+CREATE TABLE IF NOT EXISTS pending_entity_indexes (
     entity_id         TEXT PRIMARY KEY NOT NULL,
     namespace         TEXT NOT NULL,
     source_version    INTEGER NOT NULL CHECK (typeof(source_version) = 'integer' AND source_version > 0),
@@ -9,7 +9,7 @@ CREATE TABLE pending_entity_indexes (
 );
 
 -- This applies to every entity DELETE, including writers with foreign_keys OFF.
-CREATE TRIGGER entities_delete_pending_indexes
+CREATE TRIGGER IF NOT EXISTS entities_delete_pending_indexes
 AFTER DELETE ON entities
 BEGIN
     DELETE FROM pending_entity_indexes WHERE entity_id = OLD.id;
