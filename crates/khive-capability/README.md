@@ -9,6 +9,8 @@ the workspace copy of `lion-core` 0.4.0, and is licensed Apache-2.0.
 
 ## Library surface
 
+Public re-exports include `khive-lion-core` types, so their API follows the core crate's major version.
+
 - `ActorRegistry` retains session-to-actor bookkeeping.
 - `NamespaceMap` retains the deterministic BLAKE3 namespace-to-resource mapping.
 - `RequestContext` takes a validated `khive_types::Namespace` and carries session/task scope.
